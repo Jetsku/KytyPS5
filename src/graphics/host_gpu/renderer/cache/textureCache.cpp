@@ -646,7 +646,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 		return false;
 	}
 	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
+	    cached.type != requested.type) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -1702,9 +1702,12 @@ bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const ch
 	const bool source_depth = source.info.IsDepth();
 	const bool dest_depth   = destination.info.IsDepth();
 	const bool direct_copy =
-	    source.backing.format == destination.backing.format ||
-	    (!source_depth && !dest_depth &&
-	     vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format));
+	    (source.backing.image_type == destination.backing.image_type ||
+	     (source.backing.image_type != vk::ImageType::e1D &&
+	      destination.backing.image_type != vk::ImageType::e1D)) &&
+	    (source.backing.format == destination.backing.format ||
+	     (!source_depth && !dest_depth &&
+	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
 	// Lossless paths copy raw texel bits; the D16 path converts through unorm16.
 	bool        lossless = true;
 	const char* path     = nullptr;
@@ -1963,12 +1966,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
+		// A view cannot change the native image type or grow its extent.
 		if (requested.data.size == cached.info.data.size &&
-		    requested.resources == cached.info.resources && requested.type == cached.info.type &&
-		    requested.extent.width > cached.info.extent.width &&
-		    requested.extent.height >= cached.info.extent.height &&
-		    requested.extent.depth >= cached.info.extent.depth &&
-		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+		    requested.resources == cached.info.resources &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    (requested.type != cached.info.type
+		         ? requested.extent == cached.info.extent
+		         : requested.extent.width > cached.info.extent.width &&
+		               requested.extent.height >= cached.info.extent.height &&
+		               requested.extent.depth >= cached.info.extent.depth)) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
