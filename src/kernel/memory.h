@@ -149,7 +149,7 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 [[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
-bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.
 [[nodiscard]] uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size);

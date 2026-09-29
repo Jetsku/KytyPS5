@@ -422,14 +422,21 @@ public:
 		}
 
 		auto* destination = static_cast<uint8_t*>(data);
-		std::memset(destination, 0, size);
+		auto  cursor      = vaddr;
 		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
 		     ++mapping) {
 			const auto& entry  = mapping->second;
 			const auto  start  = std::max(vaddr, entry.vaddr);
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
 			const auto  offset = entry.backing_offset + start - entry.vaddr;
+			if (cursor < start) {
+				std::memset(destination + cursor - vaddr, 0, start - cursor);
+			}
 			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+			cursor = start + bytes;
+		}
+		if (cursor < end) {
+			std::memset(destination + cursor - vaddr, 0, end - cursor);
 		}
 		return true;
 	}

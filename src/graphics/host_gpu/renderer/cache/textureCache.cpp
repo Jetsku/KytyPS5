@@ -2584,7 +2584,7 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 			for (const auto& range: ranges) {
 				if (!LibKernel::Memory::TryReadBacking(base + range.offset, mapped + range.packed,
 				                                       range.size) &&
-				    !LibKernel::Memory::TryReadPrtBacking(base + range.offset,
+				    !LibKernel::Memory::TryReadSparseBacking(base + range.offset,
 				                                          mapped + range.packed, range.size)) {
 					EXIT("TextureCache: failed to read mapped guest image backing\n");
 				}
@@ -2663,7 +2663,7 @@ void TextureCache::RecordChunkHashes(Image& image) {
 		const auto end   = std::min(image.live.End(), chunks.base + uint64_t {index + 1} * chunk_size);
 		if (begin >= end ||
 		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
-		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
+		     !LibKernel::Memory::TryReadSparseBacking(begin, bytes.data(), end - begin))) {
 			chunks.hashes.clear();
 			return;
 		}
@@ -2686,7 +2686,7 @@ bool TextureCache::VerifyCleanChunks(Image& image) {
 		const auto end   = std::min(image.live.End(), chunks.base + uint64_t {index + 1} * chunk_size);
 		if (begin >= end ||
 		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
-		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
+		     !LibKernel::Memory::TryReadSparseBacking(begin, bytes.data(), end - begin))) {
 			return false;
 		}
 		if (XXH3_64bits(bytes.data(), static_cast<size_t>(end - begin)) != chunks.hashes[index]) {
