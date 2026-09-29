@@ -205,11 +205,11 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		const bool shared = output.kind == IR::StageOutputKind::Layer;
 		output.mesh_data_variable =
 		    MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
-		              shared ? mesh.max_vertices : state.lane_count);
+		              shared ? mesh.max_vertices : state.lane_count * state.mesh_passes);
 	}
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
-	state.mesh_primitive_data =
-	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
+	state.mesh_primitive_data = MeshArray(state, spv::StorageClassPrivate, TypeU32(state),
+	                                      state.lane_count * state.mesh_passes);
 	state.mesh_primitives =
 	    MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
 	state.mesh_cull =
@@ -251,12 +251,25 @@ uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32
 	return MeshElement(
 	    state, output->mesh_data_variable,
 	    shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, MeshOutputType(state, kind),
-	    shared ? EmitLocalInvocationIndex(state) : ConstantU32(state, state.lane_half));
+	    shared ? EmitLocalInvocationIndex(state) : MeshLaneSlot(state));
 }
 
 uint32_t MeshPrimitivePointer(EmitterState& state) {
 	return MeshElement(state, state.mesh_primitive_data, spv::StorageClassPrivate, TypeU32(state),
-	                   ConstantU32(state, state.lane_half));
+	                   MeshLaneSlot(state));
+}
+
+// The element of a per-lane Private array that belongs to this lane in the current pass.
+uint32_t MeshLaneSlot(EmitterState& state) {
+	if (state.mesh_pass_variable == 0) {
+		return ConstantU32(state, state.lane_half);
+	}
+	const auto pass = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), pass, state.mesh_pass_variable);
+	return Binary(state, spv::OpIAdd, TypeU32(state),
+	              Binary(state, spv::OpIMul, TypeU32(state), pass,
+	                     ConstantU32(state, state.lane_count)),
+	              ConstantU32(state, state.lane_half));
 }
 
 void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -279,11 +292,19 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// The copy-out reads the lanes of each pass in turn; EmitLocalInvocationIndex reads the pass.
+static void SelectMeshPass(EmitterState& state, uint32_t pass) {
+	if (state.mesh_pass_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.mesh_pass_variable, ConstantU32(state, pass));
+	}
+}
+
 void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.builder.AllocateId());
 	state.lane_half = 0;
+	SelectMeshPass(state, 0);
 	if (state.mesh_zero_position_mask != 0) {
 		// Cleared before the guest code: the barrier after it orders the clear before the marks.
 		const auto first = state.builder.AllocateId();
@@ -299,8 +320,25 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			}
 		});
 	}
-	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
-	                          state.mesh_guest_func);
+	if (state.mesh_segment_funcs.empty()) {
+		state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
+		                          state.mesh_guest_func);
+	} else {
+		// Every pass runs a segment before any pass runs the next: the guest barrier between
+		// them then orders the same accesses as on hardware, where all waves run at once.
+		for (size_t segment = 0; segment < state.mesh_segment_funcs.size(); segment++) {
+			if (segment != 0) {
+				EmitBarrier(state);
+			}
+			for (uint32_t pass = 0; pass < state.mesh_passes; pass++) {
+				state.builder.AddFunction(spv::OpStore, state.mesh_pass_variable,
+				                          ConstantU32(state, pass));
+				state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state),
+				                          state.builder.AllocateId(),
+				                          state.mesh_segment_funcs[segment]);
+			}
+		}
+	}
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
 	auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
@@ -320,7 +358,9 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	}
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
-	for (uint32_t half = 0; half < state.lane_count; half++) {
+	for (uint32_t slot = 0; slot < state.lane_count * state.mesh_passes; slot++) {
+		const auto half = slot % state.lane_count;
+		SelectMeshPass(state, slot / state.lane_count);
 		state.lane_half      = half;
 		const auto index     = EmitLocalInvocationIndex(state);
 		const auto is_vertex = state.builder.AllocateId();
@@ -333,7 +373,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				const auto type  = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
-				             ConstantU32(state, half));
+				             ConstantU32(state, slot));
 				uint32_t pointer;
 				if (output.kind == IR::StageOutputKind::ClipDistance ||
 				    output.kind == IR::StageOutputKind::CullDistance) {
@@ -356,15 +396,16 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		// Primitives test the marks of vertices that other invocations stored.
 		EmitBarrier(state);
 	}
-	for (uint32_t half = 0; half < state.lane_count; half++) {
-		state.lane_half         = half;
+	for (uint32_t slot = 0; slot < state.lane_count * state.mesh_passes; slot++) {
+		SelectMeshPass(state, slot / state.lane_count);
+		state.lane_half         = slot % state.lane_count;
 		const auto index        = EmitLocalInvocationIndex(state);
 		const auto is_primitive = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_primitive, index,
 		                          primitives);
 		EmitIfCondition(state, is_primitive, [&] {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
-			                             TypeU32(state), ConstantU32(state, half));
+			                             TypeU32(state), ConstantU32(state, slot));
 			// Three 10-bit fields at bits 0, 10 and 20; the top bit of each is that vertex's edge
 			// flag (the GS passthrough VGPR {edge 2, offset 2, edge 1, offset 1, edge 0, offset 0}
 			// is exported as is) and a subgroup has at most 256 vertices, so the index is the low

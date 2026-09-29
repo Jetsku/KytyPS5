@@ -1304,6 +1304,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		return skipped;
 	}
 	IR::EliminateDeadCode(ir.blocks);
+	// A subgroup larger than a host mesh workgroup runs in passes, cut at its barriers.
+	if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr &&
+	    options.input_info.vertex->mesh.passes > 1u) {
+		if (const auto* reason = Spirv::MeshPassesUnsupported(ir); reason != nullptr) {
+			// Skipped like the draws of a program that gives up, logged once per shader.
+			NoteSkippedProgram(options, 0, reason);
+			TranslateResult skipped;
+			skipped.skip_dispatch = true;
+			skipped.skip_reason   = "mesh passes cannot cut the program at its barriers";
+			return skipped;
+		}
+	}
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

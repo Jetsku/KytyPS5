@@ -6871,16 +6871,15 @@ void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vert
 	// group offset, so ExecutePreparedDraw can split a draw with more groups along X.
 	mesh.split_groups =
 	    limits.maxMeshWorkGroupCount[0] < limits.maxMeshWorkGroupTotalCount ? 1u : 0u;
-	const auto  logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-	const auto  host_threads    = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-	                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-	if (host_threads > limits.maxMeshWorkGroupInvocations ||
-	    host_threads > limits.maxMeshWorkGroupSize[0] ||
-	    mesh.max_vertices > limits.maxMeshOutputVertices ||
+	// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its waves in
+	// passes (Senaxx a1c2a88a9; EmitMeshEntryPoint).
+	mesh.passes = mesh.PassesFor(
+	    std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
+	if (mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
 	    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 	    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
 		EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-		     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+		     mesh.HostThreads(), mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
 	}
 }
 

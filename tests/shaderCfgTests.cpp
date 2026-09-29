@@ -10827,6 +10827,77 @@ void TestMeshIndirectParams() {
   CheckMeshIndirectParams(indexed, true, true);
 }
 
+// Eight wave32 waves (256 threads) are twice NVIDIA's mesh workgroup limit: the subgroup runs in
+// two passes of 128 invocations, cut at its barrier, and the vertex index it computes before the
+// barrier reaches the export after it through a per-pass Private array.
+void TestMeshPassesAcrossBarrier() {
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t code[] = {
+      EncodeSMovB32(12, 255), 0x1003u,              // 3 vertices, 1 primitive
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x06, 1, 256 + 5),                // v1 = float(v5), the vertex index
+      EncodeSopp(0x0a),                            // s_barrier
+      EncodeVop1(0x01, 0, 128),                    // v0 = 0
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(1, 1, 1, 1),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kPointList);
+  mesh.wave_size = 32;
+  mesh.host_subgroup_size = 32;
+  mesh.threads_num[0] = 256;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 128;
+  mesh.primitives_per_group = 1;
+  mesh.vertices_per_group = 1;
+  mesh.max_vertices = 128;
+  mesh.max_primitives = 256;
+  mesh.passes = mesh.PassesFor(128);
+  Check(mesh.passes == 2, "a 256-thread wave32 subgroup does not take two passes of 128");
+  std::array<uint32_t, 14> user_data{};
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = 32;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  const auto result =
+      RecompileForTest(code, options, nullptr, nullptr, PushData::MeshDrawDwordCount);
+  // Validation also rejects a value one segment function uses from another.
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto count = [&](std::string_view text) {
+    size_t found = 0;
+    for (auto at = source.find(text); at != std::string::npos; at = source.find(text, at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  Check(source.find("LocalSize 128 1 1") != std::string::npos,
+        "a two-pass mesh workgroup is not 128 invocations");
+  Check(count("OpFunctionCall %void") == 4,
+        "each of the two segments is not called once per pass");
+  // The pass, the position and primitive lanes, and the vertex index crossing the barrier.
+  Check(count("OpVariable %_ptr_Private_") >= 4,
+        "no value crosses the barrier in a Private array");
+
+  // A barrier that a branch can skip cannot be cut: the shader gives up instead.
+  const uint32_t nested[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeSopc(0x06, 0, 128), // s_cmp_eq_u32 s0, 0 (user data)
+      EncodeSopp(0x05, 1),      // s_cbranch_scc1 over the barrier
+      EncodeSopp(0x0a),
+      EncodeVop1(0x01, 0, 128),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  Check(ShaderRecompiler::TranslateProgram(nested, options).skip_dispatch,
+        "a barrier inside a branch did not stop the mesh passes");
+}
+
 void TestMergedShaderUserDataSnapshot() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -16126,6 +16197,7 @@ int main(int argc, char **argv) {
   TestMeshIndirectParams();
   TestGeometryOutputGuard();
   TestReadOnlyBuffers();
+  TestMeshPassesAcrossBarrier();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

@@ -620,6 +620,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	if (program.stage != ShaderType::Compute) {
 		NoteGraphicsAddTid(program, state.lane_count, state.wave_clusters);
 	}
+	if (program.stage == ShaderType::Mesh) {
+		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
