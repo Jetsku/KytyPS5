@@ -44797,6 +44797,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
+#include "GuestSyncTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -45446,6 +45447,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-range-memo-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferRangeMemo();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-sync-only") == 0) {
+    VulkanHarness vulkan;
+    GuestSyncTests::CheckBdaPacketBoundaries(vulkan);
+    GuestSyncTests::CheckReleaseWait(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-epoch-only") == 0) {

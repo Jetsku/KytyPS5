@@ -377,13 +377,14 @@ jobs:
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
               audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+              tile_hardware_reference_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation|tile_hardware_reference)$'
 
       - name: Install
         shell: bash

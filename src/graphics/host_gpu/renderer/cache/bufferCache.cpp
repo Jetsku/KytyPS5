@@ -300,7 +300,7 @@ int RelaxedVerifyMode() {
 // window loses GPU ownership, so a smaller window downloads fewer bytes per fault but makes a
 // CPU writer walking a larger GPU-written range drain the GPU once per window instead.
 uint64_t WriteFaultWindow() {
-	static const uint64_t window = [] {
+	static const uint64_t window = []() -> uint64_t {
 		constexpr uint64_t Default = 512 * 1024;
 		const auto*        value   = std::getenv("KYTY_WRITE_FAULT_WINDOW_KB");
 		if (value == nullptr) {

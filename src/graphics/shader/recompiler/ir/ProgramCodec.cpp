@@ -932,7 +932,7 @@ public:
 			}
 			source.dword_count = r.U32();
 			if (r.Bool()) {
-				auto& image           = source.indirect_image.emplace();
+				auto& image           = source.indirect_image.emplace(DescriptorSource::IndirectImage {});
 				image.material_source = r.U32();
 				image.table_source    = r.U32();
 				image.selector_stride = r.U32();

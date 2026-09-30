@@ -11,6 +11,8 @@ LIB_VERSION("Graphics5", 1, "Graphics5", 1, 1);
 
 namespace Gen5 = Graphics::Gen5;
 
+// A handler's name is sce<name> of its NID, except the entries tools/check_nid_labels.py lists as
+// known exceptions (Unknown*, descriptive labels and second NIDs of a handler).
 LIB_DEFINE(InitAgcDriver_1) {
 	PRINT_NAME_ENABLE(true);
 

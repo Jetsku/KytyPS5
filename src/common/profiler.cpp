@@ -915,68 +915,79 @@ struct LoadingLogCloser {
 };
 using LoadingLog = std::unique_ptr<std::FILE, LoadingLogCloser>;
 
-LoadingLog OpenLoadingLog(bool apr = false) {
+LoadingLog CreateLoadingLog(bool apr) {
 	const auto* setting = std::getenv("KYTY_LOADING_LOG");
 	if (setting == nullptr || *setting == '\0') return {};
-	try {
-		auto path = std::filesystem::u8path(setting);
-		if (!path.is_absolute()) {
-			::printf("Loading diagnostics CSV requires a new absolute path; log disabled\n");
-			return {};
-		}
-		// A launcher can start more than one emulator with the same inherited
-		// requested path. Give each process its own destination without replacing
-		// an earlier capture; the timestamp also distinguishes reused process IDs.
-		static const auto startup_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-		    std::chrono::system_clock::now().time_since_epoch()).count();
+	auto path = Common::PathFromUtf8(setting);
+	if (!path.is_absolute()) {
+		::printf("Loading diagnostics CSV requires a new absolute path; log disabled\n");
+		return {};
+	}
+	// A launcher can start more than one emulator with the same inherited
+	// requested path. Give each process its own destination without replacing
+	// an earlier capture; the timestamp also distinguishes reused process IDs.
+	static const auto startup_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	    std::chrono::system_clock::now().time_since_epoch()).count();
 #ifdef _WIN32
-		const auto process_id = _getpid();
+	const auto process_id = _getpid();
 #else
-		const auto process_id = ::getpid();
+	const auto process_id = ::getpid();
 #endif
-		auto filename = path.stem();
-		if (apr) filename += ".apr-submissions";
-		filename += ".pid-" + std::to_string(process_id) + ".start-" + std::to_string(startup_ns);
-		filename += path.extension();
-		path = path.parent_path() / filename;
-		::printf("Loading %s CSV path: %s\n", apr ? "APR submissions" : "diagnostics",
-		         Common::PathToString(path).c_str());
-		std::FILE* handle = nullptr;
+	auto filename = path.stem();
+	if (apr) filename += ".apr-submissions";
+	filename += ".pid-" + std::to_string(process_id) + ".start-" + std::to_string(startup_ns);
+	filename += path.extension();
+	path = path.parent_path() / filename;
+	::printf("Loading %s CSV path: %s\n", apr ? "APR submissions" : "diagnostics",
+	         Common::PathToString(path).c_str());
+	std::FILE* handle = nullptr;
 #ifdef _WIN32
-		// Exclusive creation preserves earlier captures; allow readers while this
-		// publisher writes, so loading progress can be inspected during a stall.
-		int descriptor = -1;
-		if (_wsopen_s(&descriptor, path.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_TEXT,
-		              _SH_DENYWR, _S_IREAD | _S_IWRITE) == 0) {
-			handle = _wfdopen(descriptor, L"w");
-			if (handle == nullptr) _close(descriptor);
-		}
+	// Exclusive creation preserves earlier captures; allow readers while this
+	// publisher writes, so loading progress can be inspected during a stall.
+	int descriptor = -1;
+	if (_wsopen_s(&descriptor, path.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_TEXT,
+	              _SH_DENYWR, _S_IREAD | _S_IWRITE) == 0) {
+		handle = _wfdopen(descriptor, L"w");
+		if (handle == nullptr) _close(descriptor);
+	}
 #else
-		handle = std::fopen(path.c_str(), "wx");
+	handle = std::fopen(path.c_str(), "wx");
 #endif
-		LoadingLog log(handle);
-		if (!log) {
-			::printf("Loading diagnostics CSV could not be opened; log disabled\n");
-			return {};
-		}
-		if (apr) {
-			std::fputs(kLoadingAprHeader, log.get());
-			std::fflush(log.get());
-			return log;
-		}
-		std::fprintf(log.get(), "elapsed_ns");
-		for (const auto* name: kLoadingEventNames) std::fprintf(log.get(), ",%s", name);
-		for (const auto& names: kLoadingOperationNames) {
-			std::fprintf(log.get(), ",%s,%s,%s,%s", names.started, names.completed,
-			             names.in_flight, names.nanoseconds);
-		}
-		std::fprintf(log.get(), ",Loading.CompletedFlips.Cumulative\n");
+	LoadingLog log(handle);
+	if (!log) {
+		::printf("Loading diagnostics CSV could not be opened; log disabled\n");
+		return {};
+	}
+	if (apr) {
+		std::fputs(kLoadingAprHeader, log.get());
 		std::fflush(log.get());
 		return log;
+	}
+	std::fprintf(log.get(), "elapsed_ns");
+	for (const auto* name: kLoadingEventNames) std::fprintf(log.get(), ",%s", name);
+	for (const auto& names: kLoadingOperationNames) {
+		std::fprintf(log.get(), ",%s,%s,%s,%s", names.started, names.completed,
+		             names.in_flight, names.nanoseconds);
+	}
+	std::fprintf(log.get(), ",Loading.CompletedFlips.Cumulative\n");
+	std::fflush(log.get());
+	return log;
+}
+
+// Path conversion and filesystem calls report errors by exception where the build enables
+// them (clang-cl /EHsc on Windows). The Clang/GCC builds use -fno-exceptions, where a try
+// does not compile and such a failure terminates as it does elsewhere in those builds.
+LoadingLog OpenLoadingLog(bool apr = false) {
+#if defined(__cpp_exceptions)
+	try {
+		return CreateLoadingLog(apr);
 	} catch (const std::exception&) {
 		::printf("Loading diagnostics CSV path could not be used; log disabled\n");
 		return {};
 	}
+#else
+	return CreateLoadingLog(apr);
+#endif
 }
 
 void PublishLoadingAprSubmissions(std::FILE* log) {
@@ -1438,6 +1449,34 @@ void ScopedLoadingOperation::End() {
 	totals.in_flight.fetch_sub(1, std::memory_order_relaxed);
 }
 
+namespace {
+
+void StartLoadingPublisher() {
+	g_loading_publisher = std::jthread([](std::stop_token stop) {
+		tracy::SetThreadName("Loading diagnostics");
+		const auto start = FrameWaitClockNs();
+		auto log = OpenLoadingLog();
+		auto apr_log = OpenLoadingLog(true);
+		uint32_t log_rows = 0;
+		constexpr uint32_t max_log_rows = 7200;
+		std::unique_lock lock(g_loading_publish_mutex);
+		while (!stop.stop_requested()) {
+			const bool write_log = log != nullptr && std::ferror(log.get()) == 0 &&
+			                       log_rows < max_log_rows;
+			PublishLoadingProgress(FrameWaitClockNs() - start, write_log ? log.get() : nullptr);
+			PublishLoadingAprSubmissions(apr_log.get());
+			if (write_log && ++log_rows == max_log_rows) log.reset();
+			g_loading_publish_condition.wait_for(lock, stop, std::chrono::seconds(1),
+			                                     [] { return false; });
+		}
+		PublishLoadingAprSubmissions(apr_log.get());
+	});
+	::printf("Tracy loading progress diagnostics enabled (KYTY_PROFILE_LOADING=1); "
+	         "independent one-second cumulative snapshots\n");
+}
+
+} // namespace
+
 void Initialize() {
 	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
 		tracy::StartupProfiler();
@@ -1485,31 +1524,17 @@ void Initialize() {
 	Detail::g_event_sink.store(Detail::CurrentEventSink(), std::memory_order_relaxed);
 	HangTrace::Initialize();
 	if (LoadingEnabled() && tracy::ProfilerAvailable() && !g_loading_publisher.joinable()) {
+		// A thread that cannot start is reported by exception where the build enables them
+		// (clang-cl /EHsc on Windows); see OpenLoadingLog.
+#if defined(__cpp_exceptions)
 		try {
-			g_loading_publisher = std::jthread([](std::stop_token stop) {
-				tracy::SetThreadName("Loading diagnostics");
-				const auto start = FrameWaitClockNs();
-				auto log = OpenLoadingLog();
-				auto apr_log = OpenLoadingLog(true);
-				uint32_t log_rows = 0;
-				constexpr uint32_t max_log_rows = 7200;
-				std::unique_lock lock(g_loading_publish_mutex);
-				while (!stop.stop_requested()) {
-					const bool write_log = log != nullptr && std::ferror(log.get()) == 0 &&
-					                       log_rows < max_log_rows;
-					PublishLoadingProgress(FrameWaitClockNs() - start, write_log ? log.get() : nullptr);
-					PublishLoadingAprSubmissions(apr_log.get());
-					if (write_log && ++log_rows == max_log_rows) log.reset();
-					g_loading_publish_condition.wait_for(lock, stop, std::chrono::seconds(1),
-					                                     [] { return false; });
-				}
-				PublishLoadingAprSubmissions(apr_log.get());
-			});
-			::printf("Tracy loading progress diagnostics enabled (KYTY_PROFILE_LOADING=1); "
-			         "independent one-second cumulative snapshots\n");
+			StartLoadingPublisher();
 		} catch (const std::exception&) {
 			::printf("Loading diagnostics publisher could not start; game startup continues\n");
 		}
+#else
+		StartLoadingPublisher();
+#endif
 	}
 }
 

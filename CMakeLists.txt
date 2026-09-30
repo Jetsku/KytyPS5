@@ -705,6 +705,15 @@ add_executable(binding_path_tests EXCLUDE_FROM_ALL
 target_link_libraries(binding_path_tests common fmt::fmt xxhash Vulkan::Headers)
 target_include_directories(binding_path_tests PRIVATE ${inc_headers})
 
+# Tile addressing (guest_gpu/tile.cpp) against maps and mip fetches measured on PS5 hardware.
+add_executable(tile_hardware_reference_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileHardwareReferenceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+)
+target_link_libraries(tile_hardware_reference_tests common fmt::fmt)
+target_include_directories(tile_hardware_reference_tests PRIVATE ${inc_headers})
+
 # CP recorder command stream (renderer/commandStream.h): ring, encoder, replay and verify mode,
 # without a Vulkan device (KYTY_CP_RECORDER).
 add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
@@ -788,6 +797,7 @@ if(BUILD_TESTING)
 	add_test(NAME host_input_pulse COMMAND $<TARGET_FILE:host_input_pulse_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
+	add_test(NAME tile_hardware_reference COMMAND $<TARGET_FILE:tile_hardware_reference_tests>)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
 	add_test(NAME cp_sequencer COMMAND $<TARGET_FILE:cp_sequencer_tests>)
 	add_test(NAME image_exact_lookup
@@ -909,6 +919,28 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	set_tests_properties(buffer_range_memo_locked_queries PROPERTIES
 		ENVIRONMENT "KYTY_TRACKER_RELAXED_QUERIES=0")
+	# Real PM4 ordering points and RELEASE_MEM/WAIT_REG_MEM64, including the threaded resolver.
+	foreach(lane IN ITEMS direct inline threaded completion)
+		set(guest_sync_seq off)
+		set(guest_sync_recorder 0)
+		set(guest_sync_submission sync)
+		set(guest_sync_label record)
+		if(lane STREQUAL inline)
+			set(guest_sync_seq inline)
+		elseif(lane STREQUAL threaded OR lane STREQUAL completion)
+			set(guest_sync_seq 1)
+			set(guest_sync_recorder 1)
+			set(guest_sync_submission queued)
+		endif()
+		if(lane STREQUAL completion)
+			set(guest_sync_label completion)
+		endif()
+		add_test(NAME guest_sync_${lane}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-sync-only)
+		set_tests_properties(guest_sync_${lane} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "KYTY_SYNC_EPOCH=1;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_SYNC_EPOCH=1;KYTY_BDA_SYNC_EPOCH_VERIFY=0;KYTY_CP_SEQ_VERIFY=0;KYTY_LABEL_MODE=${guest_sync_label};KYTY_CP_RECORDER=${guest_sync_recorder};KYTY_CP_SEQ=${guest_sync_seq};KYTY_SUBMISSION_MODE=${guest_sync_submission}")
+	endforeach()
+
 	# KYTY_BDA_SYNC_EPOCH: default, with incremental synchronization (as the product runs), verify
 	# mode (it needs the fault epoch of incremental synchronization), off.
 	add_test(NAME bda_sync_epoch

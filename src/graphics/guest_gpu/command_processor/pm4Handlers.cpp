@@ -2291,7 +2291,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060 && cmd_id != 0xc0064900);
 
 	cp.ReleaseMem(buffer);
 
