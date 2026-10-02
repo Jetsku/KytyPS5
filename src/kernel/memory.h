@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -115,6 +117,11 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 // the guest unmaps the range it shows whatever that backing then holds. Any thread.
 [[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU fault report (post-mortem, any thread): text saying where the guest's mappings hold 8-byte values
+// whose low 48 bits lie in [low, high], that is, where a faulting address was loaded from
+// (kernel/pointerScan.h). Reads only pages that already have a valid page-table entry; stops after
+// budget_ms.
+std::string ScanGuestMemoryForAddressRange(uint64_t low, uint64_t high, uint32_t budget_ms);
 // TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
 // draw-prep preparation the read is certified by that digest instead of its bytes
 // (DrawPrep::ReadSet::RecordDigest): only for bytes the preparation merely hashes.

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/gpuReadDelegate.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/pointerScan.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -20,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -36,6 +38,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <psapi.h>   // K32QueryWorkingSetEx
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
 #endif
@@ -1314,6 +1317,13 @@ static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t 
                                uint64_t size, uint64_t caller) {
 	return ReadForDrawPrep(recorder, vaddr, data, size, caller) &&
 	       recorder.reads->Record(vaddr, data, size);
+}
+
+std::string ScanGuestMemoryForAddressRange(uint64_t low, uint64_t high, uint32_t budget_ms) {
+	if (g_guest_address_space == nullptr) {
+		return "guest address space is not initialized\n";
+	}
+	return g_guest_address_space->ScanForAddressRange(low, high, std::chrono::milliseconds(budget_ms));
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
