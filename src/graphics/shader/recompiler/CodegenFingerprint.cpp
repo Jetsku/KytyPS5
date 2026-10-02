@@ -20,9 +20,10 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 13 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders. Add a new member
-// to the fingerprint below, then update this size.
-static_assert(sizeof(CodegenOptions) == 56, "CodegenOptions changed: update CodegenFingerprint");
+// Members: 21 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders, dispatcher_cap.
+// Add a new member to the fingerprint below, then update this size (a new bool can fill padding
+// and leave it).
+static_assert(sizeof(CodegenOptions) == 64, "CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -82,6 +83,14 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
+	b.U8(options.movrel_known_zeros ? 1u : 0u);
+	b.U8(options.movrel_switch ? 1u : 0u);
+	b.U8(options.uniform_lane_reads ? 1u : 0u);
+	b.U8(options.short_f32_helpers ? 1u : 0u);
+	b.U8(options.realtime_clock ? 1u : 0u);
+	b.U8(options.dpp_skip_inactive ? 1u : 0u);
+	b.U8(options.lane_reductions ? 1u : 0u);
+	b.U32(options.dispatcher_cap);
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();
@@ -90,6 +99,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(float_controls.denorm_preserve_f64 ? 1u : 0u);
 	b.U8(Spirv::GetHostBufferRobustness().storage_dword_loads_return_zero ? 1u : 0u);
 	b.U8(Spirv::GetHostImageFeatures().min_lod ? 1u : 0u);
+	const auto shader_clock = Spirv::GetHostShaderClock();
+	b.U8(static_cast<uint8_t>(shader_clock.scope));
+	b.U32(static_cast<uint32_t>(shader_clock.shift));
 
 	// Outside the source set: ExtractResourcePlan's flow aliases, and the page constants the
 	// BDA page-table walk bakes into SPIR-V (spirvEmitterMemory.cpp).

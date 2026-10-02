@@ -226,30 +226,102 @@ bool RepinEnabled() {
 	return enabled;
 }
 
+uint64_t ParseLogicalMask(const char* text, bool* valid) {
+	const auto fail = [valid] {
+		if (valid != nullptr) {
+			*valid = false;
+		}
+		return uint64_t {0};
+	};
+	if (valid != nullptr) {
+		*valid = true;
+	}
+	if (text == nullptr || *text == '\0') {
+		return fail();
+	}
+	uint64_t    mask = 0;
+	const char* p    = text;
+	for (;;) {
+		char*      end   = nullptr;
+		const auto first = std::strtoul(p, &end, 10);
+		if (end == p) {
+			return fail();
+		}
+		auto last = first;
+		p         = end;
+		if (*p == '-') {
+			p++;
+			last = std::strtoul(p, &end, 10);
+			if (end == p) {
+				return fail();
+			}
+			p = end;
+		}
+		if (last < first || last > 63) {
+			return fail();
+		}
+		for (auto bit = first; bit <= last; bit++) {
+			mask |= uint64_t {1} << bit;
+		}
+		if (*p == '\0') {
+			return mask;
+		}
+		if (*p != ',') {
+			return fail();
+		}
+		p++;
+	}
+}
+
+uint64_t CpuSetsMask() {
+	static const uint64_t mask = [] {
+		const auto* value = EnvValue("KYTY_CPU_SETS");
+		if (value == nullptr) {
+			return uint64_t {0};
+		}
+		bool       valid  = true;
+		const auto parsed = ParseLogicalMask(value, &valid);
+		if (!valid) {
+			std::printf("KYTY_CPU_SETS must list logical processors 0-63 like 16-31 or 0-7,16-23 "
+			            "(got '%s'): unset\n",
+			            value);
+			std::fflush(stdout);
+		}
+		return parsed;
+	}();
+	return mask;
+}
+
+bool ReassertEnabled() {
+	static const bool enabled = [] {
+		const auto* value = EnvValue("KYTY_CPU_RESERVE_REASSERT");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 namespace {
 
 #if defined(_WIN32)
 
-// The process default CPU sets someone else set before startup (a Process Lasso CPU-set rule), or
-// empty. Read once, before this module replaces them with its own.
-const std::vector<ULONG>& ExternalDefaultCpuSets() {
-	static const std::vector<ULONG> defaults = [] {
-		std::vector<ULONG> ids(256);
-		ULONG              count = 0;
-		if (GetProcessDefaultCpuSets(GetCurrentProcess(), ids.data(),
-		                             static_cast<ULONG>(ids.size()), &count) == 0) {
-			count = 0;
-		}
-		ids.resize(count);
-		return ids;
-	}();
-	return defaults;
+// The process default CPU sets now (sorted CPU set ids; empty: none assigned).
+std::vector<ULONG> ProcessDefaultCpuSets() {
+	std::vector<ULONG> ids(256);
+	ULONG              count = 0;
+	if (GetProcessDefaultCpuSets(GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size()),
+	                             &count) == 0) {
+		count = 0;
+	}
+	ids.resize(count);
+	std::sort(ids.begin(), ids.end());
+	return ids;
 }
 
 // Every CPU set of the system, `allowed` when in the process affinity mask, not allocated to
-// another process, and in the external default CPU sets (if any).
-std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity) {
-	const auto&             external = ExternalDefaultCpuSets();
+// another process, and in the constraint: KYTY_CPU_SETS when set, otherwise the external default
+// CPU sets (if any: those found at startup, or another process's that replaced ours later).
+std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity, const std::vector<ULONG>& external) {
+	const auto              restriction = CpuSetsMask();
 	std::vector<CpuSetInfo> sets;
 	ULONG                   length = 0;
 	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
@@ -280,22 +352,20 @@ std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity) {
 			set.cache            = cpu.LastLevelCacheIndex;
 			set.scheduling_class = cpu.SchedulingClass;
 			const bool ours      = cpu.Allocated == 0 || cpu.AllocatedToTargetProcess != 0;
+			const bool in_constraint =
+			    restriction != 0
+			        ? cpu.LogicalProcessorIndex < 64 &&
+			              ((restriction >> cpu.LogicalProcessorIndex) & 1u) != 0
+			        : external.empty() ||
+			              std::find(external.begin(), external.end(), cpu.Id) != external.end();
 			set.allowed = cpu.Group == 0 && cpu.LogicalProcessorIndex < 64 &&
 			              ((affinity >> cpu.LogicalProcessorIndex) & 1u) != 0 && ours &&
-			              (external.empty() ||
-			               std::find(external.begin(), external.end(), cpu.Id) != external.end());
+			              in_constraint;
 			sets.push_back(set);
 		}
 		offset += info->Size;
 	}
 	return sets;
-}
-
-#else
-
-std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity) {
-	affinity = 0;
-	return {};
 }
 
 #endif
@@ -310,6 +380,12 @@ struct State {
 	// The threads placed on reserved cores (their sets are re-applied when the layout changes).
 	std::array<HANDLE, static_cast<size_t>(ThreadRole::Count)> threads {};
 	bool applied_default = false; // our process default CPU sets are in effect
+	// The constraint without KYTY_CPU_SETS: the default CPU sets found at startup, replaced by
+	// another process's when it replaces ours (KYTY_CPU_RESERVE_REASSERT). Restored when nothing
+	// is reserved.
+	std::vector<ULONG> external;
+	// The process default CPU sets this module applied last (sorted), while applied_default.
+	std::vector<ULONG> applied;
 #endif
 	// ScanThreadAffinities: threads already counted (FrameEvents count each once).
 	std::mutex                   scan_mutex;
@@ -334,6 +410,7 @@ std::array<std::array<std::atomic<uint32_t>, PlacementHistogram::Processors>,
 std::array<std::atomic<uint32_t>, static_cast<size_t>(ThreadRole::Count)> g_on_cp_core {};
 std::atomic<bool>                                                         g_topology_ready {false};
 std::array<std::atomic<uint32_t>, 256>                                    g_core_of {};
+std::atomic<uint32_t>                                                     g_reasserts {0};
 
 void PublishTopology(const std::vector<CpuSetInfo>& sets) {
 	for (auto& core: g_core_of) {
@@ -365,45 +442,87 @@ void ApplyThreadSets(HANDLE thread, const std::vector<uint32_t>& ids) {
 }
 #endif
 
-// State mutex held: computes the layout for the current process mask and applies it.
-void ApplyLayoutLocked(State& state, const char* why) {
+#if defined(_WIN32)
+// The logical processors (group 0) of CPU set ids, by the last CPU set table read.
+uint64_t LogicalMaskOfIds(const State& state, const std::vector<ULONG>& ids) {
+	uint64_t mask = 0;
+	for (const auto& set: state.sets) {
+		if (set.group == 0 && set.logical < 64 &&
+		    std::find(ids.begin(), ids.end(), set.id) != ids.end()) {
+			mask |= uint64_t {1} << set.logical;
+		}
+	}
+	return mask;
+}
+#endif
+
+// State mutex held: computes the layout for the current process mask and constraint and applies
+// it: the process default CPU sets (the general processors of a reservation, or every allowed
+// processor with only KYTY_CPU_SETS) and the reserved threads' selected CPU sets.
+void ApplyLayoutLocked(State& state, const char* why, bool log = true) {
 	uint64_t affinity = 0;
-	state.sets        = ReadCpuSets(affinity);
-	state.affinity    = affinity;
+#if defined(_WIN32)
+	state.sets = ReadCpuSets(affinity, state.external);
+#else
+	state.sets.clear();
+#endif
+	state.affinity = affinity;
 	PublishTopology(state.sets);
-	const auto mode = GetCpuReserveMode();
-	state.layout    = ComputeCpuLayout(state.sets, mode, ForcedCpLogical());
-	if (mode == CpuReserveMode::Off) {
+	const auto mode        = GetCpuReserveMode();
+	const auto restriction = CpuSetsMask();
+	state.layout           = ComputeCpuLayout(state.sets, mode, ForcedCpLogical());
+	if (mode == CpuReserveMode::Off && restriction == 0) {
 		return;
 	}
 #if defined(_WIN32)
+	std::vector<ULONG> wanted;
 	if (state.layout.reserved) {
-		std::vector<ULONG> general(state.layout.general_ids.begin(),
-		                           state.layout.general_ids.end());
-		if (SetProcessDefaultCpuSets(GetCurrentProcess(), general.data(),
-		                             static_cast<ULONG>(general.size())) == 0) {
-			state.layout.description =
-			    "SetProcessDefaultCpuSets failed (" + std::to_string(GetLastError()) + ")";
-			state.layout.reserved = false;
+		wanted.assign(state.layout.general_ids.begin(), state.layout.general_ids.end());
+	} else if (restriction != 0) {
+		uint64_t mask = 0;
+		for (const auto& set: state.sets) {
+			if (set.allowed) {
+				wanted.push_back(set.id);
+				mask |= uint64_t {1} << set.logical;
+			}
 		}
+		const auto text = "every thread on logical " + MaskText(mask) + " (KYTY_CPU_SETS)";
+		state.layout.description =
+		    mode == CpuReserveMode::Off ? text : state.layout.description + "; " + text;
 	}
-	if (!state.layout.reserved) {
+	if (!wanted.empty() && SetProcessDefaultCpuSets(GetCurrentProcess(), wanted.data(),
+	                                                static_cast<ULONG>(wanted.size())) == 0) {
+		state.layout.description =
+		    "SetProcessDefaultCpuSets failed (" + std::to_string(GetLastError()) + ")";
+		state.layout.reserved = false;
+		wanted.clear();
+	}
+	if (wanted.empty()) {
 		if (state.applied_default) {
-			// Nothing reserved any more: restore the defaults found at startup.
-			auto external = ExternalDefaultCpuSets();
+			// Nothing applied any more: restore the external defaults.
 			(void)SetProcessDefaultCpuSets(GetCurrentProcess(),
-			                               external.empty() ? nullptr : external.data(),
-			                               static_cast<ULONG>(external.size()));
+			                               state.external.empty() ? nullptr : state.external.data(),
+			                               static_cast<ULONG>(state.external.size()));
 			state.applied_default = false;
 		}
+		state.applied.clear();
 		for (auto thread: state.threads) {
 			ApplyThreadSets(thread, {});
 		}
 	} else {
 		state.applied_default = true;
-		ApplyThreadSets(state.threads[static_cast<size_t>(ThreadRole::Cp)], state.layout.cp_ids);
-		ApplyThreadSets(state.threads[static_cast<size_t>(ThreadRole::Recorder)],
-		                state.layout.recorder_ids);
+		std::sort(wanted.begin(), wanted.end());
+		state.applied = std::move(wanted);
+		if (state.layout.reserved) {
+			ApplyThreadSets(state.threads[static_cast<size_t>(ThreadRole::Cp)],
+			                state.layout.cp_ids);
+			ApplyThreadSets(state.threads[static_cast<size_t>(ThreadRole::Recorder)],
+			                state.layout.recorder_ids);
+		} else {
+			for (auto thread: state.threads) {
+				ApplyThreadSets(thread, {});
+			}
+		}
 	}
 #else
 	state.layout.reserved = false;
@@ -411,15 +530,19 @@ void ApplyLayoutLocked(State& state, const char* why) {
 	g_cp_mask.store(state.layout.reserved ? state.layout.cp_mask : 0, std::memory_order_relaxed);
 	g_recorder_mask.store(state.layout.reserved ? state.layout.recorder_mask : 0,
 	                      std::memory_order_relaxed);
-	std::printf("Kyty CPU placement (KYTY_CPU_RESERVE, %s): process mask %s: %s\n", why,
-	            MaskText(state.affinity).c_str(), state.layout.description.c_str());
-	std::fflush(stdout);
+	if (log) {
+		std::printf("Kyty CPU placement (%s, %s): process mask %s: %s\n",
+		            restriction != 0 ? "KYTY_CPU_RESERVE/KYTY_CPU_SETS" : "KYTY_CPU_RESERVE", why,
+		            MaskText(state.affinity).c_str(), state.layout.description.c_str());
+		std::fflush(stdout);
+	}
 }
 
-// Once a second: the layout against the process mask; every 5 s: the hard-affinity scan.
+// Once a second: the layout against the process mask (and, with KYTY_CPU_RESERVE_REASSERT, the
+// process default CPU sets); every 5 s: the hard-affinity scan.
 void StartMonitor() {
 #if defined(_WIN32)
-	const bool maintain = GetCpuReserveMode() != CpuReserveMode::Off;
+	const bool maintain = GetCpuReserveMode() != CpuReserveMode::Off || CpuSetsMask() != 0;
 	const bool repin    = maintain && RepinEnabled();
 	const bool scan     = repin || PlacementSamplingEnabled();
 	if (!maintain && !scan) {
@@ -450,6 +573,11 @@ void InitCpuPlacement() {
 			return;
 		}
 		state.initialized = true;
+#if defined(_WIN32)
+		// The process default CPU sets someone else set before startup (a Process Lasso CPU-set
+		// rule), or empty.
+		state.external = ProcessDefaultCpuSets();
+#endif
 		ApplyLayoutLocked(state, "startup");
 	}
 	StartMonitor();
@@ -457,7 +585,7 @@ void InitCpuPlacement() {
 
 void MaintainCpuPlacement() {
 #if defined(_WIN32)
-	if (GetCpuReserveMode() == CpuReserveMode::Off) {
+	if (GetCpuReserveMode() == CpuReserveMode::Off && CpuSetsMask() == 0) {
 		return;
 	}
 	DWORD_PTR process_mask = 0;
@@ -467,10 +595,43 @@ void MaintainCpuPlacement() {
 	}
 	auto&           state = GetState();
 	std::lock_guard lock(state.mutex);
-	if (state.initialized && static_cast<uint64_t>(process_mask) != state.affinity) {
-		ApplyLayoutLocked(state, "process affinity changed");
+	if (!state.initialized) {
+		return;
 	}
+	if (static_cast<uint64_t>(process_mask) != state.affinity) {
+		ApplyLayoutLocked(state, "process affinity changed");
+		return;
+	}
+	if (!ReassertEnabled() || !state.applied_default) {
+		return;
+	}
+	// KYTY_CPU_RESERVE_REASSERT: another process replaced the default CPU sets applied here (Process
+	// Lasso's CPU-set rule does so once, shortly after the process starts). Without KYTY_CPU_SETS
+	// its sets become the constraint, then the layout is applied again.
+	auto current = ProcessDefaultCpuSets();
+	if (current == state.applied) {
+		return;
+	}
+	const auto count    = g_reasserts.fetch_add(1, std::memory_order_relaxed) + 1u;
+	const bool log      = count <= 8u || count % 60u == 0u;
+	const auto replaced = LogicalMaskOfIds(state, current);
+	const auto ours     = LogicalMaskOfIds(state, state.applied);
+	if (CpuSetsMask() == 0) {
+		state.external = std::move(current);
+	}
+	if (log) {
+		std::printf("Kyty CPU placement: another process replaced the process default CPU sets "
+		            "(logical %s instead of %s); applying the layout again (re-assert %u, "
+		            "KYTY_CPU_RESERVE_REASSERT)\n",
+		            MaskText(replaced).c_str(), MaskText(ours).c_str(), count);
+		std::fflush(stdout);
+	}
+	ApplyLayoutLocked(state, "re-assert", log);
 #endif
+}
+
+uint32_t PlacementReasserts() {
+	return g_reasserts.load(std::memory_order_relaxed);
 }
 
 void PlaceCurrentThread(ThreadRole role) {

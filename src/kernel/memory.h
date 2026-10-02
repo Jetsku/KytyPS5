@@ -111,6 +111,10 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadBacking whose destination may hold partial bytes when it fails (the caller discards it
+// then): any size through a per-thread mapping record, without the mapping lock (see
+// GuestBackingStore::TryReadBackingDirect). Any thread.
+bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size);
 // The direct-memory backing alias of [vaddr, vaddr + size) when one mapping holds the whole range,
 // or nullptr (not direct memory, or spanning mappings). The alias stays mapped and writable for
 // the process lifetime: reading it never faults, whatever the guest view's protection, and after

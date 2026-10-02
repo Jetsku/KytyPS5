@@ -7,7 +7,10 @@
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <chrono>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <tuple>
 #include <vector>
@@ -19,6 +22,28 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+struct DiagnosticCheckpoint {
+	uint32_t op        = 0;
+	uint64_t submit_id = 0;
+	uint32_t arg0      = 0;
+	uint32_t arg1      = 0;
+	uint32_t arg2      = 0;
+	uint32_t arg3      = 0;
+	uint64_t arg4      = 0;
+	uint64_t sequence  = 0;
+	uint64_t tick = 0;
+	uint64_t vs = 0;
+	uint64_t ps = 0;
+	uint64_t cs = 0;
+};
+
+struct GraphicContext;
+
+[[nodiscard]] const void*
+RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
+[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
+void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -28,10 +53,12 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               precise_occlusion_enabled             = false;
+	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
@@ -55,6 +82,11 @@ struct GraphicContext {
 	// VK_EXT_conditional_rendering, enabled only for KYTY_PREDICATION_MODE=gpu
 	// (renderer/gpuPredication.h).
 	bool                               conditional_rendering_enabled         = false;
+	// KYTY_BDA_PAGETABLE_SPARSE=1: sparseBinding + sparseResidencyBuffer enabled, unbound buffer
+	// ranges read as zero (residencyNonResidentStrict) and queue_family can bind sparse memory.
+	bool                               sparse_residency_buffer_enabled       = false;
+	// KYTY_TEXTURE_SPARSE_RESIDENCY=1: sparseBinding + sparseResidencyImage2D enabled, strict.
+	bool                               sparse_residency_image_enabled        = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
@@ -132,21 +164,45 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// KYTY_VRAM_STATS report lines (vramStats.h): VMA heaps, allocation kinds, native image pool.
+	void                   ReportVramStats();
+	// KYTY_NATIVE_IMAGE_POOL_IDLE_MS (vma.cpp): destroys retained native images unused that long
+	// (GPU thread, from the garbage collector; rate-limited).
+	void                   TrimRetiredImages();
+	// KYTY_TEXTURE_SPARSE_RESIDENCY (sparse_residency_image_enabled): creates `info` as a sparse
+	// residency image with memory bound behind levels >= first_level only (a single-layer,
+	// single-sample 2D image whose format, usage and flags support sparse residency; false and
+	// nothing created otherwise). BindSparseImageLevels binds memory behind levels >= first_level
+	// that have none yet. Both wait until the binding is done: unbound levels read as zero
+	// (residencyNonResidentStrict) and writes to them are discarded, so only levels a view can
+	// sample need memory. DeleteImage frees the memory.
+	[[nodiscard]] bool     CreateSparseImage(const vk::ImageCreateInfo& info, uint32_t first_level,
+	                                         VulkanImage& image);
+	void                   BindSparseImageLevels(VulkanImage& image, uint32_t first_level);
+	// The device memory behind an image: its allocation's size, or the bound bytes of a sparse one.
+	[[nodiscard]] uint64_t NativeImageBytes(const VulkanImage& image) const;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	[[nodiscard]] bool SparseImageSupported(const vk::ImageCreateInfo& info);
+	std::mutex                                 m_sparse_mutex;
+	vk::Fence                                  m_sparse_fence = nullptr;
+	std::map<std::tuple<vk::Format, vk::ImageUsageFlags, vk::ImageCreateFlags>, bool>
+	                                           m_sparse_support;
 	struct RetiredNativeImage {
 		vk::ImageCreateInfo create;
 		vk::Image image;
 		VmaAllocation allocation;
 		uint64_t bytes;
+		std::chrono::steady_clock::time_point retired;
 	};
 	void ClearRetiredImages();
 	std::mutex m_retired_image_mutex;
 	std::vector<RetiredNativeImage> m_retired_images;
 	uint64_t m_retired_image_bytes = 0;
+	std::chrono::steady_clock::time_point m_retired_trim_next {};
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -182,6 +238,20 @@ struct VulkanImage {
 	// Guest contents, views and layout tracking are never retained across owners.
 	bool                         pool_eligible = false;
 	vk::ImageCreateInfo          pool_create_info {};
+	// KYTY_TEXTURE_SPARSE_RESIDENCY: a sparse residency image (allocation is null) and its memory.
+	struct SparseState {
+		uint32_t                   first_bound      = UINT32_MAX; // levels >= this have memory
+		uint32_t                   tail_first       = UINT32_MAX; // imageMipTailFirstLod
+		uint64_t                   tail_offset      = 0;
+		uint64_t                   tail_size        = 0;
+		bool                       tail_bound       = false;
+		vk::Extent3D               granularity      = {1, 1, 1};
+		uint64_t                   block_size       = 0;
+		uint32_t                   memory_type_bits = 0;
+		uint64_t                   bytes            = 0;
+		std::vector<VmaAllocation> allocations;
+	};
+	std::unique_ptr<SparseState> sparse;
 };
 
 

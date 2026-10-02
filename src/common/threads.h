@@ -32,6 +32,12 @@ bool YieldToReadyThread();
 // sleep would, then pauses until `micros` have passed since the call. Never returns early.
 void YieldAndPauseMicro(uint32_t micros);
 
+// KYTY_SHORT_SLEEP_BLOCK=1 (default off; upstream KytyPS5 6f24b031f): short sleeps block on the
+// high-resolution timer instead of spinning (Thread::SleepMicro/SleepNano up to 50 us) and guest
+// sleeps of at most 1 us no longer yield-and-pause (kernel/pthread.cpp). Frees the CPUs that
+// sleeping guest threads spin on, but a short sleep then lasts as long as the timer's resolution.
+[[nodiscard]] bool ShortSleepsBlock();
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

@@ -39,9 +39,14 @@ class Buffer {
 public:
 	// transfer_shared: concurrent sharing with the upload DMA transfer queue family
 	// (GraphicContext::transfer_queue_family), when the device has that queue.
+	// host_cached: mapped cached host memory (CPU writes stay in the CPU caches, the GPU reads
+	// them over the bus) instead of what `usage` picks (KYTY_STREAM_RING_HOST, BufferCache).
+	// sparse_residency: a sparse residency buffer without memory (DeviceLocal only, needs
+	// GraphicContext::sparse_residency_buffer_enabled); its owner binds memory to the ranges it
+	// uses, the others read as zero (KYTY_BDA_PAGETABLE_SPARSE, BufferCache).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
-	       bool transfer_shared = false);
+	       bool transfer_shared = false, bool host_cached = false, bool sparse_residency = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -49,6 +54,7 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool               IsSparse() const noexcept { return m_sparse; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	// GPU-thread command-recording revision, including writes that have not executed yet.
@@ -78,6 +84,8 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// KYTY_BUFFER_LRU_SKIP=1 (BufferCache::TouchBuffer): the tick the LRU item last received.
+	mutable uint64_t lru_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -98,7 +106,12 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_sparse   = false;
 	std::span<uint8_t>            m_mapped;
+	// KYTY_VRAM_STATS (vramStats.h): what this buffer was counted as (0 bytes: not counted).
+	uint64_t                      m_vram_bytes        = 0;
+	uint8_t                       m_vram_kind         = 0;
+	bool                          m_vram_device_local = false;
 };
 
 class StreamBuffer final: public Buffer {
@@ -107,7 +120,7 @@ public:
 	// shaders reach by device address).
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	             uint64_t size, bool transfer_shared = false,
-	             vk::BufferUsageFlags extra_flags = {});
+	             vk::BufferUsageFlags extra_flags = {}, bool host_cached = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

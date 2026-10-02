@@ -41,6 +41,27 @@ struct HostImageFeatures {
 void              SetHostImageFeatures(const HostImageFeatures& features);
 HostImageFeatures GetHostImageFeatures();
 
+// The clock S_MEMREALTIME reads (VK_KHR_shader_clock, set once by the device layer). S_MEMREALTIME
+// is a free-running 64-bit counter at 100 MHz. The emitter reads OpReadClockKHR at this scope and
+// shifts the value toward 100 MHz: right by `shift` bits when it is positive, left when negative.
+// Device scope (shaderDeviceClock) is the device-wide clock; Subgroup scope (shaderSubgroupClock)
+// is the fallback; None (no shader clock) keeps the placeholder UINT64_MAX.
+enum class HostClockScope : uint8_t { None, Subgroup, Device };
+
+struct HostShaderClock {
+	HostClockScope scope = HostClockScope::None;
+	int32_t        shift = 0;
+};
+
+void            SetHostShaderClock(const HostShaderClock& clock);
+HostShaderClock GetHostShaderClock();
+
+// Vulkan reports no rate for the shader clock. The device clock counts at the rate of timestamp
+// queries on NVIDIA (1 GHz) and AMD (the 100 MHz reference clock), and Intel's subgroup clock is
+// its timestamp counter, so the shift is taken from timestampPeriod: the one that brings the rate
+// into [66.7, 133.3) MHz (3 at 1 GHz, 0 at 100 MHz, -2 at 19.2 MHz), between -8 and 8.
+[[nodiscard]] int32_t RealtimeClockShift(double timestamp_period_ns);
+
 // mip_stats_records=false emits the plain variant of a GET_LOD_STATS-instrumented pixel shader:
 // the same bindings and code, without the per-sample feedback (and so without its storage-buffer
 // atomics, which force depth/stencil tests after the shader for a shader that can discard).

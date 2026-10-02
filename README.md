@@ -1,16 +1,17 @@
 # KytyPS5 experimental
 
-The main branch contains the U59 renderer and the validated Demon's Souls
-shader and compatibility changes. The U59 release remains the last packaged
-build; merging source changes does not certify a new release or a 60 FPS result.
+The main branch contains the U59 renderer, the validated Demon's Souls shader and
+compatibility changes, and the U59 integration work: command-processor and VRAM
+improvements, profile-guided optimization, and upstream's newer changes. No 60 FPS
+result is claimed.
 
 - [U59 feature changes and performance evidence](docs/CHANGES-U59.md)
 - [Fork commit and file catalog through U59](docs/CHANGE-CATALOG.md)
-- [U59 build and launch guide](docs/EXPERIMENTAL.md)
+- [Current release: what is new, launch and build guide](docs/EXPERIMENTAL.md)
 
 This fork retains sanitized development history and upstream attribution.
-The badges and general project description below refer to upstream. The
-packaged Windows U59 build is available under Releases.
+The badges and general project description below refer to upstream. Packaged
+Windows builds are available under Releases.
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -18,6 +19,10 @@ packaged Windows U59 build is available under Releases.
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+
+**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes and ongoing development.
+
+**[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
@@ -80,8 +85,8 @@ or graphical glitches, so please include the version you tested when reporting a
       <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
+      <strong>UFC 5</strong><br>
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="UFC 5 running in KytyPS5">
     </td>
   </tr>
 </table>
@@ -91,7 +96,7 @@ or graphical glitches, so please include the version you tested when reporting a
 ## Contributing
 
 Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
+issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
 
 Code contributions should be focused, build successfully on the platforms they touch, and include
 relevant tests where practical. Windows is the primary target, so a change that alters shared code
@@ -144,7 +149,7 @@ the Vulkan/SPIR-V validation rules.
 ### Build requirements (Windows)
 
 - Git
-- CMake 3.12 or newer
+- CMake 3.22.1 or newer
 - Ninja
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
@@ -190,7 +195,7 @@ sudo apt-get install --no-install-recommends \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
+Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
 (`qt6-base-dev`) or an official Qt installation.
 
 ```bash
@@ -208,6 +213,18 @@ The install step copies the Qt libraries and plugins next to the binaries, so
 `_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
 from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
 release, including VP9 and WebM support. System FFmpeg packages are not required.
+
+To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
+
+```bash
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DKYTY_BUILD_LAUNCHER=OFF
+
+cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
+```
 
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.
@@ -232,9 +249,10 @@ cmake --build _Build/linux --target launcher --parallel
 cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
-The configure step downloads the FFmpeg prebuilts and the `xbyak`/`zydis` sources, so it needs
-network access; a fully sandboxed `nix build` would require vendoring those inputs. A Vulkan 1.3
-driver must be available at runtime (on NixOS, `hardware.graphics.enable = true`).
+The configure step downloads the FFmpeg prebuilts and the `xbyak`, `zydis`, `zstd`, and ZArchive
+sources, so it needs network access; a fully sandboxed `nix build` would require vendoring those
+inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
+`hardware.graphics.enable = true`).
 
 ### Building on macOS
 
@@ -328,17 +346,21 @@ open _Build/macos/install/KytyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
-from the game list.
+folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
+whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
+ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
 
-The emulator can also be started directly with a legally obtained game directory or ELF file:
+The emulator can also be started directly with a legally obtained game directory, ELF file, or
+ZArchive dump:
 
 ```powershell
 .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
 ```
 
 ```bash
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
 ```
 
 On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no

@@ -62,7 +62,7 @@ static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: updat
 static_assert(sizeof(ResourcePlan) == 704, "IR::ResourcePlan changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
-static_assert(sizeof(ResourceSpecialization::Buffer) == 12,
+static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
               "IR::ResourceSpecialization::Buffer changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Image) == 36,
               "IR::ResourceSpecialization::Image changed: update ProgramCodec");
@@ -419,6 +419,7 @@ void Write(CodecWriter& w, const SamplerResource& v) {
 	w.U32(v.first_use_pc);
 	w.Bool(v.force_point_filtering);
 	w.Bool(v.depth_compare);
+	w.Bool(v.integer_border);
 }
 
 void Read(CodecReader& r, SamplerResource& v) {
@@ -426,6 +427,7 @@ void Read(CodecReader& r, SamplerResource& v) {
 	v.first_use_pc          = r.U32();
 	v.force_point_filtering = r.Bool();
 	v.depth_compare         = r.Bool();
+	v.integer_border        = r.Bool();
 }
 
 void Write(CodecWriter& w, const SampledResourcePair& v) {
@@ -518,12 +520,14 @@ void Write(CodecWriter& w, const ResourceSpecialization::Buffer& v) {
 	w.U32(v.packed_stride);
 	w.U32(EnumBits(v.descriptor_format));
 	w.U32(v.descriptor_swizzle);
+	w.Bool(v.zero_stride_oob);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Buffer& v) {
 	v.packed_stride      = r.U32();
 	v.descriptor_format  = EnumFrom<Prospero::BufferFormat>(r.U32());
 	v.descriptor_swizzle = r.U32();
+	v.zero_stride_oob    = r.Bool();
 }
 
 void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {

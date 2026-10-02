@@ -528,43 +528,30 @@ void TestInvariantIndirectImageMaterialization() {
             malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
-  auto immediate_fixture = MakeIndirectImageFixture(false, 4u);
-  immediate_fixture->PlanAndTrack();
-  auto immediate_plan = ExtractResourcePlan(immediate_fixture->program);
-  Check(immediate_fixture->program.resource_tracking_complete &&
-            std::ranges::any_of(immediate_plan.descriptor_sources,
-                                [](const DescriptorSource &source) {
-                                  return source.indirect_image.has_value() &&
-                                         source.indirect_image->selector_immediate == 4u;
-                                }),
-        "material key immediate was not carried into the indirect image source");
-  LinearTestMemory immediate_memory;
-  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
-    immediate_memory.words[(0x2000u - immediate_memory.base) / 4u + dword] =
-        image_descriptor[dword];
-    immediate_memory.words[(0x2020u - immediate_memory.base) / 4u + dword] =
-        image_descriptor[dword];
-  }
-  immediate_memory.words[(0x2020u - immediate_memory.base) / 4u] ^= 1u;
-  SrtRuntime immediate_runtime{.user_data = user_data,
-                               .userdata = &immediate_memory,
-                               .read_specialization_memory = ReadLinearTestMemory};
-  immediate_memory.words[(0x1000u - immediate_memory.base + 36u) / 4u] = 1u;
-  ResourceSnapshot unshifted_snapshot;
-  ResourceSpecialization unshifted_specialization;
-  Check(MaterializeResources(immediate_plan, immediate_runtime, unshifted_snapshot,
-                             unshifted_specialization) &&
-            unshifted_snapshot.images.size() == 1,
-        "material key immediate was applied to the wrapped dynamic offset");
-  immediate_memory.words[(0x1000u - immediate_memory.base + 36u) / 4u] = 0u;
-  immediate_memory.words[(0x1000u - immediate_memory.base + 40u) / 4u] = 1u;
-  ResourceSnapshot shifted_snapshot;
-  ResourceSpecialization shifted_specialization;
-  Check(MaterializeResources(immediate_plan, immediate_runtime, shifted_snapshot,
-                             shifted_specialization) &&
-            shifted_snapshot.images.size() == 2 &&
-            shifted_specialization.images.size() == 2,
-        "material key immediate did not select the record field after the wrapped offset");
+  // A record read's own immediate offset (S_BUFFER_LOAD offset=4 with a register soffset) adds to
+  // the selector offset when it is dword aligned; an unaligned one stays outside the proof.
+  auto unaligned_immediate = MakeIndirectImageFixture(false, 3u);
+  BuildSrtPlan(unaligned_immediate->program);
+  CheckFatal([&] { TrackResources(unaligned_immediate->program); },
+             "not a valid runtime value",
+             "unaligned scalar immediate entered the invariant image proof");
+  Check(!unaligned_immediate->program.resource_tracking_complete,
+        "unaligned scalar immediate entered the invariant image proof");
+
+  auto record_immediate = MakeIndirectImageFixture(false, 4u);
+  record_immediate->PlanAndTrack();
+  Check(record_immediate->program.resource_tracking_complete &&
+            record_immediate->program.info.images.size() == 1u,
+        "an aligned record immediate was rejected");
+  const auto record_source = record_immediate->program.info.images[0].source;
+  Check(record_source < record_immediate->program.descriptor_sources.size() &&
+            record_immediate->program.descriptor_sources[record_source]
+                .indirect_image.has_value() &&
+            record_immediate->program.descriptor_sources[record_source]
+                    .indirect_image->selector_offset == 8u &&
+            record_immediate->program.descriptor_sources[record_source]
+                    .indirect_image->selector_stride == 224u,
+        "the record immediate was not folded into the selector offset");
 }
 
 void TestGuardedDirectImageTable() {
@@ -3020,6 +3007,31 @@ void TestGraphicsPushConstantLayout() {
 }
 
 void TestResourceLimitIsTransactional() {
+  Fixture accepted;
+  MemoryInfo accepted_memory;
+  accepted_memory.kind = ResourceKind::Buffer;
+  for (uint32_t index = 0; index < ShaderInfo::MaxBuffers; index++) {
+    const auto handle = accepted.Buffer(
+        {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
+        index * 4u);
+    accepted.Emit(ValueOpcode::LoadBufferU32,
+                  {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+                  accepted.AddMemory(accepted_memory, index * 4u));
+  }
+  accepted.PlanAndTrack();
+  Check(accepted.program.info.buffers.size() == 64u &&
+            accepted.program.descriptor_sources.size() == 64u &&
+            accepted.program.memory_info.back().resource == 63u,
+        "compute shader did not retain all 64 distinct buffers");
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(accepted.program, {.compute = &compute});
+  AllocateBindings(accepted.program);
+  const auto *binding = FindBinding(accepted.program.bindings,
+                                    DescriptorBindingKind::Buffers);
+  Check(binding != nullptr && binding->resources.size() == 64u &&
+            accepted.program.bindings.memory_offset_count == 64u,
+        "compute shader binding layout truncated the 64 buffers");
+
   Fixture fixture;
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;

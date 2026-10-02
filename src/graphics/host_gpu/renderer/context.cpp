@@ -606,6 +606,9 @@ void CommandBuffer::Begin() {
 		state.layout    = nullptr;
 		state.bound_set = nullptr;
 	}
+	for (auto& epoch: m_descriptor_epochs) {
+		epoch++;
+	}
 	// Push constants are undefined at the start of a command buffer.
 	m_push_constants.valid = false;
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
@@ -657,6 +660,7 @@ void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
 	auto& state     = m_descriptor_states[BindingPointIndex(point)];
 	state.layout    = nullptr;
 	state.bound_set = nullptr;
+	m_descriptor_epochs[BindingPointIndex(point)]++;
 }
 
 void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
@@ -671,6 +675,7 @@ void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineL
 		return;
 	}
 	StateSink().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
+	m_descriptor_epochs[BindingPointIndex(point)]++;
 	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
 	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
 	state.writes.clear();
@@ -702,8 +707,18 @@ void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlag
 
 int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                        uint32_t set, uint32_t count,
-                                       const vk::WriteDescriptorSet* writes) {
+                                       const vk::WriteDescriptorSet* writes, bool known_miss) {
 	auto& state = m_descriptor_states[BindingPointIndex(point)];
+	if (known_miss) {
+		// The comparison below could only miss. No copy is kept for the next update either: one
+		// equal to this (its upload deduplicated to the same range) is then recorded again, which
+		// is only redundant; the Sky Garden start avoids no push at all (DescriptorPushesAvoided).
+		StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
+		state.layout    = nullptr;
+		state.bound_set = nullptr;
+		return PushMissFresh;
+	}
 	bool supported = Common::RendererBatchEnabled() && set == 0;
 	size_t buffer_count = 0, image_count = 0;
 	for (uint32_t i = 0; supported && i < count; ++i) {
@@ -753,6 +768,7 @@ int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::Pipeline
 		return result;
 	}
 	StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
+	m_descriptor_epochs[BindingPointIndex(point)]++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
 	state.layout    = nullptr;
 	state.bound_set = nullptr;
@@ -785,6 +801,22 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {
+		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
+		                                                 .submit_id = submit_id,
+		                                                 .arg0      = arg0,
+		                                                 .arg1      = arg1,
+		                                                 .arg2      = arg2,
+		                                                 .arg3      = arg3,
+		                                                 .arg4      = arg4,
+		                                                 .tick = m_context.GetCommandScheduler().CurrentTick(),
+		                                                 .vs = m_shaders != nullptr ? m_shaders->GetVs().es_regs.data_addr : 0,
+		                                                 .ps = m_shaders != nullptr ? m_shaders->GetPs().ps_regs.data_addr : 0,
+		                                                 .cs = m_shaders != nullptr ? m_shaders->GetCs().cs_regs.data_addr : 0});
+		if (marker != nullptr) {
+			Handle().setCheckpointNV(marker);
+		}
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

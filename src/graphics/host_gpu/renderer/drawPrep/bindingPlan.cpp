@@ -114,26 +114,30 @@ bool PlanShaderData(const CompiledShaderInfo& program, const ResourceSnapshot& r
 struct RememberedSampler {
 	uint64_t                owner = 0;
 	std::array<uint32_t, 4> fields {};
-	vk::Sampler             sampler = nullptr;
+	bool                    integer_border = false;
+	vk::Sampler             sampler        = nullptr;
 };
 thread_local std::array<RememberedSampler, 256> t_samplers {};
 
-vk::Sampler FindPlanSampler(SamplerCache& cache, const ShaderSamplerResource& descriptor) {
+vk::Sampler FindPlanSampler(SamplerCache& cache, const ShaderSamplerResource& descriptor,
+                            bool integer_border) {
 	static_assert(sizeof(descriptor.fields) == sizeof(RememberedSampler::fields));
 	const auto slot  = (descriptor.fields[0] * 0x9e3779b1u ^ descriptor.fields[1] * 0x85ebca6bu ^
-                       descriptor.fields[2] * 0xc2b2ae35u ^ descriptor.fields[3]) >>
+                       descriptor.fields[2] * 0xc2b2ae35u ^ descriptor.fields[3] ^
+                       (integer_border ? 0x27d4eb2fu : 0u)) >>
 	                  24u;
 	auto&      entry = t_samplers[slot % t_samplers.size()];
 	const auto owner = cache.InstanceId();
-	if (entry.owner == owner && entry.sampler != nullptr &&
+	if (entry.owner == owner && entry.sampler != nullptr && entry.integer_border == integer_border &&
 	    std::memcmp(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0) {
 		return entry.sampler;
 	}
-	const auto sampler = cache.FindSampler(descriptor);
+	const auto sampler = cache.FindSampler(descriptor, integer_border);
 	if (sampler != nullptr) {
 		entry.owner = owner;
 		std::memcpy(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields));
-		entry.sampler = sampler;
+		entry.integer_border = integer_border;
+		entry.sampler        = sampler;
 	}
 	return sampler;
 }
@@ -153,8 +157,9 @@ bool PlanSamplers(SamplerCache& cache, const CompiledShaderInfo& program,
 		if (value.dword_count < sizeof(ShaderSamplerResource) / sizeof(uint32_t)) {
 			return false;
 		}
-		stage.samplers[i] = FindPlanSampler(
-		    cache, NativeSamplerDescriptor(program, static_cast<uint32_t>(i), value));
+		stage.samplers[i] =
+		    FindPlanSampler(cache, NativeSamplerDescriptor(program, static_cast<uint32_t>(i), value),
+		                    program.info.samplers[i].integer_border);
 		absent += stage.samplers[i] == nullptr ? 1u : 0u;
 	}
 	if (absent != 0) {
@@ -227,6 +232,9 @@ bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
 				mrt_mask |= 1u << output.index;
 			}
 		}
+	}
+	if (SkipInactivePixelShadersEnabled()) {
+		mrt_mask &= DrawColorOutputFilter(ctx); // as PrepareDrawRenderState
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) == 0) {

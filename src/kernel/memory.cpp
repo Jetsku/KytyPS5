@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/pointerScan.h"
+#include "graphics/shader/shader.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -1063,6 +1064,11 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBackingDirect(vaddr, data, size);
 }
 
 const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
@@ -2989,8 +2995,10 @@ int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 }
 
 static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
-	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
-	       g_virtual_ranges->Remove(vaddr, size);
+	if (!g_guest_address_space->ReleaseCommitted(vaddr, size) ||
+	    !g_virtual_ranges->Remove(vaddr, size)) return false;
+	Libs::Graphics::ShaderUnmapCode(vaddr, size);
+	return true;
 }
 
 static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
@@ -3059,6 +3067,7 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	}
 
 	g_virtual_ranges->Remove(vaddr, len);
+	Libs::Graphics::ShaderUnmapCode(vaddr, len);
 
 	if (g_free_callback != nullptr && IsCommittedRangeType(range.type)) {
 		g_free_callback(vaddr, len);

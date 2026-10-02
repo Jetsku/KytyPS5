@@ -119,6 +119,9 @@ struct LogExecutor {
 	                          uint32_t n, const vk::WriteDescriptorSet* w) {
 		Push(Op::PushDescriptorSet, VerifyHash::PushDescriptorSet(p, l, s, n, w));
 	}
+	void updateDescriptorSets(vk::DescriptorSet s, uint32_t n, const vk::WriteDescriptorSet* w) {
+		Push(Op::UpdateDescriptorSets, VerifyHash::UpdateDescriptorSets(s, n, w));
+	}
 	void pushConstants(vk::PipelineLayout l, vk::ShaderStageFlags st, uint32_t o, uint32_t s,
 	                   const void* d) {
 		Push(Op::PushConstants, VerifyHash::PushConstants(l, st, o, s, d));
@@ -486,7 +489,8 @@ public:
 				                            static_cast<uint32_t>(offsets.size()), offsets.data())});
 				break;
 			}
-			case Op::PushDescriptorSet: {
+			case Op::PushDescriptorSet:
+			case Op::UpdateDescriptorSets: {
 				// Mixed image, sampler and buffer bindings with multi-element arrays, as
 				// CommitBindings builds them (infos in separate vectors).
 				const uint32_t                        writes_n = n;
@@ -495,8 +499,12 @@ public:
 				std::vector<vk::DescriptorImageInfo>  images;
 				buffers.reserve(writes_n * 4);
 				images.reserve(writes_n * 4);
+				// UpdateDescriptorSets: every write targets the same set (CommitDescriptorSet).
+				const auto set = op == Op::UpdateDescriptorSets ? H<vk::DescriptorSet>()
+				                                                : vk::DescriptorSet {};
 				for (uint32_t i = 0; i < writes_n; i++) {
 					auto& w           = writes[i];
+					w.dstSet          = set;
 					w.dstBinding      = U32() % 128;
 					w.dstArrayElement = Below(2);
 					w.descriptorCount = 1 + Below(4);
@@ -520,11 +528,18 @@ public:
 						}
 					}
 				}
-				const auto l = H<vk::PipelineLayout>();
-				e.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, l, 0, writes_n,
-				                       writes.data());
-				expected.push_back({op, VerifyHash::PushDescriptorSet(vk::PipelineBindPoint::eGraphics,
-				                                                      l, 0, writes_n, writes.data())});
+				if (op == Op::UpdateDescriptorSets) {
+					e.updateDescriptorSets(set, writes_n, writes.data());
+					expected.push_back(
+					    {op, VerifyHash::UpdateDescriptorSets(set, writes_n, writes.data())});
+				} else {
+					const auto l = H<vk::PipelineLayout>();
+					e.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, l, 0, writes_n,
+					                       writes.data());
+					expected.push_back(
+					    {op, VerifyHash::PushDescriptorSet(vk::PipelineBindPoint::eGraphics, l, 0,
+					                                       writes_n, writes.data())});
+				}
 				// The encoder copied: scribbling over the caller's arrays changes nothing.
 				for (auto& b: buffers) {
 					b.offset = 0xdead;

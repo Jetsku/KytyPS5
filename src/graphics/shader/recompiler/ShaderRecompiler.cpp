@@ -79,6 +79,28 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
+	// The dispatcher is rare: the console names each guest shader that takes it (the first 64, then
+	// every 64th), so a title's log shows whether KYTY_DISPATCHER_CAP can apply to it.
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	size_t                              count = 0;
+	{
+		std::scoped_lock lock(mutex);
+		if (!seen.insert(options.shader_hash).second) {
+			return;
+		}
+		count = seen.size();
+	}
+	if (count <= 64u || count % 64u == 0u) {
+		const auto cap = GetCodegenOptions().dispatcher_cap;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader: CFG dispatcher #{}: {} 0x{:016x} ({}; {})\n", count, StageName(options.stage),
+		    options.shader_hash, CFG::FailureKindToString(cfg.failure_kind),
+		    cap != 0 ? fmt::format("an invocation leaves it after {} block transitions, "
+		                           "KYTY_DISPATCHER_CAP",
+		                           cap)
+		             : std::string("no transition cap, KYTY_DISPATCHER_CAP=0")));
+	}
 }
 
 enum class EmbeddedFetchValueType {
@@ -624,7 +646,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
-	IR::ConstantPropagationPass(ir.blocks);
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
@@ -632,12 +654,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.blocks);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
+	// KYTY_DUMP_STDOUT=1 with the early dump: the decoded ISA and the IR that resource tracking is
+	// about to see go to stdout, so a shader the tracker rejects can still be inspected offline.
+	if (options.dump_ir && options.early_dump && std::getenv("KYTY_DUMP_STDOUT") != nullptr) {
+		std::fputs(decoded_dump.c_str(), stdout);
+		std::fputs(MakeIrDump(CFG::GraphToString(cfg), ir).c_str(), stdout);
+		std::fflush(stdout);
+	}
 	const bool variant_reads = GetCodegenOptions().srt_variant_reads;
 	IR::BuildSrtPlan(ir, variant_reads);
 	IR::EliminateDeadCode(ir.blocks);

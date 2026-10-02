@@ -16,19 +16,32 @@ bool UsesPhysicalAddresses(const EmitterState& state) {
 }
 
 uint32_t TypeVoid(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeVoid);
+	if (state.void_type == 0) {
+		state.void_type = state.builder.Type(spv::OpTypeVoid);
+	}
+	return state.void_type;
 }
 
 uint32_t TypeBool(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeBool);
+	if (state.bool_type == 0) {
+		state.bool_type = state.builder.Type(spv::OpTypeBool);
+	}
+	return state.bool_type;
 }
 
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeBool(state), components);
+	auto& type = state.bool_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeBool(state), components);
+	}
+	return type;
 }
 
 uint32_t TypeU32(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeInt, 32, 0);
+	if (state.u32_type == 0) {
+		state.u32_type = state.builder.Type(spv::OpTypeInt, 32, 0);
+	}
+	return state.u32_type;
 }
 
 uint32_t TypeU64(EmitterState& state) {
@@ -36,29 +49,55 @@ uint32_t TypeU64(EmitterState& state) {
 }
 
 uint32_t TypeScalarU64(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeInt, 64, 0);
+	if (state.native_u64_type == 0) {
+		state.native_u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
+	}
+	return state.native_u64_type;
 }
 
 uint32_t TypeU32Pair(EmitterState& state) {
-	const auto element = TypeU32(state);
-	return state.builder.Type(spv::OpTypeStruct, element, element);
+	if (state.u32_pair_type == 0) {
+		const auto element = TypeU32(state);
+		state.u32_pair_type = state.builder.Type(spv::OpTypeStruct, element, element);
+	}
+	return state.u32_pair_type;
 }
 
 uint32_t TypeI32(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeInt, 32, 1);
+	if (state.i32_type == 0) {
+		state.i32_type = state.builder.Type(spv::OpTypeInt, 32, 1);
+	}
+	return state.i32_type;
 }
 
 uint32_t TypeI32Pair(EmitterState& state) {
-	const auto element = TypeI32(state);
-	return state.builder.Type(spv::OpTypeStruct, element, element);
+	if (state.i32_pair_type == 0) {
+		const auto element = TypeI32(state);
+		state.i32_pair_type = state.builder.Type(spv::OpTypeStruct, element, element);
+	}
+	return state.i32_pair_type;
 }
 
 uint32_t TypeF32(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeFloat, 32);
+	if (state.f32_type == 0) {
+		state.f32_type = state.builder.Type(spv::OpTypeFloat, 32);
+	}
+	return state.f32_type;
+}
+
+uint32_t TypeF64(EmitterState& state) {
+	if (state.f64_type == 0) {
+		state.f64_type = state.builder.Type(spv::OpTypeFloat, 64);
+	}
+	return state.f64_type;
 }
 
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
+	auto& type = state.u32_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
+	}
+	return type;
 }
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
@@ -67,11 +106,19 @@ uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
 }
 
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeI32(state), components);
+	auto& type = state.i32_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeI32(state), components);
+	}
+	return type;
 }
 
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeF32(state), components);
+	auto& type = state.f32_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeF32(state), components);
+	}
+	return type;
 }
 
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee) {
@@ -79,7 +126,10 @@ uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint3
 }
 
 uint32_t TypeFunction(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeFunction, TypeVoid(state));
+	if (state.function_type == 0) {
+		state.function_type = state.builder.Type(spv::OpTypeFunction, TypeVoid(state));
+	}
+	return state.function_type;
 }
 
 uint32_t StorageRuntimeArrayType(EmitterState& state) {
@@ -726,9 +776,14 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics) {
+	if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+	}
+	if (state.requirements.shared_int64_atomics) {
+		state.builder.RequireVersion(0x00010400u);
+		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
+		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
@@ -759,6 +814,13 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.requirements.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.requirements.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	}
+	if (state.requirements.shader_clock) {
+		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
+		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
 	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
@@ -799,6 +861,19 @@ void DefineModule(EmitterState& state) {
 	}
 	if (float_controls.denorm_preserve_f64) {
 		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 64u);
+	}
+	if (state.requirements.float64) {
+		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
+		                     state.input_info.compute->float_mode != 0xc0);
+		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
+		state.builder.RequireCapability(spv::CapabilityFloat64);
+		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               64u);
+		// FP64 denormal preservation is temporarily disabled.
+		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
+		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
 	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;

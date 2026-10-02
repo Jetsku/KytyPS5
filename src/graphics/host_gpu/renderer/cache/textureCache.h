@@ -20,6 +20,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -71,6 +72,7 @@ public:
 	struct MetadataNoop {
 		static constexpr uint32_t MaxPages     = 2;
 		static constexpr uint32_t MaxGpuRanges = 4;
+		static constexpr uint32_t MaxGuestKeys = 4;
 
 		bool                                 provable        = false;
 		uint64_t                             first_page      = 0;
@@ -79,6 +81,14 @@ public:
 		uint64_t                             fill_generation = 0;
 		uint32_t                             gpu_range_count = 0;
 		std::array<GuestRange, MaxGpuRanges> gpu_ranges      {};
+		// KYTY_CP_COMMIT=dccguest: a DCC decision on metadata the GPU had not written, none of whose
+		// slices' first key decoded to a clear (so nothing else of the slice was read). It stays the
+		// same decision while `guest_range` is still not GPU-dirty and every recorded first key
+		// still reads as recorded (guest_key_count keys; 0: no such certificate).
+		GuestRange                             guest_range     {};
+		uint32_t                               guest_key_count = 0;
+		std::array<uint64_t, MaxGuestKeys>     guest_key_addresses {};
+		std::array<uint8_t, MaxGuestKeys>      guest_key_codes {};
 	};
 	// KYTY_DRAW_SEQUENCE_FAST: what a FindImage of a description returned, and why the same
 	// lookup would return it again with nothing to do but its access bookkeeping (see
@@ -122,6 +132,9 @@ public:
 	// Diagnostics (KYTY_DRAW_SEQUENCE_VERIFY): residency extensions and alias synchronizations
 	// FindImage has performed; a repeat must add none.
 	[[nodiscard]] uint64_t      LookupSideEffects() const noexcept { return m_lookup_side_effects; }
+	// Diagnostics (KYTY_CP_COMMIT=texdcc verify): DCC decisions of MaterializeDccClear that did
+	// something (a slice clear, or a native GPU inspection); a memo hit's full resolution adds none.
+	[[nodiscard]] uint64_t      DccDecisionEffects() const noexcept { return m_dcc_decision_effects; }
 	// KYTY_DRAW_SEQUENCE_VERIFY: a GPU-owned metadata range `record` relied on is no longer
 	// GPU-modified. FindImage never ends GPU ownership of such a range before a decision that
 	// differs from the recorded one, so after a repeat check this means another thread (a guest
@@ -160,6 +173,18 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// KYTY_IMAGE_EXACT_RANGE_INVALIDATE (default off; =1 on, =count dry run): when a GPU buffer
+	// write covers exactly one image's range, InvalidateMemoryFromGPU rebuilds only the images
+	// inside that range; images it partly overlaps lose ownership of the written bytes but are not
+	// rebuilt (they are other surfaces sharing the memory at other times, e.g. the DRS-sized
+	// render targets of one heap). Count mode rebuilds them as before and only counts. Both modes
+	// count, per 10 s on the console, the sampled/storage uses of such images before their next
+	// GPU write (RebindImages calls this): a stale read the rule would expose.
+	void NoteExactRangeStaleUse(Image& image, bool storage) {
+		if (m_exact_range_mode != 0 && image.exact_range_stale) [[unlikely]] {
+			NoteExactRangeStaleUseSlow(image, storage);
+		}
+	}
 	// Diagnostics only (changes nothing): images that InvalidateMemoryFromGPU(address, size) would
 	// invalidate but that no range in `written` overlaps.
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
@@ -167,6 +192,9 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	// KYTY_META_CLEAR_MEMO=1 (default off; BryanKAdams/KytyPS5 c36bbff): the last answer is kept for
+	// its address while m_surface_meta_generation holds, without m_lock. Called by the GPU (CP)
+	// thread only (the depth-target resolution of draws).
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
@@ -178,6 +206,9 @@ public:
 	// earlier in the same frame as stale.
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	void RunGarbageCollector();
+	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
+	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
+	void ReportVram();
 
 	// KYTY_ALIAS_BYTES (default on; =0 restores whole-image ownership). GPU ownership follows the
 	// bytes a write can reach: a write takes only those bytes from overlapping images (a draw only
@@ -337,6 +368,11 @@ private:
 	[[nodiscard]] bool MetadataPagesHold(const MetadataNoop& noop) const;
 	// Without m_lock: the recorded fills and GPU-dirty states are still as recorded.
 	[[nodiscard]] bool MetadataStateHolds(const MetadataNoop& noop);
+	// KYTY_CP_COMMIT=dccguest: the guest-key certificate of `noop` still holds.
+	[[nodiscard]] bool GuestKeysHold(const MetadataNoop& noop);
+	// m_surface_metas.erase(address) (caller holds m_lock); KYTY_CP_COMMIT=metaerase skips it
+	// when it would erase nothing (m_meta_erases).
+	void EraseSurfaceMeta(uint64_t address);
 	// SyncAliasFromOwner returns before looking for an owner (caller holds m_lock).
 	[[nodiscard]] static bool SyncAliasReturnsAtOnce(const Image& image);
 	// Whether a registered image other than `found` has exactly its backing range, extent and
@@ -414,6 +450,35 @@ private:
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	void RunPressureGarbageCollector(uint64_t tick);
+	// KYTY_VRAM_IDLE_FRAMES=N (default 0: off): once every 32 frames, registered images unused for
+	// more than N presented frames that the submission-age collector frees without a download (not
+	// GPU-modified, not bound, a target, a stencil association or a presentation surface) are freed,
+	// whatever the memory usage, so earlier scenes' images do not stay until the budget runs out.
+	// A later use recreates and refreshes the image.
+	// KYTY_VRAM_PRESSURE_FRAMES=K (default 0: off): above the collection trigger, instead of the
+	// submission-age collection (images unused for 16-160 completed submissions, a fraction of a
+	// frame, are freed and recreated by the next frame; it also stops at the first LRU entries it
+	// may not free), images unused for K frames are freed the same way, once per frame, oldest
+	// first, until usage is under the trigger (K/4, at least 2, above the critical mark).
+	// m_frame_ticks: the GC tick each recent frame began at (LRU ticks are GC ticks).
+	[[nodiscard]] bool IdleRetirable(const Image& image, uint64_t frame, uint64_t min_age) const;
+	void               NoteFrameTick(uint64_t frame, uint64_t tick);
+	// Returns the AccountedSize bytes freed (stops past `enough`).
+	uint64_t           RetireUnusedImages(uint64_t frame, uint64_t min_age, size_t max_count,
+	                                      uint64_t enough);
+	uint64_t           m_idle_frames          = 0;
+	uint64_t           m_idle_next_frame      = 0;
+	uint64_t           m_idle_freed           = 0;
+	uint64_t           m_pressure_frames      = 0;
+	uint64_t           m_pressure_frame       = 0;
+	uint64_t           m_pressure_freed_bytes = 0;
+	std::deque<std::pair<uint64_t, uint64_t>> m_frame_ticks;
+	// KYTY_VRAM_STATS: images created and freed (per HangTrace::ImageFreeReason) since the last
+	// report, {count, native bytes}.
+	void NoteVramFree(const Image& image, HangTrace::ImageFreeReason reason);
+	std::array<std::pair<uint64_t, uint64_t>, static_cast<size_t>(HangTrace::ImageFreeReason::Count)>
+	                              m_vram_frees {};
+	std::pair<uint64_t, uint64_t> m_vram_creates {};
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -437,6 +502,30 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::atomic<uint64_t>                             m_frame {0};
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// KYTY_CP_COMMIT=metaerase (EraseSurfaceMeta): insertions into m_surface_metas so far, and per
+	// recently erased address the insertion count at its erase. While the count is unchanged the
+	// address is still absent (every other change of the map is a removal).
+	struct MetaErase {
+		uint64_t address = UINT64_MAX;
+		uint64_t inserts = 0;
+	};
+	uint64_t                                          m_surface_meta_inserts = 0;
+	std::array<MetaErase, 64>                         m_meta_erases {};
+	// KYTY_CP_COMMIT=targetalloc: FindRenderTarget's bounded-claim block list (m_lock held).
+	RangeSet                                          m_claim_blocks;
+	// Bumped under m_lock after every change of m_surface_metas (an entry added or removed, a
+	// clear_mask changed): validates m_meta_clear_memo (IsMetaCleared).
+	std::atomic<uint64_t> m_surface_meta_generation {0};
+	void                  NoteSurfaceMetaChange() noexcept {
+		m_surface_meta_generation.fetch_add(1, std::memory_order_release);
+	}
+	struct MetaClearMemo {
+		uint64_t address    = 0;
+		uint64_t generation = 0;
+		uint32_t clear_mask = 0;
+		bool     found      = false;
+		bool     valid      = false;
+	} m_meta_clear_memo;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_registered_image_memory = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
@@ -461,6 +550,8 @@ private:
 	uint64_t         m_image_lookup_mismatches = 0;
 	// LookupSideEffects (GPU thread).
 	uint64_t         m_lookup_side_effects = 0;
+	// DccDecisionEffects (GPU thread).
+	uint64_t         m_dcc_decision_effects = 0;
 	bool             m_readback_linear_images = false;
 	// Texture streaming (see TextureCache constructor for the environment switches).
 	bool             m_partial_upload      = true;
@@ -496,6 +587,22 @@ private:
 	// still uncounted is a mismatch (exit stops), one whose pages are counted by now was
 	// registered after the decision (a race). FrameEvents GpuWriteImageSkip*.
 	[[nodiscard]] bool SkipGpuWriteImageWalk(uint64_t address, uint64_t size);
+	// KYTY_IMAGE_EXACT_RANGE_INVALIDATE: 0 off, 1 on, 2 count (see InvalidateMemoryFromGPU), and
+	// its totals (GPU thread) for the 10 s console summary.
+	void NoteExactRangeStaleUseSlow(Image& image, bool storage);
+	void NoteExactRangeRewrite(Image& image);
+	void PrintExactRangeSummary();
+	int  m_exact_range_mode = 0;
+	struct ExactRangeTotals {
+		uint64_t exact_writes = 0; // buffer writes whose range equals an image's range
+		uint64_t kept         = 0; // partly overlapped images left unrebuilt (count: would be)
+		uint64_t stale_uses   = 0; // sampled/storage uses of such an image before its next write
+		uint64_t rewrites     = 0; // such images written again by the GPU (or refreshed, on)
+	};
+	ExactRangeTotals m_exact_range_totals;
+	ExactRangeTotals m_exact_range_printed;
+	uint64_t         m_exact_range_print_ns = 0;
+	uint32_t         m_exact_range_logged   = 0;
 	bool m_gpu_write_skip        = true;
 	int  m_gpu_write_skip_verify = 0;
 	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).
@@ -558,6 +665,8 @@ private:
 	LruTouchTotals m_lru_touch_totals;
 	enum class ResidencyMode : uint8_t { Off, On, Poison };
 	ResidencyMode                            m_residency            = ResidencyMode::On;
+	// KYTY_TEXTURE_SPARSE_RESIDENCY: partially resident textures are sparse residency images.
+	bool                                     m_sparse_textures      = false;
 	uint64_t                                 m_residency_violations = 0;
 	uint64_t                                 m_residency_overlap_logs = 0;
 	// Partially resident images (stale ids are dropped by the once-per-frame scan).

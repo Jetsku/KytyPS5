@@ -1,13 +1,16 @@
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -396,6 +399,49 @@ void TestUniformFirstLaneSamplerLod() {
         "uniform sampler LOD clamp evaluated incorrectly");
 }
 
+void TestFloatComparisonDescriptorInputs() {
+  struct Input {
+    uint32_t bits;
+    uint32_t less_equal;
+    uint32_t greater_equal;
+  };
+  constexpr std::array inputs = {
+      Input{0x00000001u, 0, 1}, Input{0x80000001u, 1, 0},
+      Input{0x007fffffu, 0, 1}, Input{0x807fffffu, 1, 0},
+      Input{0x00800000u, 0, 1}, Input{0x80800000u, 1, 0},
+      Input{0x00000000u, 1, 1}, Input{0x80000000u, 1, 1},
+      Input{0x7fc00000u, 0, 0}};
+  for (const bool flush : {false, true}) {
+    Fixture fixture;
+    const auto user = fixture.Emit(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+    const auto value = fixture.Emit(ValueOpcode::BitCastF32U32, {user});
+    const auto less_equal = fixture.Emit(ValueOpcode::FPOrdLessThanEqual32,
+                                         {value, Value::F32(0.0f)});
+    const auto greater_equal = fixture.Emit(ValueOpcode::FPOrdGreaterThanEqual32,
+                                            {value, Value::F32(0.0f)});
+    less_equal.Instruction()->SetFlags(FPCompareFlags{flush});
+    greater_equal.Instruction()->SetFlags(FPCompareFlags{flush});
+    const auto low = fixture.Emit(ValueOpcode::SelectU32,
+                                  {less_equal, Value(1u), Value(0u)});
+    const auto high = fixture.Emit(ValueOpcode::SelectU32,
+                                   {greater_equal, Value(1u), Value(0u)});
+    fixture.program.descriptor_sources.push_back(
+        {.dwords = {low, high}, .dword_count = 2});
+    fixture.Plan();
+    for (size_t index = 0; index < inputs.size(); index++) {
+      const auto &input = inputs[index];
+      const std::array user_data{input.bits};
+      DescriptorValue result;
+      Check(SrtWalker(fixture.program, {.user_data = user_data})
+                    .EvaluateDescriptor(0, result) &&
+                result.dwords[0] == (flush && index < 4 ? 1 : input.less_equal) &&
+                result.dwords[1] == (flush && index < 4 ? 1 : input.greater_equal),
+            "descriptor comparison disagrees with native FP32 input mode");
+    }
+  }
+}
+
 void TestSharedIntegerRuntimeDependencies() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::LaneId);
@@ -560,6 +606,100 @@ void TestUndefinedRuntimeValueFails() {
         "undefined typed descriptor source was accepted");
 }
 
+// KYTY_MOVREL_KNOWN_ZEROS. Astro Bot's foliage vertex shaders index a register array by a loop
+// counter, M0 = (i << 2) & 0xff: its values are unknown, but its two low bits are zero, so only
+// every fourth register of a V_MOVRELS select chain can be read.
+void TestKnownZeroBitsFoldIndexedReads() {
+  namespace Recompiler = Libs::Graphics::ShaderRecompiler;
+  const auto saved = Recompiler::GetCodegenOptions();
+  struct Restore {
+    Recompiler::CodegenOptions options;
+    ~Restore() { Recompiler::SetCodegenOptions(options); }
+  } restore{saved};
+
+  for (const bool enabled : {false, true}) {
+    auto options = saved;
+    options.movrel_range = true;
+    options.movrel_known_zeros = enabled;
+    Recompiler::SetCodegenOptions(options);
+
+    Fixture fixture;
+    const auto counter =
+        fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+    const auto shifted = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {counter, Value(2u)});
+    const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(0xffu)});
+    Value selected = Value(100u);
+    for (uint32_t index = 1; index < 64u; index++) {
+      const auto match = fixture.Emit(ValueOpcode::IEqual32, {m0, Value(index)});
+      selected = fixture.Emit(ValueOpcode::SelectU32, {match, Value(100u + index), selected});
+    }
+    const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+    const auto compare = [&](Value lhs, ValueOpcode opcode, uint32_t constant) {
+      return fixture.Emit(
+          ValueOpcode::ReferenceU32,
+          {fixture.Emit(ValueOpcode::SelectU32,
+                        {fixture.Emit(opcode, {lhs, Value(constant)}), Value(1u), Value(2u)})});
+    };
+    // A sum keeps the fewer low zero bits: 4 * i + 2 can be 6 but never 7.
+    const auto plus_two = fixture.Emit(ValueOpcode::IAdd32, {shifted, Value(2u)});
+    const auto six = compare(plus_two, ValueOpcode::IEqual32, 6u);
+    const auto seven = compare(plus_two, ValueOpcode::IEqual32, 7u);
+    const auto not_seven = compare(plus_two, ValueOpcode::INotEqual32, 7u);
+    // A waterfall loop reads one lane's index; that lane's value keeps the bits.
+    const auto lane_index = fixture.Emit(
+        ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::ReadFirstLane, {shifted, Value(true)}), Value(0xffu)});
+    const auto lane_eight = compare(lane_index, ValueOpcode::IEqual32, 8u);
+    const auto lane_five = compare(lane_index, ValueOpcode::IEqual32, 5u);
+    // A value whose low bits are unknown folds nothing.
+    const auto unknown = compare(counter, ValueOpcode::IEqual32, 5u);
+
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+
+    std::vector<uint32_t> indices;
+    auto value = chain.ResolveInstruction()->Arg(0).Resolve();
+    while (const auto *select = value.TryInstruction()) {
+      Check(select->GetOpcode() == ValueOpcode::SelectU32, "chain lost its selects");
+      const auto *match = select->Arg(0).ResolveInstruction();
+      Check(match != nullptr && match->GetOpcode() == ValueOpcode::IEqual32 &&
+                match->Arg(0).Resolve() == m0.Resolve(),
+            "chain select does not test M0");
+      const auto index = match->Arg(1).Resolve().U32();
+      Check(select->Arg(1).Resolve() == Value(100u + index),
+            "chain select picks the wrong register");
+      indices.push_back(index);
+      value = select->Arg(2).Resolve();
+    }
+    std::ranges::sort(indices);
+    std::vector<uint32_t> expected;
+    for (uint32_t index = enabled ? 4u : 1u; index < 64u; index += enabled ? 4u : 1u) {
+      expected.push_back(index);
+    }
+    Check(value == Value(100u) && indices == expected,
+          enabled ? "compares with bits M0 never sets were kept, or reachable ones were dropped"
+                  : "known zero bits folded compares while KYTY_MOVREL_KNOWN_ZEROS was off");
+    const auto folded = [](Value reference, uint32_t result) {
+      return reference.ResolveInstruction()->Arg(0).Resolve() == Value(result);
+    };
+    const auto kept = [](Value reference) {
+      return reference.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr;
+    };
+    Check(kept(six), "a compare the known bits allow was folded");
+    Check(kept(unknown), "a compare on a value with unknown low bits was folded");
+    Check(kept(lane_eight), "a lane compare the known bits allow was folded");
+    if (enabled) {
+      Check(folded(seven, 2u) && folded(not_seven, 1u),
+            "a compare the known bits rule out was not folded");
+      Check(folded(lane_five, 2u), "known bits did not pass through ReadFirstLane");
+    } else {
+      Check(kept(seven) && kept(not_seven) && kept(lane_five),
+            "known zero bits folded compares while KYTY_MOVREL_KNOWN_ZEROS was off");
+    }
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -591,12 +731,14 @@ int main() {
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
+    TestFloatComparisonDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
+    TestKnownZeroBitsFoldIndexedReads();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

@@ -338,7 +338,207 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+// KYTY_MOVREL_SWITCH (from BryanKAdams/KytyPS5 55a7540). A link select(index == constant, value,
+// rest) of an indexed select chain: a V_MOVRELS read is one chain over every register above the
+// source, on a uniform index (M0 & 0xff).
+struct IndexedSelectLink {
+	IR::Value index;
+	uint32_t  constant = 0;
+	IR::Value value;
+	IR::Value rest;
+};
+
+bool IndexedSelectLinkOf(const IR::Inst& inst, IndexedSelectLink& link) {
+	if (inst.GetOpcode() != IR::ValueOpcode::SelectU32 || inst.NumArgs() != 3) {
+		return false;
+	}
+	const auto* compare = inst.Arg(0).Resolve().TryInstruction();
+	if (compare == nullptr || compare->GetOpcode() != IR::ValueOpcode::IEqual32) {
+		return false;
+	}
+	auto index    = compare->Arg(0).Resolve();
+	auto constant = compare->Arg(1).Resolve();
+	if (index.IsImmediate()) {
+		std::swap(index, constant);
+	}
+	if (index.IsImmediate() || !constant.IsImmediate() || constant.GetType() != IR::Type::U32) {
+		return false;
+	}
+	link = {index, constant.U32(), inst.Arg(1), inst.Arg(2)};
+	return true;
+}
+
+// The link below `inst` on the same index, when only `inst` uses it and it is in the same block.
+const IR::Inst* NextIndexedSelect(const IR::Inst& inst, const IndexedSelectLink& link,
+                                  IndexedSelectLink& next) {
+	const auto* rest = link.rest.Resolve().TryInstruction();
+	if (rest == nullptr || rest->Parent() != inst.Parent() || rest->UseCount() != 1 ||
+	    !IndexedSelectLinkOf(*rest, next) || !(next.index == link.index)) {
+		return nullptr;
+	}
+	return rest;
+}
+
+// Shorter chains stay selects.
+constexpr size_t MinIndexedSelects = 16;
+
+void FindIndexedSelects(EmitterState& state) {
+	state.indexed_selects_found = true;
+	if (!GetCodegenOptions().movrel_switch) {
+		return;
+	}
+	std::unordered_set<const IR::Inst*> inner;
+	IndexedSelectLink                   link;
+	IndexedSelectLink                   next;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IndexedSelectLinkOf(inst, link)) {
+				if (const auto* rest = NextIndexedSelect(inst, link, next)) {
+					inner.insert(rest);
+				}
+			}
+		}
+	}
+	std::vector<const IR::Inst*> members;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inner.contains(&inst) || !IndexedSelectLinkOf(inst, link)) {
+				continue;
+			}
+			members.clear();
+			for (const auto* current = &inst;;) {
+				const auto* rest = NextIndexedSelect(*current, link, next);
+				if (rest == nullptr) {
+					break;
+				}
+				members.push_back(rest);
+				current = rest;
+				link    = next;
+			}
+			if (members.size() + 1u >= MinIndexedSelects) {
+				state.indexed_select_heads.insert(&inst);
+				state.indexed_select_members.insert(members.begin(), members.end());
+			}
+		}
+	}
+	// The compares of converted links emit nothing either, unless something else uses them.
+	const auto converted = [&](const IR::Inst* select) {
+		return state.indexed_select_heads.contains(select) ||
+		       state.indexed_select_members.contains(select);
+	};
+	for (const auto* set: {&state.indexed_select_heads, &state.indexed_select_members}) {
+		for (const auto* select: *set) {
+			const auto* compare = select->Arg(0).Resolve().TryInstruction();
+			if (compare != nullptr && compare->HasUses() &&
+			    std::ranges::all_of(compare->Uses(), [&](const IR::Use& use) {
+				    return use.operand == 0u && converted(use.user);
+			    })) {
+				state.indexed_select_compares.insert(compare);
+			}
+		}
+	}
+}
+
+// Emits a long indexed select chain at its outermost select as an OpSwitch on index / 16 into
+// short select chains: the host branches on the uniform index and runs one chain of at most 16
+// selects, while the code stays about as large as the whole chain (one case per index value
+// compiled about twice as slowly on AMD, for little more speed). Returns false for other
+// instructions; the chain's inner selects emit nothing.
+bool EmitIndexedSelect(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (!state.indexed_selects_found) {
+		FindIndexedSelects(state);
+	}
+	if (state.indexed_select_members.contains(&inst) ||
+	    state.indexed_select_compares.contains(&inst)) {
+		return true;
+	}
+	if (!state.indexed_select_heads.contains(&inst)) {
+		return false;
+	}
+	IndexedSelectLink link;
+	IndexedSelectLinkOf(inst, link);
+	const auto selector = ctx.Def(link.index);
+	// Outer links take precedence over inner ones with the same constant, as in the chain.
+	std::vector<std::pair<uint32_t, uint32_t>> cases; // Constant, value.
+	std::unordered_set<uint32_t>               constants;
+	for (const auto* current = &inst;;) {
+		if (constants.insert(link.constant).second) {
+			cases.emplace_back(link.constant, ctx.Def(link.value));
+		}
+		IndexedSelectLink next;
+		const auto*       rest = NextIndexedSelect(*current, link, next);
+		if (rest == nullptr) {
+			break;
+		}
+		current = rest;
+		link    = next;
+	}
+	const auto         fallback   = ctx.Def(link.rest);
+	constexpr uint32_t BucketBits = 4;
+	std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> buckets;
+	for (const auto& [constant, value]: cases) {
+		if (value != fallback) {
+			buckets[constant >> BucketBits].emplace_back(constant, value);
+		}
+	}
+	if (buckets.empty()) {
+		ctx.Define(inst, fallback);
+		return true;
+	}
+	const auto bucket_selector =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, selector, ConstantU32(state, BucketBits));
+	const auto            default_label = state.builder.AllocateId();
+	const auto            merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> switch_words {spv::OpSwitch, bucket_selector, default_label};
+	for (const auto& [bucket, entries]: buckets) {
+		labels.push_back(state.builder.AllocateId());
+		switch_words.push_back(bucket);
+		switch_words.push_back(labels.back());
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(switch_words);
+	std::vector<uint32_t> phi_words {spv::OpPhi, TypeU32(state), state.builder.AllocateId(),
+	                                 fallback, default_label};
+	EmitLabel(state, default_label);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	size_t label_index = 0;
+	for (const auto& [bucket, entries]: buckets) {
+		const auto label = labels[label_index++];
+		EmitLabel(state, label);
+		// The constants are distinct, so the order of the selects does not matter.
+		auto selected = fallback;
+		for (const auto& [constant, value]: entries) {
+			const auto match = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), match, selector,
+			                          ConstantU32(state, constant));
+			const auto chosen = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), chosen, match, value, selected);
+			selected = chosen;
+		}
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		phi_words.push_back(selected);
+		phi_words.push_back(label);
+	}
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi_words);
+	ctx.Define(inst, phi_words[2]);
+	return true;
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
+	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
+		// Both operations already combine both emulated halves into one whole-wave result.
+		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
+	if ((inst.GetOpcode() == IR::ValueOpcode::SelectU32 ||
+	     inst.GetOpcode() == IR::ValueOpcode::IEqual32) &&
+	    EmitIndexedSelect(ctx, inst)) {
+		return;
+	}
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
@@ -461,9 +661,32 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// KYTY_DISPATCHER_CAP (from Senaxx's wolverine branch): a guest loop whose trip count comes from
+	// bad data (memory an unemulated pass left unwritten) hung the GPU until the driver reset it.
+	// The invocation leaves the dispatcher after a bounded number of block transitions instead:
+	// its results are wrong, the device survives. 0 emits the loop without the bound.
+	const auto cap            = GetCodegenOptions().dispatcher_cap;
+	uint32_t   iteration      = 0;
+	uint32_t   next_iteration = 0;
+	if (cap != 0) {
+		iteration      = state.builder.AllocateId();
+		next_iteration = state.builder.AllocateId();
+	}
+	const auto finished = state.builder.AllocateId();
+	if (cap != 0) {
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+		                          initial_parent, next_iteration, dispatcher.continue_label);
+	}
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	auto done = finished;
+	if (cap != 0) {
+		const auto exhausted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+		                          ConstantU32(state, cap));
+		done = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, exhausted);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -496,6 +719,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	if (cap != 0) {
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+		                          ConstantU32(state, 1u));
+	}
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);
@@ -513,6 +740,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U64: return TypeU64(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
+		case IR::Type::F64: return TypeF64(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);

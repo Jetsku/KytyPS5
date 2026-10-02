@@ -9,6 +9,35 @@
 
 namespace Libs::Graphics::CommandStream {
 
+namespace Detail {
+// Rebuilds a packet's descriptor writes in state.writes (their infos point into the packet), each
+// with dstSet `set`.
+inline void RebuildDescriptorWrites(ReplayState& state, const DescriptorWriteRecord* records,
+                                    uint32_t write_count, const DescriptorInfo* infos,
+                                    uint32_t info_count, vk::DescriptorSet set) {
+	state.writes.resize(write_count);
+	uint32_t next = 0;
+	for (uint32_t i = 0; i < write_count; i++) {
+		const auto& record    = records[i];
+		auto&       write     = state.writes[i];
+		write                 = vk::WriteDescriptorSet {};
+		write.dstSet          = set;
+		write.dstBinding      = record.binding;
+		write.dstArrayElement = record.element;
+		write.descriptorCount = record.count;
+		write.descriptorType  = record.type;
+		EXIT_IF(next + record.count > info_count);
+		if (record.is_image != 0) {
+			write.pImageInfo = reinterpret_cast<const vk::DescriptorImageInfo*>(infos + next);
+		} else {
+			write.pBufferInfo = reinterpret_cast<const vk::DescriptorBufferInfo*>(infos + next);
+		}
+		next += record.count;
+	}
+	EXIT_IF(next != info_count);
+}
+} // namespace Detail
+
 template <typename Exec>
 void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandler on_mismatch,
             void* mismatch_context) {
@@ -192,30 +221,21 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p       = reader.Get<PushDescriptorSetPacket>();
 			const auto* records = reader.GetArray<DescriptorWriteRecord>(p.write_count);
 			const auto* infos   = reader.GetArray<DescriptorInfo>(p.info_count);
-			state.writes.resize(p.write_count);
-			uint32_t next = 0;
-			for (uint32_t i = 0; i < p.write_count; i++) {
-				const auto& record    = records[i];
-				auto&       write     = state.writes[i];
-				write                 = vk::WriteDescriptorSet {};
-				write.dstBinding      = record.binding;
-				write.dstArrayElement = record.element;
-				write.descriptorCount = record.count;
-				write.descriptorType  = record.type;
-				EXIT_IF(next + record.count > p.info_count);
-				if (record.is_image != 0) {
-					write.pImageInfo =
-					    reinterpret_cast<const vk::DescriptorImageInfo*>(infos + next);
-				} else {
-					write.pBufferInfo =
-					    reinterpret_cast<const vk::DescriptorBufferInfo*>(infos + next);
-				}
-				next += record.count;
-			}
-			EXIT_IF(next != p.info_count);
+			Detail::RebuildDescriptorWrites(state, records, p.write_count, infos, p.info_count,
+			                                nullptr);
 			check(VerifyHash::PushDescriptorSet(p.point, p.layout, p.set, p.write_count,
 			                                    state.writes.data()));
 			exec.pushDescriptorSetKHR(p.point, p.layout, p.set, p.write_count, state.writes.data());
+			break;
+		}
+		case Op::UpdateDescriptorSets: {
+			const auto& p       = reader.Get<UpdateDescriptorSetsPacket>();
+			const auto* records = reader.GetArray<DescriptorWriteRecord>(p.write_count);
+			const auto* infos   = reader.GetArray<DescriptorInfo>(p.info_count);
+			Detail::RebuildDescriptorWrites(state, records, p.write_count, infos, p.info_count,
+			                                p.set);
+			check(VerifyHash::UpdateDescriptorSets(p.set, p.write_count, state.writes.data()));
+			exec.updateDescriptorSets(p.set, p.write_count, state.writes.data());
 			break;
 		}
 		case Op::PushConstants: {

@@ -29,6 +29,18 @@
 #include <immintrin.h>
 #endif
 
+namespace Common {
+
+bool ShortSleepsBlock() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHORT_SLEEP_BLOCK");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+} // namespace Common
+
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -46,8 +58,8 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 
 	// Keep spinning only where a kernel transition is
 	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
-	// per-thread high-resolution waitable timer below.
-	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
+	// per-thread high-resolution waitable timer below (always with KYTY_SHORT_SLEEP_BLOCK=1).
+	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS && !Common::ShortSleepsBlock()) {
 		LARGE_INTEGER frequency {};
 		LARGE_INTEGER start {};
 		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&
@@ -156,7 +168,7 @@ static void SleepHighResolutionNanos(uint64_t nanos) {
 	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
 	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
 
-	if (nanos <= SPIN_LIMIT_NS) {
+	if (nanos <= SPIN_LIMIT_NS && !Common::ShortSleepsBlock()) {
 		timespec now {};
 		do {
 			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {

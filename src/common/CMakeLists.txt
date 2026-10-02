@@ -12,6 +12,12 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
+# Loading diagnostics handles filesystem and thread-start exceptions locally.
+# Other sources retain the project's no-exceptions compilation policy.
+if(LINUX)
+	set_property(SOURCE profiler.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE
@@ -26,6 +32,7 @@ target_link_libraries(common
 		cpuinfo
 		kyty_git_version
 		spdlog::spdlog
+		ZArchive::zarchive
 )
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

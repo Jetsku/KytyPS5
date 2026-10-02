@@ -47,6 +47,9 @@ public:
 	// runs, and every decision taken from the answer (`!gpu && cpu`, `!cpu`) equals the one a
 	// locked QueryDirty would give at some moment during the call.
 	[[nodiscard]] bool QueryDirtyRelaxed(uint64_t vaddr, uint64_t size, DirtyState& state) const;
+	// CPU half of QueryDirtyRelaxed, with the same missing-region and GPU-thread rules.
+	// Upload decisions need only this bit; GPU ownership is checked separately by their callers.
+	[[nodiscard]] bool QueryCpuDirtyRelaxed(uint64_t vaddr, uint64_t size, bool& dirty) const;
 	// IsRegionGpuModified without the region locks, on the regions' lock-free mirrors of their
 	// GPU-dirty bits (RegionManager::IsGpuModifiedRelaxed). Any thread. A hint: a transition racing
 	// it may or may not be seen, as with a locked query made a moment earlier or later.

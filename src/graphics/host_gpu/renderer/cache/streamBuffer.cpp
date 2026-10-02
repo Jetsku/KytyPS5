@@ -6,8 +6,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/vramStats.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -59,7 +61,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
-               bool transfer_shared)
+               bool transfer_shared, bool host_cached, bool sparse_residency)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -74,10 +76,37 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
 		buffer_info.pQueueFamilyIndices   = families.data();
 	}
+	if (sparse_residency) {
+		// No memory here: the owner binds pages to the ranges it uses (unbound ranges read zero).
+		EXIT_IF(!graphics.sparse_residency_buffer_enabled || usage != MemoryUsage::DeviceLocal ||
+		        host_cached || static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress));
+		buffer_info.flags =
+		    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		vk::Buffer sparse_buffer = nullptr;
+		RequireVulkanSuccess(graphics.device.createBuffer(&buffer_info, nullptr, &sparse_buffer),
+		                     "create sparse residency buffer");
+		m_buffer = sparse_buffer;
+		m_sparse = true;
+		return;
+	}
 
+	// Buffers with device addresses (every guest buffer) take dedicated memory, a driver allocation
+	// each. KYTY_BDA_SHARED_BLOCKS=1 (default off) lets the ones up to 64 MiB share VMA's memory
+	// blocks instead: nothing needs the allocation's offset to be 0. The BDA page table stores
+	// BufferDeviceAddress() + page offset per page (BufferCache::ChangeRegister), and
+	// vkGetBufferDeviceAddress already includes the placement; mapped pointers come from VMA's
+	// pMappedData and flushes/invalidates go through vmaFlush/InvalidateAllocation, both
+	// allocation-relative. The allocator was created with VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+	// so its blocks carry the device-address flag.
+	static const bool shared_blocks = [] {
+		const auto* value = std::getenv("KYTY_BDA_SHARED_BLOCKS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	static constexpr uint64_t SharedBlockMax = 64ull * 1024 * 1024;
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && !(shared_blocks && size <= SharedBlockMax) ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	                                                          : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -85,6 +114,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (host_cached) {
+		allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
+		                        VMA_ALLOCATION_CREATE_MAPPED_BIT |
+		                        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		allocation_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                                VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+		allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -111,11 +149,32 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
 	}
+	if (VramStats::Enabled()) {
+		const auto kind = cpu_address != 0              ? VramStats::Kind::GuestBuffer
+		                  : usage != MemoryUsage::DeviceLocal ? VramStats::Kind::RingBuffer
+		                                                      : VramStats::Kind::OtherBuffer;
+		m_vram_bytes        = static_cast<uint64_t>(allocation_result.size);
+		m_vram_kind         = static_cast<uint8_t>(kind);
+		m_vram_device_local = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+		VramStats::Note(kind, m_vram_device_local, static_cast<int64_t>(m_vram_bytes));
+		VramStats::RegisterBuffer(this, {m_vram_bytes, cpu_address, static_cast<uint8_t>(usage),
+		                                 m_vram_device_local, host_cached});
+	}
 }
 
 Buffer::~Buffer() {
+	if (m_vram_bytes != 0) {
+		VramStats::Note(static_cast<VramStats::Kind>(m_vram_kind), m_vram_device_local,
+		                -static_cast<int64_t>(m_vram_bytes));
+		VramStats::UnregisterBuffer(this);
+	}
 	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		if (m_sparse) {
+			// The owner frees the bound pages (after this, or before: the buffer is no longer used).
+			m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		} else {
+			vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		}
 	}
 }
 
@@ -235,8 +294,10 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size, bool transfer_shared, vk::BufferUsageFlags extra_flags)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_flags, size, transfer_shared),
+                           uint64_t size, bool transfer_shared, vk::BufferUsageFlags extra_flags,
+                           bool host_cached)
+    : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_flags, size, transfer_shared,
+             host_cached),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

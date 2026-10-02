@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -274,13 +275,12 @@ void CommandScheduler::PopPendingOperations() {
 	PopOperations(true);
 }
 
-// KYTY_PENDING_OPS_NOWAIT (default on; =0 waits as PopPendingOperations does).
+// KYTY_PENDING_OPS_NOWAIT (default on; =0 waits as PopPendingOperations does). Live switch
+// (common/liveSwitch.h): each call picks one of two valid behaviours.
+static Live::Switch g_pending_ops_nowait("KYTY_PENDING_OPS_NOWAIT", Live::ParseDefaultOn);
+
 static bool PendingOpsNoWait() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_PENDING_OPS_NOWAIT");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+	return g_pending_ops_nowait.On();
 }
 
 void CommandScheduler::PopReadyOperations() {
@@ -294,6 +294,20 @@ bool CommandScheduler::PriorityDoneLocked(uint64_t tick) const noexcept {
 	return !active_before_or_at && !queued_before_or_at;
 }
 
+// KYTY_PENDING_REFRESH_US=<n> (default 0: off; BryanKAdams/KytyPS5 e4a7551): the non-waiting pop
+// at draw entry (PopReadyOperations) queries the GPU's progress (vkGetSemaphoreCounterValue) at
+// most once per n microseconds; between queries it runs what the last known progress allows. The
+// operations are deletions, recycling and fault-buffer processing that nothing waits for; every
+// blocking pop, explicit wait and allocation path queries as before. Live switch
+// (common/liveSwitch.h): a parameter read at every pop.
+static Live::Switch g_pending_refresh_us("KYTY_PENDING_REFRESH_US", [](const char* value) -> int64_t {
+	return value == nullptr ? 0 : static_cast<int64_t>(std::strtoull(value, nullptr, 10));
+});
+
+static uint64_t PendingRefreshIntervalNs() {
+	return static_cast<uint64_t>(g_pending_refresh_us.Get()) * 1000u;
+}
+
 void CommandScheduler::PopOperations(bool wait_for_priority) {
 	if (Common::RendererBatchEnabled()) {
 		uint64_t first_tick = 0;
@@ -305,7 +319,16 @@ void CommandScheduler::PopOperations(bool wait_for_priority) {
 		// A callback on the recording tick cannot have completed. Known completed
 		// ticks need no driver query; explicit waits and allocation paths still refresh.
 		if (first_tick >= CurrentTick()) return;
-		if (!m_master.IsFree(first_tick)) m_master.Refresh();
+		if (!m_master.IsFree(first_tick)) {
+			if (const auto interval = PendingRefreshIntervalNs(); interval != 0 && !wait_for_priority) {
+				// The operations are queued in tick order: with the first one not known complete,
+				// none is, until the next query.
+				const auto now = GpuTiming::NowNs();
+				if (now - m_last_pending_refresh_ns < interval) return;
+				m_last_pending_refresh_ns = now;
+			}
+			m_master.Refresh();
+		}
 	} else {
 		m_master.Refresh();
 	}
@@ -499,13 +522,14 @@ void CommandScheduler::DrainPriorityOperations() {
 }
 
 // KYTY_PRIORITY_WAIT_SPIN_US (default 0): WaitPriorityOperations spins this long before blocking.
+// Live switch (common/liveSwitch.h), read at each wait.
+static Live::Switch g_priority_wait_spin_us("KYTY_PRIORITY_WAIT_SPIN_US", [](const char* value) -> int64_t {
+	const auto us = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+	return static_cast<int64_t>(std::min<unsigned long long>(us, 100'000ull));
+});
+
 static uint64_t PriorityWaitSpinNs() {
-	static const uint64_t spin_ns = [] {
-		const auto* value = std::getenv("KYTY_PRIORITY_WAIT_SPIN_US");
-		const auto  us    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
-		return std::min<unsigned long long>(us, 100'000ull) * 1000u;
-	}();
-	return spin_ns;
+	return static_cast<uint64_t>(g_priority_wait_spin_us.Get()) * 1000u;
 }
 
 static void PriorityWaitRelax() {
@@ -766,6 +790,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		}
 	}
 
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpDeviceLossDiagnostics(graphics, tick);
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,

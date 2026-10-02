@@ -124,6 +124,11 @@ struct Totals {
 	std::atomic<uint64_t> cert_ranges_prebuilt {0};
 	std::atomic<uint64_t> cert_ranges_verify_checks {0};
 	std::atomic<uint64_t> cert_ranges_verify_mismatches {0};
+	// KYTY_CP_SEQ_PREFETCH (P3c): slots published by a speculative parse, adopted by the real
+	// parse, and retired unused (SkipSlots).
+	std::atomic<uint64_t> prefetch_published {0};
+	std::atomic<uint64_t> prefetch_adopted {0};
+	std::atomic<uint64_t> prefetch_skipped {0};
 };
 [[nodiscard]] Totals& GetTotals();
 
@@ -231,9 +236,44 @@ public:
 	                               const HW::Shader& shaders,
 	                               const std::function<bool()>& wait_for_space);
 	[[nodiscard]] bool WindowHasSpace() const noexcept;
+	// Sequencer, diagnostics: it passed a barrier (kind 1, a lockstep op) or another stop (kind 2:
+	// a submission start, the frame fence, a handoff, a pending CP write); the next published draw
+	// is marked as the first after it (FrameEvent DrawPrepCommitWaitsBarrier/Start,
+	// CpSeqBarrierDrawBursts). A barrier outranks another stop.
+	void NoteStop(uint8_t kind) noexcept {
+		if (m_stop_pending != 1) {
+			m_stop_pending = kind;
+		}
+	}
 	// Resolver: commits the draw at window position `position` (the head), recorded with
 	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
 	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
+
+	// P3c (KYTY_CP_SEQ_PREFETCH, cpOps.h): the sequencer's speculative parse past a wait publishes
+	// draws without ops. Each such slot carries the number of packets and the hash of every byte
+	// the speculative parse consumed from the wait up to and including the draw packet
+	// (`packets`, `inputs`). The front's state is a deterministic function of its state at the wait
+	// and those bytes, so the real parse's draw with the same packets and hash has the same
+	// registers and arguments, and the slot's preparation is the one it would publish.
+	// Sequencer: publishes a speculative slot unless the window is full (false, nothing done).
+	[[nodiscard]] bool PublishSpeculative(const DrawIndexArgs* index_args,
+	                                      const DrawAutoArgs* auto_args, const HW::Context& context,
+	                                      const HW::UserConfig& user_config,
+	                                      const HW::Shader& shaders, uint64_t packets,
+	                                      uint64_t inputs);
+	// Sequencer: speculative slots not adopted or dropped yet.
+	[[nodiscard]] uint64_t SpeculativeSlots() const noexcept;
+	enum class Adoption : uint8_t { None, Adopted, Dropped };
+	// Sequencer, before publishing a draw: None (no speculative slot), Adopted (the next one has the
+	// draw's packets and inputs: `position` is its window position, publish nothing), or Dropped
+	// (it differs: every speculative slot is given up, `dropped` of them, which the caller hands
+	// to the resolver as a SkipSlots op before it publishes the draw).
+	[[nodiscard]] Adoption TryAdopt(uint64_t packets, uint64_t inputs, uint64_t& position,
+	                                uint64_t& dropped);
+	// Sequencer: gives up every speculative slot (a barrier, the stream end); returns how many.
+	[[nodiscard]] uint64_t DropSpeculative();
+	// Resolver: retires `count` head slots without drawing (their SkipSlots op).
+	void SkipPublished(uint64_t count);
 
 	// Per-packet hook of the command processor (before the packet's handler runs). fence_kind
 	// only matters for a fence (counted as FrameEvent DrawPrepFence<kind>).
@@ -259,6 +299,10 @@ private:
 	std::unique_ptr<Slot>    m_inline_slot;
 	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
 	uint64_t                 m_draws_since_fence = 0;
+	uint8_t                  m_stop_pending      = 0; // sequencer only (NoteStop)
+	// P3c, sequencer only: the window position of the real parse's next draw; the slots from here
+	// to the window's tail are speculative.
+	uint64_t                 m_real_tail = 0;
 };
 
 } // namespace DrawPrep

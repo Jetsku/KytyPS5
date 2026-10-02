@@ -4,12 +4,16 @@
 #include "common/cpuPlacement.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
@@ -80,7 +84,9 @@ bool HasActivePixelShader(const RegisterSnapshot& registers) {
 	const auto& ctx     = registers.context;
 	const auto& sh_regs = ctx.GetShaderRegisters();
 	const auto& db      = sh_regs.db_shader_control;
-	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
+	const bool  has_color_output = SkipInactivePixelShadersEnabled()
+	                                   ? DrawColorOutputFilter(ctx) != 0
+	                                   : (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
 	const bool  side_effects = db.shader_kill_enable || db.shader_z_export_enable ||
 	                          db.shader_mask_export_enable || db.shader_dual_export_enable ||
 	                          db.shader_execute_on_noop;
@@ -90,9 +96,11 @@ bool HasActivePixelShader(const RegisterSnapshot& registers) {
 void TargetExportMapping(const HW::Context&                              ctx,
                          std::array<Prospero::ColorComponentMapping, 8>& mapping) {
 	mapping = {};
+	const auto output_filter = DrawColorOutputFilter(ctx);
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
-		if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0) {
+		if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+		    (output_filter & (1u << slot)) != 0) {
 			mapping[slot] = TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                             rt.info.channel_order)
 			                    .export_mapping;
@@ -434,9 +442,13 @@ static ValidateResult ValidateValues(const ReadSet& reads) {
 //   with changed bytes: 0 in all five Run A scenes).
 // - value: every coalesced read range must be clean for a backing read now and hold the recorded
 //   bytes, and every digest range must hash to the recorded digest. Sound on its own (readSet.h).
+// Per-reason fallback counts for the periodic console line (PrintDrawPrepSummary).
+std::array<std::atomic<uint64_t>, static_cast<size_t>(Failure::Mismatch) + 1u> g_fallback_reasons;
+
 bool Validate(PreparedDraw& prepared, bool pixel_active,
               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping) {
 	const auto fail = [&](Failure failure) {
+		g_fallback_reasons[static_cast<size_t>(failure)].fetch_add(1, std::memory_order_relaxed);
 		prepared.failure = failure;
 		Profiler::CountFrameEvent(FallbackEvent(failure));
 		g_totals.fallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -630,16 +642,32 @@ struct Engine::Slot {
 	BindingPlan      plan;
 	bool             eligible        = false; // DrawReachesPrograms, decided at submission
 	bool             worker_prepared = false;
+	// P3b diagnostics: the first draw the sequencer published after one of its stops
+	// (Engine::NoteStop: 1 a barrier, 2 another stop); classifies a commit wait on this slot
+	// (DrawPrepCommitWaitsBarrier / DrawPrepCommitWaitsStart).
+	uint8_t          after_stop = 0;
+	// P3c (Engine::PublishSpeculative): published by a speculative parse; the packets and the hash
+	// of the bytes it consumed from its wait to this draw (the adoption key).
+	bool             speculative   = false;
+	uint64_t         spec_packets  = 0;
+	uint64_t         spec_inputs   = 0;
 	// KYTY_CP_REPEAT_TRACE (repeatTrace.h): the draw's input hashes, filled by the preparing thread,
 	// and the guest address of its draw packet.
 	RepeatTrace::DrawRecord repeat;
 	uint64_t                repeat_packet = 0;
+	// KYTY_DRAW_RUN (drawRun.h): the structure key of the preparation, by the preparing thread.
+	uint64_t run_key = 0;
 };
 
 namespace {
 
-// After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs.
+// After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs, and the
+// run key (KYTY_DRAW_RUN).
 void HashForRepeatTrace(Engine::Slot& slot) {
+	slot.run_key = DrawRun::Enabled() ? DrawRun::StructureKey(slot.registers.context,
+	                                                          slot.registers.user_config,
+	                                                          slot.prepared)
+	                                  : 0;
 	if (!RepeatTrace::Enabled()) [[likely]] {
 		return;
 	}
@@ -718,9 +746,10 @@ private:
 // others park until the unclaimed backlog reaches KYTY_DRAW_PREP_WAKE_BACKLOG.
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
-	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal)
+	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal,
+	        bool cold_token)
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
-	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog) {
+	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token) {
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
@@ -819,14 +848,17 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		steal.min_unclaimed  = EnvUnsigned("KYTY_DRAW_PREP_STEAL", 0, 0, 1024);
 		const auto steal_us  = EnvUnsigned("KYTY_DRAW_PREP_STEAL_AFTER_US", 0, 0, 1000000);
 		steal.after_ns       = uint64_t {steal_us} * 1000u;
+		// KYTY_DRAW_PREP_COLD_TOKEN=1: the cold-wake protocol whose wakes cannot stick
+		// (workerGate.h); with the default one the cold workers stop waking after a race.
+		const bool cold_token = EnvUnsigned("KYTY_DRAW_PREP_COLD_TOKEN", 0, 0, 1) != 0;
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
-		                                      uint64_t {cold_spin_us} * 1000u, steal);
+		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token);
 		m_workers->plan_context = MakeBindingPlanContext(m_renderer);
 		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
-		     "cold_spin=%uus steal=%u steal_after=%uus cert=%s verify=%d\n",
+		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d\n",
 		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
-		     wake_backlog, cold_spin_us, steal.min_unclaimed, steal_us,
+		     wake_backlog, cold_spin_us, cold_token ? 1 : 0, steal.min_unclaimed, steal_us,
 		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
 	}
 }
@@ -862,6 +894,8 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
 	slot.registers.shaders     = shaders;
 	slot.eligible        = DrawReachesPrograms(context, user_config, shaders, count, instances);
 	slot.worker_prepared = false;
+	slot.after_stop      = 0;
+	slot.speculative     = false;
 	slot.repeat_packet   = RepeatTrace::Enabled() ? RepeatTrace::TakeDrawPacket() : 0;
 }
 
@@ -892,6 +926,7 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 	}
 	FillSlot(window.Reserve(), submit_id, index_args, auto_args, context, user_config, shaders);
 	window.Publish();
+	m_real_tail = window.Tail(); // no speculative slots outside thread mode
 	m_workers->Wake();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepPublished);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepWindowOccupancy, window.Occupancy());
@@ -904,6 +939,8 @@ uint64_t Engine::Publish(const DrawIndexArgs* index_args, const DrawAutoArgs* au
 	EXIT_IF(m_workers == nullptr);
 	EXIT_IF((index_args == nullptr) == (auto_args == nullptr));
 	auto& window = m_workers->window;
+	// Speculative slots are adopted or dropped (TryAdopt, DropSpeculative) before a publish.
+	EXIT_IF(m_real_tail != window.Tail());
 	if (window.Full()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqWindowFull);
 		if (!wait_for_space()) {
@@ -912,8 +949,15 @@ uint64_t Engine::Publish(const DrawIndexArgs* index_args, const DrawAutoArgs* au
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSubmitted);
 	const auto position = window.Tail();
+	m_real_tail         = position + 1u;
 	// The submission id is the resolver's (CommitPublished); the repeat trace is off in this mode.
-	FillSlot(window.Reserve(), 0, index_args, auto_args, context, user_config, shaders);
+	auto& slot = window.Reserve();
+	FillSlot(slot, 0, index_args, auto_args, context, user_config, shaders);
+	slot.after_stop = m_stop_pending;
+	if (m_stop_pending == 1) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqBarrierDrawBursts);
+	}
+	m_stop_pending = 0;
 	window.Publish();
 	m_workers->Wake();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepPublished);
@@ -923,6 +967,84 @@ uint64_t Engine::Publish(const DrawIndexArgs* index_args, const DrawAutoArgs* au
 
 bool Engine::WindowHasSpace() const noexcept {
 	return m_workers != nullptr && !m_workers->window.Full();
+}
+
+bool Engine::PublishSpeculative(const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args,
+                                const HW::Context& context, const HW::UserConfig& user_config,
+                                const HW::Shader& shaders, uint64_t packets, uint64_t inputs) {
+	EXIT_IF(m_workers == nullptr);
+	EXIT_IF((index_args == nullptr) == (auto_args == nullptr));
+	auto& window = m_workers->window;
+	if (window.Full()) {
+		return false;
+	}
+	auto& slot = window.Reserve();
+	FillSlot(slot, 0, index_args, auto_args, context, user_config, shaders);
+	slot.speculative  = true;
+	slot.spec_packets = packets;
+	slot.spec_inputs  = inputs;
+	window.Publish();
+	m_workers->Wake();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchDraws);
+	g_totals.prefetch_published.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+uint64_t Engine::SpeculativeSlots() const noexcept {
+	return m_workers != nullptr ? m_workers->window.Tail() - m_real_tail : 0u;
+}
+
+Engine::Adoption Engine::TryAdopt(uint64_t packets, uint64_t inputs, uint64_t& position,
+                                  uint64_t& dropped) {
+	if (SpeculativeSlots() == 0) {
+		return Adoption::None;
+	}
+	auto& window = m_workers->window;
+	// The slot's key fields were written by this thread (the speculative publish).
+	const auto& slot = window.PayloadAt(m_real_tail);
+	if (slot.spec_packets == packets && slot.spec_inputs == inputs &&
+	    CpSeq::PrefetchMode() != 2) {
+		position = m_real_tail++;
+		// Diagnostics: the first draw after the stop was prepared ahead (not a burst start).
+		m_stop_pending = 0;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSubmitted);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepPublished);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchAdopted);
+		g_totals.prefetch_adopted.fetch_add(1, std::memory_order_relaxed);
+		return Adoption::Adopted;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchMismatches);
+	dropped = DropSpeculative();
+	return Adoption::Dropped;
+}
+
+uint64_t Engine::DropSpeculative() {
+	const auto count = SpeculativeSlots();
+	if (count != 0) {
+		m_real_tail = m_workers->window.Tail();
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchSkipped, count);
+		g_totals.prefetch_skipped.fetch_add(count, std::memory_order_relaxed);
+	}
+	return count;
+}
+
+void Engine::SkipPublished(uint64_t count) {
+	EXIT_IF(!GuestGpu::IsGpuThread() || m_workers == nullptr);
+	auto& window = m_workers->window;
+	for (uint64_t i = 0; i < count; i++) {
+		EXIT_IF(window.Empty());
+		auto& slot = window.HeadPayload();
+		if (!window.TryClaimHead()) {
+			// A worker prepares it (or has): its preparation is discarded once it is done.
+			while (!window.HeadDone()) {
+				CpuRelax();
+			}
+		}
+		// Claimed or done (acquired): the slot is this thread's until it retires.
+		EXIT_IF(!slot.speculative);
+		slot.plan.Reset();
+		window.Retire();
+	}
 }
 
 void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count) {
@@ -958,6 +1080,11 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
+		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
+		const auto occupancy = window.Occupancy();
+		if (window.Unclaimed() != 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsUnclaimed);
+		}
 		// A worker holds the head. KYTY_DRAW_PREP_STEAL: meanwhile this thread prepares the next
 		// unclaimed slots exactly as a worker does (AwaitHead, workerGate.h): same function, the
 		// workers' clean hint, CheckActive armed, Done published with a release store. They are
@@ -987,6 +1114,24 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
+		// The head is done (acquired): its publication fields are visible.
+		if (slot.speculative) {
+			// P3c: an adopted slot whose speculative preparation had not finished yet.
+			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchAdoptedWaits);
+		}
+		if (slot.after_stop == 1) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsBarrier);
+			Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWaitBarrier, 1, stats.spin_ns);
+		} else if (slot.after_stop == 2) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsStart);
+			Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWaitStart, 1, stats.spin_ns);
+		} else if (occupancy <= 2) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsShallow);
+			Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWaitShallow, 1, stats.spin_ns);
+		} else {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsDeep);
+			Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWaitDeep, 1, stats.spin_ns);
+		}
 		if (stats.stolen != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
 		}
@@ -1010,8 +1155,55 @@ void Engine::Drain() {
 	}
 }
 
+// One console line every 10 s (command processor thread): draws committed from a worker's
+// preparation against draws that fell back to the serial path, and why. Fallbacks run the whole
+// program preparation on the command processor, so the ratio says how much of it is avoidable.
+namespace {
+void PrintDrawPrepSummary() {
+	static uint64_t last_ns        = 0;
+	static uint64_t last_committed = 0;
+	static uint64_t last_fallbacks = 0;
+	static std::array<uint64_t, static_cast<size_t>(Failure::Mismatch) + 1u> last_reasons {};
+	// KYTY_CP_COMMIT=draws: the clock is read every 256th commit (the line is due every 10 s).
+	static uint32_t calls = 0;
+	if (CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
+		return;
+	}
+	const auto now = NowNs();
+	if (last_ns == 0) {
+		last_ns = now;
+		return;
+	}
+	if (now - last_ns < 10'000'000'000ull) {
+		return;
+	}
+	const auto committed = g_totals.committed.load(std::memory_order_relaxed);
+	const auto fallbacks = g_totals.fallbacks.load(std::memory_order_relaxed);
+	static const char* const names[] = {"none",       "ineligible", "unclean",     "backing",
+	                                    "overflow",   "inconsistent", "uncertified", "notpublished",
+	                                    "shadermap",  "certunclean", "certchanged", "coherencelog",
+	                                    "mismatch"};
+	std::string reasons;
+	for (size_t i = 1; i < last_reasons.size(); i++) {
+		const auto value = g_fallback_reasons[i].load(std::memory_order_relaxed);
+		if (value != last_reasons[i]) {
+			reasons += " " + std::string(names[i]) + "=" + std::to_string(value - last_reasons[i]);
+			last_reasons[i] = value;
+		}
+	}
+	std::printf("DrawPrep %.0fs: %" PRIu64 " committed from a prepared slot, %" PRIu64
+	            " fell back to the serial path;%s\n",
+	            static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
+	            fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str());
+	last_ns        = now;
+	last_committed = committed;
+	last_fallbacks = fallbacks;
+}
+} // namespace
+
 void Engine::Commit(Slot& slot) {
 	Profiler::ScopedFrameWait commit_time(Profiler::FrameWait::DrawPrepCommit);
+	CommitStats::BeginDraw();
 	auto&      scheduler = m_renderer.GetCommandScheduler();
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto previous  = scheduler.BindRegisters(slot.registers.context,
@@ -1022,11 +1214,16 @@ void Engine::Commit(Slot& slot) {
 	// accepted the preparation it was computed from.
 	executor.m_binding_plan        = slot.plan.valid ? &slot.plan : nullptr;
 	executor.m_binding_plan_active = false;
+	// KYTY_DRAW_RUN (drawRun.h): the draw is an engine commit with this structure key.
+	executor.m_run_key          = slot.run_key;
+	executor.m_in_engine_commit = true;
 	if (slot.kind == DrawKind::Index) {
 		executor.DrawIndex(slot.submit_id, scheduler.Current(), slot.index_args);
 	} else {
 		executor.DrawAuto(slot.submit_id, scheduler.Current(), slot.auto_args);
 	}
+	executor.m_in_engine_commit = false;
+	executor.m_run_key          = 0;
 	if (slot.plan.valid) {
 		CountCommittedPlan(executor.m_binding_plan_active);
 		slot.plan.Reset();
@@ -1051,6 +1248,9 @@ void Engine::Commit(Slot& slot) {
 	if (m_after_commit) {
 		m_after_commit();
 	}
+	CommitStats::EndDraw();
+	PrintDrawPrepSummary();
+	DrawRun::PrintSummary();
 }
 
 void Engine::NoteFence() {

@@ -25,16 +25,18 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	vk::Sampler GetSampler(const ShaderSamplerResource& r);
-	// The sampler GetSampler returns for these dwords when it was created already, null otherwise
-	// (lookup only: nothing is created). Samplers are never evicted, so a handle found stays the
-	// answer for the cache's lifetime. Any thread (DrawPrep binding plans).
-	[[nodiscard]] vk::Sampler FindSampler(const ShaderSamplerResource& r);
+	// integer_border: the sampler reads integer images (IR::SamplerResource::integer_border), so a
+	// border colour must be the integer variant.
+	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool integer_border);
+	// The sampler GetSampler returns for these dwords and border class when it was created
+	// already, null otherwise (lookup only: nothing is created). Samplers are never evicted, so a
+	// handle found stays the answer for the cache's lifetime. Any thread (DrawPrep binding plans).
+	[[nodiscard]] vk::Sampler FindSampler(const ShaderSamplerResource& r, bool integer_border);
 	// Unique per cache object for the process lifetime (per-thread lookup memos key on it).
 	[[nodiscard]] uint64_t InstanceId() const noexcept { return m_instance; }
 
 private:
-	using SamplerKey = std::array<uint32_t, 4>;
+	using SamplerKey = std::array<uint32_t, 5>;
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

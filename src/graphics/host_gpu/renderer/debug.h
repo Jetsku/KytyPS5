@@ -26,6 +26,13 @@ struct ScissorRect {
 };
 
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
+// KYTY_SKIP_INACTIVE_PS=1 (default off; upstream 6956b454f): a colour target counts as written
+// only when the pixel shader's export format for it (SPI_SHADER_COL_FORMAT) is not ZERO, so a
+// pixel shader that writes no such target and has no depth or coverage side effects does not run.
+[[nodiscard]] bool       SkipInactivePixelShadersEnabled();
+// Slots written with KYTY_SKIP_INACTIVE_PS: CB_TARGET_MASK & CB_SHADER_MASK nonzero and a nonzero
+// export format. 0xff without the flag (no slot excluded). Any thread.
+[[nodiscard]] uint32_t   DrawColorOutputFilter(const HW::Context& ctx);
 uint32_t                 render_target_first_bound_slot(const CommandBuffer& buffer);
 bool                     graphics_debug_dump_enabled();
 void                     uc_print(const char* func, const HW::UserConfig& uc);

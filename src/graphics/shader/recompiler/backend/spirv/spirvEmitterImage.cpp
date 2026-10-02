@@ -739,15 +739,15 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicSMin32: return spv::OpAtomicSMin;
 		case IR::ValueOpcode::ImageAtomicUMin32: return spv::OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicSMax32: return spv::OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicUMax32: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
 		case IR::ValueOpcode::ImageAtomicISub32: return spv::OpAtomicISub;
 		// R32ui texel pointers: SMin/SMax interpret the unsigned bits as signed.
-		case IR::ValueOpcode::ImageAtomicSMin32: return spv::OpAtomicSMin;
-		case IR::ValueOpcode::ImageAtomicSMax32: return spv::OpAtomicSMax;
 		// Compare-exchange and wrapping inc/dec are expanded by EmitImage.
 		case IR::ValueOpcode::ImageAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::ImageAtomicInc32:
@@ -1354,7 +1354,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
-	if (atomic_opcode != spv::OpNop) {
+	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
 		const auto exec_arg = inst.NumArgs() - 1;
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, exec_arg), [&]() {
@@ -1376,6 +1376,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                                          : AtomicDecrement(state, old, limit);
 				                               });
 			           }
+			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
+			               op == IR::ValueOpcode::ImageAtomicFMax32) {
+				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
+				                               [&](uint32_t old) {
+					                               return EmitFloatAtomicReplacement(
+					                                   state, old, ctx.Arg(inst, 2),
+					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
+				                               });
+			           }
 			           const auto old = state.builder.AllocateId();
 			           if (op == IR::ValueOpcode::ImageAtomicCmpSwap32) {
 				           // DATA[0] is stored when the texel equals the comparator in DATA[1].
@@ -1391,7 +1400,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
 				                                     ctx.Arg(inst, 2));
 			           }
-			           EmitDeviceAtomicMemoryBarrier(state);
+			           // This pointer names storage-image memory, not a storage buffer.
+			           state.builder.AddFunction(
+			               spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+			               ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+			                                     spv::MemorySemanticsImageMemoryMask));
 			           return old;
 		           }));
 		return;

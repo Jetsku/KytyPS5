@@ -55,6 +55,10 @@ public:
 	}
 
 	[[nodiscard]] Payload& HeadPayload() noexcept { return m_slots[Head() & m_mask].payload; }
+	// The payload of a published position in [Head(), Tail()) (P3c: a speculative slot's key).
+	[[nodiscard]] const Payload& PayloadAt(uint64_t seq) const noexcept {
+		return m_slots[seq & m_mask].payload;
+	}
 
 	// Claims the head for the producer when no worker has; true when it did.
 	[[nodiscard]] bool TryClaimHead() noexcept {

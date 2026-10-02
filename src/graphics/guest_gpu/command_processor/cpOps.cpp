@@ -49,6 +49,33 @@ bool PacketHashing() {
 	return enabled;
 }
 
+int PrefetchMode() {
+	static const int mode = [] {
+		const auto* value = EnvValue("KYTY_CP_SEQ_PREFETCH");
+		if (value == nullptr || std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0) {
+			return 0;
+		}
+		if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0) {
+			return 1;
+		}
+		if (std::strcmp(value, "mismatch") == 0) {
+			return 2;
+		}
+		EXIT("KYTY_CP_SEQ_PREFETCH must be 0, 1 or mismatch (got '%s')\n", value);
+		return 0;
+	}();
+	return mode;
+}
+
+uint32_t PrefetchDraws() {
+	static const uint32_t draws = [] {
+		const auto* value = EnvValue("KYTY_CP_SEQ_PREFETCH_DRAWS");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 16ul;
+		return static_cast<uint32_t>(parsed < 1ul ? 1ul : (parsed > 1024ul ? 1024ul : parsed));
+	}();
+	return draws;
+}
+
 VerifyTotals& GetVerifyTotals() {
 	static VerifyTotals totals;
 	return totals;
@@ -81,6 +108,7 @@ const char* OpKindName(OpKind kind) noexcept {
 		case OpKind::StreamEnd: return "StreamEnd";
 		case OpKind::Handoff: return "Handoff";
 		case OpKind::LockstepRead: return "LockstepRead";
+		case OpKind::SkipSlots: return "SkipSlots";
 		case OpKind::Count: break;
 	}
 	return "?";
@@ -113,6 +141,7 @@ uint32_t PayloadSize(OpKind kind) noexcept {
 		case OpKind::StreamEnd: return sizeof(StreamEndOp);
 		case OpKind::Handoff: return sizeof(HandoffOp);
 		case OpKind::LockstepRead: return sizeof(LockstepReadOp);
+		case OpKind::SkipSlots: return sizeof(SkipSlotsOp);
 		case OpKind::Count: break;
 	}
 	return 0;

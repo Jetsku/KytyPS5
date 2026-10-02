@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/stringUtils.h"
@@ -18,9 +19,12 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
@@ -392,8 +396,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
+	                              resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage ||
+	    raw_sint_storage || raw_float_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -594,19 +600,50 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& description,
-                                          uint32_t                      view_levels) {
+static bool ResolveTextureMipView(const TileSurfaceDescription& description, bool metadata,
+                                   uint32_t view_levels, uint32_t& levels, uint32_t& base_level) {
 	TileSurfaceLayout physical {};
 	TileSurfaceLayout view {};
 	auto              view_description = description;
-	view_description.levels            = view_levels;
-	return TileGetTiledTextureLayout(description, physical) &&
-	       TileGetTiledTextureLayout(view_description, view) &&
-	       physical.first_tail_level == view.first_tail_level &&
-	       physical.block_slice_size == view.block_slice_size &&
-	       physical.total_size == view.total_size &&
-	       std::equal(std::begin(physical.mips), std::begin(physical.mips) + description.levels,
-	                  std::begin(view.mips));
+	view_description.levels            = levels;
+	if (!TileGetTiledTextureLayout(description, physical) ||
+	    !TileGetTiledTextureLayout(view_description, view)) {
+		return false;
+	}
+	if (physical.first_tail_level == view.first_tail_level &&
+	    physical.block_slice_size == view.block_slice_size &&
+	    physical.total_size == view.total_size &&
+	    std::equal(std::begin(physical.mips), std::begin(physical.mips) + description.levels,
+	               std::begin(view.mips))) {
+		return true;
+	}
+	if (metadata || ((description.layers > 1 || description.depth > 1) &&
+	                 physical.block_slice_size != view.block_slice_size)) {
+		return false;
+	}
+	// T# addresses the last mip. A view can select the same stored subresources
+	// with different mip indices; inaccessible mips need no host representation.
+	for (uint32_t base = 0; base + view_levels <= description.levels; ++base) {
+		bool matches = true;
+		for (uint32_t i = 0; i < view_levels; ++i) {
+			const auto source = base_level + i;
+			const auto target = base + i;
+			if (physical.mips[target] != view.mips[source] ||
+			    (target >= physical.first_tail_level) != (source >= view.first_tail_level) ||
+			    std::max(description.width >> target, 1u) != std::max(description.width >> source, 1u) ||
+			    std::max(description.height >> target, 1u) != std::max(description.height >> source, 1u) ||
+			    std::max(description.depth >> target, 1u) != std::max(description.depth >> source, 1u)) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) {
+			levels     = description.levels;
+			base_level = base;
+			return true;
+		}
+	}
+	return false;
 }
 
 static TextureCache::ImageDesc BuildTextureDescription(
@@ -627,7 +664,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	const auto view_levels = multisampled || single_storage_mip
 	                             ? 1u
 	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
-	const auto levels =
+	auto levels =
 	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
@@ -667,12 +704,13 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
+	auto          view_base    = static_cast<uint32_t>(base_level);
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
 		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
-		// Texture mip views take precedence over the resource count, but must keep its storage layout.
-		if (!TextureViewPreservesMipLayout(physical, levels)) {
+		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
+		                           view_levels, levels, view_base)) {
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,
@@ -727,7 +765,8 @@ static TextureCache::ImageDesc BuildTextureDescription(
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
+	const auto storage_view_format = storage && (resource.atomic ||
+	                                            format == Prospero::BufferFormat::k32SInt)
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
@@ -763,6 +802,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
+	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	return desc;
@@ -814,15 +854,23 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		if (!descriptor.IsNull() && HangTrace::Enabled()) {
 			HangTrace::RecordTexture(descriptor.fields);
 		}
-		if (m_texture_memo.LastHitRevalidated() && TextureBindingMemo::RevalidateVerify()) {
+		const bool dcc_hit = m_texture_memo.LastHitDcc();
+		if ((m_texture_memo.LastHitRevalidated() || dcc_hit) && TextureBindingMemo::RevalidateVerify()) {
 			// KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY: the full resolution (without the memo) must
-			// give the same image and description.
+			// give the same image and description; after a DCC entry's hit (KYTY_CP_COMMIT=texdcc)
+			// its DCC decision must also do nothing (it would clear what the hit did not).
+			const auto     effects = texture_cache.DccDecisionEffects();
 			TextureBinding full;
 			ResolveTextureFull(resource, descriptor, memo_key, hash, false, full);
+			const bool dcc_differs = dcc_hit && texture_cache.DccDecisionEffects() != effects;
 			if (full.image_id != binding.image_id || full.desc.type != binding.desc.type ||
 			    !(full.desc.view_info == binding.desc.view_info) ||
 			    full.desc.info.data != binding.desc.info.data ||
-			    full.desc.info.pixel_format != binding.desc.info.pixel_format) {
+			    full.desc.info.pixel_format != binding.desc.info.pixel_format || dcc_differs) {
+				if (dcc_differs) {
+					std::fprintf(stderr, "TextureMemoRevalidateVerify: a DCC entry's hit skipped a DCC "
+					                     "decision that does something (KYTY_CP_COMMIT=texdcc)\n");
+				}
 				TextureBindingMemo::ReportRevalidateMismatch();
 				binding = std::move(full);
 			}
@@ -902,7 +950,13 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	const auto base_layer = desc.view_info.base_layer;
 	const bool shader_conversion = TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
 	                               Prospero::BufferFormat::kInvalid;
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	// KYTY_CP_COMMIT=texdcc: a DCC description's lookup also records the certificate of its DCC
+	// decision, with which the memo may answer later lookups of this binding
+	// (TextureBindingMemo::Record). Recording changes nothing FindImage does.
+	const bool dcc_memo = memo && desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+	                      CpCommit::Enabled(CpCommit::Part::TexDcc);
+	TextureCache::RepeatLookup dcc_record;
+	auto id = texture_cache.FindImage(desc, shader_conversion, dcc_memo ? &dcc_record : nullptr);
 	const auto found               = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -924,8 +978,9 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	if (memo) {
 		const bool view_rebased =
 		    desc.view_info.base_level != base_level || desc.view_info.base_layer != base_layer;
+		const bool dcc_proven = dcc_memo && dcc_record.valid && dcc_record.image == found;
 		m_texture_memo.Record(texture_cache, memo_key, hash, binding, found, shader_conversion,
-		                      view_rebased);
+		                      view_rebased, dcc_proven ? &dcc_record.dcc : nullptr);
 	}
 }
 
@@ -984,13 +1039,15 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
 vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                           uint32_t                                        index,
                                           const ShaderRecompiler::IR::DescriptorValue&    value) {
-	auto descriptor = NativeSamplerDescriptor(program, index, value);
+	auto       descriptor     = NativeSamplerDescriptor(program, index, value);
+	const bool integer_border = program.info.samplers[index].integer_border;
 	if (!SamplerMemoEnabled()) {
-		return m_context.GetSamplerCache().GetSampler(descriptor);
+		return m_context.GetSamplerCache().GetSampler(descriptor, integer_border);
 	}
-	// Keyed on exactly the SamplerCache key (the four final dwords). SamplerMemoWays entries per
-	// set, most recently used first: the desert stamps bind eight samplers per draw, two of which
-	// shared a direct-mapped slot and missed on every draw (1,815 misses per flip).
+	// Keyed on exactly the SamplerCache key (the four final dwords and the border class).
+	// SamplerMemoWays entries per set, most recently used first: the desert stamps bind eight
+	// samplers per draw, two of which shared a direct-mapped slot and missed on every draw
+	// (1,815 misses per flip).
 	static_assert(sizeof(descriptor.fields) == sizeof(SamplerMemoEntry::fields));
 	const auto slot = (descriptor.fields[0] * 0x9e3779b1u ^ descriptor.fields[1] * 0x85ebca6bu ^
 	                   descriptor.fields[2] * 0xc2b2ae35u ^ descriptor.fields[3]) >>
@@ -1000,7 +1057,7 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 	auto* const set = m_sampler_memo.data() + (slot % sets) * SamplerMemoWays;
 	for (uint32_t way = 0; way < SamplerMemoWays; way++) {
 		auto& entry = set[way];
-		if (entry.sampler != nullptr &&
+		if (entry.sampler != nullptr && entry.integer_border == integer_border &&
 		    std::memcmp(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoHits);
 			const auto sampler = entry.sampler;
@@ -1011,11 +1068,12 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 		}
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoMisses);
-	const auto sampler = m_context.GetSamplerCache().GetSampler(descriptor);
+	const auto sampler = m_context.GetSamplerCache().GetSampler(descriptor, integer_border);
 	// The least recently used way makes room at the front.
 	std::rotate(set, set + SamplerMemoWays - 1, set + SamplerMemoWays);
 	std::memcpy(set[0].fields.data(), descriptor.fields, sizeof(descriptor.fields));
-	set[0].sampler = sampler;
+	set[0].integer_border = integer_border;
+	set[0].sampler        = sampler;
 	return sampler;
 }
 
@@ -1304,7 +1362,8 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings& prepared, DrawPrep::StagePlan* plan) {
+                                     PreparedBindings& prepared, DrawPrep::StagePlan* plan,
+                                     bool keep_images) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -1317,10 +1376,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
-	prepared.samplers.clear();
+	if (!keep_images) {
+		prepared.samplers.clear();
+	}
 	prepared.shader_data.clear();
 	const bool verify = plan != nullptr && DrawPrep::BindingsVerifyMode() != 0;
-	if (!RepeatStageTextures(program, snapshot, prepared)) {
+	// KYTY_DRAW_RUN continuation: the texture and sampler bindings are the previous draw's (the
+	// same program, T# and S# words; RenderExecutor::DrawRunCandidate).
+	if (!keep_images && !RepeatStageTextures(program, snapshot, prepared)) {
 		// KYTY_DRAW_PREP_BINDINGS textures: the memo hashes the preparing worker computed.
 		const auto count  = static_cast<uint32_t>(program.info.images.size());
 		const bool hashes = plan != nullptr && plan->texture_hashes_valid &&
@@ -1397,9 +1460,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// resolved here as before.
 	const bool plan_samplers = plan != nullptr && plan->samplers_valid &&
 	                           plan->samplers.size() == program.info.samplers.size();
-	prepared.samplers.reserve(program.info.samplers.size());
+	if (!keep_images) {
+		prepared.samplers.reserve(program.info.samplers.size());
+	}
 	uint32_t planned_samplers = 0;
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+	for (uint32_t i = 0; !keep_images && i < program.info.samplers.size(); i++) {
 		auto sampler = plan_samplers ? plan->samplers[i] : vk::Sampler {};
 		planned_samplers += sampler != nullptr ? 1u : 0u;
 		if (sampler == nullptr || verify) {
@@ -1755,7 +1820,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				for (auto& binding: images) {
 					binding.mip_views.clear();
 					// Sampled bindings only (TryRepeatViews).
-					texture_cache.GetImage(binding.image_id).usage.texture = true;
+					auto& image         = texture_cache.GetImage(binding.image_id);
+					image.usage.texture = true;
+					texture_cache.NoteExactRangeStaleUse(image, false);
 				}
 				return;
 			}
@@ -1805,7 +1872,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			for (uint32_t j = i; j < i + run; j++) {
 				images[j].mip_views.clear();
 				// Sampled bindings only (TryAcquireView).
-				texture_cache.GetImage(images[j].image_id).usage.texture = true;
+				auto& image         = texture_cache.GetImage(images[j].image_id);
+				image.usage.texture = true;
+				texture_cache.NoteExactRangeStaleUse(image, false);
 			}
 			if (run != 0) {
 				DrawPrep::GetBindingTotals().view_run_hits.fetch_add(run, std::memory_order_relaxed);
@@ -1848,6 +1917,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		texture_cache.NoteExactRangeStaleUse(image, storage);
 		if (verify_runs && i < view_run_end) {
 			// A predicted run hit acquires the entry's view.
 			DrawPrep::CountBindingVerifyCheck();
@@ -1867,7 +1937,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-                                             std::span<RenderColorInfo> colors) {
+                                             std::span<RenderColorInfo> colors, bool keep_images) {
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
@@ -1876,11 +1946,20 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
+	CommitStats::Mark(CommitStats::Phase::FindBuffers);
+	// KYTY_DRAW_RUN continuation: the views and targets are the previous draw's (checked against the
+	// image state after the buffer work, RenderExecutor::DrawRunImagesUnchanged).
 	for (auto* stage: stages) {
+		if (keep_images) {
+			break;
+		}
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
+		if (keep_images) {
+			break;
+		}
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -1894,13 +1973,35 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	CommitStats::Mark(CommitStats::Phase::RebindImages);
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	// The uploads of every stage share one barrier pair (KYTY_UPLOAD_BATCH).
-	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
-	for (auto* stage: stages) {
-		RebindBuffers(*stage);
+	{
+		const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
+		for (auto* stage: stages) {
+			RebindBuffers(*stage);
+		}
 	}
+	CommitStats::Mark(CommitStats::Phase::RebindBuffers);
+}
+
+// KYTY_PUSH_SHADOW_FRESH_SKIP=1 (default off): a push-descriptor update whose stages include a shader
+// data or flattened-SRT upload made for this command (PreparedBindings::fresh_upload) skips the
+// comparison with the update in effect (CommandBuffer::PushDescriptors) and the copy kept for the
+// next comparison: it cannot be equal, since no earlier descriptor of the recording refers to that
+// upload. At the Sky Garden start every one of about 4,000 pushes per flip missed anyway
+// (DescriptorPushMissBuffer/Layout, no DescriptorPushesAvoided), after copying about 1-2 KB of
+// writes and infos for the next comparison.
+// Live switch (common/liveSwitch.h): a per-push choice between two valid behaviours; a push made
+// without a copy leaves the shadow invalid, so the next comparison after switching off starts over.
+static int64_t ParseOnlyOne(const char* value) {
+	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
+}
+static Live::Switch g_push_shadow_fresh_skip("KYTY_PUSH_SHADOW_FRESH_SKIP", ParseOnlyOne);
+
+static bool PushShadowFreshSkipEnabled() {
+	return g_push_shadow_fresh_skip.On();
 }
 
 // Why a renderer push-descriptor update was recorded (FrameEvent.DescriptorPushMiss*).
@@ -1911,6 +2012,10 @@ static void CountDescriptorPushMiss(int32_t result, std::span<const vk::WriteDes
 	}
 	if (result == CommandBuffer::PushMissState) {
 		Profiler::CountFrameEvent(Event::DescriptorPushMissLayout);
+		return;
+	}
+	if (result == CommandBuffer::PushMissFresh) {
+		Profiler::CountFrameEvent(Event::DescriptorPushMissUpload);
 		return;
 	}
 	if (result == CommandBuffer::PushMissShape || result < 0 ||
@@ -2054,7 +2159,8 @@ private:
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
-                                    std::span<PreparedBindings* const> prepared_bindings) {
+                                    std::span<PreparedBindings* const> prepared_bindings,
+                                    bool                               keep_images) {
 	KYTY_PROFILER_FUNCTION();
 	// Run after resource discovery so an unbounded address writer cannot retain a
 	// metadata-inspection memo created during preparation of this same command.
@@ -2104,6 +2210,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
+	// KYTY_DRAW_RUN_PUSH: a continuation pushes only its per-draw descriptors; its image and sampler
+	// descriptors are the previous draw's, still in effect (RenderExecutor::DrawRunPartialPush).
+	const bool partial = keep_images && pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+	                     DrawRunPartialPush(buffer, pipeline);
+	if (partial) {
+		DrawRun::GetTotals().partial_pushes.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -2141,7 +2254,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// KYTY_DRAW_RUN continuation: every image is in the state the previous draw's transitions
+		// left it in (RenderExecutor::DrawRunImagesUnchanged), which the bindings' layouts record.
+		for (uint32_t i = 0; !keep_images && i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
 			const auto&                 view = binding.desc.view_info;
@@ -2194,6 +2309,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
+			if (partial && (binding.kind == BindingKind::Samplers ||
+			                ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
+			                    ShaderRecompiler::IR::ImageResourceClass::None)) {
+				continue;
+			}
 			vk::WriteDescriptorSet write {};
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
 			write.descriptorType = NativeDescriptorType(binding.kind);
@@ -2264,7 +2384,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			m_descriptor_writes.push_back(write);
 		}
-		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
+		for (uint32_t i = 0; !partial && i < descriptors.images.size(); i++) {
 			const auto expected =
 			    descriptors.images[i].mip_views.empty()
 			        ? 1u
@@ -2320,9 +2440,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 		if (pipeline.uses_push_descriptors) {
+			// KYTY_PUSH_SHADOW_FRESH_SKIP: a stage's shader data or flattened SRT was uploaded for
+			// this command, so its descriptor differs from every earlier push of this recording.
+			const bool known_miss =
+			    PushShadowFreshSkipEnabled() &&
+			    std::ranges::any_of(prepared_bindings,
+			                        [](const auto* prepared) { return prepared->fresh_upload; });
 			const auto result = buffer.PushDescriptors(
 			    pipeline_bind_point, pipeline.pipeline_layout, 0,
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(),
+			    known_miss);
 			CountDescriptorPushMiss(result, m_descriptor_writes);
 		} else {
 			const bool fresh = std::ranges::any_of(
@@ -2355,6 +2482,22 @@ static int SetReuseFreshMode() {
 		           : 1;
 	}();
 	return mode;
+}
+
+// KYTY_RECORDER_DESCRIPTOR_SETS=1 (default off; BryanKAdams/KytyPS5 8d2e74c): with the CP recorder
+// (KYTY_CP_RECORDER), a descriptor set written for a layout beyond maxPushDescriptors is written by
+// the recorder thread (an UpdateDescriptorSets packet, commandStream.h) in stream order before the
+// packet that binds it, instead of by vkUpdateDescriptorSets on the CP (about 1,000 sets per flip
+// at the Sky Garden start). The CP still allocates the set, so the reuse cache and the bind shadow
+// see the same handles; the set is new (or a reuse of one written earlier in the same recording,
+// whose packet precedes), and its pool is reset only after the tick completes. Without the
+// recorder, and in a direct window, the CP writes it at once as before.
+// Live switch (common/liveSwitch.h): a per-commit choice. Either way the set is written before the
+// bind that follows it (in the stream, or at once), so sets of both kinds may share a recording.
+static Live::Switch g_recorder_descriptor_sets("KYTY_RECORDER_DESCRIPTOR_SETS", ParseOnlyOne);
+
+static bool RecorderDescriptorSetsEnabled() {
+	return g_recorder_descriptor_sets.On();
 }
 
 void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
@@ -2399,9 +2542,15 @@ void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBind
 		for (auto& write: m_descriptor_writes) {
 			write.dstSet = set;
 		}
-		m_context.GetGraphics().device.updateDescriptorSets(
-		    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-		    nullptr);
+		const auto count = static_cast<uint32_t>(m_descriptor_writes.size());
+		if (RecorderDescriptorSetsEnabled()) {
+			// Encoded before the bind below: the recorder writes the set, then binds it.
+			buffer.StateSink().updateDescriptorSets(m_context.GetGraphics().device, set, count,
+			                                        m_descriptor_writes.data());
+		} else {
+			m_context.GetGraphics().device.updateDescriptorSets(count, m_descriptor_writes.data(),
+			                                                    0, nullptr);
+		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetsWritten);
 		if (lookup) {
 			m_descriptor_set_reuse.Insert(tick, layout, m_descriptor_writes, hash, set);

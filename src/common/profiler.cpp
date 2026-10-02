@@ -488,6 +488,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.BdaSyncEpochSkips.Cumulative",
     "FrameEvent.BdaSyncEpochVerifyChecks.Cumulative",
     "FrameEvent.BdaSyncEpochVerifyMismatches.Cumulative",
+    "FrameEvent.BdaSyncSubmissionSkips.Cumulative",
     "FrameEvent.BindingEpochMemoStreamHits.Cumulative",
     "FrameEvent.BindingEpochMemoCachedHits.Cumulative",
     "FrameEvent.BindingEpochMemoRecords.Cumulative",
@@ -669,6 +670,31 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.CpSeqDirectReads.Cumulative",
     "FrameEvent.DrawPrepLogChecks.Cumulative",
     "FrameEvent.DrawPrepLogEntries.Cumulative",
+    "FrameEvent.CpSeqBarrierWaitSelfLabel.Cumulative",
+    "FrameEvent.CpSeqBarrierWaitOther.Cumulative",
+    "FrameEvent.CpSeqBarrierFlipWait.Cumulative",
+    "FrameEvent.CpSeqBarrierCondition.Cumulative",
+    "FrameEvent.CpSeqBarrierDrawBursts.Cumulative",
+    "FrameEvent.DrawPrepCommitWaitsBarrier.Cumulative",
+    "FrameEvent.DrawPrepCommitWaitsShallow.Cumulative",
+    "FrameEvent.DrawPrepCommitWaitsDeep.Cumulative",
+    "FrameEvent.DrawPrepCommitWaitsUnclaimed.Cumulative",
+    "FrameEvent.DrawPrepCommitWaitsStart.Cumulative",
+    "FrameEvent.CpSeqPrefetchRuns.Cumulative",
+    "FrameEvent.CpSeqPrefetchDraws.Cumulative",
+    "FrameEvent.CpSeqPrefetchAdopted.Cumulative",
+    "FrameEvent.CpSeqPrefetchMismatches.Cumulative",
+    "FrameEvent.CpSeqPrefetchSkipped.Cumulative",
+    "FrameEvent.CpSeqPrefetchStopLockstep.Cumulative",
+    "FrameEvent.CpSeqPrefetchStopRead.Cumulative",
+    "FrameEvent.CpSeqPrefetchStopWindow.Cumulative",
+    "FrameEvent.CpSeqPrefetchStopEnd.Cumulative",
+    "FrameEvent.CpSeqPrefetchAdoptedWaits.Cumulative",
+    "FrameEvent.SubmitIntervalDeferrals.Cumulative",
+    "FrameEvent.CpCommitDccGuestRecords.Cumulative",
+    "FrameEvent.CpCommitDccGuestRejects.Cumulative",
+    "FrameEvent.CpCommitTexDccRecords.Cumulative",
+    "FrameEvent.CpCommitTexDccRejects.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -738,6 +764,11 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.CpSeqSequencerWait.Calls.Cumulative",
     "FrameWait.CpSeqResolverStarved.Calls.Cumulative",
     "FrameWait.DrawPrepCommit.Calls.Cumulative",
+    "FrameWait.DrawPrepCommitWaitBarrier.Calls.Cumulative",
+    "FrameWait.DrawPrepCommitWaitShallow.Calls.Cumulative",
+    "FrameWait.DrawPrepCommitWaitDeep.Calls.Cumulative",
+    "FrameWait.DrawPrepCommitWaitStart.Calls.Cumulative",
+    "FrameWait.CpSeqPrefetch.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -800,6 +831,11 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.CpSeqSequencerWait.Nanoseconds.Cumulative",
     "FrameWait.CpSeqResolverStarved.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepCommit.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepCommitWaitBarrier.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepCommitWaitShallow.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepCommitWaitDeep.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepCommitWaitStart.Nanoseconds.Cumulative",
+    "FrameWait.CpSeqPrefetch.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

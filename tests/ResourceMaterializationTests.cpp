@@ -2,6 +2,8 @@
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "common/liveSwitch.h"
+
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -612,6 +614,9 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  for (const char* state : {"KYTY_BUFFER_REFRESH_FUSION=0\n", "KYTY_BUFFER_REFRESH_FUSION=1\n", "KYTY_BUFFER_REFRESH_FUSION=0\n"}) {
+    Live::Testing::StageText(state);
+    Live::OnCpFlip();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
@@ -620,6 +625,7 @@ int main() {
   TestSealedPlanEvaluatesConcurrently();
   TestSpeculativeRuntimeMatchesSerial();
   TestRecordedPreparationCertifies();
+  }
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

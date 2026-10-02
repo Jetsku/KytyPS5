@@ -146,6 +146,156 @@ void CheckMoveRelValueSet(VulkanHarness *vulkan) {
               slow_selects, fast_selects, slow_spirv.size(), fast_spirv.size());
 }
 
+// V_MOVRELS with M0 = s << 2, s loaded from memory (a loop counter times 4 in Astro Bot's foliage
+// vertex shaders): the value set is unknown, but the two low bits are zero. KYTY_MOVREL_KNOWN_ZEROS
+// keeps every fourth link of each select chain, and KYTY_MOVREL_SWITCH branches on M0 / 16 into
+// short chains; the results must equal the ISA reference in every combination, including index 0,
+// out-of-range indices (VGPR0) and never-written registers.
+void CheckMoveRelKnownZeros(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenMoveRelKnownZeros";
+  using O = ShaderOpcode;
+  constexpr u32 OutBase = 16;
+  constexpr u32 Count = 8;
+  constexpr u32 Limit = 102; // the highest named VGPR is v101
+  constexpr u32 Bases[] = {12u, 45u};
+  const u32 sources[Count] = {0u, 1u, 17u, 0x40u, 13u, 0x3fu, 5u, 0xffffffffu};
+  TestCase test;
+  test.name = name;
+  AppendVMovLiteral(&test.code, 0, 0xdeadbeefu);
+  for (u32 reg = 10; reg <= 90; reg++) {
+    AppendVMovLiteral(&test.code, reg, 0xa0000000u + reg);
+  }
+  for (u32 k = 0; k < Count; k++) {
+    AppendSmemLoadOpcode(&test.code, 0x08, 33, k * 4u); // s_buffer_load_dword s33
+    test.code.push_back(EncodeSopp(0x0c, 0));             // s_waitcnt 0
+    test.code.push_back(EncodeSop2(0x1e, 34, 33, InlineU32(2))); // s_lshl_b32 s34, s33, 2
+    test.code.push_back(EncodeSMovB32(124, 34));                 // s_mov_b32 m0, s34
+    test.code.push_back(EncodeVop1(0x43, 100, Vgpr(Bases[0])));  // v_movrels v100, v12
+    test.code.push_back(EncodeVop1(0x43, 101, Vgpr(Bases[1])));  // v_movrels v101, v45
+    AppendStoreVgpr(&test.code, 100, OutBase + 2u * k);
+    AppendStoreVgpr(&test.code, 101, OutBase + 2u * k + 1u);
+  }
+  AppendEnd(&test.code);
+  test.initial.assign(OutBase + 2u * Count, 0u);
+  std::copy(std::begin(sources), std::end(sources), test.initial.begin());
+  test.opcodes = {O::V_MOV_B32, O::S_BUFFER_LOAD_DWORD, O::S_WAITCNT,
+                  O::S_LSHL_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+
+  // RDNA2 3.6.1: a source past the last VGPR reads VGPR0. v31 holds store addresses, but no
+  // index reaches it (it is not base + a multiple of 4); v91-v99 are never written.
+  std::vector<u32> expected(OutBase + 2u * Count, 0u);
+  std::copy(std::begin(sources), std::end(sources), expected.begin());
+  for (u32 k = 0; k < Count; k++) {
+    for (u32 i = 0; i < 2u; i++) {
+      const u32 index = (sources[k] << 2u) & 0xffu;
+      const u32 reg = Bases[i] + index;
+      u32 value = 0u;
+      if (index >= Limit - Bases[i]) {
+        value = 0xdeadbeefu;
+      } else if (reg >= 10u && reg <= 90u) {
+        Require(name, "reference", reg != 31u, "an index reads the address register");
+        value = 0xa0000000u + reg;
+      }
+      expected[OutBase + 2u * k + i] = value;
+    }
+  }
+
+  // [known_zeros][switch]: KYTY_MOVREL_KNOWN_ZEROS and KYTY_MOVREL_SWITCH. With known zeros the
+  // v45 chain keeps 14 links (below the switch threshold of 16) and the v12 chain 22.
+  CodegenOptions base = GetCodegenOptions();
+  base.movrel_range = true;
+  size_t selects[2][2] = {};
+  size_t switches[2][2] = {};
+  size_t words[2][2] = {};
+  for (const bool known_zeros : {false, true}) {
+    for (const bool use_switch : {false, true}) {
+      CodegenOptions options = base;
+      options.movrel_known_zeros = known_zeros;
+      options.movrel_switch = use_switch;
+      std::vector<u32> spirv;
+      std::vector<u32> actual;
+      {
+        ScopedCodegenOptions scope(options);
+        actual = RunCollect(vulkan, test, OutBase + 2u * Count, &spirv);
+      }
+      const std::string stage = std::string(known_zeros ? "known-zeros" : "value-set") +
+                                (use_switch ? " switch" : " select") + " readback";
+      RequireEqualWords(name, stage.c_str(), expected, actual);
+      selects[known_zeros][use_switch] = CountSpirv(spirv, "OpSelect");
+      switches[known_zeros][use_switch] = CountSpirv(spirv, "OpSwitch");
+      words[known_zeros][use_switch] = spirv.size();
+    }
+  }
+  Require(name, "select count", selects[1][0] * 2u < selects[0][0],
+          "known zero bits did not shrink the select chains: " + std::to_string(selects[1][0]) +
+              " vs " + std::to_string(selects[0][0]));
+  for (const bool known_zeros : {false, true}) {
+    Require(name, "switch count", switches[known_zeros][1] >= switches[known_zeros][0] + Count,
+            "KYTY_MOVREL_SWITCH did not turn the long chains into switches");
+  }
+  std::printf("[codegen] %-32s ok (OpSelect %zu -> %zu, words %zu -> %zu; switch: OpSwitch +%zu/+%zu, "
+              "words %zu/%zu)\n",
+              name, selects[0][0], selects[1][0], words[0][0], words[1][0],
+              switches[0][1] - switches[0][0], switches[1][1] - switches[1][0], words[0][1],
+              words[1][1]);
+}
+
+// KYTY_UNIFORM_LANE_READS: V_READFIRSTLANE and V_READLANE results go through
+// OpGroupNonUniformBroadcastFirst, which must not change them (wave32: one guest lane per host
+// invocation; wave64: two per invocation on 32-lane hosts).
+void CheckUniformLaneReads(VulkanHarness *vulkan) {
+  for (const u32 wave_size : {32u, 64u}) {
+  const std::string case_name = "CodegenUniformLaneReads/wave" + std::to_string(wave_size);
+  const char *name = case_name.c_str();
+  using O = ShaderOpcode;
+  constexpr u32 OutBase = 8;
+  TestCase test;
+  test.name = name;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.code.push_back(EncodeVop2(0x1a, 1, InlineU32(1), 0));        // v_lshlrev_b32 v1, 1, v0
+  test.code.push_back(EncodeVop2(0x25, 1, InlineU32(7), 1));        // v_add_nc_u32 v1, 7, v1
+  test.code.push_back(EncodeVop1(0x02, 33, Vgpr(1)));               // v_readfirstlane_b32 s33, v1
+  AppendVop3(&test.code, 0x360, 34, Vgpr(1), InlineU32(5));         // v_readlane_b32 s34, v1, 5
+  test.code.push_back(EncodeSop2(0x00, 35, 33, 34));                // s_add_u32 s35, s33, s34
+  AppendStoreSgpr(&test.code, 33, OutBase);
+  AppendStoreSgpr(&test.code, 34, OutBase + 1u);
+  AppendStoreSgpr(&test.code, 35, OutBase + 2u);
+  AppendEnd(&test.code);
+  test.initial.assign(OutBase + 3u, 0u);
+  test.opcodes = {O::V_LSHLREV_B32,  O::V_ADD_NC_U32, O::V_READFIRSTLANE_B32,
+                  O::V_READLANE_B32, O::S_ADD_U32,    O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  std::vector<u32> expected(OutBase + 3u, 0u);
+  expected[OutBase] = 7u;       // lane 0: 2 * 0 + 7
+  expected[OutBase + 1u] = 17u; // lane 5: 2 * 5 + 7
+  expected[OutBase + 2u] = 24u;
+
+  size_t broadcasts[2] = {};
+  for (const bool uniform : {false, true}) {
+    CodegenOptions options = GetCodegenOptions();
+    options.uniform_lane_reads = uniform;
+    std::vector<u32> spirv;
+    std::vector<u32> actual;
+    {
+      ScopedCodegenOptions scope(options);
+      actual = RunCollect(vulkan, test, OutBase + 3u, &spirv);
+    }
+    RequireEqualWords(name, uniform ? "uniform readback" : "shuffle readback", expected, actual);
+    broadcasts[uniform ? 1 : 0] = CountSpirv(spirv, "OpGroupNonUniformBroadcastFirst");
+  }
+  Require(name, "broadcast count", broadcasts[0] == 0u && broadcasts[1] >= 2u,
+          "KYTY_UNIFORM_LANE_READS did not mark both lane reads uniform: " +
+              std::to_string(broadcasts[0]) + " -> " + std::to_string(broadcasts[1]));
+  std::printf("[codegen] %-32s ok (OpGroupNonUniformBroadcastFirst %zu -> %zu)\n", name,
+              broadcasts[0], broadcasts[1]);
+  }
+}
+
 // A 64-thread workgroup that loops over `count` elements (a multiple of 64). Input i of element
 // e is at dword i * count + e; output o at (inputs + o) * count + e. The body reads inputs from
 // v2.. and writes outputs to v10.. (v1 holds the lane byte offset, s40 the element byte offset).
@@ -391,6 +541,70 @@ void CheckFloatMinMax(VulkanHarness *vulkan) {
   std::printf("[codegen] %-32s ok (%u elements, SPIR-V %zu -> %zu words, OpSelect %zu -> %zu)\n",
               name, bulk.count, slow_run.spirv.size(), fast_run.spirv.size(),
               CountSpirv(slow_run.spirv, "OpSelect"), CountSpirv(fast_run.spirv, "OpSelect"));
+}
+
+// KYTY_SHORT_F32_HELPERS: NaN tests by OpIsNan (float-to-int conversions, the legacy min/max) must
+// give the same bits as the integer tests they replace. sin/cos stay in the set: their large-value
+// select is kept on purpose (the RTX 3090's Fract of -FLT_MAX is not +0), so they must not change.
+void CheckShortF32Helpers(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenShortF32Helpers";
+  using O = ShaderOpcode;
+  auto special = SpecialF32();
+  // Whole numbers around 2^23 and 2^24 of both signs, and a value just below 2^23.
+  for (const u32 bits : {0x4b000000u, 0xcb000000u, 0x4b000001u, 0xcb000001u, 0x4affffffu,
+                         0xcaffffffu, 0x4b800000u, 0xcb800000u, 0x4f000000u, 0xdf000000u}) {
+    special.push_back(bits);
+  }
+  std::vector<std::vector<u32>> inputs(2);
+  for (const auto a : special) {
+    for (const auto b : special) {
+      inputs[0].push_back(a);
+      inputs[1].push_back(b);
+    }
+  }
+  uint64_t seed = 0x5eed5eed12345678ull;
+  while (inputs[0].size() < 65536u) {
+    for (auto &input : inputs) {
+      input.push_back(RandomF32(seed));
+    }
+  }
+  const auto bulk = MakeBulkCase(
+      name, 2, 6, inputs,
+      [](std::vector<u32> *code) {
+        code->push_back(EncodeVop1(0x08, 10, Vgpr(2)));    // v_cvt_i32_f32 v10, v2
+        code->push_back(EncodeVop1(0x07, 11, Vgpr(2)));    // v_cvt_u32_f32 v11, v2
+        code->push_back(EncodeVop1(0x35, 12, Vgpr(2)));    // v_sin_f32 v12, v2
+        code->push_back(EncodeVop1(0x36, 13, Vgpr(2)));    // v_cos_f32 v13, v2
+        code->push_back(EncodeVop2(0x0f, 14, Vgpr(2), 3)); // v_min_f32 v14, v2, v3
+        code->push_back(EncodeVop2(0x10, 15, Vgpr(2), 3)); // v_max_f32 v15, v2, v3
+      },
+      {O::V_CVT_I32_F32, O::V_CVT_U32_F32, O::V_SIN_F32, O::V_COS_F32, O::V_MIN_F32,
+       O::V_MAX_F32});
+  // The legacy min/max classifies both operands; the fast one uses OpIsNan anyway.
+  CodegenOptions legacy = GetCodegenOptions();
+  legacy.fast_float_min_max = false;
+  legacy.short_f32_helpers = false;
+  CodegenOptions shorter = legacy;
+  shorter.short_f32_helpers = true;
+  const auto short_run = RunBulk(vulkan, bulk, shorter);
+  const auto legacy_run = RunBulk(vulkan, bulk, legacy);
+  static const char *const names[] = {"cvt_i32", "cvt_u32", "sin", "cos", "min", "max"};
+  // cvt/sin/cos: bit-identical to the legacy sequences (checked by CompareBulk); min/max: also
+  // the CPU model of the legacy emulation.
+  CompareBulk(name, bulk, short_run, legacy_run,
+              [&](u32 o, u32 e) -> u32 {
+                if (o == 4u || o == 5u) {
+                  return RefMinMaxF32(inputs[0][e], inputs[1][e], o == 5u);
+                }
+                return legacy_run.words[static_cast<size_t>(bulk.inputs + o) * bulk.count + e];
+              },
+              names);
+  const auto nan_tests = [](const std::vector<u32> &spirv) { return CountSpirv(spirv, "OpIsNan"); };
+  Require(name, "OpIsNan count", nan_tests(short_run.spirv) > nan_tests(legacy_run.spirv),
+          "KYTY_SHORT_F32_HELPERS did not classify NaNs with OpIsNan");
+  std::printf("[codegen] %-32s ok (%u elements, SPIR-V %zu -> %zu words, OpIsNan %zu -> %zu)\n",
+              name, bulk.count, legacy_run.spirv.size(), short_run.spirv.size(),
+              nan_tests(legacy_run.spirv), nan_tests(short_run.spirv));
 }
 
 // med3/min/max with constant operands (the clamp idiom): x from the special set and random bits.
@@ -1483,6 +1697,346 @@ int CorpusPipelineTimes(VulkanHarness *vulkan, const char *directory) {
   return 0;
 }
 
+// KYTY_DPP_SKIP_INACTIVE: a DPP source lane EXEC disables leaves the receiving lane unchanged
+// (default); with the switch off the lane reads zero from it, the behaviour before.
+void CheckDppInactiveSource(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenDppInactiveSource";
+  const auto test = VectorDppInactiveSourcePreservesDestination();
+  std::vector<u32> skip_words;
+  std::vector<u32> zero_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.dpp_skip_inactive = true;
+    ScopedCodegenOptions scope(options);
+    skip_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.dpp_skip_inactive = false;
+    ScopedCodegenOptions scope(options);
+    zero_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  RequireEqualWords(name, "inactive source kept", test.expected, skip_words);
+  auto legacy = test.expected;
+  legacy[4] = 100u; // lane 4 read zero from the disabled lane 3
+  RequireEqualWords(name, "KYTY_DPP_SKIP_INACTIVE=0", legacy, zero_words);
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
+// KYTY_LANE_REDUCTIONS: a v_max_u32 DPP row_shr scan (1, 2, 4, 8) read by v_readlane at each
+// row's last lane (wave32: 15, 31) or, after V_PERMLANEX16, at each row pair's last lane (wave64:
+// 31, 63) on full waves of distinct data, with every lane enabled by s_mov exec, -1 or as EXEC =
+// m | ~m (s_orn2_saveexec of a copy of EXEC). The native subgroup reduction and the emulated scan
+// must both give each row's (pair's) maximum.
+void CheckLaneReductions(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenLaneReductions";
+  for (const u32 variant : {0u, 1u, 2u, 3u}) {
+    const u32 wave = (variant & 1u) != 0u ? 64u : 32u;
+    const bool complement = (variant & 2u) != 0u;
+    TestCase test;
+    test.name = name;
+    auto &code = test.code;
+    code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v_lshlrev_b32 v3, 2, v0
+    AppendBufferLoadDword(&code, 1, 3);                  // v1 = data[lane]
+    code.push_back(EncodeSopp(0x0c, 0));                 // s_waitcnt 0
+    if (!complement) {
+      code.push_back(wave == 64u ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
+                                 : EncodeSMovB32(126, 193));   // s_mov_b32 exec_lo, -1
+    } else if (wave == 64u) {
+      code.push_back(EncodeSop1(0x04, 10, 126)); // s_mov_b64 s[10:11], exec
+      code.push_back(EncodeSop1(0x28, 12, 10));  // s_orn2_saveexec_b64 s[12:13], s[10:11]
+    } else {
+      code.push_back(EncodeSMovB32(10, 126));    // s_mov_b32 s10, exec_lo
+      code.push_back(EncodeSop1(0x40, 12, 10));  // s_orn2_saveexec_b32 s12, s10
+    }
+    for (const u32 shift : {1u, 2u, 4u, 8u}) {
+      code.push_back(EncodeVop2(0x14, 1, 250, 1));       // v_max_u32 v1, v1 row_shr:n, v1
+      code.push_back(EncodeVop2Dpp(1, 0x110u + shift));
+    }
+    if (wave == 64u) {
+      AppendVop3(&code, 0x378, 2, Vgpr(1), 193, 193);   // v_permlanex16_b32 v2, v1, -1, -1
+      code.push_back(EncodeVop2(0x14, 1, Vgpr(1), 2));   // v_max_u32 v1, v1, v2
+    }
+    const u32 first = wave == 64u ? 31u : 15u;
+    const u32 second = wave == 64u ? 63u : 31u;
+    AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(first));  // v_readlane_b32 s20, v1, first
+    AppendVop3(&code, 0x360, 21, Vgpr(1), InlineU32(second)); // v_readlane_b32 s21, v1, second
+    AppendStoreSgpr(&code, 20, wave);
+    AppendStoreSgpr(&code, 21, wave + 1u);
+    AppendEnd(&code);
+    test.initial.resize(wave + 2u);
+    for (u32 lane = 0; lane < wave; lane++) {
+      test.initial[lane] = (lane * 2654435761u) ^ 0x5a5a5a5au;
+    }
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = 1;
+    test.compute_info.threads_num[2] = 1;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = wave;
+    test.has_compute_info = true;
+    const u32 span = wave == 64u ? 32u : 16u;
+    std::vector<u32> expected = test.initial;
+    expected[wave] = *std::max_element(test.initial.begin(), test.initial.begin() + span);
+    expected[wave + 1u] = *std::max_element(test.initial.begin() + (wave - span),
+                                            test.initial.begin() + wave);
+    std::vector<u32> native_spirv;
+    std::vector<u32> scan_spirv;
+    std::vector<u32> native_words;
+    std::vector<u32> scan_words;
+    {
+      CodegenOptions options = GetCodegenOptions();
+      options.lane_reductions = true;
+      ScopedCodegenOptions scope(options);
+      native_words = RunCollect(vulkan, test, wave + 2u, &native_spirv);
+    }
+    {
+      CodegenOptions options = GetCodegenOptions();
+      options.lane_reductions = false;
+      ScopedCodegenOptions scope(options);
+      scan_words = RunCollect(vulkan, test, wave + 2u, &scan_spirv);
+    }
+    const auto stage = wave == 64u ? (complement ? "wave64 row pairs, EXEC = m | ~m"
+                                                 : "wave64 row pairs")
+                                   : (complement ? "wave32 rows, EXEC = m | ~m" : "wave32 rows");
+    if (CountSpirv(native_spirv, "OpGroupNonUniformUMax") != 2u) {
+      // The IR the match saw, for the failure below.
+      CodegenOptions options = GetCodegenOptions();
+      options.lane_reductions = true;
+      ScopedCodegenOptions scope(options);
+      std::fprintf(stderr, "%s (%s): IR\n%s\n", name, stage,
+                   ShaderRecompiler::IR::ProgramToString(
+                       CompileCase(test, vulkan->SubgroupSize()).program)
+                       .c_str());
+    }
+    Require(name, stage,
+            CountSpirv(native_spirv, "OpGroupNonUniformUMax") == 2u &&
+                CountSpirv(scan_spirv, "OpGroupNonUniformUMax") == 0u,
+            "the row scan reads did not become two native reductions, or did with the switch off");
+    RequireEqualWords(name, stage, expected, native_words);
+    RequireEqualWords(name, stage, expected, scan_words);
+  }
+  std::printf("[codegen] %-32s ok (wave32 rows, wave64 row pairs; both EXEC forms)\n", name);
+}
+
+// KYTY_DISPATCHER_CAP: a guest loop that never ends in an irreducible CFG (the dispatcher
+// fallback; entry -> B or A, A -> C, C -> A or B, B -> C, never S_ENDPGM) after a store of 7.
+// With the cap the invocation leaves the dispatcher loop and the dispatch completes; codegen with
+// and without the cap. Without a cap this dispatch would never end, so the GPU part needs one.
+void CheckDispatcherCap(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenDispatcherCap";
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 7);
+  AppendStoreVgpr(&code, 2, 0);
+  code.push_back(EncodeSopp(0x05, 2));       // entry -> B, fallthrough A
+  code.push_back(EncodeSopp(0x02, 0));       // A -> C
+  code.push_back(EncodeSopp(0x05, 0xfffeu)); // C -> A, fallthrough B
+  code.push_back(EncodeSopp(0x02, 0xfffeu)); // B -> C
+  AppendEnd(&code);
+  test.initial = {0u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_CBRANCH_SCC1, O::S_BRANCH,
+                  O::S_ENDPGM};
+  const auto compile = [&](uint32_t cap) {
+    CodegenOptions options = GetCodegenOptions();
+    options.dispatcher_cap = cap;
+    ScopedCodegenOptions scope(options);
+    return CompileCase(test, vulkan->SubgroupSize());
+  };
+  const auto capped = compile(4096u);
+  const auto uncapped = compile(0u);
+  Require(name, "dispatcher", capped.program.dispatcher_fallback,
+          "the irreducible loop did not take the dispatcher fallback");
+  Require(name, "cap",
+          CountSpirv(capped.spirv, "OpUGreaterThanEqual") ==
+                  CountSpirv(uncapped.spirv, "OpUGreaterThanEqual") + 1u &&
+              CountSpirv(capped.spirv, "OpLogicalOr") ==
+                  CountSpirv(uncapped.spirv, "OpLogicalOr") + 1u,
+          "the dispatcher loop does not leave at KYTY_DISPATCHER_CAP");
+  if (GetCodegenOptions().dispatcher_cap == 0u) {
+    std::printf("[codegen] %-32s ok (codegen only: KYTY_DISPATCHER_CAP=0)\n", name);
+    return;
+  }
+  const auto words = RunCollect(vulkan, test, 1);
+  Require(name, "endless loop ends", words[0] == 7u,
+          "the dispatch with an endless dispatcher loop did not complete with its store");
+  std::printf("[codegen] %-32s ok (an endless dispatcher loop ended after %u transitions)\n",
+              name, GetCodegenOptions().dispatcher_cap);
+}
+
+// The Scope operand of every OpReadClockKHR (Device 1, Subgroup 3), from the 32-bit constants.
+std::vector<u32> ReadClockScopes(const std::vector<u32> &spirv) {
+  constexpr u32 OpConstant = 43;
+  constexpr u32 OpReadClockKHR = 5056;
+  std::unordered_map<u32, u32> constants;
+  std::vector<u32> scope_ids;
+  for (size_t at = 5; at < spirv.size();) {
+    const u32 words = spirv[at] >> 16u;
+    const u32 opcode = spirv[at] & 0xffffu;
+    if (words == 0 || at + words > spirv.size()) {
+      break;
+    }
+    if (opcode == OpConstant && words == 4) {
+      constants[spirv[at + 2]] = spirv[at + 3];
+    } else if (opcode == OpReadClockKHR && words == 4) {
+      scope_ids.push_back(spirv[at + 3]);
+    }
+    at += words;
+  }
+  std::vector<u32> scopes;
+  for (const auto id : scope_ids) {
+    const auto found = constants.find(id);
+    scopes.push_back(found != constants.end() ? found->second : UINT32_MAX);
+  }
+  return scopes;
+}
+
+// S_MEMREALTIME (KYTY_REALTIME_CLOCK, default on): a guest spin-wait timed by it. t0 = clock; the
+// loop reads the clock until it is 1000 ticks (10 us at 100 MHz) past t0 or 2^24 reads were made,
+// then stores whether it advanced, the ticks and the reads. Codegen for every host clock (CPU),
+// then the wait on the GPU: with the device's clock it ends by time; with KYTY_REALTIME_CLOCK=0
+// (the placeholder UINT64_MAX) the clock never advances and only the read limit ends it.
+void CheckRealtimeClock(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenRealtimeClock";
+  namespace Spirv = ShaderRecompiler::Spirv;
+  using O = ShaderOpcode;
+  Require(name, "shift",
+          Spirv::RealtimeClockShift(1.0) == 3 && Spirv::RealtimeClockShift(10.0) == 0 &&
+              Spirv::RealtimeClockShift(0.5) == 4 && Spirv::RealtimeClockShift(52.083) == -2 &&
+              Spirv::RealtimeClockShift(83.333) == -3 && Spirv::RealtimeClockShift(0.0) == 3,
+          "unexpected shift toward the 100 MHz S_MEMREALTIME rate");
+
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeSmem0(0x25, 12));            // s_memrealtime s[12:13]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));              // s_waitcnt 0
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));  // s_mov_b32 s20, 0
+  const size_t loop = code.size();
+  code.push_back(EncodeSmem0(0x25, 14));            // s_memrealtime s[14:15]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));              // s_waitcnt 0
+  code.push_back(EncodeSop2(0x01, 16, 14, 12));     // s_sub_u32 s16, s14, s12
+  code.push_back(EncodeSop2(0x05, 17, 15, 13));     // s_subb_u32 s17, s15, s13
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1))); // s_add_u32 s20, s20, 1
+  code.push_back(EncodeSopc(0x07, 17, InlineU32(0))); // s_cmp_lg_u32 s17, 0
+  const size_t exit_high = code.size();
+  code.push_back(0);                                // s_cbranch_scc1 done
+  code.push_back(EncodeSopc(0x09, 16, 255));        // s_cmp_ge_u32 s16, 1000
+  code.push_back(1000u);
+  const size_t exit_low = code.size();
+  code.push_back(0);                                // s_cbranch_scc1 done
+  code.push_back(EncodeSopc(0x0a, 20, 255));        // s_cmp_lt_u32 s20, 1 << 24
+  code.push_back(1u << 24u);
+  const size_t back = code.size();
+  code.push_back(0);                                // s_cbranch_scc1 loop
+  const size_t done = code.size();
+  const auto branch = [&](size_t at, size_t target) {
+    const auto offset = static_cast<int32_t>(target) - static_cast<int32_t>(at + 1);
+    code[at] = EncodeSopp(0x05, static_cast<u32>(offset) & 0xffffu);
+  };
+  branch(exit_high, done);
+  branch(exit_low, done);
+  branch(back, loop);
+  code.push_back(EncodeSopc(0x09, 16, 255));        // s_cmp_ge_u32 s16, 1000
+  code.push_back(1000u);
+  code.push_back(EncodeSop2(0x0a, 22, InlineU32(1), InlineU32(0))); // s_cselect_b32 s22, 1, 0
+  code.push_back(EncodeSopc(0x07, 17, InlineU32(0)));               // s_cmp_lg_u32 s17, 0
+  code.push_back(EncodeSop2(0x0a, 23, InlineU32(1), InlineU32(0))); // s_cselect_b32 s23, 1, 0
+  code.push_back(EncodeSop2(0x10, 22, 22, 23));                     // s_or_b32 s22, s22, s23
+  AppendStoreSgpr(&code, 22, 0);
+  AppendStoreSgpr(&code, 16, 1);
+  AppendStoreSgpr(&code, 20, 2);
+  AppendEnd(&code);
+  test.initial = {0u, 0u, 0u};
+  test.opcodes = {O::S_MEMREALTIME, O::S_WAITCNT,     O::S_MOV_B32,      O::S_SUB_U32,
+                  O::S_SUBB_U32,    O::S_ADD_U32,     O::S_CMP_LG_U32,   O::S_CBRANCH_SCC1,
+                  O::S_CMP_GE_U32,  O::S_CMP_LT_U32,  O::S_CSELECT_B32,  O::S_OR_B32,
+                  O::V_MOV_B32,     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+
+  // Codegen: the clock read for each host clock, with the shift toward 100 MHz.
+  const auto saved_clock = Spirv::GetHostShaderClock();
+  const auto compile = [&](Spirv::HostShaderClock clock, bool realtime_clock) {
+    CodegenOptions options = GetCodegenOptions();
+    options.realtime_clock = realtime_clock;
+    ScopedCodegenOptions scope(options);
+    Spirv::SetHostShaderClock(clock);
+    auto spirv = CompileCase(test, 32).spirv;
+    Spirv::SetHostShaderClock(saved_clock);
+    ValidateSpirv(name, spirv);
+    return spirv;
+  };
+  using Scope = Spirv::HostClockScope;
+  const auto device3 = compile({Scope::Device, 3}, true);
+  const auto device0 = compile({Scope::Device, 0}, true);
+  const auto left2 = compile({Scope::Device, -2}, true);
+  const auto subgroup = compile({Scope::Subgroup, 3}, true);
+  const auto none = compile({Scope::None, 3}, true);
+  const auto off = compile({Scope::Device, 3}, false);
+  const auto right_shifts = [](const std::vector<u32> &spirv) {
+    return CountSpirv(spirv, "OpShiftRightLogical");
+  };
+  const auto left_shifts = [](const std::vector<u32> &spirv) {
+    return CountSpirv(spirv, "OpShiftLeftLogical");
+  };
+  Require(name, "device clock",
+          ReadClockScopes(device3) == std::vector<u32>{1u, 1u} &&
+              CountSpirv(device3, "OpGroupNonUniformBroadcastFirst") ==
+                  CountSpirv(off, "OpGroupNonUniformBroadcastFirst") + 2u &&
+              CountSpirv(device3, "ShaderClockKHR") >= 1u &&
+              ReadClockScopes(device0) == std::vector<u32>{1u, 1u},
+          "S_MEMREALTIME did not read the device clock once per instruction, wave-uniform");
+  Require(name, "shift",
+          right_shifts(device3) == right_shifts(device0) + 4u &&
+              left_shifts(device3) == left_shifts(device0) + 2u &&
+              right_shifts(left2) == right_shifts(device0) + 2u &&
+              left_shifts(left2) == left_shifts(device0) + 4u,
+          "the clock was not scaled by the host clock's shift");
+  Require(name, "subgroup clock", ReadClockScopes(subgroup) == std::vector<u32>{3u, 3u},
+          "the subgroup-clock fallback did not read at subgroup scope");
+  Require(name, "placeholder",
+          ReadClockScopes(none).empty() && CountSpirv(none, "ShaderClockKHR") == 0u &&
+              ReadClockScopes(off).empty() && CountSpirv(off, "ShaderClockKHR") == 0u,
+          "no host clock or KYTY_REALTIME_CLOCK=0 still read a clock");
+
+  // GPU: the wait ends by time with this device's clock; KYTY_REALTIME_CLOCK=0 never advances.
+  const auto host = Spirv::GetHostShaderClock();
+  std::vector<u32> clock_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.realtime_clock = true;
+    ScopedCodegenOptions scope(options);
+    clock_words = RunCollect(vulkan, test, 3);
+  }
+  std::vector<u32> placeholder_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.realtime_clock = false;
+    ScopedCodegenOptions scope(options);
+    placeholder_words = RunCollect(vulkan, test, 3);
+  }
+  Require(name, "placeholder wait",
+          placeholder_words[0] == 0u && placeholder_words[1] == 0u &&
+              placeholder_words[2] == (1u << 24u),
+          "with the placeholder the clock advanced or the read limit did not end the wait");
+  if (host.scope == Scope::None) {
+    Require(name, "no host clock", clock_words == placeholder_words,
+            "without a host clock S_MEMREALTIME did not keep the placeholder");
+  } else {
+    Require(name, "clock wait",
+            clock_words[0] == 1u && clock_words[2] < (1u << 24u),
+            "S_MEMREALTIME did not advance 1000 ticks within 2^24 reads");
+  }
+  std::printf("[codegen] %-32s ok (%s clock, shift %d: 1000 ticks after %u reads, %u ticks)\n",
+              name,
+              host.scope == Scope::Device     ? "device"
+              : host.scope == Scope::Subgroup ? "subgroup"
+                                              : "no",
+              host.shift, clock_words[2], clock_words[1]);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
@@ -1493,7 +2047,10 @@ void RunAll(VulkanHarness *vulkan) {
   CheckLodStatsGate();
   CheckLodStatsPlainVariant();
   CheckMoveRelValueSet(vulkan);
+  CheckMoveRelKnownZeros(vulkan);
+  CheckUniformLaneReads(vulkan);
   CheckFloatMinMax(vulkan);
+  CheckShortF32Helpers(vulkan);
   CheckFloatClampConstants(vulkan);
   CheckPackRtzExhaustive();
   CheckPackRtz(vulkan);

@@ -90,6 +90,9 @@ enum class Op : uint16_t {
 	EndQuery,
 	CopyQueryPoolResults,
 	WriteTimestamp2,
+	// vkUpdateDescriptorSets of one descriptor set (KYTY_RECORDER_DESCRIPTOR_SETS): a device call,
+	// not a command, replayed in stream order before the command that binds the set.
+	UpdateDescriptorSets,
 	BeginConditionalRendering,
 	EndConditionalRendering,
 	Count,
@@ -237,6 +240,13 @@ struct DescriptorInfo {
 };
 static_assert(sizeof(vk::DescriptorBufferInfo) == sizeof(DescriptorInfo));
 static_assert(sizeof(vk::DescriptorImageInfo) == sizeof(DescriptorInfo));
+// Every write targets `set` (the replay sets each dstSet to it); records and infos as for
+// PushDescriptorSetPacket.
+struct UpdateDescriptorSetsPacket {
+	vk::DescriptorSet set         = nullptr;
+	uint32_t          write_count = 0;
+	uint32_t          info_count  = 0;
+};
 struct PushConstantsPacket {
 	vk::PipelineLayout   layout = nullptr;
 	vk::ShaderStageFlags stages {};
@@ -431,6 +441,8 @@ uint64_t BindDescriptorSets(vk::PipelineBindPoint point, vk::PipelineLayout layo
                             uint32_t dynamic_count, const uint32_t* dynamic_offsets);
 uint64_t PushDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
                            uint32_t count, const vk::WriteDescriptorSet* writes);
+uint64_t UpdateDescriptorSets(vk::DescriptorSet set, uint32_t count,
+                              const vk::WriteDescriptorSet* writes);
 uint64_t PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
                        uint32_t size, const void* data);
 uint64_t BindVertexBuffers2(uint32_t first, uint32_t count, const vk::Buffer* buffers,
@@ -642,6 +654,9 @@ public:
 	                        uint32_t dynamic_count, const uint32_t* dynamic_offsets);
 	void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                          uint32_t count, const vk::WriteDescriptorSet* writes);
+	// Every write's dstSet must be `set`.
+	void updateDescriptorSets(vk::DescriptorSet set, uint32_t count,
+	                          const vk::WriteDescriptorSet* writes);
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
 	                   uint32_t size, const void* data);
 	void bindVertexBuffers2(uint32_t first, uint32_t count, const vk::Buffer* buffers,
@@ -704,6 +719,11 @@ private:
 	// Reserves a packet with `payload` bytes after the header blocks.
 	Writer Open(Op op, uint64_t payload, bool barrier);
 	void   Close(Writer& writer, uint64_t hash);
+	// Descriptor writes (PushDescriptorSet, UpdateDescriptorSets): the number of infos they carry
+	// (only image and buffer descriptors, no pNext chains), and their records and infos.
+	static uint64_t DescriptorInfoCount(uint32_t count, const vk::WriteDescriptorSet* writes);
+	static void     PutDescriptorWrites(Writer& writer, uint32_t count,
+	                                    const vk::WriteDescriptorSet* writes, uint64_t infos);
 
 	Ring&     m_ring;
 	Options   m_options;

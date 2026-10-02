@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <shared_mutex>
 
 namespace Libs::Graphics {
@@ -215,6 +217,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
 	m_fault_process_pending = true;
@@ -322,6 +328,41 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	m_graphics.TrimRetiredImages();
+	if (VramStats::ReportDue()) {
+		ReportVram();
+	}
+}
+
+void RenderContext::ReportVram() {
+	using VramStats::ToMiB;
+	const auto now   = std::time(nullptr);
+	std::tm    local {};
+#if defined(_WIN32)
+	localtime_s(&local, &now);
+#else
+	localtime_r(&now, &local);
+#endif
+	char clock[16];
+	std::strftime(clock, sizeof(clock), "%H:%M:%S", &local);
+	VramStats::Line("==== %s +%.1f s", clock, VramStats::Seconds());
+	m_graphics.ReportVramStats();
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		uint64_t         mapped = 0;
+		uint64_t         lowest = UINT64_MAX;
+		uint64_t         highest = 0;
+		m_mapped_ranges.ForEach([&](uint64_t begin, uint64_t end) {
+			mapped += end - begin;
+			lowest  = std::min(lowest, begin);
+			highest = std::max(highest, end);
+		});
+		VramStats::Line("guest GPU mappings: %.1f MiB in %zu ranges, 0x%" PRIx64 "..0x%" PRIx64, ToMiB(mapped),
+		                m_mapped_ranges.Size(), lowest == UINT64_MAX ? 0 : lowest, highest);
+	}
+	m_texture_cache.ReportVram();
+	m_buffer_cache.ReportVram();
+	VramStats::Flush();
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

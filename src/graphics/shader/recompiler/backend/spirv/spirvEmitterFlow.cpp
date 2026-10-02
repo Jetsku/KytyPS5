@@ -2,6 +2,8 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
 #include <atomic>
@@ -504,6 +506,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
 		return;
 	}
+	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.
+	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+	    exp.index != 0 && state.input_info.pixel->alpha_blend_source_remap) {
+		return;
+	}
 	EmitIfCondition(state, exec, [&]() {
 		const auto data = ctx.Arg(inst, 0);
 		if (exp.kind == IR::ExportTargetKind::Primitive) {
@@ -544,6 +551,18 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool uint_output = MrtOutputMode(state, exp) == 7u;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
+			// Broadcast logical alpha before swizzling the primary output.
+			const auto blend_output =
+			    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1});
+			if (blend_output != 0) {
+				const auto alpha = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
+				                          3u, 3u, 3u, 3u);
+				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
+			}
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
@@ -728,7 +747,18 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	auto       write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	if (GetCodegenOptions().dpp_skip_inactive && !flags.bound_control && !flags.fetch_inactive &&
+	    !flags.dpp8) {
+		// A source lane EXEC disables is invalid like a vacated one, and without bound_ctrl the
+		// receiving lane keeps its value (PS5 ISA, DPP options); so does a lane the host subgroup
+		// lacks. EmitDppMoveU32 read zero from it (KYTY_DPP_SKIP_INACTIVE, from Senaxx's wolverine
+		// branch).
+		const auto target        = EmitDppTargetLane(ctx.state, flags);
+		const auto source_active = EmitBallotLaneActiveBool(ctx.state, ctx.Ballot(inst.Arg(2)),
+		                                                    target.lane);
+		write = Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), write, source_active);
+	}
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }
@@ -751,6 +781,24 @@ uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
 	return any;
 }
 
+// KYTY_UNIFORM_LANE_READS (from BryanKAdams/KytyPS5 d514872): after a shuffle by a uniform lane
+// every invocation holds the same value, so OpGroupNonUniformBroadcastFirst of it returns it
+// unchanged. It tells the host compiler that the value is uniform: AMD compiles the shuffle alone
+// to ds_bpermute and treats the result, and everything derived from a waterfall loop's key
+// (addresses, scalar loads, loop exits), as per-lane vector work.
+static uint32_t MarkLaneReadUniform(ValueEmitContext& ctx, const IR::Inst& inst,
+                                    uint32_t shuffled) {
+	if (!GetCodegenOptions().uniform_lane_reads) {
+		return shuffled;
+	}
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
+	                          TypeId(state, inst.Arg(0).GetType()), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), shuffled);
+	return result;
+}
+
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
@@ -768,11 +816,58 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto lane = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), lane, active, first,
 	                          ConstantU32(state, 0));
-	return ctx.Shuffle(inst, 0, lane);
+	return MarkLaneReadUniform(ctx, inst, ctx.Shuffle(inst, 0, lane));
+}
+
+// The lanes' reduction, natively over the lanes the host subgroup has (IR::MatchLaneReduction,
+// KYTY_LANE_REDUCTIONS; from Senaxx's wolverine branch).
+static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction& reduction) {
+	auto& state = ctx.state;
+	// A wave64 on a 32-wide subgroup keeps lanes 32-63 in the second half.
+	const auto host_lanes = state.lane_count == 2 ? 32u : state.program.wave_size;
+	auto&      lane = reduction.first_lane / host_lanes == ctx.half ? ctx : *ctx.other_half;
+	const auto subid = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), subid,
+	                          state.subgroup_local_invocation_id_variable);
+	const auto in_range =
+	    Binary(state, spv::OpULessThan, TypeBool(state),
+	           Binary(state, spv::OpISub, TypeU32(state), subid,
+	                  ConstantU32(state, reduction.first_lane % host_lanes)),
+	           ConstantU32(state, reduction.lanes));
+	const auto contribution =
+	    Select(state, TypeU32(state), in_range, lane.Def(reduction.source),
+	           ConstantU32(state, IR::ReductionIdentity(reduction.operation)));
+	spv::Op operation = spv::OpGroupNonUniformIAdd;
+	switch (reduction.operation) {
+		case IR::ValueOpcode::UMax32: operation = spv::OpGroupNonUniformUMax; break;
+		case IR::ValueOpcode::UMin32: operation = spv::OpGroupNonUniformUMin; break;
+		case IR::ValueOpcode::SMax32: operation = spv::OpGroupNonUniformSMax; break;
+		case IR::ValueOpcode::SMin32: operation = spv::OpGroupNonUniformSMin; break;
+		case IR::ValueOpcode::BitwiseOr32: operation = spv::OpGroupNonUniformBitwiseOr; break;
+		case IR::ValueOpcode::BitwiseAnd32: operation = spv::OpGroupNonUniformBitwiseAnd; break;
+		case IR::ValueOpcode::BitwiseXor32: operation = spv::OpGroupNonUniformBitwiseXor; break;
+		default: break;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(operation, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          contribution);
+	return result;
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	if (GetCodegenOptions().lane_reductions) {
+		if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {
+			// One reduction per wave: the second half of a wave64 that one invocation runs
+			// (lane_count 2) takes the first half's result, which covers the same lanes.
+			if (ctx.half == 1) {
+				return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+			}
+			return EmitLaneReduction(ctx, *reduction);
+		}
+	}
+	// V_READLANE's lane is an SGPR, M0 or a constant, so the shuffle's lane is uniform too.
+	return MarkLaneReadUniform(ctx, inst, ctx.Shuffle(inst, 0, ctx.Arg(inst, 1)));
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -848,6 +943,57 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	// Guest S_GETPC values stay shader-relative in SPIR-V, matching the runtime ABI. The
 	// runtime descriptor evaluator supplies the mapped shader base for host-side planning.
 	return ctx.Def(IR::Value(uint64_t {0}));
+}
+
+uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx, const IR::Inst& inst) {
+	// S_MEMREALTIME is a scalar instruction: one value per wave. The second half of a wave64 that
+	// one invocation runs (lane_count 2) takes the first half's value.
+	if (ctx.half == 1) {
+		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+	}
+	auto&      state = ctx.state;
+	const auto clock = GetHostShaderClock();
+	if (clock.scope == HostClockScope::None) {
+		// No shader clock on this device: the placeholder.
+		return ctx.Def(IR::Value(UINT64_MAX));
+	}
+	// Read the clock once as a uvec2 (the halves cannot tear) and take the subgroup's first active
+	// invocation's value, so every lane sees the same time, as on the guest.
+	const auto read = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpReadClockKHR, TypeU32Vector(state, 2), read,
+	    ConstantU32(state, clock.scope == HostClockScope::Device ? spv::ScopeDevice
+	                                                             : spv::ScopeSubgroup));
+	const auto uniform = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32Vector(state, 2), uniform,
+	                          ConstantU32(state, spv::ScopeSubgroup), read);
+	if (clock.shift == 0) {
+		return uniform;
+	}
+	// Scale toward 100 MHz with a shift (no 64-bit arithmetic): right by `shift` bits for a faster
+	// clock (1 GHz: 125 MHz, so guest timeouts expire slightly early rather than 10x late), left
+	// for a slower one.
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, uniform, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, uniform, 1);
+	const bool     right  = clock.shift > 0;
+	const uint32_t amount = static_cast<uint32_t>(right ? clock.shift : -clock.shift);
+	const auto     shift  = right ? spv::OpShiftRightLogical : spv::OpShiftLeftLogical;
+	const auto     carry  = right ? spv::OpShiftLeftLogical : spv::OpShiftRightLogical;
+	// Right: low' = low >> n | high << (32 - n), high' = high >> n.
+	// Left: high' = high << n | low >> (32 - n), low' = low << n.
+	const auto receiving = right ? low : high; // gets the bits that cross the word boundary
+	const auto giving    = right ? high : low;
+	const auto kept      = Binary(state, shift, TypeU32(state), receiving, ConstantU32(state, amount));
+	const auto crossing =
+	    Binary(state, carry, TypeU32(state), giving, ConstantU32(state, 32u - amount));
+	const auto received = Binary(state, spv::OpBitwiseOr, TypeU32(state), kept, crossing);
+	const auto given    = Binary(state, shift, TypeU32(state), giving, ConstantU32(state, amount));
+	const auto result   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result,
+	                          right ? received : given, right ? given : received);
+	return result;
 }
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {

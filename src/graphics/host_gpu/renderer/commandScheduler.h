@@ -216,6 +216,9 @@ private:
 	std::unique_ptr<EopTimestampRing> m_eop_timestamps;
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
+	// KYTY_PENDING_REFRESH_US: when the draw-entry pop last queried the GPU's progress (steady
+	// clock nanoseconds; the recording producer only).
+	uint64_t m_last_pending_refresh_ns = 0;
 	std::array<SubmitDependency*, SubmitDependencySlots> m_submit_dependencies {};
 	// KYTY_CP_RECORDER: the recorder thread of the guest scheduler (after m_gpu_timing, whose
 	// ring it drives; destroyed before it).

@@ -35,6 +35,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/vramStats.h"
 
 #include <algorithm>
 #include <array>
@@ -90,6 +91,12 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 		if (const auto* limit = std::getenv("KYTY_TILER_SCRATCH_POOL_MB"); limit != nullptr) {
 			m_scratch_pool_limit = std::strtoull(limit, nullptr, 10) * 1024ull * 1024ull;
 		}
+		// KYTY_TILER_SCRATCH_POOL_IDLE_MS=N (default 0: off): pooled scratch buffers no detile has
+		// reused for N ms are destroyed (TrimScratchPool, from the image garbage collector).
+		if (const auto* idle = std::getenv("KYTY_TILER_SCRATCH_POOL_IDLE_MS"); idle != nullptr) {
+			m_scratch_idle = std::chrono::milliseconds(
+			    static_cast<int64_t>(std::min(std::strtoull(idle, nullptr, 10), 3600000ull)));
+		}
 	}
 	// Detile output is consumed only by buffer->image copies (and element-wise conversions)
 	// that read exactly the width x height elements of each tile at its pitch, all of which the
@@ -102,6 +109,7 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 
 TileManager::~TileManager() {
 	for (const auto& scratch: m_scratch_pool) {
+		VramStats::Note(VramStats::Kind::TilerScratch, true, -static_cast<int64_t>(scratch.capacity));
 		vmaDestroyBuffer(m_graphics.allocator, scratch.buffer, scratch.allocation);
 	}
 	m_scratch_pool.clear();
@@ -185,7 +193,41 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
 	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
 	                     "allocate TileManager scratch buffer");
+	VramStats::Note(VramStats::Kind::TilerScratch, true, static_cast<int64_t>(capacity));
 	return {buffer, memory, size, capacity};
+}
+
+std::pair<uint64_t, uint64_t> TileManager::ScratchPoolBytes() {
+	std::scoped_lock lock(m_scratch_mutex);
+	return {m_scratch_pool_bytes, m_scratch_pool_limit};
+}
+
+void TileManager::TrimScratchPool() {
+	if (m_scratch_idle.count() == 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now < m_scratch_trim_next) {
+		return;
+	}
+	m_scratch_trim_next = now + std::chrono::milliseconds(100);
+	std::vector<Scratch> expired;
+	{
+		std::scoped_lock lock(m_scratch_mutex);
+		// Released in order: the oldest entries are at the front.
+		size_t count = 0;
+		while (count < m_scratch_pool.size() && now - m_scratch_pool[count].released >= m_scratch_idle) {
+			m_scratch_pool_bytes -= m_scratch_pool[count].capacity;
+			expired.push_back(m_scratch_pool[count]);
+			++count;
+		}
+		m_scratch_pool.erase(m_scratch_pool.begin(),
+		                     m_scratch_pool.begin() + static_cast<std::ptrdiff_t>(count));
+	}
+	for (const auto& old: expired) {
+		VramStats::Note(VramStats::Kind::TilerScratch, true, -static_cast<int64_t>(old.capacity));
+		vmaDestroyBuffer(m_graphics.allocator, old.buffer, old.allocation);
+	}
 }
 
 void TileManager::DeferDestroy(Scratch scratch) {
@@ -195,8 +237,10 @@ void TileManager::DeferDestroy(Scratch scratch) {
 		return;
 	}
 	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+	m_scheduler.DeferOperation([allocator, scratch] {
+		VramStats::Note(VramStats::Kind::TilerScratch, true, -static_cast<int64_t>(scratch.capacity));
+		vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation);
+	});
 }
 
 void TileManager::ReleaseScratch(Scratch scratch) {
@@ -210,6 +254,7 @@ void TileManager::ReleaseScratch(Scratch scratch) {
 				m_scratch_pool_bytes -= m_scratch_pool.front().capacity;
 				m_scratch_pool.erase(m_scratch_pool.begin());
 			}
+			scratch.released = std::chrono::steady_clock::now();
 			m_scratch_pool.push_back(scratch);
 			m_scratch_pool_bytes += scratch.capacity;
 		} else {
@@ -217,6 +262,7 @@ void TileManager::ReleaseScratch(Scratch scratch) {
 		}
 	}
 	for (const auto& old: evicted) {
+		VramStats::Note(VramStats::Kind::TilerScratch, true, -static_cast<int64_t>(old.capacity));
 		vmaDestroyBuffer(m_graphics.allocator, old.buffer, old.allocation);
 	}
 }

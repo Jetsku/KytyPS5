@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <bit>
 #include <unordered_map>
 #include <utility>
 
@@ -227,9 +228,28 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
-	if (type == IR::Type::U64) {
-		const auto pair = ReadU32Pair(operand);
-		return ir.ConstructU64(pair[0], pair[1]);
+	if (type == IR::Type::U64 || type == IR::Type::F64) {
+		auto pair = ReadU32Pair(operand);
+		if (type == IR::Type::F64) {
+			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
+				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
+			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+				const auto bits = operand.value == 0x3e22f983u
+				                      ? 0x3fc45f306dc9c882ull
+				                      : std::bit_cast<uint64_t>(static_cast<double>(
+				                            std::bit_cast<float>(operand.value)));
+				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+			}
+			if (operand.absolute) {
+				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
+			}
+			if (operand.negate) {
+				pair[1] = ir.BitwiseXor(pair[1], IR::U32(IR::Value(0x80000000u)));
+			}
+		}
+		const auto bits = ir.ConstructU64(pair[0], pair[1]);
+		return type == IR::Type::F64 ? ir.Emit(IR::ValueOpcode::BitCastF64U64, {bits}) : IR::Value(bits);
 	}
 	auto bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	if (TypesOverlap(type, IR::Type::F32) && !TypesOverlap(type, IR::Type::U32)) {
@@ -405,6 +425,10 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
 	}
+	if (type == IR::Type::F64) {
+		value = ir.Emit(IR::ValueOpcode::BitCastU64F64, {value});
+		type  = IR::Type::U64;
+	}
 	if (type == IR::Type::U64) {
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
 		return;
@@ -537,6 +561,12 @@ IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_la
 	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
 		offset = operand.sdwa_sel == 5u ? 16u : 0u;
 	}
+	if (width == 8u && operand.sdwa_sext) {
+		// Extend the selected byte into the 16-bit operand before halfword modifiers.
+		const auto value = IR::U32(
+		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {bits, IR::Value(offset), IR::Value(width)}));
+		return ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
+	}
 	return IR::U32(
 	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(width)}));
 }
@@ -544,7 +574,7 @@ IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_la
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
 	auto value = Read16LaneBits(operand, high_lane);
-	if (sign_extend || operand.sdwa_sext) {
+	if (sign_extend) {
 		value = IR::U32(
 		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {value, IR::Value(0u), IR::Value(16u)}));
 	}
@@ -854,8 +884,40 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	include_vector(inst.src1);
 	include_vector(inst.src2);
 	include_vector(inst.src3);
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_CVT_F64_I32:
+		case Decoder::Opcode::V_CVT_F64_F32:
+		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
+		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_ADD_F64:
+		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_EQ_F64:
+		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GE_F64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_LT_U64:
+		case Decoder::Opcode::V_CMP_EQ_U64:
+		case Decoder::Opcode::V_CMP_LE_U64:
+		case Decoder::Opcode::V_CMP_GT_U64:
+		case Decoder::Opcode::V_CMP_NE_U64:
+		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_LE_U64:
+		case Decoder::Opcode::V_CMPX_NE_U64:
+			include_vector(inst.src0, 2u);
+			include_vector(inst.src1, 2u);
+			break;
+		default: break;
+	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
+			case Decoder::Opcode::DS_ADD_U64:
+			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
@@ -1283,10 +1345,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
+	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
+	                             (options.input_info.compute->float_mode & 0x10u) == 0;
 	bool lds_write_pending = false;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit);
+		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
 		// Blocks are visited in address order; keep unordered LDS writes pending across
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);

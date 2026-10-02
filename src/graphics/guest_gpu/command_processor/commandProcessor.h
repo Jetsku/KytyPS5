@@ -117,7 +117,10 @@ public:
 
 	// Thread: the graphics queue's front on the sequencer thread (KYTY_CP_SEQ=1); ops go to the
 	// resolver through the op ring, lockstep ops wait for its answer.
-	enum class FrontMode : uint8_t { Direct, Inline, Reference, Thread };
+	// Prefetch: P3c (KYTY_CP_SEQ_PREFETCH), a copy of the sequencer's front parsing past a wait
+	// while the resolver catches up: it emits no op, publishes its draws to the draw-prep window
+	// as speculative slots, and stops at anything it cannot parse without the resolver.
+	enum class FrontMode : uint8_t { Direct, Inline, Reference, Thread, Prefetch };
 
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id);
 	~CommandProcessor();
@@ -231,10 +234,10 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 	[[nodiscard]] FrontMode GetFrontMode() const noexcept { return m_front_mode; }
-	// A reference front (KYTY_CP_SEQ_VERIFY) only parses: packet handlers skip their counters and
-	// diagnostics for it.
+	// A reference front (KYTY_CP_SEQ_VERIFY) and a speculative one (KYTY_CP_SEQ_PREFETCH) only
+	// parse: packet handlers skip their counters and diagnostics for them.
 	[[nodiscard]] bool IsReferenceFront() const noexcept {
-		return m_front_mode == FrontMode::Reference;
+		return m_front_mode == FrontMode::Reference || m_front_mode == FrontMode::Prefetch;
 	}
 
 	// ---- P3b, KYTY_CP_SEQ=1 (cpSequencer.h) ----
@@ -293,6 +296,40 @@ private:
 	                                       uint64_t& begin, uint64_t& end);
 	// Resolver: register state for an op with a snapshot (bound around its execution).
 	[[nodiscard]] CpSeq::RegisterState* OpSnapshot(CpSeq::OpKind kind, const void* payload);
+
+	// ---- P3c, KYTY_CP_SEQ_PREFETCH (cpOps.h) ----
+	// Sequencer: the last end-of-pipe label's value, when it is plain data (NoteLastLabel), and
+	// whether a WAIT_REG_MEM waits for exactly that label (the "wait for idle" idiom): no guest
+	// CPU write can be ordered before such a wait, so draws after it may be prepared before it.
+	void               NoteLastLabel(CpSeq::OpKind kind, const void* payload);
+	[[nodiscard]] bool IsSelfLabelWait(const CpSeq::WaitRegMemOp& op) const;
+	// Sequencer, at such a wait (lockstep op `wait_op` emitted, its answer pending): runs the
+	// speculative front from the packet after the wait until the answer comes or it must stop.
+	void RunPrefetch(uint64_t wait_op);
+	// Sequencer: hands every speculative slot not adopted yet to the resolver to retire.
+	void DropSpeculativeSlots();
+	void EmitSkipSlots(uint64_t count);
+	// Sequencer: a draw of the real parse takes the next speculative slot when its adoption key
+	// matches (sets DrawFlagPublished and the window position); false: publish as usual.
+	template <typename Op>
+	[[nodiscard]] bool AdoptSpeculativeDraw(Op& op);
+	// Both fronts after a wait: the packets and bytes consumed so far (the adoption key).
+	void TrackAdoptPacket(const uint32_t* packet, uint32_t packet_dw, uint64_t guest_address);
+	void TrackAdoptInputs(const void* data, uint64_t size, uint64_t guest_address);
+	// The adoption key of the draw packet being parsed: the inputs hash with its bytes added.
+	[[nodiscard]] uint64_t CurrentPacketKey() const;
+	// Speculative front: the op's CP write is noted (bytes the parse must not read before it
+	// executes); a lockstep op stops the parse (suspended).
+	CpSeq::Result SubmitPrefetch(CpSeq::OpKind kind, const void* payload);
+	template <typename Op>
+	void               PrefetchDraw(const Op& op);
+	[[nodiscard]] bool CheckCommandBytesPrefetch(Pm4Execution::BufferCursor& cursor);
+	[[nodiscard]] bool ReadGuestForPrefetch(uint64_t address, uint64_t size, void* dst);
+	[[nodiscard]] bool PrefetchOverlaps(uint64_t begin, uint64_t end) const;
+	void               StopPrefetch(Profiler::FrameEvent reason);
+	// The speculative front takes the sequencer's front state (not the constant RAM, which the
+	// thread-mode stream never changes and draws never read).
+	void CopyFrontStateForPrefetch(const CommandProcessor& from);
 	CpSeq::Result ExecLockstepRead(const CpSeq::LockstepReadOp& op);
 	// The back: executes one op with today's code (the direct path's bodies).
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
@@ -497,6 +534,33 @@ private:
 		uint64_t op    = 0;
 	};
 	std::vector<PendingWrite> m_pending_writes;
+	// Sequencer: the destination of the last end-of-pipe label it emitted (EndOfPipe/ReleaseMem),
+	// which classifies the next WAIT_REG_MEM (FrameEvent CpSeqBarrierWaitSelfLabel), and, for P3c,
+	// its data (known: plain data, and no other CP write was emitted since).
+	uint64_t m_last_label_begin = 0;
+	uint64_t m_last_label_end   = 0;
+	uint64_t m_last_label_value = 0;
+	uint32_t m_last_label_size  = 0;
+	bool     m_last_label_known = false;
+	// ---- P3c ----
+	// Sequencer: the speculative front (created on first use). Speculative front: its owner, the
+	// wait it runs for, the CP writes of the ops it did not emit, whether it must stop, and the
+	// draws it published.
+	struct PrefetchDeleter {
+		void operator()(CommandProcessor* processor) const noexcept;
+	};
+	std::unique_ptr<CommandProcessor, PrefetchDeleter> m_prefetch;
+	CommandProcessor*         m_prefetch_owner = nullptr;
+	uint64_t                  m_prefetch_wait  = 0;
+	std::vector<PendingWrite> m_prefetch_writes;
+	bool                      m_prefetch_stop  = false;
+	uint32_t                  m_prefetch_draws = 0;
+	// Both fronts after a wait (P3c): the adoption key so far. skip_one: the wait packet itself
+	// completes first and is not counted.
+	bool     m_adopt_tracking = false;
+	bool     m_adopt_skip_one = false;
+	uint64_t m_adopt_packets  = 0;
+	uint64_t m_adopt_inputs   = 0;
 	// The draw ops of published window slots and the ops of taken snapshots, oldest first: the
 	// op whose execution frees the next slot or snapshot (the sequencer's wake threshold).
 	std::deque<uint64_t> m_published_ops;

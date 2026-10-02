@@ -25,15 +25,30 @@
 // predicate, and a waker changes the signal word after its own seq_cst update of what the
 // predicate reads. Either the sleeper sees the new state, or the waker sees the sleeper.
 //
+// Cold wakes, default protocol: a wake sets a "pending" flag that only a sleeper leaving the park
+// clears. That flag can stick: a cold worker that parks while the backlog is already high
+// announces itself, skips the wait and clears the flag on its way out; a waker that saw it
+// announced but sets the flag only after that clear leaves it set with no sleeper to clear it.
+// Every later MaybeWakeCold then returns at once and parked cold workers never wake again (seen in
+// game: no cold wake in a whole session, every waited head held by one of the two hot workers
+// while other published slots waited unclaimed).
+// KYTY_DRAW_PREP_COLD_TOKEN=1 (cold_token): a wake is a token instead (0 none, 1 one in flight). A
+// cold worker that parks first takes an outstanding token, and only sleeps while there is none, so
+// a token given while its sleeper was leaving is taken by the next cold worker to park instead of
+// blocking every later wake. Still at most one cold wake in flight.
+//
 // Work stealing (KYTY_DRAW_PREP_STEAL, AwaitHead below): a producer that must commit a head a
 // worker still holds prepares later unclaimed slots itself instead of idling.
 namespace Libs::Graphics::DrawPrep {
 
 class WorkerGate {
 public:
-	WorkerGate(uint32_t workers, uint32_t hot, uint32_t wake_backlog) noexcept
+	WorkerGate(uint32_t workers, uint32_t hot, uint32_t wake_backlog,
+	           bool cold_token = false) noexcept
 	    : m_hot(hot == 0 || hot > workers ? workers : hot), m_has_cold(m_hot < workers),
-	      m_wake_backlog(wake_backlog == 0 ? 1u : wake_backlog) {}
+	      m_wake_backlog(wake_backlog == 0 ? 1u : wake_backlog), m_cold_token_mode(cold_token) {}
+
+	[[nodiscard]] bool ColdTokenMode() const noexcept { return m_cold_token_mode; }
 
 	[[nodiscard]] bool     Hot(uint32_t index) const noexcept { return index < m_hot; }
 	[[nodiscard]] uint32_t HotCount() const noexcept { return m_hot; }
@@ -58,6 +73,19 @@ public:
 
 	// Any thread that has just measured the unclaimed backlog. Returns true when it woke one.
 	bool MaybeWakeCold(uint64_t backlog) noexcept {
+		if (m_cold_token_mode) {
+			if (backlog < m_wake_backlog || m_cold_sleepers.load(std::memory_order_seq_cst) == 0 ||
+			    m_cold_token.load(std::memory_order_relaxed) != 0) {
+				return false;
+			}
+			uint32_t none = 0;
+			if (!m_cold_token.compare_exchange_strong(none, 1u, std::memory_order_seq_cst)) {
+				return false; // another thread's wake is in flight
+			}
+			m_cold_token.notify_one();
+			m_cold_wakes.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
 		if (backlog < m_wake_backlog || m_cold_sleepers.load(std::memory_order_seq_cst) == 0 ||
 		    m_cold_wake_pending.load(std::memory_order_relaxed) ||
 		    m_cold_wake_pending.exchange(true, std::memory_order_acq_rel)) {
@@ -83,6 +111,25 @@ public:
 	// Cold worker with nothing claimable: sleeps until the backlog reaches WakeBacklog().
 	template <typename BacklogHigh>
 	void ParkCold(BacklogHigh&& backlog_high, const std::atomic<bool>& stop) noexcept {
+		if (m_cold_token_mode) {
+			m_cold_sleepers.fetch_add(1, std::memory_order_seq_cst);
+			for (;;) {
+				// An outstanding wake (also one given while its intended sleeper was leaving) is
+				// this worker's: it goes back to claiming instead of sleeping.
+				uint32_t token = 1;
+				if (m_cold_token.compare_exchange_strong(token, 0u, std::memory_order_seq_cst)) {
+					break;
+				}
+				// Shutdown (WakeAll) leaves its own value, which no sleeper consumes.
+				if (token == ColdTokenShutdown || backlog_high() ||
+				    stop.load(std::memory_order_seq_cst)) {
+					break;
+				}
+				m_cold_token.wait(0u, std::memory_order_seq_cst);
+			}
+			m_cold_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+			return;
+		}
 		const auto observed = m_cold_signal.load(std::memory_order_seq_cst);
 		m_cold_sleepers.fetch_add(1, std::memory_order_seq_cst);
 		if (!backlog_high() && !stop.load(std::memory_order_seq_cst)) {
@@ -100,6 +147,16 @@ public:
 		m_hot_signal.notify_all();
 		m_cold_signal.fetch_add(1, std::memory_order_seq_cst);
 		m_cold_signal.notify_all();
+		// Not a wake token: one sleeper would consume it and the others sleep on.
+		m_cold_token.store(ColdTokenShutdown, std::memory_order_seq_cst);
+		m_cold_token.notify_all();
+	}
+
+	// Tests: a cold wake token is outstanding (KYTY_DRAW_PREP_COLD_TOKEN), or the default
+	// protocol's pending flag is set.
+	[[nodiscard]] bool ColdWakeOutstanding() const noexcept {
+		return m_cold_token_mode ? m_cold_token.load(std::memory_order_seq_cst) != 0
+		                         : m_cold_wake_pending.load(std::memory_order_seq_cst);
 	}
 
 	[[nodiscard]] uint64_t ColdWakes() const noexcept {
@@ -116,7 +173,12 @@ private:
 	const uint32_t m_hot;
 	const bool     m_has_cold;
 	const uint32_t m_wake_backlog;
+	const bool     m_cold_token_mode;
 	uint32_t       m_publishes = 0; // producer only
+	// KYTY_DRAW_PREP_COLD_TOKEN: the cold wake token (0 none, 1 one in flight, ColdTokenShutdown
+	// after WakeAll).
+	static constexpr uint32_t         ColdTokenShutdown = 2;
+	alignas(64) std::atomic<uint32_t> m_cold_token {0};
 
 	alignas(64) std::atomic<uint64_t> m_hot_signal {0};
 	std::atomic<uint32_t>             m_hot_sleepers {0};

@@ -224,6 +224,7 @@ const char* OpName(Op op) noexcept {
 	    "EndQuery",
 	    "CopyQueryPoolResults",
 	    "WriteTimestamp2",
+	    "UpdateDescriptorSets",
 	    "BeginConditionalRendering",
 	    "EndConditionalRendering",
 	};
@@ -470,16 +471,10 @@ uint64_t BindDescriptorSets(vk::PipelineBindPoint point, vk::PipelineLayout layo
 	return h.Value();
 }
 
-uint64_t PushDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
-                           uint32_t count, const vk::WriteDescriptorSet* writes) {
-	Hasher h(Op::PushDescriptorSet);
-	h.AddEnum(point);
-	h.AddHandle(layout);
-	h.Add(set);
-	h.Add(count);
+// The writes' fields other than dstSet, and their infos.
+static void AddDescriptorWrites(Hasher& h, uint32_t count, const vk::WriteDescriptorSet* writes) {
 	for (uint32_t i = 0; i < count; i++) {
 		const auto& w = writes[i];
-		// dstSet is ignored by vkCmdPushDescriptorSetKHR.
 		h.Add(w.dstBinding);
 		h.Add(w.dstArrayElement);
 		h.Add(w.descriptorCount);
@@ -501,6 +496,29 @@ uint64_t PushDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layou
 			h.Add(0xdeadu);
 		}
 	}
+}
+
+uint64_t PushDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
+                           uint32_t count, const vk::WriteDescriptorSet* writes) {
+	Hasher h(Op::PushDescriptorSet);
+	h.AddEnum(point);
+	h.AddHandle(layout);
+	h.Add(set);
+	h.Add(count);
+	// dstSet is ignored by vkCmdPushDescriptorSetKHR.
+	AddDescriptorWrites(h, count, writes);
+	return h.Value();
+}
+
+uint64_t UpdateDescriptorSets(vk::DescriptorSet set, uint32_t count,
+                              const vk::WriteDescriptorSet* writes) {
+	Hasher h(Op::UpdateDescriptorSets);
+	h.AddHandle(set);
+	h.Add(count);
+	for (uint32_t i = 0; i < count; i++) {
+		h.AddHandle(writes[i].dstSet);
+	}
+	AddDescriptorWrites(h, count, writes);
 	return h.Value();
 }
 
@@ -977,16 +995,14 @@ void Encoder::bindDescriptorSets(vk::PipelineBindPoint point, vk::PipelineLayout
 	                          : 0);
 }
 
-void Encoder::pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout,
-                                   uint32_t set, uint32_t count,
-                                   const vk::WriteDescriptorSet* writes) {
+uint64_t Encoder::DescriptorInfoCount(uint32_t count, const vk::WriteDescriptorSet* writes) {
 	uint64_t infos = 0;
 	for (uint32_t i = 0; i < count; i++) {
 		const auto& write = writes[i];
 		if (write.pNext != nullptr || write.pTexelBufferView != nullptr ||
 		    (!IsImageDescriptor(write.descriptorType) &&
 		     !IsBufferDescriptor(write.descriptorType))) {
-			EXIT("CommandStream: push descriptor type %u is not supported\n",
+			EXIT("CommandStream: descriptor type %u is not supported\n",
 			     static_cast<uint32_t>(write.descriptorType));
 		}
 		const bool image = IsImageDescriptor(write.descriptorType);
@@ -994,11 +1010,11 @@ void Encoder::pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayo
 		        (image ? write.pImageInfo == nullptr : write.pBufferInfo == nullptr));
 		infos += write.descriptorCount;
 	}
-	auto w = Open(Op::PushDescriptorSet,
-	              Sz<PushDescriptorSetPacket>() + Arr<DescriptorWriteRecord>(count) +
-	                  Arr<DescriptorInfo>(infos),
-	              false);
-	w.Put(PushDescriptorSetPacket {layout, point, set, count, static_cast<uint32_t>(infos)});
+	return infos;
+}
+
+void Encoder::PutDescriptorWrites(Writer& w, uint32_t count, const vk::WriteDescriptorSet* writes,
+                                  uint64_t infos) {
 	auto* records = reinterpret_cast<DescriptorWriteRecord*>(w.Cursor());
 	w.Skip(sizeof(DescriptorWriteRecord) * count);
 	auto* out = w.Cursor();
@@ -1022,8 +1038,36 @@ void Encoder::pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayo
 			out += bytes;
 		}
 	}
+}
+
+void Encoder::pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+                                   uint32_t set, uint32_t count,
+                                   const vk::WriteDescriptorSet* writes) {
+	const auto infos = DescriptorInfoCount(count, writes);
+	auto       w     = Open(Op::PushDescriptorSet,
+	                        Sz<PushDescriptorSetPacket>() + Arr<DescriptorWriteRecord>(count) +
+	                            Arr<DescriptorInfo>(infos),
+	                        false);
+	w.Put(PushDescriptorSetPacket {layout, point, set, count, static_cast<uint32_t>(infos)});
+	PutDescriptorWrites(w, count, writes, infos);
 	Close(w,
 	      m_options.verify ? VerifyHash::PushDescriptorSet(point, layout, set, count, writes) : 0);
+}
+
+void Encoder::updateDescriptorSets(vk::DescriptorSet set, uint32_t count,
+                                   const vk::WriteDescriptorSet* writes) {
+	EXIT_IF(set == nullptr);
+	for (uint32_t i = 0; i < count; i++) {
+		EXIT_IF(writes[i].dstSet != set);
+	}
+	const auto infos = DescriptorInfoCount(count, writes);
+	auto       w     = Open(Op::UpdateDescriptorSets,
+	                        Sz<UpdateDescriptorSetsPacket>() + Arr<DescriptorWriteRecord>(count) +
+	                            Arr<DescriptorInfo>(infos),
+	                        false);
+	w.Put(UpdateDescriptorSetsPacket {set, count, static_cast<uint32_t>(infos)});
+	PutDescriptorWrites(w, count, writes, infos);
+	Close(w, m_options.verify ? VerifyHash::UpdateDescriptorSets(set, count, writes) : 0);
 }
 
 void Encoder::pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,

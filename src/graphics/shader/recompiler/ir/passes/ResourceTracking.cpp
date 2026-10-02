@@ -323,7 +323,7 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset || a.selector_immediate != b.selector_immediate ||
+				    a.table_offset != b.table_offset ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -943,16 +943,20 @@ private:
 			uint32_t material_memory_index = 0;
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
+			// The record read may carry its own immediate offset (S_BUFFER_LOAD offset=4 reads the
+			// second dword of a per-material record): it adds to the selector offset.
 			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
 			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
-			indirect.selector_immediate = memory->offset;
 			Value selector;
 			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
-			                         indirect.selector_offset)) {
+			                         indirect.selector_offset) ||
+			    indirect.selector_offset > UINT32_MAX - memory->offset) {
 				return false;
 			}
+			indirect.selector_offset += memory->offset;
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 			const std::array<const Inst*, 1> material_users {shift};
 			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {

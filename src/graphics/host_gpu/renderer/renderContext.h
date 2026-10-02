@@ -64,6 +64,8 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// KYTY_VRAM_STATS (vramStats.h): one GPU memory report (GPU thread).
+	void               ReportVram();
 
 	// Detectors for guest-memory changes resource tracking does not see. They only count
 	// (FrameEvent.HostBackingWrite*, GuestProtect*) and log the first occurrences to stderr.
@@ -117,6 +119,7 @@ private:
 	GuestGpu*                 m_gpu_notify = nullptr;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

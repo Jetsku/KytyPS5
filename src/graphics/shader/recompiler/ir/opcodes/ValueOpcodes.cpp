@@ -33,6 +33,7 @@ constexpr Type U32             = Type::U32;
 constexpr Type U64             = Type::U64;
 constexpr Type F16             = Type::F16;
 constexpr Type F32             = Type::F32;
+constexpr Type F64             = Type::F64;
 constexpr Type U32x2           = Type::U32x2;
 constexpr Type U32x3           = Type::U32x3;
 constexpr Type U32x4           = Type::U32x4;
@@ -123,6 +124,7 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicSMax32:
 		case ValueOpcode::BufferAtomicUMax32:
 		case ValueOpcode::BufferAtomicAnd32:
+		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicOr32:
 		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::BufferAtomicXor32:
@@ -135,7 +137,6 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicUMin64:
 		case ValueOpcode::BufferAtomicSMax64:
 		case ValueOpcode::BufferAtomicUMax64:
-		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
@@ -146,6 +147,7 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 uint32_t BufferComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::BufferAtomicSwap64:
+		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::BufferAtomicCmpSwap64:
 		case ValueOpcode::BufferAtomicIAdd64:
@@ -154,7 +156,6 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicUMin64:
 		case ValueOpcode::BufferAtomicSMax64:
 		case ValueOpcode::BufferAtomicUMax64:
-		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
@@ -184,6 +185,7 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicFMax32:
 		case ValueOpcode::SharedAtomicSwap32:
 		case ValueOpcode::SharedAtomicIAdd32:
+		case ValueOpcode::SharedAtomicIAdd64:
 		case ValueOpcode::SharedAtomicISub32:
 		case ValueOpcode::SharedAtomicInc32:
 		case ValueOpcode::SharedAtomicDec32:
@@ -193,6 +195,7 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicUMax32:
 		case ValueOpcode::SharedAtomicAnd32:
 		case ValueOpcode::SharedAtomicOr32:
+		case ValueOpcode::SharedAtomicOr64:
 		case ValueOpcode::SharedAtomicXor32: return SharedAccess::Atomic;
 		case ValueOpcode::DataAppend: return SharedAccess::Append;
 		case ValueOpcode::DataConsume: return SharedAccess::Consume;
@@ -202,6 +205,8 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 
 uint32_t SharedComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
+		case ValueOpcode::SharedAtomicIAdd64:
+		case ValueOpcode::SharedAtomicOr64:
 		case ValueOpcode::LoadSharedU32x2:
 		case ValueOpcode::WriteSharedU32x2: return 2u;
 		case ValueOpcode::LoadSharedU32x3:
@@ -236,17 +241,19 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
 		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicIAdd32:
+		case ValueOpcode::ImageAtomicSMin32:
 		case ValueOpcode::ImageAtomicUMin32:
+		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicUMax32:
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
 		case ValueOpcode::ImageAtomicCmpSwap32:
 		case ValueOpcode::ImageAtomicISub32:
-		case ValueOpcode::ImageAtomicSMin32:
-		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicInc32:
 		case ValueOpcode::ImageAtomicDec32:
+		case ValueOpcode::ImageAtomicFMin32:
+		case ValueOpcode::ImageAtomicFMax32:
 			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};
 		default: return {};
 	}

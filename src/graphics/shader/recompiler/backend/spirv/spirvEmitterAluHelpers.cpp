@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -100,7 +101,27 @@ uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return ret;
 }
 
+// KYTY_SHORT_F32_HELPERS (from BryanKAdams/KytyPS5 5e22481): OpIsNan holds for every NaN
+// encoding, signaling ones included, and is one instruction where the exponent and mantissa tests
+// take five. The module preserves NaNs (the fast min/max path relies on OpIsNan the same way).
+static bool ShortF32Helpers() {
+	return GetCodegenOptions().short_f32_helpers;
+}
+
+static F32Class EmitClassifyF32Value(EmitterState& state, uint32_t value, uint32_t bits) {
+	F32Class cls;
+	cls.bits = bits;
+	cls.nan  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsNan, TypeBool(state), cls.nan, value);
+	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, bits, 0x7fffffffu),
+	                                  0);
+	return cls;
+}
+
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
+	if (ShortF32Helpers()) {
+		return EmitClassifyF32Value(state, EmitBitcastU32ToF32(state, bits), bits);
+	}
 	F32Class cls;
 	cls.bits                 = bits;
 	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
@@ -115,6 +136,9 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 }
 
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
+	if (ShortF32Helpers()) {
+		return EmitClassifyF32Value(state, value, EmitBitcastF32ToU32(state, value));
+	}
 	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
@@ -221,6 +245,9 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
+	// The |x| >= 2^23 select stays, also with KYTY_SHORT_F32_HELPERS: such finite values are whole
+	// numbers, but the RTX 3090's Fract of -FLT_MAX is not +0 (sin/cos read NaN without the select,
+	// VectorSinCosMaxFiniteSpecialCases), so the select is not redundant on every host.
 	const auto fract        = state.builder.AllocateId();
 	const auto bits         = state.builder.AllocateId();
 	const auto abs_bits     = state.builder.AllocateId();

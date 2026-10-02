@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <type_traits>
 
@@ -109,6 +110,29 @@ CheckLogState g_check_log;
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
+}
+
+bool SkipInactivePixelShadersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SKIP_INACTIVE_PS");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
+uint32_t DrawColorOutputFilter(const HW::Context& ctx) {
+	if (!SkipInactivePixelShadersEnabled()) {
+		return 0xffu;
+	}
+	const auto& sh_regs     = ctx.GetShaderRegisters();
+	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
+	uint32_t    output_mask = 0;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if (sh_regs.target_output_mode[slot] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
+			output_mask |= 1u << slot;
+		}
+	}
+	return output_mask;
 }
 
 static bool RenderTargetMaskHasMrt(uint32_t mask) {

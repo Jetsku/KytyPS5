@@ -343,6 +343,45 @@ public:
 		    cache_mappings);
 	}
 
+	// TryReadBacking for callers whose destination may be overwritten even when the read fails
+	// (KYTY_CP_COMMIT=streamread: a stream-ring reservation committed only on success): through a
+	// per-thread mapping record straight into `data`, without m_mutex or a bounce copy, of any
+	// size; the map generation is checked afterwards exactly as TryReadCachedMapping does, and a
+	// map mutation racing the copy redoes the read under m_mutex (which also records the mapping
+	// for the next reads). The bytes returned are those a TryReadBacking at that moment returns.
+	bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || !IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		if (!Libs::Graphics::CleanVerdict::Enabled()) {
+			return TryReadBacking(vaddr, data, size); // the mapping cache is off
+		}
+		const auto generation = s_map_generation.load(std::memory_order_acquire);
+		for (const auto& entry: t_backing_mapping_cache.entries) {
+			if (entry.owner != this || entry.generation != generation || vaddr < entry.vaddr ||
+			    vaddr - entry.vaddr >= entry.size || size > entry.size - (vaddr - entry.vaddr)) {
+				continue;
+			}
+			// RangeOk held for the whole record when it was cached under m_mutex.
+			std::memcpy(data, m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
+			            static_cast<size_t>(size));
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (s_map_generation.load(std::memory_order_relaxed) == generation) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BackingMapCacheHits);
+				return true;
+			}
+			break;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BackingMapCacheMisses);
+		auto* destination = static_cast<uint8_t*>(data);
+		return TryTransferBacking(
+		    vaddr, size,
+		    [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+			    std::memcpy(destination + data_offset, backing, bytes);
+		    },
+		    true);
+	}
+
 	// In-place inspection (KYTY_BACKING_INPLACE): inspect(bytes) gets a pointer to the `size`
 	// backing bytes of [vaddr, vaddr + size) and only reads them (a compare, a hash). When a
 	// per-thread mapping record covers the range the bytes are read where they are, without
@@ -1082,6 +1121,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryReadBackingDirect(vaddr, data, size);
 	}
 
 	template <typename Inspect>

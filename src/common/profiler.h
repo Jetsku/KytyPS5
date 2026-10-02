@@ -850,6 +850,8 @@ enum class FrameEvent : uint32_t {
 	BdaSyncEpochSkips,
 	BdaSyncEpochVerifyChecks,
 	BdaSyncEpochVerifyMismatches,
+	// KYTY_BDA_SYNC_PER_SUBMISSION: BDA passes skipped because the guest submission is unchanged.
+	BdaSyncSubmissionSkips,
 	// KYTY_BINDING_EPOCH_MEMO: read bindings reused within a sync epoch (a stream copy or a cache
 	// buffer), results recorded, and the verify mode's checks, mismatches and races.
 	BindingEpochMemoStreamHits,
@@ -1163,6 +1165,55 @@ enum class FrameEvent : uint32_t {
 	// longer preparation-to-commit intervals: entries per check).
 	DrawPrepLogChecks,
 	DrawPrepLogEntries,
+	// KYTY_CP_SEQ=1: the sequencer's lockstep waits by kind. WAIT_REG_MEM on the destination of the
+	// last end-of-pipe label the front emitted (the "wait for idle" idiom) or on another address;
+	// WAIT_FLIP_DONE; predication, COND_EXEC and conditional branches. Lockstep reads are
+	// CpSeqLockstepReads/Buffers. DrawBursts: barriers after which the sequencer published a draw
+	// before its next barrier (the draw-prep window restarts empty there).
+	CpSeqBarrierWaitSelfLabel,
+	CpSeqBarrierWaitOther,
+	CpSeqBarrierFlipWait,
+	CpSeqBarrierCondition,
+	CpSeqBarrierDrawBursts,
+	// Draw-prep commit waits (DrawPrepCommitWaits) by what the command processor found when it
+	// began to wait: the head was the first draw published after a sequencer barrier (Barrier) or
+	// after another stop of the sequencer (Start: a submission start, the frame fence, a handoff,
+	// a pending CP write), the window held at most two published draws (Shallow: the commit caught
+	// up with the publication), or more (Deep: the preparing threads were behind). Unclaimed: waits
+	// that began while another published slot was waiting for a preparing thread.
+	DrawPrepCommitWaitsBarrier,
+	DrawPrepCommitWaitsShallow,
+	DrawPrepCommitWaitsDeep,
+	DrawPrepCommitWaitsUnclaimed,
+	DrawPrepCommitWaitsStart,
+	// KYTY_CP_SEQ_PREFETCH (P3c, cpOps.h): speculative parses run at waits, the draws they
+	// published, the ones the real parse adopted, the first differing draw of a parse (its slots
+	// are dropped), and the slots the resolver retired unused. Stops: why speculative parses ended
+	// before the answer came (a lockstep op, a read they could not prove clean, a pending CP write
+	// over bytes they read, the window full or the draw cap, the stream end).
+	CpSeqPrefetchRuns,
+	CpSeqPrefetchDraws,
+	CpSeqPrefetchAdopted,
+	CpSeqPrefetchMismatches,
+	CpSeqPrefetchSkipped,
+	CpSeqPrefetchStopLockstep,
+	CpSeqPrefetchStopRead,
+	CpSeqPrefetchStopWindow,
+	CpSeqPrefetchStopEnd,
+	// Commit waits (DrawPrepCommitWaits) on an adopted slot: its speculative preparation had not
+	// finished when the command processor needed it.
+	CpSeqPrefetchAdoptedWaits,
+	// KYTY_SUBMIT_MIN_INTERVAL_US: optional submits (idle flushes, end-of-pipe batches) put off
+	// because the last submit was too recent (counted per check).
+	SubmitIntervalDeferrals,
+	// KYTY_CP_COMMIT=dccguest (renderer/cpCommit.h): target lookups on CPU-owned DCC metadata
+	// recorded as provable repeats, and repeats refused because a key or the GPU ownership changed.
+	CpCommitDccGuestRecords,
+	CpCommitDccGuestRejects,
+	// KYTY_CP_COMMIT=texdcc: DCC texture descriptions the texture binding memo recorded with their
+	// decision's certificate, and memo lookups whose certificate no longer held.
+	CpCommitTexDccRecords,
+	CpCommitTexDccRejects,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -1277,6 +1328,13 @@ enum class FrameWait : uint32_t {
 	// Draw-prep commits (Engine::Commit: the prepared draw recorded from its slot), per draw; with
 	// KYTY_CP_SEQ=1 the resolver reads slots another core wrote (the snapshot cache-miss risk).
 	DrawPrepCommit,
+	// DrawPrepCommitWait split like the FrameEvent DrawPrepCommitWaits{Barrier,Shallow,Deep,Start}.
+	DrawPrepCommitWaitBarrier,
+	DrawPrepCommitWaitShallow,
+	DrawPrepCommitWaitDeep,
+	DrawPrepCommitWaitStart,
+	// KYTY_CP_SEQ_PREFETCH: sequencer time in speculative parses (inside CpSeqSequencerWait).
+	CpSeqPrefetch,
 	Count,
 };
 

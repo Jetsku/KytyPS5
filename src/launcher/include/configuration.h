@@ -5,6 +5,7 @@
 
 #include <QByteArray>
 #include <QChar>
+#include <QColor>
 #include <QMetaEnum>
 #include <QMetaType>
 #include <QObject>
@@ -88,6 +89,7 @@ public:
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
+	QString                controller_color;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -123,6 +125,7 @@ public:
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
+		controller_color            = other.controller_color;
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
@@ -173,6 +176,7 @@ public:
 		KYTY_CFG_SET(user_name);
 		KYTY_CFG_SET(user_id);
 		KYTY_CFG_SET(audio_input_device);
+		KYTY_CFG_SET(controller_color);
 		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
@@ -216,6 +220,8 @@ public:
 		                         ? saved_user_id
 		                         : Config::DEFAULT_USER_ID;
 		audio_input_device = s->value("audio_input_device", audio_input_device).toString();
+		const QColor color(s->value("controller_color", controller_color).toString());
+		controller_color = color.isValid() ? color.name(QColor::HexRgb) : QString {};
 		KYTY_CFG_GET(present_mode);
 		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {

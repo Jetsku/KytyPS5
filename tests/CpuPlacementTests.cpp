@@ -5,7 +5,9 @@
 //    threads stay on their cores; threads created before and after the layout stay off them, also
 //    after a Process Lasso-like affinity change; placement samples and their counters agree; a hard
 //    affinity confined to the CP's core is found and moved to the general processors, and one that
-//    meets them is narrowed by the CPU sets.
+//    meets them is narrowed by the CPU sets; process default CPU sets replaced by another process
+//    (Process Lasso's CPU-set rule) are applied again (KYTY_CPU_RESERVE_REASSERT).
+//    KYTY_CPU_SETS: its list parser (ParseLogicalMask).
 // 3. --bench [seconds] [reps]: KYTY_CPU_RESERVE=off against cp, in child processes on logical
 //    processors 0-15 at HIGH priority (Process Lasso's rule for the game). A CP-like thread runs
 //    fixed work chunks after ~100 us blocking waits, next to bursty guest-like threads and a yield
@@ -195,6 +197,16 @@ void TestAffinityAndModes() {
 	Check(Common::ParseCpuReserveMode(nullptr, &valid) == CpuReserveMode::Off && valid, "unset");
 	Check(Common::ParseCpuReserveMode("bogus", &valid) == CpuReserveMode::Off && !valid,
 	      "unknown text");
+	// KYTY_CPU_SETS.
+	Check(Common::ParseLogicalMask("0-15", &valid) == 0xFFFFull && valid, "mask 0-15");
+	Check(Common::ParseLogicalMask("16-31", &valid) == 0xFFFF0000ull && valid, "mask 16-31");
+	Check(Common::ParseLogicalMask("0-3,8,10-11", &valid) == 0xD0Full && valid, "mask list");
+	Check(Common::ParseLogicalMask("63", &valid) == (1ull << 63u) && valid, "mask 63");
+	Check(Common::ParseLogicalMask("0-63", &valid) == ~0ull && valid, "mask 0-63");
+	for (const char* bad: {"", "x", "3-1", "0-64", "64", "1,", ",1", "1-", "1 2", "0-15;"}) {
+		Check(Common::ParseLogicalMask(bad, &valid) == 0 && !valid, bad);
+	}
+	Check(Common::ParseLogicalMask(nullptr, &valid) == 0 && !valid, "mask nullptr");
 	std::puts("CpuPlacementTests: general-pool affinity and modes ok");
 }
 
@@ -441,6 +453,46 @@ void TestLive(CpuReserveMode mode) {
 		      "the load ran on a reserved core after the mask change");
 		(void)SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(original));
 		Common::MaintainCpuPlacement();
+	}
+
+	// Phase 4 (KYTY_CPU_RESERVE_REASSERT, set in main): another process replaces the process
+	// default CPU sets with every allowed processor, as Process Lasso's CPU-set rule does shortly
+	// after the game starts. The next monitor pass applies the layout again, once.
+	const auto before = Common::CurrentCpuLayout();
+	if (before.reserved) {
+		std::vector<ULONG> every;
+		for (const auto& ids: {before.cp_ids, before.recorder_ids, before.general_ids}) {
+			every.insert(every.end(), ids.begin(), ids.end());
+		}
+		Check(SetProcessDefaultCpuSets(GetCurrentProcess(), every.data(),
+		                               static_cast<ULONG>(every.size())) != 0,
+		      "SetProcessDefaultCpuSets (the other process)");
+		const auto reasserts = Common::PlacementReasserts();
+		Common::MaintainCpuPlacement();
+		const auto after = Common::CurrentCpuLayout();
+		std::vector<ULONG> current(256);
+		ULONG              count = 0;
+		Check(GetProcessDefaultCpuSets(GetCurrentProcess(), current.data(),
+		                               static_cast<ULONG>(current.size()), &count) != 0,
+		      "GetProcessDefaultCpuSets");
+		current.resize(count);
+		std::sort(current.begin(), current.end());
+		std::vector<ULONG> general(after.general_ids.begin(), after.general_ids.end());
+		std::sort(general.begin(), general.end());
+		std::printf("  after another process set every processor: %u re-assert(s), %s\n",
+		            Common::PlacementReasserts() - reasserts, after.description.c_str());
+		Check(Common::PlacementReasserts() == reasserts + 1, "the replaced sets were not re-asserted");
+		Check(after.reserved && after.cp_mask == before.cp_mask && current == general,
+		      "the default CPU sets are not the general processors again");
+		uint64_t load_after = 0;
+		{
+			Load load(load_after);
+			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		}
+		Check(load_after != 0 && (load_after & (after.cp_mask | after.recorder_mask)) == 0,
+		      "a thread ran on a reserved core after the re-assert");
+		Common::MaintainCpuPlacement();
+		Check(Common::PlacementReasserts() == reasserts + 1, "an unchanged state was re-asserted");
 	}
 	std::puts("CpuPlacementTests: live placement ok");
 }
@@ -832,6 +884,8 @@ int main(int argc, char** argv) {
 	SetEnv("KYTY_CPU_RESERVE", mode == CpuReserveMode::Cp ? "cp" : "cp+recorder");
 	SetEnv("KYTY_CPU_PLACEMENT_SAMPLES", "1");
 	SetEnv("KYTY_CPU_RESERVE_CORE", "");
+	SetEnv("KYTY_CPU_RESERVE_REASSERT", "1");
+	SetEnv("KYTY_CPU_SETS", "");
 	Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
 
 	TestLayouts();

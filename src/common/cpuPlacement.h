@@ -36,6 +36,19 @@
 //   KYTY_CPU_RESERVE_REPIN=1 moves such threads to the general processors (default: counted and
 //   logged only).
 //
+// KYTY_CPU_SETS=<logical processors of group 0> (default unset: no restriction), e.g. 16-31 or
+// 0-7,16-23: every thread of the process runs on these processors (within the affinity mask),
+// through the process default CPU sets, a soft affinity. With KYTY_CPU_RESERVE the CP's core is
+// chosen among them and the other threads get the rest of them. Unlike a process affinity mask,
+// Process Lasso's affinity rule does not reset it.
+// KYTY_CPU_RESERVE_REASSERT=1 (default off): the monitor also checks once a second whether another
+// process replaced the process default CPU sets this module applied, and applies its layout again.
+// Process Lasso's CPU-set rule (SetProcessDefaultCpuSets, about 0.6 s after the process starts)
+// otherwise silently undoes KYTY_CPU_RESERVE and KYTY_CPU_SETS for every thread but the CP and the
+// recorder: they keep their thread-selected sets, so the CP stays confined to its core while other
+// threads run there again. Without KYTY_CPU_SETS the other process's sets become the constraint the
+// layout is computed in (Process Lasso's (0-31) leaves it unchanged).
+//
 // Placement samples, with the profiler's aggregates, the hang trace or
 // KYTY_CPU_PLACEMENT_SAMPLES=1: the CP, the recorder, guest threads, draw-prep workers and service
 // threads note where they run.
@@ -88,6 +101,13 @@ inline constexpr uint32_t kMinGeneralProcessors = 6;
 // KYTY_CPU_RESERVE=off|cp|cp+recorder (also 0|1|2); nullptr is off. `valid` false: unknown text.
 [[nodiscard]] CpuReserveMode ParseCpuReserveMode(const char* text, bool* valid = nullptr);
 [[nodiscard]] CpuReserveMode GetCpuReserveMode(); // KYTY_CPU_RESERVE, evaluated once
+// Pure (tested): "0-15", "16-31", "0-7,16-23", "5" as a mask of logical processors 0..63; 0 with
+// `valid` false for empty or malformed text, a descending range or a processor above 63.
+[[nodiscard]] uint64_t ParseLogicalMask(const char* text, bool* valid = nullptr);
+[[nodiscard]] uint64_t CpuSetsMask();     // KYTY_CPU_SETS, evaluated once; 0: unset (no restriction)
+[[nodiscard]] bool     ReassertEnabled(); // KYTY_CPU_RESERVE_REASSERT, evaluated once
+// How often the monitor found the process default CPU sets replaced and applied its layout again.
+[[nodiscard]] uint32_t PlacementReasserts();
 
 // Startup (Common::InitializeThreads, or the first PlaceCurrentThread): computes and applies the
 // layout, and starts the monitor thread when a reservation or placement samples are on. Idempotent.

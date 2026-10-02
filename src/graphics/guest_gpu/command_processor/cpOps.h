@@ -61,6 +61,15 @@ enum class Mode : uint8_t { Off, Inline, Thread };
 [[nodiscard]] int VerifyMode();
 // The front hashes the packets it parses (verify mode with an op stream).
 [[nodiscard]] bool PacketHashing();
+// KYTY_CP_SEQ_PREFETCH (P3c, thread mode): 0 off (default); 1 at a wait on the label the stream
+// just wrote ("wait for idle"), the sequencer parses ahead on a copy of its front while the
+// resolver catches up, and publishes the draws it meets to the draw-prep window, which the
+// workers prepare; the real parse after the wait adopts each such slot whose register snapshot
+// and arguments are byte-identical to its own draw's, and has the resolver retire the others
+// unused (SkipSlots). "mismatch" (tests): every speculative slot is retired unused.
+// KYTY_CP_SEQ_PREFETCH_DRAWS (default 16): at most this many speculative slots per wait.
+[[nodiscard]] int      PrefetchMode();
+[[nodiscard]] uint32_t PrefetchDraws();
 
 enum class OpKind : uint16_t {
 	DrawIndex,
@@ -94,6 +103,9 @@ enum class OpKind : uint16_t {
 	StreamEnd,
 	Handoff,
 	LockstepRead,
+	// KYTY_CP_SEQ_PREFETCH (P3c, transport): draw-prep window slots a speculative parse published
+	// that the real parse did not adopt; the resolver retires them without drawing.
+	SkipSlots,
 	Count,
 };
 
@@ -126,7 +138,8 @@ struct Result {
 		case OpKind::StreamBegin:
 		case OpKind::StreamEnd:
 		case OpKind::Handoff:
-		case OpKind::LockstepRead: return true;
+		case OpKind::LockstepRead:
+		case OpKind::SkipSlots: return true;
 		default: return false;
 	}
 }
@@ -398,6 +411,13 @@ struct LockstepReadOp {
 	uint64_t destination = 0;
 };
 
+// KYTY_CP_SEQ_PREFETCH: `count` window slots at the head, published by a speculative parse and not
+// adopted (DrawPrep::Engine::SkipPublished).
+struct SkipSlotsOp {
+	uint32_t count    = 0;
+	uint32_t reserved = 0;
+};
+
 template <typename T>
 inline constexpr bool IsPayload = std::is_trivially_copyable_v<T> && alignof(T) <= 8 &&
                                   (sizeof(T) % 8) == 0 &&
@@ -411,7 +431,7 @@ static_assert(IsPayload<DrawIndexOp> && IsPayload<DrawAutoOp> && IsPayload<DrawI
               IsPayload<WaitFlipDoneOp> && IsPayload<DumpConstRamOp> &&
               IsPayload<PredicationOp> && IsPayload<CondExecOp> && IsPayload<BranchOp> &&
               IsPayload<ReadCheckOp> && IsPayload<StreamBeginOp> && IsPayload<StreamEndOp> &&
-              IsPayload<HandoffOp> && IsPayload<LockstepReadOp>);
+              IsPayload<HandoffOp> && IsPayload<LockstepReadOp> && IsPayload<SkipSlotsOp>);
 
 // The kind of each payload type (compile-time dispatch for Emit/Submit).
 template <typename T>
@@ -444,6 +464,7 @@ KYTY_CPSEQ_PAYLOAD(StreamBegin, StreamBeginOp)
 KYTY_CPSEQ_PAYLOAD(StreamEnd, StreamEndOp)
 KYTY_CPSEQ_PAYLOAD(Handoff, HandoffOp)
 KYTY_CPSEQ_PAYLOAD(LockstepRead, LockstepReadOp)
+KYTY_CPSEQ_PAYLOAD(SkipSlots, SkipSlotsOp)
 #undef KYTY_CPSEQ_PAYLOAD
 // DrawIndirectOp serves two kinds (DrawIndirect, DrawIndirectMulti): no KindOf.
 

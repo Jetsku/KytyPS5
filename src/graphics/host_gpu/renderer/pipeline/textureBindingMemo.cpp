@@ -36,6 +36,10 @@ struct TextureBindingMemo::Entry {
 	bool                    exact_format = false;
 	vk::ImageView           view        = nullptr;
 	TextureCache::ImageDesc desc;
+	// KYTY_CP_COMMIT=texdcc: a DCC description, recorded with the certificate of its FindImage's
+	// DCC decision (MaterializeDccClear's MetadataNoop); false for every other entry.
+	bool                       dcc = false;
+	TextureCache::MetadataNoop dcc_noop;
 	// FindHint's view of `key` and `tag` (P4b-2): Record makes `seq` odd, stores the packed key
 	// and the tag, and makes it even again (release); a reader that sees the same even value
 	// before and after its loads read a pair Record wrote together.
@@ -167,6 +171,23 @@ void TextureBindingMemo::Forget(TextureBinding& binding) {
 	binding.memo_slot = 0;
 }
 
+bool TextureBindingMemo::DccStateHolds(TextureCache& cache, const Entry& entry) {
+	// What MaterializeDccClear's decision read outside the texture-cache lock (the recorded fill,
+	// the GPU-dirty state of the metadata, the guest key bytes), as TryRepeatLookup checks it.
+	if (cache.MetadataStateHolds(entry.dcc_noop)) {
+		return true;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpCommitTexDccRejects);
+	return false;
+}
+
+void TextureBindingMemo::ApplyDcc(TextureCache& cache, const Entry& entry, Image& image) {
+	// MaterializeDccClear's bookkeeping before its decision: the image takes the description's
+	// metadata, and no other interpretation of those bytes remains (TryRepeatLookup does the same).
+	image.info.metadata = entry.desc.info.metadata;
+	cache.EraseSurfaceMeta(entry.desc.info.metadata.range.address);
+}
+
 TextureBindingMemo::PackedKey TextureBindingMemo::PackKey(const Key& key) {
 	PackedKey packed {};
 	for (uint32_t i = 0; i < 4; i++) {
@@ -236,6 +257,7 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
                                            std::span<const uint64_t> tags,
                                            std::span<TextureBinding> bindings, bool apply) {
 	m_last_revalidated = false;
+	m_last_dcc_hit     = false;
 	EXIT_IF(hashes.size() < bindings.size() || tags.size() < bindings.size());
 	if (!m_entries || bindings.empty() || tags[0] == 0) {
 		return 0;
@@ -248,6 +270,9 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
 		auto&      entry = m_entries[slot];
 		if (tags[hits] == 0 || entry.tag != tags[hits]) {
 			break;
+		}
+		if (entry.dcc) {
+			break; // TryResolve checks the DCC certificate outside the lock
 		}
 		Image* image = nullptr;
 		if (!entry.null_image) {
@@ -272,6 +297,7 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
 bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_t hash,
                                     TextureBinding& binding, uint64_t tag_hint, bool verify_hint) {
 	m_last_revalidated = false;
+	m_last_dcc_hit     = false;
 	if (!m_entries) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
@@ -290,6 +316,13 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
 	}
+	// KYTY_CP_COMMIT=texdcc: MaterializeDccClear would decide the same, and do nothing but its
+	// bookkeeping (below), only while the recorded certificate holds.
+	if (entry.dcc && !DccStateHolds(cache, entry)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoStale);
+		m_totals.stale++;
+		return false;
+	}
 	bool revalidated = false;
 	if (!entry.null_image) {
 		std::scoped_lock lock {cache.m_lock};
@@ -299,6 +332,10 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
             m_totals.stale++;
             return false;
 		};
+		if (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::CpCommitTexDccRejects);
+			return stale();
+		}
 		// A stencil association redirects the binding; a pending rebind, a copy from the alias
 		// owner and a residency extension (resident levels changed, or fewer than the view
 		// samples) are FindImage/RebindImages work: all take the full resolution.
@@ -326,19 +363,25 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		// FindImage's access bookkeeping for the returned image.
 		image->tick_accessed_last = cache.m_scheduler.CurrentTick();
 		cache.TouchImage(*image);
+		if (entry.dcc) {
+			ApplyDcc(cache, entry, *image);
+		}
 	}
 	ApplyHit(entry, slot, binding);
 	m_last_revalidated = revalidated;
+	m_last_dcc_hit     = entry.dcc;
 	return true;
 }
 
 void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t hash,
                                 TextureBinding& binding, ImageId found, bool exact_format,
-                                bool view_rebased) {
+                                bool view_rebased, const TextureCache::MetadataNoop* dcc) {
 	Forget(binding);
 	const auto& desc = binding.desc;
+	// A DCC description only with the certificate of its lookup's DCC decision (texdcc).
+	const bool dcc_desc = desc.info.metadata.kind == ImageMetadataKind::Dcc;
 	if (view_rebased || binding.image_id != found ||
-	    desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+	    (dcc_desc && (dcc == nullptr || !dcc->provable))) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
 		return;
 	}
@@ -411,9 +454,14 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	entry.exact_format    = exact_format;
 	entry.view            = nullptr;
 	entry.desc            = desc;
+	entry.dcc             = dcc_desc;
+	entry.dcc_noop        = dcc_desc ? *dcc : TextureCache::MetadataNoop {};
 	binding.memo_tag      = entry.tag;
 	binding.memo_slot     = slot;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoFills);
+	if (dcc_desc) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpCommitTexDccRecords);
+	}
 }
 
 const TextureBindingMemo::Entry* TextureBindingMemo::ViewEntry(const TextureBinding& binding) const {
@@ -485,8 +533,17 @@ uint32_t TextureBindingMemo::TryAcquireViewRun(TextureCache& cache,
 bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<TextureBinding> bindings,
                                           bool apply) {
 	m_last_revalidated = false;
+	m_last_dcc_hit     = false;
 	if (!m_entries) {
 		return false;
+	}
+	// KYTY_CP_COMMIT=texdcc: DCC certificates first, outside the lock (as TryResolve checks them).
+	for (const auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % Slots];
+		if (binding.memo_tag != 0 && entry.tag == binding.memo_tag && entry.dcc &&
+		    !DccStateHolds(cache, entry)) {
+			return false;
+		}
 	}
 	std::scoped_lock lock {cache.m_lock};
 	for (const auto& binding: bindings) {
@@ -502,7 +559,8 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 		if (image == nullptr || !image->registered || image->depth_id ||
 		    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
 		    cache.PageVersion(entry.page) != entry.page_version ||
-		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
+		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) ||
+		    (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop))) {
 			return false;
 		}
 	}
@@ -516,6 +574,9 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 			auto& image              = cache.m_slot_images[entry.image];
 			image.tick_accessed_last = tick;
 			cache.TouchImage(image);
+			if (entry.dcc) {
+				ApplyDcc(cache, entry, image);
+			}
 		}
 	}
 	// The hits TryResolve would count (each finds its binding's own entry: no description copy).

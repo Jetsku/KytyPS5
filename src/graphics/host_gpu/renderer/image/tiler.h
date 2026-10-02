@@ -6,8 +6,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <chrono>
 #include <mutex>
 #include <span>
+#include <utility>
 #include <vector>
 #include <vk_mem_alloc.h>
 
@@ -93,6 +95,11 @@ public:
 	// TilerImageVerifyChecks / TilerImageVerifyMismatches; the first mismatches are logged).
 	[[nodiscard]] static bool ImageDirectVerifyEnabled();
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size);
+	// KYTY_VRAM_STATS: idle pooled scratch bytes and their limit.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ScratchPoolBytes();
+	// KYTY_TILER_SCRATCH_POOL_IDLE_MS: destroys pooled scratch buffers unused that long
+	// (rate-limited to every 100 ms; TextureCache's garbage collector calls it).
+	void                 TrimScratchPool();
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result SwapBgra16(Result input);
@@ -137,6 +144,8 @@ private:
 		uint64_t      size       = 0;
 		// Allocated capacity (a power-of-two size class when pooled, else size).
 		uint64_t      capacity   = 0;
+		// When it entered the pool (KYTY_TILER_SCRATCH_POOL_IDLE_MS).
+		std::chrono::steady_clock::time_point released {};
 	};
 	struct StorageBinding {
 		vk::DescriptorBufferInfo info;
@@ -207,6 +216,8 @@ private:
 	std::vector<Scratch>                    m_scratch_pool;
 	uint64_t                                m_scratch_pool_bytes = 0;
 	uint64_t                                m_scratch_pool_limit = 0;
+	std::chrono::milliseconds               m_scratch_idle {0};
+	std::chrono::steady_clock::time_point   m_scratch_trim_next {};
 	bool                                    m_clear_detile_scratch = false;
 };
 

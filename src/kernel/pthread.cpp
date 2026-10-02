@@ -547,7 +547,8 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		if (!SleepMicroSchedulerBackoff(step)) {
+		// KYTY_SHORT_SLEEP_BLOCK=1 (common/threads.h): every step blocks on the host timer.
+		if (Common::ShortSleepsBlock() || !SleepMicroSchedulerBackoff(step)) {
 			Common::Thread::SleepMicro(step);
 		}
 		microseconds -= step;
@@ -885,6 +886,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
+	// PthreadExit resumes after the asm below with RBX taken from the snapshot above, so RBX is
+	// declared clobbered: the compiler must not keep a value in it across the guest call (code
+	// layout and inlining changes, e.g. under PGO, can otherwise cache a pointer there).
 #if defined(__APPLE__)
 	// Keep inputs out of r12/r13.
 	register uintptr_t guest_rsp_reg asm("r14") = guest_rsp;
@@ -902,11 +906,14 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
+	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
 	// PthreadExit resumes at this frame, so all four saved registers stay on the host stack.
+	// The stack input is tied to RAX (the return register): R12-R15 are overwritten before it is
+	// read, and an input register the compiler is free to pick could be one of them. The guest
+	// frame pointer equals the stack pointer here (guest_rbp == guest_rsp).
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "pushq %%r14\n\t"
@@ -921,7 +928,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
 	             "movq %[guest_rsp], %%rsp\n\t"
-	             "movq %[guest_rbp], %%rbp\n\t"
+	             "movq %[guest_rsp], %%rbp\n\t"
 	             "callq *%%rsi\n\t"
 	             "movq %%r13, %%rbp\n\t"
 	             "movq %%r12, %%rsp\n\t"
@@ -934,15 +941,15 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
-	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+	             : [guest_rsp] "0"(guest_rsp)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
+	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "xmm0",
-	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
-	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
+	               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+	               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #endif
 #endif
 
@@ -963,6 +970,42 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	return func(arg);
 #endif
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+static void* KYTY_SYSV_ABI GuestStackReturnProbe(void* value) {
+	return value;
+}
+static void* KYTY_SYSV_ABI GuestStackExitProbe(void* value) {
+	// The exit restores this snapshot instead of the RBX value live at the guest call: poison it
+	// so a value the compiler kept in RBX across the call cannot survive by accident.
+	g_pthread_self->guest_host_rbx = 0x19;
+	PthreadExit(value);
+	return nullptr;
+}
+
+bool TestGuestStackExitLifecycle() {
+#if defined(__x86_64__) || defined(_M_X64)
+	std::vector<uint8_t> stack(1024 * 1024);
+	PthreadPrivate       thread {};
+	const auto           saved_self   = g_pthread_self;
+	const auto           saved_return = g_guest_entry_return_rsp;
+	g_pthread_self                    = &thread;
+	bool passed                       = true;
+	for (const auto entry: {&GuestStackReturnProbe, &GuestStackExitProbe}) {
+		auto*      value  = reinterpret_cast<void*>(uintptr_t {0x12345678});
+		const auto result = RunOnGuestStack(value, entry, stack.data() + stack.size());
+		passed &= result == value && g_pthread_self == &thread && g_guest_entry_return_rsp == 0 &&
+		          thread.guest_host_rbx == 0 && thread.guest_host_rsp == 0 &&
+		          thread.guest_host_rbp == 0;
+	}
+	g_pthread_self           = saved_self;
+	g_guest_entry_return_rsp = saved_return;
+	return passed;
+#else
+	return true;
+#endif
+}
+#endif
 
 static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 	if (attr == nullptr || *attr == nullptr) {
@@ -3893,19 +3936,11 @@ int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	PRINT_NAME();
-	LOGF("\tsleep: %u\n", seconds);
-	Common::Timer t;
-	t.Start();
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
-	double ts = t.GetTimeS();
-	LOGF("\tactual: %g seconds\n", ts);
 	return OK;
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-	PRINT_NAME();
-
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
@@ -3922,13 +3957,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	LOGF("\tnanosleep: %" PRIu64 "\n", nanos);
-
-	Common::Timer t;
-	t.Start();
 	SleepNanoWithSignalPoll(nanos);
-	double ts = t.GetTimeS();
-	LOGF("\tactual: %g nanoseconds\n", ts * 1000000000.0);
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

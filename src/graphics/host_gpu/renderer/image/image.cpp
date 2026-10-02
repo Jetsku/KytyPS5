@@ -47,6 +47,9 @@ constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWr
                                                 vk::AccessFlagBits2::eShaderWrite |
                                                 vk::AccessFlagBits2::eMemoryWrite;
 
+// Image::RecordedTransitions.
+std::atomic<uint64_t> g_recorded_transitions {0};
+
 // KYTY_COPY_VIA_BUFFER_BATCH=0: Image::CopyImageWithBuffer copies one region per barrier pair.
 bool CopyViaBufferBatchEnabled() {
 	static const bool enabled = [] {
@@ -146,6 +149,10 @@ void Image::NoteContentWrite() noexcept {
 
 uint64_t Image::NextContentSerial() noexcept {
 	return g_content_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t Image::RecordedTransitions() noexcept {
+	return g_recorded_transitions.load(std::memory_order_relaxed);
 }
 
 void Image::NotePossibleWrite() noexcept {
@@ -339,6 +346,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	g_recorded_transitions.fetch_add(1, std::memory_order_relaxed);
 	// Barrier batcher (render.h): merged with pending requests, recorded now or (deferrable) at
 	// the next flush point, ending an active rendering instance only when recorded.
 	if (m_scheduler.Active() && m_scheduler.Current().BatchImageBarriers(barriers, command_buffer,
@@ -855,7 +863,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             uint32_t sparse_first_level)
     : info(image_info), live(image_info.data), m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
@@ -889,7 +898,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	if (sparse_first_level != 0 && graphics.CreateSparseImage(create, sparse_first_level, backing)) {
+		// Memory behind the resident levels only (TextureCache::EnsureResidency binds more).
+	} else if (!graphics.CreateImage(create, backing)) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);

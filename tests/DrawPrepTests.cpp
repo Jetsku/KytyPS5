@@ -1077,6 +1077,7 @@ struct PipelineConfig {
 	uint64_t              cold_spin_ns = 50000;  // KYTY_DRAW_PREP_COLD_SPIN_US default
 	DrawPrep::StealPolicy steal {};              // KYTY_DRAW_PREP_STEAL default: never
 	uint32_t              window       = 32;
+	bool                  cold_token   = false;  // KYTY_DRAW_PREP_COLD_TOKEN
 	// A worker stalls `hiccup_ns` inside this share (per mille) of its preparations: preempted by
 	// a guest thread, or late to wake, while it holds the slot. The producer never stalls.
 	uint32_t hiccup_per_mille = 0;
@@ -1102,6 +1103,7 @@ struct PipelineResult {
 	uint64_t commit_waits  = 0; // heads a worker still held when the producer needed them
 	uint64_t steals        = 0; // slots the producer prepared meanwhile (AwaitHead)
 	uint64_t cold_wakes    = 0;
+	uint64_t cold_prepared = 0; // slots prepared by cold workers (index >= hot)
 	double   wall_ms       = 0; // the producer's whole run: the command processor's critical path
 	double   spin_ms       = 0; // of which spinning on held heads
 	double   worker_cpu_ms = 0; // user + kernel time of all workers (Windows)
@@ -1119,7 +1121,8 @@ struct PipelineResult {
 // exactly once.
 PipelineResult RunPipeline(const PipelineConfig& config, const std::vector<DrawSpec>& draws) {
 	DrawPrep::Window<Item>   window(config.window);
-	DrawPrep::WorkerGate     gate(config.workers, config.hot, config.wake_backlog);
+	DrawPrep::WorkerGate     gate(config.workers, config.hot, config.wake_backlog,
+	                              config.cold_token);
 	std::atomic<bool>        stop {false};
 	std::atomic<uint64_t>    useful_ns {0};
 	std::atomic<uint64_t>    worker_cold_wakes {0};
@@ -1180,6 +1183,9 @@ PipelineResult RunPipeline(const PipelineConfig& config, const std::vector<DrawS
 		}
 		result.ok &= item.input == next_retire && item.output == Work(item.input) &&
 		             item.preparations == 1;
+		if (item.prepared_by > config.hot && item.prepared_by != StolenBy) {
+			result.cold_prepared++;
+		}
 		BusyNs(item.commit_ns);
 		next_retire++;
 		window.Retire();
@@ -1273,6 +1279,97 @@ void TestWorkerGateStress() {
 			Check(r.ok, "gated pipeline prepares every slot once, in order");
 			Check(r.cold_wakes > 0, "cold workers are woken by a backlog");
 			Check(steal || r.steals == 0, "the producer never steals without KYTY_DRAW_PREP_STEAL");
+		}
+	}
+}
+
+// KYTY_DRAW_PREP_COLD_TOKEN: a wake given while its cold sleeper was already leaving the park (the
+// race that left the default protocol's pending flag set for good) stays outstanding and is taken
+// by the next cold worker to park, which returns to claiming instead of sleeping; afterwards wakes
+// work again. Single thread, the interleaving forced through the park predicate; a park that
+// slept anyway is released by WakeAll and reported.
+void TestColdTokenStranded() {
+	DrawPrep::WorkerGate gate(2, 1, 2, true);
+	Check(gate.ColdTokenMode() && !gate.ColdWakeOutstanding(), "token mode starts without a wake");
+	std::atomic<bool> stop {false};
+	bool              woke_inside = false;
+	// The sleeper is announced when the predicate runs: a waker sees it and gives the token, and
+	// the predicate then finds the backlog high, so the sleeper leaves without taking it.
+	gate.ParkCold(
+	    [&] {
+		    woke_inside = gate.MaybeWakeCold(8);
+		    return true;
+	    },
+	    stop);
+	Check(woke_inside && gate.ColdWakeOutstanding() && gate.ColdSleepers() == 0,
+	      "a wake given while the sleeper leaves stays outstanding");
+	Check(!gate.MaybeWakeCold(8), "no second wake while one is outstanding");
+	// The next park takes the stranded token at once (the predicate says nothing to claim).
+	std::atomic<bool> returned {false};
+	std::thread       parker([&] {
+        gate.ParkCold([] { return false; }, stop);
+        returned = true;
+    });
+	for (int i = 0; i < 2000 && !returned.load(); i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	const bool took = returned.load();
+	if (!took) {
+		stop = true;
+		gate.WakeAll();
+	}
+	parker.join();
+	Check(took, "the next cold park takes the stranded wake instead of sleeping");
+	Check(stop.load() || !gate.ColdWakeOutstanding(), "the stranded wake is consumed");
+	// A real sleeper is woken again afterwards.
+	std::atomic<bool> woken {false};
+	std::thread       sleeper([&] {
+        gate.ParkCold([] { return false; }, stop);
+        woken = true;
+    });
+	bool gave = false;
+	for (int i = 0; i < 2000 && !gave; i++) {
+		gave = gate.MaybeWakeCold(8); // succeeds once the sleeper has announced itself
+		if (!gave) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	for (int i = 0; i < 2000 && !woken.load(); i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	const bool ok = gave && woken.load();
+	if (!ok) {
+		stop = true;
+		gate.WakeAll();
+	}
+	sleeper.join();
+	Check(ok, "a sleeping cold worker is woken after a stranded wake was consumed");
+}
+
+// Cold workers keep being woken for a whole bursty run in token mode: with one hot worker and
+// preparations twice as long as the producer's gap, the cold workers must prepare a large share
+// of the slots. The default protocol is run too and its share printed (it can stop waking cold
+// workers after the race above).
+void TestColdTokenStress() {
+	for (const bool token: {false, true}) {
+		PipelineConfig config;
+		config.workers      = 6;
+		config.hot          = 1;
+		config.wake_backlog = 2;
+		config.hot_spin_ns  = 20000;
+		config.cold_spin_ns = 5000;
+		config.cold_token   = token;
+		const auto draws    = UniformShape(60000, 4000, 2000, 97, true);
+		const auto r        = RunPipeline(config, draws);
+		Check(r.ok, "token-mode pipeline prepares every slot once, in order");
+		std::printf("  cold wake protocol %s: %llu cold wakes, %llu of %zu slots prepared by cold "
+		            "workers, %llu held heads\n",
+		            token ? "token" : "default", static_cast<unsigned long long>(r.cold_wakes),
+		            static_cast<unsigned long long>(r.cold_prepared), draws.size(),
+		            static_cast<unsigned long long>(r.commit_waits));
+		if (token) {
+			Check(r.cold_prepared * 5 > draws.size(),
+			      "cold workers prepare a fifth of the slots or more (they keep waking)");
 		}
 	}
 }
@@ -1773,6 +1870,8 @@ int main(int argc, char** argv) {
 	TestWorkerGateBasics();
 	TestAwaitHead();
 	TestWorkerGateStress();
+	TestColdTokenStranded();
+	TestColdTokenStress();
 	TestStealStress();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "DrawPrepTests: %d failure(s)\n", g_failures);

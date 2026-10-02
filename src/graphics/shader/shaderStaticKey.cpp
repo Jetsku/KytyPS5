@@ -58,19 +58,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];
 		const auto& destination = info.resources_dst[i];
-		key.push_back(destination.register_start);
 		key.push_back(destination.registers_num);
-		key.push_back(destination.fetch_index);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.Stride());
-		key.push_back(static_cast<uint32_t>(resource.SwizzleEnabled()));
-		key.push_back(resource.DstSelX());
-		key.push_back(resource.DstSelY());
-		key.push_back(resource.DstSelZ());
-		key.push_back(resource.DstSelW());
-		key.push_back(resource.RawFormat());
-		key.push_back(resource.OutOfBounds());
-		key.push_back(static_cast<uint32_t>(resource.AddTid()));
+		key.push_back(resource.fields[3] & 0x7ffffu); // Embedded fetch channels and format.
 	}
 }
 
@@ -100,6 +90,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
+	key.push_back(static_cast<uint32_t>(info.alpha_blend_source_remap));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
@@ -116,7 +107,8 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
 	key.clear();
 	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size);
+	// FLOAT_MODE selects FP32 compare denormal flushing and FP64 support (translator, emitter).
+	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
 	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);

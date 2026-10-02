@@ -138,6 +138,10 @@ public:
 	[[nodiscard]] uint64_t Executed() const noexcept {
 		return m_executed.load(std::memory_order_seq_cst);
 	}
+	// Lockstep op `op_sequence` has been answered (P3c: the speculative parse polls it).
+	[[nodiscard]] bool Answered(uint64_t op_sequence) const noexcept {
+		return m_answered.load(std::memory_order_acquire) == op_sequence + 1u;
+	}
 	[[nodiscard]] uint64_t Started() const noexcept {
 		return m_started.load(std::memory_order_seq_cst);
 	}

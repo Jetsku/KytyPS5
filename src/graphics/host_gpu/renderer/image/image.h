@@ -50,7 +50,11 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// sparse_first_level > 0 (KYTY_TEXTURE_SPARSE_RESIDENCY, TextureCache::InsertImage): try a sparse
+	// residency image with memory behind levels >= it only (GraphicContext::CreateSparseImage);
+	// a format or usage that cannot be sparse gets an ordinary image.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      uint32_t sparse_first_level = 0);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -69,6 +73,9 @@ public:
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
 	             bool deferrable = false);
+	// Transit calls that produced barriers (all images; KYTY_DRAW_RUN=verify reads the difference
+	// around a draw's attachment acquisition and binding commit).
+	[[nodiscard]] static uint64_t RecordedTransitions() noexcept;
 	// GetBarriers would return no barrier and change no state: the image has one state (no
 	// per-subresource states), `range` covers every level and layer (a volume's range counts as
 	// one layer, as in GetBarriers), and that state already has the layout and the access, which
@@ -447,6 +454,10 @@ public:
 	uint64_t         lru_tick            = 0;
 	// Last GPU writer among overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner         = false;
+	// KYTY_IMAGE_EXACT_RANGE_INVALIDATE (TextureCache::InvalidateMemoryFromGPU): a GPU buffer write
+	// over exactly another image's range partly overlapped this image and left it unrebuilt (in
+	// count mode: would have). Cleared by the image's next GPU write, and (on) by a refresh upload.
+	bool             exact_range_stale   = false;
 	// KYTY_ALIAS_BYTES: a level-0 texel rectangle whose 64 KiB blocks this image owns (bounded
 	// render-target claims skip the claim when a draw's scissor lies inside it). Dropped whenever
 	// the image loses owned bytes.

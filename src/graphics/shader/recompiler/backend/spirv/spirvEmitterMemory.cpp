@@ -148,7 +148,12 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 			ctx.Fail(inst, "has no address base pair");
 			return ConstantDeviceAddress(state, 0);
 		}
-		const auto base = DeviceAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1));
+		auto base_low = ctx.Arg(*handle, 0);
+		if (mem.kind == IR::ResourceKind::ScalarAddress) {
+			base_low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), base_low,
+			                  ConstantU32(state, ~3u));
+		}
+		const auto base = DeviceAddressFromWords(state, base_low, ctx.Arg(*handle, 1));
 		address         = Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
 		                         Unary(state, spv::OpUConvert, TypeScalarU64(state), low));
 	}
@@ -553,6 +558,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::BufferAtomicIAdd64:
+		case IR::ValueOpcode::SharedAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
 		case IR::ValueOpcode::BufferAtomicISub64:
@@ -574,6 +580,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
+		case IR::ValueOpcode::SharedAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::BufferAtomicXor64:
@@ -1060,6 +1067,32 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    });
 }
 
+void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	const auto& mem = ctx.Memory(inst);
+	EnsureLdsStorage(state);
+	EmitIfCondition(state, ctx.Arg(inst, 2), [&]() {
+		const auto address = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		                            ByteAddress(ctx, inst, mem), ConstantU32(state, 0xfff8u));
+		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
+		                          ConstantU32(state, 3u));
+		const auto in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index,
+		                              ConstantU32(state, LdsDwordCount(state) / 2u));
+		EmitIfCondition(state, in_bounds, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			                          TypePointer(state, spv::StorageClassWorkgroup, TypeScalarU64(state)),
+			                          pointer, state.lds_u64_variable, ConstantU32(state, 0), index);
+			const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, 1));
+			state.builder.AddFunction(
+			    SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), state.builder.AllocateId(),
+			    pointer, ConstantU32(state, spv::ScopeWorkgroup),
+			    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+			                           spv::MemorySemanticsWorkgroupMemoryMask), value);
+		});
+	});
+}
+
 uint32_t EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem       = ctx.Memory(inst);
 	const bool  max_value = inst.GetOpcode() == IR::ValueOpcode::BufferAtomicFMax32;
@@ -1283,6 +1316,8 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
+	else if (mem.kind == IR::ResourceKind::ScalarAddress)
+		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),

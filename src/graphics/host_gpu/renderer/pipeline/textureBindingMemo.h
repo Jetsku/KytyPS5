@@ -30,8 +30,9 @@ struct TextureBinding;
 //  - FindImage. Only answers of the first-page lookup are recorded: after the slow resolution,
 //    FindImageWithSameBacking(final description) must return the same image and FindImage must
 //    not have rebased the view (mip/slice-of-a-larger-image answers are never recorded; DCC
-//    descriptions are never recorded because MaterializeDccClear inspects guest metadata on every
-//    lookup). That lookup reads only the owner list of the description's first 1 MiB page, the
+//    descriptions are recorded only with KYTY_CP_COMMIT=texdcc, together with the certificate of
+//    MaterializeDccClear's decision, which inspects guest metadata on every lookup; a hit checks
+//    it). That lookup reads only the owner list of the description's first 1 MiB page, the
 //    owners' registered flags and SameBacking fields, which are fixed for an image's lifetime.
 //    Owner lists and registered flags change only in TextureCache::RegisterImage/
 //    UnregisterImage (every creation, free, expansion, overlap resolution, depth recreate,
@@ -127,8 +128,11 @@ public:
 	                                         bool apply = true);
 	// After a full resolution: records `binding` when the answer is memoizable. `found` is what
 	// FindImage returned, `view_rebased` whether FindImage changed the view's base level/layer.
+	// `dcc` (KYTY_CP_COMMIT=texdcc): for a DCC description, the certificate of FindImage's DCC
+	// decision (its RepeatLookup's); a DCC description without one is not recorded.
 	void Record(TextureCache& cache, const Key& key, uint64_t hash, TextureBinding& binding,
-	            ImageId found, bool exact_format, bool view_rebased);
+	            ImageId found, bool exact_format, bool view_rebased,
+	            const TextureCache::MetadataNoop* dcc = nullptr);
 	// Marks `binding` as not described by any entry (its description was built elsewhere).
 	static void Forget(TextureBinding& binding);
 
@@ -159,6 +163,10 @@ public:
 	// entry revalidated for a new page version; with the verify mode on, the caller then compares
 	// it with the full resolution and reports a difference.
 	[[nodiscard]] bool        LastHitRevalidated() const noexcept { return m_last_revalidated; }
+	// KYTY_CP_COMMIT=texdcc: the last TryResolve hit was a DCC entry's (its certificate held); the
+	// same verify mode then also runs the full resolution, which must make no DCC decision
+	// that does anything (TextureCache::DccDecisionEffects).
+	[[nodiscard]] bool        LastHitDcc() const noexcept { return m_last_dcc_hit; }
 	[[nodiscard]] static bool RevalidateVerify();
 	static void               ReportRevalidateMismatch();
 	// Always counted (the TextureBindingMemo* frame events need a connected profiler).
@@ -188,6 +196,12 @@ private:
 	[[nodiscard]] static bool ViewImageReady(const Entry& entry, const Image& image);
 
 	[[nodiscard]] static bool RefreshIsNoOp(const Image& image);
+	// KYTY_CP_COMMIT=texdcc: whether the DCC decision recorded with a DCC entry would be made again
+	// (MetadataStateHolds reads outside cache.m_lock what the decision reads there, as
+	// TryRepeatLookup does; the page part is checked under the lock with the other conditions),
+	// and MaterializeDccClear's bookkeeping for a hit (caller holds cache.m_lock).
+	[[nodiscard]] static bool DccStateHolds(TextureCache& cache, const Entry& entry);
+	static void               ApplyDcc(TextureCache& cache, const Entry& entry, Image& image);
 	// Whether a registered image other than `found` has exactly its backing range, extent and
 	// sample count on `page` (so SyncAliasFromOwner may copy into it). Caller holds cache.m_lock.
 	[[nodiscard]] static bool HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
@@ -198,6 +212,7 @@ private:
 	std::atomic<const Entry*> m_published {nullptr};
 	uint64_t                 m_next_tag         = 1;
 	bool                     m_last_revalidated = false;
+	bool                     m_last_dcc_hit     = false;
 	Totals                   m_totals;
 };
 

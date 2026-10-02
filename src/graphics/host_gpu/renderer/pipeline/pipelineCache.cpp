@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
@@ -1634,6 +1635,12 @@ struct PipelineCache::ProgramCache {
 			// A failure no read can fix (an unsupported descriptor format, a specialization the
 			// recompiler rejects): the stage gets no program and its draws/dispatches are dropped
 			// instead of ending the emulator. The reason was already logged by the materializer.
+			static std::atomic_uint64_t unmaterializable {0};
+			const auto count = unmaterializable.fetch_add(1, std::memory_order_relaxed) + 1u;
+			if (count <= 4u || (count & 2047u) == 0u) {
+				std::printf("Warning: stage materialization failed without a retryable read "
+				            "(#%" PRIu64 "); its draws/dispatches are dropped\n", count);
+			}
 			return false;
 		}
 		read_attempt.materialization_failed = true;
@@ -2985,7 +2992,8 @@ struct PipelineCache::PipelineDiagnostics {
 		    differ(x.alpha_comb_fcn, y.alpha_comb_fcn) ||
 		    differ(x.alpha_destblend, y.alpha_destblend) ||
 		    differ(x.separate_alpha_blend, y.separate_alpha_blend) ||
-		    differ(x.blend_enable, y.blend_enable)) {
+		    differ(x.blend_enable, y.blend_enable) ||
+		    x.blend_alpha_source_remap != y.blend_alpha_source_remap) {
 			mask |= Blend;
 		}
 		if (x.samples != y.samples || x.sample_shading_enable != y.sample_shading_enable) {
@@ -3743,6 +3751,16 @@ bool PipelineKeyNormalizationEnabled() {
 	return enabled;
 }
 
+// KYTY_BLEND_ALPHA_REMAP=1 (default off; upstream 73615c31f, PPSA02721): when target 0's export
+// mapping moves alpha out of the fourth channel and the blend reads source alpha, the pixel
+// program exports logical alpha through MRT1 and the pipeline blends with it as a second source;
+// blending whose export mapping cannot be expressed that way is disabled (one warning). Off: the
+// blend reads the swizzled output as before.
+bool BlendAlphaRemapEnabled() {
+	static const bool enabled = EnvU64("KYTY_BLEND_ALPHA_REMAP", 0) != 0;
+	return enabled;
+}
+
 // Accounts one graphics pipeline created through the library path and names the path in the
 // compiles.csv detail.
 void RecordLibraryPipeline(const GraphicsPipelineLibrary::Result& result, std::string& detail) {
@@ -3812,6 +3830,10 @@ void NormalizePipelineKey(PipelineStaticParameters& params, bool with_depth) {
 				params.alpha_comb_fcn[slot]  = 0;
 				params.alpha_destblend[slot] = 0;
 			}
+		}
+		// The alpha-source remap only changes target 0's blend factors.
+		if (!params.blend_enable[0]) {
+			params.blend_alpha_source_remap = false;
 		}
 		if (!with_depth) {
 			params.depth_bounds_test_enable = false;
@@ -3917,20 +3939,31 @@ void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vert
 }
 
 void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
-	const auto& blend          = context.GetBlendControl(0);
-	const auto  is_dual_source = [](uint8_t factor) {
-		return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
-		       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
-	};
+	const auto& blend    = context.GetBlendControl(0);
+	const bool  blending = blend.enable && !context.GetRenderTarget(0).info.blend_bypass;
+	pixel_info.alpha_blend_source_remap = false;
 	pixel_info.dual_source_blending =
-	    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-	    (is_dual_source(blend.color_srcblend) || is_dual_source(blend.color_destblend) ||
-	     (blend.separate_alpha_blend &&
-	      (is_dual_source(blend.alpha_srcblend) || is_dual_source(blend.alpha_destblend))));
+	    blending && (BlendFactorIsDualSource(blend.color_srcblend) ||
+	                 BlendFactorIsDualSource(blend.color_destblend) ||
+	                 (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
+	                                                 BlendFactorIsDualSource(blend.alpha_destblend))));
 	if (pixel_info.dual_source_blending) {
 		// MRT1 supplies a second blend source for the same render target as MRT0.
 		pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 		pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+	} else if (BlendAlphaRemapEnabled() && blending && pixel_info.target_output_mode[0] != 0 &&
+	           pixel_info.target_output_mode[0] != 7 &&
+	           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
+	                       std::end(pixel_info.target_output_mode),
+	                       [](uint8_t mode) { return mode == 0; }) &&
+	           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
+	               BlendMappingSupport::SourceAlpha) {
+		// The export mapping moves alpha out of the fourth channel: MRT1 carries logical alpha
+		// as a second blend source (KYTY_BLEND_ALPHA_REMAP, upstream 73615c31f).
+		pixel_info.alpha_blend_source_remap = true;
+		pixel_info.dual_source_blending     = true;
+		pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+		pixel_info.target_export_mapping[1] = {};
 	}
 }
 
@@ -4213,6 +4246,27 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
 		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
 		static_params.blend_enable[slot]         = bc.enable && !rt.info.blend_bypass;
+		if (BlendAlphaRemapEnabled()) {
+			// Upstream 73615c31f: logical alpha through MRT1 (ApplyDualSourceBlending), or no
+			// blending where the export mapping cannot be blended correctly.
+			const bool alpha_remap =
+			    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
+			if (static_params.blend_enable[slot] && !alpha_remap &&
+			    ClassifyBlendMapping(bc, color.export_mapping) != BlendMappingSupport::Direct) {
+				static_params.blend_enable[slot] = false;
+				static std::atomic_bool warned = false;
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: blending disabled for unsupported color mapping "
+					    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
+					    slot, color.export_mapping.packed, bc.color_srcblend, bc.color_destblend,
+					    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
+				}
+			}
+			if (alpha_remap) {
+				static_params.blend_alpha_source_remap = true;
+			}
+		}
 	}
 	const bool with_depth = targets.with_depth;
 	if (with_depth) {

@@ -193,8 +193,9 @@ std::string FormatExp(const Instruction& inst) {
 
 bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
-		// DevKit NGG should be disabled.
-		case Opcode::S_CBRANCH_CDBGSYS: return false;
+		// Conditional shader debugging is disabled.
+		case Opcode::S_CBRANCH_CDBGSYS:
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER: return false;
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
 		case Opcode::S_CBRANCH_VCCZ:
@@ -517,6 +518,7 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_ABS_I32:
 		case Opcode::S_BREV_B32:
+		case Opcode::S_BREV_B64:
 		case Opcode::S_BCNT1_I32_B32:
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
@@ -588,6 +590,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
 		case Opcode::S_CBRANCH_CDBGSYS:
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
@@ -600,8 +603,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
 		case Opcode::IMAGE_STORE_MIP:
-		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_CMPSWAP:
+		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_SUB:
 		case Opcode::IMAGE_ATOMIC_SMIN:
 		case Opcode::IMAGE_ATOMIC_SMAX:
@@ -613,6 +616,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_ATOMIC_AND:
 		case Opcode::IMAGE_ATOMIC_OR:
 		case Opcode::IMAGE_ATOMIC_XOR:
+		case Opcode::IMAGE_ATOMIC_FMIN:
+		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_LOAD:
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
@@ -673,6 +678,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_SMAX:
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:
+		case Opcode::BUFFER_ATOMIC_AND_X2:
 		case Opcode::BUFFER_ATOMIC_OR:
 		case Opcode::BUFFER_ATOMIC_OR_X2:
 		case Opcode::BUFFER_ATOMIC_XOR:
@@ -687,7 +693,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_UMIN_X2:
 		case Opcode::BUFFER_ATOMIC_SMAX_X2:
 		case Opcode::BUFFER_ATOMIC_UMAX_X2:
-		case Opcode::BUFFER_ATOMIC_AND_X2:
 		case Opcode::BUFFER_ATOMIC_XOR_X2:
 		case Opcode::BUFFER_LOAD_SBYTE:
 		case Opcode::BUFFER_LOAD_SSHORT:
@@ -706,6 +711,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::FLAT_STORE_DWORDX3:
 		case Opcode::FLAT_STORE_DWORDX4:
 		case Opcode::DS_ADD_U32:
+		case Opcode::DS_ADD_U64:
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
@@ -724,6 +730,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
+		case Opcode::DS_OR_B64:
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:

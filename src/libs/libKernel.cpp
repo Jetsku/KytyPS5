@@ -1237,6 +1237,7 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	auto* program = rt->FindProgramByFileName(module_path);
 	if (program != nullptr) {
+		++program->load_count;
 		if (res != nullptr) {
 			*res = OK;
 		}
@@ -1251,6 +1252,7 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	rt->RelocateProgram(program);
 
+	program->load_count = 1;
 	int result = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
@@ -1280,6 +1282,11 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	if (program == nullptr) {
 		LOGF("\tinvalid module handle = %" PRId32 "\n", handle);
+		return KERNEL_ERROR_ESRCH;
+	}
+
+	if (program->load_count > 1) {
+		--program->load_count;
 		return OK;
 	}
 
@@ -1799,6 +1806,12 @@ int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* /*c*/) {
 	//__sync_fetch_and_sub(c, 1);
 
 	return 0;
+}
+
+static uint64_t KYTY_SYSV_ABI KernelGetAvailableCpumask() {
+	PRINT_NAME();
+
+	return 0x1fff;
 }
 
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
@@ -3344,6 +3357,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("vYU8P9Td2Zo", KernelAioInitializeImpl);
 	LIB_FUNC("WhCc1w3EhSI", LibKernel::KernelSetThreadAtexitReport);
 	LIB_FUNC("WkwEd3N7w0Y", LibKernel::KernelInstallExceptionHandler);
+	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);

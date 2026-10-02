@@ -57,24 +57,51 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      # The PGO profile in tools/pgo was merged with LLVM 22.1.3's llvm-profdata (the clang-cl of
+      # Visual Studio 18, llvm-project e9846648f); the compiler that reads it must be the same release.
+      - name: Install LLVM 22.1.3
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.3-win64.exe'
+          Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe' `
+            -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', '/D=C:\LLVM-22.1.3' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LLVM installer exited with $($process.ExitCode)" }
+          $version = & 'C:\LLVM-22.1.3\bin\clang-cl.exe' --version | Select-Object -First 1
+          Write-Host $version
+          if ($version -notmatch 'clang version 22\.1\.3\b') { throw "Unexpected clang-cl: $version" }
+          foreach ($tool in 'lld-link.exe', 'llvm-lib.exe') {
+            if (-not (Test-Path -LiteralPath "C:\LLVM-22.1.3\bin\$tool")) { throw "$tool missing" }
+          }
+
       - name: Configure Release
         shell: cmd
         run: |
+          set LLVM=C:/LLVM-22.1.3/bin
+          set PGO_PROFILE=%GITHUB_WORKSPACE:\=/%/tools/pgo/u59-int3-sg-1.profdata
           cmake -S . -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
+            -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=%GITHUB_REF_NAME% ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
+            -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
+            -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
+            -DCMAKE_AR=%LLVM%/llvm-lib.exe ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build and install
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher kyty_emulator --parallel
+          cmake --build _Build/windows --target launcher kyty_emulator --parallel > pgo-build.log 2>&1
+          set BUILD_EXIT=%ERRORLEVEL%
+          type pgo-build.log
+          if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
+          rem Functions whose profile does not match this compile are optimized without it (not an error).
+          findstr /c:"profile data may be out of date" pgo-build.log || echo No PGO profile mismatch warnings.
           cmake --install _Build/windows --prefix _Build/windows/install
 
       - name: Package portable experimental runtime
@@ -90,6 +117,13 @@ jobs:
           }
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
+          # libFont's fallback font: the emulator looks for it under its working directory (the launcher starts it
+          # in its own folder) when the build-time source path does not exist, as on every user's PC.
+          $fonts = Join-Path $release '3rdparty/tracy/profiler/src/font'
+          New-Item -ItemType Directory -Path $fonts | Out-Null
+          Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
+          if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) { throw 'Expected four Roboto fonts.' }
+          Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
           $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Demons-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -101,5 +135,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 + Demon's Souls changes (Windows x64)" `
-            --notes "Experimental U59 plus the merged Demon's Souls shader, renderer fallback and page-hint changes. Open launcher.exe directly: the bundled u59-preset.json applies the no-diagnostics renderer settings. The existing shared Kyty.ini supplies game paths and display settings. No FPS gain is claimed; this release is for visual and performance testing. RT and U60 work are excluded."
+            --title "U59 integration: draw-run batching, possible device-lost fixes, upstream sync 2 (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "New since u59-windows-20261002-int2: draw-run batching is on in the bundled u59-preset.json (KYTY_DRAW_RUN, KYTY_DRAW_RUN_ACQUIRE, KYTY_DRAW_RUN_PUSH; about +2% fps in a same-process A/B at the Astro Bot Sky Garden start view). Possible fixes for device-lost (masterSemaphore) GPU hangs reported on RTX 40 and 50 series cards, none of them confirmed: S_MEMREALTIME reads the real GPU clock instead of a fixed placeholder (KYTY_REALTIME_CLOCK=0 restores the placeholder); a DPP read from a lane that EXEC disables keeps the destination, and DPP row scans become native subgroup reductions (KYTY_DPP_SKIP_INACTIVE=0, KYTY_LANE_REDUCTIONS=0); a shader dispatcher loop ends after 4096 block transitions (KYTY_DISPATCHER_CAP, 0 = no limit). Optional device-fault diagnostics: add KYTY_DEVICE_FAULT_DIAGNOSTICS=1 to u59-preset.json and, after a crash, send the console text from the '--- Device loss' line on, the _device_fault.nv-gpudmp file if one was written, the GPU model and the driver version (see U59-README.md). Upstream KytyPS5 sync 2: DualSense speaker and haptic audio over Bluetooth, in-game keys 1, 2 and 3 that cycle the controller's speaker volume, vibration and trigger-effect intensity, an audio popping fix, Hades II fixes, NetResolverAbort and more shader opcodes. Text that games draw with the system font (for example Astro Bot's galaxy-map prompts) uses the bundled Roboto font again instead of a blocky fallback. kyty_emulator is built with a new PGO profile recorded in Astro Bot. New flags from this update that are off by default stay off. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, three alternating runs each: 34.4 fps with int2, 35.7 fps with a local build of this source (within the spread between runs); dedicated VRAM 9.6 GB with int2, 9.4 GB with the local build. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch compiles shaders again. The upstream controller and audio changes were not tested by hand. See U59-README.md."

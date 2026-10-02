@@ -190,6 +190,7 @@ void QueueSubmissionBroker::SubmitBatch(const QueuedSubmission* records, size_t 
 		TracyPlot("SubmissionQueue.ProtectedBoundaries", static_cast<double>(m_protected_boundaries));
 		TracyPlot("SubmissionQueue.ProtectedBoundariesPerCall", static_cast<double>(protected_count));
 	}
+	if (result == vk::Result::eErrorDeviceLost) DumpDeviceLossDiagnostics(*m_graphics, records[0].tick, true);
 	if (result != vk::Result::eSuccess) {
 		// A batched driver failure does not identify a single offending entry.
 		// Preserve each entry's diagnostics rather than reading a reused wrapper.

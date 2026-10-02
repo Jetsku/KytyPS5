@@ -29,6 +29,7 @@ namespace Libs::Graphics::SyncEpoch {
 
 namespace Detail {
 inline std::atomic<uint64_t> g_epoch {1};
+inline std::atomic<uint64_t> g_submission {1};
 } // namespace Detail
 
 // KYTY_SYNC_EPOCH=0 disables every consumer of the epoch (they then check on every use).
@@ -49,6 +50,18 @@ inline std::atomic<uint64_t> g_epoch {1};
 inline void Advance() noexcept {
 	Detail::g_epoch.fetch_add(1, std::memory_order_acq_rel);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::SyncEpochAdvances);
+}
+
+// Guest submissions started: the GPU thread advances this at the first slice of every queue
+// submission (GuestGpu::Process, ProcessSequenced), coarser than the epoch, which also advances
+// at every fence inside a submission. Only KYTY_BDA_SYNC_PER_SUBMISSION reads it
+// (BufferCache::SynchronizeBdaBuffers). Starts at 1; never 0.
+[[nodiscard]] inline uint64_t CurrentSubmission() noexcept {
+	return Detail::g_submission.load(std::memory_order_acquire);
+}
+
+inline void AdvanceSubmission() noexcept {
+	Detail::g_submission.fetch_add(1, std::memory_order_acq_rel);
 }
 
 } // namespace Libs::Graphics::SyncEpoch
