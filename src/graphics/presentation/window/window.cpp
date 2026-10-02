@@ -5,10 +5,12 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/emergencySave.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/systemInfo.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "common/stringUtils.h"
@@ -153,7 +155,7 @@ struct EventController {
 
 namespace {
 
-std::unique_ptr<WindowContext> g_window;
+std::shared_ptr<WindowContext> g_window;
 
 } // namespace
 
@@ -802,7 +804,7 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EXIT_IF(g_window != nullptr);
 
-	auto window = std::make_unique<WindowContext>();
+	auto window = std::make_shared<WindowContext>();
 
 	window->graphic_ctx.screen_width  = width;
 	window->graphic_ctx.screen_height = height;
@@ -811,6 +813,9 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	window->CreateVulkan();
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
+	// Capture ownership, not the global pointer: a timed-out save must retain the renderer.
+	Common::Subsystems::SetEmergencySave(std::make_shared<Common::EmergencySave>(
+	    [context = g_window] { context->render_context->GetPipelineCache().SaveEmergency(); }));
 	return presenter;
 }
 
@@ -819,10 +824,12 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+	Common::Subsystems::SetEmergencySave(nullptr);
 	g_window->render_context->GetPipelineCache().Save();
 }
 
 void WindowShutdown() {
+	Common::Subsystems::SetEmergencySave(nullptr);
 	if (g_window != nullptr) {
 		HostInputShutdown();
 		Controller::EmergencyShutdown();

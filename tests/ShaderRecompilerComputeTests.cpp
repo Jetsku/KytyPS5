@@ -2522,11 +2522,52 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   return b.Build();
 }
 
+std::vector<u32> MakeSubgroupSizeFragmentSpirv() {
+  ShaderRecompiler::Spirv::Builder b;
+  const auto void_type = b.Type(spv::OpTypeVoid);
+  const auto uint_type = b.Type(spv::OpTypeInt, 32, 0);
+  const auto float_type = b.Type(spv::OpTypeFloat, 32);
+  const auto vec4_type = b.Type(spv::OpTypeVector, float_type, 4);
+  const auto function_type = b.Type(spv::OpTypeFunction, void_type);
+  const auto size = b.DefineGlobalVariable(
+      b.Type(spv::OpTypePointer, spv::StorageClassInput, uint_type), spv::StorageClassInput);
+  const auto output = b.DefineGlobalVariable(
+      b.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4_type), spv::StorageClassOutput);
+  const auto zero = b.Constant(spv::OpConstant, float_type, 0u);
+  const auto one = b.Constant(spv::OpConstant, float_type, 0x3f800000u);
+  const auto main = b.AllocateId();
+  const auto label = b.AllocateId();
+  const auto native_size = b.AllocateId();
+  const auto float_size = b.AllocateId();
+  const auto color = b.AllocateId();
+  b.RequireCapability(spv::CapabilityShader);
+  b.RequireCapability(spv::CapabilityGroupNonUniform);
+  b.RequireVersion(0x00010300u);
+  b.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+  b.AddEntryPoint(spv::ExecutionModelFragment, main, "main", {size, output});
+  b.AddExecutionMode(main, spv::ExecutionModeOriginUpperLeft);
+  b.AddAnnotation(spv::OpDecorate, size, spv::DecorationBuiltIn, spv::BuiltInSubgroupSize);
+  b.AddAnnotation(spv::OpDecorate, size, spv::DecorationFlat);
+  b.AddAnnotation(spv::OpDecorate, output, spv::DecorationLocation, 0);
+  b.AddFunction(spv::OpFunction, void_type, main, spv::FunctionControlMaskNone, function_type);
+  b.AddFunction(spv::OpLabel, label);
+  b.AddFunction(spv::OpLoad, uint_type, native_size, size);
+  b.AddFunction(spv::OpConvertUToF, float_type, float_size, native_size);
+  b.AddFunction(spv::OpCompositeConstruct, vec4_type, color, float_size, zero, zero, one);
+  b.AddFunction(spv::OpStore, output, color);
+  b.AddFunction(spv::OpReturn);
+  b.AddFunction(spv::OpFunctionEnd);
+  return b.Build();
+}
+
 } // namespace TestSpv
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  explicit VulkanHarness(bool require_feedback_dynamic = true,
+                         bool enable_subgroup_size_control = false)
+      : m_require_feedback_dynamic(require_feedback_dynamic),
+        m_enable_subgroup_size_control(enable_subgroup_size_control) { Init(); }
   ~VulkanHarness() { Destroy(); }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -14310,6 +14351,217 @@ public:
     return result;
   }
 
+  void CheckFragmentSubgroupSize() {
+    constexpr const char *name = "FragmentSubgroupSize";
+    auto &graphics = RuntimeContext();
+    Require(name, "device support", graphics.compute_subgroup_size_control_enabled &&
+                (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eFragment) &&
+                graphics.min_subgroup_size <= 32 && graphics.max_subgroup_size >= 64,
+            "the device cannot request fragment subgroup sizes 32 and 64");
+    const auto vs = TestSpv::MakePassthroughVertexSpirv(false);
+    const auto fs = TestSpv::MakeSubgroupSizeFragmentSpirv();
+    ValidateSpirv(name, fs);
+    ShaderProgram vertex_module{1, CreateShaderModule(name, vs)};
+    ShaderProgram pixel_module{2, CreateShaderModule(name, fs)};
+    ShaderRecompiler::IR::CompiledShaderInfo vertex_program{}, pixel_program{};
+    vertex_program.stage = ShaderType::Vertex;
+    vertex_program.info.vertex_fetch_components[0] = 2;
+    vertex_program.info.vertex_fetch_components[1] = 4;
+    pixel_program.stage = ShaderType::Pixel;
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderVertexInputInfo vertex{};
+    vertex.stage = {&vertex_program, &resources};
+    for (u32 i = 0; i < 2; ++i) {
+      const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float
+                                : Prospero::BufferFormat::k32_32_32_32Float;
+      vertex.resources[i].fields[3] = DstSel(4, 5, 6, 7) | (u32(format) << 12u);
+      vertex.resources_dst[i].registers_num = i == 0 ? 2 : 4;
+    }
+    ShaderPixelInputInfo pixel{};
+    pixel.stage = {&pixel_program, &resources};
+    PipelineRenderingState rendering{};
+    rendering.color_count = 1;
+    rendering.color_formats[0] = vk::Format::eR32G32B32A32Sfloat;
+    PipelineVertexInputState inputs{};
+    inputs.binding_count = 1;
+    inputs.bindings[0].stride = 6 * sizeof(float);
+    inputs.attribute_count = 2;
+    inputs.attributes[1].offset = 2 * sizeof(float);
+    PipelineStaticParameters params{};
+    params.topology = vk::PrimitiveTopology::eTriangleList;
+    params.polygon_mode = vk::PolygonMode::eFill;
+    params.samples = 1;
+    params.depth_clip_enable = true;
+    params.color_mask[0] = 15;
+    PipelineCache::GraphicsPrograms programs{{vertex_module}, pixel_module};
+    const std::vector<u32> vertices = {
+        0xbf800000u, 0xbf800000u, 0, 0, 0, 0x3f800000u,
+        0x40400000u, 0xbf800000u, 0, 0, 0, 0x3f800000u,
+        0xbf800000u, 0x40400000u, 0, 0, 0, 0x3f800000u};
+    auto buffer = CreateHostBuffer(name, vertices.size() * sizeof(u32),
+                                   vk::BufferUsageFlagBits::eVertexBuffer, vertices);
+    auto target = CreateImage2D(name, 16, 16, rendering.color_formats[0],
+                               vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                               vk::ImageLayout::eGeneral);
+    GraphicsPipelineLibrary libraries(graphics);
+    u32 mismatches = 0;
+    for (const auto *path : {"monolithic", "linked", "optimized", "fresh"}) {
+      const bool linked = std::strcmp(path, "monolithic") != 0;
+      for (const u32 requested : {32u, 64u, 32u}) {
+        pixel.wave_size = requested;
+        PipelineCache::Pipeline pipeline{};
+        std::unique_ptr<GraphicsPipelineSnapshot> optimized;
+        std::unique_ptr<GraphicsPipelineLibrary> fresh;
+        if (std::strcmp(path, "fresh") == 0) fresh = std::make_unique<GraphicsPipelineLibrary>(graphics);
+        auto &selected_libraries = fresh != nullptr ? *fresh : libraries;
+        const GraphicsPipelineCreateHook hook = [&](const vk::GraphicsPipelineCreateInfo &info,
+            std::span<const u32> signature, vk::Pipeline *out) {
+          auto result = selected_libraries.Create(info, signature, nullptr);
+          const bool fallback = requested == 64 && graphics.physical_device_properties.vendorID == 0x1002u;
+          Require(name, "library path",
+                  result.path == (fallback ? GraphicsPipelineLibrary::Path::Monolithic
+                                          : GraphicsPipelineLibrary::Path::Linked),
+                  "unexpected pipeline-library path for the requested wave size");
+          if (fallback) {
+            Require(name, "wave64 compatibility", result.fallback != nullptr &&
+                    std::strcmp(result.fallback, "fragment-wave64") == 0,
+                    "wave64 did not use the Radeon compatibility fallback");
+          }
+          *out = result.pipeline;
+          optimized = std::move(result.optimize);
+          if (optimized == nullptr) optimized = GraphicsPipelineSnapshot::Capture(info);
+          Require(name, "owned snapshot", optimized != nullptr, "missing owned snapshot");
+          const auto &captured = optimized->Info();
+          const auto *size = static_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo *>(
+              captured.pStages[captured.stageCount - 1].pNext);
+          Require(name, "captured wave size", size != nullptr && size->requiredSubgroupSize == requested,
+                  "the owned snapshot lost the fragment wave size");
+          std::printf("[gpu]     %s wave%u: captured=%u new_libraries=%u total=%zu\n", path,
+                      requested, size->requiredSubgroupSize, result.libraries_created,
+                      selected_libraries.LibraryCount());
+          return result.result;
+        };
+        CreatePipelineInternal(graphics, pipeline, rendering, inputs, std::span{&vertex, 1u},
+                               &pixel, programs, params, nullptr, linked ? &hook : nullptr);
+        if (std::strcmp(path, "optimized") == 0) {
+          // Compile after the producer's stack has returned, like a background optimization.
+          Require(name, "optimized snapshot", optimized != nullptr, "missing owned snapshot");
+          m_device.destroyPipeline(pipeline.pipeline);
+          RequireVk(name, "optimized snapshot",
+                    m_device.createGraphicsPipelines(nullptr, 1, &optimized->Info(), nullptr,
+                                                     &pipeline.pipeline),
+                    "vkCreateGraphicsPipelines(snapshot)");
+        }
+        TransitionImage(name, &target, vk::ImageLayout::eGeneral,
+                        vk::PipelineStageFlagBits::eAllCommands,
+                        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                        vk::AccessFlagBits::eColorAttachmentWrite);
+        auto cmd = BeginCommands(name, "fragment subgroup");
+        vk::RenderingAttachmentInfo color{};
+        color.imageView = target.view;
+        color.imageLayout = vk::ImageLayout::eGeneral;
+        color.loadOp = vk::AttachmentLoadOp::eClear;
+        color.storeOp = vk::AttachmentStoreOp::eStore;
+        vk::RenderingInfo render{};
+        render.renderArea.extent = {16, 16};
+        render.layerCount = 1;
+        render.colorAttachmentCount = 1;
+        render.pColorAttachments = &color;
+        cmd.beginRendering(render);
+        const vk::Viewport viewport{0, 0, 16, 16, 0, 1};
+        const vk::Rect2D scissor{{0, 0}, {16, 16}};
+        cmd.setViewportWithCount(1, &viewport);
+        cmd.setScissorWithCount(1, &scissor);
+        cmd.setLineWidth(1);
+        cmd.setDepthTestEnable(false);
+        cmd.setDepthWriteEnable(false);
+        cmd.setDepthCompareOp(vk::CompareOp::eAlways);
+        cmd.setDepthBiasEnable(false);
+        cmd.setDepthBias(0, 0, 0);
+        cmd.setStencilTestEnable(false);
+        cmd.setStencilOp(vk::StencilFaceFlagBits::eFrontAndBack, vk::StencilOp::eKeep,
+                        vk::StencilOp::eKeep, vk::StencilOp::eKeep, vk::CompareOp::eAlways);
+        cmd.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack, ~0u);
+        cmd.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, 0);
+        cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, ~0u);
+        const float blend_constants[4]{};
+        cmd.setBlendConstants(blend_constants);
+        const vk::Bool32 write = true;
+        cmd.setColorWriteEnableEXT(1, &write);
+        if (PipelineDynamicRasterStateEnabled()) {
+          cmd.setCullMode(vk::CullModeFlagBits::eNone);
+          cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
+          cmd.setDepthBoundsTestEnable(false);
+          cmd.setDepthBounds(0, 1);
+        }
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+        const vk::DeviceSize offset = 0;
+        cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
+        cmd.draw(3, 1, 0, 0);
+        cmd.endRendering();
+        EndSubmitAndFree(name, "fragment subgroup", cmd);
+        const auto texels = ReadImage(name, &target);
+        Require(name, "native GPU subgroup", texels.size() >= 16 * 16 * 4,
+                "missing render-target readback");
+        bool matches = true;
+        for (u32 i = 0; i < 16 * 16; ++i) {
+          if (std::bit_cast<float>(texels[i * 4]) != float(requested)) {
+            std::printf("[gpu]     %s: pixel shader ran with %g lanes instead of %u\n", path,
+                        std::bit_cast<float>(texels[i * 4]), requested);
+            ++mismatches;
+            matches = false;
+            break;
+          }
+        }
+        m_device.destroyPipeline(pipeline.pipeline);
+        std::printf("[gpu]     %-32s %s wave%u: %s\n", name,
+                    path, requested, matches ? "ok" : "FAILED");
+      }
+    }
+    DestroyImage(&target);
+    DestroyBuffer(&buffer);
+    m_device.destroyShaderModule(pixel_module.module);
+    m_device.destroyShaderModule(vertex_module.module);
+    Require(name, "native GPU subgroup", mismatches == 0, "fragment wave size mismatch");
+  }
+
+  void CheckNullImageInitialization() {
+    constexpr const char *name = "NullImageInitialization";
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetTextureCache();
+    for (const auto guest_format : {Prospero::BufferFormat::k32Float,
+                                    Prospero::BufferFormat::k32UInt,
+                                    Prospero::BufferFormat::k32SInt}) {
+      const auto format = VulkanFormat(guest_format);
+      TextureCache::ImageDesc desc{};
+      desc.info.guest_format = guest_format;
+      desc.info.pixel_format = format;
+      desc.info.pitch = 1;
+      desc.info.bytes_per_block = sizeof(u32);
+      desc.info.mip_layout[0] = {0, sizeof(u32), 1, 1};
+      desc.view_info.format = format;
+      const auto id = cache.FindImage(desc);
+      const auto writes = cache.GetImage(id).DefiniteWrites();
+      Require(name, "first use", writes != 0,
+              "fallback contents were never initialized before first use");
+      Require(name, "GPU readback",
+              ReadCachedTexel(name, context, id) == std::vector<u32>{0},
+              "the native fallback texel is not zero");
+      Require(name, "cache reuse", cache.FindImage(desc) == id &&
+                  cache.GetImage(id).DefiniteWrites() == writes,
+              "cache reuse allocated or cleared the fallback again");
+    }
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s float/uint/sint initialized and reused: ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -25481,6 +25733,16 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    if (m_enable_subgroup_size_control) {
+      vk::PhysicalDeviceSubgroupSizeControlProperties properties{};
+      vk::PhysicalDeviceProperties2 properties2{};
+      properties2.pNext = &properties;
+      m_physical_device.getProperties2(&properties2);
+      m_runtime_context.compute_subgroup_size_control_enabled = true;
+      m_runtime_context.min_subgroup_size = properties.minSubgroupSize;
+      m_runtime_context.max_subgroup_size = properties.maxSubgroupSize;
+      m_runtime_context.required_subgroup_size_stages = properties.requiredSubgroupSizeStages;
+    }
     // KYTY_SUBMISSION_MODE=queued starts the submission broker as the emulator's window does;
     // unset, submissions stay synchronous (the default for these tests).
     m_runtime_context.submission_queue.Initialize(m_runtime_context);
@@ -25488,7 +25750,7 @@ private:
       m_runtime_context.transfer_queue_family = m_transfer_family;
       m_runtime_context.transfer_queue = m_transfer_queue;
     }
-    m_runtime_context.attachment_feedback_loop_enabled = true;
+    m_runtime_context.attachment_feedback_loop_enabled = m_require_feedback_dynamic;
     m_runtime_context.provoking_vertex_last_enabled = true;
     m_runtime_context.storage_image_read_without_format_enabled =
         m_storage_image_read_without_format;
@@ -25734,7 +25996,8 @@ private:
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+                 (!m_require_feedback_dynamic ||
+                  available_feedback_dynamic.attachmentFeedbackLoopDynamicState) &&
                 available_provoking_vertex.provokingVertexLast,
             "production rasterization features are not supported");
 
@@ -25794,6 +26057,11 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    if (m_enable_subgroup_size_control) {
+      Require("VulkanHarness", "subgroup size control", available_features13.subgroupSizeControl,
+              "subgroup size control is not supported");
+      device_features13.subgroupSizeControl = true;
+    }
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
@@ -25813,7 +26081,9 @@ private:
     feedback_dynamic.pNext = &feedback_layout;
     feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
-    provoking_vertex.pNext = &feedback_dynamic;
+    provoking_vertex.pNext = m_require_feedback_dynamic
+                                ? static_cast<void *>(&feedback_dynamic)
+                                : static_cast<void *>(&feedback_layout);
     provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
     min_lod.pNext = &provoking_vertex;
@@ -25870,9 +26140,11 @@ private:
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
         VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (m_require_feedback_dynamic) {
+      device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+    }
     if (robustness2_supported) {
       device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     }
@@ -26290,6 +26562,8 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
+  bool m_require_feedback_dynamic = true;
+  bool m_enable_subgroup_size_control = false;
   bool m_pipeline_library = false;
   bool m_storage_image_read_without_format = false;
   bool m_sampler_filter_minmax = false;
@@ -44797,6 +45071,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
+#include "ShaderAsyncPipelineTests.inc"
 #include "GuestSyncTests.inc"
 
 } // namespace
@@ -44820,6 +45095,30 @@ int main(int argc, char **argv) {
   }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--async-pipeline-only") == 0) {
+    // These non-aliasing draws need no dynamic attachment-feedback feature (AMD layout-only).
+    VulkanHarness vulkan(false);
+    AsyncPipelineTests::Check(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fragment-subgroup-only") == 0) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_PIPELINE_LIBRARY", "1");
+    _putenv_s("KYTY_PIPELINE_LIBRARY_PROBE", "0");
+#else
+    setenv("KYTY_PIPELINE_LIBRARY", "1", 1);
+    setenv("KYTY_PIPELINE_LIBRARY_PROBE", "0", 1);
+#endif
+    VulkanHarness vulkan(false, true);
+    vulkan.CheckFragmentSubgroupSize();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--null-image-init-only") == 0) {
+    // Transfer-only regression: dynamic attachment feedback is not needed here.
+    VulkanHarness vulkan(false);
+    vulkan.CheckNullImageInitialization();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gi-probe-codegen-only") == 0) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();

@@ -4,9 +4,13 @@
 #include "common/common.h"
 
 #include <cstdio>
+#include <atomic>
+#include <memory>
 #include <vector>
 
 namespace Common {
+
+class EmergencySave;
 
 class Subsystems {
 public:
@@ -28,6 +32,9 @@ public:
 	void EmergencyShutdown();
 
 	static void EmergencyShutdownActive();
+	// Set during healthy initialization; clear before normal cache/resource teardown.
+	// Clearing joins the worker and is never called by the emergency path.
+	static void SetEmergencySave(std::shared_ptr<EmergencySave> save);
 
 	KYTY_CLASS_NO_COPY(Subsystems);
 
@@ -55,6 +62,7 @@ private:
 
 	std::vector<Entry> m_active;
 	bool               m_print;
+	std::atomic<bool>  m_emergency_started {false};
 };
 
 } // namespace Common
