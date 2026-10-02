@@ -173,6 +173,30 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
+        <item row="8" column="1">
+         <widget class="QCheckBox" name="checkBox_dcc_gpu_clear">
+          <property name="toolTip"><string>Clear DCC color metadata on the GPU instead of draining the GPU on the CPU fallback. Reduces stutter in foliage-heavy scenes.</string></property>
+          <property name="text"><string>GPU DCC clear (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_program_cache">
+          <property name="toolTip"><string>Cache translated shader programs to disk. Reduces shader compilation on later runs.</string></property>
+          <property name="text"><string>Persistent shader program cache (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <widget class="QCheckBox" name="checkBox_pipeline_library">
+          <property name="toolTip"><string>Fast-link graphics pipelines from libraries. May reduce pipeline creation stalls.</string></property>
+          <property name="text"><string>Graphics pipeline libraries (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="11" column="1">
+         <widget class="QCheckBox" name="checkBox_gpu_fault_report">
+          <property name="toolTip"><string>Enables VK_EXT_device_fault (KYTY_GPU_FAULT_REPORT=1). If the GPU is lost, the log gets the fault description, addresses and vendor codes. It costs nothing while the game runs. It does not turn on the graphics debug dump (KYTY_CAPTURE_SHADER_DETAILS=1), which dumps every PM4 packet and is very slow.</string></property>
+          <property name="text"><string>GPU fault report (VK_EXT_device_fault)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

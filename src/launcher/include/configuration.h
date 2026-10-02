@@ -107,6 +107,10 @@ public:
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   dcc_gpu_clear_enabled       = false;
+	bool                   program_cache_enabled       = false;
+	bool                   pipeline_library_enabled    = false;
+	bool                   gpu_fault_report_enabled = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -138,6 +142,10 @@ public:
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
+		dcc_gpu_clear_enabled       = other.dcc_gpu_clear_enabled;
+		program_cache_enabled       = other.program_cache_enabled;
+		pipeline_library_enabled    = other.pipeline_library_enabled;
+		gpu_fault_report_enabled = other.gpu_fault_report_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -184,6 +192,10 @@ public:
 		KYTY_CFG_SET(profiler_enabled);
 		KYTY_CFG_SET(renderdoc_enabled);
 		KYTY_CFG_SET(amd_cpu_enabled);
+		KYTY_CFG_SET(dcc_gpu_clear_enabled);
+		KYTY_CFG_SET(program_cache_enabled);
+		KYTY_CFG_SET(pipeline_library_enabled);
+		KYTY_CFG_SET(gpu_fault_report_enabled);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -229,6 +241,10 @@ public:
 		KYTY_CFG_GET(profiler_enabled);
 		KYTY_CFG_GET(renderdoc_enabled);
 		amd_cpu_enabled = s->value("amd_cpu_enabled", false).toBool();
+		dcc_gpu_clear_enabled = s->value("dcc_gpu_clear_enabled", false).toBool();
+		program_cache_enabled = s->value("program_cache_enabled", false).toBool();
+		pipeline_library_enabled = s->value("pipeline_library_enabled", false).toBool();
+		gpu_fault_report_enabled = s->value("gpu_fault_report_enabled", false).toBool();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
