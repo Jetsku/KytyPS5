@@ -4,6 +4,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
+#include "libs/avPlayerSync.h"
 #include "libs/libs.h"
 
 #include <algorithm>
@@ -451,9 +452,13 @@ public:
 		available.notify_all();
 	}
 	void Notify() { available.notify_all(); }
+	size_t Count() const {
+		std::lock_guard lock(mutex);
+		return queue.size();
+	}
 
 private:
-	std::mutex              mutex;
+	mutable std::mutex      mutex;
 	std::condition_variable available;
 	std::deque<DemuxPacket> queue;
 	size_t                  bytes    = 0;
@@ -552,6 +557,10 @@ public:
 	bool Empty() const {
 		std::lock_guard lock(mutex);
 		return queue.empty();
+	}
+	size_t Count() const {
+		std::lock_guard lock(mutex);
+		return queue.size();
 	}
 	void Clear() {
 		std::lock_guard lock(mutex);
@@ -882,6 +891,7 @@ public:
 	}
 	bool Active() const {
 		std::lock_guard lock(mutex);
+		LogStallNoLock();
 		return state == State::Ready ||
 		       (state == State::Playing && !pipeline_failed && !DrainedNoLock());
 	}
@@ -939,6 +949,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
+		LogStallNoLock();
 		if (state != State::Playing || !video_id) {
 			return false;
 		}
@@ -947,14 +958,9 @@ public:
 			return false;
 		}
 		auto frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
-			if (deliver_seek_frame || sync_mode != 0) {
-				return true;
-			}
-			if (audio_id) {
-				return candidate.info.time_stamp <= last_audio_ts;
-			}
-			auto now = CurrentTimeNoLock();
-			return now == 0 || candidate.info.time_stamp <= now;
+			return VideoFrameIsDue(candidate.info.time_stamp, deliver_seek_frame || sync_mode != 0,
+			                       audio_id.has_value(), audio_done && audio_frames.Empty(),
+			                       last_audio_ts, CurrentTimeNoLock());
 		});
 		if (!frame) {
 			return false;
@@ -979,6 +985,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
+		LogStallNoLock();
 		if (paused || state != State::Playing || !audio_id ||
 		    trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
 			return false;
@@ -1014,6 +1021,32 @@ public:
 
 private:
 	enum class State { Ready, Playing, Stopped };
+
+	// Report only playback that outlives the source duration. This separates a
+	// decoder/queue stall from a guest waiting elsewhere without logging each poll.
+	void LogStallNoLock() const {
+		if (state != State::Playing || paused || loop || fmt == nullptr || fmt->duration <= 0) {
+			return;
+		}
+		const auto time_ms = CurrentTimeNoLock();
+		const auto duration_ms = static_cast<uint64_t>(fmt->duration / 1000);
+		if (time_ms < duration_ms + 2000 || time_ms < next_stall_report_ms) {
+			return;
+		}
+		next_stall_report_ms = time_ms + 1000;
+		LOGF("AvPlayer end diagnostics: path=%s time_ms=%" PRIu64 " duration_ms=%" PRIu64
+		     " eof=%d video_done=%d audio_done=%d failed=%d stop=%d sync=%u"
+		     " last_video_ms=%" PRIu64 " last_audio_ms=%" PRIu64
+		     " video_packets=%zu audio_packets=%zu video_frames=%zu audio_frames=%zu"
+		     " video_buffers=%zu audio_buffers=%zu drained=%d\n",
+		     path.c_str(), time_ms, duration_ms, static_cast<int>(demux_eof.load()),
+		     static_cast<int>(video_done.load()), static_cast<int>(audio_done.load()),
+		     static_cast<int>(pipeline_failed.load()), static_cast<int>(worker_stop.load()),
+		     sync_mode, current_video ? current_video->info.time_stamp : uint64_t {0},
+		     last_audio_ts, video_packets.Count(), audio_packets.Count(), video_frames.Count(),
+		     audio_frames.Count(), video_buffers.Count(), audio_buffers.Count(),
+		     static_cast<int>(DrainedNoLock()));
+	}
 
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
@@ -1067,6 +1100,7 @@ private:
 		last_audio_ts            = 0;
 		last_output_loop_offset  = 0;
 		pending_loop_warnings    = 0;
+		next_stall_report_ms     = 0;
 	}
 	void AutoEnable() {
 		for (uint32_t i = 0; i < fmt->nb_streams; i++) {
@@ -1541,7 +1575,11 @@ private:
 			return false;
 		}
 		auto* dst = buffer->Get();
-		std::memset(dst, 0, static_cast<size_t>(size));
+		// NV12 padding must have neutral chroma. Zero U/V turns the aligned
+		// right/bottom margins green if the guest samples outside the crop.
+		std::memset(dst, src->color_range == AVCOL_RANGE_JPEG ? 0 : 16,
+		            static_cast<size_t>(pitch) * h);
+		std::memset(dst + pitch * h, 128, static_cast<size_t>(pitch) * h / 2);
 		for (int y = 0; y < src->height; y++) {
 			std::memcpy(dst + y * pitch, nv12->data[0] + y * nv12->linesize[0], src->width);
 		}
@@ -1675,6 +1713,7 @@ private:
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
 	uint64_t                                 last_audio_ts = 0;
+	mutable uint64_t                         next_stall_report_ms = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};

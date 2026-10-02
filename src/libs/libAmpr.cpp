@@ -10,6 +10,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/amprCounterBank.h"
+#include "libs/aprHostFilePool.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -1943,6 +1944,13 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// Never destroyed: the OS closes the handles at exit, which avoids a static-destruction order
+// problem with Common::File and the logger.
+static AprHostFiles::HostFilePool<Common::File>& AprFilePool() {
+	static auto* pool = new AprHostFiles::HostFilePool<Common::File>();
+	return *pool;
+}
+
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprRead);
@@ -1959,37 +1967,56 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
+	// The handle stays open in the pool between reads (see aprHostFilePool.h); it goes back to the
+	// pool when `lease` leaves scope, or is closed by Discard() when the file misbehaved.
+	auto lease = AprFilePool().Acquire(host_path, [&host_path](Common::File& opened) {
+		return opened.Open(Common::PathFromUtf8(host_path), Common::File::Mode::Read);
+	});
+	if (!lease) {
 		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
 		return LibKernel::KERNEL_ERROR_ENOENT;
 	}
+	auto&      file      = lease.File();
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprShortReads);
-		file.Close();
 		return OK;
 	}
 	if (!file.Seek(file_offset)) {
-		file.Close();
+		lease.Discard();
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		file.Close();
 		return OK;
 	}
 
-	std::vector<uint8_t> buffer(
-	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
+	// The data still goes through a host buffer and a memcpy into the guest range, not straight
+	// from the file into guest memory: the guest range can be write-protected for CPU/GPU
+	// coherence, and a user-mode copy faults into the handler that unprotects it.
+	// Small reads reuse a per-thread buffer; large ones allocate, as before.
+	constexpr size_t SMALL_READ_BUFFER_SIZE = 64 * 1024;
+	thread_local std::vector<uint8_t> small_buffer;
+	std::vector<uint8_t>              large_buffer;
+	const auto chunk = static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable));
+	uint8_t*   buffer = nullptr;
+	if (chunk <= SMALL_READ_BUFFER_SIZE) {
+		if (small_buffer.size() < SMALL_READ_BUFFER_SIZE) {
+			small_buffer.resize(SMALL_READ_BUFFER_SIZE);
+		}
+		buffer = small_buffer.data();
+	} else {
+		large_buffer.resize(chunk);
+		buffer = large_buffer.data();
+	}
 	while (*bytes_read < readable) {
 		const auto request =
-		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
+		    static_cast<uint32_t>(std::min<uint64_t>(chunk, readable - *bytes_read));
 		uint32_t read = 0;
 		{
 			Profiler::ScopedLoadingOperation host_read(Profiler::LoadingOperation::AprHostRead);
-			file.Read(buffer.data(), request, &read);
+			file.Read(buffer, request, &read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprHostReadBytes, read);
 		if (read == 0) {
@@ -1997,13 +2024,12 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		}
 		{
 			Profiler::ScopedLoadingOperation guest_copy(Profiler::LoadingOperation::AprGuestCopy);
-			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer, read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprGuestCopiedBytes, read);
 		*bytes_read += read;
 	}
 
-	file.Close();
 	if (*bytes_read < size) {
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprShortReads);
 	}

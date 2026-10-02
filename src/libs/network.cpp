@@ -37,11 +37,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,6 +52,10 @@
 #include <vector>
 
 namespace Libs::Network {
+
+namespace Http {
+static void CloseEpolls(int http_ctx_id = 0);
+}
 
 class Network {
 public:
@@ -131,6 +137,7 @@ public:
 	bool HttpValidTemplate(Id tmpl_id);
 	bool HttpValidConnection(Id conn_id);
 	bool HttpValidRequest(Id req_id);
+	bool HttpRequestBelongsToContext(Id req_id, Id http_ctx_id);
 	Id HttpCreateConnection(Id tmpl_id, const char* server_name, const char* scheme, uint16_t port,
 	                        bool enable_keep_alive);
 	Id HttpCreateConnectionWithURL(Id tmpl_id, const char* url, bool enable_keep_alive);
@@ -249,6 +256,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Http::CloseEpolls();
 	delete g_net;
 	g_net = nullptr;
 }
@@ -403,6 +411,12 @@ bool Network::HttpValidRequest(Id req_id) {
 	return (req_id.GetType() == Id::Type::Request && req_id.GetId() >= 0 &&
 	        static_cast<size_t>(req_id.GetId()) < m_requests.size() &&
 	        m_requests[req_id.GetId()].used);
+}
+
+bool Network::HttpRequestBelongsToContext(Id req_id, Id http_ctx_id) {
+	Common::LockGuard lock(m_mutex);
+	return HttpValidRequest(req_id) && HttpValid(http_ctx_id) &&
+	       m_requests[req_id.GetId()].http_ctx_id == http_ctx_id.GetId();
 }
 
 Network::HttpBase* Network::FindHttpBase(Id id, bool include_request) {
@@ -2460,16 +2474,69 @@ namespace Http {
 
 struct HttpEpoll {
 	Network::Id http_ctx_id = Network::Id(0);
-	Network::Id request_id  = Network::Id(0);
-	void*       user_arg    = nullptr;
+	std::map<int, void*> requests;
+	std::deque<HttpNBEvent> events;
+	std::condition_variable ready;
+	bool closed = false;
 };
 
-struct HttpNBEvent {
-	uint32_t events       = 0;
-	uint32_t event_detail = 0;
-	int      id           = 0;
-	void*    user_arg     = nullptr;
-};
+// Keep the state alive while a waiter releases the registry lock. Destruction
+// removes the public handle, then wakes existing waiters before releasing it.
+static std::mutex g_http_epoll_mutex;
+static std::map<HttpEpollHandle, std::shared_ptr<HttpEpoll>> g_http_epolls;
+
+static void DetachRequestLocked(int request_id) {
+	for (auto& [handle, epoll]: g_http_epolls) {
+		epoll->requests.erase(request_id);
+		std::erase_if(epoll->events, [request_id](const HttpNBEvent& event) {
+			return event.id == request_id;
+		});
+	}
+}
+
+static void PublishRequestEventLocked(int request_id, uint32_t events) {
+	for (auto& [handle, epoll]: g_http_epolls) {
+		const auto request = epoll->requests.find(request_id);
+		if (request == epoll->requests.end()) {
+			continue;
+		}
+		HttpNBEvent event {};
+		event.events       = events;
+		event.event_detail = events;
+		event.id           = request_id;
+		event.user_arg     = request->second;
+		// A request has one pending completion; repeated sends cannot grow the
+		// queue without bound before the guest drains it.
+		const auto pending = std::find_if(epoll->events.begin(), epoll->events.end(),
+		                                 [request_id](const HttpNBEvent& entry) {
+			                                 return entry.id == request_id;
+		                                 });
+		if (pending == epoll->events.end()) {
+			epoll->events.push_back(event);
+		} else {
+			*pending = event;
+		}
+		epoll->ready.notify_all();
+	}
+}
+
+static void CloseEpollsLocked(int http_ctx_id) {
+	for (auto it = g_http_epolls.begin(); it != g_http_epolls.end();) {
+		const auto& epoll = it->second;
+		if (http_ctx_id == 0 || epoll->http_ctx_id.ToInt() == http_ctx_id) {
+			epoll->closed = true;
+			epoll->ready.notify_all();
+			it = g_http_epolls.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+static void CloseEpolls(int http_ctx_id) {
+	std::lock_guard lock(g_http_epoll_mutex);
+	CloseEpollsLocked(http_ctx_id);
+}
 
 LIB_NAME("Http", "Http");
 
@@ -2513,9 +2580,11 @@ int KYTY_SYSV_ABI HttpTerm(int http_ctx_id) {
 
 	EXIT_IF(g_net == nullptr);
 
+	std::lock_guard lock(g_http_epoll_mutex);
 	if (!g_net->HttpTerm(Network::Id(http_ctx_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
+	CloseEpollsLocked(http_ctx_id);
 
 	return OK;
 }
@@ -2731,13 +2800,18 @@ int KYTY_SYSV_ABI HttpCreateEpoll(int http_ctx_id, HttpEpollHandle* eh) {
 
 	EXIT_IF(g_net == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(eh == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValid(Network::Id(http_ctx_id)));
-
-	*eh = new HttpEpoll;
-
-	(*eh)->http_ctx_id = Network::Id(http_ctx_id);
+	if (eh == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+	*eh = nullptr;
+	std::lock_guard lock(g_http_epoll_mutex);
+	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	auto epoll = std::make_shared<HttpEpoll>();
+	epoll->http_ctx_id = Network::Id(http_ctx_id);
+	*eh = epoll.get();
+	g_http_epolls.emplace(*eh, std::move(epoll));
 
 	return OK;
 }
@@ -2749,11 +2823,17 @@ int KYTY_SYSV_ABI HttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh) {
 
 	EXIT_IF(g_net == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(eh == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValid(Network::Id(http_ctx_id)));
-
-	delete eh;
+	if (eh == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+	std::lock_guard lock(g_http_epoll_mutex);
+	const auto it = g_http_epolls.find(eh);
+	if (it == g_http_epolls.end() || it->second->http_ctx_id.ToInt() != http_ctx_id) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	it->second->closed = true;
+	it->second->ready.notify_all();
+	g_http_epolls.erase(it);
 
 	return OK;
 }
@@ -2763,12 +2843,18 @@ int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
 
 	LOGF("\t id = %d\n", id);
 
-	EXIT_NOT_IMPLEMENTED(eh == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValidRequest(Network::Id(id)));
-
-	eh->request_id = Network::Id(id);
-	eh->user_arg   = user_arg;
+	EXIT_IF(g_net == nullptr);
+	if (eh == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+	std::lock_guard lock(g_http_epoll_mutex);
+	const auto it = g_http_epolls.find(eh);
+	if (it == g_http_epolls.end() ||
+	    !g_net->HttpRequestBelongsToContext(Network::Id(id), it->second->http_ctx_id)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	DetachRequestLocked(id);
+	it->second->requests.emplace(id, user_arg);
 
 	return OK;
 }
@@ -2778,7 +2864,12 @@ int KYTY_SYSV_ABI HttpUnsetEpoll(int id) {
 
 	LOGF("\t id = %d\n", id);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValidRequest(Network::Id(id)));
+	EXIT_IF(g_net == nullptr);
+	std::lock_guard lock(g_http_epoll_mutex);
+	if (!g_net->HttpValidRequest(Network::Id(id))) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	DetachRequestLocked(id);
 
 	return OK;
 }
@@ -2790,9 +2881,12 @@ int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* /*post_data*/, siz
 
 	EXIT_IF(g_net == nullptr);
 
+	std::lock_guard lock(g_http_epoll_mutex);
 	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_TIMEOUT)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
+	// Report the existing transport failure to nonblocking callers too.
+	PublishRequestEventLocked(request_id, 0x00000008u); // SOCK_ERR
 
 	return HTTP_ERROR_TIMEOUT;
 }
@@ -2804,30 +2898,43 @@ int KYTY_SYSV_ABI HttpAbortRequest(int request_id) {
 
 	EXIT_IF(g_net == nullptr);
 
-	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+	std::lock_guard lock(g_http_epoll_mutex);
+	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_ABORTED)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
+	PublishRequestEventLocked(request_id, 0x00000010u); // HUP
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxevents,
                                   int timeout) {
-	PRINT_NAME();
-
-	LOGF("\t eh        = 0x%016" PRIx64 "\n"
-	     "\t nbev      = 0x%016" PRIx64 "\n"
-	     "\t maxevents = %d\n"
-	     "\t timeout   = %d\n",
-	     reinterpret_cast<uint64_t>(eh), reinterpret_cast<uint64_t>(nbev), maxevents, timeout);
-
-	EXIT_IF(g_net == nullptr);
-
-	if (eh == nullptr || maxevents < 0 || (maxevents > 0 && nbev == nullptr)) {
+	// This is a polling hot path: logging each empty wait flooded multi-GB logs.
+	if (eh == nullptr || maxevents <= 0 || nbev == nullptr || timeout < -1) {
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	return 0;
+	std::unique_lock lock(g_http_epoll_mutex);
+	const auto it = g_http_epolls.find(eh);
+	if (it == g_http_epolls.end()) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+	const auto epoll = it->second;
+	const auto ready = [&] { return epoll->closed || !epoll->events.empty(); };
+	if (timeout == -1) {
+		epoll->ready.wait(lock, ready);
+	} else if (timeout > 0) {
+		epoll->ready.wait_for(lock, std::chrono::microseconds(timeout), ready);
+	}
+	if (epoll->closed) {
+		return HTTP_ERROR_ABORTED;
+	}
+	int count = 0;
+	while (count < maxevents && !epoll->events.empty()) {
+		nbev[count++] = epoll->events.front();
+		epoll->events.pop_front();
+	}
+	return count;
 }
 
 int KYTY_SYSV_ABI HttpGetStatusCode(int request_id, int* status_code) {
@@ -3064,9 +3171,11 @@ int KYTY_SYSV_ABI HttpDeleteRequest(int req_id) {
 
 	EXIT_IF(g_net == nullptr);
 
+	std::lock_guard lock(g_http_epoll_mutex);
 	if (!g_net->HttpDeleteRequest(Network::Id(req_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
+	DetachRequestLocked(req_id);
 
 	return OK;
 }

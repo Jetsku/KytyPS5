@@ -86,7 +86,15 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs);
 namespace Http {
 
 struct HttpEpoll;
-struct HttpNBEvent;
+struct HttpNBEvent {
+	uint32_t events       = 0;
+	uint32_t event_detail = 0;
+	int      id           = 0;
+	void*    user_arg     = nullptr;
+};
+
+static_assert(sizeof(HttpNBEvent) == 24);
+static_assert(offsetof(HttpNBEvent, user_arg) == 16);
 
 using HttpEpollHandle = HttpEpoll*;
 
