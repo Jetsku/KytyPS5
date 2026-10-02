@@ -79,6 +79,7 @@ private:
 	vk::PipelineRenderingCreateInfo                            m_rendering {};
 	std::vector<vk::Format>                                    m_color_formats;
 	std::vector<vk::PipelineShaderStageCreateInfo>             m_stages;
+	std::vector<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo> m_stage_subgroup_sizes;
 	std::vector<std::string>                                   m_stage_names;
 	vk::PipelineVertexInputStateCreateInfo                     m_vertex_input {};
 	std::vector<vk::VertexInputBindingDescription>             m_bindings;
@@ -130,7 +131,7 @@ public:
 		Path         path     = Path::Monolithic;
 		// Why a Monolithic pipeline was not linked: "ineligible" (tessellation, rect-list or mesh
 		// stages, or a structure the snapshot does not copy), "probe-failed", "library-failed" or
-		// "link-failed".
+		// "link-failed", or "fragment-wave64" (Radeon required-wave64 compatibility).
 		const char*                               fallback = nullptr;
 		std::unique_ptr<GraphicsPipelineSnapshot> optimize;
 		uint32_t                                  libraries_created = 0;

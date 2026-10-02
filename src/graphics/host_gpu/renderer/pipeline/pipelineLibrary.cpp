@@ -58,6 +58,18 @@ void WriteDynamic(KeyWriter& key, const std::vector<vk::DynamicState>& states) {
 	}
 }
 
+void WriteSubgroupSize(KeyWriter& key, const std::vector<vk::PipelineShaderStageCreateInfo>& stages,
+                      vk::ShaderStageFlagBits shader_stage) {
+	uint32_t size = 0;
+	for (const auto& stage: stages) {
+		if (stage.stage == shader_stage && stage.pNext != nullptr) {
+			size = static_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(
+			           stage.pNext)->requiredSubgroupSize;
+		}
+	}
+	key.U32(size);
+}
+
 void WriteMultisample(KeyWriter& key, const vk::PipelineMultisampleStateCreateInfo& ms) {
 	key.Flags(ms.flags);
 	key.Enum(ms.rasterizationSamples);
@@ -135,13 +147,23 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info) {
 	s.m_color_formats.assign(rendering->pColorAttachmentFormats,
 	                         rendering->pColorAttachmentFormats + rendering->colorAttachmentCount);
 
-	// Stages: one vertex shader and at most one fragment shader, plain modules.
+	// Stages: one vertex shader and at most one fragment shader, with an optional wave size.
 	for (uint32_t i = 0; i < info.stageCount; ++i) {
 		const auto& stage = info.pStages[i];
-		if (stage.pNext != nullptr || stage.flags != vk::PipelineShaderStageCreateFlags {} ||
+		if (stage.flags != vk::PipelineShaderStageCreateFlags {} ||
 		    stage.pSpecializationInfo != nullptr || stage.module == nullptr ||
 		    stage.pName == nullptr) {
 			return nullptr;
+		}
+		vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size {};
+		if (const auto* next = Next(stage.pNext); next != nullptr) {
+			if (next->sType != vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo ||
+			    next->pNext != nullptr) {
+				return nullptr;
+			}
+			subgroup_size =
+			    *reinterpret_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(next);
+			if (!std::has_single_bit(subgroup_size.requiredSubgroupSize)) return nullptr;
 		}
 		if (stage.stage == vk::ShaderStageFlagBits::eVertex && s.m_vertex_module == nullptr) {
 			s.m_vertex_module = stage.module;
@@ -152,6 +174,7 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info) {
 			return nullptr;
 		}
 		s.m_stages.push_back(stage);
+		s.m_stage_subgroup_sizes.push_back(subgroup_size);
 		s.m_stage_names.emplace_back(stage.pName);
 	}
 	if (s.m_vertex_module == nullptr) return nullptr;
@@ -275,6 +298,8 @@ void GraphicsPipelineSnapshot::Wire() {
 	m_rendering.pColorAttachmentFormats = m_color_formats.data();
 	for (size_t i = 0; i < m_stages.size(); ++i) {
 		m_stages[i].pName = m_stage_names[i].c_str();
+		m_stages[i].pNext = m_stage_subgroup_sizes[i].requiredSubgroupSize != 0
+		                       ? &m_stage_subgroup_sizes[i] : nullptr;
 	}
 	m_vertex_input.vertexBindingDescriptionCount   = static_cast<uint32_t>(m_bindings.size());
 	m_vertex_input.pVertexBindingDescriptions      = m_bindings.data();
@@ -378,6 +403,17 @@ GraphicsPipelineLibrary::Create(const vk::GraphicsPipelineCreateInfo& info,
 		return monolithic("ineligible");
 	}
 	const auto& s = *snapshot;
+	// Radeon fast links can ignore a fragment library's required wave64 (the native GPU
+	// regression observes wave32 even with fresh libraries). Monolithic creation honors it.
+	if (m_graphics.physical_device_properties.vendorID == 0x1002u) {
+		for (const auto& stage: s.m_stages) {
+			if (stage.stage == vk::ShaderStageFlagBits::eFragment && stage.pNext != nullptr &&
+			    static_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(
+			        stage.pNext)->requiredSubgroupSize == 64u) {
+				return monolithic("fragment-wave64");
+			}
+		}
+	}
 
 	// A pipeline already in the driver cache needs no compile: take the monolithic one directly.
 	if (m_graphics.pipeline_creation_cache_control_enabled && ProbeEnabled()) {
@@ -427,6 +463,7 @@ GraphicsPipelineLibrary::Create(const vk::GraphicsPipelineCreateInfo& info,
 		KeyWriter key(pr_key);
 		key.U32(0x5052u);
 		key.Handle(s.m_vertex_module);
+		WriteSubgroupSize(key, s.m_stages, vk::ShaderStageFlagBits::eVertex);
 		key.Words(layout_signature);
 		key.U32(s.m_rendering.viewMask);
 		key.U32(s.m_viewport.viewportCount);
@@ -456,6 +493,7 @@ GraphicsPipelineLibrary::Create(const vk::GraphicsPipelineCreateInfo& info,
 		KeyWriter key(fs_key);
 		key.U32(0x4653u);
 		key.Handle(s.m_fragment_module);
+		WriteSubgroupSize(key, s.m_stages, vk::ShaderStageFlagBits::eFragment);
 		key.Words(layout_signature);
 		key.U32(s.m_rendering.viewMask);
 		key.U32(s.m_has_depth_stencil ? 1u : 0u);
