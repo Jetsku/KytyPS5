@@ -90,6 +90,8 @@ enum class Op : uint16_t {
 	EndQuery,
 	CopyQueryPoolResults,
 	WriteTimestamp2,
+	BeginConditionalRendering,
+	EndConditionalRendering,
 	Count,
 };
 
@@ -316,6 +318,12 @@ struct IndirectCountPacket {
 struct DispatchIndirectPacket {
 	vk::Buffer buffer = nullptr;
 	uint64_t   offset = 0;
+};
+struct ConditionalRenderingPacket {
+	vk::Buffer buffer   = nullptr;
+	uint64_t   offset   = 0;
+	uint32_t   flags    = 0;
+	uint32_t   reserved = 0;
 };
 struct QueryRangePacket {
 	vk::QueryPool pool  = nullptr;
@@ -688,6 +696,8 @@ public:
 	                          vk::Buffer destination, vk::DeviceSize offset, vk::DeviceSize stride,
 	                          vk::QueryResultFlags flags);
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query);
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info);
+	void endConditionalRenderingEXT();
 
 private:
 	class Writer;

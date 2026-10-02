@@ -1,0 +1,23 @@
+#version 460
+// Guest SET_PREDICATION on the GPU (KYTY_PREDICATION_MODE=gpu, renderer/gpuPredication.h).
+// Reads the guest's 64-bit boolean predicate where the command processor meets the packet and
+// writes the 32-bit word VK_EXT_conditional_rendering reads: 1 draws, 0 discards. Condition 0
+// skips the predicated packets when the value is nonzero, condition 1 when it is zero
+// (CommandProcessor::ExecPredication). The same word goes to a host-visible copy, read when a
+// predicated packet the GPU cannot gate needs the decision on the CPU.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint words[]; } source;
+layout(set = 0, binding = 1, std430) writeonly buffer Predicates { uint words[]; } predicates;
+layout(set = 0, binding = 2, std430) writeonly buffer Readback { uint words[]; } readback;
+layout(push_constant) uniform Push {
+	uint source_word;
+	uint slot;
+	uint condition;
+} pc;
+
+void main() {
+	const bool nonzero = (source.words[pc.source_word] | source.words[pc.source_word + 1u]) != 0u;
+	const uint draw    = (pc.condition == 0u) == nonzero ? 0u : 1u;
+	predicates.words[pc.slot] = draw;
+	readback.words[pc.slot]   = draw;
+}

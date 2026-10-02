@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/gpuPredication.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -845,9 +846,35 @@ struct DrawRenderState {
 };
 
 RenderExecutor::RenderExecutor(RenderContext& context)
-    : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()) {}
+    : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()),
+      m_predicates(std::make_unique<GpuPredication::Predicates>(context)) {}
 
 RenderExecutor::~RenderExecutor() = default;
+
+uint32_t RenderExecutor::RecordGpuPredicate(CommandBuffer& buffer, uint64_t address,
+                                            uint32_t condition) {
+	if (!m_predicates->Supported() || buffer.IsInvalid() ||
+	    !m_context.IsMapped(address, sizeof(uint64_t)) ||
+	    m_context.GetTextureCache().IsRegionGpuModified(address, sizeof(uint64_t))) {
+		return 0;
+	}
+	const auto [source, offset] =
+	    m_context.GetBufferCache().ObtainBuffer(address, sizeof(uint64_t), false);
+	if (source == nullptr) {
+		return 0;
+	}
+	return m_predicates->Record(buffer, *source, offset, condition);
+}
+
+bool RenderExecutor::ResolveGpuPredicate(uint32_t id) {
+	const bool     trace = HangTrace::Enabled();
+	const uint64_t begin = trace ? HangTrace::NowNs() : 0;
+	const bool     draw  = m_predicates->Resolve(id);
+	if (trace) {
+		HangTrace::RecordPredicationFlushWait(HangTrace::NowNs() - begin);
+	}
+	return draw;
+}
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -1196,6 +1223,9 @@ struct DrawEmitInfo {
 	// (meshIndirect.h) with these inputs.
 	bool                 mesh_indirect = false;
 	MeshIndirect::Inputs mesh_inputs;
+	// Nonzero: the draw commands are recorded inside a conditional-rendering scope on this GPU
+	// predicate (gpuPredication.h).
+	uint32_t predicate = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1235,6 +1265,54 @@ static bool MayRunTargetOperation(const HW::Context& hw) {
 
 static bool DrawMayRunTargetOperation(const CommandBuffer& buffer) {
 	return MayRunTargetOperation(buffer.GetRegisters());
+}
+
+bool RenderExecutor::DrawNeedsCpuPredicate(const CommandBuffer& buffer) {
+	// Target operations record copies, resolves and clears; DB_RENDER_CONTROL clears run as
+	// rendering load operations and set HTILE clear state on the CPU. Conditional rendering
+	// gates none of these.
+	const auto& rc = buffer.GetRegisters().GetRenderControl();
+	return DrawMayRunTargetOperation(buffer) || rc.depth_clear_enable || rc.stencil_clear_enable;
+}
+
+// KYTY_ASYNC_PIPELINES: a program whose draw must run even while its pipeline compiles, because
+// later work may read what it writes to memory (buffers, images, addresses, GDS). Atomics count
+// as writes. Mip-statistics feedback (LodStatsCounter) is the caller's decision: it records only
+// while a counter is active.
+static bool ProgramMayWriteMemory(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	if (program.has_address_writes) {
+		return true;
+	}
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.written || buffer.atomic) return true;
+	}
+	for (const auto& image: program.info.images) {
+		if (image.written || image.atomic) return true;
+	}
+	for (const auto& descriptor: program.bindings.descriptors) {
+		if (descriptor.kind == ShaderRecompiler::IR::DescriptorBindingKind::Gds) return true;
+	}
+	return false;
+}
+
+bool RenderExecutor::DrawTargetsHoldGpuContent(const RenderColorInfo* colors, uint32_t color_count,
+                                               const RenderDepthInfo& depth) {
+	auto& cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < color_count; i++) {
+		if (!colors[i].image_id || !cache.GetImage(colors[i].image_id).IsGpuModified()) {
+			return false;
+		}
+	}
+	return !depth.image_id || cache.GetImage(depth.image_id).IsGpuModified();
+}
+
+bool RenderExecutor::TakeDrawPredicate(const CommandBuffer& buffer, uint32_t& predicate) {
+	if (predicate == 0 || !DrawNeedsCpuPredicate(buffer)) {
+		return true;
+	}
+	const bool draw = ResolveGpuPredicate(predicate);
+	predicate       = 0;
+	return draw;
 }
 
 // ResolvePrimitiveRestart without its index scan. nullopt when only a scan of CPU-visible
@@ -2415,9 +2493,54 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
-		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
+		// KYTY_ASYNC_PIPELINES: a draw whose new pipeline compiles in the background is skipped
+		// (its colour and depth writes appear a few frames late). Not when it writes memory, clears
+		// depth/stencil through load operations (DrawNeedsCpuPredicate also covers target
+		// operations), counts occlusion, or draws mesh shaders (created here anyway).
+		const char* sync_reason = nullptr;
+		if (!PipelineCache::AsyncPipelinesEnabled()) {
+			sync_reason = "off";
+		} else if (mesh_active) {
+			sync_reason = "mesh";
+		} else if (!DrawTargetsHoldGpuContent(state.color_info, state.color_count,
+		                                      state.depth_info)) {
+			// A skipped first write would leave the target undefined (possibly NaN), and temporal
+			// effects (exposure, TAA history) that read it never recover. A target a draw already
+			// wrote only stays a few frames stale.
+			sync_reason = "first-write";
+		} else if (DrawNeedsCpuPredicate(buffer)) {
+			sync_reason = "target-op-or-clear";
+		} else if (m_context.GetOcclusionCounter().WouldCount(
+		               buffer.GetRegisters().GetDepthCountControl())) {
+			sync_reason = "occlusion";
+		} else {
+			for (uint32_t i = 0; sync_reason == nullptr && i < vertex_stages.size(); i++) {
+				if (ProgramMayWriteMemory(*vertex_stages[i].stage.program)) {
+					sync_reason = "writes-vertex";
+				}
+			}
+			if (sync_reason == nullptr && state.ps_active &&
+			    ProgramMayWriteMemory(*state.ps_input_info.stage.program)) {
+				sync_reason = "writes-pixel";
+			}
+			// The guest reads mip statistics (GET_LOD_STATS) only from an active counter.
+			if (sync_reason == nullptr && state.ps_active && bindings.pixel.has_value() &&
+			    bindings.pixel->mip_stats_active) {
+				sync_reason = "mip-stats";
+			}
+		}
+		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
-		    primitive_restart_enable, *programs);
+		    primitive_restart_enable, *programs, sync_reason == nullptr, sync_reason);
+		if (pipeline_object == nullptr && PipelineCache::AsyncPipelinesWait()) {
+			pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
+			    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
+			    primitive_restart_enable, *programs, false, "wait");
+		}
+		if (pipeline_object == nullptr) {
+			// Nothing of the draw is recorded yet: its targets are acquired below.
+			return;
+		}
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.
@@ -2557,6 +2680,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);
 	}
+	// A GPU predicate gates only the draw commands: the scope begins and ends inside this
+	// rendering instance (VK_EXT_conditional_rendering), and state commands stay unconditional.
+	if (emit.predicate != 0) {
+		vk_buffer.beginConditionalRenderingEXT(m_predicates->Use(emit.predicate));
+	}
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
 		// parameter block (a record the draw does not need has no workgroups).
@@ -2598,6 +2726,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitIndirectDraw(vk_buffer, *indirect, indirect_buffers);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	}
+	if (emit.predicate != 0) {
+		vk_buffer.endConditionalRenderingEXT();
 	}
 	static const bool occlusion_draw_rows = [] {
 		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");
@@ -2691,6 +2822,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
+
+	// Resolving a GPU predicate waits for the GPU: before the renderer lock.
+	uint32_t predicate = args.predicate;
+	if (!TakeDrawPredicate(buffer, predicate)) {
+		return;
+	}
 
 	// Self time here includes renderer-lock acquisition and setup outside the
 	// separately timed preparation/execution phases.
@@ -2788,6 +2925,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	emit.predicate      = predicate;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -2812,6 +2950,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
+
+	// Resolving a GPU predicate waits for the GPU: before the renderer lock.
+	uint32_t predicate = args.predicate;
+	if (!TakeDrawPredicate(buffer, predicate)) {
+		return;
+	}
 
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	Common::LockGuard lock(m_context.GetMutex());
@@ -2884,6 +3028,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	emit.predicate      = predicate;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

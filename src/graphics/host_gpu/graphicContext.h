@@ -28,6 +28,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               device_fault_enabled                  = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               precise_occlusion_enabled             = false;
@@ -51,6 +52,9 @@ struct GraphicContext {
 	// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_creation_cache_control_enabled = false;
+	// VK_EXT_conditional_rendering, enabled only for KYTY_PREDICATION_MODE=gpu
+	// (renderer/gpuPredication.h).
+	bool                               conditional_rendering_enabled         = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

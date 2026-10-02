@@ -275,6 +275,14 @@ struct LogExecutor {
 		     VerifyHash::Value(Op::WriteTimestamp2, Bits(p), q,
 		                       static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(st))));
 	}
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) {
+		Push(Op::BeginConditionalRendering,
+		     VerifyHash::Value(Op::BeginConditionalRendering, Bits(info.buffer), info.offset,
+		                       static_cast<VkConditionalRenderingFlagsEXT>(info.flags)));
+	}
+	void endConditionalRenderingEXT() {
+		Push(Op::EndConditionalRendering, VerifyHash::Value(Op::EndConditionalRendering, 0));
+	}
 };
 
 // Discards everything (benchmark consumer).
@@ -779,6 +787,23 @@ public:
 				                                   vk::PipelineStageFlags2(stage))))});
 				break;
 			}
+			case Op::BeginConditionalRendering: {
+				vk::ConditionalRenderingBeginInfoEXT info {};
+				info.buffer = H<vk::Buffer>();
+				info.offset = U64() & 0xfffc;
+				if ((U32() & 1u) != 0) {
+					info.flags = vk::ConditionalRenderingFlagBitsEXT::eInverted;
+				}
+				e.beginConditionalRenderingEXT(info);
+				expected.push_back(
+				    {op, VerifyHash::Value(op, LogExecutor::Bits(info.buffer), info.offset,
+				                           static_cast<VkConditionalRenderingFlagsEXT>(info.flags))});
+				break;
+			}
+			case Op::EndConditionalRendering:
+				e.endConditionalRenderingEXT();
+				expected.push_back({op, VerifyHash::Value(op, 0)});
+				break;
 			default: break;
 		}
 	}

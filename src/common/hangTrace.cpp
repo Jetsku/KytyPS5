@@ -391,6 +391,8 @@ struct Totals {
 	std::atomic<uint64_t> compile_clone_ns {0};
 	std::atomic<uint64_t> compile_disk_loads {0};
 	std::atomic<uint64_t> compile_disk_load_ns {0};
+	std::atomic<uint64_t> pred_flush_waits {0};
+	std::atomic<uint64_t> pred_flush_wait_ns {0};
 	std::atomic<uint64_t> validate_async {0};
 	std::atomic<uint64_t> validate_async_ns {0};
 	using PerLibraryEvent =
@@ -1005,6 +1007,9 @@ void Publish() {
 		// Persistent program cache (appended last so that no existing column moves).
 		line += fmt::format(",{},{}", take(g_totals.compile_disk_loads),
 		                    take(g_totals.compile_disk_load_ns) / 1000u);
+		// Memory predication packets that drained the GPU (appended last).
+		line += fmt::format(",{},{}", take(g_totals.pred_flush_waits),
+		                    take(g_totals.pred_flush_wait_ns) / 1000u);
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -1141,6 +1146,9 @@ void Initialize() {
 	// Persistent program cache (KYTY_PROGRAM_CACHE): permutations reloaded instead of translated
 	// and emitted, and the time their keys, lookups and decoding took.
 	summary_header += ",compile_disk_loads,compile_disk_load_us";
+	// Memory predication packets (op 3, wait) that submitted all GPU work and blocked until it
+	// finished, and the time blocked.
+	summary_header += ",pred_flush_waits,pred_flush_wait_us";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1954,6 +1962,14 @@ void CountMemory(MemoryCounter counter, uint64_t amount) {
 		return;
 	}
 	g_totals.memory[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
+}
+
+void RecordPredicationFlushWait(uint64_t ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.pred_flush_waits.fetch_add(1, std::memory_order_relaxed);
+	g_totals.pred_flush_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 void RecordGpuOpCounts(const GpuOpCounts& counts) {

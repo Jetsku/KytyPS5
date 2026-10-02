@@ -547,6 +547,10 @@ struct CommandRecorder::NativeExecutor {
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
 		command.writeTimestamp2(stage, pool, query);
 	}
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) {
+		command.beginConditionalRenderingEXT(info);
+	}
+	void endConditionalRenderingEXT() { command.endConditionalRenderingEXT(); }
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -998,6 +1002,8 @@ void CommandRecorder::InstallVerifyHooks() {
 		KYTY_RECORDER_HOOK(vkCmdCopyQueryPoolResults);
 		KYTY_RECORDER_HOOK(vkCmdWriteTimestamp);
 		KYTY_RECORDER_HOOK(vkCmdWriteTimestamp2);
+		KYTY_RECORDER_HOOK(vkCmdBeginConditionalRenderingEXT);
+		KYTY_RECORDER_HOOK(vkCmdEndConditionalRenderingEXT);
 #undef KYTY_RECORDER_HOOK
 		std::printf("Kyty CP recorder verify: ownership hooks installed\n");
 		std::fflush(stdout);

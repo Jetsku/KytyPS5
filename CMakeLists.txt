@@ -394,6 +394,23 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
+# Guest SET_PREDICATION on the GPU (renderer/gpuPredication.h): 64-bit guest predicate -> the
+# 32-bit word VK_EXT_conditional_rendering reads.
+set(gpu_predicate_source "${gpu_tiler_shader_dir}/gpu_predicate.comp")
+set(gpu_predicate_spv "${gpu_mesh_generated_dir}/gpu_predicate.spv")
+set(gpu_predicate_header "${gpu_mesh_generated_dir}/gpu_predicate_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_predicate_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_predicate_spv}" "${gpu_predicate_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_predicate_spv} -DOUTPUT=${gpu_predicate_header}
+	        -DSYMBOL=GPU_PREDICATE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_predicate_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_predicate_header}")
+
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
 # a program produces. src/codegen_version.cmake fails the build when one of them includes a
@@ -764,6 +781,43 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_kyty_full_emulator_test(repeat_trace_tests "${KYTY_TESTS_DIR}/RepeatTraceTests.cpp")
+add_kyty_full_emulator_test(http_wait_request_tests "${KYTY_TESTS_DIR}/HttpWaitRequestTests.cpp")
+add_executable(av_player_sync_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerSyncTests.cpp")
+target_include_directories(av_player_sync_tests PRIVATE "${KYTY_SOURCE_DIR}")
+# APR host file handle pool (libs/aprHostFilePool.h): bookkeeping, content under concurrency, and
+# (with --bench) the cost of an open per read against a pooled handle.
+add_executable(apr_host_file_pool_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AprHostFilePoolTests.cpp")
+target_link_libraries(apr_host_file_pool_tests common)
+target_include_directories(apr_host_file_pool_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(apr_host_file_pool_tests Threads::Threads)
+endif()
+# Once-only GPU loss report (graphics/host_gpu/deviceLostReport.h): header-only, no Vulkan.
+add_executable(device_lost_report_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceLostReportTests.cpp")
+target_include_directories(device_lost_report_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX)
+	target_link_libraries(device_lost_report_tests Threads::Threads)
+endif()
+# Search for a faulting GPU address in memory (kernel/pointerScan.h): header-only, no OS types.
+add_executable(pointer_scan_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PointerScanTests.cpp")
+target_include_directories(pointer_scan_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+# Bounded, once-only emergency cache save; no Vulkan device or game needed.
+add_executable(emergency_save_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EmergencySaveTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/subsystems.cpp")
+target_include_directories(emergency_save_tests PRIVATE "${KYTY_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+if(LINUX)
+	target_link_libraries(emergency_save_tests Threads::Threads)
+endif()
+
+add_executable(program_cache_emergency_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramCacheEmergencyTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp")
+target_link_libraries(program_cache_emergency_tests common xxhash)
+target_include_directories(program_cache_emergency_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(program_cache_emergency_tests Threads::Threads)
+endif()
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -776,6 +830,16 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME http_wait_request COMMAND $<TARGET_FILE:http_wait_request_tests>)
+	add_test(NAME av_player_sync COMMAND $<TARGET_FILE:av_player_sync_tests>)
+	add_test(NAME apr_host_file_pool COMMAND $<TARGET_FILE:apr_host_file_pool_tests>)
+	add_test(NAME device_lost_report COMMAND $<TARGET_FILE:device_lost_report_tests>)
+	add_test(NAME pointer_scan COMMAND $<TARGET_FILE:pointer_scan_tests>)
+	add_test(NAME emergency_save COMMAND $<TARGET_FILE:emergency_save_tests>)
+	set_tests_properties(emergency_save PROPERTIES TIMEOUT 10)
+	add_test(NAME program_cache_emergency COMMAND $<TARGET_FILE:program_cache_emergency_tests>)
+	set_tests_properties(program_cache_emergency PROPERTIES TIMEOUT 15)
+	set_tests_properties(http_wait_request PROPERTIES TIMEOUT 10)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -881,6 +945,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
+	add_test(NAME texture_cache_null_image_init
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --null-image-init-only)
+	add_test(NAME fragment_subgroup_size
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fragment-subgroup-only)
+	set_tests_properties(fragment_subgroup_size PROPERTIES TIMEOUT 30)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
@@ -1420,6 +1489,10 @@ if(BUILD_TESTING)
 	# stay in the build directory, so later runs start warm).
 	add_test(NAME program_cache
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-only)
+	add_test(NAME async_pipeline
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
 	add_test(NAME program_cache_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
 	add_test(NAME program_cache_gpu_verify
@@ -1572,6 +1645,13 @@ if(BUILD_TESTING)
 		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
+		http_wait_request_tests
+		av_player_sync_tests
+		apr_host_file_pool_tests
+		device_lost_report_tests
+		pointer_scan_tests
+		emergency_save_tests
+		program_cache_emergency_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

@@ -224,6 +224,8 @@ const char* OpName(Op op) noexcept {
 	    "EndQuery",
 	    "CopyQueryPoolResults",
 	    "WriteTimestamp2",
+	    "BeginConditionalRendering",
+	    "EndConditionalRendering",
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -1287,6 +1289,21 @@ void Encoder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool,
 	Close(w, m_options.verify
 	             ? VerifyHash::Value(Op::WriteTimestamp2, HandleBits(pool), query, stage_bits)
 	             : 0);
+}
+
+void Encoder::beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) {
+	EXIT_IF(info.pNext != nullptr);
+	const auto flags = static_cast<uint32_t>(static_cast<VkConditionalRenderingFlagsEXT>(info.flags));
+	auto       w     = Open(Op::BeginConditionalRendering, Sz<ConditionalRenderingPacket>(), false);
+	w.Put(ConditionalRenderingPacket {info.buffer, info.offset, flags, 0});
+	Close(w, m_options.verify ? VerifyHash::Value(Op::BeginConditionalRendering,
+	                                              HandleBits(info.buffer), info.offset, flags)
+	                          : 0);
+}
+
+void Encoder::endConditionalRenderingEXT() {
+	auto w = Open(Op::EndConditionalRendering, 0, false);
+	Close(w, m_options.verify ? VerifyHash::Value(Op::EndConditionalRendering, 0) : 0);
 }
 
 } // namespace Libs::Graphics::CommandStream

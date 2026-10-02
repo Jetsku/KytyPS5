@@ -497,6 +497,25 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			exec.writeTimestamp2(stage, p.pool, p.query);
 			break;
 		}
+		case Op::BeginConditionalRendering: {
+			const auto& p           = reader.Get<ConditionalRenderingPacket>();
+			uint64_t    buffer_bits = 0;
+			const auto  raw         = static_cast<VkBuffer>(p.buffer);
+			std::memcpy(&buffer_bits, &raw, sizeof(buffer_bits));
+			check(VerifyHash::Value(op, buffer_bits, p.offset, p.flags));
+			vk::ConditionalRenderingBeginInfoEXT info {};
+			info.buffer = p.buffer;
+			info.offset = p.offset;
+			info.flags  = vk::ConditionalRenderingFlagsEXT(
+                static_cast<VkConditionalRenderingFlagsEXT>(p.flags));
+			exec.beginConditionalRenderingEXT(info);
+			break;
+		}
+		case Op::EndConditionalRendering: {
+			check(VerifyHash::Value(op, 0));
+			exec.endConditionalRenderingEXT();
+			break;
+		}
 	}
 	if (site != nullptr) {
 		exec.LeaveSite();

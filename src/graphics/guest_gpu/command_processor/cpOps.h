@@ -174,7 +174,7 @@ struct DrawIndexOp {
 	uint32_t flags                      = 0;
 	uint64_t window                     = 0; // DrawFlagPublished
 	uint32_t snapshot                   = 0; // DrawFlagSnapshot
-	uint32_t reserved                   = 0;
+	uint32_t predicate                  = 0; // GPU predicate id (gpuPredication.h), 0: none
 };
 
 struct DrawAutoOp {
@@ -187,6 +187,8 @@ struct DrawAutoOp {
 	uint32_t flags                      = 0;
 	uint32_t snapshot                   = 0; // DrawFlagSnapshot
 	uint64_t window                     = 0; // DrawFlagPublished
+	uint32_t predicate                  = 0; // GPU predicate id (gpuPredication.h), 0: none
+	uint32_t reserved                   = 0;
 };
 
 // DrawIndirectOp flags.
@@ -337,13 +339,16 @@ struct DumpConstRamOp {
 };
 
 // SET_PREDICATION with a memory source (op 1: Z-pass counters, op 3: boolean). Result: suspended,
-// or value = the new predicate skip state.
+// or value = 0 (run the predicated packets), 1 (skip them), or (id << 1) for a GPU predicate
+// (gpuPredication.h). resolve != 0: no packet; the CPU decision (0/1) of GPU predicate `resolve`.
 struct PredicationOp {
 	uint64_t address         = 0;
 	uint32_t condition       = 0;
 	uint32_t op              = 0;
 	uint32_t wait_op         = 0;
 	uint32_t count_in_dwords = 0;
+	uint32_t resolve         = 0;
+	uint32_t reserved        = 0;
 };
 
 // COND_EXEC. Result: value = the condition dword is non-zero.

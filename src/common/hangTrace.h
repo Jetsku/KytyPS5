@@ -526,6 +526,11 @@ enum class MemoryCounter : uint8_t {
 };
 void CountMemory(MemoryCounter counter, uint64_t amount = 1);
 
+// A memory predication packet (op 3, wait) submitted all recorded GPU work and blocked the command
+// processor until it finished (CommandProcessor::ExecPredication); `ns` is the time spent blocked.
+// Summed per second into summary.csv pred_flush_waits and pred_flush_wait_us, appended last.
+void RecordPredicationFlushWait(uint64_t ns);
+
 } // namespace HangTrace
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_COMMON_HANGTRACE_H_ */

@@ -53,6 +53,9 @@ class Engine;
 namespace MeshIndirect {
 class Converter;
 } // namespace MeshIndirect
+namespace GpuPredication {
+class Predicates;
+} // namespace GpuPredication
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -82,6 +85,8 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Nonzero: a predicated packet under a GPU predicate (gpuPredication.h).
+	uint32_t         predicate                  = 0;
 };
 
 // GPU-resident draw arguments for vkCmdDraw*Indirect*. Guest DrawIndexedIndirect (20 bytes) and
@@ -113,6 +118,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Nonzero: a predicated packet under a GPU predicate (gpuPredication.h).
+	uint32_t         predicate                  = 0;
 };
 
 // Barrier batcher (KYTY_BARRIER_BATCH, default on; KYTY_BARRIER_BATCH=0 restores the direct
@@ -826,6 +833,20 @@ public:
 			m_owner->m_buffer.dispatchIndirect(buffer, offset);
 		}
 	}
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->beginConditionalRenderingEXT(info);
+		} else {
+			m_owner->m_buffer.beginConditionalRenderingEXT(info);
+		}
+	}
+	void endConditionalRenderingEXT() const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->endConditionalRenderingEXT();
+		} else {
+			m_owner->m_buffer.endConditionalRenderingEXT();
+		}
+	}
 	void resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const {
 		if (m_owner->Encoding()) {
 			m_owner->m_encoder->resetQueryPool(pool, first, count);
@@ -947,7 +968,27 @@ public:
 	// KYTY_DRAW_PREP_BINDINGS texturememo: the memo draw-prep threads read hints from (FindHint).
 	[[nodiscard]] const TextureBindingMemo& GetTextureMemo() const noexcept { return m_texture_memo; }
 
+	// Guest predication on the GPU (gpuPredication.h). Render mutex held, recording command
+	// buffer: snapshots the boolean predicate at `address` for `condition` and returns its id, or
+	// 0 when the GPU cannot take it (no conditional rendering, unmapped, or owned by a
+	// GPU-modified image); the caller then decides on the CPU.
+	[[nodiscard]] uint32_t RecordGpuPredicate(CommandBuffer& buffer, uint64_t address,
+	                                          uint32_t condition);
+	// Whether the packets predicated on `id` run. Waits for the GPU once per id. Not with the
+	// render mutex held.
+	[[nodiscard]] bool ResolveGpuPredicate(uint32_t id);
+
 private:
+	// A draw predicated on the GPU that also acts outside conditional rendering (a target
+	// operation, a depth/stencil clear through load operations) needs the decision on the CPU.
+	[[nodiscard]] static bool DrawNeedsCpuPredicate(const CommandBuffer& buffer);
+	// The draw's GPU predicate after DrawNeedsCpuPredicate: the id to gate the draw with (0: not
+	// predicated, or resolved to run); false when the resolved predicate skips the draw.
+	[[nodiscard]] bool TakeDrawPredicate(const CommandBuffer& buffer, uint32_t& predicate);
+	// KYTY_ASYNC_PIPELINES: every colour and depth target of the draw already holds contents a
+	// GPU draw wrote (Image::IsGpuModified), so skipping the draw only leaves them stale.
+	[[nodiscard]] bool DrawTargetsHoldGpuContent(const RenderColorInfo* colors, uint32_t color_count,
+	                                             const RenderDepthInfo& depth);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	// Records a GPU-sourced indirect draw. Returns false, before recording anything, when the
@@ -1171,6 +1212,8 @@ private:
 	std::vector<vk::ImageView> m_claimed_run_views;
 	// KYTY_NATIVE_INDIRECT_MESH (meshIndirect.h): created by the first native indirect mesh draw.
 	std::unique_ptr<MeshIndirect::Converter> m_mesh_indirect;
+	// KYTY_PREDICATION_MODE=gpu (gpuPredication.h).
+	std::unique_ptr<GpuPredication::Predicates> m_predicates;
 
 	friend class CommandProcessor;
 	friend class DrawPrep::Engine;

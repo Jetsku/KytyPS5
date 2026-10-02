@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
+#include "graphics/host_gpu/renderer/gpuPredication.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1710,6 +1711,19 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	if ((packet_header & 1u) != 0 && !reference) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPackets);
 	}
+	// KYTY_PREDICATION_MODE=gpu: a predicated direct draw runs, gated by conditional rendering;
+	// any other predicated packet takes the GPU's decision on the CPU first.
+	m_packet_predicate = 0;
+	if ((packet_header & 1u) != 0 && m_predicate_gpu != 0) {
+		if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+		    opcode == Pm4::IT_DRAW_INDEX_AUTO) {
+			m_packet_predicate = m_predicate_gpu;
+		} else if (!ResolveGpuPredicate()) {
+			execution.m_next_buffer = {};
+			execution.m_chain       = false;
+			return false;
+		}
+	}
 	if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 		auto packet_dw = KYTY_PM4_LEN(packet_header);
 		EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
@@ -1800,6 +1814,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	}
 	const auto packet_dw =
 	    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+	m_packet_predicate = 0;
 	EXIT_IF(packet_dw > remaining_dw);
 	if (execution.m_suspended) {
 		// The packet runs again when the stream resumes. A reference front's lockstep packet may
@@ -1874,6 +1889,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
                                       const volatile void* address, uint32_t count_in_dwords) {
 	if (op == 0x00) {
 		m_predicate_skip = false;
+		m_predicate_gpu  = 0;
 		return;
 	}
 	CpSeq::PredicationOp payload;
@@ -1887,10 +1903,43 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		SuspendPm4();
 		return;
 	}
+	m_predicate_skip = result.value == 1;
+	m_predicate_gpu  = result.value > 1 ? static_cast<uint32_t>(result.value >> 1u) : 0u;
+}
+
+bool CommandProcessor::ResolveGpuPredicate() {
+	CpSeq::PredicationOp payload;
+	payload.resolve   = m_predicate_gpu;
+	const auto result = Submit(payload);
+	if (result.suspended) {
+		SuspendPm4();
+		return false;
+	}
 	m_predicate_skip = result.value != 0;
+	m_predicate_gpu  = 0;
+	return true;
+}
+
+// The 8 bytes of a boolean predicate without a GPU drain (KYTY_PREDICATION_MODE=precise,
+// gpuPredication.h): false when only a drain can give them (a label deferred to completion, or
+// memory a GPU-modified image owns).
+static bool TryReadPredicateWithoutDrain(uint64_t address, uint64_t& value) {
+	if (g_gpu_state != nullptr && g_gpu_state->DeferredLabelTick(address, sizeof(uint64_t)) != 0) {
+		return false;
+	}
+	if (LibKernel::Memory::TryReadGpuCleanBacking(address, &value, sizeof(uint64_t))) {
+		return true;
+	}
+	return LibKernel::Memory::SynchronizeGpuBackingForRead(address, sizeof(uint64_t)) &&
+	       LibKernel::Memory::TryReadGpuCleanBacking(address, &value, sizeof(uint64_t));
 }
 
 CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payload) {
+	if (payload.resolve != 0) {
+		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
+		const bool draw = m_renderer.GetRenderExecutor().ResolveGpuPredicate(payload.resolve);
+		return {false, draw ? 0u : 1u};
+	}
 	const auto  condition = payload.condition;
 	const auto  op        = payload.op;
 	const auto  wait_op   = payload.wait_op;
@@ -1927,9 +1976,38 @@ CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payl
 			}
 		} break;
 		case 0x03:
+			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			if (wait_op != 0 && GpuPredication::GetMode() == GpuPredication::Mode::Gpu &&
+			    (g_gpu_state == nullptr ||
+			     g_gpu_state->DeferredLabelTick(payload.address, sizeof(uint64_t)) == 0)) {
+				// A value clean on the CPU is exact and free; otherwise the GPU decides.
+				if (LibKernel::Memory::TryReadGpuCleanBacking(payload.address, &value,
+				                                              sizeof(uint64_t))) {
+					break;
+				}
+				(void)CurrentBuffer(); // the snapshot is recorded at this command position
+				uint32_t id = 0;
+				{
+					Common::LockGuard lock(m_renderer.GetMutex());
+					id = m_renderer.GetRenderExecutor().RecordGpuPredicate(
+					    CurrentBuffer(), payload.address, condition);
+				}
+				if (id != 0) {
+					return {false, uint64_t {id} << 1u};
+				}
+			}
+			if (wait_op != 0 && GpuPredication::GetMode() != GpuPredication::Mode::Drain &&
+			    TryReadPredicateWithoutDrain(payload.address, value)) {
+				break;
+			}
 			if (wait_op != 0) {
 				Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
+				const bool     trace      = HangTrace::Enabled();
+				const uint64_t wait_begin = trace ? HangTrace::NowNs() : 0;
 				BufferFlushAndWait();
+				if (trace) {
+					HangTrace::RecordPredicationFlushWait(HangTrace::NowNs() - wait_begin);
+				}
 				// Labels deferred to completion (defer-label / KYTY_LABEL_MODE=completion) are
 				// written by commands the completion runner posts: run them before reading.
 				if (g_gpu_state != nullptr &&
@@ -1939,7 +2017,6 @@ CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payl
 					g_gpu_state->ProcessCommands();
 				}
 			}
-			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = ReadGuestForCp<uint64_t>(reinterpret_cast<uint64_t>(address));
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
@@ -1982,6 +2059,7 @@ static DrawIndexArgs DrawArgsOf(const CpSeq::DrawIndexOp& op) {
 	args.first_instance             = op.first_instance;
 	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
 	args.render_target_slice_offset = op.render_target_slice_offset;
+	args.predicate                  = op.predicate;
 	return args;
 }
 
@@ -1993,6 +2071,7 @@ static DrawAutoArgs DrawArgsOf(const CpSeq::DrawAutoOp& op) {
 	args.first_instance             = op.first_instance;
 	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
 	args.render_target_slice_offset = op.render_target_slice_offset;
+	args.predicate                  = op.predicate;
 	return args;
 }
 
@@ -2035,6 +2114,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	op.first_instance             = args.first_instance;
 	op.render_target_slice_offset = args.render_target_slice_offset;
 	op.offset_source              = static_cast<uint32_t>(args.offset_source);
+	op.predicate                  = m_packet_predicate;
 	if (args.instance_count == 0) {
 		if (m_front_mode != FrontMode::Direct && m_front_instances_known) {
 			op.instance_count = m_front_num_instances;
@@ -2588,6 +2668,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	op.first_instance             = args.first_instance;
 	op.offset_source              = static_cast<uint32_t>(args.offset_source);
 	op.render_target_slice_offset = args.render_target_slice_offset;
+	op.predicate                  = m_packet_predicate;
 	if (args.instance_count == 0) {
 		if (m_front_mode != FrontMode::Direct && m_front_instances_known) {
 			op.instance_count = m_front_num_instances;
@@ -3835,6 +3916,7 @@ void CommandProcessor::CopyFrontState(const CommandProcessor& from) {
 	std::memcpy(m_const_ram, from.m_const_ram, sizeof(m_const_ram));
 	m_flip           = from.m_flip;
 	m_predicate_skip = from.m_predicate_skip;
+	m_predicate_gpu  = from.m_predicate_gpu;
 }
 
 // ---- P3b: the sequencer thread (KYTY_CP_SEQ=1, cpSequencer.h) --------------------------------

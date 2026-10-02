@@ -2,8 +2,10 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "kernel/memory.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/deviceLostReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -21,11 +23,80 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <limits>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Declared in deviceLostReport.h: also called from the DeviceLostReport hook (vulkanWindow.cpp).
+void ReportDeviceFault(const GraphicContext& graphics) {
+	if (!graphics.device_fault_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
+		Log::WriteFatal("GPU device lost; no fault details because VK_EXT_device_fault is not "
+		                "enabled (set KYTY_GPU_FAULT_REPORT=1; launcher: the \"GPU fault "
+		                "report\" option; --graphics-debug-dump also enables it)\n");
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	auto result = graphics.device.getFaultInfoEXT(&counts, nullptr);
+	if (result != vk::Result::eSuccess) {
+		Log::WriteFatal(fmt::format("GPU fault query failed: {}\n", vk::to_string(result)));
+		return;
+	}
+	// Bound diagnostic allocation even when the driver reports many fault records.
+	counts.addressInfoCount = std::min(counts.addressInfoCount, 256u);
+	counts.vendorInfoCount  = std::min(counts.vendorInfoCount, 256u);
+	counts.vendorBinarySize = 0;
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+	vk::DeviceFaultInfoEXT info {};
+	info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+	info.pVendorInfos  = vendors.empty() ? nullptr : vendors.data();
+	result = graphics.device.getFaultInfoEXT(&counts, &info);
+	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+		Log::WriteFatal(fmt::format("GPU fault details failed: {}\n", vk::to_string(result)));
+		return;
+	}
+	std::string report = fmt::format("--- GPU fault report ---\n{}\n", info.description.data());
+	for (size_t i = 0; i < std::min<size_t>(counts.addressInfoCount, addresses.size()); ++i) {
+		const auto& address = addresses[i];
+		report += fmt::format("address: type={} reported=0x{:016x} precision={}\n",
+		                      vk::to_string(address.addressType), address.reportedAddress,
+		                      address.addressPrecision);
+	}
+	for (size_t i = 0; i < std::min<size_t>(counts.vendorInfoCount, vendors.size()); ++i) {
+		const auto& vendor = vendors[i];
+		report += fmt::format("vendor: {} code=0x{:x} data=0x{:x}\n", vendor.description.data(),
+		                      vendor.vendorFaultCode, vendor.vendorFaultData);
+	}
+	Log::WriteFatal(report);
+
+	// An invalid access is usually a pointer the shader loaded from guest memory: find where that value
+	// sits. Printed after the report above, with a short budget, because other threads that hit the same
+	// loss wait for this function only for DeviceLostReport::WaitLimit before the process exits.
+	constexpr uint32_t kScanBudgetMs = 900;
+	size_t             scans         = 0;
+	for (size_t i = 0; i < std::min<size_t>(counts.addressInfoCount, addresses.size()) && scans < 2; ++i) {
+		const auto& address = addresses[i];
+		if (address.addressType != vk::DeviceFaultAddressTypeEXT::eReadInvalid &&
+		    address.addressType != vk::DeviceFaultAddressTypeEXT::eWriteInvalid) {
+			continue;
+		}
+		const uint64_t precision = std::max<uint64_t>(address.addressPrecision, 1);
+		const uint64_t low       = address.reportedAddress - address.reportedAddress % precision;
+		const uint64_t high      = low + precision - 1;
+		// Addresses near zero would match every zero in memory.
+		if (low < 0x10000 || (high >> 48) != 0) {
+			continue;
+		}
+		scans++;
+		Log::WriteFatal(fmt::format("--- Guest memory scan for the faulting address 0x{:x} ---\n{}",
+		                            address.reportedAddress,
+		                            Libs::LibKernel::Memory::ScanGuestMemoryForAddressRange(low, high, kScanBudgetMs)));
+	}
+}
 
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
@@ -251,6 +322,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo fragment_subgroup_size {};
 	uint32_t                          shader_stage_count = 0;
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =
@@ -272,6 +344,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
 		                                       .module = pixel_program.module,
 		                                       .pName  = "main"};
+		// EXEC/VCC masks describe one guest wave; keep native fragment lanes in that wave.
+		const auto wave_size = ps_input_info->wave_size;
+		if (graphics.compute_subgroup_size_control_enabled &&
+		    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eFragment) &&
+		    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+			fragment_subgroup_size.requiredSubgroupSize = wave_size;
+			shader_stages[shader_stage_count - 1].pNext = &fragment_subgroup_size;
+		}
 	}
 
 	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX] {};
@@ -591,7 +671,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result == vk::Result::eOperationDeferredKHR) {
+		// The hook took a copy of the create info for a background compile (KYTY_ASYNC_PIPELINES,
+		// PipelineCache::TryGetGraphicsPipeline); the copy refuses tessellation, so no module
+		// created here is still needed.
+		EXIT_IF(create_hook == nullptr || pipeline.pipeline != nullptr ||
+		        tess_control_shader_module != nullptr || tess_eval_shader_module != nullptr);
+		return;
+	}
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceFault(graphics);
+		}
+		EXIT("vkCreateGraphicsPipelines failed: %s\n", vk::to_string(result).c_str());
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
@@ -644,7 +737,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceFault(graphics);
+		}
+		EXIT("vkCreateComputePipelines failed: %s, shader=0x%016" PRIx64 " wave_size=%u\n",
+		     vk::to_string(result).c_str(), input_info.stage.program->shader_hash, wave_size);
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }

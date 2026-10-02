@@ -10,10 +10,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/deviceLostReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/renderer/gpuPredication.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -676,9 +678,32 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features2.pNext        = &supported_pipeline_library;
 	}
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
+	const bool device_fault_extension =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT supported_device_fault {};
+	if (device_fault_extension) {
+		supported_device_fault.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &supported_device_fault;
+	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional_rendering {};
+	if (conditional_rendering_extension) {
+		supported_conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext             = &supported_conditional_rendering;
+	}
 	supported_features12.pNext = supported_features2.pNext;
 	supported_features2.pNext  = &supported_features12;
 	physical_device.getFeatures2(&supported_features2);
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension &&
+	    supported_conditional_rendering.conditionalRendering == VK_TRUE;
+	if (GpuPredication::ExtensionRequested()) {
+		LOGF("Vulkan conditional rendering (guest predication on the GPU): %s\n",
+		     graphics.conditional_rendering_enabled ? "true" : "false");
+	}
+	graphics.device_fault_enabled = device_fault_extension && supported_device_fault.deviceFault;
+	LOGF("Vulkan device fault reporting: %s\n", graphics.device_fault_enabled ? "enabled" : "disabled");
 	graphics.maintenance8_enabled =
 	    maintenance8_extension && supported_maintenance8.maintenance8 == VK_TRUE;
 	LOGF("Vulkan maintenance8 (depth/color image copies): %s\n",
@@ -873,6 +898,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
 	                        ? static_cast<void*>(&feedback_layout)
 	                        : feedback_dynamic.pNext;
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (graphics.device_fault_enabled) {
+		device_fault.deviceFault = VK_TRUE;
+		device_fault.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext        = &device_fault;
+	}
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
@@ -897,6 +928,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_library.graphicsPipelineLibrary = VK_TRUE;
 		pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
 		create_info.pNext                        = &pipeline_library;
+	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.conditionalRendering = VK_TRUE;
+		conditional_rendering.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                          = &conditional_rendering;
 	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1337,6 +1374,17 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// VK_EXT_device_fault only costs anything after a loss (the report is read then), so it has
+		// its own switch: KYTY_GPU_FAULT_REPORT=1 (launcher: "GPU fault report"). It used to need
+		// --graphics-debug-dump, which dumps every PM4 packet and slows the game to a crawl.
+		const char* fault_report_env = std::getenv("KYTY_GPU_FAULT_REPORT");
+		const bool  want_device_fault =
+		    Config::GraphicsDebugDumpEnabled() ||
+		    (fault_report_env != nullptr && fault_report_env[0] == '1');
+		if (want_device_fault &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1369,6 +1417,12 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 		}
+		// Guest predication on the GPU (KYTY_PREDICATION_MODE=gpu, renderer/gpuPredication.h): only
+		// enabled when requested, so the default device is unchanged.
+		if (GpuPredication::ExtensionRequested() &&
+		    HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1389,6 +1443,10 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// Whichever call first sees VK_ERROR_DEVICE_LOST prints the GPU fault report (deviceLostReport.h).
+	DeviceLostReport::Register(
+	    [](void* context) { ReportDeviceFault(*static_cast<const GraphicContext*>(context)); },
+	    &graphic_ctx);
 	// Diagnostic only (KYTY_GPU_OP_PROFILE / KYTY_GPU_OP_COUNTERS): wraps dispatcher entries.
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	// KYTY_CP_RECORDER_VERIFY ownership hooks wrap the GpuOpProfiler's.
@@ -1444,6 +1502,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		DeviceLostReport::Unregister(&graphic_ctx);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;
