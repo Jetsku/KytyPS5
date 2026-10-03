@@ -205,16 +205,25 @@ static thread_local std::string* g_debug_binding_trace = nullptr;
 
 static void DebugBindingTraceEmit(RenderContext& context, uint64_t shader_hash,
                                   const PreparedBindings& prepared, const std::string& bindings) {
-	static std::mutex                                              mutex;
-	static std::unordered_map<uint64_t, std::pair<std::string, uint64_t>> last;
+	struct TraceState {
+		std::string text;
+		uint64_t    count      = 0;
+		uint64_t    last_print = 0;
+	};
+	static std::mutex                               mutex;
+	static std::unordered_map<uint64_t, TraceState> last;
 	std::lock_guard lock(mutex);
-	auto& [text, count] = last[shader_hash];
-	++count;
-	const bool changed = bindings != text;
-	if (!changed && count % 600 != 1) {
+	auto& state = last[shader_hash];
+	const auto count = ++state.count;
+	const bool changed = bindings != state.text;
+	// The first 20, then a change at most every 30th binding (per-frame data rotates through
+	// several buffers), and every 600th regardless.
+	const bool print = count <= 20 || (changed && count - state.last_print >= 30) || count % 600 == 1;
+	state.text = bindings;
+	if (!print) {
 		return;
 	}
-	text = bindings;
+	state.last_print = count;
 	std::string gds;
 	const auto  mapped = context.GetBufferCache().GetGdsBuffer()->Mapped();
 	const auto  dwords = std::min<size_t>(mapped.size() / sizeof(uint32_t), 256);
