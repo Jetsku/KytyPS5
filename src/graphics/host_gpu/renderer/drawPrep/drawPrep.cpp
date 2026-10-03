@@ -1036,8 +1036,16 @@ void Engine::SkipPublished(uint64_t count) {
 		auto& slot = window.HeadPayload();
 		if (!window.TryClaimHead()) {
 			// A worker prepares it (or has): its preparation is discarded once it is done.
-			while (!window.HeadDone()) {
+			const auto spin_start = NowNs();
+			for (uint32_t spins = 0; !window.HeadDone(); spins++) {
 				CpuRelax();
+				// The same last-resort deadlock guard as CommitHead's spin. The slots retired so
+				// far were speculative (never draws), so a command serviced here observes the
+				// window as CommitHead's guard does.
+				if ((spins & 1023u) == 1023u && m_service_commands &&
+				    NowNs() - spin_start > 2'000'000u) {
+					m_service_commands();
+				}
 			}
 		}
 		// Claimed or done (acquired): the slot is this thread's until it retires.
@@ -1121,6 +1129,10 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
 		g_totals.head_wait_ns.fetch_add(stats.spin_ns, std::memory_order_relaxed);
+		if (slot.after_stop != 0) {
+			g_totals.head_waits_after_stop.fetch_add(1, std::memory_order_relaxed);
+			g_totals.head_wait_after_stop_ns.fetch_add(stats.spin_ns, std::memory_order_relaxed);
+		}
 		g_totals.head_steals.fetch_add(stats.stolen, std::memory_order_relaxed);
 		// The head is done (acquired): its publication fields are visible.
 		if (slot.speculative) {
@@ -1175,6 +1187,8 @@ struct Head {
 	uint64_t waits_unclaimed = 0;
 	uint64_t wait_ns         = 0;
 	uint64_t steals          = 0;
+	uint64_t after_stop      = 0;
+	uint64_t after_stop_ns   = 0;
 };
 
 Head ReadHead() {
@@ -1184,7 +1198,9 @@ Head ReadHead() {
 	        g_totals.head_waits.load(std::memory_order_relaxed),
 	        g_totals.head_waits_unclaimed.load(std::memory_order_relaxed),
 	        g_totals.head_wait_ns.load(std::memory_order_relaxed),
-	        g_totals.head_steals.load(std::memory_order_relaxed)};
+	        g_totals.head_steals.load(std::memory_order_relaxed),
+	        g_totals.head_waits_after_stop.load(std::memory_order_relaxed),
+	        g_totals.head_wait_after_stop_ns.load(std::memory_order_relaxed)};
 }
 
 void PrintDrawPrepSummary() {
@@ -1227,14 +1243,16 @@ void PrintDrawPrepSummary() {
 	std::snprintf(line, sizeof(line),
 	              "DrawPrep %.0fs: %" PRIu64 " committed from a prepared slot, %" PRIu64
 	              " fell back to the serial path;%s; head ready=%" PRIu64 " self=%" PRIu64
-	              " (%.1f ms) waited=%" PRIu64 " (unclaimed behind %" PRIu64 ", %.1f ms) stolen=%" PRIu64
-	              "\n",
+	              " (%.1f ms) waited=%" PRIu64 " (unclaimed behind %" PRIu64
+	              ", %.1f ms; after a CP stop %" PRIu64 ", %.1f ms) stolen=%" PRIu64 "\n",
 	              static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
 	              fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str(),
 	              head.ready - last_head.ready, head.self - last_head.self,
 	              static_cast<double>(head.self_ns - last_head.self_ns) * 1e-6,
 	              head.waits - last_head.waits, head.waits_unclaimed - last_head.waits_unclaimed,
 	              static_cast<double>(head.wait_ns - last_head.wait_ns) * 1e-6,
+	              head.after_stop - last_head.after_stop,
+	              static_cast<double>(head.after_stop_ns - last_head.after_stop_ns) * 1e-6,
 	              head.steals - last_head.steals);
 	Log::WriteToConsoleAndLog(line);
 	last_ns        = now;

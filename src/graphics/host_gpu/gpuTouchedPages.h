@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 // P3b (KYTY_CP_SEQ=1, Profiling/analysis/P3-SEQUENCER.md §2.5 (c)): a sticky page bitmap of the
 // guest address space, one bit per 4 KiB page, set for every page a GPU-side transition ever
@@ -156,6 +158,59 @@ private:
 // The process-wide bitmap.
 inline Pages g_pages;
 
+// KYTY_CP_SEQ_TOUCHED_DIAG=1 (diagnostics only, default off): the same marks kept at 64-byte
+// lines (one 64-bit mask per marked page, mutex-guarded), so that the sequencer's lockstep reads
+// can be split into reads of bytes a transition covered and reads that only share a 4 KiB page
+// with one (what a finer bitmap would read directly). Slow on purpose-built sessions only.
+class Lines {
+public:
+	void Mark(uint64_t begin, uint64_t end) {
+		if (begin >= end) {
+			return;
+		}
+		std::scoped_lock lock(m_mutex);
+		for (auto page = begin >> PageShift; page <= (end - 1u) >> PageShift; page++) {
+			m_masks[page] |= LineMask(page, begin, end);
+		}
+	}
+	[[nodiscard]] bool AnyTouched(uint64_t begin, uint64_t end) {
+		if (begin >= end) {
+			return false;
+		}
+		std::scoped_lock lock(m_mutex);
+		for (auto page = begin >> PageShift; page <= (end - 1u) >> PageShift; page++) {
+			const auto it = m_masks.find(page);
+			if (it != m_masks.end() && (it->second & LineMask(page, begin, end)) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+private:
+	// The 64-byte lines of `page` that [begin, end) covers.
+	static uint64_t LineMask(uint64_t page, uint64_t begin, uint64_t end) {
+		const auto page_begin = page << PageShift;
+		const auto first      = (std::max(begin, page_begin) - page_begin) >> 6u;
+		const auto last       = (std::min(end, page_begin + (uint64_t {1} << PageShift)) - 1u -
+                           page_begin) >> 6u;
+		const auto count = last - first + 1u;
+		return (count == 64u ? ~uint64_t {0} : ((uint64_t {1} << count) - 1u)) << first;
+	}
+
+	std::mutex                             m_mutex;
+	std::unordered_map<uint64_t, uint64_t> m_masks;
+};
+inline Lines g_lines;
+
+[[nodiscard]] inline bool LinesDiagEnabled() noexcept {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_SEQ_TOUCHED_DIAG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 // Maintained from the first transition on when the sequencer thread is configured
 // (KYTY_CP_SEQ=1, read once here so that no mark before the sequencer starts is missed).
 [[nodiscard]] inline bool Enabled() noexcept {
@@ -170,6 +225,9 @@ inline Pages g_pages;
 inline void NoteTransition(uint64_t begin, uint64_t end, bool unclean_source) noexcept {
 	if (unclean_source && Enabled()) {
 		g_pages.Mark(begin, end);
+		if (LinesDiagEnabled() && end <= (uint64_t {1} << 48u)) {
+			g_lines.Mark(begin, end);
+		}
 	}
 }
 

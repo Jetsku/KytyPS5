@@ -4164,6 +4164,14 @@ enum class CpStopKind : uint8_t {
 	Condition,
 	Other,
 	WaitForwarded, // KYTY_CP_WAIT_FORWARD: not a stop (counted, 0 ms)
+	// LockstepRead of packet data on GPU-touched pages (ReadGuestForFront: register pairs).
+	ReadData,
+	// LockstepRead copying the rest of a command buffer on GPU-touched pages (CheckCommandBytes,
+	// after every barrier-epoch change).
+	ReadCommands,
+	FlipWait,
+	// AwaitPendingWrites: the sequencer waits for the resolver to execute a CP write it reads.
+	PendingWrite,
 	Count
 };
 
@@ -4172,6 +4180,10 @@ struct CpStopStats {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(CpStopKind::Count)> ns {};
 	std::atomic<uint64_t> last_report_ns {0};
 };
+
+// KYTY_CP_SEQ_TOUCHED_DIAG: lockstep reads (data, command bytes) whose bytes no transition ever
+// covered at 64-byte lines: they only share a GPU-touched 4 KiB page with marked bytes.
+std::array<std::atomic<uint64_t>, 2> g_lockstep_untouched_lines {};
 
 bool CpWaitStatsEnabled() {
 	static const bool enabled = [] {
@@ -4203,12 +4215,20 @@ void NoteCpStop(CpStopKind kind, uint64_t stopped_ns) {
 		return;
 	}
 	static const char* const names[] = {"wait-self-satisfied", "wait-self-unsatisfied", "wait-other",
-	                                    "condition",           "other",                 "wait-forwarded"};
+	                                    "condition",           "other",                 "wait-forwarded",
+	                                    "read-data",           "read-commands",         "flip-wait",
+	                                    "pending-write"};
+	static_assert(std::size(names) == static_cast<size_t>(CpStopKind::Count));
 	std::string line = fmt::format("CP stops {:.0f}s:", static_cast<double>(now - last) * 1e-9);
 	for (size_t i = 0; i < static_cast<size_t>(CpStopKind::Count); i++) {
 		const auto n  = stats.count[i].exchange(0, std::memory_order_relaxed);
 		const auto ns = stats.ns[i].exchange(0, std::memory_order_relaxed);
 		line += fmt::format(" {} {} ({:.0f} ms)", names[i], n, static_cast<double>(ns) * 1e-6);
+	}
+	if (GpuTouched::LinesDiagEnabled()) {
+		line += fmt::format("; untouched 64-byte lines: read-data {} read-commands {}",
+		                    g_lockstep_untouched_lines[0].exchange(0, std::memory_order_relaxed),
+		                    g_lockstep_untouched_lines[1].exchange(0, std::memory_order_relaxed));
 	}
 	Log::WriteToConsoleAndLog(line + "\n");
 }
@@ -4336,6 +4356,10 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		} else if (kind == CpSeq::OpKind::Predication || kind == CpSeq::OpKind::CondExec ||
 		           kind == CpSeq::OpKind::Branch) {
 			stop_kind = CpStopKind::Condition;
+		} else if (kind == CpSeq::OpKind::LockstepRead) {
+			stop_kind = m_lockstep_command_bytes ? CpStopKind::ReadCommands : CpStopKind::ReadData;
+		} else if (kind == CpSeq::OpKind::WaitFlipDone) {
+			stop_kind = CpStopKind::FlipWait;
 		}
 		NoteCpStop(stop_kind, CpStopClockNs() - stop_begin);
 	}
@@ -4364,9 +4388,14 @@ bool CommandProcessor::AwaitPendingWrites(uint64_t begin, uint64_t end) {
 		return true;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPendingWriteStops);
+	const bool     stop_stats = CpWaitStatsEnabled();
+	const uint64_t stop_begin = stop_stats ? CpStopClockNs() : 0;
 	if (!m_sequencer->Wait([this, needed] { return m_sequencer->Executed() >= needed; }, needed,
 	                       needed)) {
 		return false;
+	}
+	if (stop_stats) {
+		NoteCpStop(CpStopKind::PendingWrite, CpStopClockNs() - stop_begin);
 	}
 	const auto executed = m_sequencer->Executed();
 	std::erase_if(m_pending_writes,
@@ -4393,6 +4422,9 @@ bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* 
 		return true;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqLockstepReads);
+	if (GpuTouched::LinesDiagEnabled() && !GpuTouched::g_lines.AnyTouched(address, address + size)) {
+		g_lockstep_untouched_lines[0].fetch_add(1, std::memory_order_relaxed);
+	}
 	CpSeq::LockstepReadOp op;
 	op.address     = address;
 	op.size        = size;
@@ -4429,12 +4461,17 @@ bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {
 	// GPU-touched command bytes (or a copy a CP write made stale): the resolver copies the rest
 	// of the buffer at this point of the stream.
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqLockstepBuffers);
+	if (GpuTouched::LinesDiagEnabled() && !GpuTouched::g_lines.AnyTouched(rest_begin, rest_end)) {
+		g_lockstep_untouched_lines[1].fetch_add(1, std::memory_order_relaxed);
+	}
 	auto copy = std::make_shared<std::vector<uint32_t>>(rest_dw);
 	CpSeq::LockstepReadOp op;
 	op.address     = rest_begin;
 	op.size        = rest_dw * sizeof(uint32_t);
 	op.destination = reinterpret_cast<uint64_t>(copy->data());
+	m_lockstep_command_bytes = true;
 	(void)SubmitThread(CpSeq::OpKind::LockstepRead, &op, sizeof(op), nullptr, 0);
+	m_lockstep_command_bytes = false;
 	if (m_sequencer->Stopping()) {
 		return false;
 	}

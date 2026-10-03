@@ -139,6 +139,10 @@ struct Totals {
 	std::atomic<uint64_t> head_waits {0};
 	std::atomic<uint64_t> head_waits_unclaimed {0};
 	std::atomic<uint64_t> head_wait_ns {0};
+	// Of the waited heads: the first draw published after a command-processor stop (a barrier or
+	// a submission start, Slot::after_stop), and their spin.
+	std::atomic<uint64_t> head_waits_after_stop {0};
+	std::atomic<uint64_t> head_wait_after_stop_ns {0};
 	std::atomic<uint64_t> head_steals {0};
 };
 [[nodiscard]] Totals& GetTotals();

@@ -528,6 +528,9 @@ private:
 	// maybe not executed yet (range, op sequence).
 	bool     m_epoch_pending = false;
 	uint64_t m_barrier_epoch = 1;
+	// KYTY_CP_WAIT_STATS: the LockstepRead being submitted copies command bytes (CheckCommandBytes)
+	// rather than packet data (ReadGuestForFront).
+	bool m_lockstep_command_bytes = false;
 	struct PendingWrite {
 		uint64_t begin = 0;
 		uint64_t end   = 0;
