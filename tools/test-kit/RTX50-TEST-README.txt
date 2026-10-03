@@ -40,3 +40,46 @@ and send:
   - the newest folder inside _HangTrace next to kyty_emulator.exe (zip it);
   - _device_fault.nv-gpudmp, if one was written next to kyty_emulator.exe;
   - the GPU model and NVIDIA driver version.
+
+Round 3: tests 8 to 12
+======================
+
+The RTX 5090 logs of kit 2 show the GPU failing on a memory write in one
+particular shader at the title -> galaxy map step (test 5 recorded it as a GPU
+fault; the other tests froze at the same moment). These tests check where that
+write goes. Each one is a single start: title screen, then on into the galaxy
+map, or until it freezes or crashes. Run them in this order.
+
+Tests 9 to 12 also write a line to test-log.txt next to launcher.exe: the test,
+the time, your GPU and its driver version.
+
+  Test 8 - Diagnostics, frame fence off.cmd
+      As sent before (the add-on). Skip it if you have already sent its result.
+  Test 9 - Diagnostics, binding check.cmd
+      As test 1, and the log (_kyty.txt) records where that shader's buffers
+      are in GPU memory and any buffer that is used after it was freed.
+      It needs the log: in the launcher, set the printf output to a file
+      (_kyty.txt) as in your earlier logs.
+  Test 10 - Diagnostics, delayed buffer erase.cmd
+      As test 9, and freed GPU buffers are kept a few seconds longer before
+      their memory is released (this uses more video memory). If test 10
+      gets past the point where the others fail, tell us at once.
+  Test 11 - Diagnostics, after an NVIDIA driver update.cmd
+      Same settings as test 1. First install the newest NVIDIA Game Ready
+      driver (616.92 or newer; NVIDIA's notes for 616.92 list a fix for
+      Blackwell (RTX 50) GPUs). If your driver is already that new, run it
+      anyway.
+  Test 12 - Diagnostics, uniform lane reads.cmd
+      As test 1, with a shader option that keeps loops from splitting up on
+      the GPU. The first start compiles shaders again and is slower.
+
+When a test freezes, leave the frozen game open and run
+"While frozen - GPU load.cmd" (it takes 15 seconds): it notes whether the GPU
+and the emulator's threads are still busy, in gpu-load-while-frozen.txt. Then
+close the game.
+
+For each test send the same as before (whether it got into the galaxy map,
+after how long it froze or crashed, the newest _HangTrace folder zipped, the
+console text from a "Device loss" line on, _device_fault.nv-gpudmp if one was
+written), and also _kyty.txt, test-log.txt, gpu-load-while-frozen.txt and,
+once, Kyty.ini (the launcher's settings, next to launcher.exe).

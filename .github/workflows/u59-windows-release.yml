@@ -172,8 +172,8 @@ jobs:
           # RTX 50 test kit: scripts that start the launcher with different settings (RTX50-TEST-README.txt).
           Copy-Item -Path 'tools/test-kit/*' -Destination $release -Recurse -Exclude '.gitattributes'
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination (Join-Path $release 'test-presets/1-release.json')
-          if (@(Get-ChildItem -LiteralPath $release -Filter 'Test *.cmd').Count -ne 7) { throw 'Expected seven test scripts.' }
-          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 6) { throw 'Expected six test presets.' }
+          if (@(Get-ChildItem -LiteralPath $release -Filter 'Test *.cmd').Count -ne 12) { throw 'Expected 12 test scripts.' }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 10) { throw 'Expected 10 test presets.' }
           $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
