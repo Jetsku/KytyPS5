@@ -61,6 +61,8 @@ public:
 	[[nodiscard]] uint64_t ContentRevision() const noexcept { return m_content_revision; }
 	void MarkContentWritten();
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	// The device address, or 0 for a buffer created without one (diagnostics).
+	[[nodiscard]] vk::DeviceAddress DeviceAddressOrZero() const noexcept { return m_device_address; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -86,6 +88,10 @@ public:
 	size_t lru_id       = 0;
 	// KYTY_BUFFER_LRU_SKIP=1 (BufferCache::TouchBuffer): the tick the LRU item last received.
 	mutable uint64_t lru_tick = 0;
+	// KYTY_DEBUG_BINDING_CHECK=1 (BufferCache::DebugBindingCheck): the scheduler tick that last
+	// bound this buffer to a shader, and the tick at which the buffer cache deleted it.
+	mutable uint64_t debug_bound_tick  = 0;
+	uint64_t         debug_delete_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

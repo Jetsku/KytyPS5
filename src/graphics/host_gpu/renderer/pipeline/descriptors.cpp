@@ -43,12 +43,17 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <xxhash.h>
@@ -169,6 +174,65 @@ static bool WriteRangeImageStatsEnabled() {
 	return enabled;
 }
 
+// KYTY_DEBUG_BINDING_TRACE=<hash>[,<hash>...] (also ';' or '+' between hashes; needs
+// KYTY_DEBUG_BINDING_CHECK=1): the storage buffers of each dispatch or draw of the listed guest
+// shaders are printed whenever they differ from that shader's previous ones, and every 600th time,
+// with the non-zero GDS dwords the CPU sees (RebindBuffers).
+static const std::vector<uint64_t>& DebugBindingTraceShaders() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> out;
+		if (const auto* text = std::getenv("KYTY_DEBUG_BINDING_TRACE"); text != nullptr) {
+			std::string_view rest(text);
+			while (!rest.empty()) {
+				const auto separator = rest.find_first_of(",;+");
+				const auto token     = std::string(rest.substr(0, separator));
+				if (!token.empty()) {
+					out.push_back(std::strtoull(token.c_str(), nullptr, 16));
+				}
+				if (separator == std::string_view::npos) {
+					break;
+				}
+				rest.remove_prefix(separator + 1);
+			}
+		}
+		return out;
+	}();
+	return list;
+}
+
+// RebindBuffers points this at its trace text while it binds a traced shader's buffers.
+static thread_local std::string* g_debug_binding_trace = nullptr;
+
+static void DebugBindingTraceEmit(RenderContext& context, uint64_t shader_hash,
+                                  const PreparedBindings& prepared, const std::string& bindings) {
+	static std::mutex                                              mutex;
+	static std::unordered_map<uint64_t, std::pair<std::string, uint64_t>> last;
+	std::lock_guard lock(mutex);
+	auto& [text, count] = last[shader_hash];
+	++count;
+	const bool changed = bindings != text;
+	if (!changed && count % 600 != 1) {
+		return;
+	}
+	text = bindings;
+	std::string gds;
+	const auto  mapped = context.GetBufferCache().GetGdsBuffer()->Mapped();
+	const auto  dwords = std::min<size_t>(mapped.size() / sizeof(uint32_t), 256);
+	for (size_t i = 0; i < dwords; i++) {
+		uint32_t value = 0;
+		std::memcpy(&value, mapped.data() + i * sizeof(uint32_t), sizeof(value));
+		if (value != 0) {
+			gds += fmt::format(" [{}]={:#x}", i, value);
+		}
+	}
+	std::printf("BindingTrace shader 0x%016" PRIx64 " #%" PRIu64 " tick %" PRIu64
+	            " groups %ux%ux%u%s:\n%s  GDS (CPU view):%s\n",
+	            shader_hash, count, context.GetCommandScheduler().CurrentTick(),
+	            prepared.dispatch_groups[0], prepared.dispatch_groups[1], prepared.dispatch_groups[2],
+	            changed ? " (changed)" : "", bindings.c_str(), gds.empty() ? " all zero" : gds.c_str());
+	std::fflush(stdout);
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
@@ -178,6 +242,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
+		if (g_debug_binding_trace != nullptr) {
+			*g_debug_binding_trace += fmt::format("  [{}] {} null (guest=0x{:x} size=0x{:x})\n", slot,
+			                                      resource.written ? "W" : "R", address, size);
+		}
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
@@ -206,6 +274,31 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
 	                                           : size + adjustment;
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
+	if (BufferCache::DebugBindingCheck()) {
+		const auto tick     = context.GetCommandScheduler().CurrentTick();
+		buffer->debug_bound_tick = tick;
+		const bool deleted  = buffer->is_deleted;
+		const bool past_end = offset > buffer->Size() || aligned_offset + range > buffer->Size();
+		const bool outside  = !buffer->IsInBounds(address, size);
+		const auto va       = buffer->DeviceAddressOrZero();
+		if (deleted || past_end || outside) {
+			BufferCache::DebugBindingReport(fmt::format(
+			    "{} slot {} {}: guest=0x{:x} size=0x{:x} -> buffer guest=0x{:x} size=0x{:x} "
+			    "offset=0x{:x} range=0x{:x} va=0x{:x}{}{}{} tick {}",
+			    ShaderStageResourceName(stage), slot, resource.written ? "written" : "read", address,
+			    size, buffer->CpuAddress(), buffer->Size(), aligned_offset, range, va,
+			    deleted ? " DELETED" : "", past_end ? " PAST-END" : "", outside ? " OUTSIDE" : "",
+			    tick));
+		}
+		if (g_debug_binding_trace != nullptr) {
+			*g_debug_binding_trace += fmt::format(
+			    "  [{}] {} guest=0x{:x} size=0x{:x} -> buf guest=0x{:x} size=0x{:x} off=0x{:x} "
+			    "range=0x{:x} va=0x{:x}-0x{:x}{}{}{}\n",
+			    slot, resource.written ? "W" : "R", address, size, buffer->CpuAddress(),
+			    buffer->Size(), aligned_offset, range, va + aligned_offset, va + aligned_offset + range,
+			    narrowed ? " narrowed" : "", deleted ? " DELETED" : "", past_end ? " PAST-END" : "");
+		}
+	}
 	if (narrowed) {
 		for (const auto& range: *written_ranges) {
 			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
@@ -1764,6 +1857,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	auto& write_scratch = ThreadWriteRangeScratch();
 	bool  write_ranges_evaluated = false;
+	// KYTY_DEBUG_BINDING_TRACE: collect this shader's bindings (NativeStorageBuffer).
+	std::string debug_trace;
+	const bool  debug_traced =
+	    BufferCache::DebugBindingCheck() &&
+	    std::ranges::find(DebugBindingTraceShaders(), program.shader_hash) !=
+	        DebugBindingTraceShaders().end();
+	g_debug_binding_trace = debug_traced ? &debug_trace : nullptr;
 	// All bindings' uploads share one barrier pair (KYTY_UPLOAD_BATCH).
 	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
@@ -1774,6 +1874,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
+	}
+	g_debug_binding_trace = nullptr;
+	if (debug_traced) {
+		DebugBindingTraceEmit(m_context, program.shader_hash, prepared, debug_trace);
 	}
 	prepared.mip_stats_canary = false;
 	prepared.mip_stats_active = plan_shader_data

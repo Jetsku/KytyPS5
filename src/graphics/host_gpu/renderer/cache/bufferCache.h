@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -123,6 +124,11 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	// KYTY_DEBUG_BINDING_CHECK=1 (default off): shader bindings are checked against the buffer they
+	// resolve to and against later deletion (RTX 50 GPU page-fault investigation); reports go to
+	// stdout, rate-limited (DebugBindingReport).
+	[[nodiscard]] static bool DebugBindingCheck();
+	static void               DebugBindingReport(const std::string& text);
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);

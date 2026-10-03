@@ -38,6 +38,8 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #include <xmmintrin.h>
 #endif
@@ -765,6 +767,29 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
+bool BufferCache::DebugBindingCheck() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DEBUG_BINDING_CHECK");
+		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
+		if (on) {
+			std::printf("Kyty binding check: on (KYTY_DEBUG_BINDING_CHECK)\n");
+			std::fflush(stdout);
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+void BufferCache::DebugBindingReport(const std::string& text) {
+	// The first 200 reports, then every 1000th, so a repeating fault cannot flood the console.
+	static std::atomic<uint64_t> count {0};
+	const auto                   index = count.fetch_add(1, std::memory_order_relaxed);
+	if (index < 200 || index % 1000 == 0) {
+		std::printf("BindingCheck #%" PRIu64 ": %s\n", index, text.c_str());
+		std::fflush(stdout);
+	}
+}
+
 void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
@@ -776,8 +801,26 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		CompleteSideReadbacks(buffer.CpuAddress(), buffer.Size());
 	}
 	Unregister(id);
+	if (DebugBindingCheck()) {
+		m_slot_buffers[id].debug_delete_tick = m_scheduler.Active() ? m_scheduler.CurrentTick() : 0;
+	}
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferOperation([this, id] {
+			if (DebugBindingCheck()) {
+				// The erase runs once the deletion's tick has completed; a binding recorded in a
+				// later tick still points at this buffer's memory after it is freed.
+				const auto& buffer = m_slot_buffers[id];
+				if (buffer.debug_bound_tick > buffer.debug_delete_tick) {
+					DebugBindingReport(fmt::format(
+					    "deleted buffer still bound: guest=0x{:x} size=0x{:x} va=0x{:x} deleted at "
+					    "tick {} but bound at tick {}; freed after tick {} completed",
+					    buffer.CpuAddress(), buffer.Size(), buffer.DeviceAddressOrZero(),
+					    buffer.debug_delete_tick, buffer.debug_bound_tick,
+					    buffer.debug_delete_tick));
+				}
+			}
+			m_slot_buffers.erase(id);
+		});
 	} else {
 		m_slot_buffers.erase(id);
 	}
