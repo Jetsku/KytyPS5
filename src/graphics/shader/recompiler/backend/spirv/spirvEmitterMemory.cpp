@@ -290,11 +290,10 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
 
-// Plain dword loads from storage-buffer descriptors can rely on the device's bounds check: with
-// robustBufferAccess2 and a 1-byte robustness alignment (HostBufferRobustness) a dword load with any
-// byte past the descriptor range returns 0, which is exactly "index < OpArrayLength" failing (the
-// range is "size + adjustment" bytes, OpArrayLength its whole dwords). Every guest OOB_SELECT mode
-// is modelled today by that same descriptor-range check, so nothing changes for any mode. LDS,
+// Plain loads through storage-buffer descriptors may use robustBufferAccess2 with the host's
+// whole-dword range contract (HostBufferRobustness). This preserves the current emulation's
+// descriptor-range semantics; the AMD pilot still rejects indices whose byte address may wrap.
+// LDS,
 // GDS, scratch, formatted (all-or-nothing) accesses, stores and atomics keep their explicit checks.
 // KYTY_ROBUST_BUFFER_LOADS=0 keeps the explicit check everywhere.
 bool DeviceChecksDwordLoad(const MemoryResourceAccess& resource) {
@@ -304,11 +303,23 @@ bool DeviceChecksDwordLoad(const MemoryResourceAccess& resource) {
 	       GetHostBufferRobustness().storage_dword_loads_return_zero;
 }
 
+uint32_t DeviceDwordLoadInBounds(EmitterState& state, uint32_t index) {
+	if (!GetHostBufferRobustness().null_descriptor_for_short_ranges) {
+		return ConstantBool(state, true); // Existing alignment-1 path.
+	}
+	// A dword index can exceed 2^30 after the descriptor's alignment prefix or a scalar
+	// immediate is added. A driver using 32-bit byte offsets could wrap that into the buffer.
+	return Binary(state, spv::OpULessThan, TypeBool(state), index,
+	              ConstantU32(state, 0x40000000u));
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	if (DeviceChecksDwordLoad(resource)) {
-		return LoadWordInBounds(ctx, resource, index);
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, DeviceDwordLoadInBounds(ctx.state, index),
+		    [&]() { return LoadWordInBounds(ctx, resource, index); });
 	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
@@ -330,7 +341,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	if (DeviceChecksDwordLoad(resource)) {
-		return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, DeviceDwordLoadInBounds(ctx.state, index),
+		    [&]() { return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend); });
 	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
@@ -1293,13 +1306,35 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
 	                            ConstantU32(state, mem.offset));
-	const auto index =
+	auto index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	if (GetHostBufferRobustness().null_descriptor_for_short_ranges &&
+	    static_cast<int32_t>(mem.offset) > 0) {
+		// Preserve a positive scalar offset's carry past 4 GiB in the dword index. Add the
+		// quotient and low-bit carry separately so even an unaligned immediate cannot wrap.
+		index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
+		               ConstantU32(state, 2));
+		if ((mem.offset & 3u) != 0u) {
+			const auto low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1),
+			                        ConstantU32(state, 3));
+			const auto low_sum = Binary(state, spv::OpIAdd, TypeU32(state), low,
+			                            ConstantU32(state, mem.offset & 3u));
+			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+			               Binary(state, spv::OpShiftRightLogical, TypeU32(state), low_sum,
+			                      ConstantU32(state, 2)));
+		}
+		if (mem.offset >= 4u) {
+			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+			               ConstantU32(state, mem.offset >> 2u));
+		}
+	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
 	if (DeviceChecksDwordLoad(access)) {
-		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
-		                     state, EmitMemoryElementPointer(state, access, element)));
+		ctx.Define(inst, EmitValueOrZeroIfCondition(state, DeviceDwordLoadInBounds(state, element), [&]() {
+		           return EmitNative<spv::OpLoad, IR::Type::U32>(
+		               state, EmitMemoryElementPointer(state, access, element));
+	           }));
 		return;
 	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);

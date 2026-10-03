@@ -699,22 +699,27 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getProperties2(&properties2);
 	ConfigureShaderFloatControls(properties12);
-	// robustBufferAccess2 (enabled below whenever supported) makes a storage-buffer load return 0
-	// when any byte lies past the descriptor range rounded up to this alignment; at 1 byte that is
-	// exactly the shaders' own dword bounds check, which they can then leave to the device.
+	// AMD's 4-byte robustness alignment is usable only with whole-dword descriptor ranges and
+	// nullDescriptor for ranges below one word. This pilot defaults off for controlled A/B tests.
 	{
-		ShaderRecompiler::Spirv::HostBufferRobustness robustness {};
-		robustness.storage_dword_loads_return_zero =
-		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE &&
-		    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+		const auto* amd_bounds_env = std::getenv("KYTY_AMD_BUFFER_BOUNDS");
+		const bool amd_bounds_requested = amd_bounds_env != nullptr && amd_bounds_env[0] == '1';
+		const bool robust2 =
+		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE;
+		const bool null_descriptor =
+		    robustness2_ext_enabled && supported_robustness2.nullDescriptor == VK_TRUE;
+		const auto robustness = ShaderRecompiler::Spirv::SelectHostBufferRobustness(
+		    properties2.properties.vendorID, robust2,
+		    robustness2_properties.robustStorageBufferAccessSizeAlignment,
+		    null_descriptor, amd_bounds_requested);
 		ShaderRecompiler::Spirv::SetHostBufferRobustness(robustness);
 		LOGF("Vulkan robustness: robustBufferAccess2=%s storage alignment=%" PRIu64
-		     " shader dword bounds checks=%s\n",
-		     robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE
-		         ? "true"
-		         : "false",
+		     " shader dword bounds checks=%s nullDescriptor=%s amdBounds=%s\n",
+		     robust2 ? "true" : "false",
 		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
-		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
+		     robustness.storage_dword_loads_return_zero ? "device" : "shader",
+		     null_descriptor ? "true" : "false",
+		     robustness.null_descriptor_for_short_ranges ? "enabled" : "disabled");
 	}
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =

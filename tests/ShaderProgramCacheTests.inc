@@ -252,8 +252,14 @@ void CheckFingerprint() {
     Spirv::SetHostFloatControls(changed);
   });
   host_differs("storage_dword_loads_return_zero", [&] {
-    Spirv::SetHostBufferRobustness(
-        {.storage_dword_loads_return_zero = !robustness.storage_dword_loads_return_zero});
+    auto changed = robustness;
+    changed.storage_dword_loads_return_zero = !changed.storage_dword_loads_return_zero;
+    Spirv::SetHostBufferRobustness(changed);
+  });
+  host_differs("null_descriptor_for_short_ranges", [&] {
+    auto changed = robustness;
+    changed.null_descriptor_for_short_ranges = !changed.null_descriptor_for_short_ranges;
+    Spirv::SetHostBufferRobustness(changed);
   });
   host_differs("min_lod", [&] { Spirv::SetHostImageFeatures({.min_lod = !image_features.min_lod}); });
   host_differs("shader clock scope", [&] {

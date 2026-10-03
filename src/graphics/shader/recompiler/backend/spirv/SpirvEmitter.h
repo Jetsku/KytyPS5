@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/backend/spirv/HostBufferRobustness.h"
 
 #include <vector>
 
@@ -21,14 +22,8 @@ struct HostFloatControls {
 void              SetHostFloatControls(const HostFloatControls& controls);
 HostFloatControls GetHostFloatControls();
 
-// Storage-buffer robustness the device guarantees. With robustBufferAccess2 enabled and
-// robustStorageBufferAccessSizeAlignment == 1, a 32-bit load from a storage-buffer descriptor
-// returns 0 exactly when some byte of it lies outside the descriptor range, which is the
-// shader's own "dword index < OpArrayLength" check. The device layer sets this once.
-struct HostBufferRobustness {
-	bool storage_dword_loads_return_zero = false;
-};
-
+// Set once by the device layer. The AMD alignment-4 path additionally requires complete-dword
+// descriptor ranges and true null descriptors when no complete dword can be bound.
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 

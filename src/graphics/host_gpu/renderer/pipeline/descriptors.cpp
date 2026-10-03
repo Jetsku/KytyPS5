@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
@@ -199,13 +200,14 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	// Shaders bounds-check storage buffers in whole dwords (OpArrayLength floors the range), and
-	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
-	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
-	// no-op for every shader-side check, and it makes the device check match them.
-	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
-	                                           : size + adjustment;
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
+	// OpArrayLength counts whole dwords. A 4-byte robustness alignment would round a partial
+	// last word UP, exposing bytes beyond that count, so always bind only complete words.
+	// For a range below one word, the AMD pilot requires nullDescriptor (range=0 is invalid).
+	const auto range = ShaderRecompiler::Spirv::StorageBufferDwordRange(
+	    size + adjustment, ShaderRecompiler::Spirv::GetHostBufferRobustness());
+	const vk::DescriptorBufferInfo result =
+	    range == 0u ? vk::DescriptorBufferInfo {nullptr, 0, VK_WHOLE_SIZE}
+	                : vk::DescriptorBufferInfo {buffer->Handle(), aligned_offset, range};
 	if (narrowed) {
 		for (const auto& range: *written_ranges) {
 			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
@@ -219,10 +221,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	} else if (resource.written) {
 		access = "Write";
 	}
-	SetVulkanObjectNameF(
-	    graphics.device, result.buffer,
-	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
-	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
+	if (result.buffer != nullptr) {
+		SetVulkanObjectNameF(
+		    graphics.device, result.buffer,
+		    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
+		    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
+	}
 	return result;
 }
 
@@ -2331,7 +2335,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						for (const auto resource: binding.resources) {
 							const auto& view = descriptors.buffers.at(resource);
-							EXIT_IF(view.buffer == nullptr);
+							EXIT_IF(view.buffer == nullptr &&
+							        (!ShaderRecompiler::Spirv::GetHostBufferRobustness()
+							              .null_descriptor_for_short_ranges ||
+							         view.offset != 0 || view.range != VK_WHOLE_SIZE));
 							m_descriptor_buffers.push_back(view);
 						}
 						break;

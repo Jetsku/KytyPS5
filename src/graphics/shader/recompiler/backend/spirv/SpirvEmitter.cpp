@@ -23,7 +23,7 @@ enum HostFloatControlBits : uint32_t {
 };
 
 std::atomic_uint32_t g_host_float_controls {0};
-std::atomic_bool     g_storage_dword_loads_return_zero {false};
+std::atomic_uint8_t  g_host_buffer_robustness {0};
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
@@ -388,13 +388,15 @@ HostFloatControls GetHostFloatControls() {
 }
 
 void SetHostBufferRobustness(const HostBufferRobustness& robustness) {
-	g_storage_dword_loads_return_zero.store(robustness.storage_dword_loads_return_zero,
-	                                        std::memory_order_relaxed);
+	const uint8_t bits = (robustness.storage_dword_loads_return_zero ? 1u : 0u) |
+	                     (robustness.null_descriptor_for_short_ranges ? 2u : 0u);
+	g_host_buffer_robustness.store(bits, std::memory_order_relaxed);
 }
 
 HostBufferRobustness GetHostBufferRobustness() {
-	return {.storage_dword_loads_return_zero =
-	            g_storage_dword_loads_return_zero.load(std::memory_order_relaxed)};
+	const auto bits = g_host_buffer_robustness.load(std::memory_order_relaxed);
+	return {.storage_dword_loads_return_zero = (bits & 1u) != 0u,
+	        .null_descriptor_for_short_ranges = (bits & 2u) != 0u};
 }
 
 void SetHostImageFeatures(const HostImageFeatures& features) {

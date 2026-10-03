@@ -1823,6 +1823,9 @@ struct TestCase {
   size_t storage_buffer_range_dwords = 0;
   // Descriptor range in bytes for every storage buffer (overrides the dword range when set).
   size_t storage_buffer_range_bytes = 0;
+  // Optional per-resource descriptor ranges: 0 is a true null descriptor, VK_WHOLE_SIZE
+  // leaves the full backing range. Overrides the shared range for the listed resources.
+  std::vector<uint64_t> storage_buffer_descriptor_bytes;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
@@ -23984,6 +23987,19 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        const auto resource = buffers->resources[i];
+        if (resource < test.storage_buffer_descriptor_bytes.size()) {
+          const auto range = test.storage_buffer_descriptor_bytes[resource];
+          if (range == 0u) {
+            Require(test.name, "null storage descriptor", m_null_descriptor,
+                    "nullDescriptor was not enabled");
+            info = {nullptr, 0, VK_WHOLE_SIZE};
+          } else if (range != VK_WHOLE_SIZE) {
+            info.range = range;
+            Require(test.name, "per-resource descriptor range", info.range <= buffer.size,
+                    "storage buffer descriptor range exceeds backing buffer");
+          }
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -27957,6 +27973,8 @@ private:
         available_robustness2.robustBufferAccess2 == VK_TRUE;
     if (robustness2_supported) {
       robustness2.robustBufferAccess2 = VK_TRUE;
+      m_null_descriptor = available_robustness2.nullDescriptor == VK_TRUE;
+      robustness2.nullDescriptor = m_null_descriptor;
       robustness2.pNext = const_cast<void *>(device_info.pNext);
       device_info.pNext = &robustness2;
     }
@@ -28098,8 +28116,11 @@ private:
           robustness2_supported
               ? robustness2_properties.robustStorageBufferAccessSizeAlignment
               : 0u;
+      const auto *amd_bounds = std::getenv("KYTY_AMD_BUFFER_BOUNDS");
       ShaderRecompiler::Spirv::SetHostBufferRobustness(
-          {.storage_dword_loads_return_zero = m_robust_storage_alignment == 1u});
+          ShaderRecompiler::Spirv::SelectHostBufferRobustness(
+              properties.properties.vendorID, robustness2_supported, m_robust_storage_alignment,
+              m_null_descriptor, amd_bounds != nullptr && amd_bounds[0] == '1'));
       ShaderRecompiler::Spirv::SetHostImageFeatures(
           {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
       namespace Spirv = ShaderRecompiler::Spirv;
@@ -28440,6 +28461,7 @@ private:
   vk::Queue m_transfer_queue = nullptr;
   u32 m_transfer_family = UINT32_MAX;
   vk::DeviceSize m_robust_storage_alignment = 0;
+  bool m_null_descriptor = false;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
@@ -50183,6 +50205,27 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {
     VulkanHarness vulkan;
     CodegenTests::RunAll(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--robust-buffer-loads-only") == 0) {
+    VulkanHarness vulkan(false);
+    CodegenTests::CheckRobustBufferLoads(&vulkan);
+    CodegenTests::CheckRobustBufferRanges(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--amd-buffer-bounds-regressions-only") == 0) {
+    // These are compute checks; optional rasterization feedback features are unnecessary.
+    VulkanHarness vulkan(false);
+    RunCase(&vulkan, BufferFormatVariants());
+    RunCase(&vulkan, BufferFormatStoreVariants());
+    RunCase(&vulkan, BufferLoadFormatXyzwRejectsPartialRecord());
+    RunCase(&vulkan, BufferStoreFormatXyzwDropsPartialRecord());
+    RunCase(&vulkan, BufferAtomicVariants());
+    RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
+    RunCase(&vulkan, BufferAtomicAndX2GlcAndExec());
+    RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
+    RunCase(&vulkan, ScalarLoadAlignsDynamicBase());
+    SrtVariantTests::RunAll(&vulkan);
     return 0;
   }
   // CPU only: compiles and validates the GET_LOD_STATS instrumentation.

@@ -616,6 +616,9 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+add_executable(buffer_robustness_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BufferRobustnessTests.cpp")
+target_include_directories(buffer_robustness_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
@@ -1027,6 +1030,16 @@ if(BUILD_TESTING)
 	add_test(NAME program_cache_emergency COMMAND $<TARGET_FILE:program_cache_emergency_tests>)
 	set_tests_properties(program_cache_emergency PROPERTIES TIMEOUT 15)
 	add_test(NAME program_cache_preload COMMAND $<TARGET_FILE:program_cache_preload_tests>)
+	add_test(NAME buffer_robustness COMMAND $<TARGET_FILE:buffer_robustness_tests>)
+	add_test(NAME amd_buffer_bounds
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --robust-buffer-loads-only)
+	set_tests_properties(amd_buffer_bounds PROPERTIES
+		ENVIRONMENT "KYTY_AMD_BUFFER_BOUNDS=1;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_LIBRARY=0"
+		SKIP_REGULAR_EXPRESSION "AMD bounds pilot unavailable or disabled")
+	add_test(NAME amd_buffer_bounds_regressions
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --amd-buffer-bounds-regressions-only)
+	set_tests_properties(amd_buffer_bounds_regressions PROPERTIES
+		ENVIRONMENT "KYTY_AMD_BUFFER_BOUNDS=1;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_LIBRARY=0")
 	set_tests_properties(program_cache_preload PROPERTIES TIMEOUT 30)
 	set_tests_properties(http_wait_request PROPERTIES TIMEOUT 10)
 	add_test(NAME emulator_user_name_cli
@@ -2096,6 +2109,7 @@ if(BUILD_TESTING)
 		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
+		buffer_robustness_tests
 		http_wait_request_tests
 		av_player_sync_tests
 		apr_host_file_pool_tests

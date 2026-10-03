@@ -1000,8 +1000,8 @@ void CheckLodStatsPlainVariant() {
 void CheckRobustBufferLoads(VulkanHarness *vulkan) {
   constexpr const char *name = "CodegenRobustBufferLoads";
   using O = ShaderOpcode;
-  if (vulkan->RobustStorageAlignment() != 1u) {
-    std::printf("[codegen] %-32s skipped (robustStorageBufferAccessSizeAlignment %u)\n", name,
+  if (!ShaderRecompiler::Spirv::GetHostBufferRobustness().storage_dword_loads_return_zero) {
+    std::printf("[codegen] %-32s skipped (hardware bounds disabled/unavailable; alignment %u)\n", name,
                 static_cast<u32>(vulkan->RobustStorageAlignment()));
     return;
   }
@@ -1025,9 +1025,17 @@ void CheckRobustBufferLoads(VulkanHarness *vulkan) {
   mubuf(0x08, 13, 0, 4u * (Data + 8u) - 6u);   // ubyte: 1-byte steps
   mubuf(0x09, 14, 0, 4u * (Data + 8u) - 6u);   // sbyte
   mubuf(0x0e, 16, 1, 4u * (Data + 2u));        // dwordx4 v[16:19]
-  AppendSmemLoadOpcode(&code, 0x0a, 20, 4u * (Data + 6u)); // s_buffer_load_dwordx4 s[20:23]
-  AppendSmemLoadOpcode(&code, 0x08, 24, 4u * (Data + 8u)); // s_buffer_load_dword s24 (partial)
-  AppendSmemLoadOpcode(&code, 0x08, 25, 4u * (Data + 7u)); // s_buffer_load_dword s25
+  // A GPU-produced zero SOFFSET prevents the SRT planner from preloading scalar results on
+  // the CPU against the backing size (which deliberately exceeds the descriptor range).
+  mubuf(0x0c, 6, 0, 0);
+  code.push_back(EncodeVop1(0x02, 26, Vgpr(6)));
+  for (const auto [opcode, dst, offset] :
+       {std::array<u32, 3>{0x0a, 20, 4u * (Data + 6u)},
+        std::array<u32, 3>{0x08, 24, 4u * (Data + 8u)},
+        std::array<u32, 3>{0x08, 25, 4u * (Data + 7u)}}) {
+    code.push_back(EncodeSmem0(opcode, dst));
+    code.push_back(EncodeSmem1(offset, 26));
+  }
   code.push_back(EncodeSopp(0x0c, 0));
   for (u32 s = 0; s < 6; s++) {
     code.push_back(EncodeVop1(0x01, 30 + s, 20 + s)); // v_mov_b32 v(30+s), s(20+s)
@@ -1089,6 +1097,7 @@ void CheckRobustBufferLoads(VulkanHarness *vulkan) {
   }
   CodegenOptions device = GetCodegenOptions();
   device.robust_buffer_loads = true;
+  device.srt_variant_reads = true;
   CodegenOptions shader = device;
   shader.robust_buffer_loads = false;
   std::vector<u32> device_spirv;
@@ -1106,16 +1115,130 @@ void CheckRobustBufferLoads(VulkanHarness *vulkan) {
     device_words = RunCollect(vulkan, device_test, Data, &device_spirv);
   }
   {
+    // The alignment-4 device may round an odd range up in its descriptor. Compare against
+    // the renderer's actual whole-dword binding contract on that device, in BOTH paths.
+    if (vulkan->RobustStorageAlignment() == 4u) {
+      test.storage_buffer_range_bytes = RangeBytes & ~3u;
+    }
     ScopedCodegenOptions scope(shader);
     shader_words = RunCollect(vulkan, test, Data, &shader_spirv);
   }
   RequireEqualWords(name, "shader-checked loads", expected, shader_words);
   RequireEqualWords(name, "device-checked loads", expected, device_words);
+  if (ShaderRecompiler::Spirv::GetHostBufferRobustness().null_descriptor_for_short_ranges) {
+    Require(name, "AMD hardware bounds enabled",
+            CountSpirv(device_spirv, "OpArrayLength") < CountSpirv(shader_spirv, "OpArrayLength"),
+            "AMD device path did not remove descriptor length checks");
+  }
   std::printf("[codegen] %-32s ok (OpArrayLength %zu -> %zu, OpBranchConditional %zu -> %zu)\n",
               name, CountSpirv(shader_spirv, "OpArrayLength"),
               CountSpirv(device_spirv, "OpArrayLength"),
               CountSpirv(shader_spirv, "OpBranchConditional"),
               CountSpirv(device_spirv, "OpBranchConditional"));
+}
+
+// Read/write descriptors share backing but have independent ranges. Test every partial final
+// dword, true null descriptors, the renderer's alignment prefixes, and an index that would wrap
+// a driver's 32-bit byte address after adding the prefix. Output stores retain shader bounds.
+void CheckRobustBufferRanges(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenRobustBufferRanges";
+  const auto host = ShaderRecompiler::Spirv::GetHostBufferRobustness();
+  if (!host.null_descriptor_for_short_ranges) {
+    std::printf("[codegen] %-32s skipped (AMD bounds pilot unavailable or disabled)\n", name);
+    return;
+  }
+  constexpr u32 OutputBase = 128u;
+  constexpr u32 Outputs = 9u;
+  TestCase test;
+  test.name = name;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  test.initial.assign(OutputBase + Outputs, 0u);
+  for (u32 i = 0; i < OutputBase; ++i) {
+    test.initial[i] = 0x80a0c0e0u + i * 0x01010101u;
+  }
+  test.initial[OutputBase - 1u] = 0xfffffffcu;
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 1, 0u);
+  const auto load = [&](u32 opcode, u32 dst, u32 offset, u32 address = 1u) {
+    code.push_back(EncodeMubuf0(opcode, offset));
+    code.push_back(EncodeMubuf1(dst, 0, address));
+  };
+  load(0x0c, 10, 0); // dword 0
+  load(0x0c, 11, 4); // dword 1
+  load(0x08, 12, 0); // ubyte in dword 0
+  load(0x0a, 13, 2); // ushort in dword 0
+  // Fetch the huge offset at runtime so translation cannot fold away the carry checks.
+  code.push_back(EncodeMubuf0(0x0c, 4u * (OutputBase - 1u)));
+  code.push_back(EncodeMubuf1(2, 12, 1));
+  load(0x0c, 14, 0, 2); // index 2^30-1 + alignment prefix
+  code.push_back(EncodeMubuf0(0x0c, 4u * OutputBase)); // initially zero, full output descriptor
+  code.push_back(EncodeMubuf1(3, 12, 1));
+  code.push_back(EncodeVop1(0x02, 25, Vgpr(3))); // GPU-produced zero SOFFSET
+  for (const auto [dst, offset] : {std::array<u32, 2>{20, 0}, std::array<u32, 2>{21, 4}}) {
+    code.push_back(EncodeSmem0(0x08, dst));
+    code.push_back(EncodeSmem1(offset, 25));
+  }
+  code.push_back(EncodeVop1(0x02, 24, Vgpr(2))); // v_readfirstlane s24, v2
+  code.push_back(EncodeSmem0(0x08, 22));
+  code.push_back(EncodeSmem1(4, 24)); // aligned carry past 4 GiB
+  code.push_back(EncodeSop2(0x00, 24, 24, InlineU32(3))); // s24 = 0xffffffff
+  code.push_back(EncodeSmem0(0x08, 23));
+  code.push_back(EncodeSmem1(1, 24)); // unaligned carry past 4 GiB
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 15, 20));
+  code.push_back(EncodeVop1(0x01, 16, 21));
+  code.push_back(EncodeVop1(0x01, 17, 22));
+  code.push_back(EncodeVop1(0x01, 18, 23));
+  // OOB stores, including subword read/modify/write, must leave the backing untouched.
+  AppendVMovLiteral(&code, 19, 0xcafebabeu);
+  for (const u32 opcode : {0x1cu, 0x18u, 0x1au}) {
+    code.push_back(EncodeMubuf0(opcode, 12));
+    code.push_back(EncodeMubuf1(19, 0, 1));
+  }
+  for (u32 k = 0; k < Outputs; ++k) {
+    code.push_back(EncodeMubuf0(0x1c, 4u * (OutputBase + k)));
+    code.push_back(EncodeMubuf1(10u + k, 12, 1));
+  }
+  AppendEnd(&code);
+  auto device = GetCodegenOptions();
+  device.robust_buffer_loads = true;
+  device.srt_variant_reads = true;
+  auto shader = device;
+  shader.robust_buffer_loads = false;
+  u32 cases = 0;
+  for (const u32 prefix : {0u, 4u, 16u, 252u}) {
+    for (const u32 bytes : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u}) {
+      test.storage_buffer_offsets = {prefix, 0};
+      test.storage_buffer_descriptor_bytes = {prefix + bytes, VK_WHOLE_SIZE};
+      auto device_test = test;
+      device_test.storage_buffer_descriptor_bytes[0] =
+          ShaderRecompiler::Spirv::StorageBufferDwordRange(prefix + bytes, host);
+      test.storage_buffer_descriptor_bytes = device_test.storage_buffer_descriptor_bytes;
+      std::vector<u32> device_words;
+      std::vector<u32> shader_words;
+      {
+        ScopedCodegenOptions scope(device);
+        device_words = RunCollect(vulkan, device_test, test.initial.size());
+      }
+      {
+        ScopedCodegenOptions scope(shader);
+        shader_words = RunCollect(vulkan, test, test.initial.size());
+      }
+      auto expected = test.initial;
+      const auto first = bytes >= 4u ? test.initial[prefix / 4u] : 0u;
+      const auto second = bytes >= 8u ? test.initial[prefix / 4u + 1u] : 0u;
+      const std::array<u32, Outputs> values = {first, second, first & 0xffu,
+                                               first >> 16u, 0u, first, second, 0u, 0u};
+      std::copy(values.begin(), values.end(), expected.begin() + OutputBase);
+      RequireEqualWords(name, "shader ranges", expected, shader_words);
+      RequireEqualWords(name, "hardware ranges/null/carry", expected, device_words);
+      ++cases;
+    }
+  }
+  std::printf("[codegen] %-32s ok (%u ranges/prefixes, hardware vs shader)\n", name, cases);
 }
 
 // Random finite f32 with a moderate exponent, so products and sums stay normal.
@@ -2056,6 +2179,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckPackRtz(vulkan);
   CheckFloatToIntSaturation(vulkan);
   CheckRobustBufferLoads(vulkan);
+  CheckRobustBufferRanges(vulkan);
 }
 
 } // namespace CodegenTests
