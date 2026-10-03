@@ -770,9 +770,15 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
 	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(predicate);
-	const auto low    = state.builder.AllocateId();
-	const auto high   = state.builder.AllocateId();
 	const auto any    = state.builder.AllocateId();
+	if (WaveHalvesInHostSubgroup(state)) {
+		// Each 32-lane half of the host subgroup is its own guest wave (VCCZ/EXECZ per wave).
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any,
+		                          EmitOwnWaveHalfWord(state, ballot), ConstantU32(state, 0));
+		return any;
+	}
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any,
@@ -803,6 +809,18 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto first  = ctx.FirstLane(ballot);
+	if (WaveHalvesInHostSubgroup(state)) {
+		// Each 32-lane half of the host subgroup is its own guest wave, so the value is uniform
+		// per half only: no MarkLaneReadUniform. With the half's EXEC == 0 it reads the half's
+		// lane 0.
+		const auto active = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active,
+		                          EmitOwnWaveHalfWord(state, ballot), ConstantU32(state, 0));
+		const auto lane = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), lane, active, first,
+		                          EmitOwnWaveHalfBase(state));
+		return ctx.Shuffle(inst, 0, lane);
+	}
 	// With EXEC == 0, V_READFIRSTLANE_B32 reads lane 0; FindLSB of an empty ballot is -1.
 	uint32_t any_bits = ConstantU32(state, 0);
 	for (uint32_t word = 0; word < 4u; word++) {
@@ -856,6 +874,18 @@ static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (WaveHalvesInHostSubgroup(state)) {
+		// Each 32-lane half of the host subgroup is its own guest wave: the lane is the guest
+		// wave's (wave32 reads its low 5 bits), offset into the invocation's own half. The value
+		// is uniform per half only (no MarkLaneReadUniform), and a native subgroup reduction
+		// (KYTY_LANE_REDUCTIONS) would combine both waves, so the emulated scan stays.
+		const auto lane =
+		    EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 31));
+		return ctx.Shuffle(inst, 0,
+		                   EmitAddU32(state, EmitLaunchedLaneAtOrBelow(state, lane),
+		                              EmitOwnWaveHalfBase(state)));
+	}
 	if (GetCodegenOptions().lane_reductions) {
 		if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {
 			// One reduction per wave: the second half of a wave64 that one invocation runs
@@ -866,15 +896,22 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return EmitLaneReduction(ctx, *reduction);
 		}
 	}
-	// V_READLANE's lane is an SGPR, M0 or a constant, so the shuffle's lane is uniform too.
-	return MarkLaneReadUniform(ctx, inst, ctx.Shuffle(inst, 0, ctx.Arg(inst, 1)));
+	// V_READLANE's lane is an SGPR, M0 or a constant, so the shuffle's lane is uniform too (so is
+	// the launched lane chosen for it: the launched lanes are the same in every invocation).
+	return MarkLaneReadUniform(
+	    ctx, inst, ctx.Shuffle(inst, 0, EmitLaunchedLaneAtOrBelow(state, ctx.Arg(inst, 1))));
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto hit   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), hit,
-	                          EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2));
+	// In a 64-lane host subgroup split into two guest waves the lane is within the own half.
+	const auto lane = WaveHalvesInHostSubgroup(state)
+	                      ? EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                                      EmitSubgroupLocalInvocationId(state),
+	                                      ConstantU32(state, 31))
+	                      : EmitSubgroupLocalInvocationId(state);
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), hit, lane, ctx.Arg(inst, 2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, hit, ctx.Arg(inst, 1),
 	                                                ctx.Arg(inst, 0));
 }
@@ -915,11 +952,36 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-	const auto shuffled = ctx.Shuffle(inst, 0, target);
+	const auto launched = EmitLaunchedLaneAtOrBelow(state, target);
+	const auto shuffled = ctx.Shuffle(inst, 0, launched);
 	uint32_t   result   = shuffled;
 	if (!flags.fetch_inactive) {
-		const auto source_exec = ctx.Shuffle(inst, 3, target);
-		result                 = state.builder.AllocateId();
+		// A lane the host did not launch is active if the guest switched it on, which only the
+		// scalar EXEC copy records (arguments 4 and 5: EXEC_LO and EXEC_HI; a wave32's EXEC_LO is
+		// its own wave's word, see Frontend::GuestWaveMask).
+		const auto in_high = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpLogicalAnd, TypeBool(state), in_high,
+		    ConstantBool(state, state.program.wave_size == 64u),
+		    Binary(state, spv::OpINotEqual, TypeBool(state),
+		           EmitBinaryU32(state, spv::OpBitwiseAnd, target, ConstantU32(state, 32)),
+		           ConstantU32(state, 0)));
+		const auto exec_word = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), exec_word, in_high,
+		                          ctx.Arg(inst, 5), ctx.Arg(inst, 4));
+		const auto exec_bit = EmitBinaryU32(
+		    state, spv::OpBitwiseAnd,
+		    EmitBinaryU32(state, spv::OpShiftRightLogical, exec_word,
+		                  EmitBinaryU32(state, spv::OpBitwiseAnd, target, ConstantU32(state, 31))),
+		    ConstantU32(state, 1));
+		const auto was_launched = state.builder.AllocateId();
+		const auto source_exec  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), was_launched, launched, target);
+		state.builder.AddFunction(
+		    spv::OpSelect, TypeBool(state), source_exec, was_launched,
+		    ctx.Shuffle(inst, 3, launched),
+		    Binary(state, spv::OpINotEqual, TypeBool(state), exec_bit, ConstantU32(state, 0)));
+		result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
 		                          ConstantU32(state, 0));
 	}

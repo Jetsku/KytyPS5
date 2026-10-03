@@ -33521,6 +33521,181 @@ TestCase VectorPermlanex16() {
   return test;
 }
 
+// The lighting shaders' wave-wide OR in a partly launched wave (BryanKAdams/KytyPS5 067e8826):
+// S_ORN2_SAVEEXEC turns on every lane, V_CNDMASK zeroes the lanes outside the launched mask, DPP
+// row_shr scans each row, wave64 adds each row's pair with V_PERMLANEX16, and V_READLANE takes
+// each row's (wave32) or half's (wave64) last lane. The host never launched the wave's last lanes,
+// so those reads take the highest launched lane below, which holds what the guest's last lane
+// holds. A wave64 half (wave32 row) with no launched lane reads the other half's OR, which leaves
+// the combined OR exact. With KYTY_LANE_REDUCTIONS on (the default), the read of a scan becomes a
+// native reduction instead, which reads such a half as 0 (exact); the expectation follows the
+// current option, and the --wave-halves-only runner checks both.
+TestCase VectorWaveOrReduceWithUnlaunchedLanes(u32 wave_size, u32 threads) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(31), 0)); // v1 = lane & 31
+  AppendVop3(&code, 0x11a, 2, Vgpr(1), InlineU32(1));     // v2 = 1 << v1
+  code.push_back(EncodeSop1(0x04, 10, 126));              // s[10:11] = exec
+  code.push_back(EncodeSop1(0x28, 12, 10));               // exec = s[10:11] | ~exec
+  AppendVop3(&code, 0x101, 3, InlineU32(0), Vgpr(2), 10); // v3 = launched ? v2 : 0
+  for (const u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(0x1c, 3, 250, 3)); // v3 |= v3 row_shr:shift
+    code.push_back(EncodeVop2Dpp(3, 0x110u + shift));
+  }
+  if (wave_size == 64u) {
+    // v4 = lane 15 of the paired row, bound_ctrl; v3 |= v4
+    AppendVop3(&code, 0x378, 4, Vgpr(3), 193, 193, 0, 2);
+    code.push_back(EncodeVop2(0x1c, 3, Vgpr(4), 3));
+  }
+  code.push_back(EncodeSop1(0x04, 126, 12)); // exec = s[12:13]
+  const u32 last = wave_size == 64u ? 31u : 15u;
+  AppendVop3(&code, 0x360, 20, Vgpr(3), InlineU32(last));
+  AppendVop3(&code, 0x360, 21, Vgpr(3), InlineU32(2u * last + 1u));
+  code.push_back(EncodeSop2(0x10, 22, 20, 21));
+  AppendStoreSgpr(&code, 20, 0);
+  AppendStoreSgpr(&code, 21, 1);
+  AppendStoreSgpr(&code, 22, 2);
+  AppendEnd(&code);
+
+  const auto bits = [](u32 first, u32 end) {
+    u32 mask = 0;
+    for (u32 lane = first; lane < end; lane++) {
+      mask |= 1u << (lane % 32u);
+    }
+    return mask;
+  };
+  const u32 split = last + 1u;
+  const u32 low = bits(0, std::min(threads, split));
+  u32 high = bits(split, std::max(threads, split));
+  if (threads <= split && !ShaderRecompiler::GetCodegenOptions().lane_reductions) {
+    // The emulated scan reads the highest launched lane below. A native reduction
+    // (KYTY_LANE_REDUCTIONS) counts unlaunched lanes as the identity: 0, as on the guest.
+    high = low;
+  }
+  TestCase test;
+  // Names outlive the case (const char*): one per launched shape.
+  static std::map<std::pair<u32, u32>, std::string> names;
+  test.name = names
+                  .try_emplace({wave_size, threads},
+                               "VectorWaveOrReduceWithUnlaunchedLanesW" +
+                                   std::to_string(wave_size) + "T" + std::to_string(threads))
+                  .first->second.c_str();
+  test.code = std::move(code);
+  test.expected = {low, high, low | high};
+  test.opcodes = {O::V_AND_B32,     O::V_LSHLREV_B32,      O::S_MOV_B64,
+                  O::S_ORN2_SAVEEXEC_B64, O::V_CNDMASK_B32, O::V_OR_B32,
+                  O::V_READLANE_B32, O::S_OR_B32,          O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (wave_size == 64u) {
+    test.opcodes.push_back(O::V_PERMLANEX16_B32);
+  }
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A wave32 vertex shader may run in a 64-lane host subgroup (drivers need not take a required
+// subgroup size for vertex stages; the RX 9070 XT reports requiredSubgroupSizeStages 0xf0), which
+// then holds two guest waves (BryanKAdams/KytyPS5 8f02ad19, KYTY_DEBUG_WAVE_HALVES). Host-side
+// check of the emitted SPIR-V: V_READFIRSTLANE takes the first lane of the invocation's own 32-lane
+// word (FindILsb plus the half's base) instead of the subgroup's (OpGroupNonUniformBallotFindLSB),
+// the NGG MERGED_WAVE_INFO in s3 carries the wave id lane / 32 (two waves: 0x20000020 | wave << 24),
+// and the module declares the lane id it needs although the IR has no LaneId of its own. Wave64
+// vertex and wave32 compute shaders keep the subgroup-wide first lane. Fails with
+// KYTY_DEBUG_WAVE_HALVES=0.
+void CheckWave32VertexHalves() {
+  constexpr const char *name = "Wave32VertexHalves";
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble emitted SPIR-V");
+    return text;
+  };
+  const auto compile_vertex = [&](u32 wave_size, bool lone_read) {
+    std::vector<u32> code;
+    if (lone_read) {
+      // Only V_READFIRSTLANE: no MBCNT and no NGG system SGPR read, so no LaneId in the IR.
+      code.push_back(EncodeVop1(0x02, 20, Vgpr(5))); // v_readfirstlane_b32 s20, v5 (vertex id)
+      code.push_back(EncodeVop1(0x01, 1, 20));       // v_mov_b32 v1, s20
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(1, 1, 1, 1));
+    } else {
+      code.push_back(EncodeVop1(0x01, 2, InlineU32(0)));   // v_mov_b32 v2, 0
+      code.push_back(EncodeVop2(0x23, 1, 193, 2));         // v_mbcnt_lo_u32_b32 v1, -1, v2
+      code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));       // v_readfirstlane_b32 s20, v1
+      code.push_back(EncodeVop1(0x01, 3, 20));             // v_mov_b32 v3, s20
+      code.push_back(EncodeVop1(0x01, 4, 3));              // v_mov_b32 v4, s3
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(1, 3, 4, 1));
+    }
+    AppendEnd(&code);
+    std::array<u32, 16> user_data{};
+    ShaderVertexInputInfo vertex{};
+    vertex.wave_size = wave_size;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Vertex;
+    options.wave_size = wave_size;
+    options.user_data_base = 8;
+    options.user_data = user_data;
+    options.input_info.vertex = &vertex;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, {});
+    Require(name, "SPIR-V emit", !result.spirv.empty(), "recompiler returned empty SPIR-V");
+    ValidateSpirv(name, result.spirv);
+    return disassemble(result.spirv);
+  };
+
+  const auto halves = compile_vertex(32, false);
+  Require(name, "wave32 vertex first lane",
+          halves.find("FindILsb") != std::string::npos &&
+              halves.find("OpGroupNonUniformBallotFindLSB") == std::string::npos,
+          "V_READFIRSTLANE of a wave32 vertex shader took the 64-lane subgroup's first lane "
+          "instead of its own guest wave's");
+  Require(name, "wave32 vertex NGG wave info",
+          halves.find(" 536870944") != std::string::npos,
+          "s3 (MERGED_WAVE_INFO) of a wave32 vertex shader does not describe two waves "
+          "(0x20000020 | wave << 24)");
+  Require(name, "wave32 vertex lane id",
+          halves.find("BuiltIn SubgroupLocalInvocationId") != std::string::npos,
+          "the split subgroup did not declare SubgroupLocalInvocationId");
+
+  const auto lone = compile_vertex(32, true);
+  Require(name, "lone first-lane read",
+          lone.find("BuiltIn SubgroupLocalInvocationId") != std::string::npos &&
+              lone.find("FindILsb") != std::string::npos,
+          "a wave32 vertex shader whose IR has no LaneId did not declare the lane id it needs");
+
+  const auto wave64 = compile_vertex(64, false);
+  Require(name, "wave64 vertex unchanged",
+          wave64.find("OpGroupNonUniformBallotFindLSB") != std::string::npos &&
+              wave64.find(" 536870944") == std::string::npos,
+          "a wave64 vertex shader was split into wave halves");
+
+  TestCase compute;
+  compute.name = name;
+  compute.code.push_back(EncodeVop1(0x02, 20, Vgpr(0))); // v_readfirstlane_b32 s20, v0
+  AppendStoreSgpr(&compute.code, 20, 0);
+  AppendEnd(&compute.code);
+  compute.initial = {0};
+  compute.expected = {0};
+  compute.compute_info.threads_num[0] = 32;
+  compute.compute_info.threads_num[1] = 1;
+  compute.compute_info.threads_num[2] = 1;
+  compute.compute_info.wave_size = 32;
+  compute.compute_info.thread_ids_num = 1;
+  compute.has_compute_info = true;
+  compute.required_spirv = {"OpGroupNonUniformBallotFindLSB"};
+  compute.forbidden_spirv = {"FindILsb"};
+  CompileCase(compute, 64);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 TestCase VectorPermlane16FetchInactiveZero() {
   using O = ShaderOpcode;
 
@@ -43477,6 +43652,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
+  cases.push_back(VectorWaveOrReduceWithUnlaunchedLanes(64, 64));
+  cases.push_back(VectorWaveOrReduceWithUnlaunchedLanes(64, 40));
+  cases.push_back(VectorWaveOrReduceWithUnlaunchedLanes(64, 20));
+  cases.push_back(VectorWaveOrReduceWithUnlaunchedLanes(32, 20));
+  cases.push_back(VectorWaveOrReduceWithUnlaunchedLanes(32, 10));
   cases.push_back(VectorDpp8Captured(false));
   cases.push_back(VectorDpp8Captured(true));
   AddCase(VectorDppQuadPermuteReverse);
@@ -49035,6 +49215,27 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-halves-only") == 0) {
+    // Wave32 vertex shaders in 64-lane host subgroups (KYTY_DEBUG_WAVE_HALVES) and reads of lanes
+    // the host did not launch (BryanKAdams/KytyPS5 8f02ad19, 067e8826). No dynamic feedback-loop
+    // state needed (the RX 9070 XT lacks it).
+    CheckWave32VertexHalves();
+    VulkanHarness vulkan(false);
+    const auto saved = ShaderRecompiler::GetCodegenOptions();
+    for (const bool reductions : {true, false}) {
+      auto options = saved;
+      options.lane_reductions = reductions;
+      ShaderRecompiler::SetCodegenOptions(options);
+      std::printf("[compute] KYTY_LANE_REDUCTIONS=%d\n", reductions ? 1 : 0);
+      for (const auto &[wave_size, threads] :
+           {std::pair{64u, 64u}, std::pair{64u, 40u}, std::pair{64u, 20u},
+            std::pair{32u, 32u}, std::pair{32u, 20u}, std::pair{32u, 10u}}) {
+        RunCase(&vulkan, VectorWaveOrReduceWithUnlaunchedLanes(wave_size, threads));
+      }
+    }
+    ShaderRecompiler::SetCodegenOptions(saved);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {

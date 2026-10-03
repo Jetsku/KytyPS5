@@ -1158,9 +1158,14 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto high   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
-	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
-	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
+	// A wave32 in a 64-lane host subgroup (WaveHalvesInHostSubgroup): each half is its own guest
+	// wave and counts its own lanes.
+	const auto count =
+	    WaveHalvesInHostSubgroup(state)
+	        ? Unary(state, spv::OpBitCount, TypeU32(state), EmitOwnWaveHalfWord(state, ballot))
+	        : Binary(state, spv::OpIAdd, TypeU32(state),
+	                 Unary(state, spv::OpBitCount, TypeU32(state), low),
+	                 Unary(state, spv::OpBitCount, TypeU32(state), high));
 	// KYTY_PS_APPEND_LIVE_ELECTION: a helper invocation's atomic has no effect and returns an
 	// undefined value, so a pixel shader elects the first EXEC lane that is not a helper (the
 	// count above still covers every EXEC lane). With no such lane nobody consumes the result.

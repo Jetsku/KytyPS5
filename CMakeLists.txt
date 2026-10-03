@@ -1460,6 +1460,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
 	add_test(NAME wave_reductions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	# Wave32 vertex/LS/domain shaders in 64-lane host subgroups run as two guest waves
+	# (KYTY_DEBUG_WAVE_HALVES), and V_READLANE/V_PERMLANE(X)16 read unlaunched lanes as the highest
+	# launched lane below (BryanKAdams/KytyPS5 8f02ad19, 067e8826); VulkanHarness(false).
+	add_test(NAME wave_halves
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-halves-only)
 	# The set-associative sampler memo; KYTY_SET_REUSE_FRESH: default, off, verify.
 	add_test(NAME sampler_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampler-memo-only)

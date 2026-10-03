@@ -416,6 +416,26 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
+// Whether a wave32 guest program may run in a 64-lane host subgroup (vertex, LS and domain
+// stages: drivers need not take a required subgroup size there; the RX 9070 XT runs them as
+// wave64). Host lanes 32-63 are then a second guest wave, so lane choices and ballots stay within
+// the invocation's own 32 lanes (Frontend::WaveHalvesInHostSubgroup; KYTY_DEBUG_WAVE_HALVES=0
+// turns it off). From BryanKAdams/KytyPS5 8f02ad19.
+bool WaveHalvesInHostSubgroup(const EmitterState& state);
+// The invocation's own 32-lane word of a host ballot, per WaveHalvesInHostSubgroup.
+uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot);
+// 32 in host lanes 32-63, else 0 (the first host lane of the invocation's guest wave).
+uint32_t EmitOwnWaveHalfBase(EmitterState& state);
+// The lane that V_READLANE and V_PERMLANE(X)16 read for guest lane `lane`: the lane itself if the
+// host launched it, else the highest launched lane below it in the same guest wave (or wave64
+// half). A partly filled host wave has no invocations for its last lanes, which the guest still
+// has: a shader can switch them on (S_OR/S_ORN2_SAVEEXEC) and read them back, and a host shuffle
+// from them is undefined. Those lanes are outside every guest live mask, so a wave-wide
+// OR/AND/MIN/MAX (row scans with DPP row_shr, V_PERMLANEX16, V_READLANE of each row's last lane)
+// leaves them holding what the highest launched lane below holds. From BryanKAdams/KytyPS5
+// 067e8826.
+uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane);
+
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
