@@ -172,8 +172,8 @@ jobs:
           # RTX 50 test kit: scripts that start the launcher with different settings (RTX50-TEST-README.txt).
           Copy-Item -Path 'tools/test-kit/*' -Destination $release -Recurse -Exclude '.gitattributes'
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination (Join-Path $release 'test-presets/1-release.json')
-          if (@(Get-ChildItem -LiteralPath $release -Filter 'Test *.cmd').Count -ne 3) { throw 'Expected 3 test scripts.' }
-          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 4) { throw 'Expected 4 test presets.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $release 'Start game (RTX 50 workarounds).cmd'))) { throw 'Missing the start script.' }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 2) { throw 'Expected 2 presets.' }
           $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -185,5 +185,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip' --prerelease `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 RTX 50 test kit 4, 3 tests (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "Short test build for the RTX 50 crash at the title -> galaxy map step, not a regular release. int4b code, the swapchain fix from upstream pull request #1001 and debug options. Three tests: ReBAR texture staging off, delayed buffer freeing with a binding check, and Test 1 after an NVIDIA driver update. See RTX50-TEST-README.txt."
+            --title "U59 RTX 50 fix attempt (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "Fix attempt for the RTX 50 crash at the title -> galaxy map step, not a regular release. int4b code with the swapchain fix from upstream pull request #1001 and debug options; one start script switches on all three workarounds (ReBAR texture staging off, delayed buffer freeing, uniform lane reads) plus crash recording. Update the NVIDIA driver first. See RTX50-TEST-README.txt."
