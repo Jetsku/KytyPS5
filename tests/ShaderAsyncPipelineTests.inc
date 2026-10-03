@@ -3,6 +3,10 @@
 // only delays vkCreateGraphicsPipelines; it forwards unchanged to the real driver.
 // Run in a fresh process with KYTY_ASYNC_PIPELINES=1, KYTY_PIPELINE_LIBRARY=0,
 // KYTY_PROGRAM_CACHE=0, KYTY_PIPELINE_CACHE_SAVE=0 and KYTY_DRAW_PREP=off.
+// KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=1 releases the real driver when
+// the worker enters it; with KYTY_ASYNC_PIPELINE_WAIT_MS=1000 the first eligible
+// lookup must return the published pipeline. The ordinary case also runs with
+// KYTY_ASYNC_PIPELINE_WAIT_MS=0 to cover immediate deferral with the gate held.
 namespace AsyncPipelineTests {
 
 constexpr const char *Name = "AsyncPipelinePublication";
@@ -36,13 +40,16 @@ public:
 
   std::atomic<bool> entered{false}, released{false}, timed_out{false};
   std::atomic<unsigned> calls{0};
+  // Published by entered's release store; subsequent writer draws never change it.
+  std::thread::id first_thread{};
 
 private:
   static VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice device, VkPipelineCache cache,
       uint32_t count, const VkGraphicsPipelineCreateInfo *infos,
       const VkAllocationCallbacks *allocator, VkPipeline *pipelines) {
     auto &gate = *active_gate;
-    gate.calls.fetch_add(count, std::memory_order_relaxed);
+    if (gate.calls.fetch_add(count, std::memory_order_relaxed) == 0)
+      gate.first_thread = std::this_thread::get_id();
     gate.entered.store(true, std::memory_order_release);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!gate.released.load(std::memory_order_acquire)) {
@@ -109,6 +116,9 @@ std::vector<u32> PixelCode(bool writes) {
 void Check(VulkanHarness *vulkan) {
   Require(Name, "async configuration", PipelineCache::AsyncPipelinesEnabled(),
           "run this case with KYTY_ASYNC_PIPELINES=1 and KYTY_PIPELINE_LIBRARY=0");
+  const auto *publish_wait_env = std::getenv("KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT");
+  const bool publish_during_wait = publish_wait_env != nullptr &&
+      std::strcmp(publish_wait_env, "1") == 0;
   constexpr uintptr_t base = 0x000000020b000000ull;
   constexpr uint64_t size = 0x80000, alignment = 0x10000;
   constexpr uint64_t color_address = base + 0x20000, output_address = base + 0x40000;
@@ -205,26 +215,48 @@ void Check(VulkanHarness *vulkan) {
           query->programs, planned, generation);
     };
     prepare();
-    Require(Name, "cold defer", lookup(true) == nullptr,
-            "a new eligible pipeline was created synchronously instead of deferred");
-    gate.WaitEntered();
-    for (unsigned i = 0; i < 3; ++i) {
-      Require(Name, "pending defer", lookup(true) == nullptr, "pending pipeline was exposed");
-      Require(Name, "pending plan", plan() == PipelineCache::PlanLookup::Absent,
-              "draw-prep exposed an unpublished pipeline");
+    PipelineCache::Pipeline *published = nullptr;
+    if (publish_during_wait) {
+      // A missing WaitForQueuedPipeline would return null here, even though the
+      // helper subsequently releases the worker. The driver and cache remain real.
+      // Bound the helper independently of the lookup so a broken enqueue cannot hang.
+      std::jthread release([&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!gate.entered.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline)
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        gate.Release();
+      });
+      published = lookup(true);
+      release.join();
+      Require(Name, "published during eligible wait", published != nullptr &&
+          published->pipeline != nullptr && !published->pending && gate.entered.load() &&
+          !gate.timed_out.load(), "the first lookup did not return the pipeline published during its wait");
+    } else {
+      Require(Name, "cold defer", lookup(true) == nullptr,
+              "a new eligible pipeline was created synchronously instead of deferred");
+      gate.WaitEntered();
+      for (unsigned i = 0; i < 3; ++i) {
+        Require(Name, "pending defer", lookup(true) == nullptr, "pending pipeline was exposed");
+        Require(Name, "pending plan", plan() == PipelineCache::PlanLookup::Absent,
+                "draw-prep exposed an unpublished pipeline");
+      }
+      Require(Name, "one compile per key", gate.calls.load() == 1,
+              "repeated pending lookups queued duplicate driver compiles");
+      // A non-deferrable lookup must return the published object. Release from a
+      // helper so the recording thread must handle an already pending pipeline.
+      std::jthread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        gate.Release();
+      });
+      published = lookup(false);
+      release.join();
     }
-    Require(Name, "one compile per key", gate.calls.load() == 1,
-            "repeated pending lookups queued duplicate driver compiles");
-    // A non-deferrable lookup must return the published object. Release from a
-    // helper so the recording thread must handle an already pending pipeline.
-    std::thread release([&] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      gate.Release();
-    });
-    auto *published = lookup(false);
-    release.join();
     Require(Name, "published pipeline", published != nullptr && published->pipeline != nullptr &&
         !published->pending && !gate.timed_out.load(), "pending lookup did not wait for a real pipeline");
+    Require(Name, "background driver call", gate.entered.load(std::memory_order_acquire) &&
+        gate.first_thread != std::this_thread::get_id(),
+        "the first driver compile ran on the recording thread instead of a compiler worker");
     Require(Name, "published reuse", lookup(true) == published &&
         plan() == PipelineCache::PlanLookup::Found && planned == published && gate.calls.load() == 1,
         "published pipeline was not reused by draw-prep and recording lookups");

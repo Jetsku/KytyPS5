@@ -1499,8 +1499,8 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 		}
-		// Guest predication on the GPU (KYTY_PREDICATION_MODE=gpu, renderer/gpuPredication.h): only
-		// enabled when requested, so the default device is unchanged.
+		// Guest predication on the GPU (KYTY_PREDICATION_MODE=gpu, the default,
+		// renderer/gpuPredication.h): not enabled for drain or precise.
 		if (GpuPredication::ExtensionRequested() &&
 		    HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);

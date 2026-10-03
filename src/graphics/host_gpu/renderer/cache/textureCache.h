@@ -190,6 +190,14 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Diagnostics: prints the GPU-modified images IsRegionGpuModified finds over the range (first 32
+	// calls), for a guest read the renderer cannot make ready.
+	void LogGpuModifiedImages(uint64_t address, uint64_t size);
+	// A guest read the renderer must make ready (SRT readiness, RenderContext::
+	// SynchronizeGpuBackingForRead): GPU-modified images over the range that a CPU write definitely
+	// overwrote stop owning their bytes (their native contents are no longer a source of guest
+	// bytes; the next use rebuilds them from guest memory). Returns whether any did.
+	bool ReleaseCpuOverwrittenImages(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	// KYTY_META_CLEAR_MEMO=1 (default off; BryanKAdams/KytyPS5 c36bbff): the last answer is kept for

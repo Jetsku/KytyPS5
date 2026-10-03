@@ -41,9 +41,10 @@ namespace Libs::Graphics {
 // the payload, payload). Loading rejects the whole file on any header mismatch and keeps records
 // up to the first damaged one (bad magic, size or checksum: a truncated or corrupt tail).
 //
-// Threads: the file is read and indexed on a loader thread started by the constructor; lookups
-// wait for it. Records are immutable once added. Saves (whole file to "<file>.tmp", flushed, then
-// renamed over the file in one step) run on a saver thread, coalesced like the driver pipeline
+// Threads: the file is read once on a loader thread started by the constructor. Bounded batches
+// are validated by up to Settings::load_threads workers, then indexed in file order; lookups
+// wait for the complete load. Records are immutable once added. Saves (whole file to "<file>.tmp",
+// flushed, then renamed over the file in one step) run on a saver thread, coalesced like the driver pipeline
 // cache saves, and once more at shutdown (Flush); a draw never waits for file I/O.
 class ProgramDiskCache {
 public:
@@ -66,6 +67,9 @@ public:
 		uint64_t              interval_ns = 60'000'000'000ull;
 		// Tests: log nothing.
 		bool                  quiet = false;
+		// Validation workers including the loader (1: no helpers). Set before construction;
+		// loading starts immediately. Clamped to [1, 64] and to each batch's record count.
+		uint32_t              load_threads = 1;
 	};
 
 	// Canonical source key bytes and their digest.
@@ -104,6 +108,10 @@ public:
 		bool     header_rejected  = false;
 		uint64_t file_bytes       = 0;
 		uint64_t load_ns          = 0;
+		uint64_t read_ns          = 0; // file read/allocation; excludes header validation
+		uint64_t validate_ns      = 0; // framing, worker startup/join, checksum and decoding
+		uint64_t index_ns         = 0; // ordered publication and indexing
+		uint32_t load_workers     = 0; // maximum pool size including loader; 0: no framed records
 		uint64_t loaded_sources   = 0;
 		uint64_t loaded_permutations = 0;
 		uint64_t rejected_records = 0; // damaged tail

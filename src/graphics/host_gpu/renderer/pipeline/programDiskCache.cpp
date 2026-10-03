@@ -232,6 +232,7 @@ void ProgramDiskCache::Load() {
 		}
 		input.Close();
 	}
+	const auto read_ns = NowNs() - begin;
 	// Header: magic, format, identity, checksum of everything before it.
 	size_t offset          = 0;
 	bool   header_accepted = false;
@@ -254,40 +255,94 @@ void ProgramDiskCache::Load() {
 		std::scoped_lock lock(m_mutex);
 		m_stats.file_found      = found;
 		m_stats.file_bytes      = file.size();
+		m_stats.read_ns         = read_ns;
 		m_stats.header_rejected = found && !header_accepted;
 		if (header_accepted) {
 			m_file = std::move(file);
-			// Records until the end, or until the first damaged one (its size field cannot be
-			// trusted, so nothing after it is either).
+			// Frame bounded batches before dispatching any workers. An untrusted file full of
+			// tiny damaged records must not allocate a Record for every claimed boundary.
+			constexpr size_t BatchRecords = 4096;
+			std::vector<Record> batch;
+			batch.reserve(std::min(BatchRecords, (m_file.size() - offset) / RecordHeaderBytes));
 			while (offset < m_file.size()) {
-				const auto remaining = m_file.size() - offset;
-				if (remaining < RecordHeaderBytes) {
-					rejected++;
+				const auto validate_begin = NowNs();
+				batch.clear();
+				auto scan = offset;
+				bool damaged = false;
+				while (scan < m_file.size() && batch.size() < BatchRecords) {
+					const auto remaining = m_file.size() - scan;
+					if (remaining < RecordHeaderBytes) {
+						damaged = true;
+						break;
+					}
+					uint64_t size = 0;
+					std::memcpy(&size, m_file.data() + scan + 8, sizeof(size));
+					if (size > remaining - RecordHeaderBytes) {
+						damaged = true;
+						break;
+					}
+					const auto bytes = std::span<const uint8_t>(m_file).subspan(
+					    scan, static_cast<size_t>(RecordHeaderBytes + size));
+					batch.emplace_back().bytes = bytes;
+					scan += bytes.size();
+				}
+				if (!batch.empty()) {
+					// Each worker owns its slot; all spans point into immutable m_file storage.
+					std::atomic<size_t> next {0};
+					const auto validate = [&] {
+						for (;;) {
+							const auto slot = next.fetch_add(1, std::memory_order_relaxed);
+							if (slot >= batch.size()) break;
+							auto& record = batch[slot];
+							record.invalid = !ParseRecord(record.bytes, record);
+						}
+					};
+					const auto requested = std::min<size_t>(
+					    std::clamp(m_settings.load_threads, 1u, 64u), batch.size());
+					{
+						std::vector<std::jthread> workers;
+						workers.reserve(requested - 1);
+						for (size_t worker = 1; worker < requested; ++worker) {
+							try {
+								workers.emplace_back([&] {
+									Profiler::SetThreadName("ProgramCacheValidate");
+									validate();
+								});
+							} catch (const std::system_error&) {
+								// The loader and any helpers already created finish the same batch.
+								break;
+							}
+						}
+						m_stats.load_workers = std::max(
+						    m_stats.load_workers, static_cast<uint32_t>(workers.size() + 1));
+						validate();
+					} // All helpers join before any slot is inspected or indexed.
+				}
+				m_stats.validate_ns += NowNs() - validate_begin;
+				const auto index_begin = NowNs();
+				for (const auto& record: batch) {
+					if (record.invalid) {
+						damaged = true;
+						break;
+					}
+					const auto id = static_cast<uint32_t>(m_records.size());
+					m_records.push_back(record);
+					if (IndexRecord(id)) {
+						if (record.kind == RecordSource) m_stats.loaded_sources++;
+						else m_stats.loaded_permutations++;
+					} else {
+						// Keep duplicate/ambiguous handling and IDs in the original file order.
+						m_records[id].invalid = true;
+					}
+					offset += record.bytes.size();
+				}
+				m_stats.index_ns += NowNs() - index_begin;
+				if (damaged) {
+					// Never frame the next batch after a failure. The first damaged record's size
+					// is untrusted, so even successfully decoded records after it are discarded.
+					rejected = 1;
 					break;
 				}
-				uint64_t size = 0;
-				std::memcpy(&size, m_file.data() + offset + 8, sizeof(size));
-				if (size > remaining - RecordHeaderBytes) {
-					rejected++;
-					break;
-				}
-				const auto bytes = std::span<const uint8_t>(m_file).subspan(
-				    offset, static_cast<size_t>(RecordHeaderBytes + size));
-				Record record;
-				if (!ParseRecord(bytes, record)) {
-					rejected++;
-					break;
-				}
-				const auto id = static_cast<uint32_t>(m_records.size());
-				m_records.push_back(record);
-				if (IndexRecord(id)) {
-					if (record.kind == RecordSource) m_stats.loaded_sources++;
-					else m_stats.loaded_permutations++;
-				} else {
-					// Duplicate or ambiguous: kept out of the index and out of later saves.
-					m_records[id].invalid = true;
-				}
-				offset += bytes.size();
 			}
 			m_bytes = offset;
 		} else {
@@ -315,10 +370,13 @@ void ProgramDiskCache::Load() {
 			const auto stats = GetStats();
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Program cache: loaded {} sources and {} permutations ({:.1f} MiB) from {} in "
-			    "{:.1f} ms{}\n",
+			    "{:.1f} ms ({} workers; read {:.1f}, validate {:.1f}, index {:.1f} ms){}\n",
 			    stats.loaded_sources, stats.loaded_permutations,
 			    static_cast<double>(stats.file_bytes) / (1024.0 * 1024.0), path,
 			    static_cast<double>(stats.load_ns) / 1.0e6,
+			    stats.load_workers, static_cast<double>(stats.read_ns) / 1.0e6,
+			    static_cast<double>(stats.validate_ns) / 1.0e6,
+			    static_cast<double>(stats.index_ns) / 1.0e6,
 			    rejected != 0 ? "; dropped a damaged tail" : ""));
 		}
 	}

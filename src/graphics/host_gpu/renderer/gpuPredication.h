@@ -21,10 +21,10 @@ class RenderContext;
 // slow Crash Bandicoot 4 scene, so the GPU sat idle while the CPU waited and the other way round.
 //
 // KYTY_PREDICATION_MODE:
-//   drain (default)  the wait above, then a CPU read; predicated packets are skipped on the CPU.
+//   drain            the wait above, then a CPU read; predicated packets are skipped on the CPU.
 //   precise          read the value as WAIT_REG_MEM does (ReadGuestForCp's ownership checks): a
 //                    clean value needs no wait, a GPU-written one waits for its own readback.
-//   gpu              precise when the value is clean on the CPU; otherwise a one-invocation
+//   gpu (default)    precise when the value is clean on the CPU; otherwise a one-invocation
 //                    compute dispatch (gpu_predicate.comp) reads the 8 bytes where the command
 //                    processor meets the packet and writes a 32-bit predicate slot, and the
 //                    predicated direct draws are recorded inside VK_EXT_conditional_rendering
@@ -44,7 +44,7 @@ namespace GpuPredication {
 
 enum class Mode : uint8_t { Drain, Precise, Gpu };
 [[nodiscard]] Mode GetMode();
-// The device enables VK_EXT_conditional_rendering only for mode gpu (default device unchanged).
+// The device enables VK_EXT_conditional_rendering only for mode gpu.
 [[nodiscard]] bool ExtensionRequested();
 
 struct Totals {

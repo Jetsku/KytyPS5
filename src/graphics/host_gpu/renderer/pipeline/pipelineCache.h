@@ -208,7 +208,8 @@ public:
 	                              const GraphicsPrograms& programs);
 	// KYTY_ASYNC_PIPELINES=1 (default off; not with KYTY_PIPELINE_LIBRARY): GetGraphicsPipeline,
 	// except that with may_defer a pipeline not created yet is compiled on a background thread and
-	// null is returned until it is ready; the caller then skips the draw. Pipelines whose create
+	// null is returned until it is ready; the caller then skips the draw. The draw that queues the
+	// compile first waits up to KYTY_ASYNC_PIPELINE_WAIT_MS (20) for it. Pipelines whose create
 	// info GraphicsPipelineSnapshot cannot copy (mesh, tessellation) are still created here.
 	// Without may_defer it waits for a pending compile of the same key. sync_reason: why the draw
 	// may not be deferred, recorded with a pipeline created here (hang trace compiles.csv).
@@ -405,6 +406,9 @@ private:
 	// A background compile finished: publishes `pipeline` in the pending entry `target` (key).
 	void PublishAsyncPipeline(const GraphicsPipelineKey* key, Pipeline* target,
 	                          vk::Pipeline pipeline, uint64_t create_ns);
+	// The draw that queued `target` waits for it (KYTY_ASYNC_PIPELINE_WAIT_MS); m_mutex held once,
+	// released while waiting. True when it was published in time.
+	[[nodiscard]] bool WaitForQueuedPipeline(const Pipeline& target);
 	// Background compile finished: swaps `optimized` in for the linked pipeline cached under `key`.
 	void ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pipeline linked,
 	                           vk::Pipeline optimized);

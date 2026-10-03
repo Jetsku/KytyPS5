@@ -17,17 +17,17 @@ namespace Libs::Graphics::GpuPredication {
 Mode GetMode() {
 	static const Mode mode = [] {
 		const auto* value = std::getenv("KYTY_PREDICATION_MODE");
-		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "drain") == 0) {
-			return Mode::Drain;
+		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "gpu") == 0) {
+			return Mode::Gpu;
 		}
 		if (std::strcmp(value, "precise") == 0) {
 			return Mode::Precise;
 		}
-		if (std::strcmp(value, "gpu") == 0) {
-			return Mode::Gpu;
+		if (std::strcmp(value, "drain") == 0) {
+			return Mode::Drain;
 		}
 		EXIT("unknown KYTY_PREDICATION_MODE: %s (drain, precise, gpu)\n", value);
-		return Mode::Drain;
+		return Mode::Gpu;
 	}();
 	return mode;
 }

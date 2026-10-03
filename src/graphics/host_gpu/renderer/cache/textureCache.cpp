@@ -3807,7 +3807,9 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	}
 	std::scoped_lock lock {m_lock};
 	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	// Only images starting at address can match below. Their live prefix starts there too,
+	// so every candidate is indexed on its first page; size still selects the exact match.
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || owner->info.data.address != address) {
 			continue;
@@ -5301,6 +5303,62 @@ void TextureCache::RestoreContentIfUnwritten(ImageId id, const ContentMark& mark
 	if (image != nullptr && image->DefiniteWrites() == mark.definite_writes) {
 		image->AdoptContentSerial(mark.serial);
 	}
+}
+
+bool TextureCache::ReleaseCpuOverwrittenImages(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	bool released = false;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto& image = m_slot_images[id];
+		// A maybe-dirty image may still hold the only copy of its bytes: only a CPU write into the
+		// image's own bytes (InvalidateCpuWrite) releases it. Same rule as the alias
+		// materialization and SafeToDownload, which never take a CPU-dirty image's contents.
+		if (image.depth_id || !image.IsGpuModified() || !image.IsDefinitelyCpuDirty()) {
+			continue;
+		}
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("TextureCache: released CPU-overwritten GPU image 0x%016" PRIx64 "+0x%" PRIx64
+			            " (%s %ux%u) for a guest read at 0x%016" PRIx64 "\n",
+			            image.info.data.address, image.info.data.size,
+			            vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
+			            image.info.extent.height, address);
+		}
+		InvalidateCleanImageProofs(image.live.address, image.live.size,
+		                           Coherence::Source::ImageGpuClear);
+		image.ClearGpuModified();
+		released = true;
+	}
+	return released;
+}
+
+void TextureCache::LogGpuModifiedImages(uint64_t address, uint64_t size) {
+	static std::atomic<uint32_t> logged {0};
+	if (!GuestRange {address, size}.Valid() || logged.fetch_add(1, std::memory_order_relaxed) >= 32) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (image.depth_id || !image.IsGpuModified()) {
+			continue;
+		}
+		const auto& info = image.info;
+		std::fprintf(stderr,
+		             "  gpu-modified image id=%u live=0x%016" PRIx64 "+0x%" PRIx64 " data=0x%016" PRIx64
+		             "+0x%" PRIx64 " %s %ux%ux%u tiled=%d metadata=%d owns_all=%d buffer_modified=%d"
+		             " cpu_dirty=%d alias_owner=%d tick=%" PRIu64 " frame=%" PRIu64 "\n",
+		             static_cast<uint32_t>(id.index), image.live.address, image.live.size,
+		             info.data.address, info.data.size, vk::to_string(info.pixel_format).c_str(),
+		             info.extent.width, info.extent.height, info.extent.depth, info.IsTiled() ? 1 : 0,
+		             static_cast<int>(info.metadata.kind), image.OwnsAllBytes() ? 1 : 0,
+		             image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0,
+		             image.alias_owner ? 1 : 0, image.tick_accessed_last, image.frame_accessed_last);
+	}
+	std::fflush(stderr);
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

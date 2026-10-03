@@ -950,6 +950,15 @@ target_include_directories(program_cache_emergency_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(program_cache_emergency_tests Threads::Threads)
 endif()
+
+add_executable(program_cache_preload_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramCachePreloadTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp")
+target_link_libraries(program_cache_preload_tests common xxhash)
+target_include_directories(program_cache_preload_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(program_cache_preload_tests Threads::Threads)
+endif()
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -971,6 +980,8 @@ if(BUILD_TESTING)
 	set_tests_properties(emergency_save PROPERTIES TIMEOUT 10)
 	add_test(NAME program_cache_emergency COMMAND $<TARGET_FILE:program_cache_emergency_tests>)
 	set_tests_properties(program_cache_emergency PROPERTIES TIMEOUT 15)
+	add_test(NAME program_cache_preload COMMAND $<TARGET_FILE:program_cache_preload_tests>)
+	set_tests_properties(program_cache_preload PROPERTIES TIMEOUT 30)
 	set_tests_properties(http_wait_request PROPERTIES TIMEOUT 10)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
@@ -1095,6 +1106,9 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_PRIORITY_WAIT_SPIN_US=500")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	# SRT readiness over a render target the CPU overwrote (Crash 4, KYTY_DCC_GPU=1 EXIT).
+	add_test(NAME cpu_overwritten_image
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cpu-overwritten-image-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state
@@ -1805,7 +1819,15 @@ if(BUILD_TESTING)
 	add_test(NAME async_pipeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
 	set_tests_properties(async_pipeline PROPERTIES TIMEOUT 90
-		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=20;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+	add_test(NAME async_pipeline_wait_publication
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline_wait_publication PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=1000;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=1;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+	add_test(NAME async_pipeline_wait_zero
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline_wait_zero PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=0;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
 	add_test(NAME program_cache_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
 	add_test(NAME program_cache_gpu_verify
@@ -1965,6 +1987,7 @@ if(BUILD_TESTING)
 		pointer_scan_tests
 		emergency_save_tests
 		program_cache_emergency_tests
+		program_cache_preload_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

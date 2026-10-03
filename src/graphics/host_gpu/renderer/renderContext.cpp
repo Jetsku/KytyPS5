@@ -137,9 +137,28 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
-	if (!GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
-	    !m_command_scheduler.Active() || m_command_scheduler.Current().IsInvalid() ||
-	    !IsMapped(vaddr, size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+	const auto refused = [vaddr, size](const char* reason) {
+		// A failed SRT readiness retry otherwise reports only its caller's assert.
+		// Keep the rejected range and the first failing predicate without reading
+		// GPU-owned cache state from a thread that is not allowed to inspect it.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::fprintf(stderr, "GpuBackingRead: synchronization refused addr=0x%016" PRIx64
+			                     " size=0x%" PRIx64 " reason=%s\n", vaddr, size, reason);
+		}
+		return false;
+	};
+	if (!GuestGpu::IsGpuThread()) return refused("not-gpu-thread");
+	if (CommandScheduler::InDeferredOperation()) return refused("deferred-operation");
+	if (!m_command_scheduler.Active()) return refused("inactive-scheduler");
+	if (m_command_scheduler.Current().IsInvalid()) return refused("invalid-recording");
+	if (!IsMapped(vaddr, size)) return refused("unmapped-range");
+	// Old render targets whose memory the CPU rewrote (tables reusing it) give up their bytes:
+	// guest memory holds the current contents there.
+	(void)m_texture_cache.ReleaseCpuOverwrittenImages(vaddr, size);
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		refused("gpu-modified-image");
+		m_texture_cache.LogGpuModifiedImages(vaddr, size);
 		return false;
 	}
 
@@ -162,9 +181,15 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	}
 	// A publication may already have finished since the failed strict read. Such a range is
 	// ready too; callers still retry the actual read and bound their preparation retries.
-	return IsMapped(vaddr, size) && !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
-	       !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
-	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
+	if (!IsMapped(vaddr, size)) return refused("unmapped-after-wait");
+	if (m_buffer_cache.HasGpuDirtyBytes(vaddr, size)) return refused("gpu-dirty-after-wait");
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		refused("gpu-modified-image-after-wait");
+		m_texture_cache.LogGpuModifiedImages(vaddr, size);
+		return false;
+	}
+	if (m_buffer_cache.HasPendingBackingPublication(vaddr, size)) return refused("publication-pending-after-wait");
+	return true;
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {

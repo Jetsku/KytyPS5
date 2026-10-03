@@ -4069,6 +4069,95 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
   }
 
+  // Crash Bandicoot 4 with KYTY_DCC_GPU=1: the CPU writes shader tables into the memory of an old
+  // render target. The image stays GPU-modified (only CPU-dirty), so the SRT readiness read of
+  // those tables was refused until the retry loop ended the emulator. A read the renderer makes
+  // ready (SynchronizeGpuBackingForRead) now releases GPU-modified images a CPU write definitely
+  // overwrote; an image only maybe CPU-dirty (a write elsewhere on its page) keeps its bytes.
+  void CheckCpuOverwrittenImageRelease() {
+    constexpr const char *name = "CpuOverwrittenImageRelease";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t image_size = 0x800; // 16x32 R32Uint, half a tracker page
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    context.MapMemory(base, allocation_size);
+
+    auto &cache = context.GetTextureCache();
+    TextureCache::ImageDesc desc{};
+    desc.type = TextureCache::BindingType::Texture;
+    desc.info.data = {base, image_size};
+    desc.info.pixel_format = vk::Format::eR32Uint;
+    desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = {16, 32, 1};
+    desc.info.resources = {1, 1};
+    desc.info.pitch = 16;
+    desc.info.bytes_per_block = 4;
+    desc.info.samples = 1;
+    desc.info.tile_mode = Prospero::TileMode::kLinear;
+    desc.info.mip_layout[0] = {0, image_size, 16, 32};
+    desc.view_info.format = vk::Format::eR32Uint;
+    desc.view_info.type = vk::ImageViewType::e2D;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    desc.view_info.layer_count = 1;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    const auto id = cache.FindImage(desc);
+    (void)cache.FindTexture(id, desc);
+    cache.MarkGpuWritten(id);
+    const auto ready = [&] {
+      return OnGpuThread(context, [&] { return context.SynchronizeGpuBackingForRead(base, 4); });
+    };
+    Require(name, "GPU-written image owns its bytes",
+            cache.IsRegionGpuModified(base, 4) && !ready(),
+            "a read of a GPU-written image's bytes was made ready without a download");
+
+    // A CPU write on the image's page but outside its bytes: maybe dirty, still the owner.
+    cache.GetImage(id).InvalidateCpuWrite(base + 0xc00, 4);
+    Require(name, "maybe-dirty image keeps its bytes",
+            cache.GetImage(id).IsMaybeCpuDirty() && cache.IsRegionGpuModified(base, 4) &&
+                !ready(),
+            "an image only maybe overwritten gave up bytes nothing else holds");
+
+    // A CPU write into the image's bytes (tables reusing a render target's memory).
+    cache.GetImage(id).InvalidateCpuWrite(base, 4);
+    Require(name, "CPU-overwritten image releases its bytes",
+            ready() && !cache.IsRegionGpuModified(base, image_size) &&
+                !cache.GetImage(id).IsGpuModified() && cache.GetImage(id).IsCpuDirty(),
+            "the readiness read stayed refused over CPU-overwritten native contents");
+    Require(name, "release is done once",
+            !OnGpuThread(context, [&] { return cache.ReleaseCpuOverwrittenImages(base, 4); }),
+            "an image without GPU ownership was released again");
+
+    scheduler.Finish();
+    context.ShutdownGpu();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
     const auto context_owner = MakeRenderContext();
@@ -49162,6 +49251,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuMappedRangeLifecycle();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cpu-overwritten-image-only") == 0) {
+    // No dynamic feedback-loop state needed (RX 9070 XT lacks it).
+    VulkanHarness vulkan(false);
+    vulkan.CheckCpuOverwrittenImageRelease();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--stream-buffer-only") == 0) {
