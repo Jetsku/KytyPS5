@@ -21,6 +21,13 @@ foreach(lang IN ITEMS C CXX)
         if(SCCACHE_PROGRAM)
             set(CMAKE_${lang}_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
             message(STATUS "sccache enabled for ${lang}: ${SCCACHE_PROGRAM}")
+        elseif(CCACHE_PROGRAM AND (CMAKE_${lang}_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR
+                                   CMAKE_${lang}_COMPILER_ID STREQUAL "MSVC"))
+            # ccache with clang-cl (or cl) and Ninja hands Ninja no header dependencies
+            # (`ninja -t deps` shows "#deps 0"): editing a header then rebuilds nothing that
+            # includes it, and a changed class layout links old and new objects together.
+            message(STATUS "ccache not used for ${lang}: it breaks header dependencies with an "
+                           "MSVC-style compiler (set CMAKE_${lang}_COMPILER_LAUNCHER to force it)")
         elseif(CCACHE_PROGRAM)
             set(CMAKE_${lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
             message(STATUS "ccache enabled for ${lang}: ${CCACHE_PROGRAM}")
