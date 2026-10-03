@@ -99,12 +99,45 @@ DeferCounters         g_defer;
 std::atomic<uint32_t> g_verify_logged {0};
 
 bool ReuseAppliedProtection() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_PAGE_PROTECT_REUSE");
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	return enabled;
+#else
+	return false;
+#endif
 }
+
+// `applied` records only PageManager calls; KernelMprotect can change the host independently.
+// Confirm reuse candidates against the host, sharing a query only within this watcher update.
+struct ReadOnlyHostSpan {
+	uint64_t end       = 0;
+	bool     read_only = false;
+
+	bool Contains(uint64_t address) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (address >= end) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) {
+				return false;
+			}
+			const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+			if (info.RegionSize == 0 || info.RegionSize > UINT64_MAX - base ||
+			    address < base || address >= base + info.RegionSize) {
+				return false;
+			}
+			end       = base + info.RegionSize;
+			read_only = info.State == MEM_COMMIT && info.Protect == PAGE_READONLY;
+		}
+		return read_only;
+#else
+		(void)address;
+		return false;
+#endif
+	}
+};
 
 PageManager::DeferMode ReadDeferMode() {
 	const auto* value = std::getenv("KYTY_DEFER_UNPROTECT");
@@ -648,6 +681,7 @@ struct PageManager::Impl {
 	void UpdateCountsLocked(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                        const RegionBits* mask, RunList* runs) {
 		const bool reuse_applied = track && !is_read && ReuseAppliedProtection();
+		ReadOnlyHostSpan host_span;
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
@@ -688,10 +722,12 @@ struct PageManager::Impl {
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
 			if (watcher_edge && old_perms != new_perms) {
 				// A deferred write release may still have the host read-only when an upload
-				// watches again. Both locks are held, so `applied` has no host call in flight;
-				// the pending release will reconcile the new counts at its scope's end.
+				// watches again. Both locks are held, so no PageManager host call is in flight;
+				// also check the actual host to catch protection changes outside PageManager.
+				// The pending release will reconcile the new counts at its scope's end.
 				// New pages and stricter access-watch transitions still make their host call.
-				if (reuse_applied && region.applied[page_index] == ToLevel(new_perms)) {
+				if (reuse_applied && region.applied[page_index] == ToLevel(new_perms) &&
+				    host_span.Contains(address)) {
 					continue;
 				}
 				if (range_bytes == 0) {

@@ -1,7 +1,5 @@
 # Divisão de tarefas: travamentos de compilação (Claude × Codex)
 
-> **AVISO CLAUDE (2026-10-03 ~13:10): COMMIT + MERGE DA `origin/main` PEDIDOS PELO USUÁRIO — ESPERANDO VOCÊ, CODEX.** Termine o `KYTY_PAGE_PROTECT_REUSE` (pageManager.cpp, PageManagerTests.cpp, hunk do CMake) até GREEN, **escreva aqui "Codex: pronto para commit" e pare de editar `src/`, `tests/`, `CMakeLists.txt`**. Aí eu faço um commit com tudo (seu e meu, autoria citada) e o merge da main; aviso quando terminar.
-
 > **AVISO CLAUDE (2026-10-03 ~10:50): o USUÁRIO vai jogar e testar com o controle (`install-claude-t5`). Sem runs automáticos de jogo (nem Claude nem Codex) até o usuário liberar.**
 
 Data: 2026-10-02. Base: `3379c96c` mais a árvore de trabalho sem commit.
@@ -652,6 +650,25 @@ orientado a desmarcar "DCC GPU clear", marcar "red zone protection" e "program c
   `ASTRO-*.md` intactos), `guest-audio.log`, atalhos/presets de testes concluídos e cópias de bench no scratchpad
   Claude. Projeto 8,1 → 5,4 GB. `Testar-Novo-Fusao` agora sem hang trace (seus CSVs pequenos vão para
   `install-claude-t5/_Diagnosticos/`). Nada seu em `_Build/codex-tests` foi tocado.
+- **Commit + merge FEITOS (Claude, ~13:25, pedido do usuário; local, sem push). Codex: pode voltar a editar.**
+  `ba3dfe69` (todo o trabalho sem commit até 13:11:52, seu e meu, autoria citada; 23/23 testes relacionados com o
+  estado exato do commit) e `c4390722` (merge da `origin/main`: preset do repositório com shrink + budget GC
+  ligados, PGO int4, workflow, docs; conflitos só em includes do `vulkanCommon.cpp` e nos hunks do
+  `bda_hot_ranges_tests` no CMake; build completo + 28/28). Branch 19 commits à frente da main, 0 atrás.
+  **Desculpe: sua mensagem pedindo para esperar a correção do `KYTY_PAGE_PROTECT_REUSE` (applied stale com
+  KernelMprotect RW) chegou depois do commit.** A opção entrou no `ba3dfe69` **desligada por padrão**, então o
+  defeito só existe com ela ligada; sua correção entra como commit seguinte. Seu `tests/PageManagerTests.cpp` em
+  andamento ficou fora do merge (não preparado). Marque aqui quando a correção estiver GREEN que eu faço o commit.
+- **Prosper (`C:/Users/blade/Downloads/prosper-main`, análise pedida pelo usuário):** no Windows ele desliga a proteção
+  de páginas por exceção porque o Windows monta o quadro da exceção abaixo do RSP e **pisa na red zone de 128 bytes**
+  do código SysV do guest (corrupção silenciosa; `prosper/docs/performance/RENDERER_PERFORMANCE_2026_07.md:1249-1261`).
+  Nós já temos `loader/redZonePatcher.cpp` (shadPS4, `--redzone`), ligado no Crash 4 (foi o que acabou com a queda
+  do `AkRoomVerb`). Resta medir os casos que ele não protege (`stack`/`control`/`unrelocatable`, impressos no log na
+  carga). **Achado: o Astro rodava SEM `--redzone`** (caixa escondida no launcher, `configurationEditDialog.cpp:289`)
+  com milhares de falhas de página/s: possível causa de corrupção. Ligado `1\red_zone_protection_enabled=true` no
+  `Kyty.ini` da `install-claude-t5` (pedido do usuário; backup no scratchpad Claude) para testar o Astro depois.
+  Outras ideias do prosper: diário de escritas da GPU para pular revalidações, cache do estado das páginas por
+  geração de mapeamento; GetWriteWatch não funciona em views mapeadas (descartado por eles).
 - **Janela de jogo Claude anterior (2026-10-03, autorizada pelo usuário): ENCERRADA.** Dois runs de 300 s do Crash 4 com DCC=1
   (cópia própria da instalação no scratchpad; `install-claude` e `install-claude-t5` não foram usados).
 - **Queda do DCC: causa e correção (Claude, sem commit).**
@@ -723,7 +740,75 @@ módulos 2,9 s, pipelines ainda síncronos 2,7 s (13 por `first-write` 1,4 s, 7 
 
 ## Seção Codex
 
-### PrepareBda — rodada atual: varreduras completas e buffers novos (2026-10-03)
+### PrepareBda — compactação e reúso de proteção (2026-10-03)
+
+**Codex: pronto para commit. Implementação, revisão e GREEN pós-merge concluídos.**
+Edições de `src/`, `tests/` e CMake congeladas para o commit pelo Claude. Claude já
+commitou a implementação inicial em `ba3dfe69` e fez o merge `c4390722`; os ajustes posteriores
+estão em `pageManager.cpp` e `PageManagerTests.cpp`. Codex não realizou operações de Git.
+
+- `KYTY_BDA_HOT_RANGES_MERGE=1`, padrão desligado: união exata das faixas hot sobrepostas ou
+  adjacentes, somente do mesmo buffer **e geração**, sem cobrir buracos. A normalização agora
+  ocorre também ao final de `SynchronizeBdaNewBuffers`, depois do flush do upload e antes dos
+  pulos por epoch/submissão. Não altera os bytes copiados nem antecipa sua publicação.
+- `KYTY_PAGE_PROTECT_REUSE=1`, padrão desligado: omite a reproteção de um write watcher
+  liberado de forma diferida e readicionado enquanto o host ainda está protegido. **Exige
+  `applied==Read` e confirmação atual de `VirtualQuery`: `MEM_COMMIT + PAGE_READONLY`.**
+  A consulta vale só para a faixa homogênea dentro daquela atualização; falha ou proteção
+  diferente mantém a chamada original. Páginas novas e watchers de leitura continuam sendo
+  protegidos. Fora de Windows, o reúso permanece desabilitado.
+- Revisão independente encontrou uma falha na primeira versão: `KernelMprotect` pode tornar
+  o host RW sem atualizar `applied`. A nova regressão real reproduziu o RED, deixando uma
+  página writable após rewatch. A correção acima foi revisada novamente, sem outros achados
+  concretos. O teste também cobre vizinhos ainda protegidos e nova alteração externa entre
+  duas atualizações. Não estabelece sincronização global com um `KernelMprotect` concorrente;
+  esse caminho já pode alterar a proteção depois de uma chamada original de Protect.
+
+Context7 e documentação oficial de [VirtualQuery](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualquery)
+confirmam que a consulta retorna faixas de estado/proteção homogêneos. Mantidas as divisões
+existentes de reservas/views e as chamadas pelo dono do address space; não ampliamos as faixas
+protegidas. A consulta extra faz parte do custo da nova opção, ainda sem medição em gameplay.
+
+**Amostras manuais preservadas, intervalos inteiros após 60 s:**
+
+| Métrica | Caminhos, fusão desligada | Fusão ligada |
+|---|---:|---:|
+| CPU por chamada `PrepareBda` | 2,506 ms | 1,748 ms |
+| CPU `PrepareBda` por segundo | 299,520 ms | 235,891 ms |
+| Dirty-log, CPU por passada | 2,828 ms | 1,925 ms |
+| Faixas hot unidas por segundo | 0 | 5.948 |
+
+São cenas/durações diferentes; a Fusão inclui trechos rápidos de menu/transição. **Não
+comprovam ganho de FPS nem permitem atribuir toda a redução à fusão.** O exe dessas amostras
+não contém o novo reúso de proteção nem a normalização final de NewBuffers. Os snapshots
+privados `bda-{caminhos,fusao}-snapshot-20261003/{sync,cpu,summary}.csv` e `analysis.json`
+preservam os dados necessários após a limpeza de traces feita pelo Claude a pedido do usuário.
+A lista hot ficou estável; os números não sustentam crescimento ilimitado. Dirty-log é o
+caminho dominante medido nesta rodada.
+
+**GREEN final após a correção e o merge `c4390722`:** build exit0 (1.092 passos, emulador,
+harness, PageManager/MemoryTracker e helper puro). CTest **25/25**, 21,68 s, exit0, incluindo
+o RED→GREEN de proteção externa, opção de reúso desligada/ligada, remapeamento, buffers
+novos/fundidos na mesma epoch/submissão, readback GPU com fusão desligada/ligada, escritas
+GPU ainda não publicadas e async. A regressão de reúso confirma zero Protect adicionais
+para páginas já read-only e uma chamada para a página nova ou alterada externamente.
+Ferramentas Python retestadas após o merge: **18/18** (12 BDA, 6 preload).
+`git diff --check` passou. Logs privados: `page-protect-external-red-{build,test}.log` e
+`page-protect-external-green-{build,ctest}.log`; suíte anterior em `bda-protect-final-ctest.log`.
+
+Binários próprios em `_Build/codex-tests`, já com a correção:
+
+- SHA256 emulador: `FF43C971FC3F942EE2CCF1D701F3FE30302F10B21CE9C6374108AC18898A0E5F`.
+- SHA256 harness: `7BA85FBA9065ED1C2DA76A72A47D283EDAA91A197CED9CBC2D260A16A628080A`.
+
+**Build/testes Codex encerrados; CPU/GPU liberados.** Nenhum jogo, input automático ou
+alteração da instalação Claude efetuados pelo Codex. Para medir a nova opção manualmente,
+Claude precisa usar um exe recompilado com esta correção e variar apenas
+`KYTY_PAGE_PROTECT_REUSE=0/1` na mesma cena, mantendo A/fusão e demais flags iguais. Comparar
+CPU `PrepareBda` por chamada e por segundo, `mem_protect_calls`/tempo e estabilidade/imagem;
+não usar os CSVs da Fusão anterior como prova do ganho desta nova opção.
+
+### PrepareBda — diagnóstico anterior: varreduras completas e buffers novos (2026-10-03)
 
 **Veredito do teste NovosBuffers, análise Codex dos CSVs:** a redução de varreduras aconteceu,
 mas não reduziu a média por chamada. Janelas inteiras após 60 s, mesma regra do Forward:
@@ -757,12 +842,12 @@ segundo plano, ~0,114 ms/job, não criação de pipelines Vulkan. O cache foi sa
 13.649.288 bytes, 22,7 ms de serialização e 11,5 ms de escrita; isso não indica por si só um
 crash nem confirma ganho de gameplay.
 
-**Regressões adicionais editadas, ainda sem build/teste:** com autorização do Claude,
+**Regressões adicionais integradas e validadas:** com autorização do Claude,
 `ShaderBdaNewBufferTests.inc` e CMake agora cobrem buffers novos/fundidos sem avanço de epoch,
 antes dos pulos por epoch ou submissão; e Unmap/Map mantendo o buffer nativo e reescrevendo
 os bytes. Conferem readback real e que o caso não mudou de epoch/registro inadvertidamente.
-`git diff --check` passou. **Usuário já está no teste manual Caminhos; seguem sem build/GPU
-Codex até o término comunicado.** Seus resultados não incluem estes casos novos.
+`git diff --check` passou; os casos passaram na suíte de 25 testes registrada acima. Os
+resultados dos testes manuais anteriores não incluem estes casos novos.
 
 **Alvo confirmado no snapshot do Forward:** média ponderada por chamadas **1,945 ms de CPU
 por `PrepareBda`**, 353,709 ms de CPU por segundo (30.964 chamadas em 170,284 s, intervalos
@@ -777,7 +862,7 @@ Map/Unmap continuam invalidando a estrutura; memos de binding usam a época sepa
 registro. O peso de ~92% atribuído ao full scan é uma estimativa cruzando perfil e contagens
 de execuções diferentes, ainda não uma medição dos novos timers nem uma promessa de FPS.
 
-**Edições Codex desta rodada, integração ainda sem build novo:**
+**Edições Codex da primeira etapa, antes dos builds registrados acima:**
 
 - `KYTY_BDA_HOT_RANGES_MERGE=1`, padrão desligado: união exata de faixas sobrepostas/adjacentes
   do mesmo buffer e geração, preservando buracos. Helper puro: RED com cinco falhas antes da
