@@ -385,7 +385,7 @@ void Swapchain::Create() {
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
 			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-										        candidate.format == vk::Format::eR8G8B8A8Unorm;
+			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
 		                             });
 		if (it == surface.formats.end()) {
 			EXIT("no supported UNORM swapchain format\n");
@@ -424,10 +424,10 @@ void Swapchain::Create() {
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
 		m_extent.width =
 		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
-			           surface.capabilities.maxImageExtent.width);
+		               surface.capabilities.maxImageExtent.width);
 		m_extent.height =
 		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
-			           surface.capabilities.maxImageExtent.height);
+		               surface.capabilities.maxImageExtent.height);
 	}
 	if (m_extent.width == 0 || m_extent.height == 0) {
 		LOGF("Swapchain::Create(): surface currentExtent is zero while window is not minimized; "
@@ -629,7 +629,7 @@ bool Swapchain::NeedsResize() const {
 		// m_surface_extent_zero: the OS window exists but the compositor has not yet
 		// assigned a real extent. Re-query and only trigger a recreate once the extent
 		// is non-zero; otherwise return false to avoid a spinning recreate loop.
-		const_cast<WindowContext&>(m_window).RefreshSurfaceCapabilities();
+		m_window.RefreshSurfaceCapabilities();
 		const auto& caps   = m_window.surface_capabilities.capabilities;
 		const auto& extent = caps.currentExtent;
 		// Extent 0xFFFFFFFF means the surface size is determined by the swapchain;
@@ -640,7 +640,10 @@ bool Swapchain::NeedsResize() const {
 			                            m_window.graphic_ctx.screen_height > 0;
 			return drawable_ready;
 		}
-		return extent.width > 0 && extent.height > 0;
+		Common::LockGuard lock(m_window.mutex);
+		const bool drawable_ready = m_window.graphic_ctx.screen_width > 0 &&
+		                            m_window.graphic_ctx.screen_height > 0;
+		return drawable_ready && extent.width > 0 && extent.height > 0;
 	}
 	if (window_minimized) {
 		return true;
@@ -1265,7 +1268,7 @@ void Presenter::ClearLayer(int bus) {
 		return;
 	}
 	Common::LockGuard lock(m_impl->present_mutex);
-	auto&             layer = m_impl->layers[bus];
+	auto& layer = m_impl->layers[bus];
 	if (layer.frame != nullptr) {
 		m_impl->frames.Release(layer.frame);
 		layer = {};
