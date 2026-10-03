@@ -49,11 +49,14 @@ at the Astro Bot Sky Garden. This branch:
 
 - opens a larger window around each write fault, scaled automatically to the
   fault cost the emulator measures on the PC (`KYTY_FAULT_AHEAD_ADAPT`, on by
-  default; nothing to set). With a slow-fault simulation on Windows: 9 -> 21 fps;
+  default; nothing to set; Linux with `mprotect` starts at 1 MiB windows). With a
+  slow-fault simulation on Windows: about 9 -> 27 fps; in a WSL2 benchmark the
+  writer threads' stalls fell from 35-44 ms to about 1 ms per frame;
 - adds optional userfaultfd write-protection for guest write tracking
   (`KYTY_UFFD_WP=1`, off by default; untested in a game on Linux so far). It
   avoids `mprotect` for the per-frame protection changes: in a WSL2 benchmark
-  with 15 writing threads a fault cost about 11 us instead of about 230 us;
+  with 15 writing threads a fault cost about 11 us instead of about 230 us. With
+  the larger windows above, plain `mprotect` was still as fast in that benchmark;
 - logs the measured costs: a `Kyty platform:` line and `Kyty fault cost:` lines
   (at startup and every 60 s) with the kernel, the memory-map limit, whether
   userfaultfd is in use, and the per-fault and per-call costs.
@@ -66,19 +69,22 @@ To test it:
    default limit of 65530, `mprotect` fails and Kyty stops):
    `sudo sysctl -w vm.max_map_count=1048576` (until reboot; to keep it, put
    `vm.max_map_count=1048576` in `/etc/sysctl.d/99-kyty.conf`).
-3. Build this branch as above, then run the Astro Bot Sky Garden twice:
-   - A: with the preset as it is;
-   - B: with `"KYTY_UFFD_WP": "1"` added to `u59-preset.json`. The log should
+3. Build this branch as above, then run the Astro Bot Sky Garden three times:
+   - A: with the preset as it is and the launcher's "AMD CPU patch" off;
+   - B: as A, with `"KYTY_UFFD_WP": "1"` added to `u59-preset.json`. The log should
      then say `guest write tracking with userfaultfd write-protection
      (KYTY_UFFD_WP=1): on`. If it says `unavailable`, the kernel is too old or
-     userfaultfd is blocked, and everything runs as in A.
+     userfaultfd is blocked, and everything runs as in A;
+   - C: the faster of A and B with the "AMD CPU patch" on.
 4. Report the fps of each run with the `Kyty platform:` and `Kyty fault cost:`
    lines from the terminal or log.
 
 The launcher's "AMD CPU patch" emulates the `VRSQRTPS` instruction with a trap
-on every execution. On one Zen 3 CPU it raised the Sky Garden from about 8 to
-17 fps; on a Zen 4 CPU it lowered it from 34 to 18 fps. Try both settings and
-report which is faster.
+on every execution: at the Sky Garden about 140,000 traps per frame at about
+2 us each. On a Zen 4 CPU it lowered the Sky Garden from 34 to 18 fps and did
+not change the game's memory writes. On one Zen 3 CPU with an older build it
+raised the Sky Garden from about 8 to 17 fps; run C shows whether that still
+holds with this branch.
 
 ## Portability changes
 
