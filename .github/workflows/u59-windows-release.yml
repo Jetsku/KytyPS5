@@ -74,12 +74,21 @@ jobs:
             if (-not (Test-Path -LiteralPath "C:\LLVM-22.1.3\bin\$tool")) { throw "$tool missing" }
           }
 
+      # clang-cl names functions in anonymous namespaces after a hash of the source path on the compile
+      # command line, and PGO finds functions by name. The profile was recorded from C:\kyty-src, a
+      # junction to the checkout, so the release compiles from the same path (CMake keeps the junction).
+      - name: Map the source to the PGO path
+        shell: cmd
+        run: |
+          mklink /J C:\kyty-src "%GITHUB_WORKSPACE%"
+          git config --global --add safe.directory C:/kyty-src
+
       - name: Configure Release
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
-          set PGO_PROFILE=%GITHUB_WORKSPACE:\=/%/tools/pgo/u59-int3-sg-1.profdata
-          cmake -S . -B _Build/windows ^
+          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int4-sg-1.profdata
+          cmake -S C:\kyty-src -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
@@ -93,16 +102,52 @@ jobs:
             -DCMAKE_AR=%LLVM%/llvm-lib.exe ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
+      - name: Check the PGO source path
+        shell: pwsh
+        run: |
+          # The training build compiled C:\kyty-src\src\... spelled with backslashes; any other spelling
+          # renames every function in an anonymous namespace and loses its profile.
+          $ninja = Get-Content -LiteralPath '_Build/windows/build.ninja' -Raw
+          if (-not $ninja.Contains('C$:\kyty-src\src\emulator.cpp')) {
+            throw 'build.ninja does not compile C:\kyty-src\src\emulator.cpp: the PGO profile would only partly apply.'
+          }
+          Write-Host "MSVC tools $env:VCToolsVersion (the profile's standard-library code: 14.51.36231)"
+
       - name: Build and install
         shell: cmd
         run: |
+          rem -Wprofile-instr-missing (diagnostics only) reports, per file, the functions the profile has no data for.
+          rem clang-cl prepends CL to its arguments (_CL_ would land after CMake's "--" and count as a file).
+          set CL=-Wprofile-instr-missing
           cmake --build _Build/windows --target launcher kyty_emulator --parallel > pgo-build.log 2>&1
           set BUILD_EXIT=%ERRORLEVEL%
+          set CL=
           type pgo-build.log
           if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
-          rem Functions whose profile does not match this compile are optimized without it (not an error).
-          findstr /c:"profile data may be out of date" pgo-build.log || echo No PGO profile mismatch warnings.
           cmake --install _Build/windows --prefix _Build/windows/install
+
+      - name: Show build errors
+        if: failure()
+        shell: pwsh
+        run: |
+          # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first error lines as annotations.
+          if (Test-Path -LiteralPath 'pgo-build.log') {
+            $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-String -Pattern 'error|FAILED|fatal' | Select-Object -First 8)
+            if (-not $lines) { $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-Object -Last 8) }
+            foreach ($line in $lines) { Write-Host ('::error::' + "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')) }
+          } else { Write-Host '::error::pgo-build.log was not written' }
+      - name: Report PGO coverage
+        shell: pwsh
+        run: |
+          # Functions with mismatched or missing profile data are optimized without it (not an error). A local
+          # build of u59-int4-sg-1's commit from C:\kyty-src (VS 18.10, LLVM 22.1.3) reports 0 mismatched and
+          # 47 without data, all in the launcher's Qt moc file; a build from another path, about 2,500 more.
+          $log = Get-Content -LiteralPath 'pgo-build.log'
+          $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
+          $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'
+          $missing = & $sum 'profile data may be incomplete: of \d+ functions?, (\d+)'
+          Write-Host "PGO: $([int]$mismatched) functions with mismatched profile data, $([int]$missing) without profile data"
+          if ($mismatched -gt 0) { Write-Host "::warning::PGO: $mismatched functions have mismatched profile data" }
 
       - name: Package portable experimental runtime
         shell: pwsh
@@ -135,5 +180,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 integration: draw-run batching, possible device-lost fixes, upstream sync 2 (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "New since u59-windows-20261002-int2: draw-run batching is on in the bundled u59-preset.json (KYTY_DRAW_RUN, KYTY_DRAW_RUN_ACQUIRE, KYTY_DRAW_RUN_PUSH; about +2% fps in a same-process A/B at the Astro Bot Sky Garden start view). Possible fixes for device-lost (masterSemaphore) GPU hangs reported on RTX 40 and 50 series cards, none of them confirmed: S_MEMREALTIME reads the real GPU clock instead of a fixed placeholder (KYTY_REALTIME_CLOCK=0 restores the placeholder); a DPP read from a lane that EXEC disables keeps the destination, and DPP row scans become native subgroup reductions (KYTY_DPP_SKIP_INACTIVE=0, KYTY_LANE_REDUCTIONS=0); a shader dispatcher loop ends after 4096 block transitions (KYTY_DISPATCHER_CAP, 0 = no limit). Optional device-fault diagnostics: add KYTY_DEVICE_FAULT_DIAGNOSTICS=1 to u59-preset.json and, after a crash, send the console text from the '--- Device loss' line on, the _device_fault.nv-gpudmp file if one was written, the GPU model and the driver version (see U59-README.md). Upstream KytyPS5 sync 2: DualSense speaker and haptic audio over Bluetooth, in-game keys 1, 2 and 3 that cycle the controller's speaker volume, vibration and trigger-effect intensity, an audio popping fix, Hades II fixes, NetResolverAbort and more shader opcodes. Text that games draw with the system font (for example Astro Bot's galaxy-map prompts) uses the bundled Roboto font again instead of a blocky fallback. kyty_emulator is built with a new PGO profile recorded in Astro Bot. New flags from this update that are off by default stay off. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, three alternating runs each: 34.4 fps with int2, 35.7 fps with a local build of this source (within the spread between runs); dedicated VRAM 9.6 GB with int2, 9.4 GB with the local build. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch compiles shaders again. The upstream controller and audio changes were not tested by hand. See U59-README.md."
+            --title "U59 integration: lower VRAM use (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "New since u59-windows-20261002-int3: lower VRAM use, on in the bundled u59-preset.json. The shader recompiler emulates LDS in vertex and pixel shaders with a 32 KiB array per shader invocation, and the NVIDIA driver reserves memory for that array for every thread the GPU can keep resident (about 3.9 GiB on an RTX 3090) until the game exits. KYTY_FUNCTION_ARRAY_SHRINK shrinks these arrays to the elements a shader can reach before the driver sees it; KYTY_VRAM_GC_BUDGET collects textures and buffers against the VRAM budget while the game runs instead of thresholds fixed at startup. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, six alternating runs each: dedicated VRAM 9.4 GB with int3 and 6.3 GB with a local build of this source, peak since start 12.4 GB and 7.5 GB; 33.6 fps with int3 and 33.0 fps with the local build (within the spread between runs). Smaller cards were imitated by another process that holds 12 GiB or 16 GiB of the card's 24 GiB from boot: Astro Bot now reaches the Sky Garden and runs at 32-33 fps there, where int3's preset got stuck in the galaxy map. Tested on NVIDIA only; setting either flag to 0 in u59-preset.json turns it off. Release builds now compile from the source path the PGO profile was recorded at (C:\kyty-src); earlier GitHub builds missed the profile for every function in an anonymous namespace (2,499 of the 17,426 functions in int3's profile). This did not change the frame rate measurably. kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch can compile shaders again. See U59-README.md."
