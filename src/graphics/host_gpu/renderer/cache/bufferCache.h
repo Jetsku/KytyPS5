@@ -217,6 +217,11 @@ private:
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
 	}
+	// Frees a deleted buffer's slot, or parks it while KYTY_DEBUG_BUFFER_ERASE_DELAY holds it.
+	void EraseBufferSlot(BufferId id);
+	void DrainEraseGraveyard();
+	std::deque<std::pair<uint64_t, BufferId>> m_erase_graveyard; // (release tick, buffer)
+	std::mutex                                m_erase_graveyard_mutex;
 
 	using BufferMap = std::map<uint64_t, BufferId>;
 	struct OverlapResult {

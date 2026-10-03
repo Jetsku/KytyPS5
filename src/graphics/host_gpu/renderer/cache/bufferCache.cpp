@@ -772,8 +772,7 @@ bool BufferCache::DebugBindingCheck() {
 		const auto* value = std::getenv("KYTY_DEBUG_BINDING_CHECK");
 		const bool  on    = value != nullptr && std::strcmp(value, "1") == 0;
 		if (on) {
-			std::printf("Kyty binding check: on (KYTY_DEBUG_BINDING_CHECK)\n");
-			std::fflush(stdout);
+			Log::WriteToConsoleAndLog("Kyty binding check: on (KYTY_DEBUG_BINDING_CHECK)\n");
 		}
 		return on;
 	}();
@@ -781,18 +780,65 @@ bool BufferCache::DebugBindingCheck() {
 }
 
 void BufferCache::DebugBindingReport(const std::string& text) {
-	// The first 200 reports, then every 1000th, so a repeating fault cannot flood the console.
+	// The first 200 reports, then every 1000th, so a repeating fault cannot flood the log.
 	static std::atomic<uint64_t> count {0};
 	const auto                   index = count.fetch_add(1, std::memory_order_relaxed);
 	if (index < 200 || index % 1000 == 0) {
-		std::printf("BindingCheck #%" PRIu64 ": %s\n", index, text.c_str());
-		std::fflush(stdout);
+		Log::WriteToConsoleAndLog(fmt::format("BindingCheck #{}: {}\n", index, text));
+	}
+}
+
+// KYTY_DEBUG_BUFFER_ERASE_DELAY=<ticks> (default 0): a deleted cache buffer is freed only once the
+// GPU has completed that many more scheduler ticks (a diagnostic: if a GPU page fault goes away with
+// a large delay, something still used a buffer after the cache freed it).
+static uint64_t DebugBufferEraseDelay() {
+	static const uint64_t delay = [] {
+		const auto* value = std::getenv("KYTY_DEBUG_BUFFER_ERASE_DELAY");
+		const auto  ticks = value == nullptr ? uint64_t {0} : std::strtoull(value, nullptr, 10);
+		if (ticks != 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Kyty buffer erase delay: {} ticks (KYTY_DEBUG_BUFFER_ERASE_DELAY)\n", ticks));
+		}
+		return ticks;
+	}();
+	return delay;
+}
+
+void BufferCache::EraseBufferSlot(BufferId id) {
+	if (DebugBindingCheck()) {
+		// The erase runs once the deletion's tick has completed; a binding recorded in a later tick
+		// still points at this buffer's memory after it is freed.
+		const auto& buffer = m_slot_buffers[id];
+		if (buffer.debug_bound_tick > buffer.debug_delete_tick) {
+			DebugBindingReport(fmt::format(
+			    "deleted buffer still bound: guest=0x{:x} size=0x{:x} va=0x{:x} deleted at tick {} "
+			    "but bound at tick {}; freed after tick {} completed",
+			    buffer.CpuAddress(), buffer.Size(), buffer.DeviceAddressOrZero(),
+			    buffer.debug_delete_tick, buffer.debug_bound_tick, buffer.debug_delete_tick));
+		}
+	}
+	if (const auto delay = DebugBufferEraseDelay(); delay != 0 && m_scheduler.Active()) {
+		std::lock_guard lock(m_erase_graveyard_mutex);
+		m_erase_graveyard.emplace_back(m_scheduler.CurrentTick() + delay, id);
+		return;
+	}
+	m_slot_buffers.erase(id);
+}
+
+void BufferCache::DrainEraseGraveyard() {
+	std::lock_guard lock(m_erase_graveyard_mutex);
+	while (!m_erase_graveyard.empty() && m_scheduler.IsFree(m_erase_graveyard.front().first)) {
+		m_slot_buffers.erase(m_erase_graveyard.front().second);
+		m_erase_graveyard.pop_front();
 	}
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
+	}
+	if (DebugBufferEraseDelay() != 0) {
+		DrainEraseGraveyard();
 	}
 	{
 		// A pending side copy reads this buffer outside the scheduler's timeline; the deferred
@@ -805,22 +851,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		m_slot_buffers[id].debug_delete_tick = m_scheduler.Active() ? m_scheduler.CurrentTick() : 0;
 	}
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] {
-			if (DebugBindingCheck()) {
-				// The erase runs once the deletion's tick has completed; a binding recorded in a
-				// later tick still points at this buffer's memory after it is freed.
-				const auto& buffer = m_slot_buffers[id];
-				if (buffer.debug_bound_tick > buffer.debug_delete_tick) {
-					DebugBindingReport(fmt::format(
-					    "deleted buffer still bound: guest=0x{:x} size=0x{:x} va=0x{:x} deleted at "
-					    "tick {} but bound at tick {}; freed after tick {} completed",
-					    buffer.CpuAddress(), buffer.Size(), buffer.DeviceAddressOrZero(),
-					    buffer.debug_delete_tick, buffer.debug_bound_tick,
-					    buffer.debug_delete_tick));
-				}
-			}
-			m_slot_buffers.erase(id);
-		});
+		m_scheduler.DeferOperation([this, id] { EraseBufferSlot(id); });
 	} else {
 		m_slot_buffers.erase(id);
 	}
@@ -3760,7 +3791,10 @@ void BufferCache::RunGarbageCollector() {
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
-		m_slot_buffers.erase(id);
+		if (DebugBindingCheck()) {
+			buffer.debug_delete_tick = completion_tick;
+		}
+		EraseBufferSlot(id);
 	}
 }
 

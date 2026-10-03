@@ -225,12 +225,11 @@ static void DebugBindingTraceEmit(RenderContext& context, uint64_t shader_hash,
 			gds += fmt::format(" [{}]={:#x}", i, value);
 		}
 	}
-	std::printf("BindingTrace shader 0x%016" PRIx64 " #%" PRIu64 " tick %" PRIu64
-	            " groups %ux%ux%u%s:\n%s  GDS (CPU view):%s\n",
-	            shader_hash, count, context.GetCommandScheduler().CurrentTick(),
-	            prepared.dispatch_groups[0], prepared.dispatch_groups[1], prepared.dispatch_groups[2],
-	            changed ? " (changed)" : "", bindings.c_str(), gds.empty() ? " all zero" : gds.c_str());
-	std::fflush(stdout);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "BindingTrace shader 0x{:016x} #{} tick {} groups {}x{}x{}{}:\n{}  GDS (CPU view):{}\n",
+	    shader_hash, count, context.GetCommandScheduler().CurrentTick(), prepared.dispatch_groups[0],
+	    prepared.dispatch_groups[1], prepared.dispatch_groups[2], changed ? " (changed)" : "", bindings,
+	    gds.empty() ? " all zero" : gds));
 }
 
 static vk::DescriptorBufferInfo
