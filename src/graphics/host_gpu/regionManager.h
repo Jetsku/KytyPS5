@@ -196,6 +196,9 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
+		if (bits.FirstRangeFrom(start).first >= end) {
+			return;
+		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			if (mask.Any() ||

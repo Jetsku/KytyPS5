@@ -1487,6 +1487,7 @@ uint64_t Summarize() {
 
 void CheckErrorDialogLifecycle() {
   namespace ErrorDialog = Libs::Dialog::ErrorDialog;
+  namespace SystemDialog = Libs::Dialog::SystemDialog;
   struct Param {
     int32_t size = 16;
     int32_t error_code = static_cast<int32_t>(0x80550006u);
@@ -1496,27 +1497,27 @@ void CheckErrorDialogLifecycle() {
   static_assert(sizeof(Param) == 16);
   constexpr int invalid_state = static_cast<int>(0x80ed0005u);
   constexpr int invalid_param = static_cast<int>(0x80ed0003u);
-  static std::vector<ErrorDialog::VisualState> notifications;
+  static std::vector<SystemDialog::VisualState> notifications;
   notifications.clear();
-  ErrorDialog::SetVisibilityCallback([] {
-    const auto visual = ErrorDialog::GetVisualState();
-    ErrorDialog::HostSnapshot snapshot{};
+  SystemDialog::SetVisibilityCallback([] {
+    const auto visual = SystemDialog::GetVisualState();
+    SystemDialog::HostSnapshot snapshot{};
     Require("ErrorDialog", "callback reentry",
-            ErrorDialog::GetHostSnapshot(&snapshot) == visual.active &&
+            SystemDialog::GetHostSnapshot(&snapshot) == visual.active &&
                 (ErrorDialog::ErrorDialogGetStatus() == 2) == visual.active,
             "visibility callback observed inconsistent dialog state");
     notifications.push_back(visual);
   });
-  const auto initial_revision = ErrorDialog::GetVisualState().revision;
+  const auto initial_revision = SystemDialog::GetVisualState().revision;
   const auto check_state = [&](const char *stage, int status,
                                size_t visibility_changes) {
-    const auto visual = ErrorDialog::GetVisualState();
-    ErrorDialog::HostSnapshot snapshot{};
+    const auto visual = SystemDialog::GetVisualState();
+    SystemDialog::HostSnapshot snapshot{};
     Require("ErrorDialog", stage,
             ErrorDialog::ErrorDialogGetStatus() == status &&
                 ErrorDialog::ErrorDialogUpdateStatus() == status &&
-                visual.active == (status == 2) &&
-                ErrorDialog::GetHostSnapshot(&snapshot) == visual.active &&
+                visual.active == (status == 2) && !visual.background &&
+                SystemDialog::GetHostSnapshot(&snapshot) == visual.active &&
                 visual.revision == initial_revision + visibility_changes &&
                 notifications.size() == visibility_changes &&
                 (notifications.empty() ||
@@ -1546,9 +1547,9 @@ void CheckErrorDialogLifecycle() {
   check_state("failed open preserves initialized state", 1, 0);
   Require("ErrorDialog", "open", ErrorDialog::ErrorDialogOpen(&param) == 0,
           "valid error dialog did not open");
-  ErrorDialog::HostSnapshot first{};
+  SystemDialog::HostSnapshot first{};
   Require("ErrorDialog", "copied error code",
-          ErrorDialog::GetHostSnapshot(&first) &&
+          SystemDialog::GetHostSnapshot(&first) &&
               first.error_code == param.error_code,
           "host dialog did not expose the guest error code");
   param.error_code = static_cast<int32_t>(0x8055000au);
@@ -1558,31 +1559,31 @@ void CheckErrorDialogLifecycle() {
   Require(
       "ErrorDialog", "running failures",
       ErrorDialog::ErrorDialogOpen(&param) == invalid_state &&
-          !ErrorDialog::HostAccept(first.generation + 1),
+          !SystemDialog::HostClose(first.generation + 1),
       "an invalid open or stale acknowledgement replaced the active dialog");
-  ErrorDialog::HostSnapshot current{};
+  SystemDialog::HostSnapshot current{};
   Require("ErrorDialog", "failed open preserves active dialog",
-          ErrorDialog::GetHostSnapshot(&current) &&
+          SystemDialog::GetHostSnapshot(&current) &&
               current.generation == first.generation &&
               current.error_code == first.error_code,
           "active error code or generation changed after a failed open");
   check_state("failed operations preserve running state", 2, 1);
   Require("ErrorDialog", "acknowledge",
-          ErrorDialog::HostAccept(first.generation),
+          SystemDialog::HostClose(first.generation),
           "current host acknowledgement did not finish the dialog");
   check_state("acknowledged", 3, 2);
   Require("ErrorDialog", "finished operations",
-          !ErrorDialog::HostAccept(first.generation) &&
+          !SystemDialog::HostClose(first.generation) &&
               ErrorDialog::ErrorDialogClose() == invalid_state &&
               ErrorDialog::ErrorDialogOpen(&invalid) == invalid_param,
           "finished dialog accepted duplicate completion or an invalid open");
   check_state("failed operations preserve finished state", 3, 2);
   Require("ErrorDialog", "reopen and stale acknowledgement",
           ErrorDialog::ErrorDialogOpen(&param) == 0 &&
-              ErrorDialog::GetHostSnapshot(&current) &&
+              SystemDialog::GetHostSnapshot(&current) &&
               current.generation != first.generation &&
               current.error_code == param.error_code &&
-              !ErrorDialog::HostAccept(first.generation),
+              !SystemDialog::HostClose(first.generation),
           "reopened dialog accepted acknowledgement from its predecessor");
   check_state("reopened", 2, 3);
   Require("ErrorDialog", "guest close", ErrorDialog::ErrorDialogClose() == 0,
@@ -1590,15 +1591,15 @@ void CheckErrorDialogLifecycle() {
   check_state("closed", 3, 4);
   Require("ErrorDialog", "terminate running dialog",
           ErrorDialog::ErrorDialogOpen(&param) == 0 &&
-              ErrorDialog::GetHostSnapshot(&current) &&
+              SystemDialog::GetHostSnapshot(&current) &&
               ErrorDialog::ErrorDialogTerminate() == 0 &&
-              !ErrorDialog::HostAccept(current.generation),
+              !SystemDialog::HostClose(current.generation),
           "termination failed to remove the active dialog");
   check_state("terminated", 0, 6);
   Require("ErrorDialog", "reinitialize and stale acknowledgement",
           ErrorDialog::ErrorDialogInitialize() == 0 &&
               ErrorDialog::ErrorDialogOpen(&param) == 0 &&
-              !ErrorDialog::HostAccept(current.generation),
+              !SystemDialog::HostClose(current.generation),
           "reinitialization reused an old dialog generation");
   check_state("reinitialized", 2, 7);
   Require("ErrorDialog", "final termination",
@@ -1607,18 +1608,129 @@ void CheckErrorDialogLifecycle() {
                   static_cast<int>(0x80ed0001u),
           "termination did not restore the uninitialized state");
   check_state("final state", 0, 8);
-  ErrorDialog::SetVisibilityCallback(nullptr);
+  SystemDialog::SetVisibilityCallback(nullptr);
   Require("ErrorDialog", "lifecycle without a visibility listener",
           ErrorDialog::ErrorDialogInitialize() == 0 &&
               ErrorDialog::ErrorDialogOpen(&param) == 0 &&
               ErrorDialog::ErrorDialogClose() == 0 &&
               ErrorDialog::ErrorDialogTerminate() == 0 &&
               ErrorDialog::ErrorDialogGetStatus() == 0 &&
-              !ErrorDialog::GetVisualState().active &&
-              ErrorDialog::GetVisualState().revision == initial_revision + 10 &&
+              !SystemDialog::GetVisualState().active &&
+              SystemDialog::GetVisualState().revision ==
+                  initial_revision + 10 &&
               notifications.size() == 8,
           "guest lifecycle depended on a registered host visibility listener");
   std::printf("[host]    %-32s ok\n", "ErrorDialogLifecycle");
+}
+
+void CheckSigninDialogLifecycle() {
+  namespace Signin = Libs::Dialog::SigninDialog;
+  namespace Error = Libs::Dialog::ErrorDialog;
+  namespace Host = Libs::Dialog::SystemDialog;
+  struct Param {
+    int32_t size = 16;
+    int32_t user_id = Config::GetUserId();
+    int32_t reserved[2] = {};
+  } param;
+  struct Result {
+    int32_t result = -1;
+    int32_t reserved[3] = {-1, -1, -1};
+  } result;
+  constexpr int not_initialized = static_cast<int>(0x81350001u);
+  constexpr int already_initialized = static_cast<int>(0x81350002u);
+  constexpr int invalid_param = static_cast<int>(0x81350003u);
+  constexpr int invalid_state = static_cast<int>(0x81350005u);
+  Require("SigninDialog", "uninitialized",
+          Signin::SigninDialogOpen(&param) == not_initialized &&
+              Signin::SigninDialogClose() == not_initialized &&
+              Signin::SigninDialogGetResult(&result) == not_initialized,
+          "uninitialized operations returned the wrong error");
+  Require("SigninDialog", "initialize and close",
+          Signin::SigninDialogInitialize() == 0 &&
+              Signin::SigninDialogClose() == 0 &&
+              Signin::SigninDialogUpdateStatus() == 3,
+          "close must also succeed from INITIALIZED");
+  Param invalid = param;
+  invalid.reserved[0] = 1;
+  Require("SigninDialog", "parameter validation",
+          Signin::SigninDialogOpen(nullptr) == invalid_param &&
+              Signin::SigninDialogOpen(&invalid) == invalid_param,
+          "invalid parameters were accepted");
+  invalid = param;
+  invalid.user_id = -1;
+  Require("SigninDialog", "user validation",
+          Signin::SigninDialogOpen(&invalid) == static_cast<int>(0x81350007u),
+          "an invalid user was accepted");
+  Host::SetVisibilityCallback([] {
+    const auto visual = Host::GetVisualState();
+    Require("SigninDialog", "callback reentry",
+            visual.background == (Signin::SigninDialogGetStatus() == 2),
+            "foreground state did not follow the dialog lifetime");
+  });
+  Require("SigninDialog", "open", Signin::SigninDialogOpen(&param) == 0,
+          "valid sign-in dialog did not open");
+  Host::HostSnapshot first{};
+  Require(
+      "SigninDialog", "visible and backgrounded",
+      Host::GetHostSnapshot(&first) && first.kind == Host::Kind::Signin &&
+          Host::GetVisualState().active && Host::GetVisualState().background,
+      "sign-in dialog was not visible or did not background the application");
+  for (int poll = 0; poll < 8; ++poll) {
+    Require(
+        "SigninDialog", "polling waits for the user",
+        Signin::SigninDialogUpdateStatus() == 2 &&
+            Signin::SigninDialogGetStatus() == 2 &&
+            Signin::SigninDialogInitialize() == already_initialized &&
+            Signin::SigninDialogGetResult(&result) == invalid_state,
+        "polling silently finished sign-in or lost the active initialization");
+  }
+  Require(
+      "SigninDialog", "user cancellation",
+      Host::HostClose(first.generation) &&
+          Signin::SigninDialogGetResult(&result) == 0 && result.result == 1 &&
+          result.reserved[0] == 0 && result.reserved[1] == 0 &&
+          result.reserved[2] == 0 && !Host::GetVisualState().background &&
+          !Host::GetVisualState().active && Signin::SigninDialogClose() == 0,
+      "user cancellation did not finish sign-in and restore the foreground");
+  const int32_t error_param[4] = {16, static_cast<int32_t>(0x80550006u), 1, 0};
+  Host::HostSnapshot error{};
+  Require("SigninDialog", "shared presentation generations",
+          Error::ErrorDialogInitialize() == 0 &&
+              Error::ErrorDialogOpen(error_param) == 0 &&
+              Host::GetHostSnapshot(&error) &&
+              error.kind == Host::Kind::Error &&
+              error.generation != first.generation &&
+              !Host::HostClose(first.generation),
+          "an old sign-in action affected an error dialog");
+  Host::HostSnapshot overlay{};
+  Require("SigninDialog", "overlapping dialogs",
+          Signin::SigninDialogOpen(&param) == 0 &&
+              Host::GetHostSnapshot(&overlay) &&
+              overlay.kind == Host::Kind::Signin &&
+              !Host::HostClose(error.generation) &&
+              Host::HostClose(overlay.generation) &&
+              Host::GetHostSnapshot(&overlay) &&
+              overlay.kind == Host::Kind::Error &&
+              overlay.generation == error.generation &&
+              !Host::GetVisualState().background &&
+              Host::HostClose(error.generation) &&
+              Error::ErrorDialogTerminate() == 0,
+          "closing sign-in did not restore the pending error dialog");
+  Host::HostSnapshot reopened{};
+  Require(
+      "SigninDialog", "reopen and abort",
+      Signin::SigninDialogOpen(&param) == 0 &&
+          Host::GetHostSnapshot(&reopened) &&
+          !Host::HostClose(first.generation) &&
+          !Host::HostClose(error.generation) &&
+          Signin::SigninDialogTerminate() == 0 &&
+          !Host::HostClose(reopened.generation) &&
+          !Host::GetVisualState().active &&
+          !Host::GetVisualState().background &&
+          Signin::SigninDialogTerminate() == not_initialized,
+      "abort did not remove the dialog or a stale host action was accepted");
+  Host::SetVisibilityCallback(nullptr);
+  std::printf("[host]    %-32s ok\n", "SigninDialogLifecycle");
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -25977,15 +26089,26 @@ public:
         {Prospero::TileMode::kStandard64KB, TileBlockFamily::Standard64KB},
         {Prospero::TileMode::kPrt, TileBlockFamily::Prt64KB},
     };
-    for (const auto format :
-         {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8_8Srgb,
-          Prospero::BufferFormat::k9_9_9_5Float}) {
+    struct RenderTargetFormatCase {
+      Prospero::BufferFormat format;
+      u32 bytes_per_element;
+    };
+    constexpr RenderTargetFormatCase render_target_formats[] = {
+        {Prospero::BufferFormat::k8Srgb, 1},
+        {Prospero::BufferFormat::k8_8Srgb, 2},
+        {Prospero::BufferFormat::k9_9_9_5Float, 0},
+    };
+    for (const auto &test : render_target_formats) {
       for (const auto tile :
            {Prospero::TileMode::kDepth, Prospero::TileMode::kRenderTarget}) {
         TileTextureBlockLayout texture{};
+        const bool supported =
+            TileGetTextureBlockLayout(test.format, tile, false, texture);
         Require(name, "RT format policy",
-                !TileGetTextureBlockLayout(format, tile, false, texture),
-                "non-render-target format admitted by an RT/depth tile family");
+                supported == (test.bytes_per_element != 0) &&
+                    (!supported || texture.block.bytes_per_element ==
+                                       test.bytes_per_element),
+                "RT/depth tile format support or element size is incorrect");
       }
     }
     {
@@ -49048,8 +49171,9 @@ int main(int argc, char **argv) {
     vulkan.CheckPackedTextureComponents();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--error-dialog-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--system-dialog-only") == 0) {
     CheckErrorDialogLifecycle();
+    CheckSigninDialogLifecycle();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--fmask-only") == 0) {
@@ -49981,6 +50105,7 @@ int main(int argc, char **argv) {
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckErrorDialogLifecycle();
+  CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());

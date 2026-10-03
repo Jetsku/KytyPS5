@@ -111,8 +111,10 @@ struct Controller {
 		haptics_handles_rumble = false;
 		Initialize();
 		Connect(1);
-		Check(GetSettingScale(Setting::SpeakerVolume) == 1.0f &&
-		          GetSettingScale(Setting::VibrationIntensity) == 1.0f &&
+		Check(GetSettingScale(Setting::SpeakerVolume) ==
+		              Config::GetControllerSpeakerVolume() / 100.0f &&
+		          GetSettingScale(Setting::VibrationIntensity) ==
+		              Config::GetControllerVibrationIntensity() / 100.0f &&
 		          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
 		      "controller initialization retained old settings");
 		rumble.clear();
@@ -159,6 +161,48 @@ void TestSettingCycles() {
 	CycleSetting(Setting::SpeakerVolume);
 	CycleSetting(Setting::VibrationIntensity);
 	CycleSetting(Setting::TriggerEffectIntensity);
+}
+
+void TestGlobalControllerLevels() {
+	Config::ConfigOptions options;
+	options.controller_speaker_volume      = 50;
+	options.controller_vibration_intensity = 25;
+	Config::Load(options);
+	{
+		Controller controller;
+		Check(GetSettingScale(Setting::SpeakerVolume) == 0.5f &&
+		          GetSettingScale(Setting::VibrationIntensity) == 0.25f &&
+		          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
+		      "global controller levels did not scale their outputs independently");
+		SetRumble(200, 100);
+		Check(rumble.back().large == 50 * 257 && rumble.back().small == 25 * 257,
+		      "global vibration level did not scale rumble");
+		CycleSetting(Setting::SpeakerVolume);
+		CycleSetting(Setting::VibrationIntensity);
+		Check(GetSettingScale(Setting::SpeakerVolume) == 0.0f &&
+		          GetSettingScale(Setting::VibrationIntensity) == 0.0f,
+		      "cycle hotkeys did not mute globally scaled outputs");
+		CycleSetting(Setting::SpeakerVolume);
+		CycleSetting(Setting::VibrationIntensity);
+		Check(GetSettingScale(Setting::SpeakerVolume) == 0.01f &&
+		          GetSettingScale(Setting::VibrationIntensity) == 0.0825f,
+		      "cycle hotkeys did not multiply the global controller levels");
+		Check(rumble.back().large == 17 * 257 && rumble.back().small == 8 * 257,
+		      "cycling vibration did not apply the combined intensity to cached rumble");
+	}
+	options.controller_speaker_volume      = 0;
+	options.controller_vibration_intensity = 0;
+	Config::Load(options);
+	{
+		Controller controller;
+		Check(GetSettingScale(Setting::SpeakerVolume) == 0.0f &&
+		          GetSettingScale(Setting::VibrationIntensity) == 0.0f,
+		      "zero global controller levels did not mute outputs");
+		SetRumble(200, 100);
+		Check(rumble.back().large == 0 && rumble.back().small == 0,
+		      "zero global vibration level did not mute motors");
+	}
+	Config::Load(Config::ConfigOptions {});
 }
 
 void TestVibrationLifetime() {
@@ -287,6 +331,7 @@ void TestIndependentOutputsAndPadSwitch() {
 int main() {
 	Config::Initialize();
 	TestSettingCycles();
+	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();

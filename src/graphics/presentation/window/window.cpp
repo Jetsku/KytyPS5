@@ -310,14 +310,20 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
+		if (pad == nullptr) {
+			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
+			     SDL_GetError());
+			return;
+		}
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
 		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		Controller::Disconnect(f.id);
-		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
+		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
+			Controller::Disconnect(f.id);
+			SDL_CloseGamepad(pad);
+		}
 	}
 
 	if (f.down || f.up) {

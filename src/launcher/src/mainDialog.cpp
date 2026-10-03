@@ -229,15 +229,20 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (!info.audio_input_device.isEmpty()) {
 		args << "--mic" << info.audio_input_device;
 	}
-	if (!info.controller_color.isEmpty()) {
-		args << "--controller-color" << info.controller_color;
+	if (!info.controller.color.isEmpty()) {
+		args << "--controller-color" << info.controller.color;
 	}
+	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
+	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
+	}
+	if (info.hide_cursor_enabled) {
+		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	if (info.tessellation_enabled) {
@@ -546,8 +551,7 @@ void MainDialogPrivate::Update() {
 		m_lightbar.Stop();
 		return;
 	}
-	m_lightbar.SetColor(item != nullptr ? m_ui->widget->CreateConfiguration(*item)->controller_color
-	                                    : m_ui->widget->GetGlobalControllerColor());
+	m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
 }
 
 #include "mainDialog.moc"

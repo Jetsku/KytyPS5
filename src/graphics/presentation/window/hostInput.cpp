@@ -78,6 +78,7 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
+constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -87,7 +88,8 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
-SDL_Window*        g_mouse_window = nullptr;
+SDL_Window*        g_mouse_window   = nullptr;
+uint64_t           g_cursor_hide_at = 0;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -396,6 +398,23 @@ int PollMouse(uint64_t now_ms) {
 	return MOUSE_POLL_INTERVAL_MS;
 }
 
+bool IsCursorActivity(const SDL_Event& event) {
+	SDL_MouseID which;
+	switch (event.type) {
+		case SDL_EVENT_MOUSE_MOTION:
+			if (event.motion.xrel == 0.0f && event.motion.yrel == 0.0f) {
+				return false;
+			}
+			which = event.motion.which;
+			break;
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP: which = event.button.which; break;
+		case SDL_EVENT_MOUSE_WHEEL: which = event.wheel.which; break;
+		default: return false;
+	}
+	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
+}
+
 } // namespace
 
 void HostInputInit(SDL_Window* window) {
@@ -409,6 +428,9 @@ void HostInputInit(SDL_Window* window) {
 			LOGF("Host input minimum press: %ld ms (test mode)\n", ms);
 		}
 	}
+	if (Config::HideCursorEnabled()) {
+		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
+	}
 }
 
 void HostInputShutdown() {
@@ -418,7 +440,11 @@ void HostInputShutdown() {
 		CenterMouseStick();
 		g_mouse = {};
 	}
-	g_mouse_window = nullptr;
+	g_mouse_window   = nullptr;
+	g_cursor_hide_at = 0;
+	if (Config::HideCursorEnabled()) {
+		SDL_ShowCursor();
+	}
 }
 
 void HostInputKey(int key_code, bool down) {
@@ -450,22 +476,42 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event) {
-	bool has_event;
-	const int release_wait = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
+	// Waits for the next event, bounded by the next held-key release, mouse poll and cursor
+	// auto-hide deadline (-1: none of them, wait for an event).
+	int        timeout  = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
+	const auto bound_by = [&timeout](int wait) {
+		timeout = timeout < 0 ? wait : std::min(timeout, wait);
+	};
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
-		has_event = release_wait < 0 ? SDL_WaitEvent(event) : SDL_WaitEventTimeout(event, release_wait);
-		if (!has_event && release_wait < 0) {
-			EXIT("%s\n", SDL_GetError());
-		}
 	} else {
 		if (g_mouse.next_poll == 0) {
 			SDL_GetRelativeMouseState(nullptr, nullptr);
 			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
 		}
-		const int mouse_wait = PollMouse(SDL_GetTicks());
-		has_event = SDL_WaitEventTimeout(event, release_wait < 0 ? mouse_wait : std::min(mouse_wait, release_wait));
+		bound_by(PollMouse(SDL_GetTicks()));
+	}
+
+	if (g_cursor_hide_at != 0) {
+		const auto now_ms = SDL_GetTicks();
+		bound_by(now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0);
+	}
+	const bool has_event = timeout < 0 ? SDL_WaitEvent(event) : SDL_WaitEventTimeout(event, timeout);
+	if (!has_event && timeout < 0) {
+		EXIT("%s\n", SDL_GetError());
+	}
+
+	if (Config::HideCursorEnabled()) {
+		const auto now_ms = SDL_GetTicks();
+		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
+		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
+			SDL_ShowCursor();
+			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
+		} else if (g_cursor_hide_at != 0 && now_ms >= g_cursor_hide_at) {
+			SDL_HideCursor();
+			g_cursor_hide_at = 0;
+		}
 	}
 
 	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&

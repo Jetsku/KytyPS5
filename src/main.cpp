@@ -99,11 +99,15 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
+	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 100.\n");
+	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf(
+	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -248,6 +252,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--hide-cursor") {
+			options.config.hide_cursor_enabled = true;
+			continue;
+		}
+
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
 			continue;
@@ -369,6 +378,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.controller_color = color;
+		} else if (arg == "--controller-volume") {
+			if (!ParseUint32(value, options.config.controller_speaker_volume) ||
+			    options.config.controller_speaker_volume > 100) {
+				::printf("invalid controller volume: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--controller-vibration") {
+			if (!ParseUint32(value, options.config.controller_vibration_intensity) ||
+			    options.config.controller_vibration_intensity > 100) {
+				::printf("invalid controller vibration intensity: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());

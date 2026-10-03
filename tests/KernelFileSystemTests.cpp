@@ -34,8 +34,20 @@ namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibAmpr {
+void InitAmpr_1(Loader::SymbolDatabase *symbols);
+}
+
 namespace Libs::LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNpWebApi2 {
+void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -125,6 +137,119 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestAioBatches() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AIO exports resolve");
+    return symbol->vaddr;
+  };
+  struct Result { int64_t return_value; uint32_t state; };
+  struct Request {
+    int64_t offset;
+    size_t size;
+    void *buffer;
+    Result *result;
+    int32_t fd;
+  };
+  using Submit = int (KYTY_SYSV_ABI *)(Request *, int32_t, int32_t, int32_t *);
+  using Batch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *);
+  using Single = int (KYTY_SYSV_ABI *)(int32_t, int32_t *);
+  using Wait = int (KYTY_SYSV_ABI *)(int32_t, int32_t *, uint32_t *);
+  const auto submit = reinterpret_cast<Submit>(find("HgX7+AORI58"));
+  const auto poll = reinterpret_cast<Batch>(find("o7O4z3jwKzo"));
+  const auto erase = reinterpret_cast<Batch>(find("Ft3EtsZzAoY"));
+  const auto poll_one = reinterpret_cast<Single>(find("2pOuoWoCxdk"));
+  const auto erase_one = reinterpret_cast<Single>(find("5TgME6AYty4"));
+  const auto wait = reinterpret_cast<Wait>(find("KOF-oJbQVvc"));
+  constexpr char Payload[] = "AIO payload";
+  const int fd = FileSystem::KernelOpen("/savedata0/aio.dat", 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
+        "create AIO read fixture");
+  std::array<int32_t, 3> ids {};
+  std::array<char, 4> buffer {};
+  Result result {};
+  Request request {2, buffer.size(), buffer.data(), &result, fd};
+  for (int i = 0; i < 2; ++i) {
+    Check(submit(&request, 1, 2, &ids[i]) == OK &&
+              result.return_value == buffer.size() && result.state == 3 &&
+              std::memcmp(buffer.data(), Payload + 2, buffer.size()) == 0,
+          "AIO submission reads bytes at the requested offset");
+  }
+  ids[2] = -1;
+  std::array<int32_t, 3> states {-1, -1, -1};
+  Check(poll(ids.data(), ids.size(), states.data()) == OK &&
+            states[0] == 3 && states[1] == 3 && states[2] == Kernel::KERNEL_ERROR_ESRCH,
+        "batch poll writes every state and per-request invalid-ID error");
+  Check(poll_one(ids[0], &states[0]) == OK && states[0] == (3 | 0x10000) &&
+            poll(ids.data(), 2, states.data()) == OK &&
+            states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
+            wait(ids[0], &states[0], nullptr) == OK && states[0] == (3 | 0x10000),
+        "single and batch polls and waits share completion notification state");
+  Check(erase(ids.data(), ids.size(), states.data()) == OK &&
+            states[0] == OK && states[1] == OK && states[2] == Kernel::KERNEL_ERROR_ESRCH,
+        "batch deletion writes per-request results");
+  Check(poll_one(ids[0], &states[0]) == OK && states[0] == Kernel::KERNEL_ERROR_ESRCH &&
+            erase_one(ids[1], &states[1]) == OK && states[1] == Kernel::KERNEL_ERROR_ESRCH,
+        "deleted AIO IDs are invalid for single-request APIs");
+  for (const auto batch : {poll, erase}) {
+    states.fill(42);
+    Check(batch(nullptr, 1, states.data()) == Kernel::KERNEL_ERROR_EFAULT &&
+              batch(ids.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
+              batch(ids.data(), 0, states.data()) == Kernel::KERNEL_ERROR_EINVAL &&
+              batch(ids.data(), 129, states.data()) == Kernel::KERNEL_ERROR_EINVAL &&
+              states == std::array<int32_t, 3> {42, 42, 42},
+          "invalid batch arguments do not modify outputs");
+    std::array<int32_t, 128> invalid_ids {};
+    std::array<int32_t, 128> errors {};
+    Check(batch(invalid_ids.data(), invalid_ids.size(), errors.data()) == OK &&
+              std::all_of(errors.begin(), errors.end(), [](int32_t error) {
+                return error == Kernel::KERNEL_ERROR_ESRCH;
+              }),
+          "maximum-sized batch returns all invalid-ID errors");
+  }
+  Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
+}
+
+void TestNpWebApi2Memory() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpWebApi2::InitNet_1_NpWebApi2(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "NpWebApi2 library and memory exports resolve");
+    return symbol->vaddr;
+  };
+  struct Stats { size_t pool, maximum, current; int32_t reserved; };
+  static_assert(sizeof(Stats) == 32 && offsetof(Stats, reserved) == 24);
+  using Initialize = int (KYTY_SYSV_ABI *)(int, size_t);
+  using GetStats = int (KYTY_SYSV_ABI *)(int, Stats *);
+  using Terminate = int (KYTY_SYSV_ABI *)(int);
+  const auto initialize = reinterpret_cast<Initialize>(find("+o9816YQhqQ"));
+  const auto get_stats = reinterpret_cast<GetStats>(find("Xweb+naPZ8Y"));
+  const auto terminate = reinterpret_cast<Terminate>(find("bEvXpcEk200"));
+  const int first = initialize(1, 65537);
+  const int second = initialize(1, 16384);
+  Stats stats {1, 2, 3, 4};
+  Check(first > 0 && second > 0 && first != second &&
+            get_stats(first, &stats) == OK && stats.pool == 81920 &&
+            stats.maximum == 0 && stats.current == 0 && stats.reserved == 0 &&
+            get_stats(second, &stats) == OK && stats.pool == 16384,
+        "NpWebApi2 statistics retain each context's rounded pool capacity");
+  Check(get_stats(first, nullptr) == static_cast<int32_t>(0x80553402) &&
+            get_stats(0, &stats) == static_cast<int32_t>(0x80553403) &&
+            initialize(1, std::numeric_limits<size_t>::max()) == static_cast<int32_t>(0x80553402),
+        "NpWebApi2 statistics validate output, context ID, and pool rounding");
+  Check(terminate(first) == OK &&
+            get_stats(first, &stats) == static_cast<int32_t>(0x80553404) &&
+            terminate(first) == static_cast<int32_t>(0x80553404) &&
+            terminate(-1) == static_cast<int32_t>(0x80553403) &&
+            get_stats(second, &stats) == OK && stats.pool == 16384 &&
+            terminate(second) == OK,
+        "NpWebApi2 termination removes only the selected library context");
 }
 
 void CheckMountRoot(const std::filesystem::path &root) {
@@ -711,10 +836,12 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
+  TestNpWebApi2Memory();
   graphics.reset();
   subsystems.Destroy();
 

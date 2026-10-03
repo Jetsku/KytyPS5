@@ -3138,9 +3138,21 @@ namespace LibNpWebApi2 {
 
 LIB_VERSION("NpWebApi2", 1, "NpWebApi2", 1, 1);
 
-constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT  = -2141899774; /* 0x80553402 */
-constexpr int NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND = -2141899770; /* 0x80553406 */
-constexpr int NP_WEBAPI2_ERROR_NOT_SIGNED_IN     = -2141899769; /* 0x80553407 */
+constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT       = -2141899774; /* 0x80553402 */
+constexpr int NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID = -2141899773; /* 0x80553403 */
+constexpr int NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND  = -2141899772; /* 0x80553404 */
+constexpr int NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND      = -2141899770; /* 0x80553406 */
+constexpr int NP_WEBAPI2_ERROR_NOT_SIGNED_IN          = -2141899769; /* 0x80553407 */
+
+struct NpWebApi2MemoryPoolStats {
+	size_t  pool_size;
+	size_t  max_inuse_size;
+	size_t  current_inuse_size;
+	int32_t reserved;
+};
+
+static std::mutex            g_np_webapi2_context_mutex;
+static std::map<int, size_t> g_np_webapi2_contexts;
 
 struct NpWebApi2ResponseInformationOption {
 	int32_t http_status;
@@ -3171,7 +3183,30 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 
 	static int id = 0;
 
-	return ++id;
+	if (pool_size > std::numeric_limits<size_t>::max() - 0x3fff) {
+		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
+	}
+	std::lock_guard lock(g_np_webapi2_context_mutex);
+	g_np_webapi2_contexts[++id] = (pool_size + 0x3fff) & ~size_t {0x3fff};
+	return id;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
+                                                   NpWebApi2MemoryPoolStats* stats) {
+	if (stats == nullptr) {
+		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
+	}
+	if (lib_ctx_id <= 0) {
+		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
+	}
+	std::lock_guard lock(g_np_webapi2_context_mutex);
+	const auto context = g_np_webapi2_contexts.find(lib_ctx_id);
+	if (context == g_np_webapi2_contexts.end()) {
+		return NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
+	}
+	// Requests currently use host storage, not allocations from the library pool.
+	*stats = {context->second, 0, 0, 0};
+	return OK;
 }
 
 static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
@@ -3438,11 +3473,16 @@ static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
 
-	return 0;
+	if (lib_ctx_id <= 0) {
+		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
+	}
+	std::lock_guard lock(g_np_webapi2_context_mutex);
+	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 }
 
 LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("+o9816YQhqQ", LibNpWebApi2::NpWebApi2Initialize);
+	LIB_FUNC("Xweb+naPZ8Y", LibNpWebApi2::NpWebApi2GetMemoryPoolStats);
 	LIB_FUNC("WV1GwM32NgY", LibNpWebApi2::NpWebApi2PushEventCreateHandle);
 	LIB_FUNC("sk54bi6FtYM", LibNpWebApi2::NpWebApi2CreateUserContext);
 	LIB_FUNC("9X9+cneTGUU", LibNpWebApi2::NpWebApi2DeleteUserContext);
