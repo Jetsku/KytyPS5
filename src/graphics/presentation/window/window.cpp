@@ -449,10 +449,14 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_EVENT_WINDOW_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
 			minimized.store(false, std::memory_order_release);
+			// Refresh the cached drawable size in case no PIXEL_SIZE_CHANGED event follows.
+			RefreshSizeFromWindow();
 			break;
 		case SDL_EVENT_WINDOW_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
 			minimized.store(false, std::memory_order_release);
+			// Refresh the cached drawable size in case no PIXEL_SIZE_CHANGED event follows.
+			RefreshSizeFromWindow();
 			break;
 		case SDL_EVENT_WINDOW_MOUSE_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);

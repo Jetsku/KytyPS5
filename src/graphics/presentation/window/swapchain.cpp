@@ -264,8 +264,11 @@ public:
 	~Swapchain();
 	KYTY_CLASS_NO_COPY(Swapchain);
 
+	/// Creates the Vulkan swapchain; sets m_minimized when the window or surface extent is zero.
 	void                 Create();
+	/// Destroys then re-creates the swapchain, optionally recreating the Vulkan surface first.
 	void                 Recreate(bool surface_lost = false);
+	/// Returns true when the swapchain must be recreated before the next present.
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
@@ -281,6 +284,7 @@ public:
 	[[nodiscard]] bool       IsMinimized() const noexcept { return m_minimized; }
 
 private:
+	/// Destroys the swapchain Vulkan objects and resets all members.
 	void Destroy();
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
 
@@ -290,8 +294,12 @@ private:
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
-	bool                           m_minimized   = false;
-	bool                           m_suboptimal  = false;
+	bool                           m_minimized         = false;
+	/// True when m_minimized was set because the surface/drawable extent was {0,0} but
+	/// WindowContext::minimized is false (e.g. compositor not ready). Cleared on successful
+	/// swapchain creation or Destroy().
+	bool                           m_surface_extent_zero = false;
+	bool                           m_suboptimal          = false;
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
@@ -359,6 +367,10 @@ struct Presenter::Impl {
 	std::atomic<uint64_t> presented_overlay_revision {0};
 };
 
+/// Creates the Vulkan swapchain for the current window surface.
+/// Sets m_minimized and returns early when the window or surface extent is zero.
+/// Sets m_surface_extent_zero when the early return is due to a zero surface/drawable extent
+/// and WindowContext::minimized is false, so NeedsResize() can poll instead of spinning.
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
@@ -373,7 +385,7 @@ void Swapchain::Create() {
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
 			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
+										        candidate.format == vk::Format::eR8G8B8A8Unorm;
 		                             });
 		if (it == surface.formats.end()) {
 			EXIT("no supported UNORM swapchain format\n");
@@ -388,7 +400,9 @@ void Swapchain::Create() {
 	}
 
 	if (m_window.minimized.load(std::memory_order_acquire)) {
-		m_minimized = true;
+		// Window is genuinely minimized; m_surface_extent_zero is not the cause.
+		m_minimized           = true;
+		m_surface_extent_zero = false;
 		return;
 	}
 
@@ -399,7 +413,10 @@ void Swapchain::Create() {
 		m_window_extent = {graphics.screen_width, graphics.screen_height};
 	}
 	if (m_window_extent.width == 0 || m_window_extent.height == 0) {
-		m_minimized = true;
+		LOGF("Swapchain::Create(): drawable extent is zero while window is not minimized; "
+		     "waiting for surface to become ready\n");
+		m_minimized           = true;
+		m_surface_extent_zero = true;
 		return;
 	}
 
@@ -407,18 +424,22 @@ void Swapchain::Create() {
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
 		m_extent.width =
 		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
-		               surface.capabilities.maxImageExtent.width);
+			           surface.capabilities.maxImageExtent.width);
 		m_extent.height =
 		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
-		               surface.capabilities.maxImageExtent.height);
+			           surface.capabilities.maxImageExtent.height);
 	}
 	if (m_extent.width == 0 || m_extent.height == 0) {
-		m_minimized = true;
+		LOGF("Swapchain::Create(): surface currentExtent is zero while window is not minimized; "
+		     "waiting for surface to become ready\n");
+		m_minimized           = true;
+		m_surface_extent_zero = true;
 		return;
 	}
 
-	m_minimized  = false;
-	m_suboptimal = false;
+	m_minimized           = false;
+	m_surface_extent_zero = false;
+	m_suboptimal          = false;
 
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
 	if (surface.capabilities.maxImageCount != 0) {
@@ -511,9 +532,11 @@ Swapchain::~Swapchain() {
 	Destroy();
 }
 
+/// Destroys all Vulkan swapchain objects and resets all members to their default state.
 void Swapchain::Destroy() {
-	m_minimized  = false;
-	m_suboptimal = false;
+	m_minimized           = false;
+	m_surface_extent_zero = false;
+	m_suboptimal          = false;
 	if (m_handle == nullptr && m_image_acquired.empty() && m_render_complete.empty() &&
 	    m_image_views.empty()) {
 		return;
@@ -570,6 +593,7 @@ void Swapchain::Destroy() {
 	m_frame_ticks.clear();
 }
 
+/// Destroys and re-creates the swapchain, optionally recreating the Vulkan surface first.
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
@@ -586,10 +610,37 @@ void Swapchain::Recreate(bool surface_lost) {
 	Create();
 }
 
+/// Returns true when the swapchain must be recreated before the next present.
+/// In the m_surface_extent_zero case (compositor not ready, window not minimized) this
+/// re-queries the surface capabilities and only returns true when the extent is usable,
+/// preventing a recreate-every-frame busy-loop.
 bool Swapchain::NeedsResize() const {
 	const bool window_minimized = m_window.minimized.load(std::memory_order_acquire);
 	if (m_minimized) {
-		return !window_minimized;
+		if (window_minimized) {
+			// OS window is minimized; nothing to do yet.
+			return false;
+		}
+		if (!m_surface_extent_zero) {
+			// Swapchain was marked minimized because WindowContext::minimized was true at
+			// creation time, but it has since been cleared -> recreate now.
+			return true;
+		}
+		// m_surface_extent_zero: the OS window exists but the compositor has not yet
+		// assigned a real extent. Re-query and only trigger a recreate once the extent
+		// is non-zero; otherwise return false to avoid a spinning recreate loop.
+		const_cast<WindowContext&>(m_window).RefreshSurfaceCapabilities();
+		const auto& caps   = m_window.surface_capabilities.capabilities;
+		const auto& extent = caps.currentExtent;
+		// Extent 0xFFFFFFFF means the surface size is determined by the swapchain;
+		// in that case read the cached drawable size under the window mutex.
+		if (extent.width == std::numeric_limits<uint32_t>::max()) {
+			Common::LockGuard lock(m_window.mutex);
+			const bool drawable_ready = m_window.graphic_ctx.screen_width > 0 &&
+			                            m_window.graphic_ctx.screen_height > 0;
+			return drawable_ready;
+		}
+		return extent.width > 0 && extent.height > 0;
 	}
 	if (window_minimized) {
 		return true;
@@ -1214,7 +1265,7 @@ void Presenter::ClearLayer(int bus) {
 		return;
 	}
 	Common::LockGuard lock(m_impl->present_mutex);
-	auto& layer = m_impl->layers[bus];
+	auto&             layer = m_impl->layers[bus];
 	if (layer.frame != nullptr) {
 		m_impl->frames.Release(layer.frame);
 		layer = {};
