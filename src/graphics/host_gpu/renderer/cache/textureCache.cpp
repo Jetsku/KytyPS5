@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
 
 #include <algorithm>
@@ -5590,11 +5591,33 @@ bool TextureCache::IdleRetirable(const Image& image, uint64_t frame, uint64_t mi
 	       frame - std::min(frame, image.frame_accessed_last) > min_age;
 }
 
+bool TextureCache::RunBudgetGarbageCollector(uint64_t frame) {
+	if (!m_graphics.CanReportMemoryUsage()) {
+		return false; // no driver budget: the stock collection
+	}
+	// Once per frame (this runs on the command-processor thread after every completed submission;
+	// images are retired at most once per frame anyway).
+	if (frame == m_budget_frame) {
+		return true;
+	}
+	m_budget_frame    = frame;
+	const auto budget = m_graphics.GetTotalMemoryBudget();
+	m_budget_last     = budget;
+	const auto plan   = VramBudget::PlanImages(budget, m_total_used_memory, m_pressure_frames);
+	if (!plan.retire) {
+		return true;
+	}
+	const auto before  = m_idle_freed;
+	m_budget_freed_bytes += RetireUnusedImages(frame, plan.age_frames, 256, plan.bytes);
+	m_budget_freed += m_idle_freed - before;
+	return true;
+}
+
 void TextureCache::NoteFrameTick(uint64_t frame, uint64_t tick) {
 	if (m_frame_ticks.empty() || m_frame_ticks.back().first != frame) {
 		m_frame_ticks.emplace_back(frame, tick);
 	}
-	const auto keep = std::max(m_idle_frames, m_pressure_frames) + 64;
+	const auto keep = std::max({m_idle_frames, m_pressure_frames, VramBudget::DefaultAgeFrames}) + 64;
 	while (m_frame_ticks.size() > keep) {
 		m_frame_ticks.pop_front();
 	}
@@ -5650,9 +5673,8 @@ void TextureCache::RunGarbageCollector() {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	const auto frame = m_frame.load(std::memory_order_relaxed);
-	if (m_idle_frames != 0 || m_pressure_frames != 0) {
-		NoteFrameTick(frame, tick);
-	}
+	// Always (one entry per frame): KYTY_VRAM_GC_BUDGET is a live switch and needs recent frames.
+	NoteFrameTick(frame, tick);
 	if (m_idle_frames != 0 && frame >= m_idle_next_frame) {
 		m_idle_next_frame = frame + 32;
 		(void)RetireUnusedImages(frame, m_idle_frames, 512, UINT64_MAX);
@@ -5664,6 +5686,9 @@ void TextureCache::RunGarbageCollector() {
 		}
 		TracyPlot("ImageCache.RegisteredGuestBytes", static_cast<double>(m_registered_image_memory));
 		TracyPlot("ImageCache.PendingRetirementBytes", static_cast<double>(m_pressure_retirement_bytes));
+	}
+	if (VramBudget::GcEnabled() && RunBudgetGarbageCollector(frame)) {
+		return;
 	}
 	if (m_pressure_gc_enabled) {
 		RunPressureGarbageCollector(tick);
@@ -6009,13 +6034,27 @@ void TextureCache::ReportVram() {
 		m_vram_creates = {};
 	}
 	const auto [scratch_idle, scratch_limit] = m_tiler.ScratchPoolBytes();
+	const bool budget_mode = VramBudget::GcEnabled() && m_graphics.CanReportMemoryUsage();
 	VramStats::Line("GC: %s, usage %.1f MiB, trigger %.1f pressure %.1f critical %.1f MiB, registered "
 	                "guest bytes %.1f MiB, pending retirement %.1f MiB, GC tick %llu | tiler scratch "
 	                "pool %.1f of %.1f MiB idle",
-	                m_pressure_gc_enabled ? "pressure policy" : "submission age", ToMiB(m_total_used_memory),
-	                ToMiB(m_trigger_gc_memory), ToMiB(m_pressure_gc_memory), ToMiB(m_critical_gc_memory),
+	                budget_mode            ? "budget (KYTY_VRAM_GC_BUDGET)"
+	                : m_pressure_gc_enabled ? "pressure policy"
+	                                        : "submission age",
+	                ToMiB(m_total_used_memory),
+	                ToMiB(budget_mode ? VramBudget::ImageTrigger(m_budget_last) : m_trigger_gc_memory),
+	                ToMiB(budget_mode ? VramBudget::ImageTrigger(m_budget_last) : m_pressure_gc_memory),
+	                ToMiB(budget_mode ? VramBudget::Critical(m_budget_last) : m_critical_gc_memory),
 	                ToMiB(m_registered_image_memory), ToMiB(m_pressure_retirement_bytes),
 	                static_cast<unsigned long long>(m_gc_tick), ToMiB(scratch_idle), ToMiB(scratch_limit));
+	if (budget_mode) {
+		VramStats::Line("budget GC: planning budget %.1f MiB, freed %llu images / %.1f MiB in total (age %llu "
+		                "frames, a quarter above the critical mark)",
+		                ToMiB(m_budget_last), static_cast<unsigned long long>(m_budget_freed),
+		                ToMiB(m_budget_freed_bytes),
+		                static_cast<unsigned long long>(m_pressure_frames != 0 ? m_pressure_frames
+		                                                                       : VramBudget::DefaultAgeFrames));
+	}
 }
 
 void TextureCache::ProcessDownloadImages() {

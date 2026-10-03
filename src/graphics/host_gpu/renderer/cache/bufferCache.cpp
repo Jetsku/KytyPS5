@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
@@ -3640,7 +3641,23 @@ void BufferCache::RunGarbageCollector() {
 		m_idle_next_frame = frame + 32;
 		RetireUnusedBuffers(frame, m_idle_frames);
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// KYTY_VRAM_GC_BUDGET (vramBudget.h): the marks follow the budget as it is now; the collector
+	// below (blind to BDA reads) only runs above the planning budget itself.
+	auto trigger  = m_trigger_gc_memory;
+	auto critical = m_critical_gc_memory;
+	if (VramBudget::GcEnabled() && m_graphics.CanReportMemoryUsage()) {
+		// The budget once per frame (this runs on the command-processor thread after every
+		// completed submission).
+		if (frame != m_budget_frame) {
+			m_budget_frame    = frame;
+			const auto budget = m_graphics.GetTotalMemoryBudget();
+			m_budget_trigger  = VramBudget::BufferTrigger(budget);
+			m_budget_critical = VramBudget::BufferCritical(budget);
+		}
+		trigger  = m_budget_trigger;
+		critical = m_budget_critical;
+	}
+	if (m_total_used_memory < trigger) {
 		return;
 	}
 	if (m_pressure_frames != 0) {
@@ -3649,7 +3666,7 @@ void BufferCache::RunGarbageCollector() {
 		// of the submission-age collection below (no downloads).
 		if (frame != m_pressure_frame) {
 			m_pressure_frame = frame;
-			RetireUnusedBuffers(frame, m_total_used_memory >= m_critical_gc_memory
+			RetireUnusedBuffers(frame, m_total_used_memory >= critical
 			                               ? std::max<uint64_t>(m_pressure_frames / 4, 2)
 			                               : m_pressure_frames);
 		}
@@ -3659,7 +3676,7 @@ void BufferCache::RunGarbageCollector() {
 	// them so the ownership checks and downloads below see a consistent state.
 	CompleteAllSideReadbacks();
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = m_total_used_memory >= critical;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 

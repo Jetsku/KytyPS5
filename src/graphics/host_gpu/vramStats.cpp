@@ -165,6 +165,31 @@ std::vector<BufferEntry> BufferSnapshot() {
 	return entries;
 }
 
+namespace {
+std::atomic<uint64_t> g_function_declared {0};
+std::atomic<uint64_t> g_function_created {0};
+std::atomic<uint64_t> g_function_modules {0};
+
+void StoreMax(std::atomic<uint64_t>& target, uint64_t value) noexcept {
+	auto current = target.load(std::memory_order_relaxed);
+	while (value > current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {}
+}
+} // namespace
+
+void NoteFunctionStorage(uint64_t declared_bytes, uint64_t created_bytes) noexcept {
+	if (declared_bytes == 0) {
+		return;
+	}
+	StoreMax(g_function_declared, declared_bytes);
+	StoreMax(g_function_created, created_bytes);
+	g_function_modules.fetch_add(1, std::memory_order_relaxed);
+}
+
+FunctionStorage FunctionStorageMax() noexcept {
+	return {g_function_declared.load(std::memory_order_relaxed), g_function_created.load(std::memory_order_relaxed),
+	        g_function_modules.load(std::memory_order_relaxed)};
+}
+
 bool ReportDue() noexcept {
 	if (!Enabled()) {
 		return false;

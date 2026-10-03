@@ -480,6 +480,13 @@ private:
 	uint64_t           m_pressure_frames      = 0;
 	uint64_t           m_pressure_frame       = 0;
 	uint64_t           m_pressure_freed_bytes = 0;
+	// KYTY_VRAM_GC_BUDGET (graphics/host_gpu/vramBudget.h): frame-aged collection against the
+	// budget once per frame. Returns true when it handled this collection.
+	bool               RunBudgetGarbageCollector(uint64_t frame);
+	uint64_t           m_budget_frame       = UINT64_MAX;
+	uint64_t           m_budget_freed_bytes = 0;
+	uint64_t           m_budget_freed       = 0;
+	uint64_t           m_budget_last        = 0; // planning budget at the last collection
 	std::deque<std::pair<uint64_t, uint64_t>> m_frame_ticks;
 	// KYTY_VRAM_STATS: images created and freed (per HangTrace::ImageFreeReason) since the last
 	// report, {count, native bytes}.

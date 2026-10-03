@@ -760,6 +760,10 @@ private:
 	uint64_t                                          m_idle_freed_bytes = 0;
 	uint64_t                                          m_pressure_frames  = 0;
 	uint64_t                                          m_pressure_frame   = 0;
+	// KYTY_VRAM_GC_BUDGET: the marks from the budget, read once per frame.
+	uint64_t                                          m_budget_frame     = UINT64_MAX;
+	uint64_t                                          m_budget_trigger   = 0;
+	uint64_t                                          m_budget_critical  = 0;
 	std::deque<std::pair<uint64_t, uint64_t>>         m_frame_ticks;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

@@ -20,6 +20,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
 
 #include <algorithm>
@@ -105,6 +106,18 @@ std::chrono::milliseconds RetiredImageIdleLimit() {
 		return std::chrono::milliseconds(static_cast<int64_t>(std::min(ms, 3600000ull)));
 	}();
 	return limit;
+}
+
+// The native image pool keeps nothing while device usage is at this mark: the planning budget, or
+// with KYTY_VRAM_GC_BUDGET the image collector's trigger (it frees cached images there; holding
+// retired native images instead would only move the pressure).
+bool PoolPressure(const GraphicContext& graphics) {
+	if (!graphics.CanReportMemoryUsage()) {
+		return false;
+	}
+	const auto budget = graphics.GetTotalMemoryBudget();
+	const auto mark   = VramBudget::GcEnabled() ? VramBudget::ImageTrigger(budget) : budget;
+	return graphics.GetDeviceMemoryUsage() >= mark;
 }
 
 bool CanRecycleImage(const vk::ImageCreateInfo& info) {
@@ -589,6 +602,14 @@ void GraphicContext::ReportVramStats() {
 	                ToMiB(pool_bytes), pool_count, ToMiB(RetiredImageByteLimit(*this)),
 	                RetiredImageCountLimit(), NativeImagePoolEnabled() ? "on" : "off",
 	                ToMiB(GetDeviceMemoryUsage()), ToMiB(GetTotalMemoryBudget()));
+	// The driver's local memory (outside VMA) follows the largest per-invocation footprint.
+	const auto function_storage = VramStats::FunctionStorageMax();
+	VramStats::Line("Function-storage arrays: largest per invocation %llu bytes declared, %llu bytes given to "
+	                "the driver (%llu modules with such arrays; KYTY_FUNCTION_ARRAY_SHRINK %s)",
+	                static_cast<unsigned long long>(function_storage.declared),
+	                static_cast<unsigned long long>(function_storage.created),
+	                static_cast<unsigned long long>(function_storage.modules),
+	                function_storage.created < function_storage.declared ? "shrank them" : "off or no effect");
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -651,7 +672,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	const bool recycle = NativeImagePoolEnabled() && CanRecycleImage(image_info);
 	if (recycle) {
-		if (CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget()) {
+		if (PoolPressure(*this)) {
 			ClearRetiredImages();
 		}
 		std::scoped_lock lock(m_retired_image_mutex);
@@ -774,7 +795,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	}
 	bool retained = false;
 	if (image.pool_eligible && NativeImagePoolEnabled()) {
-		const bool pressure = CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget();
+		const bool pressure = PoolPressure(*this);
 		if (pressure) {
 			ClearRetiredImages();
 		} else {

@@ -49,6 +49,17 @@ void RegisterBuffer(const void* key, const BufferEntry& entry) noexcept;
 void UnregisterBuffer(const void* key) noexcept;
 [[nodiscard]] std::vector<BufferEntry> BufferSnapshot();
 
+// Shader modules' per-invocation Function-storage arrays (vulkanCommon.cpp CompileSPV): the largest
+// footprint given to the driver and the largest the emitter declared. Drivers reserve local memory
+// for the largest footprint times every resident thread (NVIDIA: ~126K threads on an RTX 3090).
+void NoteFunctionStorage(uint64_t declared_bytes, uint64_t created_bytes) noexcept;
+struct FunctionStorage {
+	uint64_t declared = 0;
+	uint64_t created  = 0;
+	uint64_t modules  = 0; // modules with any Function-storage array
+};
+[[nodiscard]] FunctionStorage FunctionStorageMax() noexcept;
+
 // GPU thread: true at most once per report interval (the first call starts the clock).
 [[nodiscard]] bool ReportDue() noexcept;
 // Seconds since the first ReportDue call.
