@@ -1043,6 +1043,9 @@ if(BUILD_TESTING)
 	add_test(NAME upsync2_shader_ir COMMAND $<TARGET_FILE:shader_cfg_tests> --upsync2-only)
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
+	add_test(NAME shader_cfg_post_dominators
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --post-dominators-only)
 	add_test(NAME registered_shader_code_on COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
 	set_tests_properties(registered_shader_code_on PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME registered_shader_code_off COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)

@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
+#include <ranges>
 #include <set>
 #include <span>
 #include <stack>
@@ -719,6 +720,30 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
+// One step of the (post-)dominator fixpoint: the sets of the blocks in `edges` intersected, plus
+// `id` (just `id` without edges). Sets are sorted; `out` and `scratch` keep their capacity across
+// calls, so the passes stop allocating once the buffers have grown.
+void MeetSets(const Graph& graph, std::vector<uint32_t> BasicBlock::*sets,
+              const std::vector<uint32_t>& edges, uint32_t id, std::vector<uint32_t>& out,
+              std::vector<uint32_t>& scratch) {
+	out.clear();
+	if (!edges.empty()) {
+		const auto& first = graph.blocks[edges.front()].*sets;
+		out.assign(first.begin(), first.end());
+		for (uint32_t i = 1; i < edges.size() && !out.empty(); i++) {
+			const auto& other = graph.blocks[edges[i]].*sets;
+			scratch.clear();
+			std::set_intersection(out.begin(), out.end(), other.begin(), other.end(),
+			                      std::back_inserter(scratch));
+			out.swap(scratch);
+		}
+	}
+	const auto it = std::lower_bound(out.begin(), out.end(), id);
+	if (it == out.end() || *it != id) {
+		out.insert(it, id);
+	}
+}
+
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
@@ -727,6 +752,8 @@ void ComputeDominators(Graph& graph) {
 		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
 	}
 
+	std::vector<uint32_t> next;
+	std::vector<uint32_t> scratch;
 	bool changed = true;
 	while (changed) {
 		changed = false;
@@ -734,20 +761,10 @@ void ComputeDominators(Graph& graph) {
 			if (block.id == graph.entry_block) {
 				continue;
 			}
-			std::vector<uint32_t> next;
-			if (block.predecessors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.predecessors.front()].dominators;
-				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
+			MeetSets(graph, &BasicBlock::dominators, block.predecessors, block.id, next, scratch);
 			if (next != block.dominators) {
-				block.dominators = std::move(next);
-				changed          = true;
+				block.dominators.swap(next);
+				changed = true;
 			}
 		}
 	}
@@ -761,24 +778,20 @@ void ComputePostDominators(Graph& graph) {
 		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
 	}
 
+	// Blocks are laid out in program order, so visiting them backwards sees most successors
+	// before their predecessors and the backward problem settles in a few passes. Any visiting
+	// order reaches the same greatest fixpoint from these starting sets; forward order needed
+	// about one pass per block of post-dominator depth, rerun after every merge split.
+	std::vector<uint32_t> next;
+	std::vector<uint32_t> scratch;
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
-			std::vector<uint32_t> next;
-			if (block.successors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.successors.front()].post_dominators;
-				for (uint32_t i = 1; i < block.successors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
+		for (auto& block: std::views::reverse(graph.blocks)) {
+			MeetSets(graph, &BasicBlock::post_dominators, block.successors, block.id, next, scratch);
 			if (next != block.post_dominators) {
-				block.post_dominators = std::move(next);
-				changed               = true;
+				block.post_dominators.swap(next);
+				changed = true;
 			}
 		}
 	}
@@ -1443,11 +1456,16 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
                                       uint32_t merge) {
 	std::vector<uint32_t> region;
 	std::vector<uint32_t> pending = {header.terminator.true_block, header.terminator.false_block};
-	const auto*           loop    = FindInnermostContainingLoop(graph, header.id);
+	uint32_t              id_end  = 0;
+	for (const auto& block: graph.blocks) {
+		id_end = std::max(id_end, block.id + 1u);
+	}
+	std::vector<bool> visited(id_end, false);
+	const auto*       loop = FindInnermostContainingLoop(graph, header.id);
 	while (!pending.empty()) {
 		const auto block_id = pending.back();
 		pending.pop_back();
-		if (block_id == merge || Contains(region, block_id) ||
+		if (block_id == merge || (block_id < visited.size() && visited[block_id]) ||
 		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block))) {
 			continue;
 		}
@@ -1457,8 +1475,13 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 		}
 		// A return terminates its own block; a branch to a shared return still has to
 		// obey selection entry/exit rules, just like any other branch.
-		AddUnique(region, block_id);
-		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+		visited[block_id] = true;
+		region.push_back(block_id);
+		for (const auto successor: block->successors) {
+			if (successor >= visited.size() || !visited[successor]) {
+				pending.push_back(successor);
+			}
+		}
 	}
 	SortUnique(region);
 	return region;
@@ -1504,7 +1527,8 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			const auto* member_block = graph.FindBlock(member);
 			return member_block != nullptr &&
 			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
-				       return predecessor != block_id && !Contains(region, predecessor);
+				       return predecessor != block_id &&
+				              !std::binary_search(region.begin(), region.end(), predecessor);
 			       });
 		});
 		if (external != region.end()) {
@@ -1594,12 +1618,15 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->dominators, dominator);
+	// Both sets are sorted: built by MeetSets, remapped through RemapIds.
+	return target != nullptr &&
+	       std::binary_search(target->dominators.begin(), target->dominators.end(), dominator);
 }
 
 bool Graph::PostDominates(uint32_t post_dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->post_dominators, post_dominator);
+	return target != nullptr && std::binary_search(target->post_dominators.begin(),
+	                                               target->post_dominators.end(), post_dominator);
 }
 
 uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const {
