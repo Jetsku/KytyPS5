@@ -172,8 +172,8 @@ jobs:
           # RTX 50 test kit: scripts that start the launcher with different settings (RTX50-TEST-README.txt).
           Copy-Item -Path 'tools/test-kit/*' -Destination $release -Recurse -Exclude '.gitattributes'
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination (Join-Path $release 'test-presets/1-release.json')
-          if (@(Get-ChildItem -LiteralPath $release -Filter 'Test *.cmd').Count -ne 12) { throw 'Expected 12 test scripts.' }
-          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 10) { throw 'Expected 10 test presets.' }
+          if (@(Get-ChildItem -LiteralPath $release -Filter 'Test *.cmd').Count -ne 13) { throw 'Expected 13 test scripts.' }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 11) { throw 'Expected 11 test presets.' }
           $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -185,5 +185,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip' --prerelease `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 RTX 50 test kit 2 (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "Test build for the RTX 50 / masterSemaphore startup freezes, not a regular release. int4b code and release settings plus the swapchain fix from upstream pull request #1001 by Ekt0re (window minimize/resize/move/fullscreen; a suboptimal acquire no longer leaves its semaphore pending). Seven test scripts: diagnostics, Vulkan overlays off, sparse residency off, a fresh shader cache, safe mode, the real GPU clock off (new), and all int3 shader changes off (new). Start with Test 1 and see RTX50-TEST-README.txt in the archive for the order and what to send back."
+            --title "U59 RTX 50 test kit 3 (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "Test build for the RTX 50 / masterSemaphore crash and freeze at the title -> galaxy map step, not a regular release. int4b code and settings, the swapchain fix from upstream pull request #1001, and debug options for the GPU page fault the RTX 5090 recorded in the deferred-lighting tile classifier (binding check, delayed freeing of buffers). Thirteen test scripts; new in kit 3: frame fence off (8), binding check (9), delayed buffer freeing (10), after an NVIDIA driver update (11), uniform lane reads (12) and ReBAR texture staging off (13), plus a While-frozen GPU load script. See RTX50-TEST-README.txt in the archive for the order and what to send back."

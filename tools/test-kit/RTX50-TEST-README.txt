@@ -1,4 +1,4 @@
-RTX 50 / masterSemaphore test kit 2
+RTX 50 / masterSemaphore test kit 3
 =================================
 
 This package is the int4b release (Kyty U59) plus the swapchain fix from upstream pull
@@ -41,7 +41,7 @@ and send:
   - _device_fault.nv-gpudmp, if one was written next to kyty_emulator.exe;
   - the GPU model and NVIDIA driver version.
 
-Round 3: tests 8 to 12
+Round 3: tests 8 to 13
 ======================
 
 The RTX 5090 logs of kit 2 show the GPU failing on a memory write in one
@@ -50,7 +50,7 @@ fault; the other tests froze at the same moment). These tests check where that
 write goes. Each one is a single start: title screen, then on into the galaxy
 map, or until it freezes or crashes. Run them in this order.
 
-Tests 9 to 12 also write a line to test-log.txt next to launcher.exe: the test,
+Tests 9 to 13 also write a line to test-log.txt next to launcher.exe: the test,
 the time, your GPU and its driver version.
 
   Test 8 - Diagnostics, frame fence off.cmd
@@ -72,6 +72,10 @@ the time, your GPU and its driver version.
   Test 12 - Diagnostics, uniform lane reads.cmd
       As test 1, with a shader option that keeps loops from splitting up on
       the GPU. The first start compiles shaders again and is slower.
+  Test 13 - Diagnostics, ReBAR staging off.cmd
+      As test 1, with the texture staging ring that is only used when Resizable
+      BAR is on switched off. The PCs where the game works have ReBAR off. If
+      test 13 gets past the point where the others fail, tell us at once.
 
 When a test freezes, leave the frozen game open and run
 "While frozen - GPU load.cmd" (it takes 15 seconds): it notes whether the GPU
