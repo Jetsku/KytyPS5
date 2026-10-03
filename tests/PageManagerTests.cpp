@@ -527,6 +527,74 @@ void SetDeferMode(DeferMode mode) { PageManager::SetDeferModeForTests(mode); }
 
 // A release inside a scope changes the counts at once and the host only when the outermost scope
 // ends; outside a scope, and with the switch off, releases stay synchronous.
+// DeferProtectScope: write watches added inside the scope change their counts at once and their
+// host protection at the scope's end, one call per stretch of a region whose pages need it or
+// already have it (pages 2 and 4, watched before the scope, are bridged; unwatched pages 6 and 7
+// split the call). Off and Verify keep the watches synchronous.
+void TestDeferProtectScope(DeferMode mode) {
+  SetDeferMode(mode);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](uint64_t index) { return memory + index * page_size; };
+  manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+  manager.UpdatePageWatchers<true>(address + page_size * 4, page_size);
+  const auto before = PageManager::GetProtectBatchStats();
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  {
+    const PageManager::DeferProtectScope scope;
+    {
+      const PageManager::DeferProtectScope nested;
+      for (const uint64_t index : {1, 3, 5, 8, 9}) {
+        manager.UpdatePageWatchers<true>(address + page_size * index, page_size);
+      }
+    }
+    if (mode == DeferMode::On) {
+      Check(g_protection_calls == 0 && IsWritable(page(1)) && IsWritable(page(3)) &&
+                IsWritable(page(5)) && IsWritable(page(8)) && IsWritable(page(9)),
+            "a write watch inside the scope (or at a nested scope's end) made its host call");
+    } else {
+      Check(g_protection_calls == 5 && Protection(page(1)) == PAGE_READONLY,
+            "a write watch outside DeferMode::On was deferred");
+    }
+  }
+  for (const uint64_t index : {1, 2, 3, 4, 5, 8, 9}) {
+    Check(Protection(page(index)) == PAGE_READONLY, "a watched page is writable after the scope");
+  }
+  Check(IsWritable(page(0)) && IsWritable(page(6)) && IsWritable(page(7)) &&
+            IsWritable(page(10)),
+        "the scope protected a page nobody watches");
+  const auto after = PageManager::GetProtectBatchStats();
+  if (mode == DeferMode::On) {
+    Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+              g_protection_ranges[0].address == address + page_size &&
+              g_protection_ranges[0].size == page_size * 5 &&
+              g_protection_ranges[1].address == address + page_size * 8 &&
+              g_protection_ranges[1].size == page_size * 2,
+          "the scope's end did not join the region's runs across already-watched pages");
+    Check(after.spans == before.spans + 5 && after.applies == before.applies + 1 &&
+              after.calls == before.calls + 2,
+          "protect batch statistics do not match the deferred watches");
+  } else {
+    Check(after.spans == before.spans, "a synchronous watch was counted as deferred");
+  }
+  for (const uint64_t index : {1, 2, 3, 4, 5, 8, 9}) {
+    manager.UpdatePageWatchers<false>(address + page_size * index, page_size);
+  }
+  {
+    // A watch released again inside the scope needs no host call at its end.
+    g_protection_calls = 0;
+    const PageManager::DeferProtectScope scope;
+    manager.UpdatePageWatchers<true>(address + page_size * 12, page_size);
+    manager.UpdatePageWatchers<false>(address + page_size * 12, page_size);
+  }
+  Check(IsWritable(page(12)), "a watch released inside the scope left its page protected");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  SetDeferMode(DeferMode::On);
+}
+
 void TestDeferredReleaseWaitsForScope(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
@@ -971,6 +1039,7 @@ int main(int argc, char **argv) {
     TestDeferredReleaseWaitsForScope(mode);
     TestDeferredReleaseRacingWatch(mode);
     TestDeferredReleaseStress(mode);
+    TestDeferProtectScope(mode);
   }
   TestDeferredBatchOverflow();
   TestParkingLock();

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <optional>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -240,6 +241,56 @@ uint32_t HotPageQuietFrames() {
 	return static_cast<uint32_t>(
 	    std::clamp<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_QUIET_FRAMES", 8), 1, 1000));
 }
+
+// KYTY_BDA_PROTECT_PROBE=1: the write-protect host calls of each BDA synchronization pass
+// (PageManager::BeginProtectProbe), summed into one console/log line every 10 s with the calls
+// the same ranges would take joined. Diagnostics only: the calls themselves are unchanged.
+class BdaProtectProbeScope final {
+public:
+	BdaProtectProbeScope() noexcept: m_active(Enabled()) {
+		if (m_active) {
+			PageManager::BeginProtectProbe();
+		}
+	}
+	~BdaProtectProbeScope() {
+		if (!m_active) {
+			return;
+		}
+		const auto probe = PageManager::EndProtectProbe();
+		static PageManager::ProtectProbe        totals;
+		static uint64_t                         passes = 0;
+		static std::chrono::steady_clock::time_point start;
+		const auto now = std::chrono::steady_clock::now();
+		if (passes == 0 && totals.calls == 0) {
+			start = now;
+		}
+		passes++;
+		totals.calls += probe.calls;
+		totals.pages += probe.pages;
+		totals.joined_calls += probe.joined_calls;
+		totals.gap8_calls += probe.gap8_calls;
+		if (now - start < std::chrono::seconds(10)) {
+			return;
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "BDA protect {:.0f}s: {} passes, {} protect calls ({} pages), {} if adjacent ranges "
+		    "were joined, {} with 8-page gaps bridged\n",
+		    std::chrono::duration<double>(now - start).count(), passes, totals.calls, totals.pages,
+		    totals.joined_calls, totals.gap8_calls));
+		totals = {};
+		passes = 0;
+		start  = now;
+	}
+	BdaProtectProbeScope(const BdaProtectProbeScope&)            = delete;
+	BdaProtectProbeScope& operator=(const BdaProtectProbeScope&) = delete;
+
+private:
+	static bool Enabled() {
+		static const bool enabled = ParseEnvU64("KYTY_BDA_PROTECT_PROBE", 0) != 0;
+		return enabled;
+	}
+	bool m_active;
+};
 
 // BufferCache::m_hot_check_limit (0 disables).
 uint32_t HotPageCheckLimit() {
@@ -1056,6 +1107,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_incremental_sync(IncrementalBdaSyncEnabled()),
       m_bda_hot_sync(m_bda_incremental_sync && BdaHotSyncEnabled()),
       m_bda_new_buffer_sync(ParseEnvU64("KYTY_BDA_NEW_BUFFER_SYNC", 0) != 0),
+      m_bda_batch_protect(ParseEnvU64("KYTY_BDA_BATCH_PROTECT", 0) != 0),
       m_memory_tracker(page_manager, m_bda_incremental_sync, BufferFaultPolicy()),
       m_hot_quiet_frames(HotPageQuietFrames()),
       m_hot_check_limit(HotPageCheckLimit()),
@@ -2333,6 +2385,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			RunRangeMemoVerifyHook(vaddr, size);
 		}
 	}
+	// KYTY_BDA_BATCH_PROTECT: inside a batched dirty-log pass a read upload is collected now and
+	// copied once the pass has protected every collected page (FinishBdaBatchedUpload).
+	if (m_bda_pending != nullptr && stats != nullptr && stats->verify_fault_epoch == 0 &&
+	    !is_written && !is_texel_buffer && !memo_verify) {
+		QueueBdaBatchedUpload(buffer, vaddr, size, stats, memo_applies, memo_signature);
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -2592,6 +2651,113 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
+}
+
+// The collection half of a read SynchronizeBuffer (KYTY_BDA_BATCH_PROTECT): the same page runs,
+// hot ranges and false-sharing splits, with no copy yet.
+void BufferCache::QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        BdaSyncStats* stats, bool memo_applies,
+                                        uint64_t memo_signature) {
+	if (!m_early_released.empty()) {
+		PruneEarlyReleased();
+	}
+	const bool exclude_unpublished = !m_early_released.empty();
+	auto&      pending             = m_bda_pending->emplace_back();
+	pending.buffer                 = &buffer;
+	pending.vaddr                  = vaddr;
+	pending.size                   = size;
+	pending.stats                  = stats;
+	pending.memo_applies           = memo_applies;
+	pending.memo_signature         = memo_signature;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false,
+	    [&](uint64_t address, uint64_t bytes, bool hot) noexcept {
+		    if (hot) {
+			    pending.hot_ranges.push_back({address, bytes});
+			    if (stats->hot_ranges != nullptr) {
+				    stats->hot_ranges->push_back({stats->buffer_id, address, bytes});
+			    }
+			    return;
+		    }
+		    if (!exclude_unpublished) {
+			    AppendUploadCopy(pending.copies, pending.total_size, buffer.Offset(address), bytes);
+			    pending.total_size += bytes;
+			    return;
+		    }
+		    uint64_t emitted = 0;
+		    ForEachPublishedPart(address, bytes, [&](uint64_t part, uint64_t part_bytes) {
+			    AppendUploadCopy(pending.copies, pending.total_size, buffer.Offset(part), part_bytes);
+			    pending.total_size += part_bytes;
+			    emitted += part_bytes;
+		    });
+		    if (emitted != bytes) {
+			    m_false_sharing_totals.upload_splits++;
+			    Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingUploadSplits);
+		    }
+	    },
+	    []() noexcept {});
+	if (pending.copies.empty() && pending.hot_ranges.empty() && !memo_applies) {
+		m_bda_pending->pop_back();
+	}
+}
+
+// The copy half of a read SynchronizeBuffer (KYTY_BDA_BATCH_PROTECT), after the pass's protection:
+// the same steps as its upload lambda and what follows it with UploadBatch on.
+void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
+	auto&                       buffer     = *pending.buffer;
+	auto&                       copies     = pending.copies;
+	uint64_t                    total_size = pending.total_size;
+	std::vector<uint64_t>       demote_hot;
+	std::vector<uint64_t>       settle_hot;
+	std::vector<UploadHostCopy> host_copies;
+	// A normal upload replaces whatever a hot page shadow described.
+	for (const auto& copy: copies) {
+		EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
+	}
+	const size_t   guest_copies = copies.size();
+	const uint64_t host_base    = total_size;
+	if (!pending.hot_ranges.empty()) {
+		CollectHotPages(buffer, pending.hot_ranges, copies, total_size, demote_hot, settle_hot);
+	}
+	const bool defer_host = m_upload_dma != nullptr && UploadDmaHostCopyEnabled() &&
+	                        !UploadDmaVerify() && m_staging_buffer.IsCoherent() &&
+	                        total_size >= m_upload_dma->MinBytes();
+	auto source = UploadCopies(buffer, copies, total_size, guest_copies, m_hot_scratch.data(),
+	                           host_base, defer_host ? &host_copies : nullptr);
+	if (pending.memo_applies) {
+		const bool collected = !copies.empty() || !pending.hot_ranges.empty();
+		if (!collected && pending.memo_signature != 0 &&
+		    m_memory_tracker.RangeSignature(pending.vaddr, pending.size) == pending.memo_signature) {
+			RecordRangeFact(pending.vaddr, pending.size, pending.memo_signature, RangeFact::Clean);
+		}
+	}
+	for (const auto page: demote_hot) {
+		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
+		EraseHotShadows(page, TRACKER_PAGE_SIZE);
+	}
+	for (const auto page: settle_hot) {
+		SettleHotPages(page, TRACKER_PAGE_SIZE);
+	}
+	if (!source) {
+		return;
+	}
+	pending.stats->upload_bytes += total_size;
+	pending.stats->upload_copies += copies.size();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordTransfer(HangTrace::TransferKind::BufferUpload, "bda-sync", "",
+		                          copies.empty() ? pending.vaddr
+		                                         : buffer.CpuAddress() + copies.front().dstOffset,
+		                          0, static_cast<uint32_t>(copies.size()), 0, total_size,
+		                          pending.size);
+	}
+	auto& command = m_scheduler.Current();
+	source        = StageUploadDma(source, copies, &host_copies);
+	command.RequestUploadCopy(source, buffer.Handle(), copies);
+	buffer.MarkContentWritten();
+	if (m_upload_batch_depth == 0) {
+		command.FlushBarriers();
+	}
 }
 
 vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies,
@@ -3931,6 +4097,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	// epoch. Everything the command processor orders before later draws (packets writing memory,
 	// waits, cache invalidations, service commands) advances the epoch first.
 	// KYTY_BDA_NEW_BUFFER_SYNC: buffers registered since the last pass, before any skip below.
+	const BdaProtectProbeScope protect_probe;
 	if (m_bda_new_buffer_sync) {
 		SynchronizeBdaNewBuffers(mapped_ranges);
 	}
@@ -4143,16 +4310,31 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	uint64_t logged  = 0;
 	{
 		const UploadBatch upload_batch(*this);
-		m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
-			logged++;
-			mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
-				SynchronizeBuffersInRange(start, finish - start, &stats);
+		BdaSyncStats      hot_stats;
+		// KYTY_BDA_BATCH_PROTECT: collect every read upload of the pass, protect, then copy.
+		std::vector<PendingBdaUpload> pending;
+		const bool batch = m_bda_batch_protect && UploadBatchEnabled() && m_range_memo_verify == 0 &&
+		                   PageManager::GetDeferMode() == PageManager::DeferMode::On;
+		{
+			std::optional<PageManager::DeferProtectScope> defer_protect;
+			if (batch) {
+				defer_protect.emplace();
+				m_bda_pending = &pending;
+			}
+			m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
+				logged++;
+				mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+					SynchronizeBuffersInRange(start, finish - start, &stats);
+				});
 			});
-		});
-		BdaSyncStats hot_stats;
-		for (const auto& range: m_bda_hot_ranges) {
-			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
-			                        false, &hot_stats);
+			for (const auto& range: m_bda_hot_ranges) {
+				(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
+				                        false, &hot_stats);
+			}
+			m_bda_pending = nullptr;
+		}
+		for (auto& upload: pending) {
+			FinishBdaBatchedUpload(upload);
 		}
 		stats.upload_bytes += hot_stats.upload_bytes;
 		stats.upload_copies += hot_stats.upload_copies;

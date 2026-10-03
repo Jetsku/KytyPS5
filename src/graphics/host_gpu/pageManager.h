@@ -77,6 +77,41 @@ public:
 	};
 	[[nodiscard]] static DeferStats GetDeferStats();
 
+	// Defers the host calls of the write watches the calling thread adds (tightenings) until the
+	// outermost scope ends, then applies them per region from the counts as they are then: one
+	// ApplySpan over all of a region's pending pages, so runs of several watches made by separate
+	// calls (several buffers, several ranges) share host calls, bridging pages already at their
+	// level. Only with DeferMode::On (Off and Verify keep every watch synchronous).
+	// The caller must not read the watched pages for an upload until the scope has ended: a write
+	// landing while the host call is pending does not fault, so only a copy made after the scope
+	// sees it (KYTY_BDA_BATCH_PROTECT: collect every upload of a pass, end the scope, then copy).
+	class DeferProtectScope final {
+	public:
+		DeferProtectScope() noexcept;
+		~DeferProtectScope();
+		DeferProtectScope(const DeferProtectScope&)            = delete;
+		DeferProtectScope& operator=(const DeferProtectScope&) = delete;
+	};
+	struct ProtectBatchStats {
+		uint64_t spans   = 0; // watches whose host call was deferred
+		uint64_t applies = 0; // ApplySpan calls made at scope ends
+		uint64_t calls   = 0; // host calls those made
+	};
+	[[nodiscard]] static ProtectBatchStats GetProtectBatchStats();
+
+	// Diagnostics: the write-protect host calls the calling thread makes between
+	// BeginProtectProbe and EndProtectProbe, and how many calls the same ranges would take with
+	// address-adjacent ranges joined (and with gaps of at most 8 pages bridged, an upper bound:
+	// bridging is only valid where the gap pages are already write-protected).
+	struct ProtectProbe {
+		uint64_t calls        = 0;
+		uint64_t pages        = 0;
+		uint64_t joined_calls = 0;
+		uint64_t gap8_calls   = 0;
+	};
+	static void                       BeginProtectProbe() noexcept;
+	[[nodiscard]] static ProtectProbe EndProtectProbe();
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

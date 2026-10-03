@@ -39,6 +39,13 @@ constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
 constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
+// PageManager::BeginProtectProbe/EndProtectProbe: the calling thread's write-protect calls.
+struct ProtectProbeState {
+	bool                                       active = false;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+};
+thread_local ProtectProbeState t_protect_probe;
+
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
@@ -97,6 +104,14 @@ struct DeferCounters {
 };
 DeferCounters         g_defer;
 std::atomic<uint32_t> g_verify_logged {0};
+
+// PageManager::GetProtectBatchStats.
+struct ProtectBatchCounters {
+	std::atomic<uint64_t> spans {0};
+	std::atomic<uint64_t> applies {0};
+	std::atomic<uint64_t> calls {0};
+};
+ProtectBatchCounters g_protect_batch;
 
 bool ReuseAppliedProtection() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -317,6 +332,21 @@ struct PageManager::Impl {
 	};
 	static thread_local DeferredBatch t_deferred;
 
+	// The calling thread's deferred write watches (DeferProtectScope): host runs whose call waits
+	// for the outermost scope's end.
+	struct ProtectSpan {
+		Impl*    impl   = nullptr;
+		Region*  region = nullptr;
+		uint64_t base   = 0;
+		uint16_t first  = 0;
+		uint16_t last   = 0;
+	};
+	struct ProtectBatch {
+		uint32_t                 depth = 0;
+		std::vector<ProtectSpan> spans;
+	};
+	static thread_local ProtectBatch t_protect_batch;
+
 	Impl() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		SYSTEM_INFO info {};
@@ -379,6 +409,9 @@ struct PageManager::Impl {
 		                             : MemoryStats::Counter::ProtectPages,
 		                   size / PAGE_SIZE);
 		const MemoryStats::ScopedTimer timer(MemoryStats::Counter::ProtectNs);
+		if (!unprotect && t_protect_probe.active) {
+			t_protect_probe.ranges.emplace_back(vaddr, size);
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -529,6 +562,36 @@ struct PageManager::Impl {
 		}
 	}
 
+	// End of the outermost DeferProtectScope: one ApplySpan per region over all of its pending
+	// runs, from the counts as they are now (pages between the runs that already have their level
+	// are bridged, pages that need another level split the call).
+	static void ApplyProtectBatch() noexcept {
+		auto& spans = t_protect_batch.spans;
+		if (spans.empty()) {
+			return;
+		}
+		std::sort(spans.begin(), spans.end(), [](const ProtectSpan& a, const ProtectSpan& b) {
+			return a.region != b.region ? a.region < b.region : a.first < b.first;
+		});
+		uint64_t applies = 0;
+		uint64_t calls   = 0;
+		for (size_t index = 0; index < spans.size();) {
+			const auto& head = spans[index];
+			uint16_t    last = head.last;
+			size_t      next = index + 1;
+			for (; next < spans.size() && spans[next].region == head.region; next++) {
+				last = std::max(last, spans[next].last);
+			}
+			calls += head.impl->ApplySpan(*head.region, head.base, head.first, last);
+			applies++;
+			index = next;
+		}
+		g_protect_batch.spans.fetch_add(spans.size(), std::memory_order_relaxed);
+		g_protect_batch.applies.fetch_add(applies, std::memory_order_relaxed);
+		g_protect_batch.calls.fetch_add(calls, std::memory_order_relaxed);
+		spans.clear();
+	}
+
 	// End of the outermost scope: applies the calling thread's pending spans from the counts as
 	// they are now.
 	static void ApplyDeferredBatch() noexcept {
@@ -662,6 +725,24 @@ struct PageManager::Impl {
 				return;
 			}
 		}
+		if constexpr (track && !is_read) {
+			if (t_protect_batch.depth != 0 && mode == DeferMode::On) {
+				// DeferProtectScope: the counts change now, the host calls at the scope's end (a
+				// full run list still makes its overflow calls here, under the locks).
+				RunList runs;
+				{
+					SpinGuard host(region.host_lock);
+					SpinGuard counts(region.lock);
+					UpdateCountsLocked<track, is_read, masked>(region, base_addr, first, last, mask,
+					                                           &runs);
+				}
+				for (size_t index = 0; index < runs.count; index++) {
+					t_protect_batch.spans.push_back(
+					    {this, &region, base_addr, runs.runs[index].first, runs.runs[index].last});
+				}
+				return;
+			}
+		}
 		SpinGuard host(region.host_lock);
 		RunList   runs;
 		{
@@ -766,6 +847,7 @@ struct PageManager::Impl {
 };
 
 thread_local PageManager::Impl::DeferredBatch PageManager::Impl::t_deferred;
+thread_local PageManager::Impl::ProtectBatch  PageManager::Impl::t_protect_batch;
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
@@ -779,8 +861,55 @@ PageManager::DeferUnprotectScope::~DeferUnprotectScope() {
 	}
 }
 
+PageManager::DeferProtectScope::DeferProtectScope() noexcept {
+	Impl::t_protect_batch.depth++;
+}
+
+PageManager::DeferProtectScope::~DeferProtectScope() {
+	if (--Impl::t_protect_batch.depth == 0) {
+		Impl::ApplyProtectBatch();
+	}
+}
+
+PageManager::ProtectBatchStats PageManager::GetProtectBatchStats() {
+	return {g_protect_batch.spans.load(std::memory_order_relaxed),
+	        g_protect_batch.applies.load(std::memory_order_relaxed),
+	        g_protect_batch.calls.load(std::memory_order_relaxed)};
+}
+
 bool PageManager::InDeferUnprotectScope() noexcept {
 	return Impl::t_deferred.depth != 0;
+}
+
+void PageManager::BeginProtectProbe() noexcept {
+	t_protect_probe.active = true;
+	t_protect_probe.ranges.clear();
+}
+
+PageManager::ProtectProbe PageManager::EndProtectProbe() {
+	auto& ranges           = t_protect_probe.ranges;
+	t_protect_probe.active = false;
+	ProtectProbe result;
+	result.calls = ranges.size();
+	if (ranges.empty()) {
+		return result;
+	}
+	std::sort(ranges.begin(), ranges.end());
+	uint64_t joined_end = 0;
+	uint64_t gap8_end   = 0;
+	for (const auto& [address, size]: ranges) {
+		result.pages += size / PAGE_SIZE;
+		if (result.joined_calls == 0 || address > joined_end) {
+			result.joined_calls++;
+		}
+		if (result.gap8_calls == 0 || address > gap8_end + 8 * PAGE_SIZE) {
+			result.gap8_calls++;
+		}
+		joined_end = std::max(joined_end, address + size);
+		gap8_end   = std::max(gap8_end, address + size);
+	}
+	ranges.clear();
+	return result;
 }
 
 void PageManager::Reconcile(uint64_t vaddr, uint64_t size, bool now) {

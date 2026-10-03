@@ -1283,6 +1283,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
 	set_tests_properties(bda_new_buffer_sync_verify PROPERTIES
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+	# KYTY_BDA_BATCH_PROTECT: the dirty-log pass collects, protects once, then copies. Contents
+	# checked on the GPU; the verify run also follows each dirty-log pass with a full scan.
+	add_test(NAME bda_new_buffer_batch_protect
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_batch_protect PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_BATCH_PROTECT=1")
+	add_test(NAME bda_new_buffer_batch_protect_sync_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_batch_protect_sync_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit")
 	# Exercise the new-buffer upload before an otherwise valid epoch/submission skip, and mapping
 	# invalidation while a native buffer survives. The fixture checks real GPU contents.
 	foreach(bda_case same_epoch same_submission remap)

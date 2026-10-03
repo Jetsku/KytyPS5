@@ -168,6 +168,29 @@ void CheckBdaNewBufferSync() {
         context.PrepareBda();
       }
 
+      if (!same_epoch) {
+        // Two registered buffers the CPU writes after their passes: the next pass is a dirty-log
+        // pass over both (KYTY_BDA_BATCH_PROTECT: their pages are collected, write-protected in
+        // one call per region, then copied). Both must hold the bytes, and the written pages
+        // must be write-protected again on the host, so a later write still faults.
+        context.PrepareBda();
+        cpu_write(new_offset + 0x4004, 0x5eed0007u);
+        cpu_write(grown_offset + 0x6008, 0x5eed0008u);
+        cpu_write(grown_offset + 0x7008, 0x5eed0009u);
+        SyncEpoch::Advance();
+        context.PrepareBda();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+        for (const uint64_t offset : {new_offset + 0x4004, grown_offset + 0x6008,
+                                      grown_offset + 0x7008}) {
+          MEMORY_BASIC_INFORMATION info{};
+          Require(name, "written pages protected again",
+                  VirtualQuery(memory + offset, &info, sizeof(info)) != 0 &&
+                      (info.Protect & 0xffu) == PAGE_READONLY,
+                  "a page the pass uploaded is still writable: its next write would be missed");
+        }
+#endif
+      }
+
       // Control: the same creation with no pass after it. Its contents must differ from the
       // guest bytes, or the cases above would not depend on the BDA pass at all.
       control_id = cache.FindBuffer(base + control_offset, new_size);

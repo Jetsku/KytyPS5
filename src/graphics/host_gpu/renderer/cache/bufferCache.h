@@ -614,6 +614,29 @@ private:
 	// a new buffer is synchronized alone at the start of the next pass (SynchronizeBdaNewBuffers),
 	// recording its hot runs. GPU mapping changes still move the epoch.
 	const bool                                        m_bda_new_buffer_sync;
+	// KYTY_BDA_BATCH_PROTECT=1 (default off): a dirty-log pass first collects the read uploads of
+	// all its buffers (their pages become clean and write-watched, the host calls deferred by a
+	// PageManager::DeferProtectScope), then ends the scope, which protects each region's pages in
+	// one ApplySpan, and only then copies them (FinishBdaBatchedUpload). Runs of separate buffers
+	// and ranges share host calls; a guest write landing before the deferred call is in the copy.
+	// Only with KYTY_UPLOAD_BATCH, KYTY_DEFER_UNPROTECT on and no range-memo verification.
+	const bool m_bda_batch_protect;
+	struct PendingBdaUpload {
+		Buffer*                     buffer = nullptr;
+		uint64_t                    vaddr  = 0;
+		uint64_t                    size   = 0;
+		BdaSyncStats*               stats  = nullptr;
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size = 0;
+		std::vector<GuestRange>     hot_ranges;
+		bool                        memo_applies   = false;
+		uint64_t                    memo_signature = 0;
+	};
+	// Non-null while a batched pass collects: SynchronizeBuffer queues its read upload here.
+	std::vector<PendingBdaUpload>* m_bda_pending = nullptr;
+	void QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t size, BdaSyncStats* stats,
+	                           bool memo_applies, uint64_t memo_signature);
+	void FinishBdaBatchedUpload(PendingBdaUpload& pending);
 	MemoryTracker                                     m_memory_tracker;
 	// Hot pages: exact copy of the last contents uploaded for each hot page (GPU thread only).
 	// While a page is hot its buffer bytes equal this copy: every other write of them either
