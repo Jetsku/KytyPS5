@@ -377,6 +377,16 @@ private:
 		// Queued upload copies (RequestUploadCopy), recorded first when the batch is flushed.
 		std::vector<PendingUpload>  uploads;
 		std::vector<vk::BufferCopy> upload_regions;
+		// Per destination of the queued uploads, the union of their regions' byte ranges, sorted
+		// and disjoint: RequestUploadCopy's overlap test in O(log n) per region instead of a scan
+		// of every queued region. The first upload_span_count entries are in use; entries and
+		// their vectors are reused across batches.
+		struct UploadSpans {
+			vk::Buffer                                destination;
+			std::vector<std::pair<uint64_t, uint64_t>> spans;
+		};
+		std::vector<UploadSpans> upload_spans;
+		size_t                   upload_span_count = 0;
 		uint32_t                              origins = 0; // bit per BarrierOrigin
 
 		[[nodiscard]] bool Empty() const {
@@ -389,6 +399,7 @@ private:
 			buffers.clear();
 			uploads.clear();
 			upload_regions.clear();
+			upload_span_count = 0;
 			origins = 0;
 		}
 	};

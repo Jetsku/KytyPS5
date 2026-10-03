@@ -237,6 +237,9 @@ public:
 		uint32_t hot_max     = 0;
 		// Written uploads copy with no region lock held (MemoryTracker::ForEachWrittenUploadRange).
 		bool copy_outside_lock = false;
+		// Read uploads defer their write-protect host calls until every region lock of the
+		// collection is released (MemoryTracker::ForEachUploadRange).
+		bool defer_upload_protect = false;
 	};
 	struct FaultResult {
 		uint64_t ahead_pages = 0;
@@ -403,8 +406,11 @@ public:
 		return settled;
 	}
 
-	// Demotes hot pages no upload visited for more than `idle_frames` frames.
-	uint32_t SweepHot(uint32_t frame, uint32_t idle_frames, std::atomic_uint32_t& hot_count) {
+	// Demotes hot pages no upload visited for more than `idle_frames` frames. on_demote(address,
+	// bytes) receives each run of them before it leaves the hot set (still under `lock`).
+	template <typename DemoteFunc>
+	uint32_t SweepHot(uint32_t frame, uint32_t idle_frames, std::atomic_uint32_t& hot_count,
+	                  DemoteFunc&& on_demote) {
 		if (m_hot.None()) {
 			return 0;
 		}
@@ -420,6 +426,9 @@ public:
 		}
 		const auto demoted = static_cast<uint32_t>(idle.Count());
 		if (demoted != 0) {
+			for (const auto [first, last]: idle) {
+				on_demote(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			}
 			Bump();
 			m_hot ^= idle;
 			hot_count.fetch_sub(demoted, std::memory_order_relaxed);

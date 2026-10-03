@@ -46,11 +46,17 @@ void MemoryTracker::DemoteHotPages(uint64_t vaddr, uint64_t size) {
 }
 
 std::vector<uint64_t> MemoryTracker::SettleHotPages(uint64_t vaddr, uint64_t size) {
-	CheckNotInUploadCallback();
 	std::vector<uint64_t> pages;
+	SettleHotPages(vaddr, size, pages);
+	return pages;
+}
+
+void MemoryTracker::SettleHotPages(uint64_t vaddr, uint64_t size, std::vector<uint64_t>& pages) {
+	CheckNotInUploadCallback();
 	if (m_hot_count.load(std::memory_order_relaxed) == 0) {
-		return pages;
+		return;
 	}
+	const auto listed = pages.size();
 	const auto collect = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		(void)manager->SettleHot(manager->GetCpuAddr() + offset, bytes, m_hot_count,
@@ -71,8 +77,7 @@ std::vector<uint64_t> MemoryTracker::SettleHotPages(uint64_t vaddr, uint64_t siz
 			collect(manager, 0, TRACKER_REGION_SIZE);
 		}
 	}
-	MemoryStats::Count(MemoryStats::Counter::HotDemotions, pages.size());
-	return pages;
+	MemoryStats::Count(MemoryStats::Counter::HotDemotions, pages.size() - listed);
 }
 
 void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
@@ -92,12 +97,13 @@ void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
 	uint32_t   demoted = 0;
 	for (auto* manager: managers) {
 		std::scoped_lock lock(manager->lock);
-		// Swept pages stay CPU-dirty and writable outside the hot set (see DemoteHotPages). A
-		// region without hot pages cannot change here; otherwise publish conservatively.
-		if (manager->IsHot(manager->GetCpuAddr(), TRACKER_REGION_SIZE)) {
-			NotifyCpuMutation(manager->GetCpuAddr(), TRACKER_REGION_SIZE);
-		}
-		demoted += manager->SweepHot(frame, idle_frames, m_hot_count);
+		// Swept pages stay CPU-dirty and writable outside the hot set (see DemoteHotPages): each
+		// demoted run is published before it changes. Pages that stay hot change nothing (logging
+		// the whole region made the next dirty-log pass rescan every buffer in it).
+		demoted += manager->SweepHot(frame, idle_frames, m_hot_count,
+		                             [this](uint64_t address, uint64_t bytes) noexcept {
+			                             NotifyCpuMutation(address, bytes);
+		                             });
 	}
 	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 }

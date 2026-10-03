@@ -161,11 +161,12 @@ static uint32_t WriteRangeLogLimit() {
 	return limit;
 }
 
-// KYTY_WRITE_RANGE_STATS=0 skips the image lookup behind FrameEvent.WriteRangeImagesSpared.
+// KYTY_WRITE_RANGE_STATS=1 (default off) counts FrameEvent.WriteRangeImagesSpared: a texture-cache
+// lock and image lookup per narrowed written binding, only for that statistic.
 static bool WriteRangeImageStatsEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_WRITE_RANGE_STATS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }

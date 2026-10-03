@@ -92,6 +92,10 @@ public:
 		DeferProtectScope(const DeferProtectScope&)            = delete;
 		DeferProtectScope& operator=(const DeferProtectScope&) = delete;
 	};
+	// Whether the calling thread is inside a DeferProtectScope. A caller that copies right after
+	// its own scope ends must not open one nested in another: the host calls would wait for the
+	// outer scope, after the copy.
+	[[nodiscard]] static bool InDeferProtectScope() noexcept;
 	struct ProtectBatchStats {
 		uint64_t spans   = 0; // watches whose host call was deferred
 		uint64_t applies = 0; // ApplySpan calls made at scope ends

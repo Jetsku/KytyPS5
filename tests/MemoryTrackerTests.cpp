@@ -1562,10 +1562,12 @@ bool FaultStressHandler(const Common::HostException::ExceptionInfo &info) {
 // Writer threads store to tracked pages (real faults, resolved as HandleFault does) while an
 // uploader keeps taking the pages back. After the last upload the uploaded copy must equal memory:
 // a write that landed on a page the tracker considered clean would be missing from it.
-void TestFaultStressNoLostWrites(PageManager::DeferMode mode) {
+void TestFaultStressNoLostWrites(PageManager::DeferMode mode,
+                                 bool defer_upload_protect = false) {
   PageManager::SetDeferModeForTests(mode);
   MemoryTracker::FaultPolicy policy;
   policy.ahead_pages = 4;
+  policy.defer_upload_protect = defer_upload_protect;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -1643,11 +1645,12 @@ void TestFaultStressNoLostWrites(PageManager::DeferMode mode) {
         "a write was not uploaded: it landed on a page the tracker considered clean");
   Check(stats.verify_mismatches == stats_before.verify_mismatches,
         "verify mode found protection mismatches under the fault stress");
-  std::printf("  fault stress (%s): %llu faults in %.0f ms (writers %.0f ms CPU, %.1f us CPU "
+  std::printf("  fault stress (%s%s): %llu faults in %.0f ms (writers %.0f ms CPU, %.1f us CPU "
               "per fault), %llu uploads, %llu deferred spans, %llu settled, %llu verify checks\n",
               mode == PageManager::DeferMode::Off   ? "deferral off"
               : mode == PageManager::DeferMode::On ? "deferred"
                                                    : "verify",
+              defer_upload_protect ? ", upload protect deferred" : "",
               static_cast<unsigned long long>(faults), wall_ms,
               static_cast<double>(writer_cpu_100ns.load()) / 1e4,
               faults != 0 ? static_cast<double>(writer_cpu_100ns.load()) / 10.0 /
@@ -1756,6 +1759,112 @@ void FaultBench() {
   }
 }
 #endif
+
+// FaultPolicy::defer_upload_protect: a read upload write-protects its pages after the region
+// locks, before upload_func copies them. Inside another DeferProtectScope it does not open its own:
+// the outer scope's end protects them (its caller copies after that, as a batched BDA pass does).
+void TestDeferredUploadProtect() {
+  PageManager::SetDeferModeForTests(PageManager::DeferMode::On);
+  MemoryTracker::FaultPolicy policy;
+  policy.defer_upload_protect = true;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 8);
+  Check(!IsWritable(memory) && !IsWritable(memory + page_size * 7),
+        "deferred upload left pages writable");
+  WriteFault(tracker, address + page_size);
+  WriteFault(tracker, address + page_size * 5);
+  bool writable_while_collecting = false;
+  bool protected_at_copy = false;
+  uint64_t collected = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 8, false,
+      [&](uint64_t range, uint64_t bytes) noexcept {
+        collected += bytes / page_size;
+        writable_while_collecting =
+            writable_while_collecting || IsWritable(reinterpret_cast<const void *>(range));
+      },
+      [&]() noexcept {
+        protected_at_copy = !IsWritable(memory + page_size) && !IsWritable(memory + page_size * 5);
+      });
+  Check(collected == 2 && writable_while_collecting && protected_at_copy &&
+            !tracker.IsRegionCpuModified(address, page_size * 8),
+        "a deferred read upload was not protected after collecting and before copying");
+
+  // A written upload keeps protecting under its locks (it copies under them).
+  WriteFault(tracker, address + page_size * 2);
+  bool written_protected = false;
+  tracker.ForEachUploadRange(
+      address + page_size * 2, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      [&]() noexcept { written_protected = !IsWritable(memory + page_size * 2); });
+  Check(written_protected, "a written upload copied before its pages were protected");
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 2, page_size);
+
+  // Nested in an outer scope: protected when that scope ends, not before.
+  WriteFault(tracker, address + page_size * 3);
+  bool writable_at_nested_copy = false;
+  {
+    const PageManager::DeferProtectScope outer;
+    tracker.ForEachUploadRange(
+        address, page_size * 8, false, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept { writable_at_nested_copy = IsWritable(memory + page_size * 3); });
+  }
+  Check(writable_at_nested_copy && !IsWritable(memory + page_size * 3),
+        "a nested upload ended its own scope instead of leaving it to the outer one");
+
+  tracker.UntrackMemory(address, page_size * 8);
+  Release(memory);
+}
+
+// MemoryTracker::SweepHotPages logs (KYTY_BDA_DIRTY_LOG) and publishes exactly the hot pages it
+// demotes: a region whose hot pages all stay hot changes nothing.
+void TestSweepLogsDemotedPagesOnly() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+
+  UploadAll(tracker, address, page_size * 8);
+  WriteFault(tracker, address);
+  WriteFault(tracker, address + page_size * 4);
+  Check(tracker.HotPageCount() == 2, "pages were not promoted for the sweep log");
+  for (int frame = 0; frame < 5; frame++) {
+    tracker.AdvanceFrame();
+  }
+  // Page 0 is visited (recently used); page 4 is idle.
+  (void)UploadHotAware(tracker, address, page_size);
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  const auto before = tracker.FaultMutationEpoch();
+  tracker.SweepHotPages(3);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && tracker.HotPageCount() == 1 &&
+            tracker.FaultMutationEpoch() != before &&
+            ranges.Contains(address + page_size * 4, page_size) &&
+            !ranges.Intersects(address, page_size * 4) &&
+            !ranges.Intersects(address + page_size * 5, page_size * 3),
+        "a sweep did not log exactly the page it demoted");
+
+  // Nothing idle: no log entry, no epoch move.
+  (void)UploadHotAware(tracker, address, page_size);
+  const auto quiet = tracker.FaultMutationEpoch();
+  tracker.SweepHotPages(3);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() &&
+            tracker.HotPageCount() == 1 && tracker.FaultMutationEpoch() == quiet,
+        "a sweep that demoted nothing logged a range or moved the epoch");
+
+  tracker.UntrackMemory(address, page_size * 8);
+  Release(memory);
+}
 
 void TestHotPageSettle() {
   MemoryTracker::FaultPolicy policy;
@@ -2812,6 +2921,7 @@ int main(int argc, char **argv) {
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();
+  TestSweepLogsDemotedPagesOnly();
   TestRangeSignature();
   TestRangeDirtiedSignature();
   TestRangeSignatureAcrossRegions();
@@ -2825,6 +2935,7 @@ int main(int argc, char **argv) {
   // Everything above ran with deferred write-unprotect (the default). The fault and upload cases
   // again with it off (the previous synchronous releases) and in verify mode.
   TestDeferredFaultUnprotect();
+  TestDeferredUploadProtect();
   for (const auto mode : {PageManager::DeferMode::Off, PageManager::DeferMode::Verify}) {
     PageManager::SetDeferModeForTests(mode);
     TestRangeInvalidation();
@@ -2842,6 +2953,8 @@ int main(int argc, char **argv) {
                           PageManager::DeferMode::Verify}) {
     TestFaultStressNoLostWrites(mode);
   }
+  // FaultPolicy::defer_upload_protect: uploads racing the writers' faults lose no write either.
+  TestFaultStressNoLostWrites(PageManager::DeferMode::On, true);
 #endif
   Check(PageManager::GetDeferStats().verify_mismatches == 0,
         "verify mode found protection mismatches");

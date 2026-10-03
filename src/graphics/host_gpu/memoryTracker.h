@@ -11,6 +11,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -219,6 +220,8 @@ public:
 	// tracking as clean, write-protected pages (RegionManager::SettleHot) and lists them. The
 	// caller must mark each one whose contents changed since its last upload CPU-dirty again.
 	[[nodiscard]] std::vector<uint64_t> SettleHotPages(uint64_t vaddr, uint64_t size);
+	// The same, appending the settled pages to `pages`.
+	void SettleHotPages(uint64_t vaddr, uint64_t size, std::vector<uint64_t>& pages);
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
@@ -266,21 +269,35 @@ public:
 		const bool  keep_hot              = hot_aware && !is_written;
 		const auto  frame                 = Frame();
 		uint32_t    demoted               = 0;
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			manager->lock.lock();
-			demoted += manager->CollectUpload(
-			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
-			    [&](uint64_t address, uint64_t range_bytes, bool hot) noexcept {
-				    if constexpr (hot_aware) {
-					    range_func(address, range_bytes, hot);
-				    } else {
-					    range_func(address, range_bytes);
-				    }
-			    });
-			if (!is_written) {
-				manager->lock.unlock();
+		{
+			// FaultPolicy::defer_upload_protect: a read upload write-protects its collected pages
+			// after the region locks below are released (guest write faults on those regions no
+			// longer wait for the host calls) and in one call per region, and copies after that,
+			// as a batched BDA pass does. A page written meanwhile does not fault, but it is still
+			// clean only once protected, and the copy below sees the write. Not inside another
+			// scope: its host calls would then come after the copy.
+			std::optional<PageManager::DeferProtectScope> defer_protect;
+			if (!is_written && m_fault_policy.defer_upload_protect &&
+			    !PageManager::InDeferProtectScope() &&
+			    PageManager::GetDeferMode() == PageManager::DeferMode::On) {
+				defer_protect.emplace();
 			}
-		});
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				manager->lock.lock();
+				demoted += manager->CollectUpload(
+				    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
+				    [&](uint64_t address, uint64_t range_bytes, bool hot) noexcept {
+					    if constexpr (hot_aware) {
+						    range_func(address, range_bytes, hot);
+					    } else {
+						    range_func(address, range_bytes);
+					    }
+				    });
+				if (!is_written) {
+					manager->lock.unlock();
+				}
+			});
+		}
 		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 		upload_func();
 		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the

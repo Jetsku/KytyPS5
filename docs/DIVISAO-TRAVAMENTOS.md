@@ -120,7 +120,35 @@ orientado a desmarcar "DCC GPU clear", marcar "red zone protection" e "program c
 
 ## Seção Claude
 
-### Revisão do caminho de buffers: correções para DEPOIS do build único (kytyps5-fork-61, 2026-10-03)
+### Correções do caminho de buffers APLICADAS (kytyps5-fork-61, 2026-10-03 noite) — pronto para o build único
+
+O usuário pediu para corrigir já. Commitado a pedido do usuário (commit "Buffer path: deferred upload
+protects, ..."; o `ShaderRecompilerComputeTests.cpp` ficou fora, é de outra sessão). Arquivos: `memoryTracker.{h,cpp}`, `regionManager.h`,
+`pageManager.{h,cpp}`, `bufferCache.{h,cpp}`, `descriptors.cpp` (só o padrão de `KYTY_WRITE_RANGE_STATS`,
+fora dos hunks do piloto AMD), `tests/MemoryTrackerTests.cpp`. Não toquei no `ShaderRecompilerComputeTests.cpp`
+(a mudança `VulkanHarness(false)` que está lá é de outra sessão, e foi ela que deixou os testes de memo/BDA rodarem aqui).
+
+| Item | O que mudou | Padrão |
+|---|---|---|
+| 1 | `KYTY_UPLOAD_DEFER_PROTECT`: o upload de leitura protege as páginas depois de soltar os locks de região, uma chamada por região, antes da cópia (não abre escopo aninhado). O lote `KYTY_BDA_BATCH_PROTECT` agora cobre também a passada hot, o full scan (com stats) e a dos buffers novos (`RunBdaPass`). Os settles de hot pages são feitos em lote (`SettleHotPageList`): proteção aplicada antes do memcmp | on (=0 desliga) |
+| 2 | Página hot comparada uma vez por passada BDA (`HotShadow::visit_pass`); dedupe das hot runs por sort em vez de O(found×H) | sempre |
+| 2b | `KYTY_BDA_HOT_PER_SUBMISSION=1`: hot runs gravadas reexaminadas uma vez por submissão. **Muda semântica** como o `SYNC_PER_SUBMISSION`: o teste `bda_hot_ranges_gpu_merge*` falha com ela ligada, como esperado (escrita hot sem falta na mesma submissão) | off |
+| 3 | `SweepHotPages` loga e publica só as runs rebaixadas (antes: a região inteira de 4 MiB) | sempre |
+| 4 | Fault-ahead: sem código; teste por variável (`KYTY_FAULT_AHEAD_KB=16`/`8`) | — |
+| 5 | Vetores do `SynchronizeBuffer` e do lote reaproveitados (`SyncScratchLease`, pool de `PendingBdaUpload`, `m_bda_found`), pool de páginas de sombra | sempre |
+| 6 | `KYTY_HOT_PAGE_PRESSURE=1`: com recusas desde o último sweep, sweep a cada frame (ocioso 2 frames) e check limit /4 | off |
+| 7 | `KYTY_BINDING_MEMO_BUFFER_GUARD`: memo de binding validado pelo próprio buffer (geração, `is_deleted`, bounds, offset), não pela época global | on (=0 desliga) |
+| 8 | `KYTY_WRITE_RANGE_STATS` desligado por padrão | off (=1 liga) |
+| extra | `CommandBuffer::RequestUploadCopy` (`context.cpp`, `render.h`): o teste de sobreposição com os uploads já enfileirados comparava cada região nova com todas as regiões do mesmo destino (quadrático numa passada BDA com centenas de runs num buffer). Agora há, por destino, a união ordenada das regiões, com busca binária. Mesma resposta: conferido contra a lógica antiga em 800 mil pedidos aleatórios | sempre |
+| 9, 10 | **Não implementados**: o 9 precisa de uma época de posse das imagens no texture cache (não existe); o 10 precisa medir a taxa de repetição antes (`KYTY_CP_COMMIT_STATS=1`) | — |
+
+Testes: `memory_tracker*`/`page_manager*` 4/4 (novos: proteção adiada no upload, inclusive aninhada; stress de 4
+escritores com ela ligada sem escrita perdida; sweep loga só o rebaixado). `bda_*`, `binding_*`, `buffer_range_memo*`,
+`buffer_upload_coalesce*`, `wave_halves`, `amd_buffer_bounds*`, `buffer_robustness`: 38/38 com o padrão, e
+`bda_hot_ranges_gpu_merge*`/`bda_new_buffer*`/`buffer_upload_coalesce*` também com `BATCH_PROTECT=1`, `+HOT_PAGE_PRESSURE=1`
+e com `UPLOAD_DEFER_PROTECT=0;BINDING_MEMO_BUFFER_GUARD=0`. `kyty_emulator` e launcher compilam. Falta o usuário jogar.
+
+### Revisão do caminho de buffers: lista original (kytyps5-fork-61, 2026-10-03)
 
 Só revisão, nada editado. O usuário pediu para corrigir **depois que as outras sessões terminarem**.
 Os arquivos são de outros donos (`bufferCache.cpp`, `memoryTracker.*`, `regionManager.h`,

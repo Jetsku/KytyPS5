@@ -871,6 +871,10 @@ PageManager::DeferProtectScope::~DeferProtectScope() {
 	}
 }
 
+bool PageManager::InDeferProtectScope() noexcept {
+	return Impl::t_protect_batch.depth != 0;
+}
+
 PageManager::ProtectBatchStats PageManager::GetProtectBatchStats() {
 	return {g_protect_batch.spans.load(std::memory_order_relaxed),
 	        g_protect_batch.applies.load(std::memory_order_relaxed),

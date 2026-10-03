@@ -218,6 +218,10 @@ uint64_t ParseEnvU64(const char* name, uint64_t fallback) {
 //                         4 KiB shadow each) are hot.
 //   KYTY_UPLOAD_COPY_OUTSIDE_LOCK  0 copies written uploads with their region locks held (the
 //                         previous behaviour) instead of MemoryTracker::ForEachWrittenUploadRange.
+//   KYTY_UPLOAD_DEFER_PROTECT  0 write-protects a read upload's pages under their region locks,
+//                         one host call per run (the previous behaviour), instead of after the
+//                         locks, once per region, before the copy (FaultPolicy::defer_upload_protect;
+//                         needs KYTY_DEFER_UNPROTECT on).
 MemoryTracker::FaultPolicy BufferFaultPolicy() {
 	MemoryTracker::FaultPolicy policy;
 	const auto ahead_kib = ParseEnvU64("KYTY_FAULT_AHEAD_KB", 32);
@@ -233,7 +237,8 @@ MemoryTracker::FaultPolicy BufferFaultPolicy() {
 			policy.hot_frames = 0;
 		}
 	}
-	policy.copy_outside_lock = ParseEnvU64("KYTY_UPLOAD_COPY_OUTSIDE_LOCK", 1) != 0;
+	policy.copy_outside_lock    = ParseEnvU64("KYTY_UPLOAD_COPY_OUTSIDE_LOCK", 1) != 0;
+	policy.defer_upload_protect = ParseEnvU64("KYTY_UPLOAD_DEFER_PROTECT", 1) != 0;
 	return policy;
 }
 
@@ -1132,6 +1137,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	// keeps only with incremental BDA synchronization.
 	m_bda_epoch_verify = m_bda_epoch_skip && m_bda_incremental_sync ? BdaEpochVerifyMode() : 0;
 	m_bda_submission_skip = ParseEnvU64("KYTY_BDA_SYNC_PER_SUBMISSION", 0) != 0;
+	m_bda_hot_per_submission =
+	    SyncEpoch::Enabled() && ParseEnvU64("KYTY_BDA_HOT_PER_SUBMISSION", 0) != 0;
+	m_hot_pressure_enabled = ParseEnvU64("KYTY_HOT_PAGE_PRESSURE", 0) != 0;
 	if (SyncEpoch::Enabled() && BindingEpochMemoEnabled()) {
 		const bool large      = CpCommit::Enabled(CpCommit::Part::BindSlots);
 		m_binding_memo_shift  = large ? 49u : 53u;
@@ -1139,6 +1147,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		                                                              : BindingMemoSlots);
 		m_binding_memo_verify = BindingEpochMemoVerifyMode();
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
+		m_binding_memo_buffer_guard = ParseEnvU64("KYTY_BINDING_MEMO_BUFFER_GUARD", 1) != 0;
 	}
 	m_written_sync_skip = WrittenSyncSkipEnabled();
 	if (m_written_sync_skip) {
@@ -1265,7 +1274,14 @@ void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
 	}
 	auto it = m_hot_shadows.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
 	while (it != m_hot_shadows.end() && it->first < vaddr + size) {
+		ReleaseHotShadow(std::move(it->second.data));
 		it = m_hot_shadows.erase(it);
+	}
+}
+
+void BufferCache::ReleaseHotShadow(std::unique_ptr<uint8_t[]> data) {
+	if (data != nullptr && m_hot_shadow_free.size() < m_memory_tracker.GetFaultPolicy().hot_max) {
+		m_hot_shadow_free.push_back(std::move(data));
 	}
 }
 
@@ -1273,7 +1289,32 @@ void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
 	if (m_memory_tracker.HotPageCount() == 0) {
 		return;
 	}
-	for (const auto page: m_memory_tracker.SettleHotPages(vaddr, size)) {
+	CompareSettledHotPages(m_memory_tracker.SettleHotPages(vaddr, size));
+}
+
+void BufferCache::SettleHotPageList(std::span<const uint64_t> pages) {
+	if (pages.empty() || m_memory_tracker.HotPageCount() == 0) {
+		return;
+	}
+	std::vector<uint64_t> settled;
+	settled.reserve(pages.size());
+	{
+		// Every page is settled with its write-protect deferred; the scope's end protects each
+		// region's pages in one host call, before any compare below (as SettleHotPages needs).
+		std::optional<PageManager::DeferProtectScope> defer_protect;
+		if (!PageManager::InDeferProtectScope() &&
+		    PageManager::GetDeferMode() == PageManager::DeferMode::On) {
+			defer_protect.emplace();
+		}
+		for (const auto page: pages) {
+			m_memory_tracker.SettleHotPages(page, TRACKER_PAGE_SIZE, settled);
+		}
+	}
+	CompareSettledHotPages(settled);
+}
+
+void BufferCache::CompareSettledHotPages(std::span<const uint64_t> pages) {
+	for (const auto page: pages) {
 		// The page is write-protected now: its contents can no longer change unobserved. If they
 		// differ from the last upload (or nothing was uploaded while hot), the CPU wrote since.
 		const auto shadow = m_hot_shadows.find(page);
@@ -1283,6 +1324,7 @@ void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
 			m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
 		}
 		if (shadow != m_hot_shadows.end()) {
+			ReleaseHotShadow(std::move(shadow->second.data));
 			m_hot_shadows.erase(shadow);
 		}
 	}
@@ -1290,14 +1332,24 @@ void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::MaintainHotPages() {
 	const auto frame = m_memory_tracker.Frame();
-	if (frame - m_hot_sweep_frame < 8) {
+	// KYTY_HOT_PAGE_PRESSURE (bufferCache.h): pages were refused hot tracking since the last sweep.
+	const auto refused = m_memory_tracker.HotRefusedCount();
+	m_hot_pressure     = m_hot_pressure_enabled && refused != m_hot_sweep_refused;
+	if (frame - m_hot_sweep_frame < (m_hot_pressure ? 1u : 8u)) {
 		return;
 	}
-	m_hot_sweep_frame = frame;
-	m_memory_tracker.SweepHotPages(m_hot_quiet_frames);
-	std::erase_if(m_hot_shadows, [this, frame](const auto& entry) {
-		return frame - entry.second.last_use > m_hot_quiet_frames;
-	});
+	m_hot_sweep_frame   = frame;
+	m_hot_sweep_refused = refused;
+	m_memory_tracker.SweepHotPages(m_hot_pressure ? std::min(m_hot_quiet_frames, 2u)
+	                                              : m_hot_quiet_frames);
+	for (auto it = m_hot_shadows.begin(); it != m_hot_shadows.end();) {
+		if (frame - it->second.last_use > m_hot_quiet_frames) {
+			ReleaseHotShadow(std::move(it->second.data));
+			it = m_hot_shadows.erase(it);
+		} else {
+			++it;
+		}
+	}
 	LogHotPages();
 }
 
@@ -1340,6 +1392,10 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 	const auto frame     = m_memory_tracker.Frame();
 	const auto max_pages = m_memory_tracker.GetFaultPolicy().hot_max;
+	// KYTY_HOT_PAGE_PRESSURE: while slots are short, unchanged pages give theirs back sooner.
+	const uint32_t check_limit =
+	    m_hot_pressure && m_hot_check_limit != 0 ? std::max(m_hot_check_limit / 4u, 1u)
+	                                             : m_hot_check_limit;
 	uint64_t   staged    = 0;
 	uint64_t   visited   = 0;
 	uint64_t   skipped   = 0;
@@ -1350,11 +1406,16 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 		// before it and keeps it valid).
 		auto next = m_hot_shadows.lower_bound(range.address);
 		for (auto page = range.address; page < range.End(); page += TRACKER_PAGE_SIZE) {
-			visited++;
 			auto shadow = m_hot_shadows.end();
 			if (next != m_hot_shadows.end() && next->first == page) {
 				shadow = next++;
 			}
+			if (m_hot_visit_pass != 0 && shadow != m_hot_shadows.end() &&
+			    shadow->second.visit_pass == m_hot_visit_pass) {
+				// Already compared (and uploaded if changed) by this BDA pass (m_hot_visit_pass).
+				continue;
+			}
+			visited++;
 			const auto unchanged = [&](const void* contents) {
 				return shadow != m_hot_shadows.end() &&
 				       std::memcmp(shadow->second.data.get(), contents, TRACKER_PAGE_SIZE) == 0;
@@ -1373,11 +1434,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			}
 			if (same) {
 				skipped++;
-				auto& state    = shadow->second;
-				state.last_use = frame;
+				auto& state      = shadow->second;
+				state.last_use   = frame;
+				state.visit_pass = m_hot_visit_pass;
 				if (frame - state.last_change > m_hot_quiet_frames) {
 					demote.push_back(page);
-				} else if (m_hot_check_limit != 0 && ++state.unchanged_checks >= m_hot_check_limit) {
+				} else if (check_limit != 0 && ++state.unchanged_checks >= check_limit) {
 					// Checked far more often than written: back to fault tracking, clean (the
 					// buffer holds exactly the shadow, which SettleHotPages compares again once the
 					// page is write-protected).
@@ -1404,7 +1466,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			if (shadow == m_hot_shadows.end()) {
 				if (m_hot_shadows.size() < max_pages) {
 					shadow = m_hot_shadows.emplace(page, HotShadow {}).first;
-					shadow->second.data = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
+					if (!m_hot_shadow_free.empty()) {
+						shadow->second.data = std::move(m_hot_shadow_free.back());
+						m_hot_shadow_free.pop_back();
+					} else {
+						shadow->second.data = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
+					}
 				} else {
 					// No shadow to compare against: back to faulting on writes.
 					demote.push_back(page);
@@ -1415,6 +1482,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				shadow->second.last_change      = frame;
 				shadow->second.last_use         = frame;
 				shadow->second.unchanged_checks = 0;
+				shadow->second.visit_pass       = m_hot_visit_pass;
 			}
 			AppendUploadCopy(copies, total_size, buffer.Offset(page), TRACKER_PAGE_SIZE, first_host_copy);
 			total_size += TRACKER_PAGE_SIZE;
@@ -2337,6 +2405,32 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+// The calling nesting level's SyncScratch, emptied (its vectors keep their capacity).
+class BufferCache::SyncScratchLease final {
+public:
+	explicit SyncScratchLease(BufferCache& cache): m_cache(cache) {
+		auto& pool = cache.m_sync_scratch;
+		if (pool.size() == cache.m_sync_scratch_depth) {
+			pool.push_back(std::make_unique<SyncScratch>());
+		}
+		m_scratch = pool[cache.m_sync_scratch_depth++].get();
+		m_scratch->copies.clear();
+		m_scratch->late_copies.clear();
+		m_scratch->hot_ranges.clear();
+		m_scratch->demote_hot.clear();
+		m_scratch->settle_hot.clear();
+		m_scratch->host_copies.clear();
+	}
+	~SyncScratchLease() { m_cache.m_sync_scratch_depth--; }
+	SyncScratchLease(const SyncScratchLease&)            = delete;
+	SyncScratchLease& operator=(const SyncScratchLease&) = delete;
+	SyncScratch*      operator->() const noexcept { return m_scratch; }
+
+private:
+	BufferCache& m_cache;
+	SyncScratch* m_scratch = nullptr;
+};
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
@@ -2392,7 +2486,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		QueueBdaBatchedUpload(buffer, vaddr, size, stats, memo_applies, memo_signature);
 		return false;
 	}
-	std::vector<vk::BufferCopy> copies;
+	const SyncScratchLease      scratch(*this);
+	auto&                       copies     = scratch->copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
 	// KYTY_FALSE_SHARING_WRITES: bytes an early release left to their publication are the GPU's
@@ -2433,14 +2528,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	// Hot pages (MemoryTracker) stay CPU-dirty: they are reported separately and copied only when
 	// they differ from the shadow of the last copy this buffer received (CollectHotPages).
-	std::vector<GuestRange> hot_ranges;
-	std::vector<uint64_t>   demote_hot;
-	std::vector<uint64_t>   settle_hot;
+	auto&                   hot_ranges = scratch->hot_ranges;
+	auto&                   demote_hot = scratch->demote_hot;
+	auto&                   settle_hot = scratch->settle_hot;
 	size_t                guest_copies = 0;
 	uint64_t              host_base    = 0;
 	// Written uploads with KYTY_UPLOAD_COPY_OUTSIDE_LOCK: pages re-dirtied by a racing guest write
 	// while the main copy ran unlocked, copied again under the tracker locks.
-	std::vector<vk::BufferCopy> late_copies;
+	auto&                       late_copies = scratch->late_copies;
 	uint64_t                    late_size = 0;
 	vk::Buffer                  late_source;
 	bool                        reserved_committed = false;
@@ -2465,7 +2560,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): a read upload large enough for the copy engine
 	// leaves its guest bytes to the DMA worker. The pages are already clean and write-protected
 	// when upload() runs (ForEachUploadRange), as for the copy made here.
-	std::vector<UploadHostCopy> host_copies;
+	auto&      host_copies = scratch->host_copies;
 	const auto upload = [&]() noexcept {
 		// A normal upload replaces whatever a hot page shadow described.
 		for (const auto& copy: copies) {
@@ -2556,9 +2651,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
 		EraseHotShadows(page, TRACKER_PAGE_SIZE);
 	}
-	for (const auto page: settle_hot) {
-		SettleHotPages(page, TRACKER_PAGE_SIZE);
-	}
+	SettleHotPageList(settle_hot);
 	if (reserved != nullptr && source && !reserved_committed) {
 		// Source copying and GPU ownership publication stayed consistent (under the tracker locks,
 		// or unlocked with the late pass). Flush and ring bookkeeping need no tracker lock and
@@ -2662,7 +2755,14 @@ void BufferCache::QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t
 		PruneEarlyReleased();
 	}
 	const bool exclude_unpublished = !m_early_released.empty();
-	auto&      pending             = m_bda_pending->emplace_back();
+	auto&      pool                = *m_bda_pending;
+	if (m_bda_pending_count == pool.size()) {
+		pool.emplace_back();
+	}
+	auto& pending = pool[m_bda_pending_count++];
+	pending.copies.clear();
+	pending.hot_ranges.clear();
+	pending.total_size             = 0;
 	pending.buffer                 = &buffer;
 	pending.vaddr                  = vaddr;
 	pending.size                   = size;
@@ -2697,7 +2797,7 @@ void BufferCache::QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t
 	    },
 	    []() noexcept {});
 	if (pending.copies.empty() && pending.hot_ranges.empty() && !memo_applies) {
-		m_bda_pending->pop_back();
+		m_bda_pending_count--;
 	}
 }
 
@@ -2707,9 +2807,10 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 	auto&                       buffer     = *pending.buffer;
 	auto&                       copies     = pending.copies;
 	uint64_t                    total_size = pending.total_size;
-	std::vector<uint64_t>       demote_hot;
-	std::vector<uint64_t>       settle_hot;
-	std::vector<UploadHostCopy> host_copies;
+	const SyncScratchLease      scratch(*this);
+	auto&                       demote_hot  = scratch->demote_hot;
+	auto&                       settle_hot  = scratch->settle_hot;
+	auto&                       host_copies = scratch->host_copies;
 	// A normal upload replaces whatever a hot page shadow described.
 	for (const auto& copy: copies) {
 		EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
@@ -2735,9 +2836,7 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
 		EraseHotShadows(page, TRACKER_PAGE_SIZE);
 	}
-	for (const auto page: settle_hot) {
-		SettleHotPages(page, TRACKER_PAGE_SIZE);
-	}
+	SettleHotPageList(settle_hot);
 	if (!source) {
 		return;
 	}
@@ -3052,8 +3151,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	} else if (memo.signature != before) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSignature);
 	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
-	           memo.guard != (stream ? m_scheduler.CurrentTick()
-	                                 : m_buffer_registry_epoch.load(std::memory_order_acquire))) {
+	           !BindingMemoGuardHolds(memo)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissGuard);
 	} else {
 		bool cross = false;
@@ -3112,6 +3210,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	const auto result = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
 	RecordBinding(vaddr, size, epoch, before, result, obtained);
 	return result;
+}
+
+bool BufferCache::BindingMemoGuardHolds(const BindingMemo& memo) {
+	if (memo.kind == BindingMemoKind::Stream) {
+		return memo.guard == m_scheduler.CurrentTick();
+	}
+	if (!m_binding_memo_buffer_guard) {
+		return memo.guard == m_buffer_registry_epoch.load(std::memory_order_acquire);
+	}
+	// KYTY_BINDING_MEMO_BUFFER_GUARD (bufferCache.h): the range is still in the same registered
+	// buffer at the same offset.
+	const auto* buffer = m_slot_buffers.try_get(memo.id);
+	return buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(memo.vaddr, memo.size) &&
+	       buffer->Offset(memo.vaddr) == memo.offset;
 }
 
 void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
@@ -4089,7 +4201,39 @@ void BufferCache::InvalidateBdaSynchronization() noexcept {
 	AdvanceEpoch(m_bda_structure_epoch);
 }
 
+template <typename Collect>
+void BufferCache::RunBdaPass(Collect&& collect) {
+	// KYTY_BDA_BATCH_PROTECT: collect every read upload of the pass, protect, then copy. Every
+	// synchronization collect() makes carries a BdaSyncStats, so none copies inside the scope.
+	const bool batch = m_bda_batch_protect && UploadBatchEnabled() && m_range_memo_verify == 0 &&
+	                   PageManager::GetDeferMode() == PageManager::DeferMode::On &&
+	                   m_bda_pending == nullptr && !PageManager::InDeferProtectScope();
+	if (!batch) {
+		collect();
+		return;
+	}
+	m_bda_pending_count = 0;
+	{
+		const PageManager::DeferProtectScope defer_protect;
+		m_bda_pending = &m_bda_pending_pool;
+		collect();
+		m_bda_pending = nullptr;
+	}
+	const auto count = std::exchange(m_bda_pending_count, 0);
+	for (size_t index = 0; index < count; index++) {
+		FinishBdaBatchedUpload(m_bda_pending_pool[index]);
+	}
+}
+
 void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
+	// Hot pages compared once per pass (HotShadow::visit_pass), new-buffer part included.
+	struct HotVisitPass {
+		explicit HotVisitPass(BufferCache& cache_): cache(cache_) {
+			cache.m_hot_visit_pass = ++cache.m_hot_pass_counter;
+		}
+		~HotVisitPass() { cache.m_hot_visit_pass = 0; }
+		BufferCache& cache;
+	} const hot_visit_pass(*this);
 	// KYTY_BDA_SYNC_EPOCH (syncEpoch.h): once per synchronization epoch. After a completed pass,
 	// memory the pass left clean can only need an upload again within the same epoch through a
 	// guest CPU write, which races the draws that follow (the first pass of the next epoch uploads
@@ -4206,7 +4350,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	                             structure_epoch != UINT64_MAX &&
 	                             structure_epoch == m_bda_scanned_structure_epoch;
 	if (structure_holds && cpu_epoch == m_bda_scanned_cpu_epoch) {
-		if (m_bda_hot_ranges.empty()) {
+		// KYTY_BDA_HOT_PER_SUBMISSION: the recorded hot runs were re-examined in this submission.
+		const bool hot_done = m_bda_hot_per_submission &&
+		                      SyncEpoch::CurrentSubmission() == m_bda_hot_synced_submission;
+		if (m_bda_hot_ranges.empty() || hot_done) {
 			BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::IncrementalSkips);
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
@@ -4267,9 +4414,20 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	{
 		// Only uploads are recorded while scanning: all of them share one barrier pair.
 		const UploadBatch upload_batch(*this);
-		mapped_ranges.ForEach([this, keep_stats, &stats](uint64_t start, uint64_t end) {
-			SynchronizeBuffersInRange(start, end - start, keep_stats ? &stats : nullptr);
-		});
+		const auto        scan = [this, keep_stats, &stats, &mapped_ranges] {
+			mapped_ranges.ForEach([this, keep_stats, &stats](uint64_t start, uint64_t end) {
+				SynchronizeBuffersInRange(start, end - start, keep_stats ? &stats : nullptr);
+			});
+		};
+		// Batched only with stats: a synchronization without them copies at once.
+		if (keep_stats) {
+			RunBdaPass(scan);
+		} else {
+			scan();
+		}
+	}
+	if (m_bda_hot_sync) {
+		m_bda_hot_synced_submission = SyncEpoch::CurrentSubmission();
 	}
 	if (m_bda_hot_sync && g_bda_hot_ranges_merge.On()) {
 		MergeRecordedHotRanges(m_bda_hot_ranges);
@@ -4303,38 +4461,38 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	// The logged ranges report the hot runs they turn up (new hot pages, which a write fault
 	// logged when it promoted them); the recorded runs are re-examined as in a hot pass.
 	const BdaSyncDiagnostics::TimedPath path_time(BdaSyncDiagnostics::Event::DirtyLogNs);
-	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotRangeRunsChecked, m_bda_hot_ranges.size());
-	std::vector<BdaHotRange> found;
-	BdaSyncStats             stats;
+	// KYTY_BDA_HOT_PER_SUBMISSION: the recorded runs once per submission.
+	const auto submission = SyncEpoch::CurrentSubmission();
+	const bool check_hot =
+	    !m_bda_hot_per_submission || submission != m_bda_hot_synced_submission;
+	if (check_hot) {
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotRangeRunsChecked,
+		                           m_bda_hot_ranges.size());
+	}
+	auto& found = m_bda_found;
+	found.clear();
+	BdaSyncStats stats;
 	stats.hot_ranges = &found;
 	uint64_t logged  = 0;
 	{
 		const UploadBatch upload_batch(*this);
 		BdaSyncStats      hot_stats;
-		// KYTY_BDA_BATCH_PROTECT: collect every read upload of the pass, protect, then copy.
-		std::vector<PendingBdaUpload> pending;
-		const bool batch = m_bda_batch_protect && UploadBatchEnabled() && m_range_memo_verify == 0 &&
-		                   PageManager::GetDeferMode() == PageManager::DeferMode::On;
-		{
-			std::optional<PageManager::DeferProtectScope> defer_protect;
-			if (batch) {
-				defer_protect.emplace();
-				m_bda_pending = &pending;
-			}
+		RunBdaPass([&] {
 			m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
 				logged++;
 				mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
 					SynchronizeBuffersInRange(start, finish - start, &stats);
 				});
 			});
-			for (const auto& range: m_bda_hot_ranges) {
-				(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
-				                        false, &hot_stats);
+			if (check_hot) {
+				for (const auto& range: m_bda_hot_ranges) {
+					(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size,
+					                        false, false, &hot_stats);
+				}
 			}
-			m_bda_pending = nullptr;
-		}
-		for (auto& upload: pending) {
-			FinishBdaBatchedUpload(upload);
+		});
+		if (check_hot) {
+			m_bda_hot_synced_submission = submission;
 		}
 		stats.upload_bytes += hot_stats.upload_bytes;
 		stats.upload_copies += hot_stats.upload_copies;
@@ -4345,17 +4503,20 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 		// on every subsequent pass. No holes or ownership boundaries are bridged.
 		m_bda_hot_ranges.insert(m_bda_hot_ranges.end(), found.begin(), found.end());
 		MergeRecordedHotRanges(m_bda_hot_ranges);
-	} else {
-		for (const auto& range: found) {
-			const bool known =
-			    std::any_of(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(), [&](const auto& other) {
-				    return other.id == range.id && other.address == range.address &&
-				           other.size == range.size;
-			    });
-			if (!known) {
-				m_bda_hot_ranges.push_back(range);
-			}
-		}
+	} else if (!found.empty()) {
+		// Exact duplicates dropped by one sort instead of a scan of every recorded run per found
+		// run; the order of the runs does not matter to the passes.
+		m_bda_hot_ranges.insert(m_bda_hot_ranges.end(), found.begin(), found.end());
+		const auto key = [](const BdaHotRange& range) {
+			return std::tuple(range.id.index, range.id.generation, range.address, range.size);
+		};
+		std::sort(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(),
+		          [&](const BdaHotRange& a, const BdaHotRange& b) { return key(a) < key(b); });
+		m_bda_hot_ranges.erase(std::unique(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(),
+		                                   [&](const BdaHotRange& a, const BdaHotRange& b) {
+			                                   return key(a) == key(b);
+		                                   }),
+		                       m_bda_hot_ranges.end());
 	}
 	m_bda_log_totals.passes++;
 	m_bda_log_totals.ranges += logged;
@@ -4417,10 +4578,13 @@ bool BufferCache::SynchronizeBdaHotRanges(BdaSyncStats& stats) {
 	const BdaSyncDiagnostics::TimedPath path_time(BdaSyncDiagnostics::Event::HotPassNs);
 	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotRangeRunsChecked, m_bda_hot_ranges.size());
 	const UploadBatch upload_batch(*this);
-	for (const auto& range: m_bda_hot_ranges) {
-		(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false, false,
-		                        &stats);
-	}
+	RunBdaPass([&] {
+		for (const auto& range: m_bda_hot_ranges) {
+			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
+			                        false, &stats);
+		}
+	});
+	m_bda_hot_synced_submission = SyncEpoch::CurrentSubmission();
 	return true;
 }
 
@@ -4473,18 +4637,20 @@ void BufferCache::SynchronizeBdaNewBuffers(const RangeSet& mapped_ranges) {
 	}
 	{
 		const UploadBatch upload_batch(*this);
-		for (const auto id: ids) {
-			auto* buffer = m_slot_buffers.try_get(id);
-			if (buffer == nullptr || buffer->is_deleted) {
-				continue;
+		RunBdaPass([&] {
+			for (const auto id: ids) {
+				auto* buffer = m_slot_buffers.try_get(id);
+				if (buffer == nullptr || buffer->is_deleted) {
+					continue;
+				}
+				stats.buffer_id = id;
+				mapped_ranges.ForEachInRange(buffer->CpuAddress(), buffer->Size(),
+				                             [&](uint64_t begin, uint64_t end) {
+					                             (void)SynchronizeBuffer(*buffer, begin, end - begin,
+					                                                     false, false, &stats);
+				                             });
 			}
-			stats.buffer_id = id;
-			mapped_ranges.ForEachInRange(buffer->CpuAddress(), buffer->Size(),
-			                             [&](uint64_t begin, uint64_t end) {
-				                             (void)SynchronizeBuffer(*buffer, begin, end - begin, false,
-				                                                     false, &stats);
-			                             });
-		}
+		});
 	}
 	if (m_bda_hot_sync && g_bda_hot_ranges_merge.On()) {
 		MergeRecordedHotRanges(m_bda_hot_ranges);

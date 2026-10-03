@@ -367,7 +367,8 @@ private:
 	//    range's regions (uploads, GPU-dirty marks, readbacks, hot-page changes, write faults), so
 	//    every tracker bit the binding's decision and synchronization read is the same;
 	//  - a cache-buffer result: the buffer structure is unchanged (m_buffer_registry_epoch moves on
-	//    every Register/Unregister), so the range is in the same buffer at the same offset. It is
+	//    every Register/Unregister; with KYTY_BINDING_MEMO_BUFFER_GUARD, only the memo's own buffer
+	//    must still be registered), so the range is in the same buffer at the same offset. It is
 	//    recorded with the signature taken after its synchronization, and for a small read only
 	//    when the tracker bits then do not make the next one a stream copy. Pages that
 	//    synchronization would upload now are hot pages written since, or pages a guest write
@@ -441,6 +442,9 @@ private:
 	                                                           BufferId id, BufferId* obtained);
 	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
 	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
+	// Whether a memo's structure guard still holds: the stream tick, or its buffer
+	// (KYTY_BINDING_MEMO_BUFFER_GUARD) or else the registry epoch.
+	[[nodiscard]] bool BindingMemoGuardHolds(const BindingMemo& memo);
 	// `cross`: the hit came from another epoch (KYTY_BINDING_MEMO_CROSS_EPOCH).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> VerifyBindingHit(const BindingMemo& memo,
 	                                                            std::pair<Buffer*, uint64_t> hit,
@@ -465,6 +469,8 @@ private:
 	// returns its hot pages to normal tracking, clean unless their contents changed since their
 	// last upload. From then on the ordinary fault tracking decides their next upload.
 	void SettleHotPages(uint64_t vaddr, uint64_t size);
+	// The compare half of SettleHotPages, for pages the tracker just settled (write-protected).
+	void CompareSettledHotPages(std::span<const uint64_t> pages);
 	void MaintainHotPages();
 	void LogHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -632,11 +638,46 @@ private:
 		bool                        memo_applies   = false;
 		uint64_t                    memo_signature = 0;
 	};
-	// Non-null while a batched pass collects: SynchronizeBuffer queues its read upload here.
+	// Non-null while a batched pass collects: SynchronizeBuffer queues its read upload in the
+	// first m_bda_pending_count entries. The entries are reused from pass to pass (their vectors
+	// keep their capacity).
 	std::vector<PendingBdaUpload>* m_bda_pending = nullptr;
+	std::vector<PendingBdaUpload>  m_bda_pending_pool;
+	size_t                         m_bda_pending_count = 0;
 	void QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t size, BdaSyncStats* stats,
 	                           bool memo_applies, uint64_t memo_signature);
 	void FinishBdaBatchedUpload(PendingBdaUpload& pending);
+	// One BDA pass's read synchronizations: collect() runs them (each with a BdaSyncStats). With
+	// KYTY_BDA_BATCH_PROTECT their uploads are collected with the protection deferred, then the
+	// pages are protected and copied. Caller holds an UploadBatch.
+	template <typename Collect>
+	void RunBdaPass(Collect&& collect);
+	// The scratch vectors of one SynchronizeBuffer call, reused across calls (one set per nesting
+	// level, in case an upload path re-enters it).
+	struct SyncScratch {
+		std::vector<vk::BufferCopy> copies;
+		std::vector<vk::BufferCopy> late_copies;
+		std::vector<GuestRange>     hot_ranges;
+		std::vector<uint64_t>       demote_hot;
+		std::vector<uint64_t>       settle_hot;
+		std::vector<UploadHostCopy> host_copies;
+	};
+	std::vector<std::unique_ptr<SyncScratch>> m_sync_scratch;
+	size_t                                    m_sync_scratch_depth = 0;
+	class SyncScratchLease;
+	// Hot runs a dirty-log pass finds in its logged ranges (reused).
+	std::vector<BdaHotRange> m_bda_found;
+	// KYTY_BDA_HOT_PER_SUBMISSION=1 (default off): the recorded hot runs (m_bda_hot_ranges) are
+	// re-examined at most once per guest submission (SyncEpoch::CurrentSubmission) instead of on
+	// every BDA pass. Hot pages are the ones the CPU writes without faulting; as with
+	// KYTY_BDA_SYNC_PER_SUBMISSION, what the game wrote to them before submitting reaches the
+	// submission, and a write made while it runs reaches the next one. Logged ranges, new buffers
+	// and full scans are unaffected (their hot pages are still compared).
+	bool     m_bda_hot_per_submission   = false;
+	uint64_t m_bda_hot_synced_submission = 0;
+	// Settles hot pages (MemoryTracker::SettleHotPages) with their write-protects in one deferred
+	// batch, then compares each with its shadow once the batch is applied.
+	void SettleHotPageList(std::span<const uint64_t> pages);
 	MemoryTracker                                     m_memory_tracker;
 	// Hot pages: exact copy of the last contents uploaded for each hot page (GPU thread only).
 	// While a page is hot its buffer bytes equal this copy: every other write of them either
@@ -649,10 +690,29 @@ private:
 		uint32_t                   last_use    = 0;
 		// Uploads in a row that found the page unchanged (KYTY_HOT_PAGE_CHECK_LIMIT).
 		uint32_t                   unchanged_checks = 0;
+		// The BDA pass that last compared the page (m_hot_visit_pass).
+		uint64_t                   visit_pass = 0;
 	};
 	std::map<uint64_t, HotShadow>                     m_hot_shadows;
+	// Shadow pages of erased shadows, reused by new ones (at most KYTY_HOT_PAGE_MAX are kept).
+	std::vector<std::unique_ptr<uint8_t[]>>           m_hot_shadow_free;
+	void ReleaseHotShadow(std::unique_ptr<uint8_t[]> data);
 	std::vector<uint8_t>                              m_hot_scratch;
+	// Non-zero while a BDA pass runs (SynchronizeBdaBuffers): a hot page compared once in the pass
+	// is not compared again by it (a page in a logged range is also in the recorded hot runs). A
+	// write between the two visits is a guest write racing the pass, seen by the next one, as a
+	// write landing right after the first compare would be.
+	uint64_t                                          m_hot_visit_pass   = 0;
+	uint64_t                                          m_hot_pass_counter = 0;
 	uint32_t                                          m_hot_quiet_frames = 8;
+	// KYTY_HOT_PAGE_PRESSURE=1 (default off): while pages are refused hot tracking because
+	// KYTY_HOT_PAGE_MAX are hot (MemoryTracker::HotRefusedCount moved since the last sweep), hot
+	// pages are swept every frame with an idle limit of 2 frames instead of every 8 frames with
+	// KYTY_HOT_PAGE_QUIET_FRAMES, and a page settles after a quarter of KYTY_HOT_PAGE_CHECK_LIMIT
+	// unchanged checks. Slots then go to the pages that fault every frame.
+	bool                                              m_hot_pressure_enabled = false;
+	bool                                              m_hot_pressure         = false;
+	uint64_t                                          m_hot_sweep_refused    = 0;
 	// KYTY_HOT_PAGE_CHECK_LIMIT (default 64; 0 disables): a hot page that this many uploads in a
 	// row found unchanged returns to normal tracking as a clean, write-protected page
 	// (SettleHotPages, which compares it with its shadow once more after protecting it). Its next
@@ -687,6 +747,12 @@ private:
 	uint32_t                                          m_binding_memo_shift = 53; // 64 - log2(slots)
 	int                                               m_binding_memo_verify = 0;
 	bool                                              m_binding_memo_cross  = false;
+	// KYTY_BINDING_MEMO_BUFFER_GUARD (default on; =0 off): a cache-buffer memo is guarded by its own
+	// buffer instead of the global registry epoch, which every buffer creation or deletion moved
+	// (dropping every memo). It holds while that buffer is still registered (its slot generation
+	// and is_deleted) and contains the range at the same offset: registered buffers never overlap
+	// (a new one joins every buffer it overlaps, which deletes them), so FindBuffer would return it.
+	bool                                              m_binding_memo_buffer_guard = false;
 	struct BindingMemoTotals {
 		uint64_t hot_hits          = 0; // successful hits through the optional front tier
 		uint64_t stream_hits       = 0;
