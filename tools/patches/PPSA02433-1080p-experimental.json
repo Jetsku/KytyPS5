@@ -1,0 +1,21 @@
+{
+  "id": "PPSA02433",
+  "version": "01.000.002",
+  "process": "eboot.bin",
+  "name": "Crash Bandicoot 4: 1080p display metrics experiment",
+  "source_sha256": "e623079b38ca59af818a1b327d29416505a7cdc7ed54bab479a273619717ade6",
+  "description": "Changes the game's 4K display-metrics selection to 1920x1080. Manual testing confirmed 1920x1080 final color targets and pitch 1920. Internal passes, visual correctness and performance still require controlled comparison; see docs/DIVISAO-TRAVAMENTOS.md. source_sha256 records the inspected file; the existing loader validates title, version and original bytes.",
+  "mods": [
+    {
+      "name": "Solicitar 1920x1080 no jogo (experimental)",
+      "enabled": false,
+      "memory": [
+        {
+          "offset": "0x19aca32",
+          "off": "837db801741148b8000f0000700800004889055b404c06",
+          "on": "837db801741148b880070000380400004889055b404c06"
+        }
+      ]
+    }
+  ]
+}
