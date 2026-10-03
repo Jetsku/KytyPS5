@@ -147,6 +147,11 @@ bool                  g_log_period_read = false;
 // a 64-bit aligned atomic<double>).
 std::atomic<double> g_live_fault_us {-1.0};
 std::atomic<double> g_live_protect_call_us {-1.0};
+std::atomic<double> g_live_tighten_fixed_us {-1.0};
+
+// SlowLevel(): the tracker runs on the command processor thread (and once at startup, before it).
+SlowLevelTracker g_slow_tracker;
+std::atomic<int> g_slow_level {0};
 
 Benchmark g_benchmark;
 Benchmark g_benchmark_uffd; // Linux with KYTY_UFFD_WP: the write-protection actually in use
@@ -886,6 +891,20 @@ void RunStartupBenchmark() {
 		            "a frame with 1,500 faults would spend ~%.1f ms on them (benchmark %.1f ms)\n",
 		            b.fault_us, b.fault_handler_us, call, call, b.protect_call_us, b.protect_page_us,
 		            b.unprotect_call_us, b.unprotect_page_us, b.clock_ns, frame_ms, spent);
+		g_slow_tracker.Seed(b.protect_call_us, b.fault_us);
+		const char* why = "startup benchmark";
+#if defined(__linux__)
+		if (!Common::UffdWriteWatch::Enabled()) {
+			// mprotect convoys on the mmap lock (SlowLevel in faultCost.h).
+			g_slow_tracker.Raise(2);
+			why = "Linux mprotect tracking";
+		}
+#endif
+		if (g_slow_tracker.Level() != 0) {
+			g_slow_level.store(g_slow_tracker.Level(), std::memory_order_relaxed);
+			std::printf("Kyty fault cost: write tracking is slow on this PC (%s): level %d\n", why,
+			            g_slow_tracker.Level());
+		}
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 		if (Common::UffdWriteWatch::Enabled()) {
 			g_benchmark_uffd = Measure(true);
@@ -927,7 +946,30 @@ CostModel Model() {
 	if (live_protect >= 0) {
 		model.protect_call_us = live_protect;
 	}
+	model.tighten_fixed_us = g_live_tighten_fixed_us.load(std::memory_order_relaxed);
 	return model;
+}
+
+int SlowLevel() noexcept {
+	return g_slow_level.load(std::memory_order_relaxed);
+}
+
+void SlowLevelTracker::Seed(double tighten_call_us, double fault_round_trip_us) noexcept {
+	const int level = tighten_call_us > 5.0 || fault_round_trip_us > 20.0  ? 2
+	                  : tighten_call_us > 2.0 || fault_round_trip_us > 10.0 ? 1
+	                                                                         : 0;
+	m_level = std::max(m_level, level);
+}
+
+int SlowLevelTracker::Update(double tighten_fixed_us) noexcept {
+	const int measured = tighten_fixed_us > 16.0 ? 2 : tighten_fixed_us > 10.0 ? 1 : 0;
+	for (int level = 1; level <= 2; level++) {
+		m_streak[level] = measured >= level ? m_streak[level] + 1 : 0;
+		if (m_streak[level] >= PeriodsNeeded && m_level < level) {
+			m_level = level;
+		}
+	}
+	return m_level;
 }
 
 void NoteFault(uint64_t handler_ns) noexcept {
@@ -992,6 +1034,26 @@ void AdvanceFrame() noexcept {
 			const auto prev  = g_live_protect_call_us.load(std::memory_order_relaxed);
 			g_live_protect_call_us.store(prev < 0 ? value : prev * 0.5 + value * 0.5, std::memory_order_relaxed);
 		}
+		// SlowLevel(): the tightening calls' cost beyond their pages, which the fault-ahead window
+		// does not change (the simulation's waits included, by design).
+		if (const auto tighten = current.protect_calls - g_model_base.protect_calls; tighten >= 32) {
+			const auto& b        = g_benchmark_uffd.valid ? g_benchmark_uffd : g_benchmark;
+			const auto  page_us  = b.valid ? b.protect_page_us : 0.02;
+			const auto  calls_d  = static_cast<double>(tighten);
+			const auto  per_call = static_cast<double>(current.protect_ns - g_model_base.protect_ns) / calls_d / 1e3;
+			const auto  pages    = static_cast<double>(current.protect_pages - g_model_base.protect_pages) / calls_d;
+			const auto  fixed    = std::max(0.0, per_call - page_us * pages);
+			g_live_tighten_fixed_us.store(fixed, std::memory_order_relaxed);
+			const int before = g_slow_tracker.Level();
+			const int level  = g_slow_tracker.Update(fixed);
+			if (level != before) {
+				g_slow_level.store(level, std::memory_order_relaxed);
+				std::printf("Kyty fault cost: write tracking is slow on this PC (tightening protection calls %.1f us "
+				            "each beyond their pages for %d periods in a row): level %d\n",
+				            fixed, SlowLevelTracker::PeriodsNeeded, level);
+				std::fflush(stdout);
+			}
+		}
 		g_model_base = current;
 	}
 	if (g_log_period_ns != 0 && now - g_log_base.time_ns >= g_log_period_ns) {
@@ -1018,7 +1080,8 @@ void AdvanceFrame() noexcept {
 		}
 		std::printf("Kyty fault cost: last %.0f s, %.1f fps: %.0f faults/frame at %.1f us in the handler "
 		            "(%.2f ms/frame); protect %.0f calls/frame at %.1f us (%.0f pages/call); unprotect %.0f "
-		            "calls/frame at %.1f us (%.0f pages/call); model %.1f us/fault, %.1f us/call\n",
+		            "calls/frame at %.1f us (%.0f pages/call); model %.1f us/fault, %.1f us/call, tightening %.1f us "
+		            "beyond its pages, slow level %d\n",
 		            seconds, static_cast<double>(frames) / seconds, static_cast<double>(faults) / static_cast<double>(frames),
 		            avg(c.fault_ns - p.fault_ns, faults),
 		            static_cast<double>(c.fault_ns - p.fault_ns) / static_cast<double>(frames) / 1e6,
@@ -1026,7 +1089,7 @@ void AdvanceFrame() noexcept {
 		            pcalls != 0 ? static_cast<double>(c.protect_pages - p.protect_pages) / static_cast<double>(pcalls) : 0.0,
 		            static_cast<double>(ucalls) / static_cast<double>(frames), avg(c.unprotect_ns - p.unprotect_ns, ucalls),
 		            ucalls != 0 ? static_cast<double>(c.unprotect_pages - p.unprotect_pages) / static_cast<double>(ucalls) : 0.0,
-		            model.fault_us, model.protect_call_us);
+		            model.fault_us, model.protect_call_us, model.tighten_fixed_us, SlowLevel());
 		if (const auto reporter = g_periodic_reporter.load(std::memory_order_acquire); reporter != nullptr) {
 			reporter(seconds, frames);
 		}

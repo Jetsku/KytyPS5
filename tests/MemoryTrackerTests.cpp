@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/eagerReadbackPages.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/writeTickMap.h"
@@ -1280,6 +1281,50 @@ void TestDirtiedLog() {
 
   tracker.UntrackMemory(address, page_size * 16);
   Release(memory);
+}
+
+// KYTY_FAULT_AHEAD_ADAPT's classification of the PC (FaultCost::SlowLevelTracker): five slow
+// periods in a row raise the level, a fast period resets the streak, a slow startup benchmark
+// seeds it, and the level never falls (the larger window makes the calls cheaper again).
+void TestSlowLevelTracker() {
+  using Libs::Graphics::FaultCost::SlowLevelTracker;
+  SlowLevelTracker tracker;
+  tracker.Seed(0.4, 2.4); // this PC's startup benchmark
+  Check(tracker.Level() == 0, "a fast startup benchmark seeded a slow level");
+  for (int i = 0; i < SlowLevelTracker::PeriodsNeeded - 1; i++) {
+    tracker.Update(12.0);
+  }
+  Check(tracker.Level() == 0, "too few slow periods raised the level");
+  tracker.Update(7.5); // this PC's worst period at the Sky Garden
+  for (int i = 0; i < SlowLevelTracker::PeriodsNeeded - 1; i++) {
+    tracker.Update(12.0);
+  }
+  Check(tracker.Level() == 0, "a fast period did not reset the streak");
+  Check(tracker.Update(12.0) == 1, "slow periods in a row did not raise the level to 1");
+  for (int i = 0; i < SlowLevelTracker::PeriodsNeeded; i++) {
+    tracker.Update(18.3); // the Linux PC's protection calls
+  }
+  Check(tracker.Level() == 2, "very slow periods did not raise the level to 2");
+  for (int i = 0; i < 4 * SlowLevelTracker::PeriodsNeeded; i++) {
+    tracker.Update(3.0);
+  }
+  Check(tracker.Level() == 2, "the level fell");
+
+  SlowLevelTracker hvci;
+  hvci.Seed(6.0, 9.0);
+  Check(hvci.Level() == 2, "a slow uncontended protection call did not seed level 2");
+  SlowLevelTracker slow_faults;
+  slow_faults.Seed(0.5, 12.0);
+  Check(slow_faults.Level() == 1, "a slow fault round trip did not seed level 1");
+  SlowLevelTracker linux_mprotect;
+  linux_mprotect.Seed(1.2, 4.0); // WSL2's uncontended numbers
+  linux_mprotect.Raise(2);
+  for (int i = 0; i < 2 * SlowLevelTracker::PeriodsNeeded; i++) {
+    linux_mprotect.Update(6.0);
+  }
+  Check(linux_mprotect.Level() == 2, "the Linux mprotect floor did not hold");
+  linux_mprotect.Raise(7);
+  Check(linux_mprotect.Level() == 2, "a raise went past level 2");
 }
 
 // KYTY_FAULT_AHEAD_ADAPT (BufferCache): a larger fault-ahead window for write faults (only larger
@@ -2769,6 +2814,7 @@ int main(int argc, char **argv) {
   TestFaultMutationEpochWithHotPages();
   TestDirtiedLog();
   TestFaultAheadOverride();
+  TestSlowLevelTracker();
   TestFaultFoundDirty();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();

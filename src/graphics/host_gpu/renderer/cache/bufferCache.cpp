@@ -67,8 +67,9 @@ Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOf
 
 // KYTY_FAULT_AHEAD_ADAPT (live): the fault-ahead window of write faults
 // (MemoryTracker::SetFaultAheadOverride, applied at every guest flip).
-//   auto   (default) scaled with the measured cost of a fault (FaultCost::Model): 256 KiB while a
-//          fault costs up to 20 us, doubled for every further doubling of the cost, at most 1 MiB.
+//   auto   (default) 256 KiB, 512 KiB or 1 MiB by FaultCost::SlowLevel() 0 / 1 / 2: how slow
+//          protection changes are on this PC (measured, only ever rising; Linux with mprotect
+//          tracking: 1 MiB from the start)
 //   <KiB>  a power of two, 8..4096
 //   0      KYTY_FAULT_AHEAD_KB alone (32 KiB), as before
 // At the Sky Garden the guest's job threads fill ~16 MB of triple-buffered data per frame. With
@@ -76,6 +77,10 @@ Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOf
 // the same page while the first fault was in flight). 256 KiB windows: ~300 faults and ~100
 // loosening calls per frame instead of ~1,700 and ~620, for ~14% more upload bytes (pages a window
 // opened that the guest did not write are uploaded once more than needed: bytes, not faults).
+// 1 MiB here: ~110 faults, but ~72 us each in the handler and twice the upload bytes of 32 KiB, so
+// only PCs with slow protection changes get it (the slow-PC simulation: 20.7 -> 26.4 fps).
+// The handler's own time grows with the window, so it must not choose the window: an earlier rule
+// based on it climbed to 1 MiB on this PC too.
 Live::Switch g_fault_ahead_adapt("KYTY_FAULT_AHEAD_ADAPT", [](const char* value) -> int64_t {
 	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0) {
 		return -2;
@@ -98,11 +103,7 @@ uint32_t FaultAheadOverridePages() {
 	}
 	uint64_t kib = static_cast<uint64_t>(value);
 	if (value == -2) {
-		const auto cost = FaultCost::Model().fault_us;
-		kib             = 256;
-		for (double limit = 20.0; cost > limit && kib < 1024; limit *= 2.0) {
-			kib *= 2;
-		}
+		kib = uint64_t {256} << std::clamp(FaultCost::SlowLevel(), 0, 2);
 	}
 	return static_cast<uint32_t>(kib * 1024 / TRACKER_PAGE_SIZE);
 }

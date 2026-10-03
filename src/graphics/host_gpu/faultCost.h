@@ -67,8 +67,47 @@ struct CostModel {
 	double fault_us        = 5.0; // one write fault, everything included
 	double protect_call_us = 2.0; // one protection call
 	double protect_page_us = 0.05;
+	double tighten_fixed_us = -1.0; // live: a tightening call beyond its pages (-1: not yet)
 };
 [[nodiscard]] CostModel Model();
+
+// How slow write tracking is on this PC, for decisions that must not feed back on themselves
+// (KYTY_FAULT_AHEAD_ADAPT): 0 normal, 1 slow, 2 very slow. The fault handler's own time grows with
+// the fault-ahead window (this PC: ~5 us per fault at 32 KiB, ~12 us at 256 KiB, ~72 us at 1 MiB),
+// so it cannot choose the window. The tightening protection calls (read-only or no-access, made
+// when uploads re-protect pages) keep their size whatever the window: their fixed part (time per
+// call minus the startup benchmark's per-page cost) is ~4-8 us here at every window, ~18 us on the
+// Linux PC whose mmap lock convoys and ~35 us in the slow-PC simulation.
+//   level 1: above 10 us, level 2: above 16 us, each for 5 consecutive ~2 s periods (32+ calls);
+//   seeded by the startup benchmark (uncontended tightening call above 2 / 5 us, or a fault round
+//   trip above 10 / 20 us: memory integrity, a hooked VirtualProtect, a slow kernel).
+//   Linux with mprotect tracking (KYTY_UFFD_WP off) starts at 2: every mprotect takes the mmap
+//   lock for writing, the larger window shortens that convoy enough to hide it from the measure
+//   above, and in the WSL2 benchmark 1 MiB windows stall the writers least (0.9 ms per frame
+//   against 2.1 ms at 256 KiB and 35-44 ms at 32 KiB).
+// The level only ever rises; "Kyty fault cost: write tracking is slow ..." logs each step.
+[[nodiscard]] int SlowLevel() noexcept;
+
+// The level logic on its own (SlowLevel uses one, on the command processor thread; tests).
+class SlowLevelTracker {
+public:
+	static constexpr int PeriodsNeeded = 5;
+	// Startup benchmark: uncontended tightening call and fault round trip (us).
+	void Seed(double tighten_call_us, double fault_round_trip_us) noexcept;
+	// A platform's floor (Linux mprotect: 2).
+	void Raise(int level) noexcept {
+		if (level > m_level) {
+			m_level = level > 2 ? 2 : level;
+		}
+	}
+	// One period's fixed tightening cost (us); returns the level.
+	int  Update(double tighten_fixed_us) noexcept;
+	[[nodiscard]] int Level() const noexcept { return m_level; }
+
+private:
+	int m_level     = 0;
+	int m_streak[3] = {0, 0, 0};
+};
 
 // Time source of the live numbers and the fault map (steady_clock).
 [[nodiscard]] uint64_t NowNs() noexcept;
