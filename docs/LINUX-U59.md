@@ -26,8 +26,8 @@ git submodule update --init --recursive
 cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DKYTY_EMULATOR_IPO=ON -DKYTY_BUILD_ORIGIN=Fork \
-  -DKYTY_BUILD_REPOSITORY=Majed-allababedi/KytyPS5 \
-  -DKYTY_RELEASE_TAG=u59-linux-20260930-demons
+  -DKYTY_BUILD_REPOSITORY=Jetsku/KytyPS5 \
+  -DKYTY_RELEASE_TAG=u59-linux-local
 cmake --build _Build/linux --target launcher --parallel 8
 cmake --install _Build/linux --prefix _Build/linux/install
 cp tools/u59-preset.json _Build/linux/install/
