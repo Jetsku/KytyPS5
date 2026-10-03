@@ -1484,6 +1484,12 @@ private:
 	void ReserveGuestRegions() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
+		// Other threads (the profiler, networking) allocate while this scan runs, and one of their
+		// allocations can land in a range VirtualQuery has just reported free. Such a range is
+		// queried again: the newcomer then shows up as occupied and is skipped like any other
+		// (IDXTRI/KytyPS5 5206955b).
+		constexpr int      MaxReserveRetries = 64;
+		int                reserve_retries   = 0;
 		const auto         process           = GetCurrentProcess();
 		const auto         guest_end         = HOST_USER_MAX + 1u;
 		auto               next_addr         = HOST_SYSTEM_MANAGED_MIN;
@@ -1507,6 +1513,9 @@ private:
 				    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
 				    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
 				if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+					if (ptr == nullptr && ++reserve_retries <= MaxReserveRetries) {
+						continue; // query next_addr again
+					}
 					EXIT("failed to reserve guest address space at 0x%016" PRIx64
 					     ", size 0x%016" PRIx64 "\n",
 					     reserve_start, reserve_end - reserve_start);
