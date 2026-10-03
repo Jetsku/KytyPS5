@@ -4151,6 +4151,83 @@ bool CommandProcessor::CpWriteRange(CpSeq::OpKind kind, const void* payload, uin
 	return true;
 }
 
+// KYTY_CP_WAIT_STATS=1 (diagnostic, default off): every 10 s one log line with the sequencer's
+// lockstep stops (it stops parsing until the resolver answers, and the draw-prep window drains
+// meanwhile): count and stopped time per kind. A wait on the label this stream last recorded is
+// split by whether that recorded value already satisfies it (a stop a forwarded answer or the
+// P3c prefetch could avoid).
+namespace {
+enum class CpStopKind : uint8_t {
+	WaitSelfSatisfied,
+	WaitSelfOther,
+	WaitOther,
+	Condition,
+	Other,
+	WaitForwarded, // KYTY_CP_WAIT_FORWARD: not a stop (counted, 0 ms)
+	Count
+};
+
+struct CpStopStats {
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(CpStopKind::Count)> count {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(CpStopKind::Count)> ns {};
+	std::atomic<uint64_t> last_report_ns {0};
+};
+
+bool CpWaitStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_WAIT_STATS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+uint64_t CpStopClockNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void NoteCpStop(CpStopKind kind, uint64_t stopped_ns) {
+	static CpStopStats stats;
+	const auto         index = static_cast<size_t>(kind);
+	stats.count[index].fetch_add(1, std::memory_order_relaxed);
+	stats.ns[index].fetch_add(stopped_ns, std::memory_order_relaxed);
+	const auto now  = CpStopClockNs();
+	auto       last = stats.last_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		stats.last_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !stats.last_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	static const char* const names[] = {"wait-self-satisfied", "wait-self-unsatisfied", "wait-other",
+	                                    "condition",           "other",                 "wait-forwarded"};
+	std::string line = fmt::format("CP stops {:.0f}s:", static_cast<double>(now - last) * 1e-9);
+	for (size_t i = 0; i < static_cast<size_t>(CpStopKind::Count); i++) {
+		const auto n  = stats.count[i].exchange(0, std::memory_order_relaxed);
+		const auto ns = stats.ns[i].exchange(0, std::memory_order_relaxed);
+		line += fmt::format(" {} {} ({:.0f} ms)", names[i], n, static_cast<double>(ns) * 1e-6);
+	}
+	Log::WriteToConsoleAndLog(line + "\n");
+}
+
+// KYTY_CP_WAIT_FORWARD=1 (default off; not with KYTY_CP_SEQ_VERIFY): a WAIT_REG_MEM on the label
+// this stream last recorded, which that recorded value already satisfies, does not stop the
+// sequencer. Crash Bandicoot 4 issues ~3000 such waits a second, each one a stop of the parse
+// (and a drained draw-prep window) until the resolver answered what was known in advance. The
+// resolver still executes the wait in order: an op that does not pass stays at the ring's head
+// and is retried, with everything after it behind it, exactly as before.
+bool CpWaitForwardEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_WAIT_FORWARD");
+		return value != nullptr && std::strcmp(value, "1") == 0 && CpSeq::VerifyMode() == 0;
+	}();
+	return enabled;
+}
+} // namespace
+
 CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* payload,
                                              uint32_t payload_size, const void* data,
                                              uint32_t data_size) {
@@ -4227,6 +4304,16 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 			break;
 		default: break;
 	}
+	if (kind == CpSeq::OpKind::WaitRegMem && CpWaitForwardEnabled() &&
+	    IsSelfLabelWait(*static_cast<const CpSeq::WaitRegMemOp*>(payload))) {
+		// Not an ordering point: the CP writes of the ops before it stay pending (they have not
+		// executed), and command bytes are checked again as after a barrier (conservative).
+		m_barrier_epoch++;
+		if (CpWaitStatsEnabled()) {
+			NoteCpStop(CpStopKind::WaitForwarded, 0);
+		}
+		return {};
+	}
 	// P3c (KYTY_CP_SEQ_PREFETCH): at a wait on the label this stream just wrote, parse ahead on a
 	// copy of the front while the resolver catches up, publishing the draws it meets.
 	const bool prefetch = kind == CpSeq::OpKind::WaitRegMem && CpSeq::PrefetchMode() != 0 &&
@@ -4235,7 +4322,23 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		RunPrefetch(sequence);
 	}
 	// An ordering point: the resolver executes everything before it, then this op.
-	const auto value = m_sequencer->AwaitAnswer(sequence);
+	const bool     stop_stats = CpWaitStatsEnabled();
+	const uint64_t stop_begin = stop_stats ? CpStopClockNs() : 0;
+	const auto     value      = m_sequencer->AwaitAnswer(sequence);
+	if (stop_stats) {
+		auto stop_kind = CpStopKind::Other;
+		if (kind == CpSeq::OpKind::WaitRegMem) {
+			const auto& wait = *static_cast<const CpSeq::WaitRegMemOp*>(payload);
+			stop_kind = wait.addr < m_last_label_begin || wait.addr >= m_last_label_end
+			                ? CpStopKind::WaitOther
+			            : IsSelfLabelWait(wait) ? CpStopKind::WaitSelfSatisfied
+			                                    : CpStopKind::WaitSelfOther;
+		} else if (kind == CpSeq::OpKind::Predication || kind == CpSeq::OpKind::CondExec ||
+		           kind == CpSeq::OpKind::Branch) {
+			stop_kind = CpStopKind::Condition;
+		}
+		NoteCpStop(stop_kind, CpStopClockNs() - stop_begin);
+	}
 	m_pending_writes.clear();
 	m_barrier_epoch++;
 	if (m_draw_prep != nullptr) {
