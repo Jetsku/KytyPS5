@@ -98,6 +98,14 @@ struct DeferCounters {
 DeferCounters         g_defer;
 std::atomic<uint32_t> g_verify_logged {0};
 
+bool ReuseAppliedProtection() noexcept {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PAGE_PROTECT_REUSE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 PageManager::DeferMode ReadDeferMode() {
 	const auto* value = std::getenv("KYTY_DEFER_UNPROTECT");
 	auto        mode  = PageManager::DeferMode::On;
@@ -639,6 +647,7 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateCountsLocked(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                        const RegionBits* mask, RunList* runs) {
+		const bool reuse_applied = track && !is_read && ReuseAppliedProtection();
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
@@ -678,6 +687,13 @@ struct PageManager::Impl {
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
 			if (watcher_edge && old_perms != new_perms) {
+				// A deferred write release may still have the host read-only when an upload
+				// watches again. Both locks are held, so `applied` has no host call in flight;
+				// the pending release will reconcile the new counts at its scope's end.
+				// New pages and stricter access-watch transitions still make their host call.
+				if (reuse_applied && region.applied[page_index] == ToLevel(new_perms)) {
+					continue;
+				}
 				if (range_bytes == 0) {
 					range_begin           = page_index;
 					potential_range_bytes = PAGE_SIZE;

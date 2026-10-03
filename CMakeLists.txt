@@ -685,6 +685,10 @@ target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
 add_executable(vram_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VramBudgetTests.cpp")
 target_include_directories(vram_budget_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(bda_hot_ranges_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BdaHotRangesTests.cpp")
+target_link_libraries(bda_hot_ranges_tests common)
+target_include_directories(bda_hot_ranges_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -1043,6 +1047,10 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --present-box-downscale-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME page_manager_protect_reuse COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME memory_tracker_protect_reuse COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	set_tests_properties(page_manager_protect_reuse memory_tracker_protect_reuse PROPERTIES
+		ENVIRONMENT "KYTY_PAGE_PROTECT_REUSE=1" TIMEOUT 60)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
@@ -1067,6 +1075,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
+	add_test(NAME bda_hot_ranges COMMAND $<TARGET_FILE:bda_hot_ranges_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -1174,6 +1183,19 @@ if(BUILD_TESTING)
 	set_tests_properties(draw_prep_code_cert_bytes PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP_CODE_DIGEST=0")
 	# KYTY_BUFFER_RANGE_MEMO and KYTY_HOT_PAGE_CHECK_LIMIT: default, verify mode, both off.
+	set(buffer_upload_test_env "KYTY_CP_RECORDER=0;KYTY_UPLOAD_DMA=0;KYTY_FAULT_AHEAD_KB=0;KYTY_HOT_PAGES=1;KYTY_HOT_PAGE_FRAMES=2;KYTY_HOT_PAGE_CHECK_LIMIT=0;KYTY_HOT_PAGE_QUIET_FRAMES=1000;KYTY_FALSE_SHARING_WRITES=1;KYTY_FALSE_SHARING_WRITES_VERIFY=1")
+	foreach(upload_batch IN ITEMS 0 1)
+		add_test(NAME buffer_upload_coalesce_batch${upload_batch}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-upload-coalesce-only)
+		set_tests_properties(buffer_upload_coalesce_batch${upload_batch} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "${buffer_upload_test_env};KYTY_UPLOAD_BATCH=${upload_batch}")
+	endforeach()
+	foreach(merge_hot IN ITEMS 0 1)
+		add_test(NAME bda_hot_ranges_gpu_merge${merge_hot}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-upload-coalesce-only)
+		set_tests_properties(bda_hot_ranges_gpu_merge${merge_hot} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "${buffer_upload_test_env};KYTY_UPLOAD_BATCH=1;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_HOT_RANGES_MERGE=${merge_hot};KYTY_BDA_HOT_SYNC_VERIFY=exit;KYTY_BDA_DIRTY_LOG_VERIFY=exit;KYTY_PAGE_PROTECT_REUSE=1")
+	endforeach()
 	add_test(NAME buffer_range_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	add_test(NAME buffer_range_memo_verify
@@ -1221,6 +1243,38 @@ if(BUILD_TESTING)
 			ENVIRONMENT "KYTY_SYNC_EPOCH=1;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_SYNC_EPOCH=1;KYTY_BDA_SYNC_EPOCH_VERIFY=0;KYTY_CP_SEQ_VERIFY=0;KYTY_LABEL_MODE=${guest_sync_label};KYTY_CP_RECORDER=${guest_sync_recorder};KYTY_CP_SEQ=${guest_sync_seq};KYTY_SUBMISSION_MODE=${guest_sync_submission}")
 	endforeach()
 
+	# BDA passes after buffers registered between them (new buffer, grown/joined buffer): contents
+	# only, so it holds for any pass strategy. Default and as the product runs (incremental).
+	add_test(NAME bda_new_buffer
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	add_test(NAME bda_new_buffer_incremental
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_incremental PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	# KYTY_BDA_NEW_BUFFER_SYNC: new buffers synchronized alone, no full scan; the verify run follows
+	# every dirty-log pass with the full scan it replaced and exits on a page it missed.
+	add_test(NAME bda_new_buffer_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_sync PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1")
+	add_test(NAME bda_new_buffer_sync_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_sync_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+	# Exercise the new-buffer upload before an otherwise valid epoch/submission skip, and mapping
+	# invalidation while a native buffer survives. The fixture checks real GPU contents.
+	foreach(bda_case same_epoch same_submission remap)
+		add_test(NAME bda_new_buffer_${bda_case}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+		set(bda_case_env "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_TEST_BDA_SAME_EPOCH=1")
+		if(bda_case STREQUAL same_submission)
+			list(APPEND bda_case_env "KYTY_BDA_SYNC_EPOCH=0" "KYTY_BDA_SYNC_PER_SUBMISSION=1")
+		elseif(bda_case STREQUAL remap)
+			list(APPEND bda_case_env "KYTY_TEST_BDA_REMAP=1" "KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+		endif()
+		set_tests_properties(bda_new_buffer_${bda_case} PROPERTIES
+			TIMEOUT 60 ENVIRONMENT "${bda_case_env}")
+	endforeach()
 	# KYTY_BDA_SYNC_EPOCH: default, with incremental synchronization (as the product runs), verify
 	# mode (it needs the fault epoch of incremental synchronization), off.
 	add_test(NAME bda_sync_epoch
@@ -2024,6 +2078,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		spirv_local_arrays_tests
 		vram_budget_tests
+		bda_hot_ranges_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

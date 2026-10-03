@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/renderer/cache/bdaSyncDiagnostics.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
@@ -198,6 +199,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	// generation in the guest address space).
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
 	m_mapped_ranges.Add(vaddr, size);
+	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::Maps);
 	m_buffer_cache.InvalidateBdaSynchronization();
 	SyncEpoch::Advance();
 }
@@ -229,6 +231,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::Unmaps);
 		m_buffer_cache.InvalidateBdaSynchronization();
 		SyncEpoch::Advance();
 	};
@@ -241,7 +244,62 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+namespace {
+// Opt-in CPU measurement, distinct from the GPU timestamp deltas. The clock has
+// the same origin as summary.csv. One CSV write per second, outside the measured
+// scope; no clock or file access when KYTY_BDA_CPU_TIMING_FILE is absent.
+class BdaCpuTimer {
+public:
+	BdaCpuTimer() {
+		if (OutputPath() != nullptr) m_start = HangTrace::NowNs();
+	}
+	~BdaCpuTimer() {
+		if (m_start == 0) return;
+		const auto end = HangTrace::NowNs();
+		thread_local Totals totals;
+		if (totals.calls == 0) totals.begin = m_start;
+		++totals.calls;
+		totals.ns += end - m_start;
+		totals.maximum = std::max(totals.maximum, end - m_start);
+		if (end - totals.begin >= 1'000'000'000) totals.Flush(end);
+	}
+
+private:
+	static const char* OutputPath() {
+		static const char* path = [] {
+			const auto* value = std::getenv("KYTY_BDA_CPU_TIMING_FILE");
+			return value != nullptr && value[0] != '\0' ? value : nullptr;
+		}();
+		return path;
+	}
+	struct Totals {
+		Totals(): file(std::fopen(OutputPath(), "w")) {
+			if (file != nullptr) std::fprintf(file, "begin_ms,end_ms,calls,total_ns,max_ns\n");
+			else std::fprintf(stderr, "BDA CPU timing: cannot open output file\n");
+		}
+		~Totals() {
+			Flush(HangTrace::NowNs());
+			if (file != nullptr) std::fclose(file);
+		}
+		void Flush(uint64_t end) {
+			if (file != nullptr && calls != 0) {
+				std::fprintf(file, "%.3f,%.3f,%llu,%llu,%llu\n", begin / 1.0e6, end / 1.0e6,
+				             static_cast<unsigned long long>(calls),
+				             static_cast<unsigned long long>(ns),
+				             static_cast<unsigned long long>(maximum));
+				std::fflush(file);
+			}
+			calls = ns = maximum = 0;
+		}
+		FILE* file;
+		uint64_t begin = 0, calls = 0, ns = 0, maximum = 0;
+	};
+	uint64_t m_start = 0;
+};
+} // namespace
+
 void RenderContext::PrepareBda() {
+	const BdaCpuTimer cpu_timer;
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;

@@ -626,6 +626,43 @@ void TestDeferredReleaseRacingWatch(DeferMode mode) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// Rewatching before a deferred release reaches the host must reuse the read-only protection.
+// A newly watched neighbouring page still needs a real host call before this method returns.
+void TestReuseAppliedProtection() {
+  SetDeferMode(DeferMode::Verify);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  manager.UpdatePageWatchers<true>(address, page_size);
+  manager.UpdatePageWatchers<true>(address + 2 * page_size, page_size);
+  {
+    const PageManager::DeferUnprotectScope scope;
+    manager.UpdatePageWatchers<false>(address, page_size);
+    manager.UpdatePageWatchers<false>(address + 2 * page_size, page_size);
+    g_protection_calls = 0;
+    g_protection_ranges.clear();
+    manager.UpdatePageWatchers<true>(address, page_size);
+    Check(g_protection_calls == 0 && Protection(memory) == PAGE_READONLY,
+          "re-watching a pending release repeated an already applied host protection");
+    manager.UpdatePageWatchers<false>(address, page_size);
+    manager.UpdatePageWatchers<true>(address, 3 * page_size);
+    Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+              g_protection_ranges[0].address == address + page_size &&
+              g_protection_ranges[0].size == page_size,
+          "protection reuse either missed a new watch or re-protected unchanged neighbours");
+    Check(Protection(memory) == PAGE_READONLY &&
+              Protection(memory + page_size) == PAGE_READONLY &&
+              Protection(memory + 2 * page_size) == PAGE_READONLY,
+          "a watched page was left writable before returning from a reused protection");
+  }
+  Check(g_protection_calls == 1, "a stale deferred release undid protection reuse");
+  manager.UpdatePageWatchers<false>(address, 3 * page_size);
+  for (uint64_t page = 0; page < 3; page++)
+    Check(IsWritable(memory + page * page_size), "reuse left a released page protected");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 // More pending spans than the batch holds: the extra ones apply at once, the rest at scope end.
 void TestDeferredBatchOverflow() {
   SetDeferMode(DeferMode::On);
@@ -849,6 +886,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
+  }
+  if (const auto *reuse = std::getenv("KYTY_PAGE_PROTECT_REUSE");
+      reuse != nullptr && std::strcmp(reuse, "1") == 0) {
+    TestReuseAppliedProtection();
   }
   TestWatchAndUnwatch();
   TestSharedWatcherCounts();

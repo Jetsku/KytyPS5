@@ -178,6 +178,9 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  static bool SyncRead(BufferCache &cache, BufferId id, uint64_t address, uint64_t bytes) {
+    return cache.SynchronizeBuffer(cache.GetBuffer(id), address, bytes, false, false);
+  }
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
@@ -27402,6 +27405,9 @@ public:
     m_device.destroyQueryPool(pool, nullptr);
   }
 
+#include "ShaderBdaNewBufferTests.inc"
+#include "ShaderBufferUploadCoalesceTests.inc"
+
 private:
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -49458,12 +49464,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-exact-lookup-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(false); // Lookup/ownership does not use dynamic feedback state.
     vulkan.CheckImageExactBackingLookup();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--texel-sync-gpu-dirty-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(false); // Lookup/ownership does not use dynamic feedback state.
     vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();
     return 0;
   }
@@ -49576,6 +49582,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-upload-coalesce-only") == 0) {
+    VulkanHarness vulkan(false);
+    vulkan.CheckBufferUploadCoalesce();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-range-memo-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferRangeMemo();
@@ -49585,6 +49596,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     GuestSyncTests::CheckBdaPacketBoundaries(vulkan);
     GuestSyncTests::CheckReleaseWait(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-new-buffer-only") == 0) {
+    VulkanHarness vulkan(false); // no dynamic feedback-loop state needed (RX 9070 XT lacks it)
+    vulkan.CheckBdaNewBufferSync();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-epoch-only") == 0) {

@@ -28,6 +28,14 @@
   can fail; tools/compare_captures.py rejects failed, missing, late and black captures.
   Compare two captures-<run>/captures.json manifests with that Python script (no packages needed).
 
+.PARAMETER KeyTaps
+  Opt-in KEY@SECONDS taps to the exact emulator process's SDL window. Example:
+  -KeyTaps 'J@25,J@32,J@40' sends Cross (J). Focus must be verified before key-down.
+  Each tap holds for -KeyTapHoldMs (default 120), and the emulator gets
+  KYTY_HOST_INPUT_MIN_PRESS_MS and KYTY_HOST_INPUT_ONLY=1 only with this option.
+  key-taps-<run>.json records requested/actual timing, PID, HWND, focus and insertion status.
+  Taps add overhead; inspect screenshots/input trace to confirm entry into gameplay.
+
 .EXAMPLE
   .\tools\bench_boot.ps1 -InstallDir _Build\windows\install-video-fix -GameDir C:/Games/PPSA01325 `
       -TitleId PPSA01325 -Seconds 60 -Repeat 3 -PresetFile tools\u59-preset.json `
@@ -57,6 +65,8 @@ param(
     [int]$SlowSeconds = 8,     # consecutive seconds below 30 fps before the slow-scene sampler starts
     [int]$SampleSeconds = 20,  # how long thread_sampler.exe samples the busiest threads
     [int[]]$ScreenshotSeconds = @(),
+    [string[]]$KeyTaps = @(),
+    [ValidateRange(120, 2000)][int]$KeyTapHoldMs = 120,
     [string]$AnalyzeOnly
 )
 
@@ -152,6 +162,12 @@ if ($AnalyzeOnly) {
 
 # ---- run mode -----------------------------------------------------------------------------
 
+if ($KeyTaps.Count) {
+    . (Join-Path $PSScriptRoot 'bench_key_taps.ps1')
+    $keyTapPlan = @(ConvertTo-BenchKeyTapPlan $KeyTaps $Seconds)
+    # Compile the optional Win32 adapter before timing the launched process.
+    Initialize-BenchKeyTapNative
+}
 if ($ScreenshotSeconds.Count) {
     if (@($ScreenshotSeconds | Where-Object { $_ -lt 0 -or $_ -ge $Seconds }).Count) {
         throw '-ScreenshotSeconds must be nonnegative and less than -Seconds'
@@ -255,6 +271,10 @@ foreach ($spec in $Variant) {
         foreach ($key in $env_vars.Keys) { Set-Item "Env:$key" $env_vars[$key] }
         $env:KYTY_HANG_TRACE = '1'
         $env:KYTY_HANG_TRACE_DIR = $trace
+        if ($KeyTaps.Count) {
+            $env:KYTY_HOST_INPUT_MIN_PRESS_MS = [string]$KeyTapHoldMs
+            $env:KYTY_HOST_INPUT_ONLY = '1'
+        }
 
         $emuArgs = @('--screen-width', '1280', '--screen-height', '720', '--user-name', 'Kyty', '--user-id', '1000',
             '--present-mode', $PresentMode, '--gpu', '0', '--readback-linear-images', 'false',
@@ -272,7 +292,15 @@ foreach ($spec in $Variant) {
         if ($ScreenshotSeconds.Count -and (Test-Path -LiteralPath (Join-Path $OutDir "captures-$tag"))) {
             throw "Capture folder for $tag already exists (choose a new -OutDir)"
         }
+        if ($KeyTaps.Count -and (Test-Path -LiteralPath (Join-Path $OutDir "key-taps-$tag.json"))) {
+            throw "Key-tap manifest for $tag already exists (choose a new -OutDir)"
+        }
         $process = Start-Process -FilePath $exe -ArgumentList $argLine -WorkingDirectory $runtime -PassThru
+        $keyTapSession = $null
+        if ($KeyTaps.Count) {
+            $keyTapSession = New-BenchKeyTaps $OutDir $tag $process $keyTapPlan $KeyTapHoldMs
+            Update-BenchKeyTaps $keyTapSession
+        }
         $captureSession = $null
         if ($ScreenshotSeconds.Count) {
             $captureSession = New-BenchCaptures $OutDir $tag $process $ScreenshotSeconds
@@ -284,6 +312,9 @@ foreach ($spec in $Variant) {
         $previous  = @{}
         $series    = New-Object System.Collections.ArrayList   # (second, tid, cpu%) for threads above 1%
         $samples   = 0
+        $cpuSampleClock = [Diagnostics.Stopwatch]::StartNew()
+        $previousSampleSeconds = $null
+        $cpuObservedSeconds = 0.0
         $deadline  = [DateTime]::UtcNow.AddSeconds($Seconds)
         # Slow-scene profiling: when the game has been below 30 fps for $SlowSeconds in a row (after
         # the first 50 s), thread_sampler.exe samples the busiest threads for $SampleSeconds.
@@ -291,10 +322,13 @@ foreach ($spec in $Variant) {
         $slowRun      = 0
         $samplerProc  = $null
         $samplesCsv   = Join-Path $OutDir "samples-$tag.csv"
-        while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
-            Start-Sleep -Milliseconds 1000
+        try {
+          while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+            if ($keyTapSession) { Wait-BenchKeyTaps $keyTapSession 1000 }
+            else { Start-Sleep -Milliseconds 1000 }
             if ($captureSession) { Update-BenchCaptures $captureSession }
-            if ($samplerExe -and -not $samplerProc -and $samples -ge $SlowAfter) {
+            $profileElapsed = if ($keyTapSession) { $cpuSampleClock.Elapsed.TotalSeconds } else { $samples }
+            if ($samplerExe -and -not $samplerProc -and $profileElapsed -ge $SlowAfter) {
                 try {
                     $lastRows = @(Import-Csv (Join-Path $trace 'summary.csv') | Select-Object -Last 2)
                     $flipsNow  = if ($lastRows.Count -ge 2) { [int](Get-Num $lastRows[0].flips) } else { 0 }
@@ -304,7 +338,7 @@ foreach ($spec in $Variant) {
                     if ($flipsNow -ge 1 -and $flipsNow -le 30 -and -not $compiling) { $slowRun++ } else { $slowRun = 0 }
                 } catch { }
                 if ($slowRun -ge $SlowSeconds) {
-                    $recent = @($series | Where-Object { $_.t -gt $samples - 5 } | Group-Object tid |
+                    $recent = @($series | Where-Object { $_.t -gt $profileElapsed - 5 } | Group-Object tid |
                         ForEach-Object { [pscustomobject]@{ tid = $_.Name; sum = ($_.Group | Measure-Object cpu_pct -Sum).Sum } } |
                         Sort-Object sum -Descending | Select-Object -First 5)
                     $tidArgs = ($recent | ForEach-Object { $_.tid }) -join ' '
@@ -324,16 +358,29 @@ foreach ($spec in $Variant) {
                     } catch { }
                 }
             } catch { break }
+            $sampleSeconds = $cpuSampleClock.Elapsed.TotalSeconds
+            $sampleInterval = if ($null -eq $previousSampleSeconds) { 0.0 } else { $sampleSeconds - $previousSampleSeconds }
+            if ($sampleInterval -gt 0) { $cpuObservedSeconds += $sampleInterval }
             foreach ($id in $current.Keys) {
                 if ($previous.ContainsKey($id)) {
                     $delta = $current[$id] - $previous[$id]
                     $perThread[$id].sum += $delta
-                    if ($delta -gt $perThread[$id].peak) { $perThread[$id].peak = $delta }
-                    if ($delta -ge 0.01) { [void]$series.Add([pscustomobject]@{ t = $samples + 1; tid = $id; cpu_pct = [Math]::Round($delta * 100) }) }
+                    # A hold at a tap deadline can extend this interval. Keep its
+                    # cost in the run, but report CPU rate per actual wall second.
+                    $cpuPercent = if ($keyTapSession) { Get-BenchKeyTapCpuPercent $delta $sampleInterval } else { $delta * 100 }
+                    if ($cpuPercent / 100 -gt $perThread[$id].peak) { $perThread[$id].peak = $cpuPercent / 100 }
+                    if ($cpuPercent -ge 1) {
+                        $sampleTime = if ($keyTapSession) { $sampleSeconds } else { $samples + 1 }
+                        [void]$series.Add([pscustomobject]@{ t = $sampleTime; tid = $id; cpu_pct = [Math]::Round($cpuPercent) })
+                    }
                 }
             }
             $previous = $current
+            $previousSampleSeconds = $sampleSeconds
             $samples++
+          }
+        } finally {
+            if ($keyTapSession) { Complete-BenchKeyTaps $keyTapSession }
         }
         $exited = $process.HasExited
         if ($captureSession) { Complete-BenchCaptures $captureSession }
@@ -352,10 +399,11 @@ foreach ($spec in $Variant) {
         $row = [ordered]@{ run = $tag; early_exit = $exited; exit_code = $exitCode; fatal = $fatal }
         $totalCpu = 0.0
         foreach ($entry in $perThread.Values) { $totalCpu += $entry.sum }
-        $row['cpu_total_pct'] = if ($samples) { [Math]::Round($totalCpu / $samples * 100) } else { 0 }
+        $cpuDenominator = if ($keyTapSession) { $cpuObservedSeconds } else { $samples }
+        $row['cpu_total_pct'] = if ($cpuDenominator -gt 0) { [Math]::Round($totalCpu / $cpuDenominator * 100) } else { 0 }
         $topThreads = @($perThread.GetEnumerator() | Sort-Object { $_.Value.sum } -Descending | Select-Object -First 8)
         $threadText = ($topThreads | ForEach-Object {
-            '{0}@{1}:{2:N0}%/{3:N0}%' -f $_.Key, $_.Value.start, ($_.Value.sum / [Math]::Max(1, $samples) * 100), ($_.Value.peak * 100)
+            '{0}@{1}:{2:N0}%/{3:N0}%' -f $_.Key, $_.Value.start, ($_.Value.sum / [Math]::Max(0.001, $cpuDenominator) * 100), ($_.Value.peak * 100)
         }) -join '  '
         $row['top_threads'] = $threadText
         Write-Host ("[{0}] cpu total {1}% of one core; top threads (tid@start avg%/peak%): {2}" -f $tag, $row['cpu_total_pct'], $threadText)

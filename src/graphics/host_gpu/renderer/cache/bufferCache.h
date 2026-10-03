@@ -254,6 +254,9 @@ private:
 		uint64_t verify_mismatch_pages  = 0;
 	};
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
+	// KYTY_BDA_NEW_BUFFER_SYNC: synchronizes the buffers registered since the last pass (their
+	// mapped parts) and records their hot runs; drops hot runs of buffers deleted since.
+	void SynchronizeBdaNewBuffers(const RangeSet& mapped_ranges);
 	// KYTY_BDA_HOT_SYNC pass: re-synchronizes only the hot page runs the last full pass recorded.
 	// False (nothing done) when a recorded buffer is gone; the caller then scans fully.
 	[[nodiscard]] bool SynchronizeBdaHotRanges(BdaSyncStats& stats);
@@ -362,7 +365,7 @@ private:
 	//  - the range's MemoryTracker::RangeSignature is unchanged: no tracker transition in the
 	//    range's regions (uploads, GPU-dirty marks, readbacks, hot-page changes, write faults), so
 	//    every tracker bit the binding's decision and synchronization read is the same;
-	//  - a cache-buffer result: the buffer structure is unchanged (m_bda_structure_epoch moves on
+	//  - a cache-buffer result: the buffer structure is unchanged (m_buffer_registry_epoch moves on
 	//    every Register/Unregister), so the range is in the same buffer at the same offset. It is
 	//    recorded with the signature taken after its synchronization, and for a small read only
 	//    when the tracker bits then do not make the next one a stream copy. Pages that
@@ -602,6 +605,13 @@ private:
 	// runs the last full pass recorded (m_bda_hot_ranges) instead of every mapped buffer, and hot
 	// pages are compared with their shadow in place before any snapshot is taken.
 	const bool                                        m_bda_hot_sync;
+	// KYTY_BDA_NEW_BUFFER_SYNC=1 (default off): registering or unregistering a buffer no longer
+	// moves the BDA structure epoch, which made the next pass scan every mapped buffer.
+	// A removed buffer needs no upload (no BDA read
+	// reaches memory without a buffer; a joined buffer's bytes are copied into its successor), and
+	// a new buffer is synchronized alone at the start of the next pass (SynchronizeBdaNewBuffers),
+	// recording its hot runs. GPU mapping changes still move the epoch.
+	const bool                                        m_bda_new_buffer_sync;
 	MemoryTracker                                     m_memory_tracker;
 	// Hot pages: exact copy of the last contents uploaded for each hot page (GPU thread only).
 	// While a page is hot its buffer bytes equal this copy: every other write of them either
@@ -690,6 +700,12 @@ private:
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
+	// Moves on every Register/Unregister and GPU mapping change (the binding memo's buffer
+	// structure guard). Equal to the BDA structure epoch's moves unless KYTY_BDA_NEW_BUFFER_SYNC.
+	std::atomic_uint64_t                               m_buffer_registry_epoch {1};
+	// KYTY_BDA_NEW_BUFFER_SYNC: buffers registered since the last BDA pass (any thread registers).
+	std::mutex                                        m_bda_new_buffers_mutex;
+	std::vector<BufferId>                             m_bda_new_buffers;
 	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
 	uint64_t                                          m_bda_scanned_cpu_epoch = 0;
 	uint64_t                                          m_bda_scanned_structure_epoch = 0;
