@@ -169,7 +169,12 @@ jobs:
           Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
           if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) { throw 'Expected four Roboto fonts.' }
           Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Demons-Windows-x64.zip'
+          # RTX 50 test kit: scripts that start the launcher with different settings (RTX50-TEST-README.txt).
+          Copy-Item -Path 'tools/test-kit/*' -Destination $release -Recurse -Exclude '.gitattributes'
+          Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination (Join-Path $release 'test-presets/1-release.json')
+          if (@(Get-ChildItem -LiteralPath $release -Filter 'Test *.cmd').Count -ne 5) { throw 'Expected five test scripts.' }
+          if (@(Get-ChildItem -LiteralPath (Join-Path $release 'test-presets') -Filter '*.json').Count -ne 4) { throw 'Expected four test presets.' }
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -178,7 +183,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
+          gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-RTX50-TestKit-Windows-x64.zip' --prerelease `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 integration: lower VRAM use (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "New since u59-windows-20261002-int3: lower VRAM use, on in the bundled u59-preset.json. The shader recompiler emulates LDS in vertex and pixel shaders with a 32 KiB array per shader invocation, and the NVIDIA driver reserves memory for that array for every thread the GPU can keep resident (about 3.9 GiB on an RTX 3090) until the game exits. KYTY_FUNCTION_ARRAY_SHRINK shrinks these arrays to the elements a shader can reach before the driver sees it; KYTY_VRAM_GC_BUDGET collects textures and buffers against the VRAM budget while the game runs instead of thresholds fixed at startup. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, six alternating runs each: dedicated VRAM 9.4 GB with int3 and 6.3 GB with a local build of this source, peak since start 12.4 GB and 7.5 GB; 33.6 fps with int3 and 33.0 fps with the local build (within the spread between runs). Smaller cards were imitated by another process that holds 12 GiB or 16 GiB of the card's 24 GiB from boot: Astro Bot now reaches the Sky Garden and runs at 32-33 fps there, where int3's preset got stuck in the galaxy map. Tested on NVIDIA only; setting either flag to 0 in u59-preset.json turns it off. Release builds now compile from the source path the PGO profile was recorded at (C:\kyty-src); earlier GitHub builds missed the profile for every function in an anonymous namespace (2,499 of the 17,426 functions in int3's profile). This did not change the frame rate measurably. kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch can compile shaders again. See U59-README.md."
+            --title "U59 RTX 50 test kit (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "Test build for the RTX 50 / masterSemaphore startup freezes and crashes, not a regular release. Same code and release settings as u59-windows-20261003-int4b, plus scripts that start the launcher with different settings: diagnostics (freeze and GPU-crash recording), Vulkan overlays off, sparse residency off, a fresh shader cache, and a safe mode with the newer features off. Start with Test 1 and see RTX50-TEST-README.txt in the archive for the order and what to send back."
