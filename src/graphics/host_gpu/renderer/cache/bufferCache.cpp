@@ -1246,6 +1246,33 @@ void BufferCache::MaintainHotPages() {
 	std::erase_if(m_hot_shadows, [this, frame](const auto& entry) {
 		return frame - entry.second.last_use > m_hot_quiet_frames;
 	});
+	LogHotPages();
+}
+
+// One console/log line every 10 s: the write faults of the buffer tracker, the hot pages
+// (KYTY_HOT_PAGES) and the pages refused hot tracking because KYTY_HOT_PAGE_MAX were hot. A
+// refused page keeps its fault/upload/reprotect cycle every frame.
+void BufferCache::LogHotPages() {
+	const auto now = std::chrono::steady_clock::now();
+	if (m_hot_log.time == std::chrono::steady_clock::time_point {}) {
+		m_hot_log.time    = now;
+		m_hot_log.faults  = m_memory_tracker.WriteFaultCount();
+		m_hot_log.refused = m_memory_tracker.HotRefusedCount();
+		m_hot_log.frame   = m_memory_tracker.Frame();
+		return;
+	}
+	if (now - m_hot_log.time < std::chrono::seconds(10)) {
+		return;
+	}
+	const auto faults  = m_memory_tracker.WriteFaultCount();
+	const auto refused = m_memory_tracker.HotRefusedCount();
+	const auto frame   = m_memory_tracker.Frame();
+	const auto seconds = std::chrono::duration<double>(now - m_hot_log.time).count();
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Hot pages {:.0f}s: {} frames, {} write faults, hot {}/{}, refused {}\n", seconds,
+	    frame - m_hot_log.frame, faults - m_hot_log.faults, m_memory_tracker.HotPageCount(),
+	    m_memory_tracker.GetFaultPolicy().hot_max, refused - m_hot_log.refused));
+	m_hot_log = {now, faults, refused, frame};
 }
 
 void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/writeTickMap.h"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
@@ -465,6 +466,7 @@ private:
 	// last upload. From then on the ordinary fault tracking decides their next upload.
 	void SettleHotPages(uint64_t vaddr, uint64_t size);
 	void MaintainHotPages();
+	void LogHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// The texel-read download of one image that owns all of its bytes and starts at the read
 	// (SynchronizeBufferFromImage's image found by TextureCache::FindImageFromRange).
@@ -699,6 +701,14 @@ private:
 	FalseSharingTotals m_false_sharing_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
+	// LogHotPages: the totals and the time of the last line.
+	struct HotLog {
+		std::chrono::steady_clock::time_point time;
+		uint64_t                              faults  = 0;
+		uint64_t                              refused = 0;
+		uint32_t                              frame   = 0;
+	};
+	HotLog m_hot_log;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
 	// Moves on every Register/Unregister and GPU mapping change (the binding memo's buffer
 	// structure guard). Equal to the BDA structure epoch's moves unless KYTY_BDA_NEW_BUFFER_SYNC.

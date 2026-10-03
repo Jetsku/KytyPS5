@@ -182,6 +182,12 @@ private:
 			}
 			MemoryStats::Count(MemoryStats::Counter::FaultAheadPages, fault.ahead_pages);
 			MemoryStats::Count(MemoryStats::Counter::HotPromotions, fault.promoted);
+			if (write_fault) {
+				m_write_faults.fetch_add(1, std::memory_order_relaxed);
+				if (fault.refused != 0) {
+					m_hot_refused.fetch_add(fault.refused, std::memory_order_relaxed);
+				}
+			}
 		});
 	}
 
@@ -195,6 +201,14 @@ public:
 	}
 	[[nodiscard]] uint32_t HotPageCount() const noexcept {
 		return m_hot_count.load(std::memory_order_relaxed);
+	}
+	// Totals since start: guest write faults handled by this tracker, and pages that qualified
+	// for hot tracking while FaultPolicy::hot_max pages were already hot.
+	[[nodiscard]] uint64_t WriteFaultCount() const noexcept {
+		return m_write_faults.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint64_t HotRefusedCount() const noexcept {
+		return m_hot_refused.load(std::memory_order_relaxed);
 	}
 	[[nodiscard]] bool IsRegionHot(uint64_t vaddr, uint64_t size);
 	// Returns hot pages of the range to normal tracking (they stay CPU-dirty until uploaded).
@@ -418,6 +432,8 @@ private:
 	const FaultPolicy                              m_fault_policy;
 	std::atomic_uint32_t                           m_frame {1};
 	std::atomic_uint32_t                           m_hot_count {0};
+	std::atomic_uint64_t                           m_write_faults {0};
+	std::atomic_uint64_t                           m_hot_refused {0};
 	// Dirtied-range log (EnableDirtiedLog). A set of disjoint ranges; past DirtiedLogMaxRanges it
 	// is dropped and the next take reports the loss.
 	static constexpr size_t DirtiedLogMaxRanges = 4096;

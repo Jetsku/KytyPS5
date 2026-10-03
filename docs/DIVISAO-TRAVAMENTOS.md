@@ -120,6 +120,44 @@ orientado a desmarcar "DCC GPU clear", marcar "red zone protection" e "program c
 
 ## Seção Claude
 
+### Perfil de threads pós-merge e novos contadores (Claude, 2026-10-03 ~13:55)
+
+Amostragem de 20 s (usuário jogando, `Testar-Novo-Fusao`, 1080p, exe pós-`748f7c86`). Thread de
+comandos da GPU ~89% ocupada; a RenderThread do jogo passa 88% num laço do guest lendo o relógio
+(espera a GPU). Tempo da thread de comandos: `PrepareBda` 24% (dentro: reproteção
+`UpdateProtection<1,0>` via `SynchronizeBuffer` ~10%, cópias ~7%), espera do head do draw prep
+(`CommitHead`, laço próprio) ~9%, `RebindBuffers`/`FindBuffers` ~8%, ociosa ~11%.
+
+**Codex, aviso:** para medir sem hang trace, adicionei contadores só de diagnóstico (sem mudança de
+comportamento; não commitados), inclusive em arquivos seus:
+- `regionManager.h`: `FaultResult::refused` (página qualificada para hot recusada por `hot_max`);
+  `memoryTracker.h`: totais `WriteFaultCount()`/`HotRefusedCount()`; `bufferCache.{h,cpp}`:
+  `LogHotPages()` chamado por `MaintainHotPages`, uma linha a cada 10 s no log
+  (`Hot pages 10s: N frames, N write faults, hot N/max, refused N`).
+- `drawPrep.{h,cpp}`: `Totals::head_*` e a linha `DrawPrep 10s` agora também vai para o log, com
+  `head ready/self (ms)/waited (unclaimed behind, ms)/stolen`.
+Testes `memory_tracker*`/`page_manager*` 4/4. Hipótese a confirmar: o limite de 1024 páginas hot
+mantém páginas no ciclo falta→upload→reproteção a cada frame.
+
+**Resultado (usuário jogando, 1080p, `KYTY_PAGE_PROTECT_REUSE=1`, trechos pesados, médias por 10 s):**
+
+| | `HOT_PAGE_MAX` 1024 | 8192 |
+|---|---:|---:|
+| Frames | ~236 | ~187 |
+| Write faults | ~230 mil | ~120 mil |
+| Hot ativas / recusadas | 1024 (cheio) / ~77 mil | 1.451→4.317 / 0 |
+| `PrepareBda` por chamada | 1,83 ms | 2,62 ms |
+| Draws em fallback (`certunclean`) | ~0 | 3–7 mil |
+| Espera do head (`CommitHead`) | 60–95 ms/s, ~5% com slot livre atrás | igual |
+
+O limite 1024 é de fato atingido, mas subir para 8192 piorou: a página hot nunca é protegida, então
+é comparada com a sombra a cada passada BDA (~120/s), e por ser sempre CPU-dirty derruba o
+certificado do draw prep (`certunclean`). Cenas não idênticas (o número de hot subiu na sessão).
+Próximo passo possível: comparar hot uma vez por submissão e não sujar o certificado quando a
+comparação diz "inalterada". `KYTY_DRAW_PREP_STEAL` não ajudaria (quase nunca há slot livre atrás
+do head); o head está sendo preparado quando o CP chega. Reuso de proteção: 1,98→1,83 ms por
+chamada do `PrepareBda`, cenas diferentes, sem prova de ganho.
+
 - 2026-10-02: começando T2 + T1.
 - **Contrato C1 feito:** `PipelineCache::SaveEmergency()` (`pipelineCache.h`). Chama `m_program_disk->Flush()`
   (a segurança do `Flush` com outras threads vivas é do dono do `programDiskCache`), depois grava o

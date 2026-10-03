@@ -1073,17 +1073,23 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	auto& slot = window.HeadPayload();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
+		const auto self_start = NowNs();
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
+		g_totals.head_self.fetch_add(1, std::memory_order_relaxed);
+		g_totals.head_self_ns.fetch_add(NowNs() - self_start, std::memory_order_relaxed);
 	} else if (window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
+		g_totals.head_ready.fetch_add(1, std::memory_order_relaxed);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
+		g_totals.head_waits.fetch_add(1, std::memory_order_relaxed);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
 		const auto occupancy = window.Occupancy();
 		if (window.Unclaimed() != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsUnclaimed);
+			g_totals.head_waits_unclaimed.fetch_add(1, std::memory_order_relaxed);
 		}
 		// A worker holds the head. KYTY_DRAW_PREP_STEAL: meanwhile this thread prepares the next
 		// unclaimed slots exactly as a worker does (AwaitHead, workerGate.h): same function, the
@@ -1114,6 +1120,8 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
+		g_totals.head_wait_ns.fetch_add(stats.spin_ns, std::memory_order_relaxed);
+		g_totals.head_steals.fetch_add(stats.stolen, std::memory_order_relaxed);
 		// The head is done (acquired): its publication fields are visible.
 		if (slot.speculative) {
 			// P3c: an adopted slot whose speculative preparation had not finished yet.
@@ -1159,10 +1167,31 @@ void Engine::Drain() {
 // preparation against draws that fell back to the serial path, and why. Fallbacks run the whole
 // program preparation on the command processor, so the ratio says how much of it is avoidable.
 namespace {
+struct Head {
+	uint64_t ready           = 0;
+	uint64_t self            = 0;
+	uint64_t self_ns         = 0;
+	uint64_t waits           = 0;
+	uint64_t waits_unclaimed = 0;
+	uint64_t wait_ns         = 0;
+	uint64_t steals          = 0;
+};
+
+Head ReadHead() {
+	return {g_totals.head_ready.load(std::memory_order_relaxed),
+	        g_totals.head_self.load(std::memory_order_relaxed),
+	        g_totals.head_self_ns.load(std::memory_order_relaxed),
+	        g_totals.head_waits.load(std::memory_order_relaxed),
+	        g_totals.head_waits_unclaimed.load(std::memory_order_relaxed),
+	        g_totals.head_wait_ns.load(std::memory_order_relaxed),
+	        g_totals.head_steals.load(std::memory_order_relaxed)};
+}
+
 void PrintDrawPrepSummary() {
 	static uint64_t last_ns        = 0;
 	static uint64_t last_committed = 0;
 	static uint64_t last_fallbacks = 0;
+	static Head     last_head {};
 	static std::array<uint64_t, static_cast<size_t>(Failure::Mismatch) + 1u> last_reasons {};
 	// KYTY_CP_COMMIT=draws: the clock is read every 256th commit (the line is due every 10 s).
 	static uint32_t calls = 0;
@@ -1191,13 +1220,27 @@ void PrintDrawPrepSummary() {
 			last_reasons[i] = value;
 		}
 	}
-	std::printf("DrawPrep %.0fs: %" PRIu64 " committed from a prepared slot, %" PRIu64
-	            " fell back to the serial path;%s\n",
-	            static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
-	            fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str());
+	// How the commits found their head slot (parallel mode): the command processor's idle spin on
+	// a head a worker held, and its own preparations of heads no worker had claimed.
+	const auto head = ReadHead();
+	char       line[512];
+	std::snprintf(line, sizeof(line),
+	              "DrawPrep %.0fs: %" PRIu64 " committed from a prepared slot, %" PRIu64
+	              " fell back to the serial path;%s; head ready=%" PRIu64 " self=%" PRIu64
+	              " (%.1f ms) waited=%" PRIu64 " (unclaimed behind %" PRIu64 ", %.1f ms) stolen=%" PRIu64
+	              "\n",
+	              static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
+	              fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str(),
+	              head.ready - last_head.ready, head.self - last_head.self,
+	              static_cast<double>(head.self_ns - last_head.self_ns) * 1e-6,
+	              head.waits - last_head.waits, head.waits_unclaimed - last_head.waits_unclaimed,
+	              static_cast<double>(head.wait_ns - last_head.wait_ns) * 1e-6,
+	              head.steals - last_head.steals);
+	Log::WriteToConsoleAndLog(line);
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;
+	last_head      = head;
 }
 } // namespace
 

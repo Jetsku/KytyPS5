@@ -238,6 +238,7 @@ public:
 	struct FaultResult {
 		uint64_t ahead_pages = 0;
 		uint32_t promoted    = 0;
+		uint32_t refused     = 0; // pages that qualified for hot while `policy.hot_max` were hot
 	};
 	template <typename AheadFunc>
 	FaultResult MarkWriteFault(uint64_t vaddr, uint64_t size, const FaultPolicy& policy,
@@ -301,6 +302,7 @@ public:
 			}
 			if (hot_count.fetch_add(1, std::memory_order_relaxed) >= policy.hot_max) {
 				hot_count.fetch_sub(1, std::memory_order_relaxed);
+				result.refused++;
 				continue;
 			}
 			streak = 0;
