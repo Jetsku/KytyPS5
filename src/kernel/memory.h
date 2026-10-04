@@ -151,6 +151,19 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
+// Diagnostics (KYTY_DRAW_PREP_CERT_DIAG): which of the exact predicates behind IsGpuCleanForRead
+// refuse the range, as GpuUnclean* bits (0: clean, or not GPU memory). GPU thread only.
+inline constexpr uint32_t GpuUncleanDirtyBytes  = 1u; // BufferCache::HasGpuDirtyBytes
+inline constexpr uint32_t GpuUncleanPublication = 2u; // BufferCache::HasPendingBackingPublication
+inline constexpr uint32_t GpuUncleanImage       = 4u; // TextureCache::IsRegionGpuModified
+[[nodiscard]] uint32_t GpuUncleanReasons(uint64_t vaddr, uint64_t size);
+// Diagnostics: prints the GPU-modified images over the range (TextureCache::LogGpuModifiedImages,
+// to stderr, first 32 calls of the process). GPU thread only.
+void                   LogGpuUncleanImages(uint64_t vaddr, uint64_t size);
+// The first step of RenderContext::SynchronizeGpuBackingForRead: GPU-modified images over the
+// range that a CPU write definitely overwrote stop owning their bytes
+// (TextureCache::ReleaseCpuOverwrittenImages). Returns whether any did. GPU thread only.
+bool                   ReleaseCpuOverwrittenGpuImages(uint64_t vaddr, uint64_t size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);

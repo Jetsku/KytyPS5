@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
@@ -448,6 +449,166 @@ static ValidateResult ValidateValues(const ReadSet& reads) {
 // Per-reason fallback counts for the periodic console line (PrintDrawPrepSummary).
 std::array<std::atomic<uint64_t>, static_cast<size_t>(Failure::Mismatch) + 1u> g_fallback_reasons;
 
+namespace {
+
+// KYTY_DRAW_PREP_CERT_DIAG=1 (live, default off; diagnostics): for every commit refused as
+// CertUnclean, the path that refused it, which exact predicate makes its first unclean range
+// unclean (Memory::GpuUncleanReasons), whether that range is a read or a digest, and how many
+// coherence generations separated preparation and commit (also for accepted commits). Summed in
+// the "DrawPrep 10s" line with the most frequent refused ranges. GPU thread only (Validate and
+// PrintDrawPrepSummary both run there), so plain counters.
+Live::Switch g_cert_diag("KYTY_DRAW_PREP_CERT_DIAG", Live::ParseDefaultOff);
+
+// KYTY_DRAW_PREP_RELEASE_OVERWRITTEN=1 (live, default off): a certificate whose only unclean
+// ranges are covered by GPU-modified images first lets the images a CPU write definitely
+// overwrote give up their bytes, as the serial path's SynchronizeGpuBackingForRead does before it
+// reads, and is accepted when every range is clean then. The preparation read those ranges from
+// the backing, which is what the serial path reads after the same release; a range still unclean
+// (an image the CPU did not overwrite, GPU-dirty bytes, a pending publication) falls back as before.
+// Crash Bandicoot 4 reuses the memory of small render targets (30x5x5 ...) for tables the CPU
+// rewrites, and its draws refused here took the serial path thousands of times a second.
+Live::Switch g_release_overwritten("KYTY_DRAW_PREP_RELEASE_OVERWRITTEN", Live::ParseDefaultOff);
+uint64_t     g_release_rescues = 0; // accepted after a release, since the last summary line
+
+// Releases the CPU-overwritten images behind the certificate's unclean ranges; false when a range
+// is unclean for another reason (nothing can be accepted then).
+bool ReleaseOverwrittenImages(const PreparedDraw& prepared) {
+	const auto release = [](std::span<const Coherence::Range> ranges) {
+		for (const auto& range: ranges) {
+			const auto size = range.end - range.begin;
+			if (LibKernel::Memory::IsGpuCleanForRead(range.begin, size)) {
+				continue;
+			}
+			if (LibKernel::Memory::GpuUncleanReasons(range.begin, size) !=
+			    LibKernel::Memory::GpuUncleanImage) {
+				return false;
+			}
+			(void)LibKernel::Memory::ReleaseCpuOverwrittenGpuImages(range.begin, size);
+		}
+		return true;
+	};
+	return release(prepared.reads.Ranges()) && release(prepared.reads.DigestRanges());
+}
+
+enum class CertPath : uint8_t { LogClean, LogConflict, Value, Count };
+
+struct CertDiag {
+	struct Top {
+		uint64_t begin = 0;
+		uint64_t size  = 0;
+		uint64_t count = 0;
+	};
+	std::array<uint64_t, static_cast<size_t>(CertPath::Count)> paths {};
+	std::array<uint64_t, 8>  reasons {}; // by GpuUnclean* bits; 0: clean again when inspected
+	uint64_t                 digest_ranges = 0;
+	uint64_t                 fail_count    = 0;
+	uint64_t                 fail_gens     = 0;
+	uint64_t                 ok_count      = 0;
+	uint64_t                 ok_gens       = 0;
+	uint64_t                 top_dropped   = 0;
+	std::array<Top, 64>      top {};
+};
+CertDiag g_cert_diag_state;
+
+void NoteCertTop(uint64_t begin, uint64_t size) {
+	auto&      top  = g_cert_diag_state.top;
+	const auto hash = (begin >> 6u) * 0x9E3779B97F4A7C15ull;
+	for (uint32_t probe = 0; probe < 8; probe++) {
+		auto& entry = top[(hash + probe) & (top.size() - 1u)];
+		if (entry.count == 0 || (entry.begin == begin && entry.size == size)) {
+			entry.begin = begin;
+			entry.size  = size;
+			entry.count++;
+			return;
+		}
+	}
+	g_cert_diag_state.top_dropped++;
+}
+
+void NoteCertUnclean(const PreparedDraw& prepared, CertPath path) {
+	if (!g_cert_diag.On()) {
+		return;
+	}
+	auto& diag = g_cert_diag_state;
+	diag.paths[static_cast<size_t>(path)]++;
+	diag.fail_count++;
+	diag.fail_gens += Coherence::Generation() - prepared.coherence_generation;
+	const auto inspect = [&](std::span<const Coherence::Range> ranges, bool digest) {
+		for (const auto& range: ranges) {
+			const auto size = range.end - range.begin;
+			if (LibKernel::Memory::IsGpuCleanForRead(range.begin, size)) {
+				continue;
+			}
+			const auto reasons = LibKernel::Memory::GpuUncleanReasons(range.begin, size);
+			diag.reasons[reasons & 7u]++;
+			diag.digest_ranges += digest ? 1u : 0u;
+			if ((reasons & LibKernel::Memory::GpuUncleanImage) != 0) {
+				// The images behind a range, once per range (the first 16 ranges).
+				static std::array<uint64_t, 16> described {};
+				static size_t                   described_count = 0;
+				const auto key = range.begin ^ (size << 48u);
+				if (described_count < described.size() &&
+				    std::find(described.begin(), described.begin() + described_count, key) ==
+				        described.begin() + described_count) {
+					described[described_count++] = key;
+					LibKernel::Memory::LogGpuUncleanImages(range.begin, size);
+				}
+			}
+			NoteCertTop(range.begin, size);
+			return true;
+		}
+		return false;
+	};
+	if (!inspect(prepared.reads.Ranges(), false) && !inspect(prepared.reads.DigestRanges(), true)) {
+		diag.reasons[0]++; // every range is clean again by now
+	}
+}
+
+void NoteCertAccepted(const PreparedDraw& prepared) {
+	if (g_cert_diag.On()) {
+		g_cert_diag_state.ok_count++;
+		g_cert_diag_state.ok_gens += Coherence::Generation() - prepared.coherence_generation;
+	}
+}
+
+// The diagnostics since the previous line, then reset; empty when nothing was noted.
+std::string TakeCertDiagText() {
+	auto& diag = g_cert_diag_state;
+	if (diag.fail_count == 0 && diag.ok_count == 0) {
+		return {};
+	}
+	const auto avg = [](uint64_t sum, uint64_t count) {
+		return count == 0 ? 0.0 : static_cast<double>(sum) / static_cast<double>(count);
+	};
+	char text[384];
+	std::snprintf(text, sizeof(text),
+	              " certdiag: path logclean=%" PRIu64 " logconflict=%" PRIu64 " value=%" PRIu64
+	              "; first unclean dirty=%" PRIu64 " publication=%" PRIu64 " image=%" PRIu64
+	              " mixed=%" PRIu64 " clean-again=%" PRIu64 " (digest %" PRIu64
+	              "); gens fail=%.1f ok=%.1f;",
+	              diag.paths[0], diag.paths[1], diag.paths[2], diag.reasons[1], diag.reasons[2],
+	              diag.reasons[4], diag.reasons[3] + diag.reasons[5] + diag.reasons[6] + diag.reasons[7],
+	              diag.reasons[0], diag.digest_ranges, avg(diag.fail_gens, diag.fail_count),
+	              avg(diag.ok_gens, diag.ok_count));
+	std::string line = text;
+	auto        top  = diag.top;
+	std::sort(top.begin(), top.end(),
+	          [](const CertDiag::Top& a, const CertDiag::Top& b) { return a.count > b.count; });
+	line += " top";
+	for (size_t i = 0; i < 6 && top[i].count != 0; i++) {
+		std::snprintf(text, sizeof(text), " 0x%" PRIx64 "+0x%" PRIx64 "(%" PRIu64 ")", top[i].begin,
+		              top[i].size, top[i].count);
+		line += text;
+	}
+	if (diag.top_dropped != 0) {
+		line += " (+" + std::to_string(diag.top_dropped) + " untracked)";
+	}
+	diag = {};
+	return line;
+}
+
+} // namespace
+
 bool Validate(PreparedDraw& prepared, bool pixel_active,
               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping) {
 	const auto fail = [&](Failure failure) {
@@ -480,7 +641,12 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogEntries, outcome.entries);
 		if (outcome.result == Coherence::CheckResult::Clean) {
 			if (!prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
-				return fail(Failure::CertUnclean);
+				if (!g_release_overwritten.On() || !ReleaseOverwrittenImages(prepared) ||
+				    !prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
+					NoteCertUnclean(prepared, CertPath::LogClean);
+					return fail(Failure::CertUnclean);
+				}
+				g_release_rescues++;
 			}
 		} else {
 			// A logged transition touched a certified range, or the interval could not be read:
@@ -496,7 +662,9 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 				case ValidateResult::Ok:
 					Profiler::CountFrameEvent(E::DrawPrepLogValueRescues);
 					break;
-				case ValidateResult::Unclean: return fail(Failure::CertUnclean);
+				case ValidateResult::Unclean:
+					NoteCertUnclean(prepared, CertPath::LogConflict);
+					return fail(Failure::CertUnclean);
 				case ValidateResult::Changed: return fail(Failure::CertChanged);
 			}
 		}
@@ -518,10 +686,13 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		}
 		switch (result) {
 			case ValidateResult::Ok: break;
-			case ValidateResult::Unclean: return fail(Failure::CertUnclean);
+			case ValidateResult::Unclean:
+				NoteCertUnclean(prepared, CertPath::Value);
+				return fail(Failure::CertUnclean);
 			case ValidateResult::Changed: return fail(Failure::CertChanged);
 		}
 	}
+	NoteCertAccepted(prepared);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitted);
 	g_totals.committed.fetch_add(1, std::memory_order_relaxed);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertRanges, ranges.size());
@@ -1277,6 +1448,15 @@ void PrintDrawPrepSummary() {
 	              static_cast<double>(head.after_stop_ns - last_head.after_stop_ns) * 1e-6,
 	              head.steals - last_head.steals);
 	std::string text = line;
+	if (g_release_rescues != 0) {
+		text.pop_back();
+		text += " released-overwritten=" + std::to_string(g_release_rescues) + "\n";
+		g_release_rescues = 0;
+	}
+	if (const auto diag = TakeCertDiagText(); !diag.empty()) {
+		text.pop_back();
+		text += diag + "\n";
+	}
 	if (head.prefetch_published != last_head.prefetch_published) {
 		// The line ends with the newline above: the prefetch counters go before it.
 		text.pop_back();

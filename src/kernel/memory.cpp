@@ -1410,6 +1410,39 @@ bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 	return QueryGpuCleanVerdict(vaddr, size);
 }
 
+uint32_t GpuUncleanReasons(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return 0;
+	}
+	auto&    resources = GetGpuResources();
+	uint32_t reasons   = 0;
+	if (resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		reasons |= GpuUncleanDirtyBytes;
+	}
+	if (resources.GetBufferCache().HasPendingBackingPublication(vaddr, size)) {
+		reasons |= GpuUncleanPublication;
+	}
+	if (resources.GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		reasons |= GpuUncleanImage;
+	}
+	return reasons;
+}
+
+void LogGpuUncleanImages(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    Graphics::GuestGpu::IsGpuThread()) {
+		std::fprintf(stderr, "GPU-unclean read 0x%016" PRIx64 "+0x%" PRIx64 ":\n", vaddr, size);
+		GetGpuResources().GetTextureCache().LogGpuModifiedImages(vaddr, size);
+	}
+}
+
+bool ReleaseCpuOverwrittenGpuImages(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetTextureCache().ReleaseCpuOverwrittenImages(vaddr, size);
+}
+
 bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       GetGpuResources().SynchronizeGpuBackingForRead(vaddr, size);
