@@ -4239,12 +4239,11 @@ void NoteCpStop(CpStopKind kind, uint64_t stopped_ns) {
 // (and a drained draw-prep window) until the resolver answered what was known in advance. The
 // resolver still executes the wait in order: an op that does not pass stays at the ring's head
 // and is retried, with everything after it behind it, exactly as before.
+// Live switch (common/liveSwitch.h): read at every such wait, so a change applies from the next
+// one; a forwarded wait only skips the sequencer's stop, which no later op depends on.
+Live::Switch g_cp_wait_forward("KYTY_CP_WAIT_FORWARD", Live::ParseDefaultOff);
 bool CpWaitForwardEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_CP_WAIT_FORWARD");
-		return value != nullptr && std::strcmp(value, "1") == 0 && CpSeq::VerifyMode() == 0;
-	}();
-	return enabled;
+	return g_cp_wait_forward.On() && CpSeq::VerifyMode() == 0;
 }
 } // namespace
 

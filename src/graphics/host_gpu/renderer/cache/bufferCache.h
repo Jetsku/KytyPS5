@@ -844,7 +844,6 @@ private:
 	// KYTY_BDA_SYNC_PER_SUBMISSION (default off): the guest submission (SyncEpoch::
 	// CurrentSubmission) taken before the last completed pass; later passes of that submission
 	// are skipped while the structure epoch holds.
-	bool     m_bda_submission_skip   = false;
 	uint64_t m_bda_synced_submission = 0;
 	struct BdaEpochTotals {
 		uint64_t passes                = 0;

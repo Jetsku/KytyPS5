@@ -249,8 +249,6 @@ struct BufferCacheTestAccess {
   // KYTY_BDA_SYNC_EPOCH.
   static bool BdaEpochSkip(const BufferCache &cache) { return cache.m_bda_epoch_skip; }
   static int BdaEpochVerify(const BufferCache &cache) { return cache.m_bda_epoch_verify; }
-  // KYTY_BDA_SYNC_PER_SUBMISSION.
-  static bool BdaSubmissionSkip(const BufferCache &cache) { return cache.m_bda_submission_skip; }
   static bool BdaDirtyLog(const BufferCache &cache) { return cache.m_bda_dirty_log; }
   static int BdaDirtyLogVerify(const BufferCache &cache) { return cache.m_bda_log_verify; }
   static BufferCache::BdaLogTotals BdaLogTotals(const BufferCache &cache) {
@@ -8216,14 +8214,10 @@ public:
     constexpr uint64_t other_offset = 0x80000;
 
     EnsureRuntimeContext();
-    // The cache reads the switch when it is constructed.
-    const char *switch_env = std::getenv("KYTY_BDA_SYNC_PER_SUBMISSION");
-    const bool switch_was_set = switch_env != nullptr;
-    const std::string switch_saved = switch_was_set ? switch_env : "";
-    SetEnvironment("KYTY_BDA_SYNC_PER_SUBMISSION", "1");
+    // A live switch, read at every BDA pass: on for this test, as KYTY_LIVE_FILE sets it at a flip.
+    Live::Testing::StageText("KYTY_BDA_SYNC_PER_SUBMISSION=1\n");
+    Live::OnCpFlip();
     const auto context_owner = MakeRenderContext();
-    SetEnvironment("KYTY_BDA_SYNC_PER_SUBMISSION",
-                   switch_was_set ? switch_saved.c_str() : nullptr);
     auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -8253,8 +8247,6 @@ public:
     {
       auto &cache = context.GetBufferCache();
       context.MapMemory(base, allocation_size);
-      Require(name, "switch", BufferCacheTestAccess::BdaSubmissionSkip(cache),
-              "KYTY_BDA_SYNC_PER_SUBMISSION=1 did not enable the per-submission gate");
       const auto totals = [&] { return BufferCacheTestAccess::BdaEpochTotals(cache); };
       const auto cpu_write = [&](uint64_t offset, uint32_t value) {
         Require(name, "write fault",
@@ -8333,6 +8325,8 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "BDA-submission direct-memory allocation release failed");
+    Live::Testing::StageText("KYTY_BDA_SYNC_PER_SUBMISSION=\n");
+    Live::OnCpFlip();
     std::printf("[host]    %-32s ok\n", name);
   }
 

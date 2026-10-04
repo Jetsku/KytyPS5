@@ -169,9 +169,10 @@ private:
 					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
 				}
 				if (write_fault) {
-					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes,
-					                                m_fault_policy, Frame(), m_hot_count,
-					                                on_ahead);
+					auto policy    = m_fault_policy;
+					policy.hot_max = HotMax();
+					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes, policy,
+					                                Frame(), m_hot_count, on_ahead);
 				} else {
 					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 					                                             bytes);
@@ -195,6 +196,10 @@ private:
 public:
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
+	// The hot page limit in effect: KYTY_HOT_PAGE_MAX_LIVE when a live change set it (1..65536),
+	// otherwise FaultPolicy::hot_max. Pages already hot above a lowered limit stay hot until they
+	// are demoted as usual.
+	[[nodiscard]] uint32_t HotMax() const noexcept;
 	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint32_t Frame() const noexcept {

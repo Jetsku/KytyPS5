@@ -55,6 +55,10 @@ Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
 
 Live::Switch g_bda_hot_ranges_merge("KYTY_BDA_HOT_RANGES_MERGE", Live::ParseDefaultOff);
 
+// KYTY_BDA_SYNC_PER_SUBMISSION (SynchronizeBdaBuffers): read at every pass, so a live change
+// takes effect at the next pass; the submission and structure it compares are kept either way.
+Live::Switch g_bda_sync_per_submission("KYTY_BDA_SYNC_PER_SUBMISSION", Live::ParseDefaultOff);
+
 template <typename Range>
 void MergeRecordedHotRanges(std::vector<Range>& ranges) {
 	const auto before = ranges.size();
@@ -1136,7 +1140,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	// The verify mode tells guest writes from missed pages by the fault epoch, which the tracker
 	// keeps only with incremental BDA synchronization.
 	m_bda_epoch_verify = m_bda_epoch_skip && m_bda_incremental_sync ? BdaEpochVerifyMode() : 0;
-	m_bda_submission_skip = ParseEnvU64("KYTY_BDA_SYNC_PER_SUBMISSION", 0) != 0;
 	m_bda_hot_per_submission =
 	    SyncEpoch::Enabled() && ParseEnvU64("KYTY_BDA_HOT_PER_SUBMISSION", 0) != 0;
 	m_hot_pressure_enabled = ParseEnvU64("KYTY_HOT_PAGE_PRESSURE", 0) != 0;
@@ -1280,7 +1283,7 @@ void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReleaseHotShadow(std::unique_ptr<uint8_t[]> data) {
-	if (data != nullptr && m_hot_shadow_free.size() < m_memory_tracker.GetFaultPolicy().hot_max) {
+	if (data != nullptr && m_hot_shadow_free.size() < m_memory_tracker.HotMax()) {
 		m_hot_shadow_free.push_back(std::move(data));
 	}
 }
@@ -1375,7 +1378,7 @@ void BufferCache::LogHotPages() {
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Hot pages {:.0f}s: {} frames, {} write faults, hot {}/{}, refused {}\n", seconds,
 	    frame - m_hot_log.frame, faults - m_hot_log.faults, m_memory_tracker.HotPageCount(),
-	    m_memory_tracker.GetFaultPolicy().hot_max, refused - m_hot_log.refused));
+	    m_memory_tracker.HotMax(), refused - m_hot_log.refused));
 	m_hot_log = {now, faults, refused, frame};
 }
 
@@ -1391,7 +1394,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 		m_hot_scratch.resize(hot_bytes);
 	}
 	const auto frame     = m_memory_tracker.Frame();
-	const auto max_pages = m_memory_tracker.GetFaultPolicy().hot_max;
+	const auto max_pages = m_memory_tracker.HotMax();
 	// KYTY_HOT_PAGE_PRESSURE: while slots are short, unchanged pages give theirs back sooner.
 	const uint32_t check_limit =
 	    m_hot_pressure && m_hot_check_limit != 0 ? std::max(m_hot_check_limit / 4u, 1u)
@@ -4260,14 +4263,14 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 		}
 		return;
 	}
-	// KYTY_BDA_SYNC_PER_SUBMISSION=1 (default off; upstream KytyPS5 309ba4f5, Senaxx): at most one
+	// KYTY_BDA_SYNC_PER_SUBMISSION=1 (default off, live; upstream KytyPS5 309ba4f5, Senaxx): at most one
 	// pass per guest submission, instead of one per epoch. What the game wrote before submitting
 	// reaches every BDA read of the submission, as on the console. A CPU write made while the
 	// submission runs reaches BDA reads only in the next submission, even behind a fence that
 	// orders it (a WAIT_REG_MEM on a CPU-written label): the epoch pass would have uploaded it.
 	// New buffers and GPU mapping changes still run the pass (structure epoch): a new buffer's
 	// pages start CPU-dirty and have never been uploaded.
-	if (m_bda_submission_skip && submission == m_bda_synced_submission &&
+	if (g_bda_sync_per_submission.On() && submission == m_bda_synced_submission &&
 	    structure == m_bda_synced_structure) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSubmissionSkips);
 		m_bda_epoch_totals.submission_skips++;

@@ -2,8 +2,28 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
+
+#include <cstdlib>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// KYTY_HOT_PAGE_MAX_LIVE (default unset: KYTY_HOT_PAGE_MAX's startup value): a live hot page limit
+// for A/B runs, read at every write fault and hot page collection.
+Live::Switch g_hot_page_max_live("KYTY_HOT_PAGE_MAX_LIVE", [](const char* value) -> int64_t {
+	return value == nullptr ? 0
+	                        : static_cast<int64_t>(std::min<unsigned long long>(
+	                              std::strtoull(value, nullptr, 10), 65536));
+});
+
+} // namespace
+
+uint32_t MemoryTracker::HotMax() const noexcept {
+	const auto live = g_hot_page_max_live.Get();
+	return live > 0 ? static_cast<uint32_t>(live) : m_fault_policy.hot_max;
+}
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
