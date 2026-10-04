@@ -2014,6 +2014,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (indirect_buffer == nullptr) {
+		if (cp.AbandonPrefetchOnInvalidData()) {
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
@@ -2061,6 +2064,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
+			if (cp.AbandonPrefetchOnInvalidData()) {
+				return KYTY_PM4_LEN(cmd_id) - 1u;
+			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
@@ -2085,6 +2091,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (indirect_buffer == nullptr) {
+		if (cp.AbandonPrefetchOnInvalidData()) {
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
@@ -2109,6 +2118,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		}
 
 		if (cmd_offset >= Pm4::SH_NUM) {
+			if (cp.AbandonPrefetchOnInvalidData()) {
+				return KYTY_PM4_LEN(cmd_id) - 1u;
+			}
 			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 			     "), value = 0x%08" PRIx32 "\n",
 			     cmd_offset, raw_cmd_offset, value);
@@ -2117,6 +2129,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
+			if (cp.AbandonPrefetchOnInvalidData()) {
+				return KYTY_PM4_LEN(cmd_id) - 1u;
+			}
 			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
 			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 			     i, indirect_num_dw, indirect_address, cmd_offset, value);
@@ -2149,6 +2164,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (indirect_buffer == nullptr) {
+		if (cp.AbandonPrefetchOnInvalidData()) {
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
@@ -2168,6 +2186,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			continue;
 		}
 		if (cmd_offset >= Pm4::UC_NUM) {
+			if (cp.AbandonPrefetchOnInvalidData()) {
+				return KYTY_PM4_LEN(cmd_id) - 1u;
+			}
 			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 			     "), value = 0x%08" PRIx32 "\n",
 			     cmd_offset, raw_cmd_offset, value);
@@ -2176,6 +2197,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
+			if (cp.AbandonPrefetchOnInvalidData()) {
+				return KYTY_PM4_LEN(cmd_id) - 1u;
+			}
 			auto* dump_regs = indirect_buffer - i * 2;
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",

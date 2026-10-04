@@ -1204,6 +1204,10 @@ struct Head {
 	uint64_t steals          = 0;
 	uint64_t after_stop      = 0;
 	uint64_t after_stop_ns   = 0;
+	// KYTY_CP_SEQ_PREFETCH (P3c): speculative slots published, adopted and skipped.
+	uint64_t prefetch_published = 0;
+	uint64_t prefetch_adopted   = 0;
+	uint64_t prefetch_skipped   = 0;
 };
 
 Head ReadHead() {
@@ -1215,7 +1219,10 @@ Head ReadHead() {
 	        g_totals.head_wait_ns.load(std::memory_order_relaxed),
 	        g_totals.head_steals.load(std::memory_order_relaxed),
 	        g_totals.head_waits_after_stop.load(std::memory_order_relaxed),
-	        g_totals.head_wait_after_stop_ns.load(std::memory_order_relaxed)};
+	        g_totals.head_wait_after_stop_ns.load(std::memory_order_relaxed),
+	        g_totals.prefetch_published.load(std::memory_order_relaxed),
+	        g_totals.prefetch_adopted.load(std::memory_order_relaxed),
+	        g_totals.prefetch_skipped.load(std::memory_order_relaxed)};
 }
 
 void PrintDrawPrepSummary() {
@@ -1269,7 +1276,17 @@ void PrintDrawPrepSummary() {
 	              head.after_stop - last_head.after_stop,
 	              static_cast<double>(head.after_stop_ns - last_head.after_stop_ns) * 1e-6,
 	              head.steals - last_head.steals);
-	Log::WriteToConsoleAndLog(line);
+	std::string text = line;
+	if (head.prefetch_published != last_head.prefetch_published) {
+		// The line ends with the newline above: the prefetch counters go before it.
+		text.pop_back();
+		text += " prefetch published=" +
+		        std::to_string(head.prefetch_published - last_head.prefetch_published) +
+		        " adopted=" + std::to_string(head.prefetch_adopted - last_head.prefetch_adopted) +
+		        " skipped=" + std::to_string(head.prefetch_skipped - last_head.prefetch_skipped) +
+		        "\n";
+	}
+	Log::WriteToConsoleAndLog(text);
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;

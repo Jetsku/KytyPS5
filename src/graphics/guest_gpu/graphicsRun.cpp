@@ -4902,6 +4902,14 @@ bool CommandProcessor::AdoptSpeculativeDraw(Op& op) {
 	return false;
 }
 
+bool CommandProcessor::AbandonPrefetchOnInvalidData() {
+	if (m_front_mode != FrontMode::Prefetch) {
+		return false;
+	}
+	StopPrefetch(Profiler::FrameEvent::CpSeqPrefetchStopRead);
+	return true;
+}
+
 void CommandProcessor::StopPrefetch(Profiler::FrameEvent reason) {
 	if (!m_prefetch_stop) {
 		m_prefetch_stop = true;

@@ -1,5 +1,7 @@
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 
+#include "common/liveSwitch.h"
+
 #include <cstdlib>
 #include <cstring>
 #include <xxhash.h>
@@ -49,22 +51,39 @@ bool PacketHashing() {
 	return enabled;
 }
 
-int PrefetchMode() {
-	static const int mode = [] {
-		const auto* value = EnvValue("KYTY_CP_SEQ_PREFETCH");
-		if (value == nullptr || std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0) {
-			return 0;
-		}
-		if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0) {
-			return 1;
-		}
-		if (std::strcmp(value, "mismatch") == 0) {
-			return 2;
-		}
-		EXIT("KYTY_CP_SEQ_PREFETCH must be 0, 1 or mismatch (got '%s')\n", value);
+namespace {
+
+// KYTY_CP_SEQ_PREFETCH: a live switch (common/liveSwitch.h), read at every self-label wait and
+// adoption. -1: a value that is not 0, 1 or mismatch (an exit at startup, off when set live).
+int64_t ParsePrefetchMode(const char* value) {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0 ||
+	    std::strcmp(value, "off") == 0) {
 		return 0;
+	}
+	if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0) {
+		return 1;
+	}
+	if (std::strcmp(value, "mismatch") == 0) {
+		return 2;
+	}
+	return -1;
+}
+
+Live::Switch g_prefetch_mode("KYTY_CP_SEQ_PREFETCH", ParsePrefetchMode);
+
+} // namespace
+
+int PrefetchMode() {
+	static const bool checked = [] {
+		if (g_prefetch_mode.Get() < 0) {
+			EXIT("KYTY_CP_SEQ_PREFETCH must be 0, 1 or mismatch (got '%s')\n",
+			     EnvValue("KYTY_CP_SEQ_PREFETCH"));
+		}
+		return true;
 	}();
-	return mode;
+	(void)checked;
+	const auto mode = g_prefetch_mode.Get();
+	return mode > 0 ? static_cast<int>(mode) : 0;
 }
 
 uint32_t PrefetchDraws() {

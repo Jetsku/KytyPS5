@@ -234,6 +234,12 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 	[[nodiscard]] FrontMode GetFrontMode() const noexcept { return m_front_mode; }
+	// KYTY_CP_SEQ_PREFETCH (P3c): the prefetch front parses ahead of a wait and may read register
+	// pairs the guest has not written yet (the hardware reads them after the wait). Invalid data
+	// there stops its speculative parse instead of exiting: the real parse reads the final bytes,
+	// and the slots published so far are adopted or skipped by their keys as usual. False (the
+	// caller exits as before) on every other front.
+	bool AbandonPrefetchOnInvalidData();
 	// A reference front (KYTY_CP_SEQ_VERIFY) and a speculative one (KYTY_CP_SEQ_PREFETCH) only
 	// parse: packet handlers skip their counters and diagnostics for them.
 	[[nodiscard]] bool IsReferenceFront() const noexcept {
