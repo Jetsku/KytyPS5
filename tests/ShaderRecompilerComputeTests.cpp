@@ -49935,7 +49935,8 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-range-memo-only") == 0) {
-    VulkanHarness vulkan;
+    // No feedback-loop dynamic state needed: runs on devices without it.
+    VulkanHarness vulkan(false);
     vulkan.CheckBufferRangeMemo();
     return 0;
   }
@@ -49951,17 +49952,20 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-epoch-only") == 0) {
-    VulkanHarness vulkan;
+    // No feedback-loop dynamic state needed: runs on devices without it.
+    VulkanHarness vulkan(false);
     vulkan.CheckBdaSyncEpoch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-sync-per-submission-only") == 0) {
-    VulkanHarness vulkan;
+    // No feedback-loop dynamic state needed: runs on devices without it.
+    VulkanHarness vulkan(false);
     vulkan.CheckBdaSyncPerSubmission();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--binding-epoch-memo-only") == 0) {
-    VulkanHarness vulkan;
+    // No feedback-loop dynamic state needed: runs on devices without it.
+    VulkanHarness vulkan(false);
     vulkan.CheckBindingEpochMemo();
     return 0;
   }
