@@ -1,13 +1,13 @@
-#include "graphics/host_gpu/vulkanCommon.h"
-
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
-#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -134,6 +134,9 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 }
 
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool queue_locked) {
+	HangWatchdog::Scope diagnostics(
+	    "device-loss-diagnostics",
+	    reinterpret_cast<uint64_t>(static_cast<VkDevice>(graphics.device)), tick);
 	if (g_dumping.test_and_set(std::memory_order_acquire)) return;
 	std::printf("--- Device loss: submission/wait tick=%" PRIu64 ", KYTY_DEVICE_FAULT_DIAGNOSTICS=%d ---\n",
 	            tick, DeviceFaultDiagnosticsEnabled());

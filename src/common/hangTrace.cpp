@@ -1,6 +1,7 @@
 #include "common/hangTrace.h"
 
 #include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 
 #include <algorithm>
 #include <array>
@@ -409,6 +410,16 @@ constexpr const char*    kPipelineOriginNames[] = {"", "new", "permutation", "va
 std::mutex               g_compile_mutex;
 std::vector<std::string> g_pending_compile_rows;
 uint64_t                 g_compile_rows_total = 0;
+std::vector<std::string> g_pending_frame_rows; // guarded by g_compile_mutex
+uint64_t                 g_frame_rows_total = 0;
+uint64_t                 g_previous_flip_ns = 0;
+bool FrameTimesEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_HANG_TRACE_FRAME_TIMES");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 struct MemoryCounterColumn {
 	const char* name;
@@ -474,6 +485,7 @@ struct Files {
 	std::FILE* lodreports    = nullptr;
 	std::FILE* transfers     = nullptr;
 	std::FILE* compiles      = nullptr;
+	std::FILE* frames        = nullptr;
 	std::FILE* cp            = nullptr;
 	std::FILE* unclean       = nullptr;
 	std::FILE* timestamps    = nullptr;
@@ -851,6 +863,11 @@ void Publish() {
 		rows.swap(g_pending_compile_rows);
 	}
 	WriteRows(g_files.compiles, rows);
+	{
+		std::scoped_lock lock(g_compile_mutex);
+		rows.swap(g_pending_frame_rows);
+	}
+	WriteRows(g_files.frames, rows);
 
 	if (g_files.tex != nullptr) {
 		for (uint32_t id = 0; id < 256; id++) {
@@ -1016,7 +1033,7 @@ void Publish() {
 
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
 	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
-	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles,
+	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles, g_files.frames,
 	                  g_files.unclean, g_files.timestamps, g_files.placement}) {
 		if (file != nullptr) {
 			std::fflush(file);
@@ -1154,6 +1171,7 @@ void Initialize() {
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
 	                            "validate_us,module_us,pipeline_us,total_us,spirv_words,host_tid,"
 	                            "detail,clone_us,load_us");
+	if (FrameTimesEnabled()) g_files.frames = OpenFile("frames.csv", "t_us,interval_us");
 	g_files.transfers = OpenFile("transfers.csv",
 	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
 	                             "span_bytes");
@@ -1252,7 +1270,7 @@ void Shutdown() {
 	for (auto** file: {&g_files.summary, &g_files.apr, &g_files.imports, &g_files.imports_index,
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
 	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
-	                   &g_files.transfers, &g_files.compiles, &g_files.unclean,
+	                   &g_files.transfers, &g_files.compiles, &g_files.frames, &g_files.unclean,
 	                   &g_files.timestamps, &g_files.placement}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
@@ -1262,6 +1280,7 @@ void Shutdown() {
 }
 
 void RegisterGuestCode(uint64_t base, uint64_t size, std::string_view name) {
+	HangWatchdog::RegisterGuestCode(base, size, name);
 	if (!Enabled() || size == 0) {
 		return;
 	}
@@ -1867,12 +1886,23 @@ void RecordDoneWait(uint64_t wait_ns) {
 }
 
 void RecordFlip() {
+	HangWatchdog::NoteFlip();
 	if (!Enabled()) {
 		return;
 	}
 	g_totals.flips.fetch_add(1, std::memory_order_relaxed);
 	UpdateMax(g_totals.apr_shrink_max_per_flip,
 	          g_totals.apr_shrinks_since_flip.exchange(0, std::memory_order_relaxed));
+	if (FrameTimesEnabled()) {
+		std::scoped_lock lock(g_compile_mutex);
+		const auto now = NowNs();
+		if (g_previous_flip_ns != 0 && g_frame_rows_total < kCompileRowLimit) {
+			g_pending_frame_rows.push_back(fmt::format("{},{}", now / 1000u,
+			    (now - g_previous_flip_ns) / 1000u));
+			++g_frame_rows_total;
+		}
+		g_previous_flip_ns = now;
+	}
 }
 
 void RecordGpuFrame(const GpuFrame& frame) {

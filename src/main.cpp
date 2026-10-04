@@ -11,6 +11,8 @@
 
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -481,6 +483,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 	if (options.config.gpu_assisted_validation_enabled) {
 		options.config.vulkan_validation_enabled = true;
+	}
+
+	// KYTY_AMD_CPU=1|0 forces the launcher's "AMD CPU patch" (--amd-cpu: guest VRSQRTPS emulated
+	// with an accurate 1/sqrt) on or off, for presets and test harnesses.
+	if (const char* amd_cpu = std::getenv("KYTY_AMD_CPU"); amd_cpu != nullptr && amd_cpu[0] != '\0') {
+		options.config.amd_cpu_enabled = std::strcmp(amd_cpu, "0") != 0;
 	}
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());

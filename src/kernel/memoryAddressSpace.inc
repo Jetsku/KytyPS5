@@ -66,6 +66,7 @@ public:
 		None,
 		BackingUnavailable,
 		PhysicalRangeOutOfBounds,
+		BackingCommitFailed,
 		FixedMapViewFailed,
 		PlaceholderMapFailed,
 		ProtectFailed,
@@ -75,8 +76,13 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const auto* lazy = std::getenv("KYTY_GUEST_BACKING_LAZY_COMMIT");
+		m_lazy_commit = lazy != nullptr && std::strcmp(lazy, "1") == 0;
+		const auto* lazy_zero = std::getenv("KYTY_GUEST_BACKING_LAZY_ZERO");
+		m_lazy_zero = m_lazy_commit && lazy_zero != nullptr && std::strcmp(lazy_zero, "1") == 0;
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr,
+		    PAGE_EXECUTE_READWRITE | (m_lazy_commit ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -93,6 +99,7 @@ public:
 			CloseHandle(m_handle);
 			m_handle = nullptr;
 		}
+		Common::RamStats::Range("guest shared backing capacity", m_backing_base, m_size);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
 		{
@@ -166,6 +173,7 @@ public:
 			case FailureReason::None: return "n/a";
 			case FailureReason::BackingUnavailable: return "backing-unavailable";
 			case FailureReason::PhysicalRangeOutOfBounds: return "physical-range-out-of-bounds";
+			case FailureReason::BackingCommitFailed: return "backing-commit-failed";
 			case FailureReason::FixedMapViewFailed: return "fixed-map-view-failed";
 			case FailureReason::PlaceholderMapFailed: return "placeholder-map-failed";
 			case FailureReason::ProtectFailed: return "protect-failed";
@@ -306,6 +314,36 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_lazy_zero) {
+			// Uncommitted section pages have never held guest data and Windows supplies zeros
+			// on first access. Commit them without materializing every page with memset. Pages
+			// committed by an earlier allocation are always cleared, including freed flexible
+			// memory reused by a different guest mapping. Never discard direct-memory contents.
+			const auto end = backing_offset + size;
+			while (backing_offset < end) {
+				MEMORY_BASIC_INFORMATION info {};
+				auto* current = m_backing_base + backing_offset;
+				if (VirtualQuery(current, &info, sizeof(info)) != sizeof(info)) {
+					return false;
+				}
+				const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+				const auto bytes = std::min(end - backing_offset,
+				                            region_end - reinterpret_cast<uint64_t>(current));
+				if (bytes == 0) return false;
+				if (info.State == MEM_RESERVE) {
+					if (!EnsureCommitted(backing_offset, bytes)) return false;
+				} else if (info.State == MEM_COMMIT) {
+					std::memset(current, 0, bytes);
+				} else {
+					return false;
+				}
+				backing_offset += bytes;
+			}
+			return true;
+		}
+#endif
+		if (!EnsureCommitted(backing_offset, size)) return false;
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -516,6 +554,14 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Commit through the writable host alias before publishing a guest view. Recommitting
+		// pages preserves their bytes, including direct-memory contents after an unmap/remap.
+		// SEC_RESERVE section pages cannot be decommitted: this saves unused physical offsets,
+		// while retaining the same process-lifetime backing and alias semantics as SEC_COMMIT.
+		if (!EnsureCommitted(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingCommitFailed);
+			return false;
+		}
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -919,6 +965,16 @@ private:
 		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;
 	}
 
+	bool EnsureCommitted(uint64_t backing_offset, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return !m_lazy_commit ||
+		       VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE) !=
+		           nullptr;
+#else
+		return true;
+#endif
+	}
+
 	static void SetFailure(FailureReason* out, FailureReason reason) {
 		if (out != nullptr) {
 			*out = reason;
@@ -981,6 +1037,8 @@ private:
 	}
 
 	HANDLE m_handle = nullptr;
+	bool m_lazy_commit = false;
+	bool m_lazy_zero = false;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 
@@ -1156,6 +1214,12 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		// KYTY_UFFD_WP (common/platform/uffdWriteWatch.h): write-watching without mprotect.
+		if (Common::UffdWriteWatch::Enabled()) {
+			return ProtectTrackedUnlocked(vaddr, size, mode);
+		}
+#endif
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1337,11 +1401,17 @@ public:
 
 private:
 	enum class MappingType { Backing, Private };
+	// KYTY_UFFD_WP: whether a mapping's tracking protection uses userfaultfd write-protection.
+	// Unknown until its first tracking call, which registers it; Unsupported: its kind cannot be
+	// tracked that way (mprotect only); Failed: registered, but an ioctl failed later, so mprotect
+	// is authoritative and write-protect bits are only ever cleared (never set) from then on.
+	enum class UffdState : uint8_t { Unknown, Registered, Unsupported, Failed };
 
 	struct MappedRegion {
 		uint64_t    vaddr = 0;
 		uint64_t    size  = 0;
 		MappingType type  = MappingType::Private;
+		UffdState   uffd  = UffdState::Unknown;
 	};
 
 	static constexpr uint64_t PageSize() { return 0x4000; }
@@ -1423,7 +1493,8 @@ private:
 		return true;
 	}
 
-	bool AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
+	bool AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type,
+	                       UffdState uffd = UffdState::Unknown) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -1438,7 +1509,7 @@ private:
 				return false;
 			}
 		}
-		return m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type}).second;
+		return m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type, uffd}).second;
 	}
 
 	bool RemoveMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
@@ -1452,18 +1523,177 @@ private:
 			const auto original = it->second;
 			const auto part_end = std::min(end, original.vaddr + original.size);
 			m_mapped.erase(it);
+			// The remaining parts keep their VMAs, so their userfaultfd state too.
 			if (original.vaddr < current) {
 				const auto left_size = current - original.vaddr;
-				EXIT_IF(!AddMappedUnlocked(original.vaddr, left_size, original.type));
+				EXIT_IF(!AddMappedUnlocked(original.vaddr, left_size, original.type, original.uffd));
 			}
 			if (part_end < original.vaddr + original.size) {
 				const auto right_size = original.vaddr + original.size - part_end;
-				EXIT_IF(!AddMappedUnlocked(part_end, right_size, original.type));
+				EXIT_IF(!AddMappedUnlocked(part_end, right_size, original.type, original.uffd));
 			}
 			current = part_end;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		// The range is unmapped or replaced: a new mapping there starts without no-access pages.
+		SetNoAccessUnlocked(vaddr, size, false);
+#endif
 		return true;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// KYTY_UFFD_WP (common/platform/uffdWriteWatch.h). Tracking protection of a registered mapping:
+	//  - read-write: write-protect bits cleared, and an mprotect back to read-write where a page is
+	//    no-access;
+	//  - read-only: write-protect bits set FIRST, then an mprotect to read-write where a page was
+	//    no-access (never a moment writable without a fault);
+	//  - no-access: mprotect (userfaultfd has no read protection); the bits stay as they are.
+	// So the mmap protection of a registered mapping is only ever read-write or no-access, and
+	// write tracking (read-only <-> read-write, ~all the traffic) changes no VMA and takes the mmap
+	// lock only for reading. m_no_access_pages: the 4 KiB pages this left no-access. A mapping
+	// whose kind cannot be write-protected, or whose ioctl fails, uses mprotect as before (a failed
+	// one also clears write-protect bits when it makes pages writable).
+	bool ProtectTrackedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		const auto end = vaddr + size;
+		auto       it  = m_mapped.upper_bound(vaddr);
+		if (it != m_mapped.begin()) {
+			--it;
+		}
+		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+			auto&      region      = it->second;
+			const auto range_start = std::max(vaddr, region.vaddr);
+			const auto range_end   = std::min(end, region.vaddr + region.size);
+			if (range_start < range_end &&
+			    !ProtectTrackedPieceUnlocked(region, range_start, range_end - range_start, mode)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ProtectTrackedPieceUnlocked(MappedRegion& region, uint64_t start, uint64_t bytes,
+	                                 VirtualMemory::Mode mode) {
+		using Mode = VirtualMemory::Mode;
+		if (region.uffd == UffdState::Unknown) {
+			const auto& support = Common::UffdWriteWatch::Get();
+			const bool  kind_ok = region.type == MappingType::Backing ? support.shared : support.private_anon;
+			region.uffd = kind_ok && Common::UffdWriteWatch::Register(region.vaddr, region.size)
+			                  ? UffdState::Registered
+			                  : UffdState::Unsupported;
+		}
+		const bool writable = mode == Mode::ReadWrite || mode == Mode::Write ||
+		                      mode == Mode::ExecuteReadWrite || mode == Mode::ExecuteWrite;
+		if (region.uffd == UffdState::Registered && (mode == Mode::Read || mode == Mode::ReadWrite)) {
+			if (WriteProtectUnlocked(start, bytes, mode == Mode::Read)) {
+				if (AnyNoAccessUnlocked(start, bytes)) {
+					if (!VirtualMemory::Protect(start, bytes, Mode::ReadWrite)) {
+						return false;
+					}
+					SetNoAccessUnlocked(start, bytes, false);
+				}
+				return true;
+			}
+			// From now on mprotect decides for this mapping (its pages may still hold write-protect
+			// bits, which only ever get cleared below).
+			region.uffd = UffdState::Failed;
+		}
+		if (!VirtualMemory::Protect(start, bytes, mode)) {
+			return false;
+		}
+		if (region.uffd == UffdState::Registered || region.uffd == UffdState::Failed) {
+			if (writable) {
+				(void)Common::UffdWriteWatch::WriteProtect(start, bytes, false);
+			}
+			SetNoAccessUnlocked(start, bytes,
+			                    region.uffd == UffdState::Registered && mode == Mode::NoAccess);
+		}
+		return true;
+	}
+
+	// One UFFDIO_WRITEPROTECT over the range; Linux before 6.5 takes one VMA per call, and the
+	// no-access runs are where mprotect split the mapping's VMA, so on a failure it tries again
+	// once per run of pages with the same no-access state.
+	bool WriteProtectUnlocked(uint64_t start, uint64_t bytes, bool protect) {
+		const bool quiet = !m_no_access_pages.empty() && bytes > NoAccessPageBytes;
+		if (Common::UffdWriteWatch::WriteProtect(start, bytes, protect, quiet)) {
+			return true;
+		}
+		if (!quiet) {
+			return false;
+		}
+		const auto end       = start + bytes;
+		auto       run_start = start;
+		bool       run_state = AnyNoAccessUnlocked(start, NoAccessPageBytes);
+		for (auto page = start + NoAccessPageBytes; page <= end; page += NoAccessPageBytes) {
+			const bool at_end = page >= end;
+			const bool state  = !at_end && AnyNoAccessUnlocked(page, NoAccessPageBytes);
+			if (at_end || state != run_state) {
+				if (!Common::UffdWriteWatch::WriteProtect(run_start, std::min(page, end) - run_start, protect)) {
+					return false;
+				}
+				run_start = page;
+				run_state = state;
+			}
+		}
+		return true;
+	}
+
+	static constexpr uint64_t NoAccessChunkBytes = 4ull << 20u;
+	static constexpr uint64_t NoAccessPageBytes  = 4096;
+
+	template <typename Visit>
+	void ForEachNoAccessChunk(uint64_t start, uint64_t bytes, Visit&& visit) {
+		const auto first = start / NoAccessPageBytes;
+		const auto last  = (start + bytes + NoAccessPageBytes - 1) / NoAccessPageBytes;
+		constexpr auto per_chunk = NoAccessChunkBytes / NoAccessPageBytes;
+		for (auto page = first; page < last;) {
+			const auto chunk = page / per_chunk;
+			const auto stop  = std::min(last, (chunk + 1) * per_chunk);
+			visit(chunk, static_cast<size_t>(page - chunk * per_chunk), static_cast<size_t>(stop - chunk * per_chunk));
+			page = stop;
+		}
+	}
+
+	[[nodiscard]] bool AnyNoAccessUnlocked(uint64_t start, uint64_t bytes) {
+		if (m_no_access_pages.empty()) {
+			return false;
+		}
+		bool any = false;
+		ForEachNoAccessChunk(start, bytes, [&](uint64_t chunk, size_t first, size_t last) {
+			const auto it = m_no_access_pages.find(chunk);
+			if (any || it == m_no_access_pages.end()) {
+				return;
+			}
+			for (auto page = first; page < last && !any; page++) {
+				any = it->second.test(page);
+			}
+		});
+		return any;
+	}
+
+	void SetNoAccessUnlocked(uint64_t start, uint64_t bytes, bool value) {
+		if (!value && m_no_access_pages.empty()) {
+			return;
+		}
+		ForEachNoAccessChunk(start, bytes, [&](uint64_t chunk, size_t first, size_t last) {
+			auto it = m_no_access_pages.find(chunk);
+			if (it == m_no_access_pages.end()) {
+				if (!value) {
+					return;
+				}
+				it = m_no_access_pages.emplace(chunk, std::bitset<NoAccessChunkBytes / NoAccessPageBytes> {}).first;
+			}
+			for (auto page = first; page < last; page++) {
+				it->second.set(page, value);
+			}
+			if (!value && it->second.none()) {
+				m_no_access_pages.erase(it);
+			}
+		});
+	}
+
+	std::unordered_map<uint64_t, std::bitset<NoAccessChunkBytes / NoAccessPageBytes>> m_no_access_pages;
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static DWORD GetProtect(VirtualMemory::Mode mode) {

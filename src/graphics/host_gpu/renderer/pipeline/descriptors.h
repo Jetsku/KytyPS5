@@ -78,6 +78,7 @@ struct PreparedBindings {
 	// RebindBuffers: flattened_srt or shader_data_buffer was allocated for this binding (not a
 	// reused upload of the same recording), so no earlier descriptor set refers to it.
 	bool                                  fresh_upload = false;
+	uint64_t                              write_preparation_tick = UINT64_MAX;
 	// KYTY_DRAW_PREP_BINDINGS: the committed draw's plan for this stage (set by PrepareBindings,
 	// null for dispatches and draws without a plan), and whether shader_data is the plan's
 	// (user dwords and mip-statistics fields filled in, memory offsets zero).

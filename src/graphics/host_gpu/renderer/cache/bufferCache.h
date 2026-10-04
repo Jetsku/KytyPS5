@@ -114,6 +114,10 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainWrittenBuffer(uint64_t vaddr, uint64_t size,
 	                                                               std::span<const GuestRange> written,
 	                                                               BufferId id = {});
+	[[nodiscard]] static bool ShaderWriteRetickEnabled();
+	// Binding preparation may submit before its draw/dispatch is recorded. Retain that
+	// command's final producer tick without expanding its GPU-dirty or protected ranges.
+	void RetagShaderWrite(uint64_t vaddr, uint64_t size, uint64_t preparation_tick);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -207,6 +211,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainImageStagingBuffer(uint64_t size);
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
@@ -834,6 +839,8 @@ private:
 		uint64_t verify_mismatch_pages = 0;
 	};
 	BdaLogTotals                                      m_bda_log_totals;
+	// Upload bytes of the last dirty-log pass (FaultCost::NoteBdaPass, the live cost log).
+	uint64_t                                          m_bda_last_pass_bytes = 0;
 	// KYTY_BDA_SYNC_EPOCH (SynchronizeBdaBuffers): the sync, BDA structure and fault epochs taken
 	// before the last completed pass (GPU thread; 0: none yet), and the outcomes (tests read them).
 	bool     m_bda_epoch_skip        = false;

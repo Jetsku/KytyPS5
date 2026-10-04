@@ -2,13 +2,14 @@
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <cstdlib>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdlib>
 #include <mutex>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
@@ -383,9 +384,23 @@ Mutex::~Mutex() {
 }
 
 void Mutex::Lock() {
+	// The uncontended path publishes no wait record. The slow path retains the resource even
+	// when EnterCriticalSection/the standard mutex never returns.
 #ifdef KYTY_WIN_CS
+	if (!HangWatchdog::Enabled()) {
+		EnterCriticalSection(&m_mutex->m_cs);
+		return;
+	}
+	if (TryEnterCriticalSection(&m_mutex->m_cs)) return;
+	HangWatchdog::Scope wait("host-mutex", reinterpret_cast<uint64_t>(this));
 	EnterCriticalSection(&m_mutex->m_cs);
 #else
+	if (!HangWatchdog::Enabled()) {
+		m_mutex->m_mutex.lock();
+		return;
+	}
+	if (m_mutex->m_mutex.try_lock()) return;
+	HangWatchdog::Scope wait("host-mutex", reinterpret_cast<uint64_t>(this));
 	m_mutex->m_mutex.lock();
 #endif
 }
@@ -413,6 +428,8 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
+	HangWatchdog::Scope wait("host-condvar", reinterpret_cast<uint64_t>(this),
+	                         reinterpret_cast<uint64_t>(mutex));
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -460,6 +477,8 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 }
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
+	HangWatchdog::Scope wait("host-condvar-timed", reinterpret_cast<uint64_t>(this), micros, 0, 0,
+	                         reinterpret_cast<uint64_t>(mutex));
 	bool ok = false;
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());

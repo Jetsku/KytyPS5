@@ -50,6 +50,7 @@ namespace DrawPrep {
 
 struct RegisterSnapshot;
 struct PreparedDraw;
+struct BindingPlanContext;
 
 enum class BindingPart : uint32_t {
 	Pipeline = 1u << 0u,
@@ -66,6 +67,8 @@ inline constexpr uint32_t AllBindingParts = (1u << 9u) - 1u;
 
 // 0: off.
 [[nodiscard]] uint32_t BindingParts();
+void PrefetchBindingPipeline(const BindingPlanContext& context, const RegisterSnapshot& registers,
+                             const DrawIndexArgs* index_args, const PreparedDraw& prepared);
 [[nodiscard]] inline bool BindingPartEnabled(uint32_t parts, BindingPart part) {
 	return (parts & static_cast<uint32_t>(part)) != 0;
 }

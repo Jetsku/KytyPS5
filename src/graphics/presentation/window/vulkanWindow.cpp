@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -573,12 +574,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext    = &supported_maintenance8;
 	}
+	const auto advertised_extensions = physical_device.enumerateDeviceExtensionProperties();
+	RequireVulkanSuccess(advertised_extensions.result, "vkEnumerateDeviceExtensionProperties");
 	const bool pipeline_library_extension =
-	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	    HasExtension(advertised_extensions.value, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT supported_pipeline_library {};
 	if (pipeline_library_extension) {
 		supported_pipeline_library.pNext = supported_features2.pNext;
 		supported_features2.pNext        = &supported_pipeline_library;
+	}
+	vk::PhysicalDeviceShaderObjectFeaturesEXT supported_shader_object {};
+	if (HasExtension(advertised_extensions.value, VK_EXT_SHADER_OBJECT_EXTENSION_NAME)) {
+		supported_shader_object.pNext = supported_features2.pNext;
+		supported_features2.pNext = &supported_shader_object;
 	}
 	// Native 64-bit LDS atomics use typed views of shared memory (upstream 6799ecbc5).
 	const bool workgroup_layout_extension =
@@ -644,22 +652,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan maintenance8 (depth/color image copies): %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	// Graphics pipeline libraries need fast linking: without it a link is a full compile.
+	bool library_fast_linking = false;
 	if (pipeline_library_extension &&
 	    supported_pipeline_library.graphicsPipelineLibrary == VK_TRUE) {
 		vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT library_properties {};
 		vk::PhysicalDeviceProperties2                          properties {};
 		properties.pNext = &library_properties;
 		physical_device.getProperties2(&properties);
-		graphics.pipeline_library_enabled =
-		    library_properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+		library_fast_linking = library_properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
 	}
+	graphics.pipeline_library_enabled = library_fast_linking &&
+	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 	// Only used by the library path's driver-cache probe; the default device stays unchanged.
 	graphics.pipeline_creation_cache_control_enabled =
 	    graphics.pipeline_library_enabled &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
-	LOGF("Vulkan graphics pipeline library: %s, pipeline creation cache control: %s\n",
+	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
+	     pipeline_library_extension ? "true" : "false",
+	     supported_pipeline_library.graphicsPipelineLibrary ? "true" : "false",
+	     library_fast_linking ? "true" : "false",
+	     supported_features13.pipelineCreationCacheControl ? "true" : "false");
+	LOGF("Vulkan graphics pipeline library enabled: %s, pipeline creation cache control enabled: %s\n",
 	     graphics.pipeline_library_enabled ? "true" : "false",
 	     graphics.pipeline_creation_cache_control_enabled ? "true" : "false");
+	LOGF("Vulkan shader object support: %s (renderer uses pipelines)\n",
+	     supported_shader_object.shaderObject ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 	// Optional: native indirect draws fall back to CPU-read arguments without these.
 	graphics.draw_indirect_first_instance_enabled =
@@ -1437,6 +1454,17 @@ void WindowContext::CreateVulkan() {
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
+	switch (HangWatchdog::ResolveAutoForDevice(device_properties.vendorID, device_properties.deviceID,
+	                                           device_properties.deviceName.data())) {
+		case HangWatchdog::AutoResult::On:
+			LOGF("Kyty hang watchdog: on for this RTX 50 GPU (KYTY_HANG_WATCHDOG=auto); if the picture stops "
+			     "for 5 s it writes _HangTrace\\watchdog-*\\watchdog.txt\n");
+			break;
+		case HangWatchdog::AutoResult::Off:
+			LOGF("Kyty hang watchdog: off, not an RTX 50 GPU (KYTY_HANG_WATCHDOG=auto)\n");
+			break;
+		case HangWatchdog::AutoResult::NotAuto: break;
+	}
 
 	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
 	    .format = vk::Format::eBc1RgbaUnormBlock,

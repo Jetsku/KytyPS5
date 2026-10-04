@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
 
 #include "common/assert.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -138,7 +139,7 @@ void Sequencer::NoteHandoffDone(uint64_t submission) {
 
 bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewake_at) {
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::CpSeqSequencerWait);
-	auto start = NowNs();
+	auto                      start = NowNs();
 	for (uint32_t spins = 0;; spins++) {
 		if (ready()) {
 			return true;
@@ -156,6 +157,8 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 		const auto observed = m_progress.load(std::memory_order_seq_cst);
 		m_parked.fetch_add(1, std::memory_order_seq_cst);
 		if (!ready() && !Stopping()) {
+			HangWatchdog::Scope wait("sequencer-progress", reinterpret_cast<uint64_t>(this),
+			                         wake_at, observed, 0, rewake_at);
 			m_progress.wait(observed, std::memory_order_seq_cst);
 		}
 		m_parked.fetch_sub(1, std::memory_order_seq_cst);
@@ -167,6 +170,8 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 }
 
 uint64_t Sequencer::AwaitAnswer(uint64_t op_sequence) {
+	HangWatchdog::Scope wait("sequencer-answer", reinterpret_cast<uint64_t>(this), op_sequence + 1,
+	                         HangWatchdog::Enabled() ? m_answered.load() : 0);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqBarriers);
 	// Pre-wake: a parked sequencer is woken this many ops before the lockstep op, so it spins
 	// again when the answer comes (the resolver has nothing else to execute until then).
@@ -195,7 +200,8 @@ void Sequencer::Run() {
 	for (;;) {
 		Intake intake;
 		{
-			std::unique_lock lock(m_intake_mutex);
+			std::unique_lock    lock(m_intake_mutex);
+			HangWatchdog::Scope wait("sequencer-intake", reinterpret_cast<uint64_t>(this));
 			m_intake_ready.wait(lock, [this] { return m_stop || !m_intake.empty(); });
 			if (m_intake.empty()) {
 				return;
@@ -203,7 +209,10 @@ void Sequencer::Run() {
 			intake = m_intake.front();
 			m_intake.pop_front();
 		}
-		if (!m_processor.SequenceSubmission(intake)) {
+		HangWatchdog::SetCpContext(0, intake.sequence);
+		const bool running = m_processor.SequenceSubmission(intake);
+		HangWatchdog::SetCpContext(UINT32_MAX, 0);
+		if (!running) {
 			return; // stopping
 		}
 	}

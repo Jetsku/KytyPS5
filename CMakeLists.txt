@@ -452,7 +452,7 @@ endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
-set(gpu_dcc_shader_names validate clear occlusion)
+set(gpu_dcc_shader_names validate clear occlusion occlusion_batch)
 foreach(shader_name IN LISTS gpu_dcc_shader_names)
 	set(shader_source "${gpu_tiler_shader_dir}/gpu_dcc_${shader_name}.comp")
 	set(shader_spv "${gpu_dcc_generated_dir}/gpu_dcc_${shader_name}.spv")
@@ -632,6 +632,7 @@ target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/faultCost.cpp"
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
@@ -650,6 +651,13 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
+
+add_executable(hang_watchdog_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HangWatchdogTests.cpp")
+target_link_libraries(hang_watchdog_tests common)
+target_include_directories(hang_watchdog_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(hang_watchdog_tests Threads::Threads)
+endif()
 
 # Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
 add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
@@ -706,6 +714,17 @@ add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
 target_link_libraries(spirv_local_arrays_tests spirv-tools)
 target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
 
+add_executable(spirv_cache_salt_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SpirvCacheSaltTests.cpp")
+target_link_libraries(spirv_cache_salt_tests spirv-tools)
+target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
+target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
+
+add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
+target_link_libraries(shader_code_snapshot_tests xxhash)
+target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
+
 # KYTY_VRAM_GC_BUDGET: the budget-relative collection marks (graphics/host_gpu/vramBudget.h).
 add_executable(vram_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VramBudgetTests.cpp")
 target_include_directories(vram_budget_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -725,6 +744,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryTrackerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/faultCost.cpp"
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
@@ -893,6 +913,11 @@ add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AmprCounterBankTests.cpp"
 )
 target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(occlusion_reset_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionResetTests.cpp")
+target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
+target_link_libraries(occlusion_reset_tests common)
+add_test(NAME occlusion_reset COMMAND $<TARGET_FILE:occlusion_reset_tests>)
 
 # Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
 add_executable(binding_path_tests EXCLUDE_FROM_ALL
@@ -1092,6 +1117,10 @@ if(BUILD_TESTING)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
+	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
+	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
+	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
 	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
 	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
@@ -1112,6 +1141,22 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
+	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
+	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
+	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
+	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
+	add_test(NAME pipeline_prefetch_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_prefetch_rendering PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_PIPELINE_PREFETCH_THREADS=2;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=127"
+		TIMEOUT 180)
+	add_test(NAME pipeline_prefetch_programs COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_prefetch_programs PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_PIPELINE_PREFETCH_PROGRAMS=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=129"
+		TIMEOUT 180)
+	add_test(NAME pipeline_prefetch_draw_run COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)
+	set_tests_properties(pipeline_prefetch_draw_run PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_DRAW_RUN=exit;KYTY_PIPELINE_COLD_SALT=128"
+		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME bda_hot_ranges COMMAND $<TARGET_FILE:bda_hot_ranges_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -1148,6 +1193,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-exit-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	if(WIN32)
+		add_test(NAME virtual_memory_allocation_lazy_backing
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_lazy_backing PROPERTIES
+			ENVIRONMENT "KYTY_GUEST_BACKING_LAZY_COMMIT=1")
+		add_test(NAME virtual_memory_allocation_lazy_zero
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_lazy_zero PROPERTIES
+			ENVIRONMENT "KYTY_GUEST_BACKING_LAZY_COMMIT=1;KYTY_GUEST_BACKING_LAZY_ZERO=1")
+	endif()
 	# KYTY_CLAMP_RANGE_MEMO: verify mode and off.
 	add_test(NAME virtual_memory_allocation_clamp_memo_verify
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
@@ -1178,6 +1233,18 @@ if(BUILD_TESTING)
 	# SRT readiness over a render target the CPU overwrote (Crash 4, KYTY_DCC_GPU=1 EXIT).
 	add_test(NAME cpu_overwritten_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cpu-overwritten-image-only)
+	# KYTY_OCCLUSION_BATCH: the batch reduction shader against the per-dump reduction, and the
+	# scheduler's pre-submit hook it flushes from.
+	add_test(NAME occlusion_batch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --occlusion-batch-only)
+	add_test(NAME stream_buffer_ring_small_upload
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	set_tests_properties(stream_buffer_ring_small_upload PROPERTIES
+		ENVIRONMENT "KYTY_RAM_SMALL_UPLOAD_RING=1")
+	add_test(NAME stream_buffer_ring_small_upload_queued
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	set_tests_properties(stream_buffer_ring_small_upload_queued PROPERTIES
+		ENVIRONMENT "KYTY_RAM_SMALL_UPLOAD_RING=1;KYTY_SUBMISSION_MODE=queued;KYTY_SUBMISSION_COALESCE=1")
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state
@@ -1917,6 +1984,29 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
+	# A storage descriptor is prepared on tick N, an upload submits N, and its producer is
+	# recorded on N+1. The control deliberately observes the old value; the fix must observe
+	# the producer. Turning off side readback also removes the stale-value race.
+	foreach(mode IN ITEMS fixed control queued_fixed queued_control no_side no_gpu_side)
+		set(write_mode --late-storage-write-only)
+		set(write_env KYTY_SHADER_WRITE_RETICK=1 KYTY_READBACK_SIDE_GPU_THREAD=1)
+		if(mode MATCHES "control")
+			set(write_mode --late-storage-write-control)
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_GPU_THREAD=1)
+		elseif(mode STREQUAL "no_side")
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_COPY=0)
+		elseif(mode STREQUAL "no_gpu_side")
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_GPU_THREAD=0)
+		endif()
+		if(mode MATCHES "^queued_")
+			list(APPEND write_env KYTY_CP_RECORDER=1 KYTY_CP_RECORDER_VERIFY=1
+				KYTY_RECORDER_DESCRIPTOR_SETS=1 KYTY_SUBMISSION_MODE=queued)
+		endif()
+		add_test(NAME buffer_cache_late_storage_${mode}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${write_mode})
+		set_tests_properties(buffer_cache_late_storage_${mode} PROPERTIES
+			ENVIRONMENT "${write_env}")
+	endforeach()
 	# KYTY_ALIAS_BYTES: byte ownership across partially overlapping writes (default), with image
 	# writebacks on, and off (whole-image ownership: the checks' failures are only reported).
 	add_test(NAME texture_cache_alias_bytes
@@ -2118,6 +2208,7 @@ if(BUILD_TESTING)
 		emergency_save_tests
 		program_cache_emergency_tests
 		program_cache_preload_tests
+		hang_watchdog_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

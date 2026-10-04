@@ -173,10 +173,9 @@ bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
 	return complete;
 }
 
-std::pair<uint64_t, uint64_t> MemoryTracker::FaultWindow(uint64_t offset,
-                                                         uint64_t bytes) const noexcept {
+std::pair<uint64_t, uint64_t> MemoryTracker::FaultWindow(uint64_t offset, uint64_t bytes,
+                                                         uint64_t ahead) noexcept {
 	// Page indices as RegionManager::MarkWriteFault computes its window.
-	const uint64_t ahead = m_fault_policy.ahead_pages;
 	const uint64_t start = offset / TRACKER_PAGE_SIZE;
 	const uint64_t end   = (offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
 	if (ahead <= 1) {

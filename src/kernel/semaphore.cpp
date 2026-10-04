@@ -1,6 +1,7 @@
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -216,6 +217,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 		return Result::TimedOut;
 	}
 
+	HangWatchdog::Scope wait("guest-semaphore", reinterpret_cast<uint64_t>(this), need_count,
+	                         m_count, 0, micros);
 	WaitingThread waiter {};
 	waiter.id         = id;
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
@@ -408,6 +411,8 @@ public:
 		timer.Start();
 
 		while (m_count <= 0) {
+			HangWatchdog::Scope wait("guest-posix-semaphore", reinterpret_cast<uint64_t>(m_guest),
+			                         1, m_count);
 			if (timed_wait && elapsed >= *micros) {
 				SyncGuest();
 				return POSIX_ETIMEDOUT;

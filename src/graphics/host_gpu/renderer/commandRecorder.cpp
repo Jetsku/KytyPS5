@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -10,6 +11,7 @@
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/watchdogSubmit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -335,6 +337,12 @@ struct CommandRecorder::NativeExecutor {
 			{
 				Common::LockGuard         lock(graphics.queue_mutex);
 				Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::DriverSubmit);
+				HangWatchdog::Scope       submit(
+				    "vkQueueSubmit-recorder",
+				    reinterpret_cast<uint64_t>(static_cast<VkQueue>(graphics.queue)), p.tick, 0, 0,
+				    p.debug_submit);
+				HangWatchdog::DebugDelay("submit", p.tick);
+				NoteWatchdogSubmit(graphics.queue, submit_info, p.tick);
 				result = graphics.queue.submit(1, &submit_info, nullptr);
 			}
 			if (result == vk::Result::eErrorDeviceLost) DumpDeviceLossDiagnostics(graphics, p.tick);
@@ -621,6 +629,9 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 }
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
+	HangWatchdog::Scope wait("recorder-drain", reinterpret_cast<uint64_t>(this),
+	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,
+	                         HangWatchdog::Enabled() ? m_ring.Consumed() : 0);
 	const auto start = NowNs();
 	// Idle: the recorder released everything encoded (published or not), so it executed every
 	// packet and records nothing until the next one. The window opens without a marker and
@@ -660,6 +671,8 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 		return;
 	}
 	EXIT_IF(m_mode != Mode::Thread);
+	HangWatchdog::Scope wait("recorder-recorded-tick", reinterpret_cast<uint64_t>(this), tick,
+	                         HangWatchdog::Enabled() ? m_recorded_tick.load() : 0);
 	if (from_producer) {
 		m_ring.Kick(m_encoder.Stats());
 	}
@@ -669,6 +682,7 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 			m_recorded_waiters.fetch_add(1, std::memory_order_seq_cst);
 			for (;;) {
 				const auto value = m_recorded_tick.load(std::memory_order_seq_cst);
+				wait.Observed(value);
 				if (value >= tick) {
 					break;
 				}

@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/commandStream.h"
+#include "common/ramStats.h"
+
+#include "common/hangWatchdog.h"
 
 #include <chrono>
 #include <cinttypes>
@@ -627,6 +630,7 @@ Ring::Ring(uint64_t capacity) {
 	m_capacity = capacity;
 	m_mask     = capacity - 1u;
 	m_data     = static_cast<uint8_t*>(::operator new(capacity, std::align_val_t {64}));
+	Common::RamStats::Range("CP command ring", m_data, capacity);
 }
 
 Ring::~Ring() {
@@ -643,6 +647,8 @@ bool Ring::EnsureSpace(uint64_t bytes, const WaitPolicy& policy, WaitStats& stat
 		return false;
 	}
 	// The consumer may be parked on packets published without a wake.
+	HangWatchdog::Scope wait("recorder-ring-space", reinterpret_cast<uint64_t>(this),
+	                         m_write + bytes, m_consumed_cache, 0, m_capacity);
 	Kick(stats);
 	const auto start = NowNs();
 	stats.spins++;
@@ -704,6 +710,8 @@ void Ring::WaitConsumed(uint64_t position, const WaitPolicy& policy, WaitStats& 
 	if (done()) {
 		return;
 	}
+	HangWatchdog::Scope wait("recorder-ring-consumed", reinterpret_cast<uint64_t>(this), position,
+	                         m_consumed_cache);
 	Kick(stats);
 	const auto start = NowNs();
 	stats.spins++;
@@ -741,6 +749,8 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 	if (available()) {
 		return true;
 	}
+	HangWatchdog::Scope wait("recorder-ring-published", reinterpret_cast<uint64_t>(this), m_read,
+	                         m_published_cache);
 	const auto start = NowNs();
 	stats.spins++;
 	const bool spun =

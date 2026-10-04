@@ -1,0 +1,53 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// KYTY_OCCLUSION_BATCH (occlusion.h): reduces the occlusion queries of one batch and writes the
+// publish slots of the dumps recorded in it, in dump order. Dump i uses slot
+// (first_slot + i) % slot_count; its table entry holds the number of the batch's queries that
+// precede it and a tag (the dump's issue number). Its DB0 value is the cumulative counter
+// including exactly those queries, as the per-dump reduction (gpu_dcc_occlusion.comp, mode 0
+// then mode 1) wrote it. The tag goes to the slot's last qword, which the publication does not
+// copy, so the CPU can check that it publishes this dump's value. The counter then takes every
+// query of the batch.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Result { uint64_t results[]; } query_data;
+layout(set = 0, binding = 1, std430) buffer Counter { uint64_t total; } counter;
+layout(set = 0, binding = 2, std430) buffer Output { uint words[]; } output_data;
+layout(set = 0, binding = 3, std430) readonly buffer Table { uvec2 entries[]; } table_data;
+layout(push_constant) uniform Push {
+    uint first_slot;
+    uint dump_count;
+    uint query_count;
+    uint slot_count;
+} push_data;
+
+const uint64_t kMask      = uint64_t(0x7fffffffffffffffUL);
+const uint     kSlotWords = 64u; // OcclusionCounter::PublishSlotSize / 4
+
+void main() {
+    uint64_t sum   = counter.total;
+    uint     query = 0u;
+    for (uint i = 0u; i < push_data.dump_count; ++i) {
+        const uint  slot   = (push_data.first_slot + i) % push_data.slot_count;
+        const uvec2 entry  = table_data.entries[slot];
+        const uint  prefix = min(entry.x, push_data.query_count);
+        for (; query < prefix; ++query) {
+            sum += query_data.results[query];
+        }
+        sum &= kMask;
+        // Aggregate native counts in DB0; the remaining virtual DBs contribute zero. Write the
+        // first member of every interleaved begin/end pair (the publication copies those).
+        const uint base = slot * kSlotWords;
+        for (uint db = 0u; db < 16u; ++db) {
+            const uint64_t count = db == 0u ? sum : uint64_t(0);
+            const uint     index = base + db * 4u;
+            output_data.words[index]      = uint(count);
+            output_data.words[index + 1u] = uint(count >> 32) | 0x80000000u;
+        }
+        output_data.words[base + 62u] = entry.y;
+        output_data.words[base + 63u] = ~entry.y;
+    }
+    for (; query < push_data.query_count; ++query) {
+        sum += query_data.results[query];
+    }
+    counter.total = sum & kMask;
+}

@@ -1,31 +1,33 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/bdaSyncDiagnostics.h"
 #include "graphics/host_gpu/renderer/cache/bdaHotRanges.h"
-#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
-#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/watchdogSubmit.h"
 #include "kernel/memory.h"
-#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +52,7 @@ namespace Libs::Graphics {
 namespace {
 
 Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultOff);
+Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaultOff);
 
 Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
 
@@ -86,6 +89,16 @@ void AppendUploadCopy(std::vector<vk::BufferCopy>& copies, uint64_t source,
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+bool SmallUploadRingEnabled() {
+	// Startup only: keep large requests correct through temporary upload buffers.
+	const auto* flag = std::getenv("KYTY_RAM_SMALL_UPLOAD_RING");
+	return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+uint64_t UploadRingSize() {
+	return SmallUploadRingEnabled() ? 128 * MiB : 512 * MiB;
+}
+
 Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
 Live::Switch g_binding_memo_prefetch("KYTY_CP_BINDING_MEMO_PREFETCH", Live::ParseDefaultOff);
 std::atomic<uint64_t> g_binding_hot_generation {1};
@@ -98,6 +111,49 @@ void BindingHotChanged(int64_t, int64_t) {
 }
 Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOff,
                                BindingHotChanged);
+
+// KYTY_FAULT_AHEAD_ADAPT (live): the fault-ahead window of write faults
+// (MemoryTracker::SetFaultAheadOverride, applied at every guest flip).
+//   auto   (default) 256 KiB, 512 KiB or 1 MiB by FaultCost::SlowLevel() 0 / 1 / 2: how slow
+//          protection changes are on this PC (measured, only ever rising; Linux with mprotect
+//          tracking: 1 MiB from the start)
+//   <KiB>  a power of two, 8..4096
+//   0      KYTY_FAULT_AHEAD_KB alone (32 KiB), as before
+// At the Sky Garden the guest's job threads fill ~16 MB of triple-buffered data per frame. With
+// 32 KiB windows that took ~1,700 faults per frame, 62% of them duplicates (another thread wrote
+// the same page while the first fault was in flight). 256 KiB windows: ~300 faults and ~100
+// loosening calls per frame instead of ~1,700 and ~620, for ~14% more upload bytes (pages a window
+// opened that the guest did not write are uploaded once more than needed: bytes, not faults).
+// 1 MiB here: ~110 faults, but ~72 us each in the handler and twice the upload bytes of 32 KiB, so
+// only PCs with slow protection changes get it (the slow-PC simulation: 20.7 -> 26.4 fps).
+// The handler's own time grows with the window, so it must not choose the window: an earlier rule
+// based on it climbed to 1 MiB on this PC too.
+Live::Switch g_fault_ahead_adapt("KYTY_FAULT_AHEAD_ADAPT", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0) {
+		return -2;
+	}
+	if (std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	char*      end = nullptr;
+	const auto kib = std::strtoll(value, &end, 10);
+	if (end == value || kib < 8 || kib > 4096 || (kib & (kib - 1)) != 0) {
+		return 0;
+	}
+	return kib;
+});
+
+uint32_t FaultAheadOverridePages() {
+	const auto value = g_fault_ahead_adapt.Get();
+	if (value == 0) {
+		return 0;
+	}
+	uint64_t kib = static_cast<uint64_t>(value);
+	if (value == -2) {
+		kib = uint64_t {256} << std::clamp(FaultCost::SlowLevel(), 0, 2);
+	}
+	return static_cast<uint32_t>(kib * 1024 / TRACKER_PAGE_SIZE);
+}
 
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
@@ -566,6 +622,9 @@ struct BufferCache::SideReadbackState {
 	KYTY_CLASS_NO_COPY(SideReadbackState);
 
 	void Wait(uint64_t target) const {
+		HangWatchdog::Scope wait("side-readback-gpu",
+		                         reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(semaphore)),
+		                         target);
 		uint64_t current = 0;
 		RequireVulkanSuccess(graphics.device.getSemaphoreCounterValue(semaphore, &current),
 		                     "query side-readback semaphore");
@@ -650,6 +709,8 @@ struct BufferCache::SparsePageTable {
 	// One submission to the side queue (queue 0 without one), waited for on the host.
 	template <typename Submit>
 	void SubmitAndWait(Submit&& submit, const char* operation) {
+		HangWatchdog::Scope wait("sparse-page-table",
+		                         reinterpret_cast<uint64_t>(static_cast<VkFence>(fence)));
 		vk::Result result {};
 		if (graphics.side_queue != nullptr) {
 			Common::LockGuard lock(graphics.side_queue_mutex);
@@ -1121,7 +1182,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_hot_quiet_frames(HotPageQuietFrames()),
       m_hot_check_limit(HotPageCheckLimit()),
       m_range_memo(RangeMemoEnabled() ? std::make_unique<RangeMemo[]>(RangeMemoSlots) : nullptr),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB,
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize(),
                        graphics.transfer_queue != nullptr),
       m_upload_dma(UploadDma::Create(graphics, scheduler)),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, false, {},
@@ -1152,6 +1213,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
 		m_binding_memo_buffer_guard = ParseEnvU64("KYTY_BINDING_MEMO_BUFFER_GUARD", 1) != 0;
 	}
+	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 	m_written_sync_skip = WrittenSyncSkipEnabled();
 	if (m_written_sync_skip) {
 		m_written_sync_skip_verify = EnvVerifyMode("KYTY_WRITTEN_SYNC_SKIP_VERIFY");
@@ -1269,6 +1331,9 @@ BufferCache::UploadBatch::~UploadBatch() {
 
 void BufferCache::AdvanceFrame() noexcept {
 	m_memory_tracker.AdvanceFrame();
+	FaultCost::AdvanceFrame();
+	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
+	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 }
 
 void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
@@ -1501,6 +1566,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	HangWatchdog::Scope       read("buffer-readback", vaddr, size, 0, 0, is_write);
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ReadMemory);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1660,6 +1726,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
                                   ReadMemoryTrace& trace) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
+	HangWatchdog::Scope drain("buffer-readback-drain", vaddr, size, 0, 0, is_write);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
@@ -1963,6 +2030,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 			m_graphics.submission_queue.DrainPendingLocked();
 		}
 		Common::LockGuard lock(m_graphics.side_queue_mutex);
+		HangWatchdog::Scope native(
+		    "vkQueueSubmit-side-readback",
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.side_queue)), value,
+		    producer);
+		NoteWatchdogSubmit(m_graphics.side_queue, submit);
 		submit_result = m_graphics.side_queue.submit(1, &submit, nullptr);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideQueueCopies);
 	} else {
@@ -1971,6 +2043,10 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		// copy waits on it. The current recording follows this copy in submission order.
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		m_graphics.submission_queue.DrainPendingLocked();
+		HangWatchdog::Scope native(
+		    "vkQueueSubmit-shared-readback",
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.queue)), value, producer);
+		NoteWatchdogSubmit(m_graphics.queue, submit);
 		submit_result = m_graphics.queue.submit(1, &submit, nullptr);
 	}
 	RequireVulkanSuccess(submit_result, "submit side readback");
@@ -1987,6 +2063,9 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 }
 
 bool BufferCache::CompleteSideReadback(SideReadback& readback) {
+	HangWatchdog::Scope wait("readback-publication", readback.begin, readback.value, readback.end,
+	                         0, readback.eager);
+	HangWatchdog::DebugDelay("readback", readback.begin);
 	std::scoped_lock lock(readback.mutex);
 	if (readback.done.load(std::memory_order_acquire)) {
 		return false;
@@ -2122,6 +2201,16 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 		// A page the command processor reads back: submit this recording once the writer is
 		// recorded, so the read after it finds a submitted (ideally finished) producer.
 		m_eager_flush = true;
+	}
+}
+
+bool BufferCache::ShaderWriteRetickEnabled() {
+	return g_shader_write_retick.On();
+}
+
+void BufferCache::RetagShaderWrite(uint64_t vaddr, uint64_t size, uint64_t preparation_tick) {
+	if (vaddr != 0 && size != 0 && preparation_tick != m_scheduler.CurrentTick()) {
+		NoteBufferContentWrite(vaddr, size);
 	}
 }
 
@@ -2277,6 +2366,9 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 		side.pending.push_back(readback);
 		side.pending_count.store(side.pending.size(), std::memory_order_release);
 	}
+	// Diagnostic only: allow a guest reader to acquire this publication before the CP flushes
+	// its producer tick, opening the issue-to-submit race window without changing ordering.
+	HangWatchdog::DebugDelay("eager-issue", page);
 	// Queued for this recording's tick: the completion runner publishes it once the recording
 	// has finished, unless a reader (guest fault, CP read) completed it first.
 	m_scheduler.DeferPriorityOperation(
@@ -3499,6 +3591,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::ObtainImageStagingBuffer(uint64_t size) {
+	auto [mapped, offset] = m_staging_buffer.Map(size, 16);
+	if (mapped != nullptr) return {&m_staging_buffer, offset};
+	if (!SmallUploadRingEnabled()) return {nullptr, 0};
+	// The fixed ring must not impose a maximum guest image size. Keep this one-off source
+	// alive until the submission using it has completed, as UploadCopies does for buffers.
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+	                                         AllFlags, size);
+	auto* source = temporary.get();
+	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {source, 0};
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -3516,13 +3621,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+	auto [source, stage_offset] = ObtainImageStagingBuffer(size);
+	if (source == nullptr) EXIT("BufferCache: failed to read mapped guest image backing\n");
+	auto* staging = source->Mapped().data() + stage_offset;
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	if (source == &m_staging_buffer) m_staging_buffer.Commit();
+	else source->Flush(0, size);
+	return {source, stage_offset};
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
@@ -4361,11 +4469,13 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
 			}
+			FaultCost::NoteBdaPass(0, 0);
 			return;
 		}
 		BdaSyncStats stats;
 		if (SynchronizeBdaHotRanges(stats)) {
 			BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotPasses);
+			FaultCost::NoteBdaPass(1, stats.upload_bytes);
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotPasses);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotRanges,
@@ -4383,6 +4493,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
 	           SynchronizeBdaDirtied(mapped_ranges)) {
 		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::DirtyLogPasses);
+		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
 		if (m_bda_log_verify != 0) {
 			m_bda_log_totals.verify_checks++;
@@ -4441,6 +4552,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 	// The log taken above holds nothing this scan did not cover; later transitions log again.
 	m_bda_log_baseline = m_bda_dirty_log;
+	FaultCost::NoteBdaPass(3, stats.upload_bytes);
 	if (collect) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncPasses);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncScannedBuffers, stats.scanned_buffers);
@@ -4523,6 +4635,7 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	}
 	m_bda_log_totals.passes++;
 	m_bda_log_totals.ranges += logged;
+	m_bda_last_pass_bytes = stats.upload_bytes;
 	if (Profiler::AggregateEnabled()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogPasses);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogRanges, logged);

@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/queueSubmission.h"
 
 #include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/watchdogSubmit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -59,6 +61,8 @@ void QueueSubmissionBroker::Initialize(GraphicContext& graphics) {
 void QueueSubmissionBroker::Enqueue(QueuedSubmission submission) {
 	EXIT_IF(!m_enabled || submission.command == nullptr);
 	std::unique_lock lock(m_mutex);
+	HangWatchdog::Scope wait("submission-broker-space", reinterpret_cast<uint64_t>(this), MaxQueued,
+	                         m_pending.size(), 0, submission.tick);
 	// The worker needs only queue_mutex and this mutex. In particular it never
 	// needs the renderer lock, which the producer can own while waiting for space.
 	m_space_available.wait(lock, [this] { return m_stopping || m_pending.size() < MaxQueued; });
@@ -173,6 +177,15 @@ void QueueSubmissionBroker::SubmitBatch(const QueuedSubmission* records, size_t 
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("SubmissionQueue::DriverSubmit");
 		Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::DriverSubmit);
+		HangWatchdog::Scope       native(
+		    "vkQueueSubmit-broker",
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics->queue)),
+		    records[count - 1].tick, records[0].tick, native_count, count);
+		HangWatchdog::DebugDelay("submit", records[count - 1].tick);
+		if (HangWatchdog::Enabled()) {
+			for (size_t i = 0; i < native_count; ++i)
+				NoteWatchdogSubmit(m_graphics->queue, submits[i]);
+		}
 		result = m_graphics->queue.submit(static_cast<uint32_t>(native_count), submits.data(), nullptr);
 	}
 	++m_driver_calls;

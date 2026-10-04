@@ -1745,6 +1745,9 @@ static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&       
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	prepared.write_preparation_tick = BufferCache::ShaderWriteRetickEnabled()
+	                                      ? m_context.GetCommandScheduler().CurrentTick()
+	                                      : UINT64_MAX;
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
@@ -2167,6 +2170,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     std::span<PreparedBindings* const> prepared_bindings,
                                     bool                               keep_images) {
 	KYTY_PROFILER_FUNCTION();
+	// Storage writes were reserved during preparation. A later binding/table upload may have
+	// submitted that recording before this command was emitted. Its readbacks must wait for
+	// the final recording, not the already submitted preparation tick. No dirty range expands.
+	if (BufferCache::ShaderWriteRetickEnabled()) {
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		for (auto* prepared: prepared_bindings) {
+			EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+			if (prepared->write_preparation_tick == tick) continue;
+			const auto& resources = prepared->runtime->program->info.buffers;
+			EXIT_IF(prepared->buffer_sources.size() != resources.size());
+			for (size_t i = 0; i < resources.size(); ++i) {
+				if (!resources[i].written) continue;
+				const auto& source = prepared->buffer_sources[i];
+				m_context.GetBufferCache().RetagShaderWrite(source.address, source.size,
+				                                          prepared->write_preparation_tick);
+			}
+			prepared->write_preparation_tick = tick;
+		}
+	}
 	// Run after resource discovery so an unbounded address writer cannot retain a
 	// metadata-inspection memo created during preparation of this same command.
 	// Read-only BDA access leaves contents unchanged; tracked descriptor writes carry

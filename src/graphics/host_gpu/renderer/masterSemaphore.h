@@ -52,6 +52,7 @@ private:
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
 	std::shared_ptr<SubmissionProgress> m_submission_progress;
+	uint32_t                            m_watchdog_timeline = UINT32_MAX;
 };
 
 } // namespace Libs::Graphics

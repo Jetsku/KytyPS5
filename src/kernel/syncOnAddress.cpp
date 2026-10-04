@@ -1,5 +1,6 @@
 #include "kernel/syncOnAddress.h"
 
+#include "common/hangWatchdog.h"
 #include "common/threads.h"
 #include "libs/errno.h"
 
@@ -256,6 +257,8 @@ int WakePortable(volatile void* address, int32_t count) {
 template <typename T>
 int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
+	HangWatchdog::Scope wait("guest-sync-on-address", reinterpret_cast<uint64_t>(address), expected,
+	                         0, sizeof(T));
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
 	}

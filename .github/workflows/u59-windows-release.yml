@@ -87,7 +87,7 @@ jobs:
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
-          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int4-sg-1.profdata
+          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int7-sg-1.profdata
           cmake -S C:\kyty-src -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
@@ -140,8 +140,9 @@ jobs:
         shell: pwsh
         run: |
           # Functions with mismatched or missing profile data are optimized without it (not an error). A local
-          # build of u59-int4-sg-1's commit from C:\kyty-src (VS 18.10, LLVM 22.1.3) reports 0 mismatched and
-          # 47 without data, all in the launcher's Qt moc file; a build from another path, about 2,500 more.
+          # build of the int7 profile's commit from C:\kyty-src (LLVM 22.1.3) is expected to match the
+          # hot renderer functions. The profile was retrained after turning on occlusion reset batching,
+          # pipeline prefetch and the small upload ring. Check the actual mismatch and missing-data counts below.
           $log = Get-Content -LiteralPath 'pgo-build.log'
           $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
           $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'
@@ -180,5 +181,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 integration: lower VRAM use (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "New since u59-windows-20261002-int3: lower VRAM use, on in the bundled u59-preset.json. The shader recompiler emulates LDS in vertex and pixel shaders with a 32 KiB array per shader invocation, and the NVIDIA driver reserves memory for that array for every thread the GPU can keep resident (about 3.9 GiB on an RTX 3090) until the game exits. KYTY_FUNCTION_ARRAY_SHRINK shrinks these arrays to the elements a shader can reach before the driver sees it; KYTY_VRAM_GC_BUDGET collects textures and buffers against the VRAM budget while the game runs instead of thresholds fixed at startup. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, six alternating runs each: dedicated VRAM 9.4 GB with int3 and 6.3 GB with a local build of this source, peak since start 12.4 GB and 7.5 GB; 33.6 fps with int3 and 33.0 fps with the local build (within the spread between runs). Smaller cards were imitated by another process that holds 12 GiB or 16 GiB of the card's 24 GiB from boot: Astro Bot now reaches the Sky Garden and runs at 32-33 fps there, where int3's preset got stuck in the galaxy map. Tested on NVIDIA only; setting either flag to 0 in u59-preset.json turns it off. Release builds now compile from the source path the PGO profile was recorded at (C:\kyty-src); earlier GitHub builds missed the profile for every function in an anonymous namespace (2,499 of the 17,426 functions in int3's profile). This did not change the frame rate measurably. kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch can compile shaders again. See U59-README.md."
+            --title "U59 integration: less stutter, less RAM, stale GPU readback fix (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "New since u59-windows-20261003-int5. Less stutter on first runs: new shader pipelines are prepared ahead on worker threads (KYTY_PIPELINE_PREFETCH=1, KYTY_PIPELINE_PREFETCH_PROGRAMS=1); with an empty shader cache the command processor stalled 68-70 s instead of 87-89 s along the Sky Garden route and 57-59 s instead of 76 s along the Creamy Canyon route, and the slowest 1% of Creamy Canyon frames took about 100-130 ms instead of 230-245 ms; with a warm cache fps is unchanged. Less memory: small uploads use their own ring buffer (KYTY_RAM_SMALL_UPLOAD_RING=1), about 430-540 MB less RAM, 385 MB less shared GPU memory and 60-150 MB less VRAM. Unused occlusion queries are reset in batches (KYTY_OCCLUSION_RESET_BATCH=1): Go-Go Archipelago +1.5% to +1.9% fps, Bathhouse Battle +2.6%. A fix for a race in which a side readback could hand the game the old contents of memory a shader had just written (KYTY_SHADER_WRITE_RETICK=1); the logs of RTX 50 PCs that freeze at the title screen -> galaxy map step end in this readback path, so RTX 40/50 players with that freeze should try this release (the race is reproduced and fixed in a Vulkan test, not yet confirmed on an RTX 50 PC). A hang watchdog is on only for NVIDIA RTX 50 GPUs (KYTY_HANG_WATCHDOG=auto): when the picture stops for 5 seconds it writes what every thread is doing and waiting for into _HangTrace\watchdog-*\watchdog.txt beside the emulator; RTX 50 players who still freeze, please send that file. Every switch is in the bundled u59-preset.json; =0 restores the old behavior. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank). kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. The shader translation is unchanged, so int5's program caches stay valid. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. See U59-README.md. Earlier in int5: batched occlusion queries (Creamy Canyon start view 8.3 -> 22 fps), larger fault-ahead windows (KYTY_FAULT_AHEAD_ADAPT) and the swapchain fixes from upstream PR #1001."

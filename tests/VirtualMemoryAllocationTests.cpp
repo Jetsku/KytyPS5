@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -55,6 +56,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
@@ -280,6 +282,96 @@ void RunTest(void (*test_func)()) {
 		test_func();
 	} catch (const TestFailure&) {
 	}
+}
+
+void TestGuestBackingCommitPolicy() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	namespace Memory = Libs::LibKernel::Memory;
+	const char* test = "GuestBackingCommitPolicy";
+	const auto* flag = std::getenv("KYTY_GUEST_BACKING_LAZY_COMMIT");
+	const bool lazy = flag != nullptr && std::strcmp(flag, "1") == 0;
+	const auto backing = Memory::TestGuestBackingBase();
+	const auto direct_end = Memory::KernelGetDirectMemorySize();
+	const auto offset = direct_end - 3 * SceKernelPageSize;
+	const auto state_at = [&](uint64_t physical) {
+		MEMORY_BASIC_INFORMATION info {};
+		Check(test, VirtualQuery(reinterpret_cast<void*>(backing + physical), &info,
+		                         sizeof(info)) == sizeof(info), "VirtualQuery backing failed");
+		return info.State;
+	};
+	Check(test, state_at(offset) == (lazy ? MEM_RESERVE : MEM_COMMIT),
+	      "unused backing has the wrong commitment state");
+	int64_t physical = 0;
+	CheckOk(test, Memory::KernelAllocateDirectMemory(offset, direct_end, SceKernelPageSize,
+	                                                SceKernelPageSize, SceKernelMtypeC, &physical),
+	        "allocate unused physical page");
+	Check(test, physical == offset, "physical allocation moved unexpectedly");
+	Check(test, state_at(offset) == (lazy ? MEM_RESERVE : MEM_COMMIT),
+	      "physical allocation alone committed host pages");
+	void* address = nullptr;
+	CheckOk(test, Memory::KernelMapDirectMemory(&address, SceKernelPageSize, SceKernelProtCpuRw,
+	                                          0, physical, SceKernelPageSize), "map physical page");
+	Check(test, state_at(offset) == MEM_COMMIT, "mapped physical page was not committed");
+	Check(test, state_at(offset + SceKernelPageSize) == (lazy ? MEM_RESERVE : MEM_COMMIT),
+	      "mapping committed an unrelated physical page");
+	Check(test, *static_cast<uint64_t*>(address) == 0, "fresh physical page was not zero-filled");
+	constexpr uint64_t sentinel = 0x52414d434f4d4d49ull;
+	*static_cast<uint64_t*>(address) = sentinel;
+	Check(test, *reinterpret_cast<uint64_t*>(backing + offset) == sentinel,
+	      "guest and backing alias bytes disagree");
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(address), SceKernelPageSize),
+	        "unmap physical page");
+	address = nullptr;
+	CheckOk(test, Memory::KernelMapDirectMemory(&address, SceKernelPageSize, SceKernelProtCpuRw,
+	                                          0, physical, SceKernelPageSize), "remap physical page");
+	Check(test, *static_cast<uint64_t*>(address) == sentinel, "recommit erased physical bytes");
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(address), SceKernelPageSize),
+	        "unmap remapped page");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(physical, SceKernelPageSize),
+	        "release physical page");
+	std::printf("[host]    %-48s %s ok\n", test, lazy ? "lazy" : "eager");
+#endif
+}
+
+void TestFlexibleBackingDemandZero() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	namespace Memory = Libs::LibKernel::Memory;
+	const char* test = "FlexibleBackingDemandZero";
+	const auto* lazy_flag = std::getenv("KYTY_GUEST_BACKING_LAZY_COMMIT");
+	const auto* zero_flag = std::getenv("KYTY_GUEST_BACKING_LAZY_ZERO");
+	const bool demand_zero = lazy_flag != nullptr && std::strcmp(lazy_flag, "1") == 0 &&
+	                         zero_flag != nullptr && std::strcmp(zero_flag, "1") == 0;
+	constexpr uint64_t length = 8 * SceKernelPageSize;
+	void* address = nullptr;
+	CheckOk(test, Memory::KernelMapNamedFlexibleMemory(&address, length, SceKernelProtCpuRw, 0,
+	                                                  "demand_zero"), "map fresh flexible range");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	const auto backing = reinterpret_cast<uint64_t>(Memory::GuestBackingAlias(base, length));
+	Check(test, backing != 0, "flexible range has no backing alias");
+	std::array<PSAPI_WORKING_SET_EX_INFORMATION, length / 0x1000> pages {};
+	for (size_t i = 0; i < pages.size(); i++) {
+		pages[i].VirtualAddress = reinterpret_cast<void*>(backing + i * 0x1000);
+	}
+	Check(test, QueryWorkingSetEx(GetCurrentProcess(), pages.data(), sizeof(pages)) != FALSE,
+	      "QueryWorkingSetEx backing failed");
+	for (const auto& page: pages) {
+		Check(test, bool(page.VirtualAttributes.Valid) != demand_zero,
+		      "fresh flexible backing residency disagrees with the zero policy");
+	}
+	for (uint64_t i = 0; i < length; i++) {
+		Check(test, static_cast<uint8_t*>(address)[i] == 0, "fresh flexible memory is not zero");
+	}
+	std::memset(address, 0xa5, length);
+	CheckOk(test, Memory::KernelMunmap(base, length), "unmap dirty flexible range");
+	address = nullptr;
+	CheckOk(test, Memory::KernelMapNamedFlexibleMemory(&address, length, SceKernelProtCpuRw, 0,
+	                                                  "demand_zero_reuse"), "reuse flexible range");
+	for (uint64_t i = 0; i < length; i++) {
+		Check(test, static_cast<uint8_t*>(address)[i] == 0, "reused flexible memory leaked bytes");
+	}
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(address), length), "unmap reuse");
+	std::printf("[host]    %-48s %s ok\n", test, demand_zero ? "demand" : "eager");
+#endif
 }
 
 VirtualQueryInfo Query(const char* test, uint64_t addr, int flags = 0) {
@@ -4140,6 +4232,8 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	RunTest(TestGuestBackingCommitPolicy);
+	RunTest(TestFlexibleBackingDemandZero);
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);

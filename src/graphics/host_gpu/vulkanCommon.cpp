@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/spirvCacheSalt.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -245,6 +246,16 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	}
 	if (VramStats::Enabled()) {
 		VramStats::NoteFunctionStorage(declared, created);
+	}
+	// Startup diagnostic; the program cache retains unsalted code. Only driver input changes.
+	static const uint32_t salt = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_COLD_SALT");
+		return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	std::vector<uint32_t> salted;
+	if (salt != 0) {
+		EXIT_IF(!SaltSpirvIds(code, salt, salted));
+		code = salted;
 	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();

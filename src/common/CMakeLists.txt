@@ -12,10 +12,10 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
-# Loading diagnostics handles filesystem and thread-start exceptions locally.
+# Loading/watchdog diagnostics handle filesystem and thread-start exceptions locally.
 # Other sources retain the project's no-exceptions compilation policy.
 if(LINUX)
-	set_property(SOURCE profiler.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+	set_property(SOURCE profiler.cpp hangWatchdog.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
 endif()
 
 target_include_directories(common

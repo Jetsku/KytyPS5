@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WINDOW_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WINDOW_H_
 
+#include "common/ramStats.h"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -34,6 +36,8 @@ public:
 		}
 		m_mask  = size - 1u;
 		m_slots = std::vector<Slot>(size);
+		Common::RamStats::Range("draw preparation window", m_slots.data(),
+		                       m_slots.capacity() * sizeof(Slot));
 	}
 
 	[[nodiscard]] uint32_t Capacity() const noexcept { return m_mask + 1u; }

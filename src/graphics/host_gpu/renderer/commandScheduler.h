@@ -89,6 +89,15 @@ public:
 	// context dies: the call happens while the operation is still marked active.
 	using ProgressHook = void (*)(void* context);
 	void SetProgressHook(ProgressHook hook, void* context);
+	// Called at the start of every Submit while the scheduler is active, on the recording thread,
+	// before the command buffer is ended: an owner that defers work to the end of the command
+	// buffer records it there (KYTY_OCCLUSION_BATCH: OcclusionCounter::FlushBatch). Never
+	// re-entered from a Submit it causes. The owner clears it before it is destroyed.
+	using PreSubmitHook = void (*)(void* context);
+	void SetPreSubmitHook(PreSubmitHook hook, void* context) noexcept {
+		m_pre_submit_hook         = hook;
+		m_pre_submit_hook_context = context;
+	}
 	// KYTY_PRIORITY_WAKE_BATCH=0 restores a runner wake per queued operation and a waiter
 	// broadcast after every operation.
 	[[nodiscard]] static bool PriorityWakeupsBatched();
@@ -201,6 +210,9 @@ private:
 	std::atomic<uint64_t>        m_priority_progress {0};
 	ProgressHook                 m_progress_hook         = nullptr;
 	void*                        m_progress_hook_context = nullptr;
+	PreSubmitHook                m_pre_submit_hook         = nullptr;
+	void*                        m_pre_submit_hook_context = nullptr;
+	bool                         m_in_pre_submit           = false;
 	OperationState               m_operation_state      = OperationState::Open;
 	// Guarded by m_operation_mutex, alongside callback registration and the
 	// queued-submit tick transition. Captured into each owned submission record.

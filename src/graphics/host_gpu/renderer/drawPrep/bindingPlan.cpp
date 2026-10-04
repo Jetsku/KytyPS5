@@ -281,10 +281,11 @@ uint32_t IndexElementSize(uint32_t index_type_and_size) {
 
 void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& registers,
                   const DrawIndexArgs* index_args, const PreparedDraw& prepared,
-                  BindingPlan& plan) {
+	              BindingPlan& plan, bool prefetch_only = false) {
 	using E = Profiler::FrameEvent;
 	// Rare (a pipeline not created yet, the map lock busy): shared totals are fine here.
-	const auto abstain = [](E event) {
+	const auto abstain = [prefetch_only](E event) {
+		if (prefetch_only) return;
 		Profiler::CountFrameEvent(event);
 		(event == E::DrawPrepBindingAbstainPipelineBusy ? g_binding_totals.pipeline_busy
 		                                                : g_binding_totals.pipeline_abstains)
@@ -317,6 +318,12 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 	if (plan.plain_pixel) {
 		programs.pixel = PipelineCache::PlainPixelProgram(prepared.pixel_prep);
 	}
+	if (prefetch_only) {
+		context.pipelines->PrefetchGraphicsPipeline(plan.targets, ctx, ucfg, prepared.vertex_info,
+		    prepared.pixel_active ? &prepared.pixel_info : nullptr, plan.topology,
+		    plan.primitive_restart, programs);
+		return;
+	}
 	const PipelineCache::Pipeline* pipeline   = nullptr;
 	uint64_t                       generation = 0;
 	switch (context.pipelines->FindGraphicsPipelineForPlan(
@@ -330,6 +337,12 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 		case PipelineCache::PlanLookup::Busy:
 			return abstain(E::DrawPrepBindingAbstainPipelineBusy);
 		case PipelineCache::PlanLookup::Absent:
+			if (context.pipelines->PipelinePrefetchEnabled()) {
+				context.pipelines->PrefetchGraphicsPipeline(plan.targets, ctx, ucfg, prepared.vertex_info,
+				    prepared.pixel_active ? &prepared.pixel_info : nullptr, plan.topology,
+				    plan.primitive_restart, programs);
+			}
+			return abstain(E::DrawPrepBindingAbstainPipeline);
 		case PipelineCache::PlanLookup::Unsupported:
 			return abstain(E::DrawPrepBindingAbstainPipeline);
 	}
@@ -501,6 +514,22 @@ void ReportBindingMismatch(const char* item, uint32_t detail) {
 
 BindingTotals& GetBindingTotals() {
 	return g_binding_totals;
+}
+
+void PrefetchBindingPipeline(const BindingPlanContext& context, const RegisterSnapshot& registers,
+                             const DrawIndexArgs* index_args, const PreparedDraw& prepared) {
+	if (!context.pipelines->PipelinePrefetchEnabled() || !prepared.ok) return;
+	// A regular pipeline binding plan below already requests the same key.
+	if (BindingPartEnabled(BindingParts(), BindingPart::Pipeline)) return;
+	BindingPlan plan;
+	if (prepared.pixel_active && LodStatsCounter::PlainVariant() == LodStatsCounter::Plain::On &&
+	    PipelineCache::PlainPixelProgram(prepared.pixel_prep)) {
+		bool active = false;
+		static thread_local std::vector<uint32_t> scratch;
+		if (!PlanShaderData(*prepared.pixel_info.stage.program, prepared.pixel_prep.resources, scratch, active)) return;
+		plan.plain_pixel = !active;
+	}
+	PlanPipeline(context, registers, index_args, prepared, plan, true);
 }
 
 void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapshot& registers,

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -124,6 +125,8 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 		return Result::AlreadyWaiting;
 	}
 
+	HangWatchdog::Scope wait("guest-event-flag", reinterpret_cast<uint64_t>(this), bits, m_bits,
+	                         bits, static_cast<uint64_t>(wait_mode));
 	while (!((wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
 	         (wait_mode == WaitMode::Or && (m_bits & bits) != 0))) {
 		if ((elapsed >= micros && !infinitely)) {

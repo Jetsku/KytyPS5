@@ -7,11 +7,13 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/bdaSyncDiagnostics.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -34,6 +36,23 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_occlusion_counter(*this), m_lod_stats(*this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
+	// take their first fault.
+	FaultCost::SetThreadDescriber([](char* name, uint64_t size) -> int {
+		if (GuestGpu::IsGpuThread()) {
+			return 0;
+		}
+		auto self = LibKernel::PthreadSelfOrNull();
+		if (self == nullptr) {
+			return 2;
+		}
+		char full[64] {};
+		if (name != nullptr && size != 0 && LibKernel::PthreadGetname(self, full) == 0) {
+			std::snprintf(name, static_cast<size_t>(size), "%s", full);
+		}
+		return 1;
+	});
+	FaultCost::RunStartupBenchmark();
 }
 
 RenderContext::~RenderContext() {
@@ -92,16 +111,34 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
+	// Live cost numbers (faultCost.h); the slow-PC simulation's wait comes first, outside every lock.
+	const auto start = FaultCost::NowNs();
+	FaultCost::SimulateFault();
+	const bool               map = FaultCost::MapEnabled();
+	FaultCost::FaultRecord   record;
 	MemoryStats::Count(access == PageFaultAccess::Write ? MemoryStats::Counter::WriteFaults
 	                                                    : MemoryStats::Counter::ReadFaults);
 	if (access == PageFaultAccess::Write) {
 		// Both caches' releases of the page reach the host once, when the scope ends and no
 		// tracking lock is held (KYTY_DEFER_UNPROTECT).
 		const bool nested = PageManager::InDeferUnprotectScope();
+		if (map) {
+			FaultCost::MapInFault(true);
+		}
+		uint64_t mark = map ? FaultCost::NowNs() : 0;
+		const auto lap = [&](FaultCost::Part part) {
+			if (map) {
+				const auto now = FaultCost::NowNs();
+				record.part_ns[static_cast<int>(part)] += now - mark;
+				mark = now;
+			}
+		};
 		{
 			const PageManager::DeferUnprotectScope defer_unprotect;
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, true);
+			lap(FaultCost::Part::Buffer);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+			lap(FaultCost::Part::Texture);
 			// The faulting page gets the protection its watchers ask even when neither cache
 			// released anything here: another thread may have released it without having applied
 			// the release yet. A fault inside an enclosing scope (an emulator write between that
@@ -109,11 +146,25 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			m_page_manager.Reconcile(Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE),
 			                         TRACKER_PAGE_SIZE, nested);
 		}
+		lap(FaultCost::Part::Reconcile);
+		if (map) {
+			FaultCost::MapInFault(false);
+		}
 		if (nested) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DeferredUnprotectNestedFaults);
 		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+	}
+	const auto handler_ns  = FaultCost::NowNs() - start;
+	const bool found_dirty = access == PageFaultAccess::Write && MemoryTracker::TakeFaultFoundDirty();
+	FaultCost::NoteFault(handler_ns);
+	if (map) {
+		record.address     = fault_vaddr;
+		record.handler_ns  = handler_ns;
+		record.write       = access == PageFaultAccess::Write;
+		record.found_dirty = found_dirty;
+		FaultCost::MapFault(record);
 	}
 	return true;
 }
@@ -445,6 +496,7 @@ void RenderContext::ReportVram() {
 	}
 	m_texture_cache.ReportVram();
 	m_buffer_cache.ReportVram();
+	m_pipeline_cache.ReportRamStats();
 	VramStats::Flush();
 }
 

@@ -2,6 +2,7 @@
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1409,6 +1410,7 @@ static bool ReadGuestWaitValue(uint64_t address, uint64_t* out) {
 // or AMPR_WAIT_TIMEOUT elapses. Returns whether it was satisfied.
 template <typename Satisfied>
 static bool WaitBounded(Satisfied&& satisfied, uint64_t* waited_us) {
+	HangWatchdog::Scope wait("ampr-bounded-wait", reinterpret_cast<uint64_t>(waited_us), 1000000);
 	using Clock = std::chrono::steady_clock;
 
 	uint64_t seen = 0;
@@ -1508,9 +1510,12 @@ static int ExecuteSyncCommand(uint64_t command_buffer, const CommandBufferState:
 		}
 
 		case Kind::WaitOnCounter: {
+			HangWatchdog::Scope scope("ampr-counter", command.counter_index, command.value, 0,
+			                          command.mask, command.op);
 			uint64_t   observed  = 0;
 			const auto satisfied = [&]() {
 				observed = ReadCounter(lane);
+				scope.Observed(observed);
 				if (command.mask_op == CounterBank::MASK_AND) {
 					observed &= command.mask;
 				}
@@ -1524,6 +1529,8 @@ static int ExecuteSyncCommand(uint64_t command_buffer, const CommandBufferState:
 		}
 
 		case Kind::WaitOnAddress: {
+			HangWatchdog::Scope scope("ampr-address", command.address, command.value, 0, 0,
+			                          command.op);
 			uint64_t   observed  = 0;
 			bool       readable  = true;
 			const auto satisfied = [&]() {
@@ -1531,6 +1538,7 @@ static int ExecuteSyncCommand(uint64_t command_buffer, const CommandBufferState:
 					readable = false;
 					return true;
 				}
+				scope.Observed(observed);
 				return CounterBank::CompareSatisfied(observed, command.value, command.op,
 				                                     sizeof(uint64_t));
 			};
@@ -1832,7 +1840,9 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					return finish(OK);
 				}
 
-				uint64_t bytes_read = 0;
+				HangWatchdog::Scope read("ampr-file", command.destination, command.size,
+				                         command.file_id, command.file_offset, command_buffer);
+				uint64_t            bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
 				if (diagnostic != nullptr) diagnostic->read_bytes += bytes_read;
@@ -2016,6 +2026,8 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		uint32_t read = 0;
 		{
 			Profiler::ScopedLoadingOperation host_read(Profiler::LoadingOperation::AprHostRead);
+			HangWatchdog::Scope wait("ampr-host-read", destination + *bytes_read, request,
+			                         *bytes_read, file_offset + *bytes_read);
 			file.Read(buffer, request, &read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprHostReadBytes, read);
@@ -2024,6 +2036,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		}
 		{
 			Profiler::ScopedLoadingOperation guest_copy(Profiler::LoadingOperation::AprGuestCopy);
+			HangWatchdog::Scope copy("ampr-guest-copy", destination + *bytes_read, read);
 			std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer, read);
 		}
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprGuestCopiedBytes, read);

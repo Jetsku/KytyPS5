@@ -150,6 +150,8 @@ struct Totals {
 // One draw's speculative preparation and its certificate. Reused across draws (vectors keep
 // their capacity).
 struct PreparedDraw {
+	// Optional clean-snapshot program compilation; CP wait attribution at CommitHead.
+	uint64_t                                            program_compile_ns = 0;
 	bool                                                ok      = false;
 	Failure                                             failure = Failure::None;
 	bool                                                pixel_active = false;

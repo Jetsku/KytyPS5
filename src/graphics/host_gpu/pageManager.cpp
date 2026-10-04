@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/profiler.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/parkingLock.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -403,16 +404,27 @@ struct PageManager::Impl {
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
 		const bool unprotect = mode == Common::VirtualMemory::Mode::ReadWrite;
+		const auto pages     = size / PAGE_SIZE;
 		MemoryStats::Count(unprotect ? MemoryStats::Counter::UnprotectCalls
 		                             : MemoryStats::Counter::ProtectCalls);
 		MemoryStats::Count(unprotect ? MemoryStats::Counter::UnprotectPages
 		                             : MemoryStats::Counter::ProtectPages,
-		                   size / PAGE_SIZE);
+		                   pages);
 		const MemoryStats::ScopedTimer timer(MemoryStats::Counter::ProtectNs);
 		if (!unprotect && t_protect_probe.active) {
 			t_protect_probe.ranges.emplace_back(vaddr, size);
 		}
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
+		// The live cost numbers (faultCost.h) include the slow-PC simulation's wait, if any.
+		const auto start = FaultCost::NowNs();
+		FaultCost::SimProtectBegin(unprotect, pages);
+		const bool ok = Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode);
+		FaultCost::SimProtectEnd();
+		const auto ns = FaultCost::NowNs() - start;
+		FaultCost::NoteProtect(unprotect, pages, ns);
+		if (FaultCost::MapEnabled()) {
+			FaultCost::MapProtect(unprotect, mode == Common::VirtualMemory::Mode::NoAccess, pages, ns);
+		}
+		if (!ok) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}

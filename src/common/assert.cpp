@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
@@ -42,6 +43,7 @@ static void StartFatalWatchdog(int status) {
 }
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
+	HangWatchdog::NoteFatal(text, file, line);
 	StartFatalWatchdog(1);
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
 	Subsystems::EmergencyShutdownActive();
@@ -58,11 +60,13 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 }
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
+	HangWatchdog::NoteFatal(text, file, line);
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
+	HangWatchdog::NoteFatal(text, file, line);
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
 	return 1;
 }

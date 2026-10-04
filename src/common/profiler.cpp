@@ -2,6 +2,7 @@
 
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -9,9 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
-#include <condition_variable>
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1273,6 +1274,7 @@ void EndBlock() {
 }
 
 void SetThreadName(const char* name) {
+	if (name != nullptr) HangWatchdog::SetThreadName(name);
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}
@@ -1559,6 +1561,7 @@ void Initialize() {
 	                      std::memory_order_relaxed);
 	Detail::g_event_sink.store(Detail::CurrentEventSink(), std::memory_order_relaxed);
 	HangTrace::Initialize();
+	HangWatchdog::Initialize(HangTrace::OutputDirectory());
 	if (LoadingEnabled() && tracy::ProfilerAvailable() && !g_loading_publisher.joinable()) {
 		// A thread that cannot start is reported by exception where the build enables them
 		// (clang-cl /EHsc on Windows); see OpenLoadingLog.
@@ -1575,6 +1578,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	HangWatchdog::Shutdown();
 	HangTrace::Shutdown();
 	// The publisher must finish before Tracy's global state is torn down. Its wait
 	// is interruptible and uses only a private host mutex, never guest/GPU locks.

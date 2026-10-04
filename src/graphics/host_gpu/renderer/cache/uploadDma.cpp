@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -220,6 +221,8 @@ uint64_t UploadDma::PendingValue() {
 }
 
 void UploadDma::WaitHost(uint64_t value) {
+	HangWatchdog::Scope wait_scope(
+	    "upload-dma-gpu", reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)), value);
 	vk::SemaphoreWaitInfo wait {};
 	wait.semaphoreCount = 1;
 	wait.pSemaphores    = &m_semaphore;
@@ -278,6 +281,22 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 	submit.signalSemaphoreInfoCount = 1;
 	submit.pSignalSemaphoreInfos    = &signal;
 	// Only this worker submits to the transfer queue.
+	HangWatchdog::Scope native(
+	    "vkQueueSubmit2-transfer",
+	    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.transfer_queue)), value,
+	    reuse_tick);
+	if (HangWatchdog::Enabled()) {
+		const HangWatchdog::SemaphoreValue waited {
+		    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(reuse.semaphore)), reuse.value,
+		    static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(reuse.stageMask))};
+		const HangWatchdog::SemaphoreValue signalled {
+		    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(signal.semaphore)), signal.value,
+		    static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(signal.stageMask))};
+		HangWatchdog::NoteNativeSubmit(
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.transfer_queue)), 0,
+		    reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(command)),
+		    std::span(&waited, submit.waitSemaphoreInfoCount), std::span(&signalled, 1));
+	}
 	RequireVulkanSuccess(m_graphics.transfer_queue.submit2(1, &submit, nullptr),
 	                     "submit upload DMA copies");
 	batch.value = value;

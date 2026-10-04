@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -148,6 +149,7 @@ public:
 	int  GetTriggeredEvents(KernelEvent* ev, int num);
 	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
 	void Close();
+	void NoteWatchdogEvent(const KernelEqueueEvent& event, bool deleted = false) const;
 
 private:
 	int  GetTriggeredEventsLegacy(KernelEvent* ev, int num);
@@ -168,6 +170,12 @@ KernelEqueuePrivate::~KernelEqueuePrivate() {
 	Close();
 }
 
+void KernelEqueuePrivate::NoteWatchdogEvent(const KernelEqueueEvent& event, bool deleted) const {
+	HangWatchdog::NoteEvent(reinterpret_cast<uint64_t>(this), m_name, event.event.ident,
+	                        event.event.filter, event.triggered, event.event.data,
+	                        reinterpret_cast<uint64_t>(event.event.udata), deleted);
+}
+
 void KernelEqueuePrivate::Close() {
 	Common::LockGuard lock(m_mutex);
 
@@ -176,6 +184,7 @@ void KernelEqueuePrivate::Close() {
 	}
 	m_closed = true;
 	for (auto& event: m_events) {
+		NoteWatchdogEvent(event, true);
 		if (event.filter.delete_event_func != nullptr) {
 			auto owner = event.filter.owner;
 			event.filter.delete_event_func(m_handle, &event);
@@ -219,6 +228,7 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 		ev[ret++]   = event.event;
 		NoteDelivery(event);
 		if ((event.event.flags & EV_ONESHOT) != 0) {
+			NoteWatchdogEvent(event, true);
 			m_events.erase(next);
 			continue;
 		}
@@ -232,6 +242,7 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 		if (event.triggered) {
 			event.active_seq = m_next_active_seq++;
 		}
+		NoteWatchdogEvent(event);
 	}
 
 	return ret;
@@ -298,6 +309,7 @@ int KernelEqueuePrivate::GetTriggeredEventsLegacy(KernelEvent* ev, int num) {
 				break;
 			}
 		}
+		NoteWatchdogEvent(event, erase);
 		it = (erase ? m_events.erase(it) : std::next(it));
 		if (ret >= num) {
 			break;
@@ -336,6 +348,7 @@ void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
 			earliest->triggered  = true;
 			earliest->active_seq = m_next_active_seq++;
 		}
+		NoteWatchdogEvent(*earliest);
 	}
 }
 
@@ -377,6 +390,8 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 			return ret;
 		}
 
+		HangWatchdog::Scope wait("guest-equeue", reinterpret_cast<uint64_t>(this), num, 0, 0,
+		                         micros);
 		uint32_t   timer_wait = 0;
 		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
 		if (micros == 0 && !has_timer) {
@@ -411,6 +426,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		for (auto& pending: it->pending_events) {
 			pending.udata = event.event.udata;
 		}
+		NoteWatchdogEvent(*it);
 	} else {
 		auto& added = m_events.emplace_back(event);
 		added.pending_events.clear();
@@ -418,6 +434,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		added.coalesced_data_change = false;
 		added.verify_logged         = 0;
 		added.active_seq            = added.triggered ? m_next_active_seq++ : 0;
+		NoteWatchdogEvent(added);
 	}
 
 	m_cond_var.Signal();
@@ -447,6 +464,7 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 		if (!was_triggered && event.triggered) {
 			event.active_seq = m_next_active_seq++;
 		}
+		NoteWatchdogEvent(event);
 
 		m_cond_var.Signal();
 
@@ -496,6 +514,7 @@ int KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 			event.filter.delete_event_func(m_handle, &event);
 		}
 
+		NoteWatchdogEvent(event, true);
 		m_events.erase(it);
 
 		return OK;

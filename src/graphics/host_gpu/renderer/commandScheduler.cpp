@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -14,6 +15,7 @@
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/watchdogSubmit.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -513,6 +515,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 }
 
 void CommandScheduler::DrainPriorityOperations() {
+	HangWatchdog::Scope wait("priority-drain", reinterpret_cast<uint64_t>(this));
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	++m_priority_waiters;
@@ -546,6 +549,8 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	if (PriorityDoneLocked(tick)) {
 		return;
 	}
+	HangWatchdog::Scope wait("priority-completion", reinterpret_cast<uint64_t>(this), tick,
+	                         m_priority_active_tick, 0, m_priority_operations.size());
 	if (const auto spin_ns = PriorityWaitSpinNs(); spin_ns != 0) {
 		// Spin on the runner's progress counter and take the lock only when it moves: the
 		// runner needs the lock to finish each operation.
@@ -577,6 +582,7 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
+	HangWatchdog::Scope callback("priority-or-pending-callback", reinterpret_cast<uint64_t>(this));
 	auto* previous                = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
 	operation();
@@ -637,9 +643,17 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
+	HangWatchdog::NoteSubmission();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
+		// Work its owner deferred to the end of this command buffer (SetPreSubmitHook).
+		m_in_pre_submit = true;
+		m_pre_submit_hook(m_pre_submit_hook_context);
+		m_in_pre_submit = false;
+		EXIT_IF(m_command.IsInvalid());
+	}
 	for (auto* dependency: m_submit_dependencies) {
 		if (dependency == nullptr) {
 			continue;
@@ -786,6 +800,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 
 		{
 			KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::DriverSubmit");
+			HangWatchdog::Scope native(
+			    "vkQueueSubmit-direct",
+			    reinterpret_cast<uint64_t>(static_cast<VkQueue>(graphics.queue)), tick, 0,
+			    submit.num_wait_semaphores, submit.num_signal_semaphores);
+			NoteWatchdogSubmit(graphics.queue, submit_info, tick);
 			result = graphics.queue.submit(1, &submit_info, nullptr);
 		}
 	}

@@ -3079,6 +3079,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() &&
+	    (m_binding_plan == nullptr || m_binding_plan->pipeline == nullptr)) {
+		m_context.GetPipelineCache().PrefetchGraphicsPipeline(
+		    {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
+		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+		    state.programs);
+	}
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
 	// Reused per thread (draws run on the GPU thread under the render mutex).

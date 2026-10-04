@@ -3,9 +3,10 @@
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
-#include "common/logging/log.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -18,6 +19,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/gpuTouchedPages.h"
+#include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
@@ -25,9 +27,9 @@
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuPredication.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/renderer/threadSampler.h"
 #include "graphics/host_gpu/syncEpoch.h"
@@ -38,12 +40,11 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
-#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
-#include <chrono>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -315,6 +316,8 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		operation();
 		done.release();
 	});
+	HangWatchdog::Scope wait("cp-service-command", reinterpret_cast<uint64_t>(this),
+	                         reinterpret_cast<uint64_t>(&done));
 	done.acquire();
 }
 
@@ -387,6 +390,7 @@ bool GuestGpu::FrameFencePassed(const Submission& submission) const {
 void GuestGpu::AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick) {
 	Common::LockGuard lock(m_queue_mutex);
 	m_deferred_labels.push_back({address, size, tick});
+	HangWatchdog::NoteEvent(address, "deferred-label", tick, INT16_MIN, false, 0, size);
 	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
 	                             std::memory_order_release);
 }
@@ -399,6 +403,7 @@ void GuestGpu::RemoveDeferredLabel(uint64_t address, uint64_t tick) {
 	                                });
 	EXIT_IF(found == m_deferred_labels.end());
 	m_deferred_labels.erase(found);
+	HangWatchdog::NoteEvent(address, "deferred-label", tick, INT16_MIN, false, 0, 0, true);
 	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
 	                             std::memory_order_release);
 	// A queue suspended on this label (WAIT_REG_MEM) can make progress now.
@@ -512,6 +517,7 @@ void GuestGpu::Done() {
 	if (IsGpuThread() || target == 0) {
 		return;
 	}
+	HangWatchdog::Scope blocked("agc-done-prefix", reinterpret_cast<uint64_t>(this), target);
 	const auto wait_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
 	{
 		Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::AgcDoneWait);
@@ -523,6 +529,7 @@ void GuestGpu::Done() {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::AgcDoneBoundedWaits);
 			++m_done_waiters;
 			while (!prefix_done()) {
+				blocked.Observed(m_in_flight.empty() ? 0 : *m_in_flight.begin());
 				m_done_progress.Wait(&m_queue_mutex);
 			}
 			--m_done_waiters;
@@ -932,12 +939,21 @@ CpSeq::Result CommandProcessor::ExecWaitRegMem(const CpSeq::WaitRegMemOp& op) {
 
 template <typename T>
 CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& op) {
+	const auto queue =
+	    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
+	HangWatchdog::Scope blocked("wait-reg-mem-read", op.addr, op.ref, 0, op.mask, op.func);
 	const auto* addr  = reinterpret_cast<const T*>(op.addr);
 	const auto  ref   = static_cast<T>(op.ref);
 	const auto  mask  = static_cast<T>(op.mask);
 	const auto  func  = op.func;
 	const auto  value  = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
 	const bool  passed = TestWaitRegMemValue(value, ref, mask, func);
+	blocked.Observed(static_cast<uint64_t>(value));
+	if (passed)
+		HangWatchdog::ClearQueueWait(queue);
+	else
+		HangWatchdog::NoteQueueWait(queue, "WAIT_REG_MEM", op.addr, op.ref, value, op.mask, op.func,
+		                            op.size);
 	if (HangTrace::CpTraceEnabled()) {
 		// One row per wait: the first failed evaluation, and the pass (aux = failed retries).
 		struct WaitTrace {
@@ -1222,6 +1238,7 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForIdle() {
+	HangWatchdog::Scope wait("cp-idle", reinterpret_cast<uint64_t>(this));
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
@@ -1257,6 +1274,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -1279,6 +1297,8 @@ void GuestGpu::ThreadRun(void* data) {
 						continue;
 					}
 					if (!gpu->FrameFencePassed(queue.front())) {
+						HangWatchdog::NoteQueue(id, queue.front().sequence, "frame-fence-held",
+						                        queue.front().frame_fence);
 						if (queue.front().fence_hold_ns == 0) {
 							queue.front().fence_hold_ns = CpNowNs();
 						}
@@ -1302,6 +1322,9 @@ void GuestGpu::ThreadRun(void* data) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::FrameFenceHolds);
 				}
 				if (selected_queue < 0) {
+					HangWatchdog::Scope suspended("cp-all-queues-suspended",
+					                              reinterpret_cast<uint64_t>(gpu),
+					                              gpu->m_submission_count);
 					gpu->m_processing = false;
 					if (!wakeups) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -1351,6 +1374,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			HangWatchdog::Scope service("cp-service-execute", reinterpret_cast<uint64_t>(gpu));
 			command();
 			SyncEpoch::Advance();
 			// KYTY_DRAW_RUN: a service command is other command-processor work.
@@ -1376,8 +1400,17 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		HangTrace::SetCpContext(submission.queue_id, submission.sequence);
+		HangWatchdog::SetCpContext(submission.queue_id, submission.sequence);
+		HangWatchdog::NoteQueue(submission.queue_id, submission.sequence, "executing",
+		                        submission.frame_fence);
+		HangWatchdog::DebugDelay("queue", submission.queue_id);
 		Live::CpSliceBegin(); // CP busy time in the "Live:" lines (KYTY_LIVE_FILE only)
 		const bool complete = gpu->Process(submission);
+		HangWatchdog::NoteQueue(
+		    submission.queue_id, submission.sequence,
+		    complete ? "complete"
+		             : (submission.command_execution.Yielded() ? "yielded" : "blocked"),
+		    submission.frame_fence);
 		Live::CpSliceEnd();
 		if (HangTrace::Enabled()) {
 			HangTrace::RecordQueueBusy(submission.queue_id, HangTrace::NowNs() - slice_start,
@@ -1392,6 +1425,7 @@ void GuestGpu::ThreadRun(void* data) {
 			HangTrace::RecordCp(event);
 		}
 		HangTrace::SetCpContext(UINT32_MAX, 0);
+		HangWatchdog::SetCpContext(UINT32_MAX, 0);
 
 		if (complete || submission.slice_progress) {
 			spin_deadline = 0;
@@ -1781,6 +1815,17 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	}
 
 	EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+	if (HangWatchdog::Enabled() && !reference && !sequencer) {
+		const auto q =
+		    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
+		const auto word = [&](uint32_t i) {
+			return i < std::min<uint32_t>(remaining_dw, KYTY_PM4_LEN(packet_header) + 2u)
+			           ? packet[i]
+			           : 0u;
+		};
+		HangWatchdog::NotePacket(q, m_submit_id, guest_packet, packet_header, word(1), word(2),
+		                         word(3), word(4));
+	}
 
 	if (GraphicsRunDebugDumpEnabled() && !reference && !prefetch) {
 		LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
@@ -2834,6 +2879,7 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 	if (!FlipWaitSuspends()) {
 		BufferFlush();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitBlocking);
+		HangWatchdog::Scope wait("cp-flip-done", handle, index);
 		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
 		return {};
 	}
@@ -2847,9 +2893,15 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
 		}
 		m_flip_wait_suspended = true;
+		const auto queue =
+		    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
+		HangWatchdog::NoteQueueWait(queue, "WAIT_FLIP_DONE", handle, 0, 1, index, 0, 0);
 		return {true, 0};
 	}
 	m_flip_wait_suspended = false;
+	const auto queue =
+	    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
+	HangWatchdog::ClearQueueWait(queue);
 	return {};
 }
 
@@ -2884,6 +2936,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	auto&      scheduler = GetScheduler();
 	const auto tick      = scheduler.CurrentTick();
 	gpu.AddDeferredLabel(address, size, tick);
+	HangWatchdog::NoteEvent(address, "deferred-label", tick, INT16_MIN, false, value, size);
 	TraceCpLabel(proxy ? "label-defer-proxy" : (ordered ? "label-defer-ordered" : "label-defer"),
 	             dst, value, size);
 	const int64_t trace_queue =
@@ -2914,6 +2967,8 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 		                                          trace_queue] {
 			    {
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
+				    HangWatchdog::Scope write("deferred-label-write", address, written, tick, size);
+				    HangWatchdog::DebugDelay("label", address);
 				    std::memcpy(reinterpret_cast<void*>(address), &written, size);
 			    }
 			    if (HangTrace::CpTraceEnabled()) {
@@ -5196,6 +5251,14 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			                                        snapshot->shaders);
 		}
 		m_executing       = true;
+		uint64_t diagnostic_args[4] {};
+		if (HangWatchdog::Enabled()) {
+			std::memcpy(diagnostic_args, view.payload,
+			            std::min<size_t>(sizeof(diagnostic_args), CpSeq::PayloadSize(kind)));
+			HangWatchdog::NotePacket(0, submission, 0, 0x10000u + static_cast<uint32_t>(kind),
+			                         diagnostic_args[0], diagnostic_args[1], diagnostic_args[2],
+			                         diagnostic_args[3], CpSeq::OpKindName(kind));
+		}
 		const auto result = ExecuteOp(kind, view.payload, view.data);
 		m_executing       = false;
 		if (snapshot != nullptr) {

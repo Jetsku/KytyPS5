@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "common/ramStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -148,6 +149,10 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
+		Common::RamStats::Range((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0
+		                           ? "Vulkan mapped device buffer"
+		                           : "Vulkan mapped system buffer",
+		                       m_mapped.data(), size);
 	}
 	if (VramStats::Enabled()) {
 		const auto kind = cpu_address != 0              ? VramStats::Kind::GuestBuffer

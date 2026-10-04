@@ -147,6 +147,13 @@ private:
 		static_assert(std::is_invocable_v<Flush&>);
 		static_assert(std::is_nothrow_invocable_v<AheadFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
+		// KYTY_FAULT_AHEAD_ADAPT (SetFaultAheadOverride): a larger window for write faults.
+		FaultPolicy policy = m_fault_policy;
+		policy.hot_max     = HotMax();
+		if (const auto ahead = s_ahead_override.load(std::memory_order_relaxed);
+		    write_fault && ahead > policy.ahead_pages) {
+			policy.ahead_pages = ahead;
+		}
 		// The pages this makes CPU-dirty become writable when the scope ends, after every region
 		// lock below is released (KYTY_DEFER_UNPROTECT): their bits, serials and mirrors change
 		// under the lock as before, only the host call leaves it.
@@ -163,14 +170,12 @@ private:
 					return true;
 				}
 				if (write_fault) {
-					const auto [begin, end] = FaultWindow(offset, bytes);
+					const auto [begin, end] = FaultWindow(offset, bytes, policy.ahead_pages);
 					NotifyCpuMutation(manager->GetCpuAddr() + begin, end - begin);
 				} else {
 					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
 				}
 				if (write_fault) {
-					auto policy    = m_fault_policy;
-					policy.hot_max = HotMax();
 					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes, policy,
 					                                Frame(), m_hot_count, on_ahead);
 				} else {
@@ -181,6 +186,9 @@ private:
 			}();
 			if (should_flush) {
 				on_flush();
+			}
+			if (fault.already_dirty) {
+				t_fault_found_dirty = true;
 			}
 			MemoryStats::Count(MemoryStats::Counter::FaultAheadPages, fault.ahead_pages);
 			MemoryStats::Count(MemoryStats::Counter::HotPromotions, fault.promoted);
@@ -200,6 +208,21 @@ public:
 	// otherwise FaultPolicy::hot_max. Pages already hot above a lowered limit stay hot until they
 	// are demoted as usual.
 	[[nodiscard]] uint32_t HotMax() const noexcept;
+	// KYTY_FAULT_AHEAD_ADAPT (BufferCache): write faults use a fault-ahead window of at least this
+	// many pages (a power of two dividing TRACKER_REGION_PAGES; 0 or anything smaller than the
+	// policy's: the policy's). Any thread; a fault takes the value current when it starts.
+	static void SetFaultAheadOverride(uint32_t pages) noexcept {
+		const bool valid = pages != 0 && (pages & (pages - 1)) == 0 && pages <= TRACKER_REGION_PAGES;
+		s_ahead_override.store(valid ? pages : 0, std::memory_order_relaxed);
+	}
+	[[nodiscard]] static uint32_t FaultAheadOverride() noexcept {
+		return s_ahead_override.load(std::memory_order_relaxed);
+	}
+	// Diagnostics (KYTY_FAULT_MAP): whether a write fault on this thread since the last call found
+	// a faulting page CPU-dirty already (FaultResult::already_dirty). Resets the flag.
+	[[nodiscard]] static bool TakeFaultFoundDirty() noexcept {
+		return std::exchange(t_fault_found_dirty, false);
+	}
 	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint32_t Frame() const noexcept {
@@ -441,9 +464,11 @@ private:
 	void           NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept;
 	void           AdvanceCpuMutationEpoch() noexcept;
 	// The region-relative byte window a write fault of [offset, offset + bytes) can make CPU-dirty
-	// (RegionManager::MarkWriteFault's fault-ahead window).
-	[[nodiscard]] std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset,
-	                                                        uint64_t bytes) const noexcept;
+	// (RegionManager::MarkWriteFault's fault-ahead window of `ahead` pages).
+	[[nodiscard]] static std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset, uint64_t bytes,
+	                                                               uint64_t ahead) noexcept;
+	inline static std::atomic_uint32_t s_ahead_override {0};
+	inline static thread_local bool   t_fault_found_dirty = false;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
