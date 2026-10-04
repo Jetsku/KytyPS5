@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -387,6 +388,17 @@ private:
 		};
 		std::vector<UploadSpans> upload_spans;
 		size_t                   upload_span_count = 0;
+		// Destination -> upload_spans index, built once more than UploadSpanIndexMin destinations
+		// are queued (a BDA pass queues hundreds), so that each request finds its destination
+		// without scanning them all. Empty while fewer are queued.
+		static constexpr size_t                UploadSpanIndexMin = 16;
+		std::unordered_map<VkBuffer, uint32_t> upload_span_index;
+		void ClearUploadSpans() {
+			upload_span_count = 0;
+			if (!upload_span_index.empty()) {
+				upload_span_index.clear();
+			}
+		}
 		uint32_t                              origins = 0; // bit per BarrierOrigin
 
 		[[nodiscard]] bool Empty() const {
@@ -399,7 +411,7 @@ private:
 			buffers.clear();
 			uploads.clear();
 			upload_regions.clear();
-			upload_span_count = 0;
+			ClearUploadSpans();
 			origins = 0;
 		}
 	};
