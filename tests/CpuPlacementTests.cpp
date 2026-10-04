@@ -31,6 +31,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -187,6 +191,11 @@ void TestAffinityAndModes() {
 	Check(Common::GeneralPoolAffinity(0x14, layout) == 0x14,
 	      "a hard affinity that meets the general processors is kept");
 	Check(Common::GeneralPoolAffinity(0x4, CpuLayout {}) == 0x4, "nothing reserved: kept");
+	Check(Common::NarrowedAffinity(0xFFFF, 0x7F7F) == 0x7F7F, "Linux: the reserved core is removed");
+	Check(Common::NarrowedAffinity(0x0101, 0x7F7F) == 0x0101, "Linux: a narrower affinity is kept");
+	Check(Common::NarrowedAffinity(0x8080, 0x7F7F) == 0x7F7F,
+	      "Linux: one confined to the reserved core gets every general processor");
+	Check(Common::NarrowedAffinity(0x8080, 0) == 0x8080, "Linux: nothing applied: kept");
 	bool valid = false;
 	Check(Common::ParseCpuReserveMode("cp", &valid) == CpuReserveMode::Cp && valid, "mode cp");
 	Check(Common::ParseCpuReserveMode("1", &valid) == CpuReserveMode::Cp && valid, "mode 1");
@@ -859,6 +868,72 @@ int Bench(double seconds, uint32_t reps) {
 
 #endif
 
+#if defined(__linux__)
+uint64_t LinuxAffinity() {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+		return 0;
+	}
+	uint64_t mask = 0;
+	for (uint32_t cpu = 0; cpu < 64; cpu++) {
+		if (CPU_ISSET(cpu, &set)) {
+			mask |= uint64_t {1} << cpu;
+		}
+	}
+	return mask;
+}
+
+// The CP keeps its core; a thread it creates inherits that core and leaves it at the monitor's
+// next pass (MaintainCpuPlacement); one created by another thread never runs there.
+void TestLiveLinux(CpuReserveMode mode) {
+	uint64_t other_before = 0;
+	std::thread([&] { other_before = LinuxAffinity(); }).join();
+	Common::InitCpuPlacement();
+	const auto layout = Common::CurrentCpuLayout();
+	std::printf("CpuPlacementTests: live %s: %s\n",
+	            mode == CpuReserveMode::Cp ? "cp" : "cp+recorder", layout.description.c_str());
+	if (!layout.reserved) {
+		std::puts("CpuPlacementTests: live skipped (nothing reserved on this machine)");
+		return;
+	}
+	const auto reserved = layout.cp_mask | layout.recorder_mask;
+	std::atomic<int> phase {0};
+	uint64_t         child_inherited = 0;
+	uint64_t         child_after     = 0;
+	uint64_t         cp_mask         = 0;
+	std::thread      cp([&] {
+        Common::PlaceCurrentThread(Common::ThreadRole::Cp);
+        cp_mask = LinuxAffinity();
+        std::thread child([&] {
+            child_inherited = LinuxAffinity();
+            phase           = 1;
+            while (phase.load() != 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            child_after = LinuxAffinity();
+        });
+        while (phase.load() != 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Common::MaintainCpuPlacement();
+        phase = 2;
+        child.join();
+    });
+	cp.join();
+	uint64_t other_after = 0;
+	std::thread([&] { other_after = LinuxAffinity(); }).join();
+	Check(cp_mask == layout.cp_mask, "Linux: the CP runs on its reserved core only");
+	Check(child_inherited == layout.cp_mask, "Linux: a thread the CP creates inherits its core");
+	Check(child_after != 0 && (child_after & reserved) == 0,
+	      "Linux: the monitor's pass moves it off the reserved cores");
+	Check(other_after != 0 && (other_after & reserved) == 0,
+	      "Linux: threads created by other threads stay off the reserved cores");
+	Check((other_before & reserved) != 0, "Linux: before the layout they could run there");
+	std::puts("CpuPlacementTests: live ok");
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -893,8 +968,10 @@ int main(int argc, char** argv) {
 	Check(Common::GetCpuReserveMode() == mode, "KYTY_CPU_RESERVE");
 #if defined(_WIN32)
 	TestLive(mode);
+#elif defined(__linux__)
+	TestLiveLinux(mode);
 #else
-	std::puts("CpuPlacementTests: live placement skipped (Windows only)");
+	std::puts("CpuPlacementTests: live placement skipped (Windows and Linux only)");
 #endif
 	std::puts("CpuPlacementTests: ok");
 	return 0;

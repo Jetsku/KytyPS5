@@ -18,6 +18,9 @@
 // process default CPU sets: guest threads, draw-prep workers, service and completion threads, the
 // CP recorder, and driver threads alike.
 // cp+recorder: the CP recorder thread (KYTY_CP_RECORDER=1) gets a second core the same way.
+// Linux: the same layout through hard thread affinities (sched_setaffinity), with the topology from
+// sysfs. The monitor narrows every other thread once a second, as threads inherit the affinity of
+// the thread that creates them (the CP creates the draw-prep workers and the sequencer).
 //
 // Details:
 // - The allowed processors are read at runtime: the process affinity mask (Process Lasso pins
@@ -98,6 +101,10 @@ inline constexpr uint32_t kMinGeneralProcessors = 6;
 // (the CPU sets narrow it), otherwise every general processor.
 [[nodiscard]] uint64_t GeneralPoolAffinity(uint64_t affinity, const CpuLayout& layout);
 
+// Pure (tested), Linux: there are no soft CPU sets, so every thread but the reserved ones gets a
+// hard affinity narrowed to `general` (the processors left to other threads): the ones of
+// `affinity` among them, or all of them when it has none. Unchanged when `general` is 0.
+[[nodiscard]] uint64_t NarrowedAffinity(uint64_t affinity, uint64_t general);
 // KYTY_CPU_RESERVE=off|cp|cp+recorder (also 0|1|2); nullptr is off. `valid` false: unknown text.
 [[nodiscard]] CpuReserveMode ParseCpuReserveMode(const char* text, bool* valid = nullptr);
 [[nodiscard]] CpuReserveMode GetCpuReserveMode(); // KYTY_CPU_RESERVE, evaluated once
