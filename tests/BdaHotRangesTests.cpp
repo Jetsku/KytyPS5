@@ -62,9 +62,9 @@ void TestCoverage() {
 		std::vector<Range> ranges;
 		std::array<std::array<bool, 256>, 4> before {}, after {};
 		for (unsigned i = 0; i < 64; ++i) {
-			const auto index = random() % 4;
-			const auto begin = random() % 240;
-			const auto size = random() % 16 + 1;
+			const auto index = static_cast<uint32_t>(random() % 4);
+			const auto begin = static_cast<uint32_t>(random() % 240);
+			const auto size = static_cast<uint32_t>(random() % 16 + 1);
 			ranges.push_back({Common::SlotId {index, 1}, begin, size});
 			for (auto p = begin; p < begin + size; ++p) before[index][p] = true;
 		}
