@@ -3,12 +3,14 @@
 #include "libs/acm.h"
 #include "libs/audio3d.h"
 #include "libs/audio.h"
+#include "libs/audioPropagation.h"
 #include "libs/ngs2.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -18,60 +20,86 @@ namespace LibAudioPropagation {
 
 LIB_VERSION("AudioPropagation", 1, "AudioPropagation", 1, 0);
 
-using AudioPropagationHandle = uint64_t;
+// libSceAudioPropagation: objects as handles, an empty propagation scene and the direct sound in
+// each source's render (libs/audioPropagation.h). The function names were matched to the NIDs by
+// their hashes; the arguments follow Astro Bot's calls.
+namespace AP = Libs::AudioPropagation;
 
-struct AudioPropagationStructDescriptor {
-	uint32_t id;
-	size_t   size;
-};
+using AudioPropagationHandle = AP::Handle;
 
 struct AudioPropagationSystemMemory {
-	AudioPropagationStructDescriptor desc;
-	void*                            p_cpu_mem;
-	size_t                           size_cpu_mem;
-	void*                            p_gpu_mem;
-	size_t                           size_gpu_mem;
+	AP::StructDescriptor desc;
+	void*                p_cpu_mem;
+	size_t               size_cpu_mem;
+	void*                p_gpu_mem;
+	size_t               size_gpu_mem;
 };
 
-static AudioPropagationHandle AudioPropagationNextHandle() {
-	static std::atomic_uint64_t next_handle {1};
-	return next_handle.fetch_add(1, std::memory_order_relaxed);
+// One console line at the first call of each entry point the game uses.
+static void NoteFirstCall(std::atomic_bool& seen, const char* what) {
+	if (!seen.exchange(true, std::memory_order_relaxed)) {
+		std::printf("AudioPropagation: first %s\n", what);
+	}
 }
+
+static int32_t CreateObject(AP::Kind kind, AudioPropagationHandle* out_handle) {
+	if (out_handle == nullptr) {
+		return AP::ErrorInvalidParam;
+	}
+	*out_handle = AP::Create(kind);
+	return 0;
+}
+
+// The memory the game provides for the system. The HLE state lives on the host, so the sizes are
+// only what the game must allocate to be satisfied by a nonzero request (the library's real sizes
+// are not known); the buffers are never touched by Kyty.
+static constexpr size_t AudioPropagationCpuMemorySize = 1024u * 1024u;
+static constexpr size_t AudioPropagationGpuMemorySize = 64u * 1024u;
 
 static int32_t KYTY_SYSV_ABI AudioPropagationSystemQueryMemory(
     const void* /*options*/, AudioPropagationSystemMemory* out_memory) {
 	PRINT_NAME();
 
-	if (out_memory != nullptr) {
-		out_memory->p_cpu_mem    = nullptr;
-		out_memory->size_cpu_mem = 0;
-		out_memory->p_gpu_mem    = nullptr;
-		out_memory->size_gpu_mem = 0;
+	if (out_memory == nullptr) {
+		return AP::ErrorInvalidParam;
 	}
-
+	out_memory->size_cpu_mem = AudioPropagationCpuMemorySize;
+	out_memory->size_gpu_mem = AudioPropagationGpuMemorySize;
 	return 0;
 }
 
 static int32_t KYTY_SYSV_ABI
 AudioPropagationSystemCreate(const void* /*options*/, AudioPropagationSystemMemory* /*memory*/,
                              AudioPropagationHandle* out_system_handle) {
+	static std::atomic_bool seen {false};
+	NoteFirstCall(seen, "sceAudioPropagationSystemCreate");
 	PRINT_NAME();
+	return CreateObject(AP::Kind::System, out_system_handle);
+}
 
-	if (out_system_handle != nullptr) {
-		*out_system_handle = AudioPropagationNextHandle();
-	}
-
+static int32_t KYTY_SYSV_ABI AudioPropagationSystemDestroy(AudioPropagationHandle system_handle) {
+	PRINT_NAME();
+	AP::Destroy(system_handle);
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /*system_handle*/,
-                                                        AudioPropagationHandle* out_room_handle) {
-	PRINT_NAME();
+static int32_t KYTY_SYSV_ABI
+AudioPropagationSystemSetAttributes(AudioPropagationHandle /*system_handle*/,
+                                    const AP::Attribute* /*attributes*/, uint32_t /*num_attributes*/) {
+	return 0;
+}
 
-	if (out_room_handle != nullptr) {
-		*out_room_handle = AudioPropagationNextHandle();
+// The rays the library wants the game to trace: none in an empty scene.
+static int32_t KYTY_SYSV_ABI AudioPropagationSystemGetRays(AudioPropagationHandle /*system_handle*/,
+                                                           void* /*rays*/, uint32_t* num_rays) {
+	if (num_rays != nullptr) {
+		*num_rays = 0;
 	}
+	return 0;
+}
 
+static int32_t KYTY_SYSV_ABI AudioPropagationSystemSetRays(AudioPropagationHandle /*system_handle*/,
+                                                           const void* /*rays*/, uint32_t /*num_rays*/) {
 	return 0;
 }
 
@@ -79,40 +107,159 @@ static int32_t KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
     AudioPropagationHandle /*system_handle*/, const void* /*material*/,
     AudioPropagationHandle* out_material_handle) {
 	PRINT_NAME();
+	return CreateObject(AP::Kind::Material, out_material_handle);
+}
 
-	if (out_material_handle != nullptr) {
-		*out_material_handle = AudioPropagationNextHandle();
+// Astro Bot passes the material handle first (its second argument register is not set).
+static int32_t KYTY_SYSV_ABI AudioPropagationSystemUnregisterMaterial(AudioPropagationHandle first,
+                                                                      AudioPropagationHandle second) {
+	PRINT_NAME();
+	if (!AP::Destroy(first) && AP::IsLive(second, AP::Kind::Material)) {
+		AP::Destroy(second);
 	}
+	return 0;
+}
 
+static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /*system_handle*/,
+                                                        AudioPropagationHandle* out_room_handle) {
+	static std::atomic_bool seen {false};
+	NoteFirstCall(seen, "sceAudioPropagationRoomCreate");
+	PRINT_NAME();
+	return CreateObject(AP::Kind::Room, out_room_handle);
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationRoomDestroy(AudioPropagationHandle /*system_handle*/,
+                                                         AudioPropagationHandle room_handle) {
+	PRINT_NAME();
+	AP::Destroy(room_handle);
+	return 0;
+}
+
+// The parameters (descriptor 0x010107d8, 0x60 bytes) hold the portal's corners and its two rooms.
+static int32_t KYTY_SYSV_ABI AudioPropagationPortalCreate(AudioPropagationHandle /*system_handle*/,
+                                                          const void* /*params*/,
+                                                          AudioPropagationHandle* out_portal_handle) {
+	static std::atomic_bool seen {false};
+	NoteFirstCall(seen, "sceAudioPropagationPortalCreate");
+	PRINT_NAME();
+	return CreateObject(AP::Kind::Portal, out_portal_handle);
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationPortalDestroy(AudioPropagationHandle /*system_handle*/,
+                                                           AudioPropagationHandle portal_handle) {
+	PRINT_NAME();
+	AP::Destroy(portal_handle);
+	return 0;
+}
+
+// Called whenever a portal opens, closes or moves (thousands of times in the clock tower level).
+static int32_t KYTY_SYSV_ABI
+AudioPropagationPortalSetAttributes(AudioPropagationHandle /*portal_handle*/,
+                                    const AP::Attribute* /*attributes*/, uint32_t /*num_attributes*/) {
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceCreate(AudioPropagationHandle /*system_handle*/,
+                                                          AudioPropagationHandle* out_source_handle) {
+	static std::atomic_bool seen {false};
+	NoteFirstCall(seen, "sceAudioPropagationSourceCreate");
+	PRINT_NAME();
+	return CreateObject(AP::Kind::Source, out_source_handle);
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceDestroy(AudioPropagationHandle /*system_handle*/,
+                                                           AudioPropagationHandle source_handle) {
+	PRINT_NAME();
+	AP::Destroy(source_handle);
 	return 0;
 }
 
 static int32_t KYTY_SYSV_ABI
-AudioPropagationSystemSetAttributes(AudioPropagationHandle /*system_handle*/,
-                                    const void* /*attributes*/, uint32_t /*num_attributes*/) {
-	PRINT_NAME();
-
+AudioPropagationSourceSetAttributes(AudioPropagationHandle source_handle,
+                                    const AP::Attribute* attributes, uint32_t num_attributes) {
+	AP::SetSourceAttributes(source_handle, attributes, num_attributes);
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudioPropagationSystemGetRays(AudioPropagationHandle /*system_handle*/,
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceGetRays(AudioPropagationHandle /*source_handle*/,
                                                            void* /*rays*/, uint32_t* num_rays) {
-	PRINT_NAME();
-
 	if (num_rays != nullptr) {
 		*num_rays = 0;
 	}
+	return 0;
+}
 
+// The results keep what the game initialised them to (each path's gains 1.0).
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceCalculateAudioPaths(
+    AudioPropagationHandle /*source_handle*/, const void* /*rays*/, uint32_t /*num_rays*/,
+    uint32_t /*flags*/, void* /*results*/, uint32_t /*num_results*/) {
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceGetAudioPathCount(
+    AudioPropagationHandle /*source_handle*/, uint32_t* num_paths) {
+	if (num_paths == nullptr) {
+		return AP::ErrorInvalidParam;
+	}
+	*num_paths = 0;
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceGetAudioPath(
+    AudioPropagationHandle /*source_handle*/, uint32_t /*index*/, AudioPropagationHandle* out_path) {
+	static std::atomic_bool seen {false};
+	NoteFirstCall(seen, "sceAudioPropagationSourceGetAudioPath");
+	PRINT_NAME();
+	if (out_path != nullptr) {
+		*out_path = 0;
+	}
+	return AP::ErrorNoPath;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceSetAudioPaths(
+    AudioPropagationHandle /*source_handle*/, const void* /*paths*/, uint32_t /*num_paths*/) {
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceRender(AudioPropagationHandle /*system_handle*/,
+                                                          const AP::RenderParams* params,
+                                                          uint32_t                num_params) {
+	static std::atomic_bool seen {false};
+	NoteFirstCall(seen, "sceAudioPropagationSourceRender");
+	if (params == nullptr && num_params != 0) {
+		return AP::ErrorInvalidParam;
+	}
+	for (uint32_t i = 0; i < num_params; i++) {
+		if (const auto result = AP::Render(params[i]); result != 0) {
+			return result;
+		}
+	}
 	return 0;
 }
 
 LIB_DEFINE(InitAudio_1_AudioPropagation) {
 	LIB_FUNC("7xyAxrusLko", LibAudioPropagation::AudioPropagationSystemQueryMemory);
 	LIB_FUNC("aNEqtSHdUSo", LibAudioPropagation::AudioPropagationSystemCreate);
-	LIB_FUNC("8bI5h8req30", LibAudioPropagation::AudioPropagationRoomCreate);
-	LIB_FUNC("CPLV6G-eXmk", LibAudioPropagation::AudioPropagationSystemRegisterMaterial);
+	LIB_FUNC("x5VPqg5iyAk", LibAudioPropagation::AudioPropagationSystemDestroy);
 	LIB_FUNC("kIdb+iQUzCs", LibAudioPropagation::AudioPropagationSystemSetAttributes);
 	LIB_FUNC("ht-QXT3zGxo", LibAudioPropagation::AudioPropagationSystemGetRays);
+	LIB_FUNC("VlBT16890mA", LibAudioPropagation::AudioPropagationSystemSetRays);
+	LIB_FUNC("CPLV6G-eXmk", LibAudioPropagation::AudioPropagationSystemRegisterMaterial);
+	LIB_FUNC("XKCN4gpeYsM", LibAudioPropagation::AudioPropagationSystemUnregisterMaterial);
+	LIB_FUNC("8bI5h8req30", LibAudioPropagation::AudioPropagationRoomCreate);
+	LIB_FUNC("S0JwP2AFTTE", LibAudioPropagation::AudioPropagationRoomDestroy);
+	LIB_FUNC("b-dYXrjSNZU", LibAudioPropagation::AudioPropagationPortalCreate);
+	LIB_FUNC("ZQXE-xS6MTE", LibAudioPropagation::AudioPropagationPortalDestroy);
+	LIB_FUNC("WXMhENV2NcA", LibAudioPropagation::AudioPropagationPortalSetAttributes);
+	LIB_FUNC("d84otraxt2s", LibAudioPropagation::AudioPropagationSourceCreate);
+	LIB_FUNC("wkseM3LWPuc", LibAudioPropagation::AudioPropagationSourceDestroy);
+	LIB_FUNC("-wsUTr31yeg", LibAudioPropagation::AudioPropagationSourceSetAttributes);
+	LIB_FUNC("aKJZx7wCma8", LibAudioPropagation::AudioPropagationSourceGetRays);
+	LIB_FUNC("PBcrVpEqUVY", LibAudioPropagation::AudioPropagationSourceCalculateAudioPaths);
+	LIB_FUNC("G+QLTfyLMYk", LibAudioPropagation::AudioPropagationSourceGetAudioPathCount);
+	LIB_FUNC("eEeKqFeNI3o", LibAudioPropagation::AudioPropagationSourceGetAudioPath);
+	LIB_FUNC("5vzOS2pHMFc", LibAudioPropagation::AudioPropagationSourceSetAudioPaths);
+	LIB_FUNC("hhz9pITnC8k", LibAudioPropagation::AudioPropagationSourceRender);
 }
 
 } // namespace LibAudioPropagation
