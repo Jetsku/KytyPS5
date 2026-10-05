@@ -44,6 +44,15 @@ public:
 			return;
 		}
 	}
+	// Drops the tasks that have not started (running ones finish). Their owners must not wait for
+	// them any more: a std::packaged_task or promise left unfulfilled reports a broken promise.
+	size_t DropPending() {
+		std::lock_guard lock(m_mutex);
+		const auto dropped = m_tasks.size();
+		m_tasks.clear();
+		m_outstanding -= dropped;
+		return dropped;
+	}
 	void Stop() {
 		{
 			std::lock_guard lock(m_mutex);

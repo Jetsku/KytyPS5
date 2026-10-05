@@ -271,6 +271,26 @@ public:
 	void NotePlannedPipeline(const RenderDepthInfo& depth, const ShaderPixelInputInfo* ps_input_info);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// The pipeline a compute dispatch runs, or null when the dispatch must be skipped. Programs
+	// without software BVH instructions get GetComputePipeline's (built on this thread). A
+	// software ray-tracing kernel (program.info.uses_bvh, KYTY_RT_SOFTWARE) builds on a background
+	// thread: its first dispatch waits up to KYTY_RT_PIPELINE_WAIT_MS (default 250) for it, then
+	// every dispatch is skipped until it is ready, so a cold 300k-word compile (17 s on an RTX 50
+	// GPU) never freezes the command processor; the lighting it feeds lags. Null also, for every
+	// RT kernel, once any RT pipeline failed to build (rtSession.h: software RT is then off for the
+	// session, logged once). KYTY_RT_PIPELINE_ASYNC=0 builds in the background but waits for it.
+	[[nodiscard]] Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                              const ShaderProgram&          compute_program);
+	// Starts the background build of an RT kernel's pipeline without waiting (the shader precompile
+	// replay: the game's first dispatch then finds it built). Does nothing for other programs.
+	void PrewarmComputePipeline(const ShaderComputeInputInfo& input_info,
+	                            const ShaderProgram&          compute_program);
+	// RT kernels' pipelines: published, failed, and the time the CP waited for them (tests, log).
+	struct RtPipelineTotals {
+		uint64_t requested = 0, published = 0, failed = 0, skipped_dispatches = 0, waited = 0;
+		uint64_t wait_ns = 0, build_ns = 0, max_build_ns = 0;
+	};
+	[[nodiscard]] RtPipelineTotals GetRtPipelineTotals() const;
 
 	// Process-wide totals of the program caches (tests and diagnostics): permutations created
 	// (emitted or reloaded), TranslateProgram runs, and the persistent program cache's reloads and
@@ -382,6 +402,11 @@ private:
 	std::unique_ptr<FastFirstState> m_fast_first;
 	struct PrefetchState;
 	std::unique_ptr<PrefetchState> m_prefetch;
+	// Background pipeline builds of software RT kernels (TryGetComputePipeline).
+	struct RtState;
+	std::unique_ptr<RtState> m_rt;
+	std::once_flag           m_rt_once;
+	[[nodiscard]] RtState&   Rt();
 	// Shader precompile (KYTY_SHADER_PRECOMPILE=1, shaderPrecompile.h): the journal of compiled
 	// permutations' inputs and the background replay of the entries an earlier run left in it.
 	std::unique_ptr<ShaderJournal>     m_shader_journal;
@@ -451,7 +476,10 @@ using ComputePipelineCreateHook =
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            const ComputePipelineCreateHook* create_hook = nullptr);
+                            const ComputePipelineCreateHook* create_hook = nullptr,
+                            // Not null: a failed creation is returned here (and cleaned up)
+                            // instead of stopping the emulator.
+                            vk::Result* result_out = nullptr);
 
 } // namespace Libs::Graphics
 
