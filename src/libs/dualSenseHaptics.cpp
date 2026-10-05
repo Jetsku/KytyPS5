@@ -2,11 +2,13 @@
 
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "libs/audioDiag.h"
 #include "libs/dualSenseBluetooth.h"
 
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <vector>
@@ -35,6 +37,36 @@ uint8_t            g_large_motor = 0, g_small_motor = 0;
 uint64_t           g_rumble_until = 0, g_haptics_until = 0;
 int                g_speaker_controller = -1;
 std::map<int, int> g_speaker_streams;
+
+// Where pad speaker and vibration audio goes, for the console diagnostics: printed when it
+// changes, per port kind, so a 2-second device recheck does not repeat it.
+enum class Route { Unknown, NoWiredPad, NoUsbDevice, Usb, UsbFailed, Bluetooth, BluetoothFailed };
+std::atomic<Route> g_reported_route[2] {Route::Unknown, Route::Unknown};
+
+void ReportRoute(const Stream* stream, Route route, const char* detail) {
+	auto& reported = g_reported_route[stream->speaker ? 1 : 0];
+	if (reported.exchange(route) == route) {
+		return;
+	}
+	const char* text = "unknown";
+	switch (route) {
+		case Route::NoWiredPad:
+			text = "no single wired DualSense and no Bluetooth one; not played";
+			break;
+		case Route::NoUsbDevice:
+			text = "wired DualSense, but no 4-channel 'Wireless Controller' audio device";
+			break;
+		case Route::Usb: text = "USB audio device"; break;
+		case Route::UsbFailed: text = "USB audio device failed to open"; break;
+		case Route::Bluetooth: text = "Bluetooth HID audio"; break;
+		case Route::BluetoothFailed: text = "Bluetooth HID audio failed to open"; break;
+		case Route::Unknown: break;
+	}
+	Libs::Audio::Diag::Print("DualSense %s audio (controller %d, %u Hz): %s%s%s",
+	                         stream->speaker ? "speaker" : "vibration", stream->controller,
+	                         stream->freq, text, detail != nullptr ? ": " : "",
+	                         detail != nullptr ? detail : "");
+}
 
 void ApplyRumble(bool force = false) { // Caller holds g_mutex; no calls into Audio or Controller.
 	SDL_LockJoysticks();
@@ -214,6 +246,7 @@ void RefreshDevice(Stream* stream, int controller, bool wireless) {
 	CloseDevice(stream);
 	stream->device = device;
 	if (!wireless && device == 0) {
+		ReportRoute(stream, Route::NoUsbDevice, nullptr);
 		return;
 	}
 	SDL_AudioStream*            sdl       = nullptr;
@@ -248,12 +281,16 @@ void RefreshDevice(Stream* stream, int controller, bool wireless) {
 		if (!wireless) {
 			LOGF("DualSenseHaptics: playing on '%s'\n", SDL_GetAudioDeviceName(device));
 		}
+		ReportRoute(stream, wireless ? Route::Bluetooth : Route::Usb,
+		            wireless ? nullptr : SDL_GetAudioDeviceName(device));
 	} else {
 		DualSenseBluetooth::Close(bluetooth);
 		SDL_DestroyAudioStream(sdl);
 		if (!wireless) {
 			LOGF("DualSenseHaptics: cannot open quad output: %s\n", SDL_GetError());
 		}
+		ReportRoute(stream, wireless ? Route::BluetoothFailed : Route::UsbFailed,
+		            wireless ? nullptr : SDL_GetError());
 	}
 }
 
@@ -330,6 +367,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	if (!wireless && !CanUseDevice(controller)) {
 		CloseDevice(stream);
 		stream->next_check = 0; // Look for the device as soon as a DualSense is active again.
+		ReportRoute(stream, Route::NoWiredPad, nullptr);
 		return 0;
 	}
 	RefreshDevice(stream, controller, wireless);
