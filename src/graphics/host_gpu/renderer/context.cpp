@@ -69,6 +69,12 @@ bool DepthFeedbackKeepEnabled() {
 	return enabled;
 }
 
+bool DepthFeedbackLazyEnabled() {
+	static const bool enabled =
+	    DepthFeedbackKeepEnabled() && EnvSwitch("KYTY_DEPTH_FEEDBACK_LAZY", true);
+	return enabled;
+}
+
 bool DepthLayoutStableEnabled() {
 	static const bool enabled = EnvSwitch("KYTY_DEPTH_LAYOUT_STABLE", true);
 	return enabled;
@@ -928,13 +934,19 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	StateSink().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	--m_internal_recording;
-	if (m_context.GetOcclusionCounter().Active() &&
-	    (HangTrace::Enabled() || OcclusionCounter::SyncProxyDumps())) {
-		const auto& db = GetRegisters().GetDepthRenderTarget();
-		m_context.GetOcclusionCounter().NoteScope(db.z_read_base_addr, state.width, state.height,
-		                                          state.num_color_attachments,
-		                                          depth_stencil.has_depth,
-		                                          static_cast<uint32_t>(db.z_info.format));
+	if (HangTrace::Enabled() || OcclusionCounter::SyncProxyDumps()) {
+		const auto& db        = GetRegisters().GetDepthRenderTarget();
+		auto&       occlusion = m_context.GetOcclusionCounter();
+		// A query a split dump begins inside this instance reports the same scope
+		// (KYTY_OCCLUSION_SPLIT).
+		occlusion.NoteInstance(db.z_read_base_addr, state.width, state.height,
+		                       state.num_color_attachments, depth_stencil.has_depth,
+		                       static_cast<uint32_t>(db.z_info.format));
+		if (occlusion.Active()) {
+			occlusion.NoteScope(db.z_read_base_addr, state.width, state.height,
+			                    state.num_color_attachments, depth_stencil.has_depth,
+			                    static_cast<uint32_t>(db.z_info.format));
+		}
 	}
 	m_render_state = state;
 	m_rendering    = true;

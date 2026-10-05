@@ -251,6 +251,25 @@ public:
 	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
 	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
 
+	// KYTY_DRAW_PREP_INDIRECT (default on; parallel mode with the CP sequencer): a single-record
+	// indirect draw (DRAW_INDIRECT, DRAW_INDEX_INDIRECT) is published like a direct draw, so a
+	// worker prepares its programs from the same register snapshot meanwhile. Its counts are GPU
+	// data: the preparation assumes the draw draws. The resolver executes the draw as before
+	// (native, or the CPU path) with the preparation offered where the serial path would prepare
+	// the programs (RefreshShaders), under the same certificate (Validate); the binding plan is not
+	// used. Astro Bot's clock tower level issues ~2,400 native indirect draws per frame, each
+	// preparing its programs on the command processor (~9 us of its ~15 us).
+	// KYTY_DRAW_PREP_INDIRECT=0: indirect draws prepare serially again.
+	[[nodiscard]] static bool IndirectEnabled();
+	// Sequencer: publishes an indirect draw's preparation; the window position, or UINT64_MAX.
+	[[nodiscard]] uint64_t PublishIndirect(bool indexed, const HW::Context& context,
+	                                       const HW::UserConfig& user_config,
+	                                       const HW::Shader& shaders,
+	                                       const std::function<bool()>& wait_for_space);
+	// Resolver: runs `draw` (the indirect draw's execution) with the head slot (window position
+	// `position`) prepared and offered to it, then retires the slot.
+	void ExecuteIndirect(uint64_t position, const std::function<void()>& draw);
+
 	// P3c (KYTY_CP_SEQ_PREFETCH, cpOps.h): the sequencer's speculative parse past a wait publishes
 	// draws without ops. Each such slot carries the number of packets and the hash of every byte
 	// the speculative parse consumed from the wait up to and including the draw packet
@@ -289,6 +308,9 @@ private:
 	void Commit(Slot& slot);
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
 	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
+	// The head slot once prepared (by a worker, or here); the caller commits or uses it, then
+	// retires it.
+	Slot& ReadyHead();
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,

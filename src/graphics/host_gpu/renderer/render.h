@@ -157,6 +157,22 @@ struct DrawAutoArgs {
 // is not continued after all, BeginRendering() records the left-out barrier before the next
 // one (CommandBuffer::NoteFeedbackKeep). KYTY_DEPTH_FEEDBACK_KEEP=0 restores the toggles.
 [[nodiscard]] bool DepthFeedbackKeepEnabled();
+// KYTY_DEPTH_FEEDBACK_LAZY (default on, needs KYTY_DEPTH_FEEDBACK_KEEP): the keep adopts the union
+// (attachment + shader read) only when a draw samples the depth attachment or the image already
+// holds the union. A draw that does not sample it while it holds the attachment access alone keeps
+// that access: the union would avoid no barrier for it, and the change of tracked state made the
+// next draw unable to continue the draw run (DrawRun "depth-promotions excluded": about 40% of the
+// draws in Astro Bot's clock tower level, against 0.2% in the Sky Garden). The first sampling draw
+// of the instance adopts the union instead, with the same proof. KYTY_DEPTH_FEEDBACK_LAZY=0
+// restores the promotion by every unwritten draw.
+[[nodiscard]] bool DepthFeedbackLazyEnabled();
+// Whether the depth-feedback keep moves a depth attachment's tracked access to the union
+// (AcquireRenderTargets), given the draw samples it (sampled), its tracked access is the attachment
+// access alone (attachment_only) and the keep's proof holds (keep).
+[[nodiscard]] constexpr bool DepthFeedbackAdoptsUnion(bool keep, bool lazy, bool sampled,
+                                                      bool attachment_only) {
+	return keep && !(lazy && !sampled && attachment_only);
+}
 // KYTY_DEPTH_LAYOUT_STABLE (default on): a depth target the draw does not sample keeps its
 // current attachment layout while that layout allows the draw's writes, instead of taking the
 // narrowest layout for each draw's write aspects (depth_stable_attachment_layout in
@@ -288,6 +304,8 @@ public:
 	[[nodiscard]] uint64_t ActiveRenderingSerial() const {
 		return m_rendering ? m_rendering_serial : 0;
 	}
+	// The DB_COUNT_CONTROL the active rendering instance counts under (OcclusionCounter::Dump).
+	[[nodiscard]] uint32_t OcclusionControl() const { return m_occlusion_control; }
 	// Image barriers queued for the next flush point (inspection).
 	[[nodiscard]] size_t PendingImageBarriers() const { return m_pending.images.size(); }
 	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);

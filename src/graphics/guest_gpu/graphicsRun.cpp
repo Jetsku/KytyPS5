@@ -50,8 +50,11 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <fmt/format.h>
 #include <mutex>
+#include <optional>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -299,7 +302,7 @@ void GuestGpu::ProcessCommands() {
 		SyncEpoch::Advance();
 		// KYTY_DRAW_RUN: other command-processor work (drawPrep/drawRun.h).
 		if (DrawRun::Enabled()) {
-			DrawRun::NoteForeignActivity();
+			DrawRun::NoteForeignActivity("service command");
 		}
 	}
 }
@@ -1048,6 +1051,10 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 		        ? cache.TryWriteDataGpu(address, src + (dw_num - 1u), sizeof(uint32_t))
 		        : cache.TryWriteDataGpu(address, src, uint64_t {dw_num} * sizeof(uint32_t));
 		if (written) {
+			// KYTY_DRAW_RUN_QUIET_OPS: GPU-timeline writes still end a run (ExecuteOp).
+			if (DrawRun::Enabled() && DrawRun::QuietOpsEnabled()) {
+				DrawRun::NoteForeignActivity("WriteData gpu");
+			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataGpu);
 			TraceCpLabel("wd-gpu", dst, src[write_one_address ? dw_num - 1u : 0u],
 			             uint64_t {dw_num} * 4u);
@@ -1381,7 +1388,7 @@ void GuestGpu::ThreadRun(void* data) {
 			SyncEpoch::Advance();
 			// KYTY_DRAW_RUN: a service command is other command-processor work.
 			if (DrawRun::Enabled()) {
-				DrawRun::NoteForeignActivity();
+				DrawRun::NoteForeignActivity("service command");
 			}
 			spin_deadline = 0;
 
@@ -1472,7 +1479,7 @@ bool GuestGpu::Process(Submission& submission) {
 		SyncEpoch::AdvanceSubmission();
 	}
 	if (DrawRun::Enabled()) {
-		DrawRun::NoteForeignActivity();
+		DrawRun::NoteForeignActivity("submission slice");
 	}
 
 	if (first_slice && submission.reset_processor) {
@@ -1591,7 +1598,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	// A new submission, or a slice after other queues ran (syncEpoch.h).
 	SyncEpoch::Advance();
 	if (DrawRun::Enabled()) {
-		DrawRun::NoteForeignActivity();
+		DrawRun::NoteForeignActivity("submission slice");
 	}
 	if (first_slice) {
 		SyncEpoch::AdvanceSubmission();
@@ -2456,11 +2463,41 @@ static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t ind
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	const auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	// KYTY_DRAW_PREP_INDIRECT (drawPrep.h): the draw's programs are prepared in a window slot.
+	auto*      engine  = m_draw_prep.get();
+	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
+	                     engine->Parallel() && DrawPrep::Engine::IndirectEnabled();
+	if (prepare && engine->SpeculativeSlots() != 0) {
+		// The slot must follow the real parse's (a SkipSlots op retires the speculative ones).
+		DropSpeculativeSlots();
+	}
+	auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	if (prepare) {
+		const auto position = engine->PublishIndirect(indexed, m_ctx, m_ucfg, m_sh_ctx,
+		                                              [this] { return WaitForWindowSpace(); });
+		if (position != UINT64_MAX) {
+			op.flags |= CpSeq::IndirectFlagPrepared;
+			op.window = position;
+			m_published_ops.push_back(m_ops->Emitted());
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(CpSeq::OpKind::DrawIndirect, &op, sizeof(op));
 }
 
+// KYTY_CP_OP_STATS: an Exec* body may name its outcome for the op being timed (ExecuteOp).
+static const char* g_cp_op_outcome = nullptr;
+
 void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
+	if ((op.flags & CpSeq::IndirectFlagPrepared) != 0) {
+		// KYTY_DRAW_PREP_INDIRECT: the same execution, with the slot's preparation offered.
+		auto plain = op;
+		plain.flags &= ~CpSeq::IndirectFlagPrepared;
+		m_draw_prep->ExecuteIndirect(op.window, [this, &plain] { ExecDrawIndirect(plain); });
+		return;
+	}
 	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
 		m_num_instances = op.num_instances;
 		m_pending_num_instances.clear();
@@ -2477,8 +2514,10 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	                           .index_base_addr     = op.index_base_addr,
 	                           .index_buffer_size   = op.index_buffer_size,
 	                           .index_type_and_size = op.index_type_and_size})) {
+		g_cp_op_outcome = "DrawIndirect native";
 		return;
 	}
+	g_cp_op_outcome = indexed ? "DrawIndirect cpu indexed" : "DrawIndirect cpu auto";
 
 	m_pending_num_instances.clear();
 	if (!indexed) {
@@ -3528,9 +3567,20 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			}
 			if (OcclusionCounter::Enabled()) {
 				bool sync = false;
+				bool kept = false;
 				{
 					Common::LockGuard lock(m_renderer.GetMutex());
-					sync = m_renderer.GetOcclusionCounter().Dump(event_address);
+					auto&             counter = m_renderer.GetOcclusionCounter();
+					sync = counter.Dump(event_address);
+					kept = counter.LastDumpKeptInstance();
+				}
+				// KYTY_DRAW_RUN: a dump that kept the instance and does not wait recorded only query
+				// commands, which a continuation's skipped work does not depend on (ExecuteOp).
+				const bool waits =
+				    sync && OcclusionCounter::GetProxyMode() == OcclusionCounter::ProxyMode::Sync;
+				if (DrawRun::Enabled() && DrawRun::QuietOpsEnabled() &&
+				    OcclusionCounter::SplitEnabled() && (!kept || waits)) {
+					DrawRun::NoteForeignActivity("EventWrite occlusion dump");
 				}
 				if (sync) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionProxyDumps);
@@ -3860,14 +3910,120 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
 	return result;
 }
 
+// KYTY_DRAW_RUN's "activity by" attribution of an EVENT_WRITE (ExecEventWrite's groups).
+static const char* EventWriteActivityName(uint32_t event_type) {
+	switch (event_type) {
+		case 0x07:
+		case 0x0f:
+		case 0x10: return "EventWrite partial flush";
+		case 0x16:
+		case 0x31:
+		case 0x2a:
+		case 0x2c:
+		case 0x2e: return "EventWrite cache writeback";
+		case 0x39: return "EventWrite occlusion dump";
+		default: return "EventWrite ignored type";
+	}
+}
+
+// KYTY_CP_OP_STATS=1 (diagnostic, default off): the resolver's time per op kind (EVENT_WRITE by
+// group), one console line every 10 s: "CpOps 10s: <kind> <count> <ms> ...", sorted by time.
+namespace {
+struct CpOpStats {
+	struct Entry {
+		const char* name  = nullptr;
+		uint64_t    count = 0;
+		uint64_t    ns    = 0;
+	};
+	std::array<Entry, 40> entries {};
+	uint64_t              last_print_ns = 0;
+};
+bool CpOpStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_OP_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+uint64_t CpOpStatsNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+class CpOpTimer {
+public:
+	explicit CpOpTimer(const char* name): m_name(name), m_start(CpOpStatsNowNs()) {}
+	~CpOpTimer() {
+		static CpOpStats stats;
+		const auto       now = CpOpStatsNowNs();
+		if (g_cp_op_outcome != nullptr) {
+			m_name          = g_cp_op_outcome;
+			g_cp_op_outcome = nullptr;
+		}
+		for (auto& entry: stats.entries) {
+			if (entry.name == m_name || entry.name == nullptr) {
+				entry.name = m_name;
+				entry.count++;
+				entry.ns += now - m_start;
+				break;
+			}
+		}
+		if (stats.last_print_ns == 0) {
+			stats.last_print_ns = now;
+		} else if (now - stats.last_print_ns >= 10'000'000'000ull) {
+			auto sorted = stats.entries;
+			std::sort(sorted.begin(), sorted.end(),
+			          [](const auto& a, const auto& b) { return a.ns > b.ns; });
+			std::string line = "CpOps 10s:";
+			for (const auto& entry: sorted) {
+				if (entry.name != nullptr && entry.count != 0) {
+					line += fmt::format(" {} {} {:.1f}ms;", entry.name, entry.count,
+					                    static_cast<double>(entry.ns) / 1e6);
+				}
+			}
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+			stats.entries       = {};
+			stats.last_print_ns = now;
+		}
+	}
+	CpOpTimer(const CpOpTimer&)            = delete;
+	CpOpTimer& operator=(const CpOpTimer&) = delete;
+
+private:
+	const char* m_name;
+	uint64_t    m_start;
+};
+} // namespace
+
 CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
                                           const void* data) {
 	using CpSeq::OpKind;
+	std::optional<CpOpTimer> op_timer;
+	if (CpOpStatsEnabled()) [[unlikely]] {
+		op_timer.emplace(kind == OpKind::EventWrite
+		                     ? EventWriteActivityName(
+		                           static_cast<const CpSeq::EventWriteOp*>(payload)->event_type)
+		                     : CpSeq::OpKindName(kind));
+	}
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): every operation but a direct draw (whose commit keeps its
 	// own run bookkeeping) and pure control flow is other command-processor work, which ends a run.
+	// An occlusion dump that keeps the rendering instance (KYTY_OCCLUSION_SPLIT) records only query
+	// commands: ExecEventWrite notes the activity when it ends the instance or waits instead.
+	// KYTY_DRAW_RUN_QUIET_OPS: so does ExecWriteData for a WRITE_DATA done on the GPU timeline.
+	const bool quiet =
+	    DrawRun::QuietOpsEnabled() &&
+	    (kind == OpKind::WriteData ||
+	     (kind == OpKind::EventWrite &&
+	      static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u &&
+	      OcclusionCounter::Enabled() && OcclusionCounter::SplitEnabled()));
 	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
-	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch) {
-		DrawRun::NoteForeignActivity();
+	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch &&
+	    !quiet) {
+		DrawRun::NoteForeignActivity(
+		    kind == OpKind::EventWrite
+		        ? EventWriteActivityName(static_cast<const CpSeq::EventWriteOp*>(payload)->event_type)
+		        : CpSeq::OpKindName(kind));
 	}
 	switch (kind) {
 		case OpKind::DrawIndex: ExecDrawIndex(*static_cast<const CpSeq::DrawIndexOp*>(payload)); break;
