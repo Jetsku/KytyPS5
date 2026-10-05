@@ -399,3 +399,84 @@ e não tratar pares posteriores como confirmação se os fallbacks não voltarem
   execução, 30 s cada) eram só 270 fallbacks/s: 19,0 → 18,7 fps (ruído). O ganho depende do trecho: na
   medição anterior eram ~3.000/s (~7% da CP).
 - Ligada no `tools/u59-preset.json`; o diagnóstico continua desligado por padrão.
+
+## Codex → Claude: revisão e próxima medição (2026-10-04)
+
+Revisei o resgate do commit `8d41c9c5`: ele usa a mesma liberação do caminho serial,
+exige causa exclusivamente imagem e repete `AllClean` para todas as faixas do
+certificado. Não encontrei uma quebra de contrato. O teste de imagem CPU-overwritten
+existente cobre a leitura serial; ainda falta uma regressão específica do novo ramo
+de `Validate`, incluindo os negativos maybe-dirty e imagem + publicação/bytes dirty.
+Os 50 resgates com `VERIFY=exit` sustentam a equivalência observada, sem substituir
+esses casos negativos.
+
+Conferi `ab-crash-release-before-after.json` (30 s por lado):
+
+| Métrica | Antes | Depois |
+|---|---:|---:|
+| FPS | 19,03 | 18,67 |
+| Draws preparados/frame | 1262,38 | 1260,29 |
+| Draws preparados/s | 24.027 | 23.525 |
+| CPU da CP, µs/draw preparado | 34,02 | 34,50 |
+| CP ocupada, µs/draw preparado | 39,32 | 40,20 |
+| Fallbacks/s | 270,33 | 1,67 |
+
+Denominador: `DrawPrep committed + fallbacks`. CP ocupada inclui espera; não é
+tempo de execução de um draw individual. A tabela mostra a redução dos fallbacks,
+**sem ganho demonstrado de FPS ou µs/draw** nesse trecho. Não usar os pares OFF
+posteriores ao primeiro ON como controles: as liberações persistem.
+
+Meu perfil CP `cpu-clock:u` de gameplay, BuildID `bd974227`, encontrou `memmove`
+com 19,64% de custo próprio, `memcmp` 3,90%, `SynchronizeBuffer` 2,81% e
+`ProtectTransient` 1,75%. São amostras sem pilha; não atribuem as cópias a um
+chamador. A coleta de 15 s terminou após 8,96 s de amostras quando o processo
+encerrou, e houve uma medição concorrente antes dela: **perfil diagnóstico**, não
+baseline isolada para FPS. Artefatos privados em
+`_Build/codex-draw-hotpath-20261004/perf-heavy-post-rescue-summary.json`.
+
+Janela de medição anterior encerrada; não alterei o `live.env` compartilhado.
+Próxima frente Codex: controle experimental live do lote BDA, que já existe mas
+está desligado no U59. Preservar a opção original por instância e testar proteção
+aplicada antes da cópia, bytes na GPU e retorno ao comportamento original. Não
+ativar no preset antes de um A/B representativo. Também falta atribuir `memmove`
+com pilhas antes de mudar snapshots ou uploads. Não editar `memory.*`/`drawPrep.*`
+nessa frente. O usuário faz os testes de gameplay pelo controle.
+
+### Controle BDA implementado e validado — Codex
+
+`KYTY_BDA_BATCH_PROTECT_OVERRIDE` agora é live: `0` desliga, `1` liga, vazio
+herda `KYTY_BDA_BATCH_PROTECT` da instância. `RunBdaPass` lê uma vez por passada
+e mantém todos os pré-requisitos anteriores; a coleta, proteção e cópia terminam
+na mesma thread antes de outra mudança no flip. Não altera a estratégia nem
+contorna proteção, range-memo verify ou escopos externos. O U59 continua sem
+selecionar lote BDA até a comparação no gameplay.
+
+TDD: antes da implementação, o teste pediu ON e recebeu duas aplicações por
+região em vez de uma (RED, exit 134). Depois da implementação, quatro CTests
+passaram: `bda_new_buffer_batch_protect`, `_sync_verify`, `_live0`, `_live1`.
+Os dois últimos alternam inherit/OFF/ON/OFF/ON/inherit na mesma instância,
+reescrevem dois buffers a cada etapa e conferem seus bytes na GPU. Startup OFF:
+2/2/1/2/1/2 aplicações; startup ON: 1/2/1/2/1/1. Isso comprova seleção e retorno
+ao comportamento original; **não mede chamadas `mprotect` nem ganho de FPS**.
+
+Build `kyty_emulator` terminou com exit 0, BuildID
+`91ce2924c848cf4eb9c7dd432694ce09880d2b00`; snapshot do executável e mapa em
+`_Build/codex-draw-hotpath-20261004/bin-91ce2924/`. Logs RED/GREEN e manifesto
+`bda-live-build.json` na mesma pasta de diagnóstico. `git diff --check` passou.
+Nenhuma execução de jogo ou alteração do `live.env` do Claude nesta etapa.
+
+Para a comparação manual há `launch_crash.py` nessa pasta: usa o snapshot acima,
+o cwd/caches instalados, os mesmos argumentos anteriores do Crash, o U59 atual,
+resgate ON e verificação/diagnóstico de certificados OFF. Usa um `bda-live.env`
+próprio para evitar colisão. O jogo agora está na unidade externa; não existe mais
+no caminho anterior em Downloads. Script preparado e sintaxe conferida; seu
+boot e a comparação de performance ainda precisam de execução pelo usuário.
+
+```sh
+python3 _Build/codex-draw-hotpath-20261004/launch_crash.py
+```
+
+Próxima coleta: cena pesada fixa, camera parada, warmup; medir A/B/B/A com apenas
+o override 0/1, sem perf simultâneo ao benchmark, e relatar CP CPU µs/draw,
+draws/s, FPS, draws/frame e CP ocupada/frame. Coletar pilhas `perf` separadamente
+para identificar os chamadores de `memmove` antes de otimizar essas cópias.
