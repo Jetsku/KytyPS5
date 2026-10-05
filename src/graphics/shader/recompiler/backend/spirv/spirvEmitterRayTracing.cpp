@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
+#include <vector>
 
 // Software IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (IR BvhIntersectRay, built by
 // KYTY_RT_SOFTWARE). The node test follows AMD GPURT's emulation of the RTIP 1.1 instruction
@@ -648,6 +650,92 @@ uint32_t EmitBvhNodeTest(ValueEmitContext& ctx, const BvhOperands& operands) {
 	return BvhLowering(ctx, operands).NodeTest();
 }
 
+namespace {
+
+// The node test at one instruction: a call of the module's function (DefineBvhNodeTestFunction), or
+// the whole lowering inline (KYTY_RT_FUNCTION=0).
+uint32_t EmitBvhNodeTestSite(ValueEmitContext& ctx, const BvhOperands& operands) {
+	auto& s = ctx.state;
+	if (s.bvh_node_test_function == 0) {
+		return EmitBvhNodeTest(ctx, operands);
+	}
+	std::vector<uint32_t> arguments(operands.tsharp.begin(), operands.tsharp.end());
+	arguments.push_back(operands.node_lo);
+	arguments.push_back(operands.node_hi);
+	arguments.push_back(operands.extent);
+	arguments.insert(arguments.end(), operands.origin.begin(), operands.origin.end());
+	arguments.insert(arguments.end(), operands.direction.begin(), operands.direction.end());
+	arguments.insert(arguments.end(), operands.inverse.begin(), operands.inverse.end());
+	const auto result = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
+	                      s.bvh_node_test_function, std::span<const uint32_t>(arguments));
+	return result;
+}
+
+bool HasSoftwareBvh(const EmitterState& state) {
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == IR::ValueOpcode::BvhIntersectRay) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+void DefineBvhNodeTestFunction(EmitterState& state) {
+	const auto& options = GetCodegenOptions();
+	const auto  mode    = RtFunctionMode();
+	if (mode == 0 || !options.rt_software || !state.program.info.uses_dma ||
+	    !HasSoftwareBvh(state)) {
+		return;
+	}
+	const auto u32    = TypeU32(state);
+	const auto f32    = TypeF32(state);
+	const auto result = TypeU32Vector(state, 4);
+	// tsharp[4], node_lo, node_hi, extent, origin[3], direction[3], inverse[3]
+	std::vector<uint32_t> parameter_types(6u, u32);
+	parameter_types.insert(parameter_types.end(), 10u, f32);
+	const auto function_type =
+	    state.builder.Type(spv::OpTypeFunction, result, std::span<const uint32_t>(parameter_types));
+	state.bvh_node_test_function = state.builder.AllocateId();
+	state.builder.AddName(state.bvh_node_test_function, "bvh_node_test");
+	state.builder.AddFunction(spv::OpFunction, result, state.bvh_node_test_function,
+	                          mode >= 2u ? spv::FunctionControlDontInlineMask
+	                                                    : spv::FunctionControlMaskNone,
+	                          function_type);
+	std::vector<uint32_t> parameters;
+	for (const auto type: parameter_types) {
+		const auto id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, type, id);
+		parameters.push_back(id);
+	}
+	EmitLabel(state, state.builder.AllocateId());
+	BvhOperands operands;
+	size_t      next = 0;
+	for (auto& dword: operands.tsharp) {
+		dword = parameters[next++];
+	}
+	operands.node_lo = parameters[next++];
+	operands.node_hi = parameters[next++];
+	operands.extent  = parameters[next++];
+	for (auto& value: operands.origin) {
+		value = parameters[next++];
+	}
+	for (auto& value: operands.direction) {
+		value = parameters[next++];
+	}
+	for (auto& value: operands.inverse) {
+		value = parameters[next++];
+	}
+	ValueEmitContext ctx(state);
+	const auto       value = EmitBvhNodeTest(ctx, operands);
+	state.builder.AddFunction(spv::OpReturnValue, value);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
 uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	// Every operand is read before the first branch.
@@ -671,7 +759,7 @@ uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (s.bvh_node_count_variable == 0) {
 		return EmitValueOrDefaultIfCondition(s, active, TypeU32Vector(s, 4),
 		                                     ConstantU32CompositeZero(s, 4),
-		                                     [&]() { return EmitBvhNodeTest(ctx, operands); });
+		                                     [&]() { return EmitBvhNodeTestSite(ctx, operands); });
 	}
 	// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS: every invocation counts every execution, whatever
 	// EXEC holds (the wave's traversal length; a two-lane invocation counts once per half).
@@ -685,7 +773,7 @@ uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (budget == 0) {
 		return EmitValueOrDefaultIfCondition(s, active, TypeU32Vector(s, 4),
 		                                     ConstantU32CompositeZero(s, 4),
-		                                     [&]() { return EmitBvhNodeTest(ctx, operands); });
+		                                     [&]() { return EmitBvhNodeTestSite(ctx, operands); });
 	}
 	// Past the budget a node test misses without reading memory: a box has no hit children and a
 	// triangle is not hit, so the guest's traversal stack only drains.
@@ -696,7 +784,7 @@ uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    s, active, TypeU32Vector(s, 4), ConstantU32CompositeZero(s, 4), [&]() {
 		    return EmitValueOrDefaultIfCondition(s, allowed, TypeU32Vector(s, 4),
 		                                         EmitBvhIntersectRayStub(s, operands.node_lo),
-		                                         [&]() { return EmitBvhNodeTest(ctx, operands); });
+		                                         [&]() { return EmitBvhNodeTestSite(ctx, operands); });
 	    });
 }
 

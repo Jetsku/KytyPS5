@@ -118,6 +118,8 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	// KYTY_RT_FUNCTION: the module's one software BVH node test function (DefineBvhNodeTestFunction).
+	uint32_t                                         bvh_node_test_function  = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;

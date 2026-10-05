@@ -184,6 +184,20 @@ struct CodegenOptions {
 	// the passes but lets every ray miss (no ray-traced shadows); KYTY_RT_SOFTWARE=0 alone restores
 	// the old skip.
 	bool rt_software = true;
+	// KYTY_RT_SOFTWARE=auto (the default; also what an unset or empty variable means): software RT
+	// on, whatever the GPU. "1" forces it on, "0" turns it off. The switch for users whose GPU or
+	// driver fails the ray tracing kernels (a game that crashes right after the first lighting
+	// dispatches, device loss on AMD): KYTY_RT_SOFTWARE=0 skips those dispatches again. A pipeline
+	// the driver fails to build for such a kernel turns software RT off for the session on its own
+	// (rtSession.h). rt_software_auto only records which spelling selected the mode.
+	bool rt_software_auto = true;
+	// KYTY_RT_FUNCTION=0|1|2 (with KYTY_RT_SOFTWARE; default 1): how a BVH instruction lowers. 1: the
+	// node test (box and triangle tests, traversal helpers, ~100k SPIR-V words) is ONE function per
+	// module that every BVH instruction calls (OpFunctionCall); a kernel with three instructions
+	// was 322k words with the test inlined at each. 2: the same with the DontInline function
+	// control, so the driver does not inline it again. 0: inline at every site (the pre-int16
+	// code, for comparisons).
+	uint32_t rt_function = 1;
 	// KYTY_RT_TYPE6=0 (with KYTY_RT_SOFTWARE): node type 6 misses (four invalid children) like
 	// RDNA2's user node, instead of being decoded as the PS5 shared-exponent box.
 	bool rt_type6 = true;
@@ -222,6 +236,12 @@ inline constexpr uint32_t RtNodeStatsBins        = 24;
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
 // while no shader is being compiled.
 void SetCodegenOptions(const CodegenOptions& options);
+
+// The BVH lowering mode in effect on this thread: rt_function, unless this thread overrides it
+// (KYTY_RT_DUMP_DIR also emits each RT module inline, mode 0, for size and build-time comparisons).
+[[nodiscard]] uint32_t RtFunctionMode();
+// -1 clears the override.
+void SetThreadRtFunctionOverride(int mode);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 
