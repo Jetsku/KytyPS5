@@ -107,6 +107,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -25302,6 +25303,135 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(set_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+  }
+
+  // Milliseconds vkCreateComputePipelines spends on a compute module read from disk (no layout
+  // given: descriptor bindings and push constants are read from its decorations). Cache-proof as
+  // TimeComputePipeline. -1 when the module cannot be used.
+  double TimeComputeSpirvFile(const std::vector<u32> &source, u32 nonce) {
+    auto spirv = source;
+    if (spirv.size() < 5 || spirv[0] != 0x07230203u) return -1.0;
+    spirv[3] += nonce;
+    std::unordered_map<u32, u32> set_of, binding_of, constant_of, pointer_class, pointer_type;
+    std::unordered_map<u32, std::vector<u32>> types; // id -> instruction words
+    std::vector<std::pair<u32, u32>> variables; // (id, pointer type)
+    bool push = false;
+    for (size_t at = 5; at < spirv.size();) {
+      const u32 op = spirv[at] & 0xffffu;
+      const u32 count = spirv[at] >> 16u;
+      if (count == 0 || at + count > spirv.size()) return -1.0;
+      const u32 *w = &spirv[at];
+      if (op == 71 /* OpDecorate */ && count >= 4) {
+        if (w[2] == 34 /* DescriptorSet */) set_of[w[1]] = w[3];
+        if (w[2] == 33 /* Binding */) binding_of[w[1]] = w[3];
+      } else if (op == 43 /* OpConstant */ && count >= 4) {
+        constant_of[w[2]] = w[3];
+      } else if (op == 32 /* OpTypePointer */) {
+        pointer_class[w[1]] = w[2];
+        pointer_type[w[1]] = w[3];
+      } else if (op >= 19 && op <= 39) {
+        types[w[1]] = std::vector<u32>(w, w + count);
+      } else if (op == 59 /* OpVariable */ && count >= 4) {
+        if (w[3] == 9 /* PushConstant */) push = true;
+        variables.emplace_back(w[2], w[1]);
+      }
+      at += count;
+    }
+    std::map<u32, std::vector<vk::DescriptorSetLayoutBinding>> sets;
+    for (const auto &[id, ptr] : variables) {
+      if (!set_of.contains(id) || !binding_of.contains(id)) continue;
+      const u32 storage = pointer_class[ptr];
+      u32 type = pointer_type[ptr];
+      u32 descriptors = 1;
+      for (;;) {
+        const auto &t = types[type];
+        if (t.empty()) break;
+        const u32 op = t[0] & 0xffffu;
+        if (op == 28 /* OpTypeArray */) {
+          descriptors *= constant_of.contains(t[3]) ? constant_of[t[3]] : 1u;
+          type = t[2];
+        } else if (op == 29 /* OpTypeRuntimeArray */) {
+          descriptors *= 64u;
+          type = t[2];
+        } else {
+          break;
+        }
+      }
+      const auto &t = types[type];
+      const u32 op = t.empty() ? 0u : (t[0] & 0xffffu);
+      vk::DescriptorType kind = vk::DescriptorType::eStorageBuffer;
+      if (storage == 12 /* StorageBuffer */) {
+        kind = vk::DescriptorType::eStorageBuffer;
+      } else if (storage == 2 /* Uniform */) {
+        kind = vk::DescriptorType::eUniformBuffer;
+      } else if (op == 25 /* OpTypeImage */) {
+        const bool buffer = t[3] == 5; // Dim Buffer
+        const bool storage_image = t[7] == 2;
+        kind = buffer ? (storage_image ? vk::DescriptorType::eStorageTexelBuffer
+                                       : vk::DescriptorType::eUniformTexelBuffer)
+                      : (storage_image ? vk::DescriptorType::eStorageImage
+                                       : vk::DescriptorType::eSampledImage);
+      } else if (op == 26 /* OpTypeSampler */) {
+        kind = vk::DescriptorType::eSampler;
+      } else if (op == 27 /* OpTypeSampledImage */) {
+        kind = vk::DescriptorType::eCombinedImageSampler;
+      } else {
+        continue;
+      }
+      vk::DescriptorSetLayoutBinding item{};
+      item.binding = binding_of[id];
+      item.descriptorType = kind;
+      item.descriptorCount = descriptors;
+      item.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      sets[set_of[id]].push_back(item);
+    }
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = spirv.size() * sizeof(u32);
+    module_info.pCode = spirv.data();
+    vk::ShaderModule module = nullptr;
+    if (m_device.createShaderModule(&module_info, nullptr, &module) != vk::Result::eSuccess) {
+      return -1.0;
+    }
+    const u32 set_count = sets.empty() ? 0u : sets.rbegin()->first + 1u;
+    std::vector<vk::DescriptorSetLayout> set_layouts(set_count, nullptr);
+    for (u32 set = 0; set < set_count; set++) {
+      const auto &bindings = sets[set];
+      vk::DescriptorSetLayoutCreateInfo set_info{};
+      set_info.bindingCount = static_cast<u32>(bindings.size());
+      set_info.pBindings = bindings.empty() ? nullptr : bindings.data();
+      RequireVk("TimeComputeSpirvFile", "layout",
+                m_device.createDescriptorSetLayout(&set_info, nullptr, &set_layouts[set]),
+                "vkCreateDescriptorSetLayout");
+    }
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.setLayoutCount = set_count;
+    pipeline_layout_info.pSetLayouts = set_layouts.empty() ? nullptr : set_layouts.data();
+    vk::PushConstantRange push_range{};
+    if (push) {
+      push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
+      pipeline_layout_info.pushConstantRangeCount = 1;
+      pipeline_layout_info.pPushConstantRanges = &push_range;
+    }
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk("TimeComputeSpirvFile", "layout",
+              m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto result = m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline);
+    const auto end = std::chrono::steady_clock::now();
+    if (pipeline != nullptr) m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    for (auto layout : set_layouts) m_device.destroyDescriptorSetLayout(layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    if (result != vk::Result::eSuccess) return -1.0;
     return std::chrono::duration<double, std::milli>(end - begin).count();
   }
 
@@ -52203,6 +52333,25 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized();
     VulkanHarness vulkan;
     return CodegenTests::CorpusPipelineTimes(&vulkan, argv[2]);
+  }
+  // --time-spv <file.spv>...: one cache-proof vkCreateComputePipelines time per compute module
+  // (KYTY_RT_DUMP_DIR dumps), "<file>,<words>,<ms>".
+  if (argc >= 3 && std::strcmp(argv[1], "--time-spv") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    u32 nonce = 9001;
+    for (int arg = 2; arg < argc; arg++) {
+      std::vector<u32> words;
+      if (std::FILE *file = std::fopen(argv[arg], "rb"); file != nullptr) {
+        u32 word = 0;
+        while (std::fread(&word, sizeof(word), 1, file) == 1) words.push_back(word);
+        std::fclose(file);
+      }
+      const double ms = vulkan.TimeComputeSpirvFile(words, nonce++);
+      std::printf("%s,%zu,%.1f\n", argv[arg], words.size(), ms);
+      std::fflush(stdout);
+    }
+    return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--exec-selects-bench") == 0) {
     VulkanHarness vulkan;
