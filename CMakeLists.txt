@@ -1376,6 +1376,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
 	set_tests_properties(bda_new_buffer_batch_protect_sync_verify PROPERTIES
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+	# The live override alternates off/on/inherit on one cache and checks real protection
+	# batches and GPU bytes; clearing the override restores either per-instance startup option.
+	foreach(batch_protect_startup IN ITEMS 0 1)
+		add_test(NAME bda_new_buffer_batch_protect_live${batch_protect_startup}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+		set_tests_properties(bda_new_buffer_batch_protect_live${batch_protect_startup} PROPERTIES
+			TIMEOUT 60
+			ENVIRONMENT "KYTY_TEST_BDA_BATCH_PROTECT_LIVE=1;KYTY_BDA_BATCH_PROTECT=${batch_protect_startup};KYTY_BDA_BATCH_PROTECT_OVERRIDE=;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=1;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_CP_RECORDER=0;KYTY_UPLOAD_DMA=0")
+	endforeach()
 	# Exercise the new-buffer upload before an otherwise valid epoch/submission skip, and mapping
 	# invalidation while a native buffer survives. The fixture checks real GPU contents.
 	foreach(bda_case same_epoch same_submission remap)

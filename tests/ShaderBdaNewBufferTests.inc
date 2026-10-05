@@ -13,6 +13,9 @@
 // any implementation.
 // KYTY_TEST_BDA_SAME_EPOCH=1 omits the explicit epoch advances, covering registrations before
 // epoch/submission skips. KYTY_TEST_BDA_REMAP=1 also remaps the existing new buffer's GPU range.
+// KYTY_TEST_BDA_BATCH_PROTECT_LIVE=1 checks live off/on/inherit changes against real protection
+// batches and GPU bytes. Run with KYTY_UPLOAD_BATCH=1, KYTY_UPLOAD_DEFER_PROTECT=1,
+// KYTY_DEFER_UNPROTECT=1, KYTY_BUFFER_RANGE_MEMO_VERIFY=0 and fault-ahead disabled.
 void CheckBdaNewBufferSync() {
   constexpr const char *name = "BdaNewBufferSync";
   constexpr uintptr_t base = 0x0000000207400000ull;
@@ -27,6 +30,9 @@ void CheckBdaNewBufferSync() {
   constexpr uint64_t control_offset = 0xc0000; // created last, with no pass after it
   const bool same_epoch = std::getenv("KYTY_TEST_BDA_SAME_EPOCH") != nullptr;
   const bool remap = std::getenv("KYTY_TEST_BDA_REMAP") != nullptr;
+  const bool live_batch = std::getenv("KYTY_TEST_BDA_BATCH_PROTECT_LIVE") != nullptr;
+  const char *batch_env = std::getenv("KYTY_BDA_BATCH_PROTECT");
+  const bool initial_batch = batch_env != nullptr && std::strtoull(batch_env, nullptr, 10) != 0;
 
   EnsureRuntimeContext();
   const auto context_owner = MakeRenderContext();
@@ -189,6 +195,41 @@ void CheckBdaNewBufferSync() {
                   "a page the pass uploaded is still writable: its next write would be missed");
         }
 #endif
+      }
+
+      if (live_batch) {
+        Require(name, "live batch prerequisites",
+                !same_epoch && UploadBatchEnabled() &&
+                    PageManager::GetDeferMode() == PageManager::DeferMode::On,
+                "live batching needs ordinary epochs, upload batching and deferred protection");
+        // Two separate buffers in the same tracker region: ordinary read uploads apply that
+        // region twice; the BDA batch applies it once after collecting both. This catches an
+        // ignored live override or an override that replaces the per-instance startup default.
+        const std::array<std::pair<const char *, uint64_t>, 6> steps{{
+            {"", initial_batch ? 1u : 2u}, {"0", 2}, {"1", 1},
+            {"0", 2}, {"1", 1}, {"", initial_batch ? 1u : 2u}}};
+        uint32_t value = 0x5eed0100u;
+        for (const auto &[override_text, expected_applies] : steps) {
+          Live::Testing::StageText(std::string("KYTY_BDA_BATCH_PROTECT_OVERRIDE=") +
+                                   override_text + "\n");
+          Live::OnCpFlip();
+          cpu_write(new_offset + 0x4004, ++value);
+          cpu_write(grown_offset + 0x6008, ++value);
+          SyncEpoch::Advance();
+          const auto before = PageManager::GetProtectBatchStats();
+          context.PrepareBda();
+          const auto after = PageManager::GetProtectBatchStats();
+          const auto applies = after.applies - before.applies;
+          std::printf("[host]    BDA batch override %s: %llu region applies (expected %llu)\n",
+                      override_text[0] == '\0' ? "inherit" : override_text,
+                      static_cast<unsigned long long>(applies),
+                      static_cast<unsigned long long>(expected_applies));
+          Require(name, "live override changes real batching",
+                  after.spans > before.spans && applies == expected_applies,
+                  "the live override did not select the expected real protection batch");
+          matches(new_id, "live override new buffer bytes");
+          matches(grown_id, "live override grown buffer bytes");
+        }
       }
 
       // Control: the same creation with no pass after it. Its contents must differ from the

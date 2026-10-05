@@ -62,6 +62,16 @@ Live::Switch g_bda_hot_ranges_merge("KYTY_BDA_HOT_RANGES_MERGE", Live::ParseDefa
 // takes effect at the next pass; the submission and structure it compares are kept either way.
 Live::Switch g_bda_sync_per_submission("KYTY_BDA_SYNC_PER_SUBMISSION", Live::ParseDefaultOff);
 
+// KYTY_BDA_BATCH_PROTECT_OVERRIDE (live): 0 disables the pass's protection batch, 1 enables it;
+// unset (or unrecognized) inherits the cache's KYTY_BDA_BATCH_PROTECT startup option. A pass
+// completes its collection, protection and copying before the next flip can change this choice.
+Live::Switch g_bda_batch_protect_override("KYTY_BDA_BATCH_PROTECT_OVERRIDE",
+                                         [](const char* value) -> int64_t {
+	if (value != nullptr && std::strcmp(value, "0") == 0) return 0;
+	if (value != nullptr && std::strcmp(value, "1") == 0) return 1;
+	return -1;
+});
+
 template <typename Range>
 void MergeRecordedHotRanges(std::vector<Range>& ranges) {
 	const auto before = ranges.size();
@@ -4316,7 +4326,9 @@ template <typename Collect>
 void BufferCache::RunBdaPass(Collect&& collect) {
 	// KYTY_BDA_BATCH_PROTECT: collect every read upload of the pass, protect, then copy. Every
 	// synchronization collect() makes carries a BdaSyncStats, so none copies inside the scope.
-	const bool batch = m_bda_batch_protect && UploadBatchEnabled() && m_range_memo_verify == 0 &&
+	const auto batch_override = g_bda_batch_protect_override.Get();
+	const bool enabled = batch_override >= 0 ? batch_override != 0 : m_bda_batch_protect;
+	const bool batch = enabled && UploadBatchEnabled() && m_range_memo_verify == 0 &&
 	                   PageManager::GetDeferMode() == PageManager::DeferMode::On &&
 	                   m_bda_pending == nullptr && !PageManager::InDeferProtectScope();
 	if (!batch) {
