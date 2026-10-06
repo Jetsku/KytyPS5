@@ -257,6 +257,26 @@ bool GraphicContext::CreateAllocator() {
 			}
 		}
 	}
+	// KYTY_VRAM_LIMIT_MB=<n> (test tool, from chenxiao07/KytyPS5 05e64602f): every device-local heap
+	// as on a GPU with n MiB of video memory (VMA's heap size limit): its budget, the cache thresholds
+	// derived from the budget, and allocations past it failing. Code that reads the driver's heap
+	// sizes directly still sees the real ones.
+	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_limits {};
+	if (const char* text = std::getenv("KYTY_VRAM_LIMIT_MB"); text != nullptr) {
+		const uint64_t limit_mb = std::strtoull(text, nullptr, 10);
+		if (limit_mb > 0) {
+			heap_limits.fill(VK_WHOLE_SIZE);
+			const auto properties = physical_device.getMemoryProperties();
+			for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+				if (properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+					heap_limits[heap] = std::min<VkDeviceSize>(limit_mb << 20u,
+					                                           properties.memoryHeaps[heap].size);
+				}
+			}
+			info.pHeapSizeLimit = heap_limits.data();
+			LOGF("KYTY_VRAM_LIMIT_MB: device-local heaps limited to %" PRIu64 " MiB\n", limit_mb);
+		}
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
