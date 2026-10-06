@@ -2633,6 +2633,13 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 		if (const auto stack = FiberMapStack(fiber, size_context + FIBER_STACK_EXTRA); stack != 0) {
 			fiber->context_start = reinterpret_cast<void*>(stack);
 			fiber->context_end   = reinterpret_cast<uint8_t*>(stack) + size_context + FIBER_STACK_EXTRA;
+			static std::atomic<uint32_t> moved {0};
+			if (moved.fetch_add(1, std::memory_order_relaxed) < 4) {
+				std::fprintf(stderr,
+				             "Fiber '%s': context of %" PRIu64 " bytes, runs on a guest stack of its own "
+				             "(+%" PRIu64 " KiB; KYTY_FIBER_GUEST_STACK)\n",
+				             fiber->name, size_context, FIBER_STACK_EXTRA / 1024);
+			}
 		}
 	} else {
 		FiberUnmapStack(fiber);
