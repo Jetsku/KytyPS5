@@ -1,0 +1,2086 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 09fcd99..70d53c8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -727,6 +727,37 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
+ endif()
+ 
+ 
++if(NOT WIN32)
++    # The journal replay catches failed compilation; its regression throws.
++    set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp"
++        APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
++    target_compile_options(shader_precompile_tests PRIVATE -fexceptions)
++endif()
++
++# Existing int15 loader/*.cpp CONFIGURE_DEPENDS glob picks up redZonePatcher.cpp.
++# The new file has non-Linux stubs; this test target is Linux x86-64 only.
++if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
++  add_executable(linux_native_instruction_tests EXCLUDE_FROM_ALL
++    "${KYTY_TESTS_DIR}/linuxNativeInstructionTests.cpp"
++    "${KYTY_TESTS_DIR}/linuxNativeEquivalenceTests.cpp"
++    "${KYTY_TESTS_DIR}/linuxNativeV2PlanningTests.cpp"
++    "${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
++    "${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp")
++  add_executable(linux_native_int15_neighbors_tests EXCLUDE_FROM_ALL
++    "${KYTY_TESTS_DIR}/linuxNativeInt15IntegrationTests.cpp"
++    "${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp")
++  foreach(target linux_native_instruction_tests linux_native_int15_neighbors_tests)
++    target_link_libraries(${target} PRIVATE common fmt::fmt Zydis::Zydis xbyak::xbyak)
++    target_include_directories(${target} PRIVATE ${inc_headers})
++  endforeach()
++  if(BUILD_TESTING)
++    add_test(NAME linux_native_instructions COMMAND linux_native_instruction_tests)
++    add_test(NAME linux_native_int15_neighbors COMMAND linux_native_int15_neighbors_tests)
++    set_tests_properties(linux_native_instructions PROPERTIES TIMEOUT 900)
++  endif()
++endif()
++
++
+ # KYTY_PIPELINE_FAST_FIRST: scheduling, retirement and accounting (pipeline/pipelineFastFirst.h).
+ add_executable(pipeline_fast_first_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineFastFirstTests.cpp")
+ target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})
+diff --git a/src/loader/redZonePatcher.cpp b/src/loader/redZonePatcher.cpp
+new file mode 100644
+index 0000000..ca022a3
+--- /dev/null
++++ b/src/loader/redZonePatcher.cpp
+@@ -0,0 +1,954 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "loader/redZonePatcher.h"
++
++#include "common/assert.h"
++#include "common/logging/log.h"
++#include "common/virtualMemory.h"
++#include "loader/x64InstructionEmulator.h"
++
++#include <Zydis/Zydis.h>
++#include <algorithm>
++#include <array>
++#include <bitset>
++#include <climits>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <unordered_set>
++#include <vector>
++#if defined(__linux__)
++#define XBYAK_NO_EXCEPTION
++#endif
++#if defined(__linux__)
++#include <xbyak/xbyak.h>
++#include <xbyak/xbyak_util.h>
++#endif
++
++#ifdef min
++#undef min
++#endif
++#ifdef max
++#undef max
++#endif
++
++#if defined(__linux__)
++using namespace Xbyak::util;
++#endif
++
++namespace Loader::LinuxNative {
++
++using u8  = uint8_t;
++using s8  = int8_t;
++using u16 = uint16_t;
++using s16 = int16_t;
++using u32 = uint32_t;
++using s32 = int32_t;
++using u64 = uint64_t;
++using s64 = int64_t;
++
++#define ASSERT(condition) EXIT_IF(!(condition))
++
++constexpr size_t NearJumpSize = 5;
++
++bool LinuxNativeCpuEnabled() {
++#if defined(__linux__)
++	const auto* value = std::getenv("KYTY_LINUX_NATIVE_CPU");
++	return value != nullptr && (std::strcmp(value, "extrq") == 0 || std::strcmp(value, "extrq-v2") == 0 ||
++	                            std::strcmp(value, "extrq-v3") == 0 || std::strcmp(value, "extrq-v4") == 0);
++#else
++	return false;
++#endif
++}
++
++#if defined(__linux__)
++
++struct PatchModule {
++	std::mutex           mutex {};
++	u8*                  start = nullptr;
++	u8*                  end   = nullptr;
++	std::set<u8*>        patched;
++	Xbyak::CodeGenerator patch_gen;
++	Xbyak::CodeGenerator trampoline_gen;
++	u64                  trampoline_capacity;
++	bool                 trampoline_exhausted = false;
++
++	PatchModule(u8* module_ptr, u64 module_size, u8* trampoline_ptr, u64 trampoline_size)
++	    : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
++	      trampoline_gen(trampoline_size, trampoline_ptr), trampoline_capacity(trampoline_size) {}
++};
++
++static std::map<u64, PatchModule> g_patch_modules;
++
++static PatchModule* GetContainingModule(const void* ptr) {
++	auto upper = g_patch_modules.upper_bound(reinterpret_cast<u64>(ptr));
++	if (upper == g_patch_modules.begin()) {
++		return nullptr;
++	}
++	auto* module  = &std::prev(upper)->second;
++	auto* address = static_cast<const u8*>(ptr);
++	return address >= module->start && address < module->end ? module : nullptr;
++}
++
++
++
++static ZydisDecoder& GetDecoder() {
++	static ZydisDecoder decoder = [] {
++		ZydisDecoder value {};
++		EXIT_IF(!ZYAN_SUCCESS(
++		    ZydisDecoderInit(&value, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)));
++		return value;
++	}();
++	return decoder;
++}
++
++#endif
++#if defined(__linux__)
++
++namespace {
++
++constexpr size_t GuestRedZoneSize = 128;
++constexpr size_t ShortJumpSize    = 2;
++using RedZoneMask                 = std::bitset<GuestRedZoneSize>;
++
++struct DecodedCodeInstruction {
++	uintptr_t                                                address {};
++	ZydisDecodedInstruction                                  instruction {};
++	std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands {};
++	RedZoneMask                                              red_zone_use {};
++	RedZoneMask                                              red_zone_def {};
++	RedZoneMask                                              red_zone_live {};
++	bool                                                     accesses_memory {};
++	bool                                                     uses_stack_pointer {};
++	bool                                                     has_red_zone_operand {};
++	bool                                                     has_unmodeled_red_zone_operand {};
++	bool                                                     changes_stack_pointer {};
++	bool                                                     replaces_stack_pointer {};
++	std::optional<s64>                                       stack_pointer_delta;
++};
++
++struct DecodedFunction {
++	std::map<uintptr_t, DecodedCodeInstruction> instructions;
++	std::set<uintptr_t>                         branch_targets;
++	bool                                        uses_red_zone {};
++	bool                                        has_indirect_branch {};
++	bool                                        requires_conservative_red_zone_tracking {};
++};
++
++struct InstructionRewrite {
++	bool protect_red_zone {};
++	bool protected_indirect_call {};
++};
++
++bool IsStackPointerRegister(ZydisRegister reg) {
++	return reg != ZYDIS_REGISTER_NONE &&
++	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) == ZYDIS_REGISTER_RSP;
++}
++
++bool IsControlFlowTerminator(const ZydisDecodedInstruction& instruction) {
++	return instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
++	       instruction.meta.category == ZYDIS_CATEGORY_RET ||
++	       instruction.meta.category == ZYDIS_CATEGORY_INTERRUPT ||
++	       instruction.meta.category == ZYDIS_CATEGORY_SYSRET ||
++	       instruction.mnemonic == ZYDIS_MNEMONIC_UD2;
++}
++
++uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
++	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
++		const auto& operand = decoded.operands[index];
++		if (operand.type != ZYDIS_OPERAND_TYPE_IMMEDIATE || !operand.imm.is_relative) {
++			continue;
++		}
++
++		ZyanU64 target {};
++		if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &operand, decoded.address,
++		                                          &target))) {
++			return target;
++		}
++	}
++	return 0;
++}
++
++DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
++	DecodedCodeInstruction decoded {.address = address};
++	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address),
++	                                           end - address, &decoded.instruction,
++	                                           decoded.operands.data());
++	if (!ZYAN_SUCCESS(status)) {
++		decoded.instruction.length = 0;
++		return decoded;
++	}
++
++	for (u8 index = 0; index < decoded.instruction.operand_count; ++index) {
++		const auto& operand = decoded.operands[index];
++		if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER) {
++			decoded.uses_stack_pointer |= IsStackPointerRegister(operand.reg.value);
++			if (IsStackPointerRegister(operand.reg.value) &&
++			    (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
++			    decoded.instruction.meta.category != ZYDIS_CATEGORY_CALL &&
++			    decoded.instruction.meta.category != ZYDIS_CATEGORY_RET) {
++				decoded.changes_stack_pointer = true;
++			}
++			continue;
++		}
++		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
++			continue;
++		}
++
++		const bool stack_relative =
++		    IsStackPointerRegister(operand.mem.base) || IsStackPointerRegister(operand.mem.index);
++		decoded.uses_stack_pointer |= stack_relative;
++		constexpr ZydisOperandActions MemoryAccessMask =
++		    ZYDIS_OPERAND_ACTION_MASK_READ | ZYDIS_OPERAND_ACTION_MASK_WRITE;
++		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEA &&
++		    decoded.instruction.mnemonic != ZYDIS_MNEMONIC_NOP && !stack_relative &&
++		    (operand.actions & MemoryAccessMask) != 0) {
++			decoded.accesses_memory = true;
++		}
++	}
++
++	if (decoded.changes_stack_pointer) {
++		const auto& operands = decoded.operands;
++		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
++		    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++		    IsStackPointerRegister(operands[0].reg.value) &&
++		    operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
++			decoded.replaces_stack_pointer = true;
++		} else if ((decoded.instruction.mnemonic == ZYDIS_MNEMONIC_ADD ||
++		            decoded.instruction.mnemonic == ZYDIS_MNEMONIC_SUB) &&
++		           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++		           IsStackPointerRegister(operands[0].reg.value) &&
++		           operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
++			const s64 immediate = operands[1].imm.is_signed
++			                          ? operands[1].imm.value.s
++			                          : static_cast<s64>(operands[1].imm.value.u);
++			decoded.stack_pointer_delta =
++			    decoded.instruction.mnemonic == ZYDIS_MNEMONIC_ADD ? immediate : -immediate;
++		} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
++		           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++		           IsStackPointerRegister(operands[0].reg.value) &&
++		           operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
++		           IsStackPointerRegister(operands[1].mem.base) &&
++		           operands[1].mem.index == ZYDIS_REGISTER_NONE) {
++			decoded.stack_pointer_delta = operands[1].mem.disp.value;
++		} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSH ||
++		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSHF ||
++		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFD ||
++		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFQ) {
++			decoded.stack_pointer_delta = -static_cast<s64>(sizeof(u64));
++		} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP ||
++		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPF ||
++		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFD ||
++		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFQ) {
++			decoded.stack_pointer_delta = sizeof(u64);
++		}
++	}
++
++	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
++		const auto& operand = decoded.operands[index];
++		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
++		    !IsStackPointerRegister(operand.mem.base) || operand.mem.disp.size == 0 ||
++		    operand.mem.disp.value >= 0) {
++			continue;
++		}
++
++		decoded.has_red_zone_operand = true;
++		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
++			if (decoded.stack_pointer_delta.has_value()) {
++				decoded.has_red_zone_operand = false;
++				continue;
++			}
++			decoded.has_unmodeled_red_zone_operand = true;
++			continue;
++		}
++
++		const s64 access_start = operand.mem.disp.value;
++		const s64 access_size  = std::max<s64>(operand.size / 8, 1);
++		const s64 range_start  = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
++		const s64 range_end    = std::min<s64>(access_start + access_size, 0);
++		for (s64 offset = range_start; offset < range_end; ++offset) {
++			const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
++			if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
++				decoded.red_zone_use.set(bit);
++			}
++			if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
++				decoded.red_zone_def.set(bit);
++			}
++		}
++	}
++	return decoded;
++}
++
++bool IsSameRegister(ZydisRegister lhs, ZydisRegister rhs) {
++	return lhs != ZYDIS_REGISTER_NONE && rhs != ZYDIS_REGISTER_NONE &&
++	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, lhs) ==
++	           ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, rhs);
++}
++
++bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
++	return std::ranges::any_of(
++	    std::span {decoded.operands}.first(decoded.instruction.operand_count),
++	    [reg](const ZydisDecodedOperand& operand) {
++		    return operand.type == ZYDIS_OPERAND_TYPE_REGISTER &&
++		           (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
++		           IsSameRegister(operand.reg.value, reg);
++	    });
++}
++
++std::optional<std::vector<uintptr_t>>
++ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
++                        uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
++                        uintptr_t segment_end) {
++	const auto branch = function.instructions.find(branch_address);
++	if (branch == function.instructions.end() ||
++	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
++	    branch->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
++		return std::nullopt;
++	}
++	const ZydisRegister target_reg = branch->second.operands[0].reg.value;
++
++	const auto previous_contiguous = [&function](auto instruction) {
++		if (instruction == function.instructions.begin()) {
++			return function.instructions.end();
++		}
++		const auto previous = std::prev(instruction);
++		return previous->first + previous->second.instruction.length == instruction->first
++		           ? previous
++		           : function.instructions.end();
++	};
++
++	constexpr size_t MaxInterveningInstructions = 4;
++	auto             add                        = function.instructions.end();
++	auto             pattern_cursor             = branch;
++	for (size_t count = 0; count <= MaxInterveningInstructions; ++count) {
++		const auto candidate = previous_contiguous(pattern_cursor);
++		if (candidate == function.instructions.end()) {
++			break;
++		}
++		const auto& decoded = candidate->second;
++		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_ADD &&
++		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++		    IsSameRegister(decoded.operands[0].reg.value, target_reg) &&
++		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
++			add = candidate;
++			break;
++		}
++		if (WritesRegister(decoded, target_reg) || IsControlFlowTerminator(decoded.instruction)) {
++			return std::nullopt;
++		}
++		pattern_cursor = candidate;
++	}
++	if (add == function.instructions.end()) {
++		return std::nullopt;
++	}
++	const ZydisRegister table_reg = add->second.operands[1].reg.value;
++
++	const auto load = previous_contiguous(add);
++	if (load == function.instructions.end() ||
++	    load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
++	    load->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
++	    !IsSameRegister(load->second.operands[0].reg.value, target_reg) ||
++	    load->second.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
++	    !IsSameRegister(load->second.operands[1].mem.base, table_reg) ||
++	    load->second.operands[1].mem.index == ZYDIS_REGISTER_NONE ||
++	    load->second.operands[1].mem.scale != sizeof(s32)) {
++		return std::nullopt;
++	}
++	const ZydisRegister index_reg = load->second.operands[1].mem.index;
++
++	constexpr size_t         MaxPatternInstructions = 64;
++	std::optional<size_t>    table_size;
++	std::optional<uintptr_t> guarded_path_start;
++	auto                     cursor = load;
++	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
++		cursor = previous_contiguous(cursor);
++		if (cursor == function.instructions.end()) {
++			break;
++		}
++		const auto& decoded = cursor->second;
++		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_CMP &&
++		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++		    IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
++		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
++			const uintptr_t next_address  = decoded.address + decoded.instruction.length;
++			const auto      bounds_branch = function.instructions.find(next_address);
++			if (bounds_branch == function.instructions.end()) {
++				return std::nullopt;
++			}
++			const s64 bound = decoded.operands[1].imm.is_signed
++			                      ? decoded.operands[1].imm.value.s
++			                      : static_cast<s64>(decoded.operands[1].imm.value.u);
++			if (bound < 0) {
++				return std::nullopt;
++			}
++			if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNBE) {
++				table_size = static_cast<size_t>(bound) + 1;
++			} else if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNB) {
++				table_size = static_cast<size_t>(bound);
++			} else {
++				return std::nullopt;
++			}
++			guarded_path_start = next_address + bounds_branch->second.instruction.length;
++			break;
++		}
++		if (WritesRegister(decoded, index_reg)) {
++			return std::nullopt;
++		}
++	}
++	if (!table_size) {
++		return std::nullopt;
++	}
++	if (std::ranges::any_of(function.branch_targets, [&](uintptr_t target) {
++		    return target >= *guarded_path_start && target <= branch_address;
++	    })) {
++		return std::nullopt;
++	}
++
++	const auto decode_table_address =
++	    [table_reg](const DecodedCodeInstruction& decoded) -> std::optional<uintptr_t> {
++		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEA ||
++		    decoded.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
++		    !IsSameRegister(decoded.operands[0].reg.value, table_reg) ||
++		    decoded.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
++			return std::nullopt;
++		}
++		ZyanU64 absolute_address {};
++		if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &decoded.operands[1],
++		                                           decoded.address, &absolute_address))) {
++			return std::nullopt;
++		}
++		return absolute_address;
++	};
++
++	std::set<uintptr_t> table_candidates;
++	cursor = load;
++	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
++		cursor = previous_contiguous(cursor);
++		if (cursor == function.instructions.end()) {
++			break;
++		}
++		if (!WritesRegister(cursor->second, table_reg)) {
++			continue;
++		}
++		if (const auto address = decode_table_address(cursor->second)) {
++			table_candidates.insert(*address);
++		}
++		break;
++	}
++	if (table_candidates.empty()) {
++		for (const auto& [address, decoded]: function.instructions) {
++			if (address >= branch_address) {
++				break;
++			}
++			if (const auto table_address = decode_table_address(decoded)) {
++				table_candidates.insert(*table_address);
++			}
++		}
++	}
++	constexpr size_t MaxJumpTableEntries = 4096;
++	if (*table_size == 0 || *table_size > MaxJumpTableEntries) {
++		return std::nullopt;
++	}
++
++	std::optional<std::vector<uintptr_t>> resolved_targets;
++	for (const uintptr_t table_address: table_candidates) {
++		if (table_address < segment_start || table_address > segment_end ||
++		    *table_size > (segment_end - table_address) / sizeof(s32)) {
++			continue;
++		}
++
++		std::vector<uintptr_t> targets;
++		targets.reserve(*table_size);
++		bool valid = true;
++		for (size_t index = 0; index < *table_size; ++index) {
++			s32 offset;
++			std::memcpy(&offset,
++			            reinterpret_cast<const void*>(table_address + index * sizeof(offset)),
++			            sizeof(offset));
++			const s64 target = static_cast<s64>(table_address) + offset;
++			if (target < static_cast<s64>(function_start) ||
++			    target >= static_cast<s64>(function_end)) {
++				valid = false;
++				break;
++			}
++			targets.push_back(static_cast<uintptr_t>(target));
++		}
++		if (!valid) {
++			continue;
++		}
++		std::ranges::sort(targets);
++		targets.erase(std::ranges::unique(targets).begin(), targets.end());
++		if (resolved_targets) {
++			return std::nullopt;
++		}
++		resolved_targets = std::move(targets);
++	}
++	return resolved_targets;
++}
++
++DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
++                               uintptr_t segment_start, uintptr_t segment_end) {
++	DecodedFunction               function;
++	std::vector<uintptr_t>        blocks {function_start};
++	std::unordered_set<uintptr_t> visited;
++	std::set<uintptr_t>           indirect_branches;
++	std::set<uintptr_t>           resolved_indirect_branches;
++
++	while (true) {
++		while (!blocks.empty()) {
++			uintptr_t address = blocks.back();
++			blocks.pop_back();
++
++			while (address >= function_start && address < function_end &&
++			       !visited.contains(address)) {
++				visited.insert(address);
++				auto decoded = DecodeCodeInstruction(address, function_end);
++				if (decoded.instruction.length == 0) {
++					break;
++				}
++
++				function.uses_red_zone |= decoded.has_red_zone_operand;
++				function.requires_conservative_red_zone_tracking |=
++				    decoded.has_unmodeled_red_zone_operand ||
++				    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
++
++				const uintptr_t next_address  = address + decoded.instruction.length;
++				const uintptr_t branch_target = GetRelativeTarget(decoded);
++				if (branch_target >= function_start && branch_target < function_end) {
++					function.branch_targets.insert(branch_target);
++				}
++				function.instructions.emplace(address, decoded);
++
++				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
++					if (branch_target >= function_start && branch_target < function_end) {
++						blocks.push_back(branch_target);
++					}
++				} else if (IsControlFlowTerminator(decoded.instruction)) {
++					if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR &&
++					    branch_target >= function_start && branch_target < function_end) {
++						blocks.push_back(branch_target);
++					} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR &&
++					           branch_target == 0) {
++						indirect_branches.insert(address);
++					}
++					break;
++				}
++				address = next_address;
++			}
++		}
++
++		bool discovered_block = false;
++		for (const uintptr_t branch_address: indirect_branches) {
++			if (resolved_indirect_branches.contains(branch_address)) {
++				continue;
++			}
++			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
++			                                             function_end, segment_start, segment_end);
++			if (!targets) {
++				continue;
++			}
++			resolved_indirect_branches.insert(branch_address);
++			for (const uintptr_t target: *targets) {
++				function.branch_targets.insert(target);
++				if (!visited.contains(target)) {
++					blocks.push_back(target);
++					discovered_block = true;
++				}
++			}
++		}
++		if (!discovered_block) {
++			break;
++		}
++	}
++	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
++	return function;
++}
++
++RedZoneMask TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
++	RedZoneMask translated;
++	for (size_t bit = 0; bit < GuestRedZoneSize; ++bit) {
++		if (!mask.test(bit)) {
++			continue;
++		}
++		const s64 after_offset  = static_cast<s64>(bit) - static_cast<s64>(GuestRedZoneSize);
++		const s64 before_offset = after_offset + stack_pointer_delta;
++		if (before_offset >= -static_cast<s64>(GuestRedZoneSize) && before_offset < 0) {
++			translated.set(static_cast<size_t>(before_offset + static_cast<s64>(GuestRedZoneSize)));
++		}
++	}
++	return translated;
++}
++
++void AnalyzeRedZoneLiveness(DecodedFunction& function) {
++	if (!function.uses_red_zone) {
++		return;
++	}
++
++	if (function.has_indirect_branch || function.requires_conservative_red_zone_tracking ||
++	    std::ranges::any_of(function.branch_targets, [&function](uintptr_t target) {
++		    return !function.instructions.contains(target);
++	    })) {
++		for (auto& [_, decoded]: function.instructions) {
++			decoded.red_zone_live.set();
++		}
++		return;
++	}
++
++	std::vector<DecodedCodeInstruction*> instructions;
++	instructions.reserve(function.instructions.size());
++	std::map<uintptr_t, size_t> indices;
++	for (auto& [address, decoded]: function.instructions) {
++		indices.emplace(address, instructions.size());
++		instructions.push_back(&decoded);
++	}
++
++	std::vector<RedZoneMask> live_in(instructions.size());
++	bool                     changed;
++	do {
++		changed = false;
++		for (size_t reverse_index = instructions.size(); reverse_index-- > 0;) {
++			const auto& decoded = *instructions[reverse_index];
++			RedZoneMask live_out;
++
++			const auto add_successor = [&](uintptr_t address) {
++				if (const auto successor = indices.find(address); successor != indices.end()) {
++					live_out |= live_in[successor->second];
++				}
++			};
++
++			const uintptr_t next_address  = decoded.address + decoded.instruction.length;
++			const uintptr_t branch_target = GetRelativeTarget(decoded);
++			if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
++				add_successor(next_address);
++				add_successor(branch_target);
++			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
++				add_successor(branch_target);
++			} else if (!IsControlFlowTerminator(decoded.instruction)) {
++				add_successor(next_address);
++			}
++
++			const RedZoneMask translated_live_out =
++			    decoded.stack_pointer_delta.has_value()
++			        ? TranslateRedZoneMask(live_out, *decoded.stack_pointer_delta)
++			        : live_out;
++			const RedZoneMask new_live_in =
++			    decoded.red_zone_use | (translated_live_out & ~decoded.red_zone_def);
++			if (new_live_in != live_in[reverse_index]) {
++				live_in[reverse_index] = new_live_in;
++				changed                = true;
++			}
++		}
++	} while (changed);
++
++	for (size_t index = 0; index < instructions.size(); ++index) {
++		instructions[index]->red_zone_live = live_in[index];
++	}
++}
++
++} // namespace
++#endif
++#if defined(__linux__)
++namespace {
++bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
++                                Xbyak::CodeGenerator&         generator) {
++	ZydisEncoderRequest request;
++	if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(
++	        &decoded.instruction, decoded.operands.data(),
++	        decoded.instruction.operand_count_visible, &request))) {
++		return false;
++	}
++
++	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
++		const auto& operand = decoded.operands[index];
++		if (operand.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operand.imm.is_relative) {
++			ZyanU64 absolute_address {};
++			if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &operand,
++			                                           decoded.address, &absolute_address))) {
++				return false;
++			}
++			request.operands[index].imm.u = absolute_address;
++		} else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
++		           (operand.mem.base == ZYDIS_REGISTER_RIP ||
++		            operand.mem.base == ZYDIS_REGISTER_EIP)) {
++			ZyanU64 absolute_address {};
++			if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &operand,
++			                                           decoded.address, &absolute_address))) {
++				return false;
++			}
++			request.operands[index].mem.displacement = static_cast<ZyanI64>(absolute_address);
++		}
++	}
++
++	std::array<u8, ZYDIS_MAX_INSTRUCTION_LENGTH> encoded {};
++	ZyanUSize                                    encoded_size = encoded.size();
++	if (!ZYAN_SUCCESS(ZydisEncoderEncodeInstructionAbsolute(
++	        &request, encoded.data(), &encoded_size,
++	        reinterpret_cast<ZyanU64>(generator.getCurr())))) {
++		return false;
++	}
++	generator.db(encoded.data(), encoded_size);
++	return true;
++}
++
++} // namespace
++#endif
++#if defined(__linux__)
++
++namespace {
++// v1 replaces complete >=5-byte EXTRQ only. Explicit extrq-v2 additionally
++// relocates an ordinary contiguous neighbor of a short form.
++bool EmitLinuxExtrq(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerator& c, bool v3, bool v4, u64 constants) {
++	const auto& ops = decoded.operands;
++	if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ ||
++	    ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
++	    ops[0].reg.value < ZYDIS_REGISTER_XMM0 || ops[0].reg.value > ZYDIS_REGISTER_XMM15) {
++		return false;
++	}
++	const bool immediate = ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
++	                       ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
++	const bool registers = ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++	                       ops[1].reg.value >= ZYDIS_REGISTER_XMM0 &&
++	                       ops[1].reg.value <= ZYDIS_REGISTER_XMM15;
++	if (!immediate && !registers) return false;
++	const Xbyak::Xmm dst(ops[0].reg.value - ZYDIS_REGISTER_XMM0);
++	if (v4 && registers) {
++		const Xbyak::Xmm src(ops[1].reg.value - ZYDIS_REGISTER_XMM0);
++		int a = 0;
++		while (a == dst.getIdx() || a == src.getIdx()) ++a;
++		int b = a + 1;
++		while (b == dst.getIdx() || b == src.getIdx()) ++b;
++		const Xbyak::Xmm index(a), length(b);
++		// The private save area is strictly below the 128-byte guest red zone.
++		// Legacy instructions retain upper YMM; LEA leaves RFLAGS untouched.
++		c.lea(rsp, ptr[rsp - GuestRedZoneSize - 32]);
++		c.movdqu(ptr[rsp], index); c.movdqu(ptr[rsp + 16], length);
++		c.movdqa(index, src); c.movdqa(length, src);
++		c.psllq(index, 50); c.psrlq(index, 58);
++		c.psllq(length, 58); c.psrlq(length, 58);
++		c.pxor(length, ptr[rip + reinterpret_cast<void*>(constants)]);
++		c.paddq(length, ptr[rip + reinterpret_cast<void*>(constants + 16)]);
++		c.pand(length, ptr[rip + reinterpret_cast<void*>(constants)]);
++		c.psrlq(dst, index); c.psllq(dst, length); c.psrlq(dst, length);
++		c.movq(dst, dst);
++		c.movdqu(index, ptr[rsp]); c.movdqu(length, ptr[rsp + 16]);
++		c.lea(rsp, ptr[rsp + GuestRedZoneSize + 32]);
++		return true;
++	}
++	if (v3 && immediate) {
++		u32 length = ops[1].imm.value.u & 63u;
++		const u32 index = ops[2].imm.value.u & 63u;
++		if (length == 0) length = 64;
++		length = std::min(length, 64u - index);
++		// Legacy SSE2 MOVQ xmm,xmm clears bits 127:64, retaining upper YMM.
++		// Shift each 64-bit lane independently; no GPR, flags, stack or MXCSR.
++		c.movq(dst, dst);
++		if (index != 0) c.psrlq(dst, index);
++		if (length < 64u - index) {
++			c.psllq(dst, 64u - length);
++			c.psrlq(dst, 64u - length);
++		}
++		return true;
++	}
++	c.lea(rsp, ptr[rsp - GuestRedZoneSize]);
++	c.pushfq(); c.push(rax); c.push(rcx); c.push(rdx);
++	if (immediate) {
++		u32 length = ops[1].imm.value.u & 63u;
++		const u32 index = ops[2].imm.value.u & 63u;
++		if (length == 0) length = 64;
++		length = std::min(length, 64u - index);
++		const u64 mask = length == 64 ? UINT64_MAX : ((u64{1} << length) - 1);
++		c.movq(rax, dst);
++		if (index != 0) c.shr(rax, index);
++		c.mov(rdx, mask); c.and_(rax, rdx);
++	} else {
++		// Consume the control register before writing dst, including dst==src.
++		const Xbyak::Xmm src(ops[1].reg.value - ZYDIS_REGISTER_XMM0);
++		Xbyak::Label full_length, mask_done;
++		c.movq(rax, src); c.mov(rcx, rax); c.and_(ecx, 63);
++		c.jz(full_length);
++		c.mov(rdx, 1); c.shl(rdx, cl); c.dec(rdx); c.jmp(mask_done);
++		c.L(full_length); c.mov(rdx, UINT64_MAX);
++		c.L(mask_done);
++		c.shr(rax, 8); c.and_(eax, 63); c.mov(ecx, eax);
++		c.movq(rax, dst); c.shr(rax, cl); c.and_(rax, rdx);
++	}
++	// Legacy MOVQ clears high XMM bits while preserving the upper YMM half.
++	c.movq(dst, rax);
++	c.pop(rdx); c.pop(rcx); c.pop(rax); c.popfq();
++	c.lea(rsp, ptr[rsp + GuestRedZoneSize]);
++	return true;
++}
++} // namespace
++
++RedZonePatchResult PatchGuestInstructions(u64 address, u64 size,
++                                        std::span<const uintptr_t> function_starts, bool, bool emulate_amd) {
++	RedZonePatchResult result {};
++	if (!LinuxNativeCpuEnabled() || size == 0 || size > UINTPTR_MAX - address) return result;
++	auto* module = GetContainingModule(reinterpret_cast<void*>(address));
++	if (module == nullptr || address + size > reinterpret_cast<u64>(module->end)) return result;
++	std::unique_lock lock {module->mutex};
++	std::vector<uintptr_t> starts;
++	for (auto start : function_starts) if (start >= address && start < address + size) starts.push_back(start);
++	std::ranges::sort(starts);
++	starts.erase(std::ranges::unique(starts).begin(), starts.end());
++	const size_t begin = module->trampoline_gen.getSize();
++	const bool v3 = std::strcmp(std::getenv("KYTY_LINUX_NATIVE_CPU"), "extrq-v3") == 0;
++	const bool v4 = std::strcmp(std::getenv("KYTY_LINUX_NATIVE_CPU"), "extrq-v4") == 0;
++	const bool v2 = v3 || v4 || std::strcmp(std::getenv("KYTY_LINUX_NATIVE_CPU"), "extrq-v2") == 0;
++	u64 constants = 0; // Shared within this patch pass; never an execution entry.
++	std::map<uintptr_t, uintptr_t> intervals;
++	std::set<uintptr_t> all_targets(starts.begin(), starts.end());
++	// Analyze every boundary before changing bytes; direct targets can cross functions.
++	// Keep only targets between passes, not the entire module's large decoded operand file.
++	for (size_t i = 0; i < starts.size(); ++i) {
++		const auto end = i + 1 < starts.size() ? starts[i + 1] : address + size;
++		const auto function = DecodeFunction(starts[i], end, address, address + size);
++		all_targets.insert(function.branch_targets.begin(), function.branch_targets.end());
++		for (const auto& [site, decoded] : function.instructions) {
++			if (v2) intervals[site] = site + decoded.instruction.length;
++			const auto target = GetRelativeTarget(decoded);
++			if (target != 0) all_targets.insert(target);
++		}
++	}
++	for (size_t i = 0; i < starts.size(); ++i) {
++		const auto end = i + 1 < starts.size() ? starts[i + 1] : address + size;
++		const auto function = DecodeFunction(starts[i], end, address, address + size);
++		++result.function_count;
++		result.instruction_count += function.instructions.size();
++		for (const auto& [site, decoded] : function.instructions) {
++			if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) continue;
++			++result.extrq_found_count;
++			auto continuation = site + decoded.instruction.length;
++			std::vector<const DecodedCodeInstruction*> neighbors;
++			if (v2 && decoded.instruction.length < NearJumpSize) {
++				// Experimental: roots/direct targets do not prove unknown computed entries.
++				// Only steal decoded, contiguous, non-control-flow ordinary instructions.
++				while (continuation - site < NearJumpSize) {
++					const auto next = function.instructions.find(continuation);
++					if (next == function.instructions.end()) break;
++					const auto& n = next->second;
++					// int15's --amd-cpu pass runs next, on original executable segments.
++					// Do not hide its replacement site inside our separate trampoline.
++					if (emulate_amd &&
++					    (n.instruction.mnemonic == ZYDIS_MNEMONIC_RSQRTPS ||
++					     n.instruction.mnemonic == ZYDIS_MNEMONIC_RSQRTSS ||
++					     n.instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS ||
++					     n.instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTSS ||
++					     n.instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
++					     n.instruction.mnemonic == ZYDIS_MNEMONIC_RDPID ||
++					     n.instruction.mnemonic == ZYDIS_MNEMONIC_CLWB)) break;
++					if (n.instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
++					    IsControlFlowTerminator(n.instruction) ||
++					    n.instruction.meta.category == ZYDIS_CATEGORY_COND_BR ||
++					    n.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
++					    n.instruction.meta.category == ZYDIS_CATEGORY_SYSCALL ||
++					    n.instruction.meta.category == ZYDIS_CATEGORY_X87_ALU ||
++					    std::ranges::any_of(n.operands, [](const auto& op) {
++						    return op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && op.imm.is_relative;
++					    })) break;
++					neighbors.push_back(&n);
++					continuation += n.instruction.length;
++				}
++			}
++			const auto inner_target = all_targets.upper_bound(site);
++			const auto inner_instruction = function.instructions.upper_bound(site);
++			bool overlap = false;
++			if (v2) {
++				// Includes earlier-starting alternate decode intervals (max x86 length 15).
++				for (auto it = intervals.lower_bound(site > 15 ? site - 15 : 0);
++				     it != intervals.end() && it->first < continuation; ++it) {
++					if (it->second <= site || it->first == site) continue;
++					if (std::ranges::none_of(neighbors, [&](auto* n) { return n->address == it->first; })) {
++						overlap = true; break;
++					}
++				}
++			}
++			if (continuation - site < NearJumpSize || overlap || module->patched.contains(reinterpret_cast<u8*>(site)) ||
++			    (inner_target != all_targets.end() && *inner_target < continuation) ||
++			    (!v2 && inner_instruction != function.instructions.end() && inner_instruction->first < continuation)) continue;
++			auto& c = module->trampoline_gen;
++			const auto offset = c.getSize();
++			const bool new_constants = v4 && decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER && constants == 0;
++			const auto reserve = new_constants ? 304u : 256u;
++			const auto predicted = reinterpret_cast<u64>(c.getCurr()) + (new_constants ? 47u : 0u);
++			// A generous bounded slot avoids partial emission or exhaustion aborts.
++			if (module->trampoline_capacity - offset < reserve ||
++			    !Xbyak::inner::IsInInt32(static_cast<s64>(predicted) - static_cast<s64>(site + NearJumpSize)) ||
++			    !Xbyak::inner::IsInInt32(static_cast<s64>(continuation) - static_cast<s64>(predicted + 256))) continue;
++			Xbyak::ClearError();
++			if (new_constants) {
++				c.align(16); constants = reinterpret_cast<u64>(c.getCurr());
++				c.dq(63); c.dq(0); c.dq(1); c.dq(0);
++			}
++			const auto trampoline = reinterpret_cast<u64>(c.getCurr());
++			auto rewind = [&] { Xbyak::ClearError(); c.setSize(offset); if (new_constants) constants = 0; };
++			if (!EmitLinuxExtrq(decoded, c, v3, v4, constants)) { rewind(); continue; }
++			bool relocated = true;
++			for (auto* n : neighbors) if (!EncodeRelocatedInstruction(*n, c)) { relocated = false; break; }
++			if (!relocated) { rewind(); continue; }
++			c.jmp(reinterpret_cast<void*>(continuation), Xbyak::CodeGenerator::T_NEAR);
++			if (Xbyak::GetError() != 0 ||
++			    !Xbyak::inner::IsInInt32(static_cast<s64>(trampoline) - static_cast<s64>(site + NearJumpSize))) {
++				rewind(); continue;
++			}
++			const s32 displacement = static_cast<s32>(static_cast<s64>(trampoline) - static_cast<s64>(site + NearJumpSize));
++			auto* bytes = reinterpret_cast<u8*>(site);
++			bytes[0] = 0xe9;
++			std::memcpy(bytes + 1, &displacement, sizeof(displacement));
++			std::memset(bytes + NearJumpSize, 0x90, continuation - site - NearJumpSize);
++			module->patched.insert(bytes);
++			++result.extrq_native_count;
++		}
++	}
++	result.extrq_fallback_count = result.extrq_found_count - result.extrq_native_count;
++	Common::VirtualMemory::FlushInstructionCache(address, size);
++	if (module->trampoline_gen.getSize() != begin)
++		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<u64>(module->trampoline_gen.getCode()) + begin,
++		                                           module->trampoline_gen.getSize() - begin);
++	return result;
++}
++
++#else
++
++RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool) {
++	return {};
++}
++
++#endif
++
++void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
++                                uint64_t trampoline_area_size) {
++#if defined(__linux__)
++	EXIT_IF(module_ptr == nullptr || module_size == 0 || trampoline_area_ptr == nullptr ||
++	        trampoline_area_size == 0);
++	const auto module_addr = reinterpret_cast<u64>(module_ptr);
++	g_patch_modules.erase(module_addr);
++	g_patch_modules.emplace(std::piecewise_construct, std::forward_as_tuple(module_addr),
++	                        std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
++	                                              static_cast<u8*>(trampoline_area_ptr),
++	                                              trampoline_area_size));
++#else
++	(void)module_ptr;
++	(void)module_size;
++	(void)trampoline_area_ptr;
++	(void)trampoline_area_size;
++#endif
++}
++
++void UnregisterRedZonePatchModule(void* module_ptr) {
++#if defined(__linux__)
++	g_patch_modules.erase(reinterpret_cast<u64>(module_ptr));
++#else
++	(void)module_ptr;
++#endif
++}
++
++#undef ASSERT
++
++} // namespace Loader::LinuxNative
+diff --git a/src/loader/redZonePatcher.h b/src/loader/redZonePatcher.h
+new file mode 100644
+index 0000000..9340e58
+--- /dev/null
++++ b/src/loader/redZonePatcher.h
+@@ -0,0 +1,50 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef KYTY_LOADER_RED_ZONE_PATCHER_H_
++#define KYTY_LOADER_RED_ZONE_PATCHER_H_
++
++#include "common/common.h"
++
++#include <span>
++#include <vector>
++
++namespace Loader::LinuxNative {
++
++struct RedZonePatchResult {
++	uint64_t function_count                           = 0;
++	uint64_t instruction_count                        = 0;
++	uint64_t red_zone_function_count                   = 0;
++	uint64_t memory_instruction_count                 = 0;
++	uint64_t short_memory_instruction_count           = 0;
++	uint64_t patched_memory_instruction_count         = 0;
++	uint64_t stack_dependent_memory_instruction_count = 0;
++	uint64_t control_flow_memory_instruction_count    = 0;
++	uint64_t unrelocatable_memory_instruction_count   = 0;
++	uint64_t indirect_red_zone_function_count         = 0;
++	uint64_t reciprocal_sqrt_instruction_count        = 0;
++	uint64_t extrq_found_count                        = 0;
++	uint64_t extrq_native_count                       = 0;
++	uint64_t extrq_fallback_count                     = 0;
++};
++
++// Linux experiment is opt-in. Unknown/empty values retain the original trap paths.
++bool LinuxNativeCpuEnabled();
++
++void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
++                                uint64_t trampoline_area_size);
++void UnregisterRedZonePatchModule(void* module_ptr);
++
++// Linux-only experimental EXTRQ rewrite (non-Linux builds return an empty result).
++// Call only while the module is unpublished/quiescent and its trampoline is writable.
++// extrq replaces only >=5-byte instructions; explicit v2/v3/v4 may relocate
++// eligible ordinary neighbors. v4 changes only the register-controlled emitter.
++// emulate_amd prevents stealing sites needed by int15's later compatibility pass.
++RedZonePatchResult PatchGuestInstructions(uint64_t segment_addr, uint64_t segment_size,
++                                          std::span<const uintptr_t> function_starts,
++                                          bool protect_memory, bool emulate_amd);
++
++
++} // namespace Loader::LinuxNative
++
++#endif /* KYTY_LOADER_RED_ZONE_PATCHER_H_ */
+diff --git a/src/loader/runtimeLinker.cpp b/src/loader/runtimeLinker.cpp
+index ac69464..7addc1d 100644
+--- a/src/loader/runtimeLinker.cpp
++++ b/src/loader/runtimeLinker.cpp
+@@ -22,6 +22,7 @@
+ #include "loader/gamePatch.h"
+ #include "loader/guestInstructionPatcher.h"
+ #include "loader/jit.h"
++#include "loader/redZonePatcher.h"
+ #include "loader/symbolDatabase.h"
+ #include "loader/x64InstructionEmulator.h"
+ 
+@@ -1831,6 +1832,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
+ 	const bool protect_memory_faults = false;
+ #endif
+ 	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
++	const bool linux_native_cpu = LinuxNative::LinuxNativeCpuEnabled();
++	constexpr uint64_t LINUX_NATIVE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
++	if (linux_native_cpu) {
++		EXIT_IF(LINUX_NATIVE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
++		program->mapped_size += LINUX_NATIVE_TRAMPOLINE_SIZE;
++	}
+ 
+ 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+ 	if (patch_guest_instructions) {
+@@ -1850,9 +1857,20 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
+ 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
+ 		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
+ 	}
++	if (linux_native_cpu) {
++		// Separate storage/registry: do not alter int15's AMD or red-zone patcher.
++		program->linux_native_trampoline_vaddr = program->base_vaddr +
++		    program->base_size_aligned + program->instruction_trampoline_size;
++		program->linux_native_trampoline_size = LINUX_NATIVE_TRAMPOLINE_SIZE;
++		LinuxNative::RegisterRedZonePatchModule(
++		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
++		    reinterpret_cast<void*>(program->linux_native_trampoline_vaddr),
++		    program->linux_native_trampoline_size);
++	}
+ 	if (!is_shared) {
+ 		program->tls.handler_vaddr =
+-		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
++		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size +
++		    program->linux_native_trampoline_size;
+ 	}
+ 
+ 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
+@@ -1937,12 +1955,29 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
+ 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
+ 		}
+ 
+-		if (patch_guest_instructions && phdr[i].p_type == PT_GNU_EH_FRAME) {
++		if ((patch_guest_instructions || linux_native_cpu) && phdr[i].p_type == PT_GNU_EH_FRAME) {
+ 			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
+ 			eh_frame_header_size = phdr[i].p_memsz;
+ 		}
+ 	}
+ 
++	if (linux_native_cpu) {
++		std::vector<uintptr_t> native_function_starts;
++		// Keep int15's existing metadata decoder; no foreign RuntimeLinker replacement.
++		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
++		                                &native_function_starts)) {
++			LOGF("Linux native CPU: no valid function roots for %s; retaining int15 paths\n",
++			     Common::PathToString(program->file_name.filename()).c_str());
++		}
++		for (const auto& [segment_addr, segment_size]: executable_segments) {
++			const auto result = LinuxNative::PatchGuestInstructions(
++			    segment_addr, segment_size, native_function_starts, false, emulate_amd);
++			LOGF("Linux native EXTRQ: %s, found=%" PRIu64 ", native=%" PRIu64 ", fallback=%" PRIu64 "\n",
++			     Common::PathToString(program->file_name.filename()).c_str(),
++			     result.extrq_found_count, result.extrq_native_count, result.extrq_fallback_count);
++		}
++	}
++
+ 	if (patch_guest_instructions) {
+ 		std::vector<uintptr_t> function_starts;
+ 		const bool             have_function_starts =
+@@ -2022,6 +2057,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
+ 		}
+ 	}
+ 
++	if (linux_native_cpu) {
++		// Emit/flush before publication, then remove trampoline write permission.
++		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
++		    program->linux_native_trampoline_vaddr, program->linux_native_trampoline_size,
++		    Common::VirtualMemory::Mode::ExecuteRead));
++	}
+ 	if (!is_shared) {
+ 		SetupTlsHandler(program);
+ 	}
+@@ -2050,6 +2091,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
+ 		if (program->instruction_trampoline_size != 0) {
+ 			UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr));
+ 		}
++		if (program->linux_native_trampoline_size != 0) {
++			LinuxNative::UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
++		}
+ 		EXIT_IF(
+ 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
+ 	}
+diff --git a/src/loader/runtimeLinker.h b/src/loader/runtimeLinker.h
+index 151f9b4..f26ba05 100644
+--- a/src/loader/runtimeLinker.h
++++ b/src/loader/runtimeLinker.h
+@@ -123,6 +123,8 @@ struct Program {
+ 	uint64_t                     base_size_aligned = 0;
+ 	uint64_t                     mapped_size       = 0;
+ 	uint64_t instruction_trampoline_size = 0;
++	uint64_t linux_native_trampoline_vaddr = 0;
++	uint64_t linux_native_trampoline_size = 0;
+ 	std::unique_ptr<SymbolDatabase> export_symbols;
+ 	std::unique_ptr<SymbolDatabase> import_symbols;
+ 	ThreadLocalStorage              tls;
+diff --git a/tests/linuxNativeEquivalenceTests.cpp b/tests/linuxNativeEquivalenceTests.cpp
+new file mode 100644
+index 0000000..580bff3
+--- /dev/null
++++ b/tests/linuxNativeEquivalenceTests.cpp
+@@ -0,0 +1,582 @@
++// Differential execution against the existing Linux SIGILL emulator.
++#include "loader/redZonePatcher.h"
++#include "loader/x64InstructionEmulator.h"
++#define XBYAK_NO_EXCEPTION
++#include <xbyak/xbyak.h>
++#include <xbyak/xbyak_util.h>
++#include <array>
++#include <bit>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++#include <sys/mman.h>
++#include <xmmintrin.h>
++#include <Zydis/Zydis.h>
++#include <chrono>
++#include <algorithm>
++
++int LinuxNativeTestTrapCount();
++namespace {
++using namespace Xbyak::util;
++void Check(bool ok, const char* message) {
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(4); }
++}
++struct State {
++    uint64_t ymm[16][4];
++    uint64_t gpr[16];
++    uint64_t red_zone[16];
++    uint64_t flags;
++};
++constexpr size_t Size = 0x4000;
++struct Fixture {
++    void* memory = mmap(nullptr, Size * 3, PROT_READ | PROT_WRITE,
++                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    uintptr_t address = reinterpret_cast<uintptr_t>(memory);
++    Fixture() { Check(memory != MAP_FAILED, "mmap"); }
++    ~Fixture() { Loader::LinuxNative::UnregisterRedZonePatchModule(memory); munmap(memory, Size * 3); }
++    void Writable() { Check(mprotect(memory, Size * 2, PROT_READ | PROT_WRITE) == 0, "RW transition"); }
++    void Executable() { Check(mprotect(memory, Size * 2, PROT_READ | PROT_EXEC) == 0, "RX transition"); }
++};
++struct Program { size_t size, site, length, span; };
++Program Generate(Fixture& f, int dst, int src, bool immediate, unsigned length, unsigned index, int neighbor = 0) {
++    f.Writable();
++    Xbyak::ClearError();
++    Xbyak::CodeGenerator c(Size, f.memory);
++    for (auto r : {rbx, rbp, r12, r13, r14, r15}) c.push(r);
++    for (int i = 0; i < 16; ++i) c.vmovdqu(Xbyak::Ymm(i), c.ptr[rdi + i * 32]);
++    for (int i = 1; i <= 16; ++i) {
++        c.mov(rax, 0x1122334455667788ull ^ i);
++        c.mov(c.qword[rsp - i * 8], rax);
++    }
++    const std::array<Xbyak::Reg64, 16> regs {rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi,
++                                           r8, r9, r10, r11, r12, r13, r14, r15};
++    for (int i = 0; i < 16; ++i)
++        if (i != 4 && i != 6 && i != 7) c.mov(regs[i], 0x8877665544332200ull + i);
++    // Deterministic flags, including CF/PF/AF/ZF/SF/OF; no stack write in the red zone.
++    c.lea(rsp, c.ptr[rsp - 128]); c.push(0xad7); c.popfq(); c.lea(rsp, c.ptr[rsp + 128]);
++    const auto site = c.getSize();
++    c.db(0x66);
++    const unsigned rex = immediate ? (dst >= 8 ? 0x41 : 0) :
++                         ((dst >= 8 ? 0x44 : 0) | (src >= 8 ? 0x41 : 0));
++    if (rex) c.db(rex);
++    c.db(0x0f); c.db(immediate ? 0x78 : 0x79);
++    c.db(immediate ? 0xc0 | (dst & 7) : 0xc0 | ((dst & 7) << 3) | (src & 7));
++    if (immediate) { c.db(length); c.db(index); }
++    const auto instruction_length = c.getSize() - site;
++    Xbyak::Label neighbors, constant;
++    if (neighbor == 1) c.nop();
++    if (neighbor == 2) c.mov(r11, c.qword[c.rip + constant]);
++    if (neighbor == 3) c.mov(c.qword[c.rip + reinterpret_cast<void*>(f.address + Size * 2)], r11);
++    if (neighbor == 4) c.add(r10, 13);
++    const auto span = c.getSize() - site;
++    c.jmp(neighbors, Xbyak::CodeGenerator::T_SHORT);
++    c.nop(); c.nop();
++    c.L(neighbors);
++    if (neighbor == 3) c.mov(r11, c.qword[c.rip + reinterpret_cast<void*>(f.address + Size * 2)]);
++    else if (neighbor != 2) c.mov(r11, c.qword[c.rip + constant]);
++    for (int i = 0; i < 16; ++i) c.vmovdqu(c.ptr[rsi + i * 32], Xbyak::Ymm(i));
++    for (int i = 0; i < 16; ++i) c.mov(c.qword[rsi + offsetof(State, gpr) + i * 8], regs[i]);
++    c.lea(rsp, c.ptr[rsp - 128]); c.pushfq(); c.pop(rax); c.lea(rsp, c.ptr[rsp + 128]);
++    c.mov(c.qword[rsi + offsetof(State, flags)], rax);
++    for (int i = 1; i <= 16; ++i) {
++        c.mov(rax, c.qword[rsp - i * 8]);
++        c.mov(c.qword[rsi + offsetof(State, red_zone) + (i - 1) * 8], rax);
++    }
++    for (auto r : {r15, r14, r13, r12, rbp, rbx}) c.pop(r);
++    c.vzeroupper(); c.ret();
++    c.L(constant); c.dq(0x123456780000ffffull);
++    Check(Xbyak::GetError() == 0, "test code generation");
++    return {c.getSize(), site, instruction_length, span};
++}
++void Execute(Fixture& f, const State& input, State& output) {
++    reinterpret_cast<void (*)(const State*, State*)>(f.memory)(&input, &output);
++}
++void Matrix(bool v2, int neighbor, bool v3 = false, bool v4 = false) {
++    setenv("KYTY_LINUX_NATIVE_CPU", v4 ? "extrq-v4" : v3 ? "extrq-v3" : (v2 ? "extrq-v2" : "extrq"), 1);
++    if (!Xbyak::util::Cpu().has(Xbyak::util::Cpu::tAVX)) {
++        std::puts("SKIP: YMM preservation matrix requires AVX host"); return;
++    }
++    Fixture f;
++    std::mt19937_64 random(0x459ce15);
++    std::array<unsigned, 16> controls {0, 1, 7, 8, 31, 32, 63, 64, 65, 127, 128, 255};
++    for (int i = 12; i < 16; ++i) controls[i] = random() & 255;
++    uint64_t cases = 0, native = 0, fallback = 0;
++    const uint32_t saved_mxcsr = _mm_getcsr();
++    for (bool immediate : {true, false}) for (int dst = 0; dst < 16; ++dst)
++    for (int src = 0; src < (immediate ? 1 : 16); ++src)
++    for (auto length : controls) for (auto index : controls) {
++        State input {}, output {};
++        for (auto& reg : input.ymm) for (auto& qword : reg) qword = random();
++        if (!immediate) input.ymm[src][0] = (input.ymm[src][0] & ~uint64_t{0xffff}) | length | (index << 8);
++        const auto p = Generate(f, dst, src, immediate, length, index, neighbor);
++        const std::vector<uint8_t> original(static_cast<uint8_t*>(f.memory), static_cast<uint8_t*>(f.memory) + p.size);
++        f.Executable();
++        const uint32_t mxcsr = 0x1fa1u | ((cases & 3u) << 13u) | ((cases & 4u) << 4u);
++        _mm_setcsr(mxcsr);
++        Execute(f, input, output);
++        Check(_mm_getcsr() == mxcsr, "reference MXCSR preservation");
++        const State expected = output;
++        f.Writable();
++        Loader::LinuxNative::UnregisterRedZonePatchModule(f.memory);
++        Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++        const std::array<uintptr_t, 1> starts {f.address};
++        const auto result = Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false);
++        Check(result.extrq_found_count == 1, "CFG lost EXTRQ");
++        const bool is_native = p.length >= 5 || (v2 && neighbor != 0);
++        Check(result.extrq_native_count == (is_native ? 1u : 0u), "native/fallback coverage");
++        native += result.extrq_native_count; fallback += result.extrq_fallback_count;
++        // v1 modifies only EXTRQ; v2 may modify its complete stolen neighbor too.
++        const auto* patched = static_cast<const uint8_t*>(f.memory);
++        for (size_t j = 0; j < p.size; ++j)
++            if (j < p.site || j >= p.site + (v2 && p.length < 5 && is_native ? p.span : p.length)) Check(patched[j] == original[j], "patch modified neighbors/data");
++        f.Executable();
++        std::memset(&output, 0, sizeof(output));
++        const auto traps_before = LinuxNativeTestTrapCount();
++        Execute(f, input, output);
++        Check(LinuxNativeTestTrapCount() == traps_before + (is_native ? 0 : 1), "native still SIGILL / fallback lost trap");
++        Check(_mm_getcsr() == mxcsr, "candidate MXCSR preservation");
++        Check(std::memcmp(&output, &expected, sizeof(output)) == 0,
++              "bit-exact XMM/YMM/GPR/RFLAGS/red-zone differential");
++        ++cases;
++    }
++    _mm_setcsr(saved_mxcsr);
++    std::printf("PASS: EXTRQ matrix v2=%d v3=%d v4=%d neighbor=%d cases=%llu native=%llu fallback=%llu; all 16 registers, dst==src, controls, seeded random, GPR/RFLAGS/red-zone/YMM/MXCSR\n",
++                v2, v3, v4, neighbor, (unsigned long long)cases, (unsigned long long)native, (unsigned long long)fallback);
++}
++void Fallbacks() {
++    Fixture f;
++    State input {};
++    for (auto& reg : input.ymm) for (auto& qword : reg) qword = 0x123456789abcdef0ull;
++    for (const char* option : {"", "0", "trap", "rsqrt", "all", "1"}) {
++        setenv("KYTY_LINUX_NATIVE_CPU", option, 1);
++        Check(!Loader::LinuxNative::LinuxNativeCpuEnabled(), "unknown option enabled native path");
++        auto p = Generate(f, 0, 0, true, 8, 4);
++        Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++        const std::array<uintptr_t, 1> starts {f.address};
++        auto result = Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false);
++        Check(result.extrq_native_count == 0, "disabled path changed code");
++    }
++    unsetenv("KYTY_LINUX_NATIVE_CPU"); Check(!Loader::LinuxNative::LinuxNativeCpuEnabled(), "default not OFF");
++    setenv("KYTY_LINUX_NATIVE_CPU", "extrq", 1);
++    const auto p = Generate(f, 0, 0, true, 8, 4);
++    const std::array<uintptr_t, 1> starts {f.address};
++    Loader::LinuxNative::UnregisterRedZonePatchModule(f.memory);
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false).extrq_native_count == 0,
++          "unregistered module must fail safe");
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), 32);
++    auto result = Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false);
++    Check(result.extrq_native_count == 0 && result.extrq_fallback_count == 1, "capacity fallback");
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + (uint64_t{1} << 33)), Size);
++    const auto far = Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false);
++    Check(far.extrq_found_count == 1 && far.extrq_native_count == 0 && far.extrq_fallback_count == 1,
++          "out-of-rel32 trampoline must retain fallback without writing unmapped memory");
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, {}, false, false).extrq_native_count == 0,
++          "missing function boundaries fallback");
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, UINT64_MAX, starts, false, false).extrq_native_count == 0,
++          "overflow fallback");
++    // Decode failure must stop this block rather than scan one byte and mistake data for code.
++    f.Writable();
++    const uint8_t data[] = {0x0f, 0x04, 0x66, 0x0f, 0x78, 0xc0, 8, 4};
++    std::memcpy(f.memory, data, sizeof(data));
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, sizeof(data), starts, false, false).extrq_found_count == 0,
++          "decoder must not scan data after failure");
++    // A direct jump over embedded data only visits the real target.
++    const uint8_t jumped[] = {0xeb, 6, 0x66, 0x0f, 0x78, 0xc0, 8, 4, 0xc3};
++    std::memcpy(f.memory, jumped, sizeof(jumped));
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, sizeof(jumped), starts, false, false).extrq_found_count == 0,
++          "CFG must not patch skipped data");
++    // A branch in another EH-frame function into the middle of EXTRQ forbids rewriting it.
++    f.Writable();
++    std::array<uint8_t, 23> overlapping {};
++    overlapping.fill(0x90);
++    overlapping[0] = 0xe9;
++    const int32_t displacement = 17 - 5;
++    std::memcpy(overlapping.data() + 1, &displacement, sizeof(displacement));
++    const uint8_t target[] = {0x66, 0x0f, 0x78, 0xc0, 8, 4, 0xc3};
++    std::memcpy(overlapping.data() + 16, target, sizeof(target));
++    std::memcpy(f.memory, overlapping.data(), overlapping.size());
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++    const std::array<uintptr_t, 2> cross_starts {f.address, f.address + 16};
++    const auto cross = Loader::LinuxNative::PatchGuestInstructions(f.address, overlapping.size(), cross_starts, false, false);
++    Check(cross.extrq_found_count == 1 && cross.extrq_native_count == 0,
++          "cross-function branch into an instruction must retain fallback");
++    std::puts("PASS: default/OFF/unknown options, capacity, missing boundaries/module, overflow, invalid decode, jumped data, cross-function target fallback");
++}
++}
++namespace {
++size_t CheckV3Body(Fixture& f, int dst) {
++    ZydisDecoder decoder;
++    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
++    size_t offset = 0;
++    for (;;) {
++        ZydisDecodedInstruction instruction;
++        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
++        Check(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,
++              reinterpret_cast<void*>(f.address + Size + offset), 256 - offset,
++              &instruction, ops)), "v3 trampoline decode");
++        if (instruction.mnemonic == ZYDIS_MNEMONIC_JMP) return offset;
++        Check(instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_LEGACY,
++              "v3 immediate must use legacy SSE, not VEX");
++        Check(instruction.mnemonic == ZYDIS_MNEMONIC_MOVQ ||
++              instruction.mnemonic == ZYDIS_MNEMONIC_PSRLQ ||
++              instruction.mnemonic == ZYDIS_MNEMONIC_PSLLQ,
++              "v3 immediate body must contain only register-only SSE2");
++        for (unsigned i = 0; i < instruction.operand_count; ++i) {
++            Check(ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE ||
++                  (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++                   ops[i].reg.value == ZYDIS_REGISTER_XMM0 + dst),
++                  "v3 immediate touches memory, GPR, flags or another XMM");
++        }
++        offset += instruction.length;
++        Check(offset < 256, "v3 trampoline bounds");
++    }
++}
++uintptr_t Entry(Fixture& f, const Program& p) {
++    int32_t displacement;
++    std::memcpy(&displacement, reinterpret_cast<void*>(f.address + p.site + 1), 4);
++    return f.address + p.site + 5 + displacement;
++}
++size_t CheckV4Body(Fixture& f, const Program& p, int dst, int src) {
++    const auto entry = Entry(f, p);
++    ZydisDecoder decoder;
++    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
++    size_t offset = 0;
++    int scratch[2] {-1, -1}; unsigned saves = 0, restores = 0, constants = 0, leas = 0;
++    for (unsigned n = 0; n < 19; ++n) {
++        ZydisDecodedInstruction ins;
++        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
++        Check(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<void*>(entry + offset),
++              256 - offset, &ins, ops)), "v4 body decode");
++        Check(ins.encoding == ZYDIS_INSTRUCTION_ENCODING_LEGACY, "v4 must not use VEX");
++        Check(ins.mnemonic == ZYDIS_MNEMONIC_LEA || ins.mnemonic == ZYDIS_MNEMONIC_MOVDQU ||
++              ins.mnemonic == ZYDIS_MNEMONIC_MOVDQA || ins.mnemonic == ZYDIS_MNEMONIC_MOVQ ||
++              ins.mnemonic == ZYDIS_MNEMONIC_PSLLQ || ins.mnemonic == ZYDIS_MNEMONIC_PSRLQ ||
++              ins.mnemonic == ZYDIS_MNEMONIC_PXOR || ins.mnemonic == ZYDIS_MNEMONIC_PADDQ ||
++              ins.mnemonic == ZYDIS_MNEMONIC_PAND, "v4 opcode modifies flags/GPR or unsupported body");
++        for (unsigned i = 0; i < ins.operand_count; ++i) {
++            const auto& op = ops[i];
++            if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
++                Check((op.reg.value >= ZYDIS_REGISTER_XMM0 && op.reg.value <= ZYDIS_REGISTER_XMM15) ||
++                      (ins.mnemonic == ZYDIS_MNEMONIC_LEA && op.reg.value == ZYDIS_REGISTER_RSP),
++                      "v4 touches GPR/RFLAGS/MXCSR");
++            }
++            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
++            Check(op.mem.index == ZYDIS_REGISTER_NONE, "v4 indexed memory");
++            if (ins.mnemonic == ZYDIS_MNEMONIC_LEA) {
++                Check(op.mem.base == ZYDIS_REGISTER_RSP && op.mem.disp.value == (leas++ == 0 ? -160 : 160), "v4 RSP adjustment");
++            } else if (op.mem.base == ZYDIS_REGISTER_RSP) {
++                Check(ins.mnemonic == ZYDIS_MNEMONIC_MOVDQU && (op.mem.disp.value == 0 || op.mem.disp.value == 16), "v4 private scratch bounds");
++                if (i == 0) {
++                    Check(saves < 2, "v4 extra scratch save");
++                    scratch[saves++] = ops[1].reg.value - ZYDIS_REGISTER_XMM0;
++                } else {
++                    Check(restores < 2 && ops[0].reg.value == ZYDIS_REGISTER_XMM0 + scratch[restores++], "v4 scratch restoration");
++                }
++            } else {
++                Check(op.mem.base == ZYDIS_REGISTER_RIP && i == 1 &&
++                      (ins.mnemonic == ZYDIS_MNEMONIC_PXOR || ins.mnemonic == ZYDIS_MNEMONIC_PADDQ || ins.mnemonic == ZYDIS_MNEMONIC_PAND), "v4 non-private memory");
++                const auto target = entry + offset + ins.length + op.mem.disp.value;
++                Check(target >= f.address + Size && target + 16 <= entry && target % 16 == 0, "v4 constants not aligned/bounded/outside execution");
++                const auto* values = reinterpret_cast<const uint64_t*>(target);
++                Check(values[0] == (ins.mnemonic == ZYDIS_MNEMONIC_PADDQ ? 1u : 63u) && values[1] == 0, "v4 constant contents");
++                ++constants;
++            }
++        }
++        offset += ins.length;
++    }
++    Check(saves == 2 && restores == 2 && constants == 3 && leas == 2 &&
++          scratch[0] != scratch[1] && scratch[0] != dst && scratch[0] != src &&
++          scratch[1] != dst && scratch[1] != src, "v4 scratch collision or incomplete body");
++    return offset;
++}
++void ExhaustiveV4Register() {
++    Check(Xbyak::util::Cpu().has(Xbyak::util::Cpu::tAVX), "v4 upper-YMM matrix needs AVX");
++    Fixture f, reference;
++    std::mt19937_64 random(0x444459ce15);
++    const auto saved_mxcsr = _mm_getcsr();
++    uint64_t cases = 0;
++    for (int dst = 0; dst < 16; ++dst) for (int src = 0; src < 16; ++src) {
++        Generate(reference, dst, src, false, 0, 0, 1); reference.Executable();
++        const auto p = Generate(f, dst, src, false, 0, 0, 1);
++        Loader::LinuxNative::UnregisterRedZonePatchModule(f.memory);
++        Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++        setenv("KYTY_LINUX_NATIVE_CPU", "extrq-v4", 1);
++        const std::array<uintptr_t, 1> starts {f.address};
++        Check(Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false).extrq_native_count == 1, "v4 register native matrix");
++        CheckV4Body(f, p, dst, src); f.Executable();
++        for (unsigned length = 0; length < 64; ++length) for (unsigned index = 0; index < 64; ++index)
++        for (unsigned wrap = 0; wrap < 4; ++wrap) {
++            State input {}, output {};
++            for (auto& reg : input.ymm) for (auto& q : reg) q = wrap == 0 ? 0 : wrap == 1 ? UINT64_MAX : random();
++            input.ymm[src][0] = (random() & ~uint64_t{0xffff}) | length | (wrap << 6) | (index << 8) | (((wrap + dst) & 3) << 14);
++            const uint32_t mxcsr = 0x1fbfu | ((cases & 3u) << 13u) | ((cases & 4u) << 4u) | ((cases & 8u) << 12u);
++            _mm_setcsr(mxcsr);
++            const auto before = LinuxNativeTestTrapCount();
++            Execute(reference, input, output);
++            Check(LinuxNativeTestTrapCount() == before + 1 && _mm_getcsr() == mxcsr, "v4 actual SIGILL reference/MXCSR");
++            const State expected = output;
++            std::memset(&output, 0, sizeof(output));
++            Execute(f, input, output);
++            Check(LinuxNativeTestTrapCount() == before + 1 && _mm_getcsr() == mxcsr, "v4 native trap/MXCSR");
++            Check(std::memcmp(&output, &expected, sizeof(output)) == 0, "v4 full state differential");
++            ++cases;
++        }
++    }
++    _mm_setcsr(saved_mxcsr);
++    std::printf("PASS: v4 register exhaustive cases=%llu; 256 dst/src combinations, 64x64 controls, 4 wraps, random high control bits, full XMM/YMM/GPR/RSP/RFLAGS/MXCSR/red-zone; decoded scratch/no-GPR/legacy body\n", (unsigned long long)cases);
++}
++void V4Smoke() {
++    setenv("KYTY_LINUX_NATIVE_CPU", "extrq-v4", 1);
++    Check(Loader::LinuxNative::LinuxNativeCpuEnabled(), "v4 explicit mode missing");
++    Fixture f;
++    const auto p = Generate(f, 9, 10, false, 0, 0, 1);
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++    const std::array<uintptr_t, 1> starts {f.address};
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false).extrq_native_count == 1,
++          "v4 register native replacement missing");
++}
++void V3Smoke() {
++    setenv("KYTY_LINUX_NATIVE_CPU", "extrq-v3", 1);
++    Fixture f;
++    const auto p = Generate(f, 9, 0, true, 16, 16);
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++    const std::array<uintptr_t, 1> starts {f.address};
++    const auto result = Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false);
++    Check(result.extrq_native_count == 1, "v3 immediate native replacement missing");
++    Check(CheckV3Body(f, 9) > 0, "v3 immediate empty body");
++    State input {}, output {};
++    input.ymm[9][0] = 0x123456789abcdef0ull;
++    input.ymm[9][1] = UINT64_MAX;
++    input.ymm[9][2] = 42; input.ymm[9][3] = 73;
++    f.Executable();
++    const auto before = LinuxNativeTestTrapCount();
++    Execute(f, input, output);
++    Check(LinuxNativeTestTrapCount() == before, "v3 immediate SIGILL");
++    Check(output.ymm[9][0] == 0x9abc && output.ymm[9][1] == 0 &&
++          output.ymm[9][2] == 42 && output.ymm[9][3] == 73, "v3 MOVQ/XMM/upper-YMM semantics");
++    std::puts("PASS: v3 real immediate register-only legacy SSE2/no SIGILL smoke");
++}
++void ExhaustiveV3Immediate() {
++    Check(Xbyak::util::Cpu().has(Xbyak::util::Cpu::tAVX), "exhaustive YMM test requires AVX");
++    Fixture f;
++    std::mt19937_64 random(0x334455abcd);
++    const auto saved_mxcsr = _mm_getcsr();
++    uint64_t cases = 0;
++    for (int dst = 0; dst < 16; ++dst) for (unsigned length = 0; length < 64; ++length)
++    for (unsigned index = 0; index < 64; ++index) for (unsigned wrap = 0; wrap < 4; ++wrap)
++    for (unsigned pattern = 0; pattern < 3; ++pattern) {
++        State input {}, expected {}, output {};
++        for (auto& reg : input.ymm) for (auto& qword : reg)
++            qword = pattern == 0 ? 0 : pattern == 1 ? UINT64_MAX : random();
++        const unsigned raw_length = length | (wrap << 6);
++        const unsigned raw_index = index | (((wrap + dst) & 3) << 6);
++        const auto p = Generate(f, dst, 0, true, raw_length, raw_index);
++        const std::vector<uint8_t> original(static_cast<uint8_t*>(f.memory), static_cast<uint8_t*>(f.memory) + p.size);
++        const uint32_t mxcsr = 0x1fbfu | ((cases & 3u) << 13u) | ((cases & 4u) << 4u) | ((cases & 8u) << 12u);
++        f.Executable(); _mm_setcsr(mxcsr);
++        const auto before = LinuxNativeTestTrapCount();
++        Execute(f, input, output);
++        expected = output;
++        Check(LinuxNativeTestTrapCount() == before + 1, "reference must execute actual SIGILL emulator");
++        Check(_mm_getcsr() == mxcsr, "exhaustive reference MXCSR");
++        for (const char* mode : {"extrq-v2", "extrq-v3", "extrq-v4"}) {
++            setenv("KYTY_LINUX_NATIVE_CPU", mode, 1);
++            f.Writable();
++            std::memcpy(f.memory, original.data(), original.size());
++            Loader::LinuxNative::UnregisterRedZonePatchModule(f.memory);
++            Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++            const std::array<uintptr_t, 1> starts {f.address};
++            const auto result = Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false);
++            Check(result.extrq_native_count == 1, "exhaustive immediate must be native");
++            if (mode[7] == '3') Check(CheckV3Body(f, dst) > 0, "exhaustive body missing");
++            f.Executable();
++            std::memset(&output, 0, sizeof(output));
++            const auto traps = LinuxNativeTestTrapCount();
++            Execute(f, input, output);
++            Check(LinuxNativeTestTrapCount() == traps, "exhaustive native SIGILL");
++            Check(_mm_getcsr() == mxcsr, "exhaustive MXCSR sticky/rounding/DAZ/FTZ preservation");
++            Check(std::memcmp(&output, &expected, sizeof(output)) == 0,
++                  "exhaustive SIGILL/v2/v3 XMM/YMM/GPR/RSP/RFLAGS/red-zone equivalence");
++        }
++        ++cases;
++    }
++    _mm_setcsr(saved_mxcsr);
++    std::printf("PASS: exhaustive immediate cases=%llu; 64x64 controls, 4 high-bit wraps, 16 dst, zero/ones/random, SIGILL/v2/v3/v4, architectural state, v3 decoded SSE2-only bodies\n", (unsigned long long)cases);
++}
++std::vector<uint8_t> ImmediateBody(Fixture& f, const char* mode, unsigned length, unsigned index) {
++    setenv("KYTY_LINUX_NATIVE_CPU", mode, 1);
++    const auto p = Generate(f, 0, 0, true, length, index);
++    Loader::LinuxNative::UnregisterRedZonePatchModule(f.memory);
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++    const std::array<uintptr_t, 1> starts {f.address};
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false).extrq_native_count == 1, "benchmark native emitter");
++    ZydisDecoder decoder;
++    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
++    size_t offset = 0;
++    auto* bytes = reinterpret_cast<uint8_t*>(f.address + Size);
++    for (;;) {
++        ZydisDecodedInstruction instruction;
++        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
++        Check(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, bytes + offset, 256 - offset, &instruction, ops)), "benchmark decode");
++        if (instruction.mnemonic == ZYDIS_MNEMONIC_JMP) break;
++        offset += instruction.length;
++        Check(offset < 256, "benchmark body bounds");
++    }
++    return {bytes, bytes + offset};
++}
++}
++void RunLinuxNativeMicrobenchmark() {
++    Fixture f;
++    constexpr uint64_t iterations = 200000, unroll = 32, operations = iterations * unroll;
++    std::puts("Microbenchmark: actual emitted immediate bodies, identical legacy MOVDQA input reset + 32-way unroll + R8 loop; steady_clock; 7 alternating trials; no FPS inference.");
++    for (const auto controls : {std::array<unsigned, 2>{32, 0}, {16, 16}, {0, 0}, {63, 63}}) {
++        const auto v2 = ImmediateBody(f, "extrq-v2", controls[0], controls[1]);
++        const auto v3 = ImmediateBody(f, "extrq-v3", controls[0], controls[1]);
++        std::array<std::vector<double>, 2> timings;
++        for (unsigned trial = 0; trial < 7; ++trial) for (unsigned order = 0; order < 2; ++order) {
++            const auto mode = (trial + order) & 1u;
++            const auto& body = mode == 0 ? v2 : v3;
++            f.Writable();
++            Xbyak::ClearError();
++            Xbyak::CodeGenerator c(Size, f.memory);
++            c.movdqu(xmm1, c.ptr[rsi]);
++            c.mov(r8, iterations);
++            Xbyak::Label loop;
++            c.align(64); c.L(loop);
++            for (unsigned i = 0; i < unroll; ++i) { c.movdqa(xmm0, xmm1); c.db(body.data(), body.size()); }
++            c.dec(r8); c.jnz(loop, Xbyak::CodeGenerator::T_NEAR);
++            c.movdqu(c.ptr[rdi], xmm0); c.ret();
++            Check(Xbyak::GetError() == 0, "benchmark loop generation");
++            f.Executable();
++            const std::array<uint64_t, 2> input {0x123456789abcdef0ull, UINT64_MAX};
++            std::array<uint64_t, 2> output {};
++            const auto run = reinterpret_cast<void (*)(void*, const void*)>(f.memory);
++            run(output.data(), input.data()); // identical warmup, excluded
++            const auto begin = std::chrono::steady_clock::now();
++            run(output.data(), input.data());
++            const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - begin).count();
++            unsigned length = controls[0] & 63, index = controls[1] & 63;
++            if (length == 0) length = 64;
++            length = std::min(length, 64 - index);
++            const auto mask = length == 64 ? UINT64_MAX : ((uint64_t{1} << length) - 1);
++            Check(output[0] == ((input[0] >> index) & mask) && output[1] == 0, "benchmark architectural output");
++            timings[mode].push_back(ns);
++            std::printf("BENCH trial=%u mode=v%u length=%u index=%u operations=%llu elapsed_ns=%.0f ns/op=%.6f body_bytes=%zu\n", trial, mode + 2, controls[0], controls[1], (unsigned long long)operations, ns, ns / operations, body.size());
++        }
++        for (auto& times : timings) std::sort(times.begin(), times.end());
++        std::printf("BENCH SUMMARY length=%u index=%u operations/trial=%llu v2_median_ns/op=%.6f v3_median_ns/op=%.6f\n", controls[0], controls[1], (unsigned long long)operations, timings[0][3] / operations, timings[1][3] / operations);
++    }
++}
++struct RegisterBody {
++    uintptr_t address;
++    std::vector<uint8_t> bytes;
++};
++RegisterBody GetRegisterBody(Fixture& f, const char* mode, int dst, int src) {
++    setenv("KYTY_LINUX_NATIVE_CPU", mode, 1);
++    const auto p = Generate(f, dst, src, false, 0, 0, 1);
++    Loader::LinuxNative::UnregisterRedZonePatchModule(f.memory);
++    Loader::LinuxNative::RegisterRedZonePatchModule(f.memory, Size, reinterpret_cast<void*>(f.address + Size), Size);
++    const std::array<uintptr_t, 1> starts {f.address};
++    Check(Loader::LinuxNative::PatchGuestInstructions(f.address, p.size, starts, false, false).extrq_native_count == 1, "register benchmark actual emitter");
++    const auto entry = Entry(f, p);
++    ZydisDecoder decoder;
++    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
++    size_t offset = 0;
++    for (;;) {
++        ZydisDecodedInstruction ins;
++        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
++        Check(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<void*>(entry + offset), 256 - offset, &ins, ops)), "register benchmark body decode");
++        offset += ins.length;
++        if (ins.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RSP && ops[1].mem.disp.value > 0) break;
++        Check(offset < 256, "register benchmark body bound");
++    }
++    auto* bytes = reinterpret_cast<uint8_t*>(entry);
++    return {entry, {bytes, bytes + offset}};
++}
++void AppendRegisterBody(Xbyak::CodeGenerator& c, const RegisterBody& body) {
++    ZydisDecoder decoder;
++    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
++    for (size_t offset = 0; offset < body.bytes.size();) {
++        ZydisDecodedInstruction ins;
++        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
++        Check(ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, body.bytes.data() + offset, body.bytes.size() - offset, &ins, ops)), "benchmark relocate decode");
++        std::array<uint8_t, 15> bytes {};
++        std::memcpy(bytes.data(), body.bytes.data() + offset, ins.length);
++        for (unsigned i = 0; i < ins.operand_count; ++i) if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[i].mem.base == ZYDIS_REGISTER_RIP) {
++            const auto target = body.address + offset + ins.length + ops[i].mem.disp.value;
++            const auto delta = static_cast<int64_t>(target) - static_cast<int64_t>(reinterpret_cast<uintptr_t>(c.getCurr()) + ins.length);
++            Check(ins.raw.disp.size == 32 && Xbyak::inner::IsInInt32(delta), "benchmark constant rel32");
++            const int32_t displacement = delta;
++            std::memcpy(bytes.data() + ins.raw.disp.offset, &displacement, 4);
++        }
++        c.db(bytes.data(), ins.length); offset += ins.length;
++    }
++}
++void RunRegisterMicrobenchmark() {
++    Fixture old_body, new_body, loop;
++    constexpr uint64_t iterations = 200000, unroll = 32, operations = iterations * unroll;
++    std::puts("V4 microbenchmark: actual emitted register bodies; only RIP constants relocated; identical memory input resets, 32-way unroll/R8 loop, warmup excluded, 7 alternating trials. Game not touched; no FPS inference.");
++    for (const auto pair : {std::array<int, 2>{0, 1}, {1, 0}, {9, 10}, {0, 0}, {15, 15}}) {
++        const auto v2 = GetRegisterBody(old_body, "extrq-v2", pair[0], pair[1]);
++        const auto v4 = GetRegisterBody(new_body, "extrq-v4", pair[0], pair[1]);
++        for (const auto controls : {std::array<unsigned, 2>{0, 0}, {32, 0}, {16, 16}, {1, 63}, {63, 63}, {255, 255}, {256, 256}}) {
++            // 256 denotes the mixed per-operation sequence, not a guest control byte.
++            std::array<std::array<uint64_t, 4>, unroll> inputs {};
++            for (unsigned i = 0; i < unroll; ++i) {
++                const auto len = controls[0] == 256 ? (i * 17u) & 255u : controls[0];
++                const auto idx = controls[1] == 256 ? (i * 31u) & 255u : controls[1];
++                inputs[i] = {0x123456789abcdef0ull, UINT64_MAX, 0xfedcba9876540000ull | len | (idx << 8), UINT64_MAX};
++                if (pair[0] == pair[1]) inputs[i][0] = inputs[i][2];
++            }
++            std::array<std::vector<double>, 2> times;
++            for (unsigned trial = 0; trial < 7; ++trial) for (unsigned order = 0; order < 2; ++order) {
++                const auto mode = (trial + order) & 1u;
++                const auto& body = mode == 0 ? v2 : v4;
++                loop.Writable(); Xbyak::ClearError();
++                Xbyak::CodeGenerator c(Size, loop.memory);
++                c.mov(r8, iterations);
++                Xbyak::Label label; c.align(64); c.L(label);
++                for (unsigned i = 0; i < unroll; ++i) {
++                    c.movdqu(Xbyak::Xmm(pair[0]), c.ptr[rsi + i * 32]);
++                    if (pair[0] != pair[1]) c.movdqu(Xbyak::Xmm(pair[1]), c.ptr[rsi + i * 32 + 16]);
++                    AppendRegisterBody(c, body);
++                }
++                c.dec(r8); c.jnz(label, Xbyak::CodeGenerator::T_NEAR);
++                c.movdqu(c.ptr[rdi], Xbyak::Xmm(pair[0])); c.ret();
++                Check(Xbyak::GetError() == 0, "register benchmark loop generation");
++                loop.Executable();
++                std::array<uint64_t, 2> output {};
++                const auto run = reinterpret_cast<void (*)(void*, const void*)>(loop.memory);
++                run(output.data(), inputs.data());
++                const auto begin = std::chrono::steady_clock::now();
++                run(output.data(), inputs.data());
++                const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - begin).count();
++                unsigned len = inputs.back()[2] & 63u, idx = (inputs.back()[2] >> 8) & 63u;
++                if (len == 0) len = 64;
++                const uint64_t mask = len == 64 ? UINT64_MAX : ((uint64_t{1} << len) - 1);
++                Check(output[0] == ((inputs.back()[0] >> idx) & mask) && output[1] == 0, "register benchmark output");
++                times[mode].push_back(ns / operations);
++                std::printf("V4BENCH trial=%u mode=v%u dst=%d src=%d length=%u index=%u operations=%llu ns/op=%.6f body_bytes=%zu\n", trial, mode == 0 ? 2 : 4, pair[0], pair[1], controls[0], controls[1], (unsigned long long)operations, ns / operations, body.bytes.size());
++            }
++            for (auto& t : times) std::sort(t.begin(), t.end());
++            std::printf("V4BENCH SUMMARY dst=%d src=%d length=%u index=%u v2_median=%.6f v4_median=%.6f ratio=%.6f\n", pair[0], pair[1], controls[0], controls[1], times[0][3], times[1][3], times[0][3] / times[1][3]);
++        }
++    }
++}
++void RunLinuxNativeEquivalenceTests() {
++    Fixture identity;
++    for (auto length : {0u, 1u, 31u, 63u, 64u, 255u}) for (auto index : {0u, 1u, 31u, 63u, 64u, 255u}) {
++        const auto old_body = ImmediateBody(identity, "extrq-v2", length, index);
++        const auto new_body = ImmediateBody(identity, "extrq-v4", length, index);
++        Check(old_body == new_body, "v4 immediate emitter must remain byte-identical to v2");
++    }
++    std::puts("PASS: v4 immediate/v2 emitted body identity (36 control pairs); default immediate not v3");
++    V4Smoke(); ExhaustiveV4Register(); V3Smoke(); ExhaustiveV3Immediate(); Fallbacks(); Matrix(false, 0);
++    for (int n = 0; n <= 4; ++n) Matrix(true, n);
++    for (int n = 0; n <= 4; ++n) Matrix(true, n, true);
++    for (int n = 0; n <= 4; ++n) Matrix(true, n, false, true);
++}
+diff --git a/tests/linuxNativeInstructionTests.cpp b/tests/linuxNativeInstructionTests.cpp
+new file mode 100644
+index 0000000..547b651
+--- /dev/null
++++ b/tests/linuxNativeInstructionTests.cpp
+@@ -0,0 +1,69 @@
++// Linux executable-code regression: native EXTRQ must not enter SIGILL.
++#include "loader/redZonePatcher.h"
++#include "loader/x64InstructionEmulator.h"
++#define XBYAK_NO_EXCEPTION
++#include <xbyak/xbyak.h>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <csignal>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <cstring>
++
++static volatile sig_atomic_t traps = 0;
++int LinuxNativeTestTrapCount() { return traps; }
++void RunLinuxNativeEquivalenceTests();
++void RunLinuxNativeV2PlanningTests(const char* mode);
++static void Handler(int, siginfo_t*, void* context) {
++    traps = traps + 1;
++    if (!Loader::X64InstructionEmulator::TryEmulate(context)) _exit(190);
++}
++void RunLinuxNativeMicrobenchmark();
++void RunRegisterMicrobenchmark();
++int main(int argc, char** argv) {
++    if (argc == 2 && std::strcmp(argv[1], "--register-microbenchmark") == 0) {
++        RunRegisterMicrobenchmark(); return 0;
++    }
++    if (argc == 2 && std::strcmp(argv[1], "--microbenchmark") == 0) {
++        RunLinuxNativeMicrobenchmark(); return 0;
++    }
++    struct sigaction action {};
++    action.sa_sigaction = Handler; action.sa_flags = SA_SIGINFO;
++    sigaction(SIGILL, &action, nullptr);
++    constexpr size_t size = 0x4000;
++    void* memory = mmap(nullptr, size * 2, PROT_READ | PROT_WRITE,
++                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (memory == MAP_FAILED) return 2;
++    auto address = reinterpret_cast<uintptr_t>(memory);
++    Xbyak::CodeGenerator c(size, memory);
++    const bool v2 = argc > 2;
++    const auto dst = argc > 1 && !v2 ? c.xmm9 : c.xmm0;
++    c.movdqu(dst, c.ptr[c.rdi]);
++    if (argc > 1) {
++        c.mov(c.rax, 0x0408); c.movq(v2 ? c.xmm1 : c.xmm10, c.rax);
++        const uint8_t reg_extrq[] = {0x66, 0x45, 0x0f, 0x79, 0xca};
++        const uint8_t short_extrq[] = {0x66, 0x0f, 0x79, 0xc1};
++        if (v2) c.db(short_extrq, sizeof(short_extrq));
++        else c.db(reg_extrq, sizeof(reg_extrq));
++    } else {
++        const uint8_t extrq[] = {0x66, 0x0f, 0x78, 0xc0, 8, 4};
++        c.db(extrq, sizeof(extrq));
++    }
++    c.movdqu(c.ptr[c.rsi], dst); c.ret();
++    std::array<uint64_t, 2> input {0x123456789abcdef0ull, UINT64_MAX}, output {};
++    setenv("KYTY_LINUX_NATIVE_CPU", v2 ? "extrq-v2" : "extrq", 1);
++    Loader::LinuxNative::RegisterRedZonePatchModule(memory, size, reinterpret_cast<void*>(address + size), size);
++    const std::array<uintptr_t, 1> starts {address};
++    Loader::LinuxNative::PatchGuestInstructions(address, c.getSize(), starts, false, false);
++    if (mprotect(memory, size * 2, PROT_READ | PROT_EXEC) != 0) return 6;
++    reinterpret_cast<void (*)(const uint64_t*, uint64_t*)>(memory)(input.data(), output.data());
++    std::printf("EXTRQ result=%llx upper=%llx SIGILL=%d\n",
++                (unsigned long long)output[0], (unsigned long long)output[1], (int)traps);
++    Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++    munmap(memory, size * 2);
++    if (output[0] != 0xef || output[1] != 0) return 3;
++    if (traps != 0) { std::puts("FAIL: EXTRQ still enters SIGILL (native replacement missing)"); return 1; }
++    std::puts("PASS: EXTRQ executes without SIGILL");
++    if (argc == 1) { RunLinuxNativeV2PlanningTests("extrq-v2"); RunLinuxNativeV2PlanningTests("extrq-v3"); RunLinuxNativeV2PlanningTests("extrq-v4"); RunLinuxNativeEquivalenceTests(); }
++}
+diff --git a/tests/linuxNativeInt15IntegrationTests.cpp b/tests/linuxNativeInt15IntegrationTests.cpp
+new file mode 100644
+index 0000000..16879ad
+--- /dev/null
++++ b/tests/linuxNativeInt15IntegrationTests.cpp
+@@ -0,0 +1,42 @@
++// Preserve int15's later --amd-cpu pass: never steal its replacement sites.
++#include "loader/redZonePatcher.h"
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sys/mman.h>
++int main() {
++    constexpr size_t size = 4096;
++    auto* memory = static_cast<unsigned char*>(mmap(nullptr, size * 2,
++        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    if (memory == MAP_FAILED) return 2;
++    const auto base = reinterpret_cast<uintptr_t>(memory);
++    const std::array<uintptr_t, 1> roots {base};
++    unsigned cases = 0;
++    // EXTRQ xmm0,xmm1 followed by an int15 AMD-compatibility instruction.
++    const unsigned char codes[][12] = {
++        {0x66,0x0f,0x79,0xc1, 0x0f,0x52,0xc2, 0xc3}, // RSQRTPS
++        {0x66,0x0f,0x79,0xc1, 0xf3,0x0f,0x52,0xc2, 0xc3}, // RSQRTSS
++        {0x66,0x0f,0x79,0xc1, 0xc5,0xf8,0x52,0xc2, 0xc3}, // VRSQRTPS
++        {0x66,0x0f,0x79,0xc1, 0xf2,0x0f,0x79,0xc2, 0xc3}, // INSERTQ
++        {0x66,0x0f,0x79,0xc1, 0xf3,0x0f,0xc7,0xf8, 0xc3}, // RDPID
++        {0x66,0x0f,0x79,0xc1, 0x66,0x0f,0xae,0x30, 0xc3}, // CLWB
++    };
++    for (const auto* mode : {"extrq-v2", "extrq-v3", "extrq-v4"}) {
++        setenv("KYTY_LINUX_NATIVE_CPU", mode, 1);
++        for (const auto& code : codes) {
++            std::memcpy(memory, code, sizeof(code));
++            Loader::LinuxNative::RegisterRedZonePatchModule(memory, size, memory + size, size);
++            const auto result = Loader::LinuxNative::PatchGuestInstructions(base, sizeof(code), roots, false, true);
++            if (result.extrq_found_count != 1 || result.extrq_native_count != 0 ||
++                std::memcmp(memory, code, sizeof(code)) != 0) {
++                std::fprintf(stderr, "FAIL: %s stole an int15 AMD replacement neighbor (case %u)\n", mode, cases);
++                return 1;
++            }
++            Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++            ++cases;
++        }
++    }
++    munmap(memory, size * 2);
++    std::printf("PASS: int15 AMD replacement neighbors remain in original code; cases=%u\n", cases);
++}
+diff --git a/tests/linuxNativeV2PlanningTests.cpp b/tests/linuxNativeV2PlanningTests.cpp
+new file mode 100644
+index 0000000..21d0b0e
+--- /dev/null
++++ b/tests/linuxNativeV2PlanningTests.cpp
+@@ -0,0 +1,197 @@
++// Bounded CFG/neighbor regressions for the explicitly experimental v2 mode.
++#include "loader/redZonePatcher.h"
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#include <sys/mman.h>
++void RunLinuxNativeV2PlanningTests(const char* mode);
++int LinuxNativeTestTrapCount();
++namespace {
++void Check(bool ok, const char* message) { if (!ok) { std::fprintf(stderr,"FAIL: %s\n",message); std::exit(5); } }
++void RipRangeFallback(const char* mode) {
++    constexpr size_t page=4096;
++    void* guest=MAP_FAILED; void* trampoline=MAP_FAILED;
++    uintptr_t base=0;
++    for (uintptr_t candidate : {0x20000000000ull,0x30000000000ull,0x40000000000ull}) {
++        guest=mmap(reinterpret_cast<void*>(candidate),page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
++        if(guest==MAP_FAILED) continue;
++        trampoline=mmap(reinterpret_cast<void*>(candidate+0x7fff0000),page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
++        if(trampoline!=MAP_FAILED) { base=candidate; break; }
++        munmap(guest,page); guest=MAP_FAILED;
++    }
++    Check(guest!=MAP_FAILED && trampoline!=MAP_FAILED,"range fixture mappings");
++    std::array<uint8_t,12> code{0x66,0x0f,0x79,0xc1,0x4c,0x8b,0x1d,0,0,0,0,0xc3};
++    // Original load can reach its target; relocated load cannot. Target is never executed/read.
++    const int32_t displacement=-0x20000-11;
++    std::memcpy(code.data()+7,&displacement,4); std::memcpy(guest,code.data(),code.size());
++    Loader::LinuxNative::RegisterRedZonePatchModule(guest,page,trampoline,page);
++    const std::array<uintptr_t,1> roots{base};
++    setenv("KYTY_LINUX_NATIVE_CPU",mode,1);
++    auto r=Loader::LinuxNative::PatchGuestInstructions(base,code.size(),roots,false,false);
++    Check(r.extrq_found_count==1 && r.extrq_native_count==0 && r.extrq_fallback_count==1,"RIP encoder range fallback");
++    Check(std::memcmp(guest,code.data(),code.size())==0,"RIP range fallback changed guest");
++    const uint8_t normal[]={0x66,0x0f,0x79,0xc1,0x90,0xc3}; std::memcpy(guest,normal,sizeof(normal));
++    auto retry=Loader::LinuxNative::PatchGuestInstructions(base,sizeof(normal),roots,false,false);
++    Check(retry.extrq_native_count==1,"failed encoding consumed capacity/patch marker");
++    const int32_t expected=static_cast<int32_t>(reinterpret_cast<uintptr_t>(trampoline) + (std::strcmp(mode,"extrq-v4")==0 ? 32 : 0) -(base+5));
++    int32_t actual=0; std::memcpy(&actual,static_cast<uint8_t*>(guest)+1,4);
++    Check(actual==expected,"failed encoding did not rewind trampoline");
++    Loader::LinuxNative::UnregisterRedZonePatchModule(guest); munmap(guest,page); munmap(trampoline,page);
++    std::puts("PASS: RIP-neighbor encoder out-of-range fallback, unchanged guest, emission rewind/retry");
++}
++}
++void V4JumpBoundary() {
++    constexpr size_t page = 4096;
++    const uintptr_t base = 0x50000000000ull;
++    void* guest = mmap(reinterpret_cast<void*>(base), page, PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++    void* trampoline = mmap(reinterpret_cast<void*>(base - (uint64_t{1} << 31)), page, PROT_READ | PROT_WRITE,
++        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++    Check(guest != MAP_FAILED && trampoline != MAP_FAILED, "v4 jump boundary maps");
++    const uint8_t code[] {0x66, 0x0f, 0x79, 0xc1, 0x90, 0xc3};
++    std::memcpy(static_cast<uint8_t*>(guest) + 40, code, sizeof(code));
++    Loader::LinuxNative::RegisterRedZonePatchModule(guest, page, trampoline, page);
++    setenv("KYTY_LINUX_NATIVE_CPU", "extrq-v4", 1);
++    const std::array<uintptr_t, 1> roots {base + 40};
++    const auto r = Loader::LinuxNative::PatchGuestInstructions(base, 46, roots, false, false);
++    Check(r.extrq_found_count == 1 && r.extrq_native_count == 0 && r.extrq_fallback_count == 1,
++          "v4 exact guest jump displacement boundary must fall back");
++    Check(std::memcmp(static_cast<uint8_t*>(guest) + 40, code, sizeof(code)) == 0, "v4 boundary changed guest");
++    // Same module, retry at an in-range site: exact rollback includes constants.
++    std::memcpy(guest, code, sizeof(code));
++    const std::array<uintptr_t, 1> retry_roots {base};
++    Check(Loader::LinuxNative::PatchGuestInstructions(base, sizeof(code), retry_roots, false, false).extrq_native_count == 1, "v4 boundary rewind retry");
++    int32_t actual; std::memcpy(&actual, static_cast<uint8_t*>(guest) + 1, 4);
++    Check(actual == INT32_MIN + 27, "v4 boundary rewind consumed constants/code");
++    Loader::LinuxNative::UnregisterRedZonePatchModule(guest); munmap(guest, page); munmap(trampoline, page);
++    std::puts("PASS: v4 exact rel32 lower-bound rejection and full constant/body rewind retry");
++}
++void V4ConstantsCapacity() {
++    constexpr size_t size = 4096;
++    void* memory = mmap(nullptr, size * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    Check(memory != MAP_FAILED, "v4 constants map");
++    const auto base = reinterpret_cast<uintptr_t>(memory);
++    const uint8_t code[] {0x66,0x0f,0x79,0xc1,0x90,0x66,0x0f,0x79,0xd3,0x90,0xc3};
++    const std::array<uintptr_t, 1> roots {base};
++    for (size_t capacity : {303u, 304u, 4093u}) {
++        std::memcpy(memory, code, sizeof(code));
++        Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++        // Deliberately unaligned start: Xbyak must align actual constant addresses.
++        Loader::LinuxNative::RegisterRedZonePatchModule(memory, size, reinterpret_cast<void*>(base + size + 3), capacity);
++        setenv("KYTY_LINUX_NATIVE_CPU", "extrq-v4", 1);
++        const auto r = Loader::LinuxNative::PatchGuestInstructions(base, sizeof(code), roots, false, false);
++        if (capacity == 303) {
++            Check(r.extrq_native_count == 0 && std::memcmp(memory, code, sizeof(code)) == 0, "v4 constant reserve capacity fallback");
++        } else {
++            Check(r.extrq_native_count == (capacity == 304 ? 1u : 2u), "v4 constant reserve/native counts");
++            int32_t displacement; std::memcpy(&displacement, static_cast<uint8_t*>(memory) + 1, 4);
++            Check(base + 5 + displacement == base + size + 48, "v4 constant alignment layout");
++            const auto* constants = reinterpret_cast<const uint64_t*>(base + size + 16);
++            Check(constants[0] == 63 && constants[1] == 0 && constants[2] == 1 && constants[3] == 0, "v4 aligned constants");
++            if (capacity > 304) {
++                std::memcpy(&displacement, static_cast<uint8_t*>(memory) + 6, 4);
++                const auto second = base + 10 + displacement;
++                // MOVDQU(2), MOVDQA(2), shifts(4), LEA precede PXOR. Verify shared
++                // constants by finding the legacy PXOR's RIP-relative disp32.
++                bool found = false;
++                for (size_t i = 0; i < 100; ++i) {
++                    const auto* b = reinterpret_cast<const uint8_t*>(second + i);
++                    if (b[0] == 0x66 && b[1] == 0x0f && b[2] == 0xef && (b[3] & 0xc7) == 0x05) {
++                        int32_t d; std::memcpy(&d, b + 4, 4);
++                        Check(second + i + 8 + d == base + size + 16, "v4 per-site duplicated constants");
++                        found = true; break;
++                    }
++                }
++                Check(found, "v4 shared constant read missing");
++            }
++        }
++    }
++    Loader::LinuxNative::UnregisterRedZonePatchModule(memory); munmap(memory, size * 2);
++    std::puts("PASS: v4 unaligned trampoline, aligned constants, exact reserve threshold, shared per-pass constants");
++}
++void RunLinuxNativeV2PlanningTests(const char* mode) {
++    if (std::strcmp(mode, "extrq-v4") == 0) { V4JumpBoundary(); V4ConstantsCapacity(); }
++    RipRangeFallback(mode);
++    constexpr size_t size=0x4000;
++    void* memory=mmap(nullptr,size*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
++    Check(memory!=MAP_FAILED,"planning mmap");
++    auto address=reinterpret_cast<uintptr_t>(memory);
++    struct Case { const char* name; std::vector<uint8_t> code; std::vector<size_t> roots; size_t found,native; };
++    std::vector<Case> cases {
++        {"x87 instruction PC tracking unsupported",{0x66,0x0f,0x79,0xc1,0xd9,0xe8,0xc3},{0},1,0},
++        {"syscall clobbers RCX with instruction PC",{0x66,0x0f,0x79,0xc1,0x0f,0x05,0xc3},{0},1,0},
++        {"short plus nop",{0x66,0x0f,0x79,0xc1,0x90,0xc3},{0},1,1},
++        {"short end",{0x66,0x0f,0x79,0xc1},{0},1,0},
++        {"return neighbor",{0x66,0x0f,0x79,0xc1,0xc3},{0},1,0},
++        {"relative branch neighbor",{0x66,0x0f,0x79,0xc1,0xeb,0,0xc3},{0},1,0},
++        {"conditional neighbor",{0x66,0x0f,0x79,0xc1,0x74,0,0xc3},{0},1,0},
++        {"relative call neighbor",{0x66,0x0f,0x79,0xc1,0xe8,0,0,0,0,0xc3},{0},1,0},
++        {"direct incoming neighbor",{0x74,4,0x66,0x0f,0x79,0xc1,0x90,0xc3},{0},1,0},
++        {"root at neighbor",{0x66,0x0f,0x79,0xc1,0x90,0xc3},{0,4},1,0},
++        {"two neighboring EXTRQ",{0x66,0x0f,0x79,0xc1,0x66,0x0f,0x79,0xc2,0x90,0xc3},{0},2,1},
++        {"earlier overlapping decode",{0x74,2,0xb8,0,0x66,0x0f,0x79,0xc1,0x90,0xc3,0x90,0x90,0x90,0xc3},{0},1,0},
++        {"invalid neighbor decode",{0x66,0x0f,0x79,0xc1,0x0f,4},{0},1,0}
++    };
++    size_t total=0;
++    for (const auto& t: cases) {
++        Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++        std::memcpy(memory,t.code.data(),t.code.size());
++        Loader::LinuxNative::RegisterRedZonePatchModule(memory,size,reinterpret_cast<void*>(address+size),size);
++        std::vector<uintptr_t> roots; for(auto r:t.roots) roots.push_back(address+r);
++        setenv("KYTY_LINUX_NATIVE_CPU",mode,1);
++        auto result=Loader::LinuxNative::PatchGuestInstructions(address,t.code.size(),roots,false,false);
++        if(result.extrq_found_count!=t.found || result.extrq_native_count!=t.native) {
++            std::fprintf(stderr,"case=%s found=%zu native=%zu expected=%zu/%zu\n",t.name,
++                size_t(result.extrq_found_count),size_t(result.extrq_native_count),t.found,t.native);
++            Check(false,"neighbor planning");
++        }
++        Check(result.extrq_fallback_count==t.found-t.native,"planning fallback count");
++        if(t.native==0) Check(std::memcmp(memory,t.code.data(),t.code.size())==0,"fallback changed guest bytes");
++        ++total;
++    }
++    // v1 must leave exactly the same eligible short fixture trapped.
++    Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++    const uint8_t short_code[]={0x66,0x0f,0x79,0xc1,0x90,0xc3};
++    std::memcpy(memory,short_code,sizeof(short_code));
++    Loader::LinuxNative::RegisterRedZonePatchModule(memory,size,reinterpret_cast<void*>(address+size),size);
++    const std::array<uintptr_t,1> roots{address};
++    setenv("KYTY_LINUX_NATIVE_CPU","extrq",1);
++    auto v1=Loader::LinuxNative::PatchGuestInstructions(address,sizeof(short_code),roots,false,false);
++    Check(v1.extrq_found_count==1 && v1.extrq_native_count==0 && v1.extrq_fallback_count==1,"v1 short unchanged");
++    Check(std::memcmp(memory,short_code,sizeof(short_code))==0,"v1 changed short bytes");
++    setenv("KYTY_LINUX_NATIVE_CPU",mode,1);
++    Loader::LinuxNative::RegisterRedZonePatchModule(memory,size,reinterpret_cast<void*>(address+size),32);
++    auto capacity=Loader::LinuxNative::PatchGuestInstructions(address,sizeof(short_code),roots,false,false);
++    Check(capacity.extrq_native_count==0 && capacity.extrq_fallback_count==1,"v2 capacity fallback");
++    Loader::LinuxNative::RegisterRedZonePatchModule(memory,size,reinterpret_cast<void*>(address+(uint64_t{1}<<33)),size);
++    auto far=Loader::LinuxNative::PatchGuestInstructions(address,sizeof(short_code),roots,false,false);
++    Check(far.extrq_native_count==0 && far.extrq_fallback_count==1,"v2 rel32 fallback");
++    Check(std::memcmp(memory,short_code,sizeof(short_code))==0,"v2 capacity/far changed guest");
++    // Execute adjacent sites: first remains trapped rather than copying unsupported EXTRQ;
++    // second is native. No duplicate emission or skipped operation.
++    Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++    const uint8_t adjacent[]={0xf3,0x0f,0x6f,0x07, 0xf3,0x0f,0x6f,0x4f,0x10,
++        0x66,0x0f,0x79,0xc1, 0x66,0x0f,0x79,0xc1, 0x90,
++        0xf3,0x0f,0x7f,0x06,0xc3};
++    std::memcpy(memory,adjacent,sizeof(adjacent));
++    std::array<uint64_t,4> input{0x123456789abcdef0ull,UINT64_MAX,0x0408,UINT64_MAX};
++    std::array<uint64_t,2> reference{},candidate{};
++    Check(mprotect(memory,size*2,PROT_READ|PROT_EXEC)==0,"adjacent RX reference");
++    using Fn=void(*)(const uint64_t*,uint64_t*);
++    auto fn=reinterpret_cast<Fn>(memory);
++    auto before=LinuxNativeTestTrapCount(); fn(input.data(),reference.data());
++    Check(LinuxNativeTestTrapCount()==before+2,"adjacent reference traps");
++    Check(mprotect(memory,size*2,PROT_READ|PROT_WRITE)==0,"adjacent RW patch");
++    Loader::LinuxNative::RegisterRedZonePatchModule(memory,size,reinterpret_cast<void*>(address+size),size);
++    setenv("KYTY_LINUX_NATIVE_CPU",mode,1);
++    auto a=Loader::LinuxNative::PatchGuestInstructions(address,sizeof(adjacent),roots,false,false);
++    Check(a.extrq_native_count==1 && a.extrq_fallback_count==1,"adjacent native/fallback");
++    Check(mprotect(memory,size*2,PROT_READ|PROT_EXEC)==0,"adjacent RX candidate");
++    before=LinuxNativeTestTrapCount(); fn(input.data(),candidate.data());
++    Check(LinuxNativeTestTrapCount()==before+1 && candidate==reference && candidate[0]==0xe,"adjacent differential execution");
++    Loader::LinuxNative::UnregisterRedZonePatchModule(memory);
++    munmap(memory,size*2);
++    std::printf("PASS: %s planning cases=%zu + v1 short control + adjacent execution; ends, control flow, direct/root targets, earlier overlap, adjacent EXTRQ, invalid decode\n",mode,total);
++}
