@@ -4306,7 +4306,14 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color)) {
+		// KYTY_WIDE_FILL_CLEAR (default off): a fill of an image with 64- or 128-bit texels is a clear
+		// too; otherwise only a zero RGBA16F fill and the 32-bit formats are.
+		static const bool wide_fill = [] {
+			const auto* value = std::getenv("KYTY_WIDE_FILL_CLEAR");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, packed_clear, clear.color)
+		                : DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color))) {
 			return false;
 		}
 	} else {
