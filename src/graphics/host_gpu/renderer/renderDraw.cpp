@@ -3213,7 +3213,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// barriers). The rendering instance is part of the certificate, not just image identity.
 	// Unless every kept image is as the previous draw left it, the structure is resolved now, in the normal order relative to the buffer
 	// bindings, which are made again after it (their reservations follow the image identities).
-	if (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true))) {
+	// KYTY_DRAW_RUN_INDIRECT: an indirect continuation also needs the argument barrier of this
+	// rendering instance (recording one ends rendering, which a continuation never does).
+	const bool run_indirect_barrier =
+	    indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering;
+	if (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
+	                     run_indirect_barrier)) {
 		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
 		DrawRun::CountMiss(DrawRun::Miss::Images);
 		m_run_active = false;
@@ -3238,11 +3243,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
 		}
 		index_binding = PrepareIndexBuffer(buffer, index_source);
+		if (indirect != nullptr) {
+			indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
+		}
 	}
 	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
 	// path's own texture resolution ran before it here). A draw that would have fallen back is
 	// not compared.
-	if (m_run_verify && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true))) {
+	if (m_run_verify && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
+	                     run_indirect_barrier)) {
 		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
 		DrawRun::CountMiss(DrawRun::Miss::Images);
 		m_run_verify = false;
@@ -3669,7 +3678,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			return static_cast<bool>(state.depth_info.image_id) && state.depth_info.image_id == id;
 		};
 		bool eligible = m_in_engine_commit && m_prepared_validated && m_run_key != 0 &&
-		                !mesh_active && indirect == nullptr && vertex_stages.size() == 1 &&
+		                !mesh_active &&
+		                (indirect == nullptr || DrawRun::IndirectRunsEnabled()) &&
+		                vertex_stages.size() == 1 &&
 		                !shader_write_stages && !feedback_aspects &&
 		                buffer.ActiveRenderingSerial() != 0 &&
 		                RenderStateFastEnabled(RenderStatePart::Reset) &&
@@ -4054,7 +4065,8 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	Common::LockGuard lock(m_context.GetMutex());
-	// KYTY_DRAW_RUN: not an engine commit (other command-processor work for the run certificate).
+	// KYTY_DRAW_RUN: an engine commit with KYTY_DRAW_RUN_INDIRECT and a prepared slot, otherwise
+	// other command-processor work for the run certificate.
 	BeginDrawRun();
 	if (DrawMayRunTargetOperation(buffer)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackTargetOp);
