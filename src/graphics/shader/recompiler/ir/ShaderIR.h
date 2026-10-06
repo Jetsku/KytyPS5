@@ -242,6 +242,7 @@ enum class StageInputKind {
 	PrimitiveId,
 	TessCoord,
 	InstanceIndex,
+	BaseInstance,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,

@@ -85,7 +85,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
-	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
+	    kind == IR::StageInputKind::BaseInstance || kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();

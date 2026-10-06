@@ -131,6 +131,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 						case StageInputKind::InvocationId:
 						case StageInputKind::PrimitiveId:
 						case StageInputKind::InstanceIndex:
+						case StageInputKind::BaseInstance:
 						case StageInputKind::FrontFacing:
 						case StageInputKind::LocalInvocationIndex:
 							if (component != 0u) {
@@ -288,6 +289,9 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					break;
 				case StageInputKind::InstanceIndex:
 					AddInput(info, kind, 0, 1, "gl_InstanceIndex");
+					break;
+				case StageInputKind::BaseInstance:
+					AddInput(info, kind, 0, 1, "gl_BaseInstance");
 					break;
 				case StageInputKind::InvocationId:
 					AddInput(info, kind, 0, 1, "gl_InvocationID");
