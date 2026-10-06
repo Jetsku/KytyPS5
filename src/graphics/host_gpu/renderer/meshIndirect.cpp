@@ -21,7 +21,11 @@ namespace Libs::Graphics::MeshIndirect {
 Mode GetMode() {
 	static const Mode mode = [] {
 		const auto* value = std::getenv("KYTY_NATIVE_INDIRECT_MESH");
-		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "empty") == 0) {
+		// Default on: the CPU path drains the GPU for every argument record it reads.
+		if (value == nullptr || value[0] == '\0') {
+			return Mode::On;
+		}
+		if (std::strcmp(value, "empty") == 0) {
 			return Mode::Empty;
 		}
 		if (std::strcmp(value, "0") == 0) {
