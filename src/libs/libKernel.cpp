@@ -30,9 +30,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2311,6 +2314,14 @@ constexpr uint32_t FIBER_MAGIC_END         = 0xb37592a0;
 constexpr uint32_t FIBER_OPT_MAGIC         = 0xbb40e64d;
 constexpr uint64_t FIBER_STACK_MAGIC       = 0x7149f2ca7149f2ca;
 constexpr uint64_t FIBER_CONTEXT_MIN_SIZE  = 512;
+// Guest code is not alone on a fiber's stack here: every guest write to a tracked page raises a
+// Windows exception whose frame and handler use the faulting stack (about 5 KiB), and HLE calls
+// run on it. Demon's Souls packs 128 fiber stacks of 16 KiB back to back, so that depth ran past
+// the bottom into the next fiber's live frames (int 0x41 asserts, garbage pointers and return
+// addresses, a broken lock wait block). Such a fiber runs on a guest stack of its own, this much
+// larger and above a guard page, like guest threads (PTHREAD_STACK_EXTRA); the game's context
+// memory keeps the stack magic only (chenxiao07 6e7c1dab1).
+constexpr uint64_t FIBER_STACK_EXTRA = 0x40000;
 constexpr size_t   FIBER_MAX_NAME_LENGTH   = 31;
 constexpr uint32_t FIBER_STATE_RUNNING     = 1;
 constexpr uint32_t FIBER_STATE_IDLE        = 2;
@@ -2503,8 +2514,7 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
+	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->context_end);
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
@@ -2529,6 +2539,54 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	context->current_fiber = nullptr;
 
 	FiberRestoreContext(&context->cpu_context, 1);
+}
+
+// KYTY_FIBER_GUEST_STACK: which fibers run on a guest stack of their own (FIBER_STACK_EXTRA).
+// Default: those whose context is smaller than 256 KiB (Demon's Souls' 16 and 64 KiB job fibers;
+// Astro Bot's 1 MiB fibers stay on their context memory). "all": every fiber; "0": none.
+static uint64_t FiberGuestStackBelow() {
+	static const uint64_t below = [] {
+		const auto* value = std::getenv("KYTY_FIBER_GUEST_STACK");
+		if (value == nullptr || *value == '\0') {
+			return uint64_t {0x40000};
+		}
+		if (std::strcmp(value, "all") == 0) {
+			return UINT64_MAX;
+		}
+		if (std::strcmp(value, "0") == 0) {
+			return uint64_t {0};
+		}
+		return uint64_t {0x40000};
+	}();
+	return below;
+}
+
+// The stacks fibers run on, by fiber object: one initialized again without sceFiberFinalize gives
+// its old stack back first.
+static std::mutex                                                             g_fiber_stack_mutex;
+static std::unordered_map<const FiberObject*, std::pair<uint64_t, uint64_t>> g_fiber_stacks;
+
+static void FiberUnmapStack(const FiberObject* fiber) {
+	std::pair<uint64_t, uint64_t> stack {};
+	{
+		std::lock_guard lock(g_fiber_stack_mutex);
+		if (auto node = g_fiber_stacks.extract(fiber)) {
+			stack = node.mapped();
+		}
+	}
+	if (stack.first != 0) {
+		LibKernel::UnmapGuestStack(stack.first, stack.second);
+	}
+}
+
+static uint64_t FiberMapStack(const FiberObject* fiber, uint64_t size) {
+	FiberUnmapStack(fiber);
+	const auto stack = LibKernel::MapGuestStack(size);
+	if (stack != 0) {
+		std::lock_guard lock(g_fiber_stack_mutex);
+		g_fiber_stacks[fiber] = {stack, size};
+	}
+	return stack;
 }
 
 int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, FiberEntry entry,
@@ -2571,6 +2629,14 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	fiber->context_start     = addr_context;
 	fiber->context_end =
 	    (addr_context != nullptr ? static_cast<uint8_t*>(addr_context) + size_context : nullptr);
+	if (size_context < FiberGuestStackBelow()) {
+		if (const auto stack = FiberMapStack(fiber, size_context + FIBER_STACK_EXTRA); stack != 0) {
+			fiber->context_start = reinterpret_cast<void*>(stack);
+			fiber->context_end   = reinterpret_cast<uint8_t*>(stack) + size_context + FIBER_STACK_EXTRA;
+		}
+	} else {
+		FiberUnmapStack(fiber);
+	}
 	std::memset(&fiber->saved_context, 0, sizeof(fiber->saved_context));
 	FiberSetContextValid(fiber, false);
 	fiber->magic_end = FIBER_MAGIC_END;
@@ -2628,6 +2694,7 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
 		return FIBER_ERROR_STATE;
 	}
+	FiberUnmapStack(fiber);
 
 	return OK;
 }

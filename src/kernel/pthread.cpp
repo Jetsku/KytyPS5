@@ -758,22 +758,13 @@ static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
 }
 
-static int CreateGuestStack(PthreadAttr attr) {
-	if (attr == nullptr) {
-		return KERNEL_ERROR_EINVAL;
-	}
-
-	if (attr->stack_addr != nullptr) {
-		attr->guard_size     = 0;
-		attr->stack_user     = true;
-		attr->stack_map_addr = 0;
-		attr->stack_map_size = 0;
-		return OK;
-	}
-
-	const auto stack_size = RoundStackSize(attr->stack_size);
-	const auto guard_size = RoundStackSize(attr->guard_size);
-	const auto map_size   = stack_size + guard_size;
+// Maps stack_size bytes of guest stack above a guard of guard_size that faults (both rounded up to
+// whole stack pages), reusing a released stack of the same shape. Returns the start of the
+// mapping (the guard), 0 when the stack area is exhausted.
+static uint64_t MapGuestStackWithGuard(size_t stack_size, size_t guard_size) {
+	stack_size          = RoundStackSize(stack_size);
+	guard_size          = RoundStackSize(guard_size);
+	const auto map_size = stack_size + guard_size;
 
 	uint64_t stack_addr = 0;
 	bool     cached     = false;
@@ -794,36 +785,60 @@ static int CreateGuestStack(PthreadAttr attr) {
 				g_guest_stack_last = PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE;
 			}
 			if (map_size > g_guest_stack_last - PTHREAD_STACK_BOTTOM) {
-				return KERNEL_ERROR_EAGAIN;
+				return 0;
 			}
 			stack_addr = g_guest_stack_last - map_size;
 			g_guest_stack_last -= map_size;
 		}
 	}
 
-	int result = OK;
 	if (!cached) {
 		stack_addr = Memory::AllocateGuestStackMemory(
 		    stack_addr, map_size, Common::VirtualMemory::Mode::ReadWrite, "stack");
 		if (stack_addr == 0) {
-			return KERNEL_ERROR_EAGAIN;
+			return 0;
 		}
 	}
 
-	if (guard_size != 0) {
-		result = Memory::KernelMprotect(reinterpret_cast<void*>(stack_addr), guard_size, 0);
-		if (result != OK) {
-			Memory::KernelMunmap(stack_addr, map_size);
-			return KERNEL_ERROR_EAGAIN;
-		}
+	if (guard_size != 0 &&
+	    Memory::KernelMprotect(reinterpret_cast<void*>(stack_addr), guard_size, 0) != OK) {
+		Memory::KernelMunmap(stack_addr, map_size);
+		return 0;
+	}
+	Common::RamStats::Range("guest thread stack", reinterpret_cast<void*>(stack_addr), map_size);
+	return stack_addr;
+}
+
+static void UnmapGuestStackWithGuard(uint64_t map_addr, size_t map_size, size_t guard_size) {
+	Common::LockGuard lock(g_guest_stack_mutex);
+	g_guest_stack_cache.push_back({map_addr, map_size, guard_size});
+}
+
+static int CreateGuestStack(PthreadAttr attr) {
+	if (attr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (attr->stack_addr != nullptr) {
+		attr->guard_size     = 0;
+		attr->stack_user     = true;
+		attr->stack_map_addr = 0;
+		attr->stack_map_size = 0;
+		return OK;
+	}
+
+	const auto stack_size = RoundStackSize(attr->stack_size);
+	const auto guard_size = RoundStackSize(attr->guard_size);
+	const auto stack_addr = MapGuestStackWithGuard(stack_size, guard_size);
+	if (stack_addr == 0) {
+		return KERNEL_ERROR_EAGAIN;
 	}
 
 	attr->stack_addr     = reinterpret_cast<void*>(stack_addr + guard_size);
 	attr->stack_size     = stack_size;
 	attr->stack_user     = false;
 	attr->stack_map_addr = stack_addr;
-	attr->stack_map_size = map_size;
-	Common::RamStats::Range("guest thread stack", reinterpret_cast<void*>(stack_addr), map_size);
+	attr->stack_map_size = stack_size + guard_size;
 
 	std::memset(attr->stack_addr, 0, stack_size);
 
@@ -836,15 +851,22 @@ static void FreeGuestStack(PthreadAttr attr) {
 		return;
 	}
 
-	const auto guard_size = attr->stack_map_size - attr->stack_size;
-	{
-		Common::LockGuard lock(g_guest_stack_mutex);
-		g_guest_stack_cache.push_back({attr->stack_map_addr, attr->stack_map_size, guard_size});
-	}
+	UnmapGuestStackWithGuard(attr->stack_map_addr, attr->stack_map_size,
+	                         attr->stack_map_size - attr->stack_size);
 
 	attr->stack_addr     = nullptr;
 	attr->stack_map_addr = 0;
 	attr->stack_map_size = 0;
+}
+
+uint64_t MapGuestStack(size_t stack_size) {
+	const auto map_addr = MapGuestStackWithGuard(stack_size, PTHREAD_STACK_PAGE);
+	return map_addr != 0 ? map_addr + PTHREAD_STACK_PAGE : 0;
+}
+
+void UnmapGuestStack(uint64_t stack_addr, size_t stack_size) {
+	UnmapGuestStackWithGuard(stack_addr - PTHREAD_STACK_PAGE,
+	                         RoundStackSize(stack_size) + PTHREAD_STACK_PAGE, PTHREAD_STACK_PAGE);
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
