@@ -64,6 +64,13 @@ public:
 	// faulting thread must not wait for that thread to run.
 	void Reconcile(uint64_t vaddr, uint64_t size, bool now);
 
+	// The host protection of [vaddr, vaddr + size) was replaced behind the tracker (a view mapped
+	// again with its own access by a partial unmap, a guest mprotect that allows writes): records
+	// it as read-write and protects the watched pages again, so CPU writes to them fault (and reach
+	// the GPU) once more. Unwatched pages keep the protection they were given. Any thread, outside
+	// the guest address-space lock.
+	void ResyncHostProtection(uint64_t vaddr, uint64_t size);
+
 	enum class DeferMode { Off, On, Verify };
 	[[nodiscard]] static DeferMode GetDeferMode();
 	static void                    SetDeferModeForTests(DeferMode mode);
