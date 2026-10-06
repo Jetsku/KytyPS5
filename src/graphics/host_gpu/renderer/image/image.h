@@ -60,6 +60,17 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// KYTY_GUEST_STORAGE_REPEAT=1 (default off; ported from chenxiao07/KytyPS5 397112a04): a shader
+	// write that guest draws and dispatches repeat in the same layout and access gets no barrier
+	// between them, as nothing but the guest's own barriers (EmitGlobalBarrier) orders them on the
+	// console. A repeated write after any other access (an upload, a copy, a helper pass) keeps its
+	// barrier. The scope marks the transitions of a guest draw's or dispatch's bindings.
+	struct GuestTransitScope {
+		GuestTransitScope();
+		~GuestTransitScope();
+		KYTY_CLASS_NO_COPY(GuestTransitScope);
+		bool m_previous;
+	};
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
