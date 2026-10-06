@@ -284,7 +284,7 @@ bool GraphicContext::CreateAllocator() {
 				}
 			}
 			info.pHeapSizeLimit = heap_limits.data();
-			LOGF("KYTY_VRAM_LIMIT_MB: device-local heaps limited to %" PRIu64 " MiB\n", limit_mb);
+			std::fprintf(stderr, "KYTY_VRAM_LIMIT_MB: device-local heaps limited to %" PRIu64 " MiB\n", limit_mb);
 		}
 	}
 
@@ -754,7 +754,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			result                    = allocate();
 			static std::atomic<uint32_t> reported {0};
 			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
-				LOGF("Vulkan: video memory full, %s: %ux%ux%u format=%d layers=%u levels=%u "
+				std::fprintf(stderr, "Vulkan: video memory full, %s: %ux%ux%u format=%d layers=%u levels=%u "
 				     "(KYTY_IMAGE_SYSMEM_FALLBACK)\n",
 				     result == vk::Result::eSuccess ? "an image is in system memory"
 				                                    : "an image could not be created",
