@@ -2,6 +2,7 @@
 #define KYTY_RENDERER_OCCLUSION_H_
 
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/occlusionPairs.h"
 #include "graphics/host_gpu/renderer/occlusionReset.h"
 #include <array>
 #include <atomic>
@@ -82,9 +83,14 @@ public:
 		return m_published.load(std::memory_order_acquire) != m_issued;
 	}
 	[[nodiscard]] bool Active() const noexcept { return m_active; }
+	// KYTY_OCCLUSION_LOG=<file> (diagnostics): while <file>.on exists, every dump ("D"), its
+	// publication ("P", the cumulative value) and every draw recorded while a dump pair is open
+	// ("d") are written to <file>. Pair results are P(end) - P(begin).
+	[[nodiscard]] bool DebugLogActive(bool any = false) noexcept;
+	static void DebugLog(const char* format, ...);
 	// KYTY_OCCLUSION_GATE (default on, needs KYTY_GPU_OCCLUSION=1). The guest reads only
 	// end - begin differences of the cumulative counter, taken by interleaved dump pairs (begin at
-	// A, A % 16 == 0; end at A + 8). Samples of rendering instances begun while no pair is open
+	// A, any 8-byte alignment; end at A + 8, see OcclusionDumpPairs). Samples of instances begun while no pair is open
 	// cannot reach any such difference, so they are not counted. Every dump ends rendering, so
 	// an instance never straddles a pair boundary. Unexpected dump patterns disable the gate for
 	// the rest of the process (always-on counting, as without the gate).
@@ -110,12 +116,15 @@ private:
 		return (control & 1u) == 0 && (control & 0xf00u) != 0;
 	}
 	[[nodiscard]] bool GateOpen() const noexcept {
-		return !GateEnabled() || m_gate_broken || !m_open_pairs.empty();
+		return !GateEnabled() || m_gate_broken || !m_pairs.Empty();
 	}
-	void UpdateOpenPairs(uint64_t address);
+	void UpdateGate(OcclusionDumpPairs::Kind kind, uint64_t address);
 	void BreakGate(const char* reason, uint64_t address);
 	static constexpr size_t MaxOpenPairs = 64;
-	std::vector<uint64_t> m_open_pairs; // begin addresses of dump pairs awaiting their end
+	// Dump pairs awaiting their end (always tracked: the gate and the visibility-proxy detection
+	// both need to know whether a dump ends a pair).
+	OcclusionDumpPairs m_pairs;
+	uint64_t           m_pairs_dropped = 0;
 	bool m_gate_broken = false;
 	static constexpr uint32_t QueryCapacity = 1024;
 	RenderContext& m_context;

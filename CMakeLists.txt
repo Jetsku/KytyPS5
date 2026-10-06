@@ -927,6 +927,10 @@ target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
 target_link_libraries(occlusion_reset_tests common)
 add_test(NAME occlusion_reset COMMAND $<TARGET_FILE:occlusion_reset_tests>)
 
+add_executable(occlusion_pairs_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionPairsTests.cpp")
+target_include_directories(occlusion_pairs_tests PRIVATE ${inc_headers})
+add_test(NAME occlusion_pairs COMMAND $<TARGET_FILE:occlusion_pairs_tests>)
+
 # Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
 add_executable(binding_path_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BindingPathTests.cpp"
@@ -2070,6 +2074,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		bit_array_tests
 		lod_stats_report_tests
+		occlusion_pairs_tests
 		game_patch_filter_tests
 		lru_cache_tests
 		spirv_local_arrays_tests
