@@ -230,13 +230,15 @@ uint64_t SideReadbackWindow() {
 	return kib * 1024;
 }
 
-// KYTY_READBACK_MERGE_GAP_KB=<KiB> (live, default 64; 0 = one region per range): GPU-written ranges
+// KYTY_READBACK_MERGE_GAP_KB=<KiB> (live, default 0 = one region per range; 64 was the fork's): GPU-written ranges
 // of one readback less than this far apart share one vkCmdCopyBuffer region (chenxiao07 9239c5773).
 // The bytes between them are copied too but never written back: write-backs and publications keep
-// the exact ranges.
+// the exact ranges. Default off: Astro Bot measured 14-18 readback commands of 20-32 ranges per flip
+// (Sky Garden, snow, clock tower), which a 64 KiB gap cut to 14-20 regions while doubling the bytes
+// copied at snow/clock tower (85 -> 176 KiB per flip); ours was one command per readback already.
 Live::Switch g_readback_merge_gap("KYTY_READBACK_MERGE_GAP_KB", [](const char* value) -> int64_t {
 	if (value == nullptr) {
-		return 64 * 1024;
+		return 0;
 	}
 	return static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 64 * 1024)) *
 	       1024;
