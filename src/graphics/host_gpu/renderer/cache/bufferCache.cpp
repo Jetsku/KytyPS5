@@ -322,7 +322,7 @@ void RecordReadbackRegions(std::span<const vk::BufferCopy> ranges,
 	const auto region_64k  = per(totals.regions_64k);
 	const auto bytes       = per(totals.range_bytes);
 	const auto copied      = per(totals.region_bytes);
-	LOGF("ReadbackRegions 10s: %" PRIu64 " flips, per flip: %.1f copy commands, %.1f ranges, %.1f "
+	std::printf("ReadbackRegions 10s: %" PRIu64 " flips, per flip: %.1f copy commands, %.1f ranges, %.1f "
 	     "regions (%.1f with a 64 KiB gap), %.1f KiB written back, %.1f KiB copied\n",
 	     flips, commands, range_count, region, region_64k, bytes / 1024.0, copied / 1024.0);
 }
