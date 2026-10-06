@@ -452,7 +452,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
-	IR::ValidateProgram(program, true);
+	if (IR::ValidationEnabled()) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	state.mip_stats_records = mip_stats_records;
 	state.lane_count = ShaderLanesPerInvocation(program.stage, program.wave_size, input_info);
