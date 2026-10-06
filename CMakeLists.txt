@@ -702,6 +702,31 @@ add_executable(shader_precompile_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_precompile_tests xxhash)
 target_include_directories(shader_precompile_tests PRIVATE ${inc_headers})
 
+# Linux x86-64 only: raw syscall ABI and signal regressions are architecture-specific.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    add_executable(tracking_spin_lock_tests EXCLUDE_FROM_ALL
+        "${KYTY_TESTS_DIR}/TrackingSpinLockTests.cpp"
+        "${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
+        "${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
+        "${KYTY_SOURCE_DIR}/graphics/host_gpu/faultCost.cpp")
+    target_link_libraries(tracking_spin_lock_tests PRIVATE fmt::fmt common Threads::Threads)
+    target_include_directories(tracking_spin_lock_tests PRIVATE ${inc_headers})
+    if(BUILD_TESTING)
+        add_test(NAME tracking_spin_lock_parking COMMAND tracking_spin_lock_tests)
+        set_tests_properties(tracking_spin_lock_parking PROPERTIES
+            ENVIRONMENT "KYTY_TRACKER_LOCK_PARK=1" TIMEOUT 120)
+        add_test(NAME tracking_spin_lock_original COMMAND tracking_spin_lock_tests --spin)
+        set_tests_properties(tracking_spin_lock_original PROPERTIES
+            ENVIRONMENT "KYTY_TRACKER_LOCK_PARK=0" TIMEOUT 120)
+        add_test(NAME tracking_spin_lock_publication COMMAND tracking_spin_lock_tests --publication-signal)
+        set_tests_properties(tracking_spin_lock_publication PROPERTIES
+            ENVIRONMENT "KYTY_TRACKER_LOCK_PARK=1" TIMEOUT 15)
+        # Additional exact-policy cases can use --policy-only or --cpu-only.
+        # ptrace regression requires PTRACE_TRACEME permission; not silently skipped.
+    endif()
+endif()
+
+
 # KYTY_PIPELINE_FAST_FIRST: scheduling, retirement and accounting (pipeline/pipelineFastFirst.h).
 add_executable(pipeline_fast_first_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineFastFirstTests.cpp")
 target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})

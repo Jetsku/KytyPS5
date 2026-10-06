@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/linuxTrackerParking.h"
 #include "common/hangWatchdog.h"
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/memoryStats.h"
@@ -33,11 +34,19 @@
 
 namespace Libs::Graphics {
 
-// Waiters spin, then park (ParkingSpinLock, KYTY_TRACKER_LOCK_PARK); with parking off they spin
-// as before: reading only with pause under KYTY_RENDERER_BATCH, else retrying back to back.
+// Linux x86-64: exact startup opt-in uses the owner-publishing raw-futex path.
+// Otherwise retain int15's spin loops/instrumentation; other platforms keep the
+// upstream ParkingSpinLock behavior.
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
+#if defined(__linux__) && defined(__x86_64__)
+		if (TrackerParking::Enabled()) {
+			LockParking();
+			return;
+		}
+#endif
+
 		const auto thread = CurrentThread();
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
@@ -49,11 +58,30 @@ public:
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
+#if defined(__linux__) && defined(__x86_64__)
+			// The exact opt-in policy above is frozen at startup. Do not fall back
+			// to int15's lazy/default-on generic parking policy after it is OFF.
+			(void)m_lock.LockContended(Common::RendererBatchEnabled(), false);
+#else
 			(void)m_lock.LockContended(Common::RendererBatchEnabled());
+#endif
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
+#if defined(__linux__) && defined(__x86_64__)
+		if (TrackerParking::Enabled()) {
+			if ((m_park_state.load(std::memory_order_relaxed) & ~TrackerParking::WAITERS) !=
+			    TrackerParking::ThreadId()) {
+				TrackerParking::Fail("region tracking lock released by non-owner\n");
+			}
+			if ((m_park_state.exchange(0, std::memory_order_release) & TrackerParking::WAITERS) != 0) {
+				TrackerParking::Wake(m_park_state);
+			}
+			return;
+		}
+#endif
+
 		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
 			EXIT("region tracking lock released by non-owner\n");
 		}
@@ -62,6 +90,60 @@ public:
 	}
 
 private:
+#if defined(__linux__) && defined(__x86_64__)
+	void LockParking() noexcept {
+		const uint32_t thread = TrackerParking::ThreadId();
+		uint32_t expected = 0;
+		if (m_park_state.compare_exchange_strong(expected, thread, std::memory_order_acquire,
+		                                       std::memory_order_relaxed)) {
+			return;
+		}
+		// Fixed bounded budget: 256 pauses, not a wall-clock duration. Read-only
+		// polling avoids repeated cache-line-invalidating RMWs during the spin.
+		for (unsigned spins = 0; spins != 256; ++spins) {
+			if ((expected & ~TrackerParking::WAITERS) == thread) {
+				TrackerParking::Fail("recursive region tracking lock\n");
+			}
+			__asm__ volatile("pause");
+			expected = m_park_state.load(std::memory_order_relaxed);
+			if (expected == 0 && m_park_state.compare_exchange_strong(
+			                        expected, thread, std::memory_order_acquire,
+			                        std::memory_order_relaxed)) {
+				return;
+			}
+		}
+		for (;;) {
+			expected = m_park_state.load(std::memory_order_relaxed);
+			if ((expected & ~TrackerParking::WAITERS) == thread) {
+				TrackerParking::Fail("recursive region tracking lock while contended\n");
+			}
+			if (expected == 0) {
+				// Slow-path winners retain the waiter bit to continue the wake chain.
+				if (m_park_state.compare_exchange_strong(expected, thread | TrackerParking::WAITERS,
+				                                       std::memory_order_acquire,
+				                                       std::memory_order_relaxed)) {
+					return;
+				}
+				continue;
+			}
+			if ((expected & TrackerParking::WAITERS) == 0) {
+				if (!m_park_state.compare_exchange_strong(expected, expected | TrackerParking::WAITERS,
+				                                        std::memory_order_relaxed)) {
+					continue;
+				}
+				expected |= TrackerParking::WAITERS;
+			}
+			TrackerParking::Wait(m_park_state, expected);
+			// EINTR, EAGAIN and spurious wakes simply retry acquisition. A fast
+			// barger cannot strand sleepers: a woken waiter re-marks the waiter bit.
+		}
+	}
+	// 0 free; low 31 bits = owner TID; high bit = potential sleepers. Ownership
+	// and acquisition MUST publish in one atomic operation: a recursive signal
+	// between acquisition and a separate owner store would otherwise deadlock.
+	alignas(4) std::atomic<uint32_t> m_park_state {0};
+#endif
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
