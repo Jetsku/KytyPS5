@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audioDiag.h"
+#include "libs/audioMix.h"
 #include "libs/audio_internal.h"
 #include "libs/controller.h"
 #include "libs/dualSenseHaptics.h"
@@ -15,6 +16,8 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <magic_enum.hpp>
@@ -154,6 +157,12 @@ public:
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
 
+	void SetMixSettings(const Mix::Settings& settings) { m_mix = settings; }
+	[[nodiscard]] const Mix::Settings& GetMixSettings() const { return m_mix; }
+	// Every LEVEL_LOG_INTERVAL_US, print each active output port's RMS and peak (KYTY_AUDIO_LEVELS).
+	void SetLevelLogging(bool enabled) { m_level_logging = enabled; }
+	static constexpr uint64_t LEVEL_LOG_INTERVAL_US = 5000000;
+
 	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
 	int      AudioInClose(Id handle);
 	int      AudioInGetSilentState(Id handle);
@@ -176,6 +185,12 @@ private:
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
+
+		Mix::LevelMeter meter;
+		uint64_t        meter_start   = 0;
+		uint32_t        meter_on_main = 0; // Blocks that played on the main output.
+		uint32_t        meter_blocks  = 0;
+		float           meter_gain    = 1.0f;
 	};
 
 	struct PortIn {
@@ -195,6 +210,10 @@ private:
 	Common::Mutex m_mutex;
 	PortOut       m_out_ports[OUT_PORTS_MAX];
 	PortIn        m_in_ports[IN_PORTS_MAX];
+	Mix::Settings m_mix;
+	bool          m_level_logging = false;
+
+	void MeterOutput(int port_id, PortOut* port, const void* data, bool on_main, float gain);
 
 	static bool            FormatIsFloat(Format format);
 	static bool            FormatIsStd(Format format);
@@ -261,6 +280,19 @@ void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
 	g_audio = new Audio;
+
+	Mix::Settings mix;
+	mix.master      = Config::GetAudioMasterVolume();
+	mix.main        = Config::GetAudioMainVolume();
+	mix.music       = Config::GetAudioMusicVolume();
+	mix.pad_on_main = Config::GetAudioPadSpeakerOnMainVolume();
+	mix             = Mix::ApplyEnvironment(mix, [](const char* name) { return std::getenv(name); });
+	g_audio->SetMixSettings(mix);
+	const char* levels = std::getenv("KYTY_AUDIO_LEVELS");
+	g_audio->SetLevelLogging(levels != nullptr && levels[0] != '\0' && levels[0] != '0');
+	std::printf("Kyty audio mix: master %u%%, main %u%%, music (BGM ports) %u%%, pad speaker on main "
+	            "output %u%%\n",
+	            mix.master, mix.main, mix.music, mix.pad_on_main);
 }
 
 void Shutdown() {
@@ -569,6 +601,38 @@ bool Audio::AudioOutHasDevice(Id handle) {
 	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].stream != nullptr);
 }
 
+void Audio::MeterOutput(int port_id, PortOut* port, const void* data, bool on_main, float gain) {
+	const auto now = LibKernel::KernelGetProcessTime();
+	if (port->meter_start == 0) {
+		port->meter_start = now;
+	}
+	port->meter.Add(data, port->samples_num, static_cast<uint32_t>(port->channels_num),
+	                FormatIsFloat(port->format));
+	port->meter_blocks++;
+	port->meter_on_main += on_main ? 1 : 0;
+	port->meter_gain = gain;
+	if (now - port->meter_start < LEVEL_LOG_INTERVAL_US) {
+		return;
+	}
+	// Raw levels are the guest's samples; "out" adds the guest's port volume (channel 0) and
+	// the host gain, i.e. what reaches the device.
+	const double volume = static_cast<double>(port->volume[0]) / 32768.0;
+	const double rms    = port->meter.Rms();
+	const double peak   = port->meter.Peak();
+	std::printf("AudioLevel: t=%.1f s port %d %s %dch %uHz: raw rms %.1f dBFS peak %.1f dBFS; guest vol "
+	            "%.2f host gain %.2f -> out rms %.1f dBFS; %u/%u blocks on main output (%.1f s)\n",
+	            static_cast<double>(now) / 1e6, port_id + 1, audio_out_port_type_name(port->type),
+	            port->channels_num, port->freq, Mix::LevelMeter::ToDb(rms), Mix::LevelMeter::ToDb(peak), volume,
+	            static_cast<double>(port->meter_gain),
+	            Mix::LevelMeter::ToDb(rms * volume * port->meter_gain), port->meter_on_main,
+	            port->meter_blocks, static_cast<double>(now - port->meter_start) / 1e6);
+	std::fflush(stdout);
+	port->meter.Reset();
+	port->meter_start   = now;
+	port->meter_blocks  = 0;
+	port->meter_on_main = 0;
+}
+
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
 	Common::LockGuard lock(m_mutex);
 
@@ -617,6 +681,8 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
+		// The DualSense speaker/vibration setting also scales a pad speaker port that falls back
+		// to the main output, so the speaker hotkey keeps working there.
 		const float gain =
 		    port.type == AUDIO_OUT_PORT_TYPE_PADSPK
 		        ? Controller::GetSettingScale(Controller::Setting::SpeakerVolume)
@@ -639,11 +705,19 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking, gain)) {
+			const float main_gain = gain * Mix::MainOutputGain(m_mix, port.type, true);
+			if (m_level_logging) {
+				MeterOutput(params[i].handle.GetId(), &port, params[i].data,
+				            port.stream != nullptr, main_gain);
+			}
+			if (QueueSdlAudio(&port, params[i].data, blocking, main_gain)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}
 		} else {
+			if (m_level_logging) {
+				MeterOutput(params[i].handle.GetId(), &port, params[i].data, false, gain);
+			}
 			port.queue_primed = false;
 			// Bluetooth HID has its own sender. Let the sample clock pace a batch
 			// without another audio device, instead of waiting on the HID queue.

@@ -90,6 +90,106 @@
         <item row="0" column="1">
          <widget class="QComboBox" name="comboBox_audio_input_device"/>
         </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="label_audio_master">
+          <property name="text"><string>Master volume:</string></property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <layout class="QHBoxLayout" name="audio_master_layout">
+          <item>
+           <widget class="QSlider" name="slider_audio_master">
+            <property name="toolTip"><string>Everything the game plays on this PC (not the DualSense). 100% is unchanged; above 100% amplifies and can clip.</string></property>
+            <property name="maximum"><number>200</number></property>
+            <property name="singleStep"><number>5</number></property>
+            <property name="pageStep"><number>10</number></property>
+            <property name="value"><number>100</number></property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="label_audio_master_value">
+            <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+            <property name="text"><string>100%</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="label_audio_main">
+          <property name="text"><string>Game sound:</string></property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <layout class="QHBoxLayout" name="audio_main_layout">
+          <item>
+           <widget class="QSlider" name="slider_audio_main">
+            <property name="toolTip"><string>Game audio on the main output ports (most effects, and music in games that mix it there). 100% is unchanged.</string></property>
+            <property name="maximum"><number>200</number></property>
+            <property name="singleStep"><number>5</number></property>
+            <property name="pageStep"><number>10</number></property>
+            <property name="value"><number>100</number></property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="label_audio_main_value">
+            <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+            <property name="text"><string>100%</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="label_audio_music">
+          <property name="text"><string>Music (BGM ports):</string></property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <layout class="QHBoxLayout" name="audio_music_layout">
+          <item>
+           <widget class="QSlider" name="slider_audio_music">
+            <property name="toolTip"><string>Music the game plays on its own background-music ports. Has no effect on games that mix music into the main output.</string></property>
+            <property name="maximum"><number>200</number></property>
+            <property name="singleStep"><number>5</number></property>
+            <property name="pageStep"><number>10</number></property>
+            <property name="value"><number>100</number></property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="label_audio_music_value">
+            <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+            <property name="text"><string>100%</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item row="4" column="0">
+         <widget class="QLabel" name="label_audio_pad_speaker">
+          <property name="text"><string>Controller speaker on PC:</string></property>
+         </widget>
+        </item>
+        <item row="4" column="1">
+         <layout class="QHBoxLayout" name="audio_pad_speaker_layout">
+          <item>
+           <widget class="QSlider" name="slider_audio_pad_speaker">
+            <property name="toolTip"><string>Sounds meant for the DualSense speaker when no DualSense plays them (no controller, or not wired/Bluetooth). The console speaker is small, so these are turned down by default.</string></property>
+            <property name="maximum"><number>200</number></property>
+            <property name="singleStep"><number>5</number></property>
+            <property name="pageStep"><number>10</number></property>
+            <property name="value"><number>30</number></property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="label_audio_pad_speaker_value">
+            <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+            <property name="text"><string>30%</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
        </layout>
       </widget>
      </item>

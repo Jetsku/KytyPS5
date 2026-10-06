@@ -70,6 +70,34 @@ struct ControllerSettings {
 	}
 };
 
+// Host mix levels (percent, 0..Config::MAX_AUDIO_VOLUME), global like the controller settings.
+struct AudioMixSettings {
+	int master      = 100;
+	int main        = 100;
+	int music       = 100;
+	int pad_speaker = static_cast<int>(Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
+
+	void WriteSettings(QSettings* s) const {
+		s->setValue("audio_master_volume", master);
+		s->setValue("audio_main_volume", main);
+		s->setValue("audio_music_volume", music);
+		s->setValue("audio_pad_speaker_main_volume", pad_speaker);
+	}
+
+	void ReadSettings(QSettings* s) {
+		const auto read_percent = [s](const char* key, int fallback) {
+			bool      ok    = false;
+			const int value = s->value(key, fallback).toInt(&ok);
+			return ok ? qBound(0, value, static_cast<int>(Config::MAX_AUDIO_VOLUME)) : fallback;
+		};
+		const AudioMixSettings defaults;
+		master      = read_percent("audio_master_volume", defaults.master);
+		main        = read_percent("audio_main_volume", defaults.main);
+		music       = read_percent("audio_music_volume", defaults.music);
+		pad_speaker = read_percent("audio_pad_speaker_main_volume", defaults.pad_speaker);
+	}
+};
+
 class Configuration: public QObject {
 	Q_OBJECT
 
@@ -111,6 +139,8 @@ public:
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
+	// So do the audio mix levels.
+	AudioMixSettings audio_mix;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";

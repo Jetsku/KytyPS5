@@ -103,6 +103,12 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --audio-master-volume <0-200>       Volume of everything on the main output. Default: 100.\n");
+	::printf("  --audio-main-volume <0-200>         Game sound (main ports). Default: 100.\n");
+	::printf("  --audio-music-volume <0-200>        Music on BGM ports. Default: 100.\n");
+	::printf("  --audio-pad-speaker-volume <0-200>  Controller-speaker sounds played on the main output\n"
+	         "                                      when no DualSense takes them. Default: %u.\n",
+	         Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -392,6 +398,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.controller_vibration_intensity) ||
 			    options.config.controller_vibration_intensity > 100) {
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--audio-master-volume" || arg == "--audio-main-volume" ||
+		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume") {
+			auto& target = arg == "--audio-master-volume" ? options.config.audio_master_volume
+			               : arg == "--audio-main-volume" ? options.config.audio_main_volume
+			               : arg == "--audio-music-volume"
+			                   ? options.config.audio_music_volume
+			                   : options.config.audio_pad_speaker_main_volume;
+			if (!ParseUint32(value, target) || target > Config::MAX_AUDIO_VOLUME) {
+				::printf("invalid %s (expected 0-%u): %s\n", arg.c_str(), Config::MAX_AUDIO_VOLUME,
+				         value.c_str());
 				return false;
 			}
 		} else if (arg == "--present-mode") {
