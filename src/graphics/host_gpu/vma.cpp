@@ -90,6 +90,16 @@ bool NativeImagePoolEnabled() {
 	return enabled;
 }
 
+// KYTY_IMAGE_SYSMEM_FALLBACK=0: an image that does not fit in video memory ends the emulator
+// ("failed to create image") instead of going to system memory.
+static bool ImageSystemMemoryFallbackEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_SYSMEM_FALLBACK");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // KYTY_NATIVE_IMAGE_POOL_IDLE_MS=N (default 0: off): a retained native image that no create has
 // reused for N ms is destroyed (TrimRetiredImages, from the garbage collector). The pool then holds
 // what the current churn recycles instead of up to its whole limit of images retired in earlier
@@ -734,6 +744,25 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			// Retained objects are optional. Release them before one allocation retry.
 			ClearRetiredImages();
 			result = allocate();
+		}
+		if (result == vk::Result::eErrorOutOfDeviceMemory && ImageSystemMemoryFallbackEnabled()) {
+			// From chenxiao07/KytyPS5 86910c0d2: out of video memory, the image goes to any memory
+			// type the driver allows for it (NVIDIA: system memory for optimal images). Slower to
+			// sample, but the game goes on instead of ending at "failed to create image".
+			alloc_info.requiredFlags  = 0;
+			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			result                    = allocate();
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("Vulkan: video memory full, %s: %ux%ux%u format=%d layers=%u levels=%u "
+				     "(KYTY_IMAGE_SYSMEM_FALLBACK)\n",
+				     result == vk::Result::eSuccess ? "an image is in system memory"
+				                                    : "an image could not be created",
+				     image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+				     static_cast<int>(image_info.format), image_info.arrayLayers,
+				     image_info.mipLevels);
+				LogMemoryBudget();
+			}
 		}
 		if (result != vk::Result::eSuccess) {
 			LogMemoryBudget();
