@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/cache/texelImageLookup.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1344,6 +1345,7 @@ void Engine::Commit(Slot& slot) {
 	CommitStats::EndDraw();
 	PrintDrawPrepSummary();
 	DrawRun::PrintSummary();
+	TexelImageLookup::PrintSummary();
 }
 
 void Engine::NoteFence() {
