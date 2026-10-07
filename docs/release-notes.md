@@ -120,7 +120,7 @@ occlusion on.
 - **First launch:** the first start after an update builds the large lighting shaders, which can freeze the picture
   for up to about 20 seconds once.
 
-## Also in int15 and int15.1
+## Also in int15
 
 - No more "unsupported sampled depth image" stops on fast GPUs, no crash when leaving extra levels in Sky Garden,
   about 20 upstream shader fixes, a Demon's Souls fix for an unknown image format, and thread priority changes.
@@ -150,7 +150,7 @@ occlusion on.
   were being built. The hang watchdog fix and the background shader builds should cure it; if it still happens,
   please send the console text.
 - **AMD graphics cards:** with the two patches turned off, the GPU can stop responding ("device lost"), and the water
-  in Go-Go Archipelago can make the frame rate drop sharply. On AMD, keep the patches on, or use int15.1.
+  in Go-Go Archipelago can make the frame rate drop sharply. On AMD, keep the patches on, or use int15.
 - **Second (red) galaxy:** one player (RTX 5080, Intel CPU) crashed while arriving at Go-Go Archipelago for the first
   time (the loader read through a bad pointer). We could not reproduce it on our PC. A save from just before the red
   galaxy would help.
