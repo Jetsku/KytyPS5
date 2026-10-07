@@ -84,6 +84,10 @@ uint32_t GetAudioObjectsVolume() {
 	return g_config->audio_objects_volume;
 }
 
+bool AudioObjectsEnabled() {
+	return g_config->audio_objects_enabled;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }

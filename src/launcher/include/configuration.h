@@ -77,6 +77,7 @@ struct AudioMixSettings {
 	int music       = 100;
 	int pad_speaker = static_cast<int>(Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
 	int objects     = 100;
+	bool objects_enabled = true;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("audio_master_volume", master);
@@ -84,6 +85,7 @@ struct AudioMixSettings {
 		s->setValue("audio_music_volume", music);
 		s->setValue("audio_pad_speaker_main_volume", pad_speaker);
 		s->setValue("audio_objects_volume", objects);
+		s->setValue("audio_objects_enabled", objects_enabled);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -98,6 +100,7 @@ struct AudioMixSettings {
 		music       = read_percent("audio_music_volume", defaults.music);
 		pad_speaker = read_percent("audio_pad_speaker_main_volume", defaults.pad_speaker);
 		objects     = read_percent("audio_objects_volume", defaults.objects);
+		objects_enabled = s->value("audio_objects_enabled", defaults.objects_enabled).toBool();
 	}
 };
 

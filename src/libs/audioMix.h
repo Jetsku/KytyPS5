@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 // Host-side mix levels for the guest's audio output ports, and a level meter for them.
 //
@@ -39,6 +40,8 @@ struct Settings {
 	uint32_t pad_on_main  = 100;
 	// AudioOut2 3D object ports, mixed into the main bed (so main and master apply on top).
 	uint32_t objects      = 100;
+	// Off: object ports are accepted but not mixed (their PCM is dropped).
+	bool     objects_enabled = true;
 };
 
 // Which mix category a port's samples belong to. A pad speaker port counts as "on main" only when
@@ -75,7 +78,7 @@ inline float MainOutputGain(const Settings& settings, int port_type, bool on_mai
 // The gain of AudioOut2 object ports relative to the main bed they are mixed into. The bed then
 // gets MainOutputGain (master x main), so "game sound" and master cover the objects as well.
 inline float ObjectsGain(const Settings& settings) {
-	return PercentToGain(settings.objects);
+	return settings.objects_enabled ? PercentToGain(settings.objects) : 0.0f;
 }
 
 // Parses an environment value 0..MAX_PERCENT; returns false (leaving *percent alone) otherwise.
@@ -92,9 +95,30 @@ inline bool ParsePercent(const char* text, uint32_t* percent) {
 	return true;
 }
 
+// Parses an environment on/off value ("1"/"0", also on/off, true/false); false (leaving *on alone)
+// otherwise.
+inline bool ParseOnOff(const char* text, bool* on) {
+	if (text == nullptr) {
+		return false;
+	}
+	for (const char* yes: {"1", "on", "true"}) {
+		if (std::strcmp(text, yes) == 0) {
+			*on = true;
+			return true;
+		}
+	}
+	for (const char* no: {"0", "off", "false"}) {
+		if (std::strcmp(text, no) == 0) {
+			*on = false;
+			return true;
+		}
+	}
+	return false;
+}
+
 // Environment overrides: KYTY_AUDIO_MASTER_VOLUME, KYTY_AUDIO_MAIN_VOLUME,
 // KYTY_AUDIO_MUSIC_VOLUME, KYTY_AUDIO_PAD_SPEAKER_ON_MAIN_VOLUME and KYTY_AUDIO_OBJECTS_VOLUME, in
-// percent (0..200).
+// percent (0..200), and KYTY_AUDIO_OBJECTS (0 or 1).
 template <class GetEnv>
 inline Settings ApplyEnvironment(Settings settings, GetEnv get_env) {
 	ParsePercent(get_env("KYTY_AUDIO_MASTER_VOLUME"), &settings.master);
@@ -102,6 +126,7 @@ inline Settings ApplyEnvironment(Settings settings, GetEnv get_env) {
 	ParsePercent(get_env("KYTY_AUDIO_MUSIC_VOLUME"), &settings.music);
 	ParsePercent(get_env("KYTY_AUDIO_PAD_SPEAKER_ON_MAIN_VOLUME"), &settings.pad_on_main);
 	ParsePercent(get_env("KYTY_AUDIO_OBJECTS_VOLUME"), &settings.objects);
+	ParseOnOff(get_env("KYTY_AUDIO_OBJECTS"), &settings.objects_enabled);
 	return settings;
 }
 

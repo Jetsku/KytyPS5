@@ -111,6 +111,7 @@ static void PrintUsage() {
 	         Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
 	::printf("  --audio-objects-volume <0-200>      3D audio objects (AudioOut2 object ports), mixed into\n"
 	         "                                      the game sound. Default: 100.\n");
+	::printf("  --audio-objects <on|off>            Play 3D audio objects (off: dropped). Default: on.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -420,6 +421,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, target) || target > Config::MAX_AUDIO_VOLUME) {
 				::printf("invalid %s (expected 0-%u): %s\n", arg.c_str(), Config::MAX_AUDIO_VOLUME,
 				         value.c_str());
+				return false;
+			}
+		} else if (arg == "--audio-objects") {
+			if (!ParseBool(value, options.config.audio_objects_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--present-mode") {

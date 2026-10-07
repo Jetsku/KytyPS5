@@ -119,7 +119,7 @@ static QString GameDirectoryKey(const QString& dir) {
 #endif
 }
 
-// The audio mix sliders (rows 1-5 of the Audio group) are global settings like the controller
+// The audio mix sliders and the 3D objects switch (rows 1-6 of the Audio group) are global settings like the controller
 // group: shown only in the global settings dialog.
 struct AudioMixSlider {
 	QSlider* slider;
@@ -137,7 +137,7 @@ static std::array<AudioMixSlider, 5> AudioMixSliders(Ui::ConfigurationEditDialog
 }
 
 static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
-	for (int row = 1; row <= 5; row++) {
+	for (int row = 1; row <= 6; row++) {
 		ui.audioLayout->setRowVisible(row, visible);
 	}
 	// The occlusion mode is global too (graphics row 9).
@@ -156,6 +156,10 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 			label->setText(ConfigurationEditDialog::tr("%1%").arg(value));
 		});
 	}
+	connect(m_ui->checkBox_audio_objects, &QCheckBox::toggled, this, [this](bool on) {
+		m_ui->slider_audio_objects->setEnabled(on);
+		m_ui->label_audio_objects_value->setEnabled(on);
+	});
 	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
@@ -246,6 +250,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	for (const auto& mix: AudioMixSliders(*m_ui)) {
 		mix.slider->setValue(info.audio_mix.*mix.field);
 	}
+	m_ui->checkBox_audio_objects->setChecked(info.audio_mix.objects_enabled);
+	m_ui->slider_audio_objects->setEnabled(info.audio_mix.objects_enabled);
+	m_ui->label_audio_objects_value->setEnabled(info.audio_mix.objects_enabled);
 	m_ui->checkBox_gpu_occlusion->setChecked(info.gpu_occlusion_accurate);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
@@ -459,6 +466,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		for (const auto& mix: AudioMixSliders(ui)) {
 			info.audio_mix.*mix.field = mix.slider->value();
 		}
+		info.audio_mix.objects_enabled = ui.checkBox_audio_objects->isChecked();
 		info.gpu_occlusion_accurate = ui.checkBox_gpu_occlusion->isChecked();
 	}
 	info.screen_resolution =

@@ -285,6 +285,10 @@ float AudioOutObjectsGain() {
 	return g_audio != nullptr ? Mix::ObjectsGain(g_audio->GetMixSettings()) : 1.0f;
 }
 
+bool AudioOutObjectsEnabled() {
+	return g_audio == nullptr || g_audio->GetMixSettings().objects_enabled;
+}
+
 } // namespace AudioInternal
 
 void Initialize() {
@@ -298,13 +302,15 @@ void Initialize() {
 	mix.music       = Config::GetAudioMusicVolume();
 	mix.pad_on_main = Config::GetAudioPadSpeakerOnMainVolume();
 	mix.objects     = Config::GetAudioObjectsVolume();
+	mix.objects_enabled = Config::AudioObjectsEnabled();
 	mix             = Mix::ApplyEnvironment(mix, [](const char* name) { return std::getenv(name); });
 	g_audio->SetMixSettings(mix);
 	const char* levels = std::getenv("KYTY_AUDIO_LEVELS");
 	g_audio->SetLevelLogging(levels != nullptr && levels[0] != '\0' && levels[0] != '0');
 	std::printf("Kyty audio mix: master %u%%, main %u%%, music (BGM ports) %u%%, pad speaker on main "
-	            "output %u%%, 3D objects %u%%\n",
-	            mix.master, mix.main, mix.music, mix.pad_on_main, mix.objects);
+	            "output %u%%, 3D objects %s %u%%\n",
+	            mix.master, mix.main, mix.music, mix.pad_on_main, mix.objects_enabled ? "on" : "off",
+	            mix.objects);
 }
 
 void Shutdown() {

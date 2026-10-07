@@ -62,6 +62,7 @@ struct ConfigOptions {
 	uint32_t               audio_pad_speaker_main_volume  = DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME;
 	// AudioOut2 3D object ports, mixed into the main bed (main and master apply on top).
 	uint32_t               audio_objects_volume           = 100;
+	bool                   audio_objects_enabled          = true;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -109,6 +110,7 @@ uint32_t GetAudioMainVolume();
 uint32_t GetAudioMusicVolume();
 uint32_t GetAudioPadSpeakerOnMainVolume();
 uint32_t GetAudioObjectsVolume();
+bool     AudioObjectsEnabled();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();

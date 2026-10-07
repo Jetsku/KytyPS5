@@ -31,6 +31,8 @@ bool     AudioOutHasDevice(int handle);
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking = true);
 // The host gain of AudioOut2 3D object ports relative to the bed they are mixed into.
 float    AudioOutObjectsGain();
+// False when 3D audio objects are switched off: object PCM is dropped, not mixed.
+bool     AudioOutObjectsEnabled();
 
 } // namespace Libs::Audio::AudioInternal
 

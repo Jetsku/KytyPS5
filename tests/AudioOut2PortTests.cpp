@@ -29,6 +29,7 @@ int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
 float                             g_objects_gain = 1.0f;
+bool                              g_objects_on   = true;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -494,6 +495,23 @@ void TestObjectPortsMixIntoBed() {
 	      "objects volume 0 did not mute");
 	g_objects_gain = 1.0f;
 
+	// Switched off: the bed is played unchanged, and the dropped block is not mixed later either.
+	g_objects_on = false;
+	SetPcm(bed, bed_pcm.data());
+	SetObject(object, mono.data(), right, 0.5f);
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "objects-off push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "objects off still mixed the object");
+	g_objects_on = true;
+	SetPcm(bed, bed_pcm.data());
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "objects-on push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "a block dropped while objects were off was mixed later");
+
 	CaptureOutputPcm(0);
 	AudioOut2::AudioOut2PortDestroy(object);
 	AudioOut2::AudioOut2PortDestroy(bed);
@@ -550,6 +568,10 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 
 float AudioOutObjectsGain() {
 	return g_objects_gain;
+}
+
+bool AudioOutObjectsEnabled() {
+	return g_objects_on;
 }
 
 } // namespace Libs::Audio::AudioInternal

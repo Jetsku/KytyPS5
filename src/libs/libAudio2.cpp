@@ -461,12 +461,14 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	thread_local std::vector<float> object_mix;
 
 	Common::LockGuard lock(g_audioout2_port_mutex);
-	bool objects_mixed = false;
+	// Objects switched off: no bed takes them, so every object block is dropped below.
+	const bool objects_on    = AudioInternal::AudioOutObjectsEnabled();
+	bool       objects_mixed = false;
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			const void* data = state.pcm_data.data();
-			if (!objects_mixed && audioout2_is_object_bed(state)) {
+			if (objects_on && !objects_mixed && audioout2_is_object_bed(state)) {
 				data          = audioout2_mix_objects_locked(ctx, state, &object_mix);
 				objects_mixed = true;
 			}
@@ -474,7 +476,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		}
 	}
 	if (!objects_mixed) {
-		// No bed to carry them: drop this push's object PCM rather than replay it later.
+		// No bed to carry them (or objects off): drop this push's object PCM rather than replay it.
 		for (auto& state: g_audioout2_ports) {
 			if (state.used && state.context == ctx) {
 				state.pcm_fresh = false;

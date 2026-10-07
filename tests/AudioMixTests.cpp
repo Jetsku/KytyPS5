@@ -100,6 +100,34 @@ void TestEnvironment() {
 	Check(settings.objects == 60, "objects override ignored");
 	Check(Near(Mix::ObjectsGain(settings), 0.6), "objects gain");
 	Check(Near(Mix::ObjectsGain(Mix::Settings {}), 1.0), "objects default is unity");
+	Check(settings.objects_enabled, "objects off without KYTY_AUDIO_OBJECTS");
+
+	bool on = true;
+	Check(!Mix::ParseOnOff(nullptr, &on) && !Mix::ParseOnOff("", &on) &&
+	          !Mix::ParseOnOff("2", &on) && on,
+	      "invalid on/off accepted");
+	Check(Mix::ParseOnOff("0", &on) && !on && Mix::ParseOnOff("1", &on) && on, "0/1 on/off");
+	Check(Mix::ParseOnOff("off", &on) && !on && Mix::ParseOnOff("on", &on) && on, "off/on");
+
+	// KYTY_AUDIO_OBJECTS overrides the option either way; off means objects are not mixed.
+	const auto with_objects = [](const char* value, bool configured) {
+		Mix::Settings base;
+		base.objects_enabled = configured;
+		return Mix::ApplyEnvironment(base, [value](const char* name) -> const char* {
+			return std::strcmp(name, "KYTY_AUDIO_OBJECTS") == 0 ? value : nullptr;
+		});
+	};
+	const auto off = with_objects("0", true);
+	Check(!off.objects_enabled && Mix::ObjectsGain(off) == 0.0f, "KYTY_AUDIO_OBJECTS=0");
+	Check(with_objects("1", false).objects_enabled, "KYTY_AUDIO_OBJECTS=1");
+	Check(!with_objects(nullptr, false).objects_enabled, "unset KYTY_AUDIO_OBJECTS changed the option");
+	Check(!with_objects("x", false).objects_enabled, "invalid KYTY_AUDIO_OBJECTS accepted");
+
+	float       bed[2] {0.1f, 0.1f};
+	const float mono[1] {1.0f};
+	const float gains[2] {1.0f, 1.0f};
+	Objects::MixInto(bed, 2, 1, mono, gains, Mix::ObjectsGain(off));
+	Check(bed[0] == 0.1f && bed[1] == 0.1f, "objects off still mixed");
 }
 
 void TestLevelMeter() {

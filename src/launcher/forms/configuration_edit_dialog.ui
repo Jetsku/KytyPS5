@@ -215,6 +215,13 @@
           </item>
          </layout>
         </item>
+        <item row="6" column="1">
+         <widget class="QCheckBox" name="checkBox_audio_objects">
+          <property name="toolTip"><string>Play the sounds the game places in 3D (PS5 3D audio object ports: ambience, positioned effects). Off drops them, as older Kyty versions did.</string></property>
+          <property name="text"><string>3D audio objects (game's positional sounds)</string></property>
+          <property name="checked"><bool>true</bool></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

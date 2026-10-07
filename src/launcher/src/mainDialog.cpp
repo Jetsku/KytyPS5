@@ -239,6 +239,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--audio-music-volume" << QString::number(info.audio_mix.music);
 	args << "--audio-pad-speaker-volume" << QString::number(info.audio_mix.pad_speaker);
 	args << "--audio-objects-volume" << QString::number(info.audio_mix.objects);
+	args << "--audio-objects" << (info.audio_mix.objects_enabled ? "on" : "off");
 	if (info.gpu_occlusion_accurate) {
 		// Overrides the bundled preset's KYTY_GPU_OCCLUSION (performance mode by default).
 		args << "--gpu-occlusion" << "on";
