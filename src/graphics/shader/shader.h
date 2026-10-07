@@ -147,6 +147,9 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// The user SGPR (s8 + GS user data index) holding the draw's start instance, which an indirect draw
+	// has the CP write; -1: the user data value.
+	int32_t                 start_instance_sgpr = -1;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

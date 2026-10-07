@@ -242,6 +242,7 @@ enum class StageInputKind {
 	PrimitiveId,
 	TessCoord,
 	InstanceIndex,
+	BaseInstance,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,
@@ -870,6 +871,10 @@ bool        HasShaderMemoryWrites(const Program& program);
 [[nodiscard]] bool CloneProgram(const Program& source, Program& target);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
+// Whether translations run ValidateProgram: debug builds, or with KYTY_IR_VALIDATE=1 in release.
+// The checks only ever stop the emulator, and they were about a fifth of a release translation
+// (first-encounter hitches, precompile time; chenxiao07 a28de66fe).
+[[nodiscard]] bool ValidationEnabled();
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);

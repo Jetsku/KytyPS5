@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 #include <string>
 #include <unordered_set>
 #include <mutex>
+#include <span>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -226,6 +228,157 @@ uint64_t SideReadbackWindow() {
 		return Default;
 	}
 	return kib * 1024;
+}
+
+// KYTY_READBACK_MERGE_GAP_KB=<KiB> (live, default 0 = one region per range; 64 was the fork's): GPU-written ranges
+// of one readback less than this far apart share one vkCmdCopyBuffer region (chenxiao07 9239c5773).
+// The bytes between them are copied too but never written back: write-backs and publications keep
+// the exact ranges. Default off: Astro Bot measured 14-18 readback commands of 20-32 ranges per flip
+// (Sky Garden, snow, clock tower), which a 64 KiB gap cut to 14-20 regions while doubling the bytes
+// copied at snow/clock tower (85 -> 176 KiB per flip); ours was one command per readback already.
+Live::Switch g_readback_merge_gap("KYTY_READBACK_MERGE_GAP_KB", [](const char* value) -> int64_t {
+	if (value == nullptr) {
+		return 0;
+	}
+	return static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 64 * 1024)) *
+	       1024;
+});
+
+// The number of regions copies (source ascending) give when a copy starting at most `gap` bytes
+// after the previous region's source end joins it.
+uint64_t CountMergedRegions(std::span<const vk::BufferCopy> copies, uint64_t gap) {
+	uint64_t count = 0;
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	for (const auto& copy: copies) {
+		if (count == 0 || copy.srcOffset < begin || copy.srcOffset > end + gap) {
+			count++;
+			begin = copy.srcOffset;
+			end   = copy.srcOffset + copy.size;
+		} else {
+			end = std::max(end, copy.srcOffset + copy.size);
+		}
+	}
+	return count;
+}
+
+// KYTY_READBACK_REGION_LOG=1: every 10 s, the readback copy commands, their ranges and regions
+// (and the regions a 64 KiB gap would give) per CP flip.
+void RecordReadbackRegions(std::span<const vk::BufferCopy> ranges,
+                           std::span<const vk::BufferCopy> regions) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_READBACK_REGION_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	struct Totals {
+		std::atomic<uint64_t> commands {0};
+		std::atomic<uint64_t> ranges {0};
+		std::atomic<uint64_t> regions {0};
+		std::atomic<uint64_t> regions_64k {0};
+		std::atomic<uint64_t> range_bytes {0};
+		std::atomic<uint64_t> region_bytes {0};
+		std::atomic<int64_t>  last_ms {0};
+		std::atomic<uint64_t> last_flip {0};
+	};
+	static Totals totals;
+	uint64_t      range_bytes  = 0;
+	uint64_t      region_bytes = 0;
+	for (const auto& range: ranges) {
+		range_bytes += range.size;
+	}
+	for (const auto& region: regions) {
+		region_bytes += region.size;
+	}
+	totals.commands.fetch_add(1, std::memory_order_relaxed);
+	totals.ranges.fetch_add(ranges.size(), std::memory_order_relaxed);
+	totals.regions.fetch_add(regions.size(), std::memory_order_relaxed);
+	totals.regions_64k.fetch_add(CountMergedRegions(ranges, 64 * 1024), std::memory_order_relaxed);
+	totals.range_bytes.fetch_add(range_bytes, std::memory_order_relaxed);
+	totals.region_bytes.fetch_add(region_bytes, std::memory_order_relaxed);
+	const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                           std::chrono::steady_clock::now().time_since_epoch())
+	                           .count();
+	auto last = totals.last_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		if (totals.last_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+			totals.last_flip.store(Live::Testing::CpFlips(), std::memory_order_relaxed);
+		}
+		return;
+	}
+	if (now_ms - last < 10000 ||
+	    !totals.last_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto flip  = Live::Testing::CpFlips();
+	const auto flips = std::max<uint64_t>(1, flip - totals.last_flip.exchange(flip));
+	const auto per   = [flips](std::atomic<uint64_t>& value) {
+        return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) /
+               static_cast<double>(flips);
+	};
+	const auto commands    = per(totals.commands);
+	const auto range_count = per(totals.ranges);
+	const auto region      = per(totals.regions);
+	const auto region_64k  = per(totals.regions_64k);
+	const auto bytes       = per(totals.range_bytes);
+	const auto copied      = per(totals.region_bytes);
+	std::printf("ReadbackRegions 10s: %" PRIu64 " flips, per flip: %.1f copy commands, %.1f ranges, %.1f "
+	     "regions (%.1f with a 64 KiB gap), %.1f KiB written back, %.1f KiB copied\n",
+	     flips, commands, range_count, region, region_64k, bytes / 1024.0, copied / 1024.0);
+}
+
+// The regions of copies whose source and destination advance together (a side-readback window):
+// a copy starting at most `gap` bytes after the previous region's source end joins it.
+std::vector<vk::BufferCopy> MergeLinearCopies(const std::vector<vk::BufferCopy>& copies,
+                                              uint64_t gap) {
+	if (gap == 0 || copies.size() < 2) {
+		return copies;
+	}
+	std::vector<vk::BufferCopy> regions;
+	regions.reserve(copies.size());
+	for (const auto& copy: copies) {
+		if (!regions.empty()) {
+			auto&      last     = regions.back();
+			const auto last_end = last.srcOffset + last.size;
+			if (copy.srcOffset >= last.srcOffset && copy.srcOffset <= last_end + gap &&
+			    copy.dstOffset >= last.dstOffset &&
+			    copy.dstOffset - last.dstOffset == copy.srcOffset - last.srcOffset) {
+				last.size = std::max(last_end, copy.srcOffset + copy.size) - last.srcOffset;
+				continue;
+			}
+		}
+		regions.push_back(copy);
+	}
+	return regions;
+}
+
+// Packs download parts (source ascending) into regions: a part starting at most `gap` bytes after
+// the previous region's source end joins it. Each part's dstOffset becomes its place inside its
+// region's packed bytes (regions 64-byte aligned, as before). Returns the packed size.
+uint64_t PackDownloadRegions(std::vector<vk::BufferCopy>& parts, uint64_t gap,
+                             std::vector<vk::BufferCopy>& regions) {
+	regions.clear();
+	regions.reserve(parts.size());
+	uint64_t packed = 0;
+	for (auto& part: parts) {
+		if (gap != 0 && !regions.empty()) {
+			auto&      last     = regions.back();
+			const auto last_end = last.srcOffset + last.size;
+			if (part.srcOffset >= last.srcOffset && part.srcOffset <= last_end + gap) {
+				packed -= Common::AlignUp(last.size, uint64_t {64});
+				last.size = std::max(last_end, part.srcOffset + part.size) - last.srcOffset;
+				packed += Common::AlignUp(last.size, uint64_t {64});
+				part.dstOffset = last.dstOffset + (part.srcOffset - last.srcOffset);
+				continue;
+			}
+		}
+		part.dstOffset = packed;
+		regions.emplace_back(part.srcOffset, packed, part.size);
+		packed += Common::AlignUp(part.size, uint64_t {64});
+	}
+	return packed;
 }
 
 uint64_t ParseEnvU64(const char* name, uint64_t fallback) {
@@ -909,6 +1062,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	// Nearby ranges share one copy region (KYTY_READBACK_MERGE_GAP_KB); `copies` stay the exact
+	// parts written back.
+	std::vector<vk::BufferCopy> regions;
+	total_size = PackDownloadRegions(copies, static_cast<uint64_t>(g_readback_merge_gap.Get()), regions);
+	RecordReadbackRegions(copies, regions);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	// A download larger than the staging ring gets a buffer of its own, released after the
@@ -924,6 +1082,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	const auto& download = temporary ? *temporary : m_download_buffer;
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
+	}
+	for (auto& region: regions) {
+		region.dstOffset += offset;
 	}
 
 	auto& command = m_scheduler.Current();
@@ -941,7 +1102,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), download.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	                  static_cast<uint32_t>(regions.size()), regions.data());
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -1808,8 +1969,13 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                        nullptr);
-	command.copyBuffer(buffer.Handle(), side.staging->Handle(), static_cast<uint32_t>(copies.size()),
-	                   copies.data());
+	// Nearby dirty ranges share one region (KYTY_READBACK_MERGE_GAP_KB): the staging window mirrors
+	// the guest window, and completion writes back only readback->ranges.
+	const auto regions =
+	    MergeLinearCopies(copies, static_cast<uint64_t>(g_readback_merge_gap.Get()));
+	RecordReadbackRegions(copies, regions);
+	command.copyBuffer(buffer.Handle(), side.staging->Handle(), static_cast<uint32_t>(regions.size()),
+	                   regions.data());
 	vk::BufferMemoryBarrier after = before;
 	after.srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask           = vk::AccessFlagBits::eHostRead;
@@ -2176,8 +2342,11 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
+	const auto regions =
+	    MergeLinearCopies(copies, static_cast<uint64_t>(g_readback_merge_gap.Get()));
+	RecordReadbackRegions(copies, regions);
 	native.copyBuffer(buffer.Handle(), side.eager_staging->Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	                  static_cast<uint32_t>(regions.size()), regions.data());
 	vk::BufferMemoryBarrier after = before;
 	after.srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask           = vk::AccessFlagBits::eHostRead;

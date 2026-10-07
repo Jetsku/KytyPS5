@@ -1637,8 +1637,26 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	return 6;
 }
 
+// The GS user SGPR at an SH register location, -1 for another register.
+// KYTY_START_INSTANCE_SGPR=0: indirect draws name no start-instance SGPR (the shaders still count
+// the instance ID from 0, as the GPU does).
+static int32_t GsUserSgprAt(uint32_t location) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_START_INSTANCE_SGPR");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled) {
+		return -1;
+	}
+	const auto id = location - Pm4::SPI_SHADER_USER_DATA_GS_0;
+	return id < 32u ? static_cast<int32_t>(id) : -1;
+}
+
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	// Ported from chenxiao07/KytyPS5 3b351932d: only an indirect draw has the CP write a start
+	// instance (START_INST_LOC); the vertex shader is translated for it.
+	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
 
@@ -1687,6 +1705,8 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto data_offset    = buffer[0];
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
+	// START_INST_LOC: the SH register the CP writes the arguments' start instance into.
+	cp.GetShCtx().SetStartInstanceUserSgpr(GsUserSgprAt(buffer[2] & 0xffffu));
 
 	cp.DrawIndirect(data_offset, draw_initiator, indexed);
 
@@ -1700,6 +1720,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
 
 	const auto data_offset        = buffer[0];
+	cp.GetShCtx().SetStartInstanceUserSgpr(GsUserSgprAt(buffer[2] & 0xffffu));
 	const auto count_indirect     = (buffer[3] >> 30u) & 0x1u;
 	const auto max_count_or_count = buffer[4];
 	auto*      count_addr         = reinterpret_cast<const volatile uint32_t*>(
@@ -1722,6 +1743,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0033500);
+	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
 
 	uint32_t max_index_size = buffer[0];
 	uint32_t index_offset   = buffer[1];
@@ -1740,6 +1762,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012d00);
+	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
 
 	uint32_t index_count = buffer[0];
 	uint32_t flags       = buffer[1];

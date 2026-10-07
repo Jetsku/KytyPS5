@@ -29,6 +29,20 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Guest ranges whose view was mapped again with the view's own access while their data stayed:
+// the neighbours of a partly unmapped view (a Windows view cannot be split, so the whole view is
+// unmapped and its remaining parts mapped again) and views an unmap rolled back. The page
+// tracker's protection of their pages went with the old view; it is applied again once the
+// address-space lock is released (GuestAddressSpace::UnmapBacking), since the tracker protects
+// through that lock (chenxiao07 3f3825158 / e6dfd8e6b).
+thread_local std::vector<std::pair<uint64_t, uint64_t>> g_remapped_views;
+
+static void ResyncRemappedViews() {
+	for (const auto& [vaddr, size]: std::exchange(g_remapped_views, {})) {
+		ResyncGpuRangeProtection(vaddr, size);
+	}
+}
+
 // Per-thread copies of recent GuestBackingStore mapping records, never guest bytes. An entry
 // is usable only while the store's map generation still equals its tag: every m_maps mutation
 // bumps that generation under m_mutex first (InvalidateMapHints). The backing view stays
@@ -503,6 +517,7 @@ public:
 				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 					EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
 					                                     it->mode));
+					g_remapped_views.emplace_back(it->vaddr, it->size);
 				}
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = false;
@@ -521,6 +536,7 @@ public:
 			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
 				                                     it->mode));
+				g_remapped_views.emplace_back(it->vaddr, it->size);
 			}
 			return false;
 		}
@@ -594,15 +610,21 @@ public:
 				ok = SplitPlaceholder(vaddr, size) && ok;
 			}
 			if (left_size != 0) {
-				ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset,
-				                                 old.mode) &&
-				     ok;
+				const bool mapped =
+				    MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset, old.mode);
+				if (mapped) {
+					g_remapped_views.emplace_back(old.vaddr, left_size);
+				}
+				ok = mapped && ok;
 			}
 			if (right_size != 0) {
-				ok = MapExistingPlaceholderFixed(right_addr, right_size,
-				                                 old.backing_offset + (right_addr - old.vaddr),
-				                                 old.mode) &&
-				     ok;
+				const bool mapped =
+				    MapExistingPlaceholderFixed(right_addr, right_size,
+				                                old.backing_offset + (right_addr - old.vaddr), old.mode);
+				if (mapped) {
+					g_remapped_views.emplace_back(right_addr, right_size);
+				}
+				ok = mapped && ok;
 			}
 			if (ok) {
 				if (placeholder_preserved != nullptr) {
@@ -621,6 +643,7 @@ public:
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(
 			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			g_remapped_views.emplace_back(old.vaddr, old.size);
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
@@ -1117,20 +1140,20 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
-		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
-			return false;
+		bool unmapped = false;
+		{
+			std::lock_guard lock(m_mutex);
+			bool            placeholder_preserved = false;
+			if (ContainsMappedUnlocked(vaddr, size, MappingType::Backing) &&
+			    m_backing->Unmap(vaddr, size, &placeholder_preserved) && placeholder_preserved) {
+				EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
+				AddFreeUnlocked(vaddr, size);
+				unmapped = true;
+			}
 		}
-		bool placeholder_preserved = false;
-		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved)) {
-			return false;
-		}
-		if (!placeholder_preserved) {
-			return false;
-		}
-		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
-		AddFreeUnlocked(vaddr, size);
-		return true;
+		// Outside the lock: the page tracker protects through it (ProtectTransient).
+		ResyncRemappedViews();
+		return unmapped;
 	}
 
 	uint64_t ReserveAligned(uint64_t search_addr, uint64_t size, uint64_t alignment) {
@@ -1725,8 +1748,18 @@ private:
 		if (search_start >= search_end || size > search_end - search_start) {
 			return 0;
 		}
-		for (const auto& [base, range_size]: m_free) {
-			const auto candidate = AlignUp(std::max(base, search_start), alignment);
+		// The free ranges are sorted and disjoint: a range below the one holding search_start can
+		// hold no candidate, nor can one starting at or past search_end. Scanning every range from
+		// the bottom of the address space, again for each guest reservation a hint-less mapping skips
+		// (FindGuestFreeRange), held m_mutex long enough to stall ProtectTransient on the render
+		// thread (chenxiao07/KytyPS5 839a57d26: up to 15 ms per wait while streaming). Same result.
+		auto it = m_free.upper_bound(search_start);
+		if (it != m_free.begin()) {
+			--it;
+		}
+		for (; it != m_free.end() && it->first < search_end; ++it) {
+			const auto& [base, range_size] = *it;
+			const auto candidate           = AlignUp(std::max(base, search_start), alignment);
 			if (candidate < search_end && size <= search_end - candidate &&
 			    GuestFreeRangeContains(base, range_size, candidate, size)) {
 				return candidate;

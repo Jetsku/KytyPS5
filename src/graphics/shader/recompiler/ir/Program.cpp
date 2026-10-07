@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -224,6 +225,17 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+bool ValidationEnabled() {
+	static const bool enabled = [] {
+		if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+			return true;
+		}
+		const auto* value = std::getenv("KYTY_IR_VALIDATE");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

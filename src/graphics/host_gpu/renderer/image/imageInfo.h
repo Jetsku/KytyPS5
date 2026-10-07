@@ -503,6 +503,46 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return DecodePackedColorClear(format, packed, clear);
 }
 
+// KYTY_WIDE_FILL_CLEAR=1 (default off; ported from chenxiao07/KytyPS5 e6b7fb0b1): the clear of a
+// texel whose memory a uniform fill wrote with one 32-bit word. A 32-bit texel is the packed clear
+// above, a 64- or 128-bit one holds the word in each of its 32-bit parts. A NaN or infinity
+// pattern keeps the dispatch (a clear does not keep it).
+[[nodiscard]] inline bool DecodeFilledColorClear(vk::Format format, uint32_t word,
+                                                 vk::ClearColorValue& clear) {
+	const auto half = [](uint32_t bits) {
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		const uint32_t mantissa = bits & 0x3ffu;
+		const float    value    = std::ldexp(
+            static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
+            static_cast<int>(std::max(exponent, 1u)) - 25);
+		return (bits & 0x8000u) != 0 ? -value : value;
+	};
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u) {
+				return false;
+			}
+			clear.float32 = std::array {half(word), half(word >> 16u), half(word), half(word >> 16u)};
+			return true;
+		case vk::Format::eR16G16B16A16Uint:
+			clear.uint32 = std::array {word & 0xffffu, word >> 16u, word & 0xffffu, word >> 16u};
+			return true;
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if ((word & 0x7f800000u) == 0x7f800000u) {
+				return false;
+			}
+			clear.float32 = std::array {std::bit_cast<float>(word), std::bit_cast<float>(word),
+			                            std::bit_cast<float>(word), std::bit_cast<float>(word)};
+			return true;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+			clear.uint32 = std::array {word, word, word, word};
+			return true;
+		default: return DecodeColorDwordFill(format, word, clear);
+	}
+}
+
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {
 	const auto value = static_cast<uint8_t>(packed);
 	if (packed != static_cast<uint32_t>(value) * 0x01010101u) {

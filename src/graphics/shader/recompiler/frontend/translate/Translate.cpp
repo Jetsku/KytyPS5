@@ -1263,9 +1263,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			     entry_ir.IMul(index_bytes, u32(8))}));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
-			entry_ir.SetVectorReg(
-			    static_cast<IR::VectorReg>(8),
-			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
+			// The instance ID counts from 0; the start instance is the draw's.
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+			                      builtin(IR::StageInputKind::WorkgroupId, 1));
+			if (options.input_info.vertex != nullptr && options.input_info.vertex->start_instance_sgpr >= 0) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr), draw(2));
+			}
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
@@ -1358,8 +1362,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
+			// The instance ID counts from 0; the start instance is Vulkan's base instance.
+			const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			                      entry_ir.ISub(builtin(IR::StageInputKind::InstanceIndex), base_instance));
+			if (options.input_info.vertex != nullptr && options.input_info.vertex->start_instance_sgpr >= 0) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr), base_instance);
+			}
 		}
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
@@ -1396,7 +1406,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 		lds_write_pending = translator.LdsWritePending();
 	}
-	IR::ValidateProgram(result, false);
+	if (IR::ValidationEnabled()) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 

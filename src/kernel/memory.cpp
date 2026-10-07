@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -103,6 +104,27 @@ static void NoteGuestProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 	}
 	const auto bits = static_cast<uint32_t>(mode);
 	GetGpuResources().NoteGuestProtection(vaddr, size, (bits & 1u) != 0, (bits & 2u) != 0);
+}
+
+// KYTY_REMAP_TRACKER_PROTECTION=0 turns it off: after a range's host protection was replaced
+// behind the page tracker (the neighbours of a partly unmapped Windows view mapped again with the
+// view's access, views an unmap rolled back, a guest mprotect that allows writes), its watched
+// pages get the tracker's protection back. Without it CPU writes to still-tracked buffers there
+// stopped faulting and the GPU kept using stale bytes (chenxiao07 3f3825158 / e6dfd8e6b).
+static bool RemapTrackerProtectionEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_REMAP_TRACKER_PROTECTION");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
+static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !RemapTrackerProtectionEnabled()) {
+		return;
+	}
+	GetGpuResources().ResyncHostProtection(vaddr, size);
 }
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -4328,6 +4350,11 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+	// A writable guest protection replaced the tracker's on watched pages: their CPU writes
+	// would stop faulting.
+	if ((prot & PROT_CPU_WRITE) != 0) {
+		ResyncGpuRangeProtection(aligned_addr, aligned_len);
+	}
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 

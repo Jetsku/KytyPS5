@@ -6478,8 +6478,18 @@ public:
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
       // The widened window collects the two earlier writes and both
-      // fault-adjacent writes.
-      uint64_t expected_packing_offset = 4 * 64;
+      // fault-adjacent writes: four 64-byte aligned regions, or with
+      // KYTY_READBACK_MERGE_GAP_KB >= 8 (default 0) one region from the
+      // first write to the end of the last.
+      const auto *merge_gap_kb = std::getenv("KYTY_READBACK_MERGE_GAP_KB");
+      const bool merged_regions =
+          merge_gap_kb != nullptr && std::strtoull(merge_gap_kb, nullptr, 10) >= 8;
+      uint64_t expected_packing_offset =
+          merged_regions
+              ? ((ring_fault_second_offset + sizeof(ring_fault_second_value) -
+                  first_offset + 63) &
+                 ~uint64_t{63})
+              : 4 * 64;
       uint64_t expected_packing_alignment = 1;
       if (!download.IsCoherent()) {
         Require(name, "fault-ring atom policy",

@@ -1264,6 +1264,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	if (DrawPrep::SpeculativeFailed()) {
 		return params; // discarded; the serial path decides at commit
 	}
+	// The GS user SGPRs start at s8: one the shader receives may hold the draw's start instance.
+	const auto start_instance = regs.start_instance_user_sgpr;
+	const int32_t start_instance_sgpr =
+	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.gs_regs.rsrc2.user_sgpr
+	        ? 8 + start_instance
+	        : -1;
 	if (!merged) {
 		const auto static_info = [&](const ShaderMappedData& metadata) {
 			return ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
@@ -1287,13 +1293,15 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 			}
 			EXIT("failed to prepare vertex shader program\n");
 		}
-		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
+		info.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
+		info.start_instance_sgpr = start_instance_sgpr;
 		return params;
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
 	info                     = {};
 	info.logical_stage       = ShaderType::Mesh;
+	info.start_instance_sgpr = start_instance_sgpr;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());

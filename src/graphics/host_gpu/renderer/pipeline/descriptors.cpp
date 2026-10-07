@@ -2342,6 +2342,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
+		// KYTY_GUEST_STORAGE_REPEAT: these are the guest draw's or dispatch's own transitions.
+		const Image::GuestTransitScope guest_transitions;
 		// KYTY_DRAW_RUN continuation: every image is in the state the previous draw's transitions
 		// left it in (RenderExecutor::DrawRunImagesUnchanged), which the bindings' layouts record.
 		for (uint32_t i = 0; !keep_images && i < program.info.images.size(); i++) {

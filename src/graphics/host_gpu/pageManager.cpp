@@ -768,6 +768,32 @@ void PageManager::Reconcile(uint64_t vaddr, uint64_t size, bool now) {
 	}
 }
 
+void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		const auto first       = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+		const auto last        = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		chunk_begin            = chunk_end;
+		if (region == nullptr) {
+			continue; // never watched: the host protection is not the tracker's
+		}
+		{
+			SpinGuard host(region->host_lock);
+			SpinGuard counts(region->lock);
+			std::fill(region->applied.data() + first, region->applied.data() + last,
+			          Impl::Level::ReadWrite);
+		}
+		Impl::CountApplied(m_impl->ApplySpan(*region, region_base, first, last));
+	}
+}
+
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;

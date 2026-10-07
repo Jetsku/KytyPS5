@@ -194,6 +194,38 @@ void TestSharedWatcherCounts() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestResyncHostProtection() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(allocation);
+  const auto address = (allocation_base + region_size - 1) & ~(region_size - 1);
+  auto *memory = reinterpret_cast<uint8_t *>(address);
+
+  RegionBits read_mask;
+  read_mask.Set(2);
+  manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<true, true>(address, read_mask);
+  // A view mapped again with its own access: every page writable behind the tracker.
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size * 4, PAGE_READWRITE, &old_protection) != 0,
+        "VirtualProtect failed");
+  // A page the tracker does not watch keeps the protection it was given (a guest's read-only).
+  Check(VirtualProtect(memory + page_size * 3, page_size, PAGE_READONLY, &old_protection) != 0,
+        "VirtualProtect failed");
+  manager.ResyncHostProtection(address, page_size * 4);
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 3) == PAGE_READONLY,
+        "resync did not restore the watched pages' protection only");
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
+  Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
+        "unwatch after a resync did not restore access");
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestCrossRegionRange() {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -858,6 +890,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
+  TestResyncHostProtection();
   TestFatalPaths();
 
   // The synchronous paths again, checked by verify mode after every change.
@@ -870,6 +903,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestResyncHostProtection();
   const auto verify_after = PageManager::GetDeferStats();
   Check(verify_after.verify_checks > verify_before.verify_checks &&
             verify_after.verify_mismatches == verify_before.verify_mismatches,
