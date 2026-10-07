@@ -785,7 +785,7 @@ static void ReportReciprocalSqrtTraps(double seconds, uint64_t frames) {
 	previous           = current;
 	const auto& bench  = Libs::Graphics::FaultCost::StartupBenchmark();
 	const auto  rate   = seconds > 0 ? static_cast<double>(traps) / seconds : 0.0;
-	std::printf("Kyty AMD CPU patch: last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
+	std::printf("Kyty AMD instruction patch (Intel CPUs): last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
 	            frames != 0 ? static_cast<double>(traps) / static_cast<double>(frames) : 0.0, rate);
 	if (bench.valid) {
 		std::printf(", ~%.1f CPU cores busy trapping (%.2f us per trap round trip)",
@@ -1985,7 +1985,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                emulate_amd ? "AMD instruction patch for Intel CPUs" : "Guest red-zone protection",
 			                module_name));
 		}
 		if (emulate_amd) {
@@ -2046,7 +2046,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
 			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+			    fmt::format("AMD instruction patch for Intel CPUs: {} {} ({})\n", module_name, status, details));
 			if (totals.reciprocal_sqrt.found != 0) {
 				// The live log's VRSQRTPS trap rate: sites without a native trampoline still trap.
 				Libs::Graphics::FaultCost::SetPeriodicReporter(ReportReciprocalSqrtTraps);

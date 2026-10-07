@@ -117,7 +117,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --amd-cpu                            Intel CPU compatibility: emulate the PS5's AMD-only\n"
+	         "                                       instructions (EXTRQ/INSERTQ, AMD VRSQRTPS results).\n"
+	         "                                       Not needed on AMD CPUs.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");

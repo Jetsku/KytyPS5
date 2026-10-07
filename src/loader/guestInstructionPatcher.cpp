@@ -1092,7 +1092,7 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 		if (NeedsTrapRedZoneProtection(decoded)) {
 			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
 				// Leaving an unsupported instruction unchanged still traps with a live red zone.
-				EXIT("AMD CPU compatibility: cannot safely trap %s at %p (guest red zone is "
+				EXIT("AMD instruction patch for Intel CPUs: cannot safely trap %s at %p (guest red zone is "
 				     "live)\n",
 				     ZydisMnemonicGetString(decoded.instruction.mnemonic),
 				     reinterpret_cast<void*>(address));

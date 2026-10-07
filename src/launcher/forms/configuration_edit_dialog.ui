@@ -407,8 +407,8 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <layout class="QVBoxLayout" name="compatibilityLayout">
         <item>
          <widget class="QCheckBox" name="checkBox_amd_cpu">
-          <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-          <property name="text"><string>AMD CPU patch (experimental)</string></property>
+          <property name="toolTip"><string>For Intel CPUs: emulates the PS5's AMD-only instructions (EXTRQ/INSERTQ) and AMD's VRSQRTPS results. Not needed on AMD CPUs.</string></property>
+          <property name="text"><string>Intel CPU compatibility (AMD instruction patch)</string></property>
          </widget>
         </item>
         <item>
