@@ -122,6 +122,13 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// KYTY_CP_BINDING_BATCH_PREFETCH (default on, live): a CPU cache hint for the binding memo
+	// slot a later ObtainBuffer(vaddr, size, false, false) on the GPU thread looks up. A stage's
+	// bindings issue all hints first (RenderExecutor::RebindBuffers), so the slots' cache misses
+	// overlap instead of each lookup waiting for its own (the 32,768-slot table is 2 MiB; the
+	// slot load was 4.1% of the command processor at the Sky Garden start view). No state
+	// changes: every key, signature, epoch and guard check of the lookup still runs.
+	void PrefetchReadBinding(uint64_t vaddr, uint64_t size) const noexcept;
 	// A writable binding whose shader can only write `written` (sub-ranges of [vaddr, vaddr +
 	// size), e.g. from a write-range proof): the whole range is synchronized as for any binding,
 	// but only `written` becomes GPU-owned (dirty, protected, write-ticked).

@@ -71,6 +71,8 @@ uint64_t UploadRingSize() {
 
 Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
 Live::Switch g_binding_memo_prefetch("KYTY_CP_BINDING_MEMO_PREFETCH", Live::ParseDefaultOff);
+// KYTY_CP_BINDING_BATCH_PREFETCH (BufferCache::PrefetchReadBinding).
+Live::Switch g_binding_batch_prefetch("KYTY_CP_BINDING_BATCH_PREFETCH", Live::ParseDefaultOn);
 std::atomic<uint64_t> g_binding_hot_generation {1};
 void BindingHotChanged(int64_t, int64_t) {
 	// The live registry serializes callbacks. Saturation makes lookups clear the tier each time.
@@ -3069,6 +3071,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		return ObtainReadBinding(vaddr, size, id);
 	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
+}
+
+void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size) const noexcept {
+	if (m_binding_memo == nullptr || !g_binding_batch_prefetch.On()) {
+		return;
+	}
+	const auto* slot =
+	    &m_binding_memo[static_cast<size_t>(BindingMemoHash(vaddr, size) >> m_binding_memo_shift)];
+#if defined(__clang__) || defined(__GNUC__)
+	__builtin_prefetch(slot, 0, 3);
+#elif defined(_M_X64) || defined(_M_IX86)
+	_mm_prefetch(reinterpret_cast<const char*>(slot), _MM_HINT_T0);
+#endif
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint64_t size,

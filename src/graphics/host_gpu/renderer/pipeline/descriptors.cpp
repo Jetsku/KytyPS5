@@ -1828,6 +1828,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	bool  write_ranges_evaluated = false;
 	// All bindings' uploads share one barrier pair (KYTY_UPLOAD_BATCH).
 	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
+	// KYTY_CP_BINDING_BATCH_PREFETCH: the memo slots of every read binding first, so their cache
+	// misses overlap (a hint only; the lookups below are unchanged).
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& source   = prepared.buffer_sources[i];
+		const auto& resource = program.info.buffers[i];
+		if (source.address != 0 && source.size != 0 && !resource.written && !resource.formatted) {
+			m_context.GetBufferCache().PrefetchReadBinding(source.address, source.size);
+		}
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t   buffer_offset = 0;
 		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
