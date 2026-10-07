@@ -800,6 +800,12 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(audio_diag_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioDiagTests.cpp")
+target_include_directories(audio_diag_tests PRIVATE ${inc_headers})
+
+add_executable(audio_mix_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioMixTests.cpp")
+target_include_directories(audio_mix_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
 target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
@@ -1128,6 +1134,8 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME audio_diag COMMAND $<TARGET_FILE:audio_diag_tests>)
+	add_test(NAME audio_mix COMMAND $<TARGET_FILE:audio_mix_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME audio_propagation COMMAND $<TARGET_FILE:audio_propagation_tests>)
@@ -2102,6 +2110,8 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
+		audio_diag_tests
+		audio_mix_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests

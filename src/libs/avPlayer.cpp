@@ -4,6 +4,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
+#include "libs/audioDiag.h"
 #include "libs/libs.h"
 
 #include <algorithm>
@@ -470,6 +471,7 @@ public:
 		m_data =
 		    static_cast<uint8_t*>(texture ? mem.allocate_texture(mem.object_pointer, align, size)
 		                                  : mem.allocate(mem.object_pointer, align, size));
+		Report("allocated");
 	}
 	~GuestBuffer() { Reset(); }
 	GuestBuffer(const GuestBuffer&)            = delete;
@@ -495,8 +497,19 @@ private:
 		r.m_data  = nullptr;
 		r.m_size  = 0;
 	}
+	// The game's allocator hands these out from its own heap, so a crash on a freed heap object
+	// can be matched against them. Bounded: looping videos would repeat them forever.
+	void Report(const char* what) const {
+		static std::atomic<int> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 48) {
+			Diag::Print("AvPlayer %s %s buffer 0x%016" PRIx64 "..0x%016" PRIx64 " (0x%x bytes)",
+			            what, m_texture ? "video" : "audio", reinterpret_cast<uint64_t>(m_data),
+			            reinterpret_cast<uint64_t>(m_data) + m_size, m_size);
+		}
+	}
 	void Reset() {
 		if (m_data != nullptr) {
+			Report("freeing");
 			if (m_texture) {
 				m_mem.deallocate_texture(m_mem.object_pointer, m_data);
 			} else {
@@ -2070,6 +2083,7 @@ int KYTY_SYSV_ABI AvPlayerClose(AvPlayerInternal* h) {
 	if (h == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
+	Diag::Print("sceAvPlayerClose(0x%016" PRIx64 ")", reinterpret_cast<uint64_t>(h));
 	h->source.reset();
 	delete h;
 	return 0;
