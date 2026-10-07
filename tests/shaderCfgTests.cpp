@@ -10978,6 +10978,85 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// KYTY_VS_OUTPUT_GUARD / KYTY_MESH_OUTPUT_GUARD (SpirvEmitter.h, HostGeometryGuard): with the guard
+// a vertex shader stores a zero position and a culling clip-guard distance before the guest code,
+// and a mesh shader clamps its counts and culls primitives naming vertices past the count. Off, the
+// SPIR-V is unchanged.
+size_t CountSpirvOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
+  size_t count = 0;
+  for (size_t i = 5; i < binary.size() && (binary[i] >> 16u) != 0u; i += binary[i] >> 16u) {
+    count += (binary[i] & 0xffffu) == opcode ? 1u : 0u;
+  }
+  return count;
+}
+
+void TestGeometryOutputGuard() {
+  namespace Spirv = ShaderRecompiler::Spirv;
+  const auto saved = Spirv::GetHostGeometryGuard();
+  constexpr uint32_t OpStore = 62u, OpUGreaterThanEqual = 174u, OpConstantNull = 46u;
+
+  const uint32_t vertex_shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
+      EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7), // PARAM0
+      0xbf810000u,
+  };
+  const auto compile_vertex = [&](bool guard) {
+    Spirv::SetHostGeometryGuard({.vertex_outputs = guard, .mesh_outputs = false});
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    auto result  = RecompileForTest(vertex_shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return result.spirv;
+  };
+  const auto vertex_off = compile_vertex(false);
+  const auto vertex_on  = compile_vertex(true);
+  Check(CountSpirvOpcode(vertex_on, OpStore) == CountSpirvOpcode(vertex_off, OpStore) + 2u,
+        "vertex output guard: expected a position store and a clip-guard store before the guest code");
+  Check(CountSpirvOpcode(vertex_off, OpConstantNull) <= CountSpirvOpcode(vertex_on, OpConstantNull),
+        "vertex output guard: the zero position constant is missing");
+  Check(compile_vertex(false) == vertex_off, "vertex output guard off: SPIR-V must not change");
+
+  const uint32_t mesh_shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u, // three vertices, one primitive
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // s_sendmsg MSG_GS_ALLOC_REQ
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0), // POS0
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0), // PARAM0
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),        // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 64;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 21;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 64;
+  mesh.max_primitives = 64;
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto compile_mesh = [&](bool guard) {
+      Spirv::SetHostGeometryGuard({.vertex_outputs = false, .mesh_outputs = guard});
+      ShaderRecompiler::CompileOptions options{};
+      options.stage = ShaderType::Mesh;
+      options.input_info.vertex = &input;
+      const auto result = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                           ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+      CheckSpirvBinaryValidates(result.spirv);
+      return result.spirv;
+    };
+    const auto mesh_off = compile_mesh(false);
+    const auto mesh_on  = compile_mesh(true);
+    const uint32_t lanes = subgroup_size == 32u ? 2u : 1u;
+    Check(CountSpirvOpcode(mesh_on, OpUGreaterThanEqual) ==
+              CountSpirvOpcode(mesh_off, OpUGreaterThanEqual) + 3u * lanes,
+          "mesh output guard: every lane must range-check its three primitive indices");
+    Check(CountSpirvOpcode(mesh_on, OpStore) >= CountSpirvOpcode(mesh_off, OpStore) + 2u * lanes,
+          "mesh output guard: lane position and primitive defaults are missing");
+    Check(compile_mesh(false) == mesh_off, "mesh output guard off: SPIR-V must not change");
+  }
+  Spirv::SetHostGeometryGuard(saved);
+  std::printf("shader_cfg geometry output guard: ok\n");
+}
+
 void TestNewShaderRecompilerExpVertexOutputs() {
   const uint32_t shader[] = {
       EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
@@ -14887,6 +14966,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-only") == 0) {
     TestMeshExportStorage();
     TestMeshIndirectParams();
+    TestGeometryOutputGuard();
     std::printf("shader_cfg --mesh-indirect-only: ok\n");
     return 0;
   }
@@ -15035,6 +15115,7 @@ int main(int argc, char **argv) {
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMeshIndirectParams();
+  TestGeometryOutputGuard();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

@@ -28,6 +28,8 @@ std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
+std::atomic_bool     g_guard_vertex_outputs {false};
+std::atomic_bool     g_guard_mesh_outputs {false};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -412,6 +414,16 @@ HostImageFeatures GetHostImageFeatures() {
 	return {.min_lod             = g_image_min_lod.load(std::memory_order_relaxed),
 	        .compute_derivatives = static_cast<HostComputeDerivatives>(
 	            g_compute_derivatives.load(std::memory_order_relaxed))};
+}
+
+void SetHostGeometryGuard(const HostGeometryGuard& guard) {
+	g_guard_vertex_outputs.store(guard.vertex_outputs, std::memory_order_relaxed);
+	g_guard_mesh_outputs.store(guard.mesh_outputs, std::memory_order_relaxed);
+}
+
+HostGeometryGuard GetHostGeometryGuard() {
+	return {.vertex_outputs = g_guard_vertex_outputs.load(std::memory_order_relaxed),
+	        .mesh_outputs   = g_guard_mesh_outputs.load(std::memory_order_relaxed)};
 }
 
 void SetHostShaderClock(const HostShaderClock& clock) {

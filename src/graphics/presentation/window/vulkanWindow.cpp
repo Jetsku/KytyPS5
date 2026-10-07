@@ -458,6 +458,175 @@ static void ConfigureShaderFloatControls(const vk::PhysicalDeviceVulkan12Propert
 	     controls.denorm_preserve_f64 ? "true" : "false", enabled ? "" : " (disabled by env)");
 }
 
+static std::string FormatBytes(uint64_t bytes) {
+	if (bytes >= (1ull << 30u)) {
+		return fmt::format("{:.1f} GiB", static_cast<double>(bytes) / static_cast<double>(1ull << 30u));
+	}
+	return fmt::format("{} MiB", bytes >> 20u);
+}
+
+// "Kyty GPU capabilities:" lines on the console, so a player's log answers device questions
+// (driver, architecture, memory, mesh limits, float controls, subgroups, features) without tests.
+// Also resolves KYTY_VS_OUTPUT_GUARD / KYTY_MESH_OUTPUT_GUARD (auto: on for NVIDIA Turing only).
+static void PrintGpuCapabilities(GraphicContext& graphics, const vk::PhysicalDeviceProperties& props,
+                                 const vk::PhysicalDeviceVulkan11Properties&            p11,
+                                 const vk::PhysicalDeviceVulkan12Properties&            p12,
+                                 const vk::PhysicalDeviceSubgroupSizeControlProperties& subgroup,
+                                 const vk::PhysicalDeviceFeatures&                      f10,
+                                 const vk::PhysicalDeviceVulkan12Features&              f12,
+                                 const vk::PhysicalDeviceVulkan13Features&              f13,
+                                 const vk::PhysicalDeviceRobustness2FeaturesEXT*        robustness2,
+                                 bool workgroup_explicit_layout) {
+	namespace Compat        = DeviceCompat;
+	const auto architecture = Compat::GuessNvidiaArchitecture(props.vendorID, props.deviceID);
+	const auto driver       = props.driverVersion;
+	const std::string driver_text =
+	    props.vendorID == Compat::NvidiaVendorId
+	        ? fmt::format("NVIDIA {}.{:02}", (driver >> 22u) & 0x3ffu, (driver >> 14u) & 0xffu)
+	        : fmt::format("{}.{}.{} (0x{:08x})", VK_VERSION_MAJOR(driver), VK_VERSION_MINOR(driver),
+	                      VK_VERSION_PATCH(driver), driver);
+	std::printf("Kyty GPU capabilities: %s, vendor 0x%04x device 0x%04x = %s; driver %s (%s %s); "
+	            "Vulkan %u.%u.%u\n",
+	            props.deviceName.data(), props.vendorID, props.deviceID,
+	            Compat::NvidiaArchitectureName(architecture), driver_text.c_str(),
+	            p12.driverName.data(), p12.driverInfo.data(), VK_VERSION_MAJOR(props.apiVersion),
+	            VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
+
+	// Memory: VRAM, the host-visible part of it (Resizable BAR), and the driver budget.
+	const auto& memory = graphics.physical_device_memory_properties;
+	uint64_t    vram   = 0;
+	uint64_t    bar    = 0;
+	uint64_t    host   = 0;
+	uint32_t    vram_heap = 0;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		const auto size = memory.memoryHeaps[heap].size;
+		if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			if (size > vram) {
+				vram      = size;
+				vram_heap = heap;
+			}
+		} else {
+			host = std::max(host, size);
+		}
+	}
+	for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+		const auto flags = memory.memoryTypes[type].propertyFlags;
+		if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+		    (flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+			bar = std::max(bar, memory.memoryHeaps[memory.memoryTypes[type].heapIndex].size);
+		}
+	}
+	std::string budget = "no VK_EXT_memory_budget";
+	if (graphics.memory_budget_ext_enabled) {
+		vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget_props {};
+		vk::PhysicalDeviceMemoryProperties2         memory2 {};
+		memory2.pNext = &budget_props;
+		graphics.physical_device.getMemoryProperties2(&memory2);
+		budget = fmt::format("budget {} (already in use {})",
+		                     FormatBytes(budget_props.heapBudget[vram_heap]),
+		                     FormatBytes(budget_props.heapUsage[vram_heap]));
+	}
+	std::printf("Kyty GPU capabilities: VRAM %s, %s; device-local host-visible heap %s (Resizable "
+	            "BAR %s); system heap %s\n",
+	            FormatBytes(vram).c_str(), budget.c_str(), FormatBytes(bar).c_str(),
+	            bar >= (2ull << 30u) ? "on" : "off", FormatBytes(host).c_str());
+
+	if (graphics.mesh_shader_enabled) {
+		const auto& m = graphics.mesh_shader_properties;
+		std::printf("Kyty GPU capabilities: mesh shaders: invocations %u (preferred %u), group size "
+		            "%u, output vertices %u primitives %u components %u, output memory %u, "
+		            "payload+output %u, shared %u; granularity vertex %u primitive %u; prefers "
+		            "local-invocation output vertex %u primitive %u, compact vertex %u primitive %u\n",
+		            m.maxMeshWorkGroupInvocations, m.maxPreferredMeshWorkGroupInvocations,
+		            m.maxMeshWorkGroupSize[0], m.maxMeshOutputVertices, m.maxMeshOutputPrimitives,
+		            m.maxMeshOutputComponents, m.maxMeshOutputMemorySize,
+		            m.maxMeshPayloadAndOutputMemorySize, m.maxMeshSharedMemorySize,
+		            m.meshOutputPerVertexGranularity, m.meshOutputPerPrimitiveGranularity,
+		            static_cast<uint32_t>(m.prefersLocalInvocationVertexOutput),
+		            static_cast<uint32_t>(m.prefersLocalInvocationPrimitiveOutput),
+		            static_cast<uint32_t>(m.prefersCompactVertexOutput),
+		            static_cast<uint32_t>(m.prefersCompactPrimitiveOutput));
+	} else {
+		std::printf("Kyty GPU capabilities: mesh shaders: unavailable\n");
+	}
+
+	const auto independence = [](vk::ShaderFloatControlsIndependence value) {
+		return value == vk::ShaderFloatControlsIndependence::eAll         ? "all"
+		       : value == vk::ShaderFloatControlsIndependence::e32BitOnly ? "32-bit only"
+		                                                                   : "none";
+	};
+	const auto bits3 = [](vk::Bool32 a, vk::Bool32 b, vk::Bool32 c) {
+		return fmt::format("{}{}{}", a ? 1 : 0, b ? 1 : 0, c ? 1 : 0);
+	};
+	const auto declared = ShaderRecompiler::Spirv::GetHostFloatControls();
+	std::printf("Kyty GPU capabilities: float controls (f16 f32 f64 bits): denorm independence %s, "
+	            "rounding independence %s; denorm preserve %s, flush %s; RTE %s, RTZ %s; signed "
+	            "zero/inf/nan %s; Kyty declares ftz32 %u preserve16 %u preserve64 %u\n",
+	            independence(p12.denormBehaviorIndependence),
+	            independence(p12.roundingModeIndependence),
+	            bits3(p12.shaderDenormPreserveFloat16, p12.shaderDenormPreserveFloat32,
+	                  p12.shaderDenormPreserveFloat64)
+	                .c_str(),
+	            bits3(p12.shaderDenormFlushToZeroFloat16, p12.shaderDenormFlushToZeroFloat32,
+	                  p12.shaderDenormFlushToZeroFloat64)
+	                .c_str(),
+	            bits3(p12.shaderRoundingModeRTEFloat16, p12.shaderRoundingModeRTEFloat32,
+	                  p12.shaderRoundingModeRTEFloat64)
+	                .c_str(),
+	            bits3(p12.shaderRoundingModeRTZFloat16, p12.shaderRoundingModeRTZFloat32,
+	                  p12.shaderRoundingModeRTZFloat64)
+	                .c_str(),
+	            bits3(p12.shaderSignedZeroInfNanPreserveFloat16,
+	                  p12.shaderSignedZeroInfNanPreserveFloat32,
+	                  p12.shaderSignedZeroInfNanPreserveFloat64)
+	                .c_str(),
+	            declared.denorm_flush_f32 ? 1u : 0u, declared.denorm_preserve_f16 ? 1u : 0u,
+	            declared.denorm_preserve_f64 ? 1u : 0u);
+
+	std::printf("Kyty GPU capabilities: subgroups: size %u (min %u max %u), required-size stages "
+	            "0x%x, size control %s; supported stages 0x%x operations 0x%x, quad ops in all "
+	            "stages %u\n",
+	            p11.subgroupSize, subgroup.minSubgroupSize, subgroup.maxSubgroupSize,
+	            static_cast<vk::ShaderStageFlags::MaskType>(subgroup.requiredSubgroupSizeStages),
+	            f13.subgroupSizeControl ? "yes" : "no",
+	            static_cast<vk::ShaderStageFlags::MaskType>(p11.subgroupSupportedStages),
+	            static_cast<vk::SubgroupFeatureFlags::MaskType>(p11.subgroupSupportedOperations),
+	            static_cast<uint32_t>(p11.subgroupQuadOperationsInAllStages));
+
+	std::printf("Kyty GPU capabilities: features: int16 %u int64 %u float64 %u float16 %u int8 %u "
+	            "storage8 %u BDA %u memory model %u demote %u maintenance4 %u robustBufferAccess %u "
+	            "robustBufferAccess2 %u robustImageAccess2 %u nullDescriptor %u workgroup layout %u "
+	            "buffer int64 atomics %u\n",
+	            static_cast<uint32_t>(f10.shaderInt16), static_cast<uint32_t>(f10.shaderInt64),
+	            static_cast<uint32_t>(f10.shaderFloat64), static_cast<uint32_t>(f12.shaderFloat16),
+	            static_cast<uint32_t>(f12.shaderInt8),
+	            static_cast<uint32_t>(f12.storageBuffer8BitAccess),
+	            static_cast<uint32_t>(f12.bufferDeviceAddress),
+	            static_cast<uint32_t>(f12.vulkanMemoryModel),
+	            static_cast<uint32_t>(f13.shaderDemoteToHelperInvocation),
+	            static_cast<uint32_t>(f13.maintenance4), static_cast<uint32_t>(f10.robustBufferAccess),
+	            robustness2 != nullptr ? static_cast<uint32_t>(robustness2->robustBufferAccess2) : 0u,
+	            robustness2 != nullptr ? static_cast<uint32_t>(robustness2->robustImageAccess2) : 0u,
+	            robustness2 != nullptr ? static_cast<uint32_t>(robustness2->nullDescriptor) : 0u,
+	            workgroup_explicit_layout ? 1u : 0u,
+	            static_cast<uint32_t>(f12.shaderBufferInt64Atomics));
+
+	// Undefined geometry outputs (SpirvEmitter.h, HostGeometryGuard).
+	const auto vertex_mode = Compat::ParseQuirkMode(std::getenv("KYTY_VS_OUTPUT_GUARD"));
+	const auto mesh_mode   = Compat::ParseQuirkMode(std::getenv("KYTY_MESH_OUTPUT_GUARD"));
+	const bool automatic   = Compat::GeometryOutputGuardAutomatic(architecture);
+	const ShaderRecompiler::Spirv::HostGeometryGuard guard {
+	    .vertex_outputs = Compat::ResolveQuirk(vertex_mode, automatic),
+	    .mesh_outputs   = Compat::ResolveQuirk(mesh_mode, automatic),
+	};
+	ShaderRecompiler::Spirv::SetHostGeometryGuard(guard);
+	std::printf("Kyty GPU capabilities: geometry output guard: vertex %s (KYTY_VS_OUTPUT_GUARD=%s), "
+	            "mesh %s (KYTY_MESH_OUTPUT_GUARD=%s); auto is %s on this GPU\n",
+	            guard.vertex_outputs ? "on" : "off", Compat::QuirkModeName(vertex_mode),
+	            guard.mesh_outputs ? "on" : "off", Compat::QuirkModeName(mesh_mode),
+	            automatic ? "on (NVIDIA Turing)" : "off");
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -888,6 +1057,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     graphics.mesh_shader_properties.maxMeshOutputPrimitives,
 		     graphics.mesh_shader_properties.maxMeshSharedMemorySize);
 	}
+	PrintGpuCapabilities(graphics, properties2.properties, properties11, properties12,
+	                     subgroup_size_control, supported_features2.features, supported_features12,
+	                     supported_features13, robustness2_ext_enabled ? &supported_robustness2 : nullptr,
+	                     workgroup_layout_extension &&
+	                         supported_workgroup_layout.workgroupMemoryExplicitLayout == VK_TRUE);
 	// VulkanFindPhysicalDevice already checked the required creation features. These
 	// requirements are specific to this creation path and are not part of device selection.
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);

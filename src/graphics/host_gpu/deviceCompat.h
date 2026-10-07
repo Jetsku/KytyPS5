@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_DEVICECOMPAT_H_
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 #ifndef VK_NO_PROTOTYPES
@@ -147,6 +148,100 @@ OptionalImageCreateFallbacks(VkImageUsageFlags usage, VkImageCreateFlags flags,
 		result.list[result.count++] = {usage, flags};
 	}
 	return result;
+}
+
+// NVIDIA architecture from the PCI device ID. The Vulkan feature, limit and format reports of
+// Turing (RTX 20, GTX 16) and Ampere (RTX 30) are identical on the same driver (vulkan.gpuinfo.org
+// 51568 vs 52005, driver 616), so the ID is the only thing that tells them apart.
+enum class NvidiaArchitecture : uint8_t {
+	NotNvidia,
+	Unknown,
+	PascalOrOlder, // Pascal, Volta and older (below 0x1E00)
+	Turing,        // TU102/TU104/TU106/TU117 0x1E00-0x1FFF, TU116 0x2180-0x21FF
+	Ampere,        // GA100 0x20B0-0x20FF, GA10x 0x2200-0x25FF (Hopper 0x2321-0x233F included)
+	Ada,           // AD10x 0x2680-0x28FF
+	Blackwell,     // GB20x 0x2900-0x2FFF
+};
+
+constexpr uint32_t NvidiaVendorId = 0x10deu;
+
+constexpr NvidiaArchitecture GuessNvidiaArchitecture(uint32_t vendor_id, uint32_t device_id) {
+	if (vendor_id != NvidiaVendorId) {
+		return NvidiaArchitecture::NotNvidia;
+	}
+	if (device_id < 0x1e00u) {
+		return NvidiaArchitecture::PascalOrOlder;
+	}
+	if (device_id <= 0x1fffu || (device_id >= 0x2180u && device_id <= 0x21ffu)) {
+		return NvidiaArchitecture::Turing;
+	}
+	if ((device_id >= 0x20b0u && device_id <= 0x20ffu) ||
+	    (device_id >= 0x2200u && device_id <= 0x25ffu)) {
+		return NvidiaArchitecture::Ampere;
+	}
+	if (device_id >= 0x2680u && device_id <= 0x28ffu) {
+		return NvidiaArchitecture::Ada;
+	}
+	if (device_id >= 0x2900u && device_id <= 0x2fffu) {
+		return NvidiaArchitecture::Blackwell;
+	}
+	return NvidiaArchitecture::Unknown;
+}
+
+constexpr const char* NvidiaArchitectureName(NvidiaArchitecture architecture) {
+	switch (architecture) {
+		case NvidiaArchitecture::NotNvidia: return "not NVIDIA";
+		case NvidiaArchitecture::Unknown: return "NVIDIA (unknown architecture)";
+		case NvidiaArchitecture::PascalOrOlder: return "NVIDIA Pascal/Volta or older";
+		case NvidiaArchitecture::Turing: return "NVIDIA Turing (RTX 20 / GTX 16)";
+		case NvidiaArchitecture::Ampere: return "NVIDIA Ampere (RTX 30)";
+		case NvidiaArchitecture::Ada: return "NVIDIA Ada (RTX 40)";
+		case NvidiaArchitecture::Blackwell: return "NVIDIA Blackwell (RTX 50)";
+	}
+	return "?";
+}
+
+// A device workaround switch: unset, empty or "auto" lets the device decide, "1"/"on"/"true"
+// forces it on, "0"/"off"/"false" forces it off. Anything else counts as auto.
+enum class QuirkMode : uint8_t { Auto, On, Off };
+
+inline QuirkMode ParseQuirkMode(const char* value) {
+	if (value == nullptr || value[0] == '\0') {
+		return QuirkMode::Auto;
+	}
+	const auto equals = [&](const char* text) {
+		size_t i = 0;
+		for (; text[i] != '\0' && value[i] != '\0'; i++) {
+			const char c = value[i] >= 'A' && value[i] <= 'Z' ? static_cast<char>(value[i] + 32)
+			                                                  : value[i];
+			if (c != text[i]) {
+				return false;
+			}
+		}
+		return text[i] == '\0' && value[i] == '\0';
+	};
+	if (equals("1") || equals("on") || equals("true")) {
+		return QuirkMode::On;
+	}
+	if (equals("0") || equals("off") || equals("false")) {
+		return QuirkMode::Off;
+	}
+	return QuirkMode::Auto;
+}
+
+constexpr bool ResolveQuirk(QuirkMode mode, bool automatic) {
+	return mode == QuirkMode::On || (mode == QuirkMode::Auto && automatic);
+}
+
+constexpr const char* QuirkModeName(QuirkMode mode) {
+	return mode == QuirkMode::On ? "on" : mode == QuirkMode::Off ? "off" : "auto";
+}
+
+// Defined values for geometry outputs a guest shader may leave unwritten (KYTY_VS_OUTPUT_GUARD,
+// KYTY_MESH_OUTPUT_GUARD): automatic on NVIDIA Turing only, the architecture with the vertex
+// explosions. Ampere and newer keep their code unless it is forced on.
+constexpr bool GeometryOutputGuardAutomatic(NvidiaArchitecture architecture) {
+	return architecture == NvidiaArchitecture::Turing;
 }
 
 } // namespace Libs::Graphics::DeviceCompat

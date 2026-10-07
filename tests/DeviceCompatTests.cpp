@@ -186,6 +186,54 @@ void TestDepthClamp() {
 	Expect(DepthClampEnable(false, false), "no extension, Z clipping off: clamp");
 }
 
+void TestNvidiaArchitecture() {
+	// Device IDs as vulkan.gpuinfo.org reports them.
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1e87) == NvidiaArchitecture::Turing, "RTX 2080 is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1e81) == NvidiaArchitecture::Turing,
+	       "RTX 2080 SUPER is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1e07) == NvidiaArchitecture::Turing, "RTX 2080 Ti is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1f08) == NvidiaArchitecture::Turing, "RTX 2060 is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2182) == NvidiaArchitecture::Turing, "GTX 1660 Ti is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1f82) == NvidiaArchitecture::Turing, "GTX 1650 is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2204) == NvidiaArchitecture::Ampere, "RTX 3090 is Ampere");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2504) == NvidiaArchitecture::Ampere, "RTX 3060 is Ampere");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x20b0) == NvidiaArchitecture::Ampere, "A100 is Ampere");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2684) == NvidiaArchitecture::Ada, "RTX 4090 is Ada");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2b85) == NvidiaArchitecture::Blackwell,
+	       "RTX 5090 is Blackwell");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1b80) == NvidiaArchitecture::PascalOrOlder,
+	       "GTX 1080 is Pascal");
+	Expect(GuessNvidiaArchitecture(0x1002, 0x1e87) == NvidiaArchitecture::NotNvidia,
+	       "an AMD device ID in the Turing range is not NVIDIA");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x3100) == NvidiaArchitecture::Unknown,
+	       "a future ID is unknown");
+	// Only Turing gets the geometry output guard automatically.
+	Expect(GeometryOutputGuardAutomatic(NvidiaArchitecture::Turing), "guard: auto on Turing");
+	Expect(!GeometryOutputGuardAutomatic(NvidiaArchitecture::Ampere) &&
+	           !GeometryOutputGuardAutomatic(NvidiaArchitecture::Ada) &&
+	           !GeometryOutputGuardAutomatic(NvidiaArchitecture::Blackwell) &&
+	           !GeometryOutputGuardAutomatic(NvidiaArchitecture::NotNvidia),
+	       "guard: auto off elsewhere");
+}
+
+void TestQuirkMode() {
+	Expect(ParseQuirkMode(nullptr) == QuirkMode::Auto && ParseQuirkMode("") == QuirkMode::Auto &&
+	           ParseQuirkMode("auto") == QuirkMode::Auto && ParseQuirkMode("maybe") == QuirkMode::Auto,
+	       "quirk mode: unset, empty, auto and unknown text are auto");
+	Expect(ParseQuirkMode("1") == QuirkMode::On && ParseQuirkMode("on") == QuirkMode::On &&
+	           ParseQuirkMode("ON") == QuirkMode::On && ParseQuirkMode("true") == QuirkMode::On,
+	       "quirk mode: 1/on/true force on");
+	Expect(ParseQuirkMode("0") == QuirkMode::Off && ParseQuirkMode("off") == QuirkMode::Off &&
+	           ParseQuirkMode("False") == QuirkMode::Off,
+	       "quirk mode: 0/off/false force off");
+	Expect(ParseQuirkMode("onx") == QuirkMode::Auto && ParseQuirkMode("o") == QuirkMode::Auto,
+	       "quirk mode: prefixes are not matches");
+	Expect(ResolveQuirk(QuirkMode::Auto, true) && !ResolveQuirk(QuirkMode::Auto, false),
+	       "quirk: auto follows the device");
+	Expect(ResolveQuirk(QuirkMode::On, false) && !ResolveQuirk(QuirkMode::Off, true),
+	       "quirk: on/off override the device");
+}
+
 } // namespace
 
 int main() {
@@ -193,6 +241,8 @@ int main() {
 	TestGraphicsSubgroupSize();
 	TestImageCreateFallbacks();
 	TestDepthClamp();
+	TestNvidiaArchitecture();
+	TestQuirkMode();
 	if (g_failures != 0) {
 		std::printf("DeviceCompatTests: failed: %d check(s)\n", g_failures);
 		return 1;

@@ -111,6 +111,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	const auto image_features = Spirv::GetHostImageFeatures();
 	b.U8(image_features.min_lod ? 1u : 0u);
 	b.U8(static_cast<uint8_t>(image_features.compute_derivatives));
+	const auto geometry_guard = Spirv::GetHostGeometryGuard();
+	b.U8(geometry_guard.vertex_outputs ? 1u : 0u);
+	b.U8(geometry_guard.mesh_outputs ? 1u : 0u);
 	const auto shader_clock = Spirv::GetHostShaderClock();
 	b.U8(static_cast<uint8_t>(shader_clock.scope));
 	b.U32(static_cast<uint32_t>(shader_clock.shift));

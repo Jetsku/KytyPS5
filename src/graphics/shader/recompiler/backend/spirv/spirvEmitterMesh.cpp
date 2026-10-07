@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -35,7 +36,63 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 	}
 }
 
+uint32_t SelectU32(EmitterState& state, uint32_t condition, uint32_t if_true, uint32_t if_false) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), value, condition, if_true, if_false);
+	return value;
+}
+
+uint32_t MinU32(EmitterState& state, uint32_t value, uint32_t limit) {
+	const auto less = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), less, value, limit);
+	return SelectU32(state, less, value, limit);
+}
+
 } // namespace
+
+void EmitGeometryOutputDefaults(EmitterState& state) {
+	const auto guard = GetHostGeometryGuard();
+	const auto zero  = [&] { return state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4)); };
+	if (guard.vertex_outputs &&
+	    (state.program.stage == ShaderType::Vertex ||
+	     state.program.stage == ShaderType::TessellationEvaluation) &&
+	    state.per_vertex_variable != 0) {
+		// Runs before the guest code: an export overwrites both stores.
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32Vector(state, 4)),
+		    pointer, state.per_vertex_variable, ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpStore, pointer, zero());
+		if (state.invalid_position_clip_distance != UINT32_MAX && state.clip_distance_variable != 0) {
+			const auto distance = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
+			    distance, state.clip_distance_variable,
+			    ConstantU32(state, state.invalid_position_clip_distance));
+			state.builder.AddFunction(spv::OpStore, distance, ConstantF32Value(state, -1.0f));
+		}
+	}
+	if (guard.mesh_outputs && state.program.stage == ShaderType::Mesh) {
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			for (const auto& output: state.outputs) {
+				if (output.kind != IR::StageOutputKind::Position || output.mesh_data_variable == 0) {
+					continue;
+				}
+				state.builder.AddFunction(
+				    spv::OpStore,
+				    MeshElement(state, output.mesh_data_variable, spv::StorageClassPrivate,
+				                TypeF32Vector(state, 4), ConstantU32(state, half)),
+				    zero());
+			}
+			// The null-primitive bit: a lane without a primitive export culls its primitive.
+			state.builder.AddFunction(spv::OpStore,
+			                          MeshElement(state, state.mesh_primitive_data,
+			                                      spv::StorageClassPrivate, TypeU32(state),
+			                                      ConstantU32(state, half)),
+			                          ConstantU32(state, 0x80000000u));
+		}
+	}
+}
 
 void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                        uint32_t cull_distance_count) {
@@ -143,10 +200,21 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
-	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 0));
-	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 1));
+	auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                           TypeU32(state), ConstantU32(state, 0));
+	auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                           TypeU32(state), ConstantU32(state, 1));
+	const bool guard = GetHostGeometryGuard().mesh_outputs;
+	if (guard) {
+		// Counts above the declared maximums, and primitives without vertices, are undefined.
+		const auto& mesh = state.input_info.vertex->mesh;
+		vertices         = MinU32(state, vertices, ConstantU32(state, mesh.max_vertices));
+		primitives       = MinU32(state, primitives, ConstantU32(state, mesh.max_primitives));
+		const auto none  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), none, vertices,
+		                          ConstantU32(state, 0));
+		primitives = SelectU32(state, none, ConstantU32(state, 0), primitives);
+	}
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -189,6 +257,28 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
 				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
 			}
+			uint32_t out_of_range = 0;
+			if (guard) {
+				// An index past the vertex count is undefined even for a culled primitive: cull it
+				// and point it at vertex 0, which exists whenever a primitive does.
+				for (uint32_t component = 0; component < 3; component++) {
+					const auto outside = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), outside,
+					                          vertex[component], vertices);
+					if (out_of_range == 0) {
+						out_of_range = outside;
+					} else {
+						const auto either = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), either,
+						                          out_of_range, outside);
+						out_of_range = either;
+					}
+				}
+				for (uint32_t component = 0; component < 3; component++) {
+					vertex[component] =
+					    SelectU32(state, out_of_range, ConstantU32(state, 0), vertex[component]);
+				}
+			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
 			                          vertex[0], vertex[1], vertex[2]);
@@ -198,9 +288,15 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			state.builder.AddFunction(spv::OpStore, triangle_pointer, triangle);
 			const auto null_bit =
 			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
-			const auto culled = state.builder.AllocateId();
+			auto culled = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), culled, null_bit,
 			                          ConstantU32(state, 0));
+			if (out_of_range != 0) {
+				const auto either = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), either, culled,
+				                          out_of_range);
+				culled = either;
+			}
 			state.builder.AddFunction(spv::OpStore,
 			                          MeshElement(state, state.mesh_cull, spv::StorageClassOutput,
 			                                      TypeBool(state), index),

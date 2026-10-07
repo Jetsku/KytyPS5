@@ -64,6 +64,24 @@ struct HostShaderClock {
 void            SetHostShaderClock(const HostShaderClock& clock);
 HostShaderClock GetHostShaderClock();
 
+// Defined values for geometry outputs a guest shader can leave unwritten (KYTY_VS_OUTPUT_GUARD and
+// KYTY_MESH_OUTPUT_GUARD, auto/on/off, set once by the device layer; auto is on for NVIDIA Turing
+// only). A guest export runs under EXEC, so a vertex whose lane skips its position export leaves
+// gl_Position (and the zero-position clip guard plane) undefined, and an NGG mesh lane that skips
+// its exports leaves its vertex and primitive undefined. Where the hardware happens to read such values as 0 nothing changes:
+//   vertex_outputs: vertex/evaluation shaders store position (0,0,0,0) and a clip-guard distance
+//     of -1 before the guest code, so an unexported vertex culls its primitives.
+//   mesh_outputs: mesh shaders start each lane's position at (0,0,0,0) and primitive as culled,
+//     clamp the allocation to the declared OutputVertices/OutputPrimitives, and cull (with index 0)
+//     a primitive that names a vertex past the allocated count (undefined in VK_EXT_mesh_shader).
+struct HostGeometryGuard {
+	bool vertex_outputs = false;
+	bool mesh_outputs   = false;
+};
+
+void              SetHostGeometryGuard(const HostGeometryGuard& guard);
+HostGeometryGuard GetHostGeometryGuard();
+
 // Vulkan reports no rate for the shader clock. The device clock counts at the rate of timestamp
 // queries on NVIDIA (1 GHz) and AMD (the 100 MHz reference clock), and Intel's subgroup clock is
 // its timestamp counter, so the shift is taken from timestampPeriod: the one that brings the rate
