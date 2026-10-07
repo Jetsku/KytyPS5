@@ -138,6 +138,8 @@ occlusion on.
 
 ## Known issues
 
+- **Grass flicker:** small grass/moss clumps on sand (e.g. the crash-site hub) can flicker between two looks from
+  frame to frame. Also in earlier builds; being looked at.
 - **RTX 50 series:** the first launch after installing or updating could crash once while the ray tracing shaders
   were being built. The hang watchdog fix and the background shader builds should cure it; if it still happens,
   please send the console text.
