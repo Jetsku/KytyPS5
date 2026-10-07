@@ -131,11 +131,11 @@ extern Live::Switch g_push;    // KYTY_DRAW_RUN_PUSH
 // which used to take the whole serial path and end the run for the draw after it.
 // KYTY_DRAW_RUN_INDIRECT=0: an indirect draw is never a commit and ends the run.
 [[nodiscard]] bool IndirectRunsEnabled();
-// KYTY_DRAW_RUN_QUIET_SYNTHETIC=1 (default off: not yet measured in game; needs
-// KYTY_DRAW_RUN_QUIET_OPS): with KYTY_GPU_OCCLUSION=0 an occlusion dump is a CPU write of an always-visible result (and NoteCpWrite), which is what a
-// quiet CPU WRITE_DATA does, so it does not end a run either. Ape Escape with occlusion off issues
-// about 1,500 such dumps per frame between otherwise continuable draws.
-// Unset or 0: a synthetic dump ends the run.
+// KYTY_DRAW_RUN_QUIET_SYNTHETIC (live, default on; needs KYTY_DRAW_RUN_QUIET_OPS): with
+// KYTY_GPU_OCCLUSION=0 an occlusion dump is a CPU write of an always-visible result (and
+// NoteCpWrite), which is what a quiet CPU WRITE_DATA does, so it does not end a run either. Ape
+// Escape with occlusion off issues about 1,500 such dumps per frame between otherwise continuable
+// draws. DRAW_RUN=verify: 0 mismatches (Ape Escape, snow). 0: a synthetic dump ends the run.
 [[nodiscard]] bool QuietSyntheticEnabled();
 // what: a static name of the work, for the 10-second line's "activity by" attribution.
 void NoteForeignActivity(const char* what = "other") noexcept;

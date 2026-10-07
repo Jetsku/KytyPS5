@@ -96,8 +96,8 @@ bool QuietOpsEnabled() {
 	return enabled;
 }
 
-// KYTY_DRAW_RUN_QUIET_SYNTHETIC (live): a mode change ends the current run.
-Live::Switch g_quiet_synthetic("KYTY_DRAW_RUN_QUIET_SYNTHETIC", Live::ParseDefaultOff,
+// KYTY_DRAW_RUN_QUIET_SYNTHETIC (live, default on): a mode change ends the current run.
+Live::Switch g_quiet_synthetic("KYTY_DRAW_RUN_QUIET_SYNTHETIC", Live::ParseDefaultOn,
                                [](int64_t, int64_t) { NoteForeignActivity(); });
 
 bool QuietSyntheticEnabled() {
