@@ -1255,8 +1255,10 @@ private:
 		uint32_t          color_count      = 0;
 		uint32_t          color_slots      = 0;
 		RenderState       rendering;
-		// The textures of the recorded stages, then the attachments, as the draw left them.
+		// The textures of the recorded stages, then the attachments (from attachments_begin), as the
+		// draw left them.
 		std::vector<DrawRunImage> images;
+		uint32_t                  attachments_begin = 0;
 		// KYTY_DRAW_RUN_ACQUIRE and verify mode: the resolved targets (depth: one entry) and the
 		// scissor union (KYTY_ALIAS_BYTES claims) the attachments were acquired for.
 		std::vector<RenderColorInfo> colors;

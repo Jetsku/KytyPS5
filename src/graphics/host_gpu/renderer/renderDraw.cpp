@@ -2409,18 +2409,21 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 	{
 		auto&            cache = m_context.GetTextureCache();
 		std::scoped_lock lock {cache.m_lock};
+		// The record's attachments follow its textures.
+		const auto attachments = std::span<const DrawRunImage>(run.images).subspan(
+		    std::min<size_t>(run.attachments_begin, run.images.size()));
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {
 				const auto* image = cache.m_slot_images.try_get(binding.image_id);
 				if (image == nullptr) {
 					return false;
 				}
-				for (const auto& mark: run.images) {
+				for (const auto& mark: attachments) {
 					if (!mark.texture && mark.id == binding.image_id) {
 						return false;
 					}
 				}
-				if (DrawRunOverAttachment(run.images, image->info.data.address,
+				if (DrawRunOverAttachment(attachments, image->info.data.address,
 				                          image->info.data.size)) {
 					return false;
 				}
@@ -2493,6 +2496,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 				run.images.push_back(MakeDrawRunImage(binding.image_id, true));
 			}
 		}
+		run.attachments_begin = static_cast<uint32_t>(run.images.size());
 		for (uint32_t i = 0; i < state.color_count; i++) {
 			run.images.push_back(MakeDrawRunImage(state.color_info[i].image_id, false));
 		}
@@ -2502,8 +2506,9 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	}
 	// A texture over an attachment's memory (an alias of it) is synchronized from the attachment by
 	// each draw's texture resolution (SyncAliasFromOwner), which a continuation skips: no run.
+	const auto attachments = std::span<const DrawRunImage>(run.images).subspan(run.attachments_begin);
 	for (const auto& mark: run.images) {
-		if (mark.texture && DrawRunOverAttachment(run.images, mark.address, mark.size)) {
+		if (mark.texture && DrawRunOverAttachment(attachments, mark.address, mark.size)) {
 			DrawRun::GetTotals().alias_excluded.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
