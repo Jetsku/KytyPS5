@@ -22,6 +22,10 @@ public:
 
     void Reduced() noexcept { m_end = 0; }
 
+    // The unused index next was reset since the last reduction (a query may begin there without
+    // a reset, e.g. inside a rendering instance).
+    [[nodiscard]] bool IsReset(uint32_t next) const noexcept { return next < m_end; }
+
 private:
     uint32_t m_end = 0;
 };

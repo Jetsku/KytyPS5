@@ -1073,6 +1073,16 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 }
 
 void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
+	auto& slot = ReadyHead();
+	if (patch != nullptr) {
+		// The preparation (and the preparing thread's reads of the slot) is complete.
+		(*patch)(slot);
+	}
+	Commit(slot);
+	m_workers->window.Retire();
+}
+
+Engine::Slot& Engine::ReadyHead() {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
 	// Commits happen at packet boundaries, never inside a preparation: the recorder and the
@@ -1151,12 +1161,55 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
 		}
 	}
-	if (patch != nullptr) {
-		// The preparation (and the preparing thread's reads of the slot) is complete.
-		(*patch)(slot);
+	return slot;
+}
+
+bool Engine::IndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_PREP_INDIRECT");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint64_t Engine::PublishIndirect(bool indexed, const HW::Context& context,
+                                 const HW::UserConfig& user_config, const HW::Shader& shaders,
+                                 const std::function<bool()>& wait_for_space) {
+	// The counts are GPU data: the preparation assumes the draw draws, as for an inherited
+	// instance count (an unused preparation is dropped, DrawPrepUnused).
+	if (indexed) {
+		DrawIndexArgs args;
+		args.index_count    = 1;
+		args.instance_count = 1;
+		return Publish(&args, nullptr, context, user_config, shaders, wait_for_space);
 	}
-	Commit(slot);
-	window.Retire();
+	DrawAutoArgs args;
+	args.vertex_count   = 1;
+	args.instance_count = 1;
+	return Publish(nullptr, &args, context, user_config, shaders, wait_for_space);
+}
+
+void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& draw) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	EXIT_IF(m_workers == nullptr || m_workers->window.Empty() ||
+	        m_workers->window.Head() != position);
+	auto& slot     = ReadyHead();
+	auto& executor = m_renderer.GetRenderExecutor();
+	// Only the programs are offered: the binding plan's vertex ranges come from counts this draw
+	// does not have, and the draw is never a draw-run commit.
+	slot.plan.Reset();
+	executor.m_prepared_draw       = &slot.prepared;
+	executor.m_binding_plan        = nullptr;
+	executor.m_binding_plan_active = false;
+	draw();
+	if (executor.m_prepared_draw != nullptr) {
+		// The draw returned before preparing its programs.
+		executor.m_prepared_draw = nullptr;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepUnused);
+	}
+	executor.m_binding_plan        = nullptr;
+	executor.m_binding_plan_active = false;
+	m_workers->window.Retire();
 }
 
 void Engine::Drain() {

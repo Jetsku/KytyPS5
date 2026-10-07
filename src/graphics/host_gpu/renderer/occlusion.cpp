@@ -502,11 +502,41 @@ bool OcclusionCounter::PriorityPublication() {
 	return enabled;
 }
 
+bool OcclusionCounter::SplitEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_SPLIT");
+		const bool  on    = value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+		return on && BatchEnabled();
+	}();
+	return enabled;
+}
+
 bool OcclusionCounter::Dump(uint64_t address) {
 	auto& scheduler = m_context.GetCommandScheduler();
-	scheduler.EndRendering();
+	if (!m_pool) {
+		scheduler.EndRendering(); // Initialize records outside rendering
+	}
 	Initialize();
 	const bool batch = static_cast<bool>(m_batch_pipeline);
+	// KYTY_OCCLUSION_SPLIT: close only the instance's query; the instance stays active.
+	const bool              active = scheduler.Active();
+	const uint64_t          instance = active ? scheduler.Current().ActiveRenderingSerial() : 0;
+	const vk::CommandBuffer command  = active ? scheduler.Current().Identity() : vk::CommandBuffer {};
+	const auto              tick     = scheduler.CurrentTick();
+	const auto              slot_index = static_cast<uint32_t>(m_issued % m_slot_count);
+	// Not with the batch verify (its per-dump reductions record outside rendering), nor when the
+	// slot must be waited for (the wait may submit this command buffer).
+	bool split = batch && SplitEnabled() && instance != 0 && !m_prepared && !m_verify_counter &&
+	             (m_issued < m_slot_count || scheduler.IsFree(m_slot_ticks[slot_index]));
+	if (split) {
+		End();
+		if (m_pending >= QueryCapacity) {
+			split = false; // the pool must be reduced outside rendering (Accumulate)
+		}
+	}
+	if (!split) {
+		scheduler.EndRendering();
+	}
 	if (!batch) {
 		FlushPending();
 	}
@@ -647,6 +677,25 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	                  m_last_scope.colors == 0 && m_last_scope.has_depth;
 	m_scopes_since_dump = 0;
 	m_last_scope        = {};
+	// A slot wait above may have submitted the command buffer (ending the instance).
+	split = split && scheduler.Active() && scheduler.Current().Identity() == command &&
+	        scheduler.CurrentTick() == tick && scheduler.Current().ActiveRenderingSerial() == instance;
+	if (split && WouldCount(scheduler.Current().OcclusionControl())) {
+		// The instance is counted from here on: its next query begins inside it, or, without a
+		// reset index, the next draw begins a new instance (Prepare resets outside rendering).
+		if (m_pending < QueryCapacity && m_reset_window.IsReset(m_pending)) {
+			scheduler.Current().Sink().beginQuery(m_pool, m_pending,
+			                                      vk::QueryControlFlagBits::ePrecise);
+			m_active = true;
+			++m_scopes_since_dump;
+			m_last_scope = m_instance_scope;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
+		} else {
+			scheduler.EndRendering();
+			split = false;
+		}
+	}
+	m_last_dump_kept = split;
 	return sync;
 }
 }

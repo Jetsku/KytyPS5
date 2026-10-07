@@ -17213,6 +17213,14 @@ public:
   // alternate_samplers: consecutive draws alternate between two S# words that sample alike (border
   // colour type under clamp-to-edge), so no draw continues a run and every draw after a stream's
   // first keeps its predecessor's attachment acquisition (KYTY_DRAW_RUN_ACQUIRE).
+  // KYTY_DEPTH_FEEDBACK_LAZY: the keep adopts the union for a sampling draw or an image already
+  // holding it, never for a non-sampling draw over the attachment access alone.
+  static_assert(DepthFeedbackAdoptsUnion(true, true, true, true));
+  static_assert(DepthFeedbackAdoptsUnion(true, true, false, false));
+  static_assert(!DepthFeedbackAdoptsUnion(true, true, false, true));
+  static_assert(DepthFeedbackAdoptsUnion(true, false, false, true));
+  static_assert(!DepthFeedbackAdoptsUnion(false, false, true, true));
+
   void CheckDrawRun(bool alternate_samplers = false, bool read_only_depth = false) {
     const char *name = read_only_depth ? (alternate_samplers ? "DrawRunDepthAcquire" : "DrawRunDepth")
                                         : (alternate_samplers ? "DrawRunAcquire" : "DrawRun");
@@ -17480,11 +17488,19 @@ public:
       const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
       const bool certified = code_cert == nullptr || std::strcmp(code_cert, "0") != 0;
       if (DrawRun::Enabled() && DrawPrep::GetMode() != DrawPrep::Mode::Off && certified) {
-        if (read_only_depth && DepthFeedbackKeepEnabled()) {
+        if (read_only_depth && DepthFeedbackLazyEnabled()) {
+          // KYTY_DEPTH_FEEDBACK_LAZY: no draw samples the depth target, so its access is never
+          // promoted and no draw is excluded from the run.
+          Require(name, "lazy depth access",
+                  totals.depth_promotions_excluded.load() == depth_excluded_before,
+                  "a read-only depth draw was excluded from the run");
+        } else if (read_only_depth && DepthFeedbackKeepEnabled()) {
           Require(name, "depth access promotion is not reusable",
                   totals.depth_promotions_excluded.load() > depth_excluded_before,
                   "the first read-only depth draw seeded a run before the access promotion");
         }
+        // With the lazy keep, read-only depth draws continue exactly as draws without depth.
+        const bool depth_loose = read_only_depth && !DepthFeedbackLazyEnabled();
         // Every draw after a stream's first continues (the second stream's first one continues
         // the first stream's run, then falls back late: its texture was rewritten). With
         // alternating samplers no draw continues, and every draw after a stream's first keeps its
@@ -17500,7 +17516,7 @@ public:
         const uint64_t want_partial =
             DrawRun::PushPartialEnabled() ? want_continued - want_late : 0;
         Require(name, "continuations",
-                read_only_depth ? (alternate_samplers ? (DrawRun::AcquireReuseEnabled() ? reused > 0 : reused == 0)
+                depth_loose ? (alternate_samplers ? (DrawRun::AcquireReuseEnabled() ? reused > 0 : reused == 0)
                                                      : continued > 0) :
                 continued == want_continued && late == want_late && reused == want_reused &&
                     partial == want_partial,

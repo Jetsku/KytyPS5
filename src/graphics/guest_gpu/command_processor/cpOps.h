@@ -207,6 +207,9 @@ inline constexpr uint32_t IndirectFlagIndexed      = 1u << 0u;
 inline constexpr uint32_t IndirectFlagSetInstances = 1u << 1u; // apply num_instances first (the
                                                                // front's SET_NUM_INSTANCES value)
 inline constexpr uint32_t IndirectFlagSnapshot     = 1u << 2u; // thread mode: `snapshot` is bound
+// KYTY_DRAW_PREP_INDIRECT, thread mode: the draw's programs were prepared in draw-prep window slot
+// `window` (DrawPrep::Engine::ExecuteIndirect).
+inline constexpr uint32_t IndirectFlagPrepared     = 1u << 3u;
 
 // DRAW_INDIRECT / DRAW_INDEX_INDIRECT (multi: DRAW_INDIRECT_MULTI / DRAW_INDEX_INDIRECT_MULTI).
 // The front's draw state at the packet travels with the op: the resolver reads the arguments.
@@ -224,6 +227,7 @@ struct DrawIndirectOp {
 	uint32_t num_instances       = 0; // IndirectFlagSetInstances
 	uint32_t snapshot            = 0; // IndirectFlagSnapshot
 	uint32_t reserved            = 0;
+	uint64_t window              = 0; // IndirectFlagPrepared
 };
 
 // Dispatch op flags.

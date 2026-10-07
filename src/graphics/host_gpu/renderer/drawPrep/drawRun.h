@@ -114,7 +114,17 @@ extern Live::Switch g_push;    // KYTY_DRAW_RUN_PUSH
 
 // Command-processor work other than committed draws (GPU thread). Relaxed: written and read by the
 // GPU thread; other threads only bump it.
-void NoteForeignActivity() noexcept;
+// KYTY_DRAW_RUN_QUIET_OPS (default on): two kinds of command-processor work between draws do not
+// end a run. An occlusion dump that kept the rendering instance (KYTY_OCCLUSION_SPLIT, no wait)
+// records only query commands. A WRITE_DATA done by the CPU writes guest memory like a guest
+// thread would: a write to a texture's or attachment's memory reaches it through write tracking
+// (its state, which the continuation checks after the buffer work, changes) and the per-draw data
+// is resolved by every draw. A WRITE_DATA done on the GPU timeline still ends the run. Astro Bot's
+// clock tower level brackets most draws with an occlusion dump pair and a WRITE_DATA.
+// KYTY_DRAW_RUN_QUIET_OPS=0: every such operation ends the run again.
+[[nodiscard]] bool QuietOpsEnabled();
+// what: a static name of the work, for the 10-second line's "activity by" attribution.
+void NoteForeignActivity(const char* what = "other") noexcept;
 [[nodiscard]] uint64_t ActivityEpoch() noexcept;
 
 // The structure key of a prepared draw (any thread; the preparing thread in parallel mode). 0 when
@@ -143,6 +153,7 @@ struct Totals {
 	std::atomic<uint64_t> pipeline_lookups {0};// continuation whose pipeline was looked up again
 	std::atomic<uint64_t> dynamic_emitted {0}; // continuation whose dynamic state was recorded again
 	std::atomic<uint64_t> depth_promotions_excluded {0}; // next depth acquisition broadens its access
+	std::atomic<uint64_t> depth_promotions_deferred {0}; // KYTY_DEPTH_FEEDBACK_LAZY kept the access
 	std::atomic<uint64_t> alias_excluded {0};  // eligible, but a texture lies over an attachment
 	std::atomic<uint64_t> acquire_reused {0};  // KYTY_DRAW_RUN_ACQUIRE (verify: would have)
 	std::atomic<uint64_t> partial_pushes {0};  // KYTY_DRAW_RUN_PUSH (verify: would have)

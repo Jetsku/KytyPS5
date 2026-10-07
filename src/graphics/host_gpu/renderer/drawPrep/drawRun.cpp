@@ -69,8 +69,31 @@ uint64_t HashValues(uint64_t hash, const std::vector<ShaderRecompiler::IR::Descr
 
 } // namespace
 
-void NoteForeignActivity() noexcept {
+namespace {
+
+// What advanced the activity epoch last, and how often each source ended a run (Miss::Activity):
+// the "activity by" part of the 10-second line. The table is the GPU thread's (CountMiss).
+std::atomic<const char*> g_last_activity {"start"};
+struct ActivitySource {
+	const char* what  = nullptr;
+	uint64_t    count = 0;
+	uint64_t    last  = 0;
+};
+std::array<ActivitySource, 24> g_activity_misses {};
+
+} // namespace
+
+void NoteForeignActivity(const char* what) noexcept {
+	g_last_activity.store(what, std::memory_order_relaxed);
 	g_activity.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool QuietOpsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_OPS");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
 }
 
 uint64_t ActivityEpoch() noexcept {
@@ -114,6 +137,16 @@ Totals& GetTotals() {
 
 void CountMiss(Miss miss) noexcept {
 	g_totals.misses[static_cast<uint32_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+	if (miss == Miss::Activity) {
+		const char* what = g_last_activity.load(std::memory_order_relaxed);
+		for (auto& source: g_activity_misses) {
+			if (source.what == what || source.what == nullptr) {
+				source.what = what;
+				source.count++;
+				break;
+			}
+		}
+	}
 }
 
 void CountVerifyCheck() noexcept {
@@ -153,7 +186,7 @@ void PrintSummary() {
 		return;
 	}
 	static uint64_t                                          last_ns = 0;
-	static std::array<uint64_t, 13>                          last {};
+	static std::array<uint64_t, 14>                          last {};
 	static std::array<uint64_t, static_cast<size_t>(Miss::Count)> last_misses {};
 	const auto                                               now = NowNs();
 	if (last_ns == 0) {
@@ -163,7 +196,7 @@ void PrintSummary() {
 	if (now - last_ns < 10'000'000'000ull) {
 		return;
 	}
-	const std::array<uint64_t, 13> values {
+	const std::array<uint64_t, 14> values {
 	    g_totals.draws.load(std::memory_order_relaxed),
 	    g_totals.eligible.load(std::memory_order_relaxed),
 	    g_totals.key_matches.load(std::memory_order_relaxed),
@@ -176,8 +209,9 @@ void PrintSummary() {
 	    g_totals.acquire_reused.load(std::memory_order_relaxed),
 	    g_totals.dynamic_emitted.load(std::memory_order_relaxed),
 	    g_totals.partial_pushes.load(std::memory_order_relaxed),
-	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed)};
-	std::array<uint64_t, 13> delta {};
+	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed),
+	    g_totals.depth_promotions_deferred.load(std::memory_order_relaxed)};
+	std::array<uint64_t, 14> delta {};
 	for (size_t i = 0; i < values.size(); i++) {
 		delta[i] = values[i] - last[i];
 	}
@@ -191,17 +225,28 @@ void PrintSummary() {
 			last_misses[i] = value;
 		}
 	}
+	std::string by;
+	for (auto& source: g_activity_misses) {
+		if (source.what != nullptr && source.count != source.last) {
+			by += " " + std::string(source.what) + "=" + std::to_string(source.count - source.last);
+			source.last = source.count;
+		}
+	}
+	if (!by.empty()) {
+		misses += " (activity by" + by + ")";
+	}
 	std::printf("DrawRun %.0fs (%s): %" PRIu64 " draws, %" PRIu64 " eligible, %" PRIu64
 	            " key matches, %" PRIu64 " continued (%.1f%%), %" PRIu64
 	            " late fallbacks; misses:%s; verify %" PRIu64 " checks, %" PRIu64
 	            " mismatches; %" PRIu64 " alias-excluded, %" PRIu64 " acquisitions reused, %" PRIu64
-	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64 " depth-promotions excluded\n",
+	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64 " depth-promotions excluded, %" PRIu64
+	            " deferred\n",
 	            static_cast<double>(now - last_ns) * 1e-9,
 	            GetMode() == Mode::Verify ? "verify" : "on", delta[0], delta[1], delta[2], delta[3],
 	            delta[0] != 0 ? 100.0 * static_cast<double>(delta[3]) / static_cast<double>(delta[0])
 	                          : 0.0,
 	            delta[4], misses.empty() ? " none" : misses.c_str(), delta[6], delta[7], delta[8],
-	            delta[9], delta[10], delta[11], delta[12]);
+	            delta[9], delta[10], delta[11], delta[12], delta[13]);
 	std::fflush(stdout);
 	last    = values;
 	last_ns = now;

@@ -1023,8 +1023,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			                          : !proof_serial   ? Profiler::FrameEvent::DepthFeedbackKeepMissSerial
 			                                            : Profiler::FrameEvent::DepthFeedbackKeepMissState);
 		}
-		if (DepthFeedbackKeepEnabled() && !draw_writes && proof_instance && proof_serial &&
-		    state_matches) {
+		const bool keep = DepthFeedbackKeepEnabled() && !draw_writes && proof_instance &&
+		                  proof_serial && state_matches;
+		if (keep && !DepthFeedbackAdoptsUnion(true, DepthFeedbackLazyEnabled(),
+		                                      static_cast<bool>(sampled_aspects),
+		                                      tracked.access_mask == access)) {
+			// KYTY_DEPTH_FEEDBACK_LAZY: nothing samples the image yet; it keeps the attachment access.
+			DrawRun::GetTotals().depth_promotions_deferred.fetch_add(1, std::memory_order_relaxed);
+		} else if (keep) {
 			// Without the keep: a barrier back to the attachment scope when the previous draw
 			// sampled, and one to the sampled scope when this draw samples.
 			const uint64_t avoided = (tracked.access_mask == sampled ? 1u : 0u) +
@@ -2164,7 +2170,7 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_verify         = false;
 	m_prepared_validated = false;
 	if (!m_in_engine_commit && DrawRun::Enabled()) {
-		DrawRun::NoteForeignActivity();
+		DrawRun::NoteForeignActivity("draw outside an engine commit");
 	}
 }
 
@@ -2463,7 +2469,10 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.images.clear();
 	{
 		std::scoped_lock lock {m_context.GetTextureCache().m_lock};
-		if (state.depth_info.image_id && DepthFeedbackKeepEnabled() &&
+		// KYTY_DEPTH_FEEDBACK_LAZY: an acquisition that does not sample the image (as a
+		// continuation's or a reused acquisition's, whose textures are never an attachment) keeps
+		// the attachment access, so nothing is excluded.
+		if (state.depth_info.image_id && DepthFeedbackKeepEnabled() && !DepthFeedbackLazyEnabled() &&
 		    !state.depth_info.AttachmentWriteAspects()) {
 			const auto* depth = m_context.GetTextureCache().m_slot_images.try_get(state.depth_info.image_id);
 			const auto attachment_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
@@ -3921,6 +3930,57 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 // Mirrors DrawIndex/DrawAuto with DrawOffsetSource::IndirectArgs, except that the counts, first
 // index/vertex, vertex offset and first instance stay GPU data. Every check that needs a
 // CPU-visible count returns false before a command is recorded.
+// KYTY_CP_OP_STATS=1 (diagnostic): where a native indirect draw's time goes, one console line
+// every 10 s ("IndirectDraws 10s: ...").
+namespace IndirectStats {
+enum class Part : uint8_t { Prepare, Execute, Count };
+static bool Enabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_OP_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+static uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+struct Totals {
+	std::array<uint64_t, 2> ns {};
+	std::array<uint64_t, 2> count {};
+	uint64_t                last_print = 0;
+};
+static Totals g_totals;
+class Timer {
+public:
+	explicit Timer(Part part): m_part(part), m_start(Enabled() ? NowNs() : 0) {}
+	void Stop() {
+		if (m_start == 0) {
+			return;
+		}
+		const auto now = NowNs();
+		g_totals.ns[static_cast<size_t>(m_part)] += now - m_start;
+		g_totals.count[static_cast<size_t>(m_part)]++;
+		m_start = 0;
+		if (g_totals.last_print == 0) {
+			g_totals.last_print = now;
+		} else if (now - g_totals.last_print >= 10'000'000'000ull) {
+			std::printf("IndirectDraws 10s: prepare %" PRIu64 " in %.1f ms, execute %" PRIu64 " in %.1f ms\n",
+			            g_totals.count[0], static_cast<double>(g_totals.ns[0]) / 1e6, g_totals.count[1],
+			            static_cast<double>(g_totals.ns[1]) / 1e6);
+			std::fflush(stdout);
+			g_totals = {};
+			g_totals.last_print = now;
+		}
+	}
+
+private:
+	Part     m_part;
+	uint64_t m_start;
+};
+} // namespace IndirectStats
+
 bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffer,
                                         const DrawIndirectSource& source) {
 	KYTY_PROFILER_FUNCTION();
@@ -4051,11 +4111,13 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 	// The member state is reused (as in DrawIndex/DrawAuto) instead of value-initialising about
 	// 37 KB and allocating fresh preparation vectors; the render mutex makes it exclusive.
 	auto& state = *m_draw_state;
+	IndirectStats::Timer prep_timer(IndirectStats::Part::Prepare);
 	state.Reset();
 	if (!PrepareDrawRenderState(buffer, draw, 0, state)) {
 		ResetBindings();
 		return true;
 	}
+	prep_timer.Stop();
 	DrawEmitInfo emit {};
 	emit.indirect = &source;
 	// Mesh draws derive group counts, restart segments and push data from the counts: on the GPU
@@ -4132,8 +4194,10 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 
 	LogDrawStateIfNeeded(buffer, draw, state, source.index_type_and_size,
 	                     reinterpret_cast<const void*>(source.index_base_addr));
+	IndirectStats::Timer exec_timer(IndirectStats::Part::Execute);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
+	exec_timer.Stop();
 	ResetBindings();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectNative);
 	return true;

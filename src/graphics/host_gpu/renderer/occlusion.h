@@ -71,6 +71,25 @@ public:
 	[[nodiscard]] static ProxyMode GetProxyMode();
 	// Returns true when this dump is a proxy end dump the caller must order (see ProxyMode).
 	[[nodiscard]] bool Dump(uint64_t address);
+	// KYTY_OCCLUSION_SPLIT (default on, with KYTY_OCCLUSION_BATCH): a dump recorded while a
+	// rendering instance is active ends only the instance's query (vkCmdEndQuery is valid inside a
+	// render pass instance) and, when the instance is counted after the dump, begins the next query
+	// in the same instance (its index was reset ahead, OcclusionResetWindow), instead of ending
+	// rendering. Every query still ends before the dump that follows it and the batch reduces the
+	// same queries for each dump, so the guest reads the same values. Astro Bot's clock tower level
+	// brackets most draws with a dump pair (~6,600 dumps per frame against ~850 in the Sky Garden):
+	// every draw was its own rendering instance, and no draw could continue a draw run. A dump
+	// that cannot split (pool full, next index not reset, no batch) ends rendering as before.
+	// KYTY_OCCLUSION_SPLIT=0 restores the end of rendering at every dump.
+	[[nodiscard]] static bool SplitEnabled();
+	// The last Dump() left the rendering instance active (KYTY_OCCLUSION_SPLIT).
+	[[nodiscard]] bool LastDumpKeptInstance() const noexcept { return m_last_dump_kept; }
+	// The attachments of the rendering instance just begun (counted or not): the scope a query
+	// begun inside it by a split dump reports to the proxy detection.
+	void NoteInstance(uint64_t depth_address, uint32_t width, uint32_t height, uint32_t colors,
+	                  bool has_depth, uint32_t depth_format) {
+		m_instance_scope = {depth_address, width, height, colors, has_depth, depth_format};
+	}
 	// Proxy detection enabled (any mode but Off).
 	[[nodiscard]] static bool SyncProxyDumps();
 	// Publications run on the completion (priority) runner instead of the GPU thread's pending
@@ -85,8 +104,8 @@ public:
 	// KYTY_OCCLUSION_GATE (default on, needs KYTY_GPU_OCCLUSION=1). The guest reads only
 	// end - begin differences of the cumulative counter, taken by interleaved dump pairs (begin at
 	// A, A % 16 == 0; end at A + 8). Samples of rendering instances begun while no pair is open
-	// cannot reach any such difference, so they are not counted. Every dump ends rendering, so
-	// an instance never straddles a pair boundary. Unexpected dump patterns disable the gate for
+	// cannot reach any such difference, so they are not counted. Every dump ends rendering, or (a
+	// split dump) the instance's query, so no query straddles a pair boundary. Unexpected dump patterns disable the gate for
 	// the rest of the process (always-on counting, as without the gate).
 	[[nodiscard]] static bool GateEnabled();
 	// True when a rendering instance begun now with DB_COUNT_CONTROL `control` would be counted.
@@ -163,6 +182,8 @@ private:
 		uint32_t depth_format  = 0;
 	};
 	ScopeInfo m_last_scope {}; // hang-trace diagnostics only
+	ScopeInfo m_instance_scope {};
+	bool      m_last_dump_kept = false;
 };
 }
 #endif
