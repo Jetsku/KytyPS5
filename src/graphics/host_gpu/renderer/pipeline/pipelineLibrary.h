@@ -61,9 +61,11 @@ struct GraphicContext;
 // renderer uses (pipeline/shaders.cpp). The copy owns everything it points to and does not move.
 class GraphicsPipelineSnapshot {
 public:
-	// Null when `info` uses anything the copy does not reproduce exactly.
+	// Null when `info` uses anything the copy does not reproduce exactly. allow_mesh also copies
+	// mesh-shader pipelines (no vertex input; stages may require their subgroup size), which the
+	// library path cannot link.
 	[[nodiscard]] static std::unique_ptr<GraphicsPipelineSnapshot>
-	Capture(const vk::GraphicsPipelineCreateInfo& info);
+	Capture(const vk::GraphicsPipelineCreateInfo& info, bool allow_mesh = false);
 
 	GraphicsPipelineSnapshot(const GraphicsPipelineSnapshot&)            = delete;
 	GraphicsPipelineSnapshot& operator=(const GraphicsPipelineSnapshot&) = delete;
@@ -94,6 +96,8 @@ private:
 	std::vector<vk::Format>                                    m_color_formats;
 	std::vector<vk::PipelineShaderStageCreateInfo>             m_stages;
 	std::vector<std::string>                                   m_stage_names;
+	std::vector<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo> m_stage_subgroups; // 0: none
+	bool                                                       m_mesh = false;
 	vk::PipelineVertexInputStateCreateInfo                     m_vertex_input {};
 	std::vector<vk::VertexInputBindingDescription>             m_bindings;
 	std::vector<vk::VertexInputAttributeDescription>           m_attributes;

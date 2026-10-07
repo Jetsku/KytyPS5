@@ -19,13 +19,15 @@ const vk::BaseInStructure* Next(const void* next) {
 } // namespace
 
 std::unique_ptr<GraphicsPipelineSnapshot>
-GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info) {
+GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bool allow_mesh) {
 	std::unique_ptr<GraphicsPipelineSnapshot> copy(new GraphicsPipelineSnapshot());
 	auto&                                     s = *copy;
+	// A mesh pipeline has no vertex input or input assembly state.
+	s.m_mesh = allow_mesh && info.stageCount != 0 && info.pStages[0].stage == vk::ShaderStageFlagBits::eMeshEXT;
 	if (info.flags != vk::PipelineCreateFlags {} || info.renderPass != nullptr ||
 	    info.basePipelineHandle != nullptr || info.layout == nullptr ||
-	    info.pTessellationState != nullptr || info.pVertexInputState == nullptr ||
-	    info.pInputAssemblyState == nullptr || info.pViewportState == nullptr ||
+	    info.pTessellationState != nullptr || (info.pVertexInputState == nullptr) != s.m_mesh ||
+	    (info.pInputAssemblyState == nullptr) != s.m_mesh || info.pViewportState == nullptr ||
 	    info.pRasterizationState == nullptr || info.pMultisampleState == nullptr ||
 	    info.pColorBlendState == nullptr || info.pDynamicState == nullptr) {
 		return nullptr;
@@ -46,15 +48,28 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info) {
 	s.m_color_formats.assign(rendering->pColorAttachmentFormats,
 	                         rendering->pColorAttachmentFormats + rendering->colorAttachmentCount);
 
-	// Stages: one vertex shader and at most one fragment shader, plain modules.
+	// Stages: one vertex (or, with allow_mesh, mesh) shader and at most one fragment shader, plain
+	// modules; a mesh pipeline's stages may require their subgroup size.
+	const auto first_stage = s.m_mesh ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex;
 	for (uint32_t i = 0; i < info.stageCount; ++i) {
-		const auto& stage = info.pStages[i];
-		if (stage.pNext != nullptr || stage.flags != vk::PipelineShaderStageCreateFlags {} ||
+		const auto& stage    = info.pStages[i];
+		uint32_t    subgroup = 0;
+		if (stage.pNext != nullptr) {
+			const auto* next = Next(stage.pNext);
+			if (!s.m_mesh || next->sType != vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo ||
+			    next->pNext != nullptr) {
+				return nullptr;
+			}
+			subgroup = reinterpret_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(next)
+			               ->requiredSubgroupSize;
+		}
+		if (stage.flags != vk::PipelineShaderStageCreateFlags {} ||
 		    stage.pSpecializationInfo != nullptr || stage.module == nullptr ||
 		    stage.pName == nullptr) {
 			return nullptr;
 		}
-		if (stage.stage == vk::ShaderStageFlagBits::eVertex && s.m_vertex_module == nullptr) {
+		s.m_stage_subgroups.push_back({.requiredSubgroupSize = subgroup});
+		if (stage.stage == first_stage && s.m_vertex_module == nullptr) {
 			s.m_vertex_module = stage.module;
 		} else if (stage.stage == vk::ShaderStageFlagBits::eFragment &&
 		           s.m_fragment_module == nullptr) {
@@ -67,19 +82,21 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info) {
 	}
 	if (s.m_vertex_module == nullptr) return nullptr;
 
-	const auto& vi = *info.pVertexInputState;
-	if (vi.pNext != nullptr || vi.flags != vk::PipelineVertexInputStateCreateFlags {})
-		return nullptr;
-	s.m_bindings.assign(vi.pVertexBindingDescriptions,
-	                    vi.pVertexBindingDescriptions + vi.vertexBindingDescriptionCount);
-	s.m_attributes.assign(vi.pVertexAttributeDescriptions,
-	                      vi.pVertexAttributeDescriptions + vi.vertexAttributeDescriptionCount);
+	if (!s.m_mesh) {
+		const auto& vi = *info.pVertexInputState;
+		if (vi.pNext != nullptr || vi.flags != vk::PipelineVertexInputStateCreateFlags {})
+			return nullptr;
+		s.m_bindings.assign(vi.pVertexBindingDescriptions,
+		                    vi.pVertexBindingDescriptions + vi.vertexBindingDescriptionCount);
+		s.m_attributes.assign(vi.pVertexAttributeDescriptions,
+		                      vi.pVertexAttributeDescriptions + vi.vertexAttributeDescriptionCount);
 
-	const auto& ia = *info.pInputAssemblyState;
-	if (ia.pNext != nullptr || ia.flags != vk::PipelineInputAssemblyStateCreateFlags {})
-		return nullptr;
-	s.m_input_assembly.topology               = ia.topology;
-	s.m_input_assembly.primitiveRestartEnable = ia.primitiveRestartEnable;
+		const auto& ia = *info.pInputAssemblyState;
+		if (ia.pNext != nullptr || ia.flags != vk::PipelineInputAssemblyStateCreateFlags {})
+			return nullptr;
+		s.m_input_assembly.topology               = ia.topology;
+		s.m_input_assembly.primitiveRestartEnable = ia.primitiveRestartEnable;
+	}
 
 	const auto& vp = *info.pViewportState;
 	// Viewports and scissors are dynamic with count: no arrays.
@@ -186,6 +203,7 @@ void GraphicsPipelineSnapshot::Wire() {
 	m_rendering.pColorAttachmentFormats = m_color_formats.data();
 	for (size_t i = 0; i < m_stages.size(); ++i) {
 		m_stages[i].pName = m_stage_names[i].c_str();
+		m_stages[i].pNext = m_stage_subgroups[i].requiredSubgroupSize != 0 ? &m_stage_subgroups[i] : nullptr;
 	}
 	m_vertex_input.vertexBindingDescriptionCount   = static_cast<uint32_t>(m_bindings.size());
 	m_vertex_input.pVertexBindingDescriptions      = m_bindings.data();
@@ -211,8 +229,8 @@ void GraphicsPipelineSnapshot::Wire() {
 	m_create.pNext               = &m_rendering;
 	m_create.stageCount          = static_cast<uint32_t>(m_stages.size());
 	m_create.pStages             = m_stages.data();
-	m_create.pVertexInputState   = &m_vertex_input;
-	m_create.pInputAssemblyState = &m_input_assembly;
+	m_create.pVertexInputState   = m_mesh ? nullptr : &m_vertex_input;
+	m_create.pInputAssemblyState = m_mesh ? nullptr : &m_input_assembly;
 	m_create.pViewportState      = &m_viewport;
 	m_create.pRasterizationState = &m_rasterization;
 	m_create.pMultisampleState   = &m_multisample;
@@ -225,7 +243,7 @@ void GraphicsPipelineSnapshot::Wire() {
 
 namespace {
 
-constexpr uint32_t SnapshotMagic = 0x314e5350u; // "PSN1"
+constexpr uint32_t SnapshotMagic = 0x324e5350u; // "PSN2"
 constexpr uint32_t SnapshotEnd   = 0x00444e45u; // "END"
 
 class WordWriter {
@@ -330,6 +348,7 @@ private:
 bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const ModuleHashFn& module_hash) const {
 	WordWriter w(out);
 	w.U32(SnapshotMagic);
+	w.U32(m_mesh ? 1u : 0u);
 	w.U32(m_rendering.viewMask);
 	w.Enum(m_rendering.depthAttachmentFormat);
 	w.Enum(m_rendering.stencilAttachmentFormat);
@@ -342,6 +361,7 @@ bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const Modul
 		w.Flags(vk::ShaderStageFlags(m_stages[i].stage));
 		w.U64(hash);
 		w.Text(m_stage_names[i]);
+		w.U32(m_stage_subgroups[i].requiredSubgroupSize);
 	}
 	w.U32(static_cast<uint32_t>(m_bindings.size()));
 	for (const auto& b: m_bindings) {
@@ -429,6 +449,7 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 	auto&                                     s = *copy;
 	WordReader                                r(words);
 	if (r.U32() != SnapshotMagic) return nullptr;
+	s.m_mesh                              = r.U32() != 0;
 	s.m_rendering.viewMask                = r.U32();
 	s.m_rendering.depthAttachmentFormat   = r.Enum<vk::Format>();
 	s.m_rendering.stencilAttachmentFormat = r.Enum<vk::Format>();
@@ -438,10 +459,12 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 		stage.stage       = static_cast<vk::ShaderStageFlagBits>(r.U32());
 		const auto hash   = r.U64();
 		auto       name   = r.Text();
+		s.m_stage_subgroups.push_back({.requiredSubgroupSize = r.U32()});
 		if (r.Failed()) return nullptr;
 		stage.module = module_for(hash);
 		if (stage.module == nullptr) return nullptr;
-		if (stage.stage == vk::ShaderStageFlagBits::eVertex && s.m_vertex_module == nullptr) {
+		const auto first = s.m_mesh ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex;
+		if (stage.stage == first && s.m_vertex_module == nullptr) {
 			s.m_vertex_module = stage.module;
 		} else if (stage.stage == vk::ShaderStageFlagBits::eFragment && s.m_fragment_module == nullptr) {
 			s.m_fragment_module = stage.module;
@@ -541,11 +564,13 @@ std::vector<uint64_t> GraphicsPipelineSnapshot::SerializedModules(std::span<cons
 	(void)r.U32();
 	(void)r.U32();
 	(void)r.U32();
+	(void)r.U32();
 	for (auto n = r.Count(8); n != 0; --n) (void)r.U32();
 	for (auto n = r.Count(2); n != 0; --n) {
 		(void)r.U32();
 		hashes.push_back(r.U64());
 		(void)r.Text();
+		(void)r.U32();
 	}
 	return r.Failed() ? std::vector<uint64_t> {} : hashes;
 }

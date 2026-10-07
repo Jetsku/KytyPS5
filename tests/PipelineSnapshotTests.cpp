@@ -219,8 +219,42 @@ int main() {
 		CHECK(GraphicsPipelineSnapshot::Deserialize(bad, ModuleFor, layout) == nullptr);
 		CHECK(GraphicsPipelineSnapshot::SerializedModules(bad).empty());
 		auto huge = words;
-		huge[4] = 1000000; // color count
+		huge[5] = 1000000; // color count
 		CHECK(GraphicsPipelineSnapshot::Deserialize(huge, ModuleFor, layout) == nullptr);
+	}
+
+	// Mesh pipelines: captured only with allow_mesh, without vertex input, keeping a stage's
+	// required subgroup size.
+	{
+		Example mesh;
+		vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+		subgroup.requiredSubgroupSize = 32;
+		mesh.stages[0].stage          = vk::ShaderStageFlagBits::eMeshEXT;
+		mesh.stages[0].pNext          = &subgroup;
+		mesh.info.pVertexInputState   = nullptr;
+		mesh.info.pInputAssemblyState = nullptr;
+		CHECK(GraphicsPipelineSnapshot::Capture(mesh.info) == nullptr);
+		const auto captured = GraphicsPipelineSnapshot::Capture(mesh.info, true);
+		CHECK(captured != nullptr);
+		if (captured != nullptr) {
+			std::vector<uint32_t> mesh_words;
+			CHECK(captured->Serialize(mesh_words, HashOf) && mesh_words != words);
+			const auto back = GraphicsPipelineSnapshot::Deserialize(mesh_words, ModuleFor, layout);
+			CHECK(back != nullptr);
+			if (back != nullptr) {
+				const auto& info = back->Info();
+				CHECK(info.pVertexInputState == nullptr && info.pInputAssemblyState == nullptr);
+				CHECK(info.pStages[0].stage == vk::ShaderStageFlagBits::eMeshEXT && info.pStages[0].pNext != nullptr &&
+				      static_cast<const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(info.pStages[0].pNext)
+				              ->requiredSubgroupSize == 32);
+				CHECK(info.pStages[1].pNext == nullptr);
+				CHECK(GraphicsPipelineSnapshot::Capture(info, true) != nullptr);
+			}
+		}
+		// A vertex pipeline with a stage pNext stays ineligible (only mesh pipelines chain one).
+		Example vertex;
+		vertex.stages[0].pNext = &subgroup;
+		CHECK(GraphicsPipelineSnapshot::Capture(vertex.info, true) == nullptr);
 	}
 
 	// Ineligible create infos are not captured (tessellation).
@@ -235,6 +269,6 @@ int main() {
 		std::printf("PipelineSnapshotTests: %d checks failed\n", g_failed);
 		return 1;
 	}
-	std::puts("Pipeline snapshot: capture, serialization round trip and refusals passed");
+	std::puts("Pipeline snapshot: capture, serialization round trip, mesh pipelines and refusals passed");
 	return 0;
 }

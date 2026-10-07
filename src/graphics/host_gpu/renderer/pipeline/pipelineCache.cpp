@@ -451,7 +451,7 @@ struct GraphicsContent {
 GraphicsContent DescribeGraphicsPipeline(const vk::GraphicsPipelineCreateInfo& info,
                                          std::span<const uint32_t>             layout_signature) {
 	GraphicsContent content;
-	content.snapshot = GraphicsPipelineSnapshot::Capture(info);
+	content.snapshot = GraphicsPipelineSnapshot::Capture(info, true);
 	if (content.snapshot == nullptr) return content;
 	if (!content.snapshot->Serialize(content.words,
 	                                 [](vk::ShaderModule module) { return g_shader_modules.HashOf(module); })) {
@@ -4672,8 +4672,8 @@ struct PipelineCache::ComputePrewarm {
 // signature) in _PipelineCache/<title>.pipelines.journal (KYTY_PIPELINE_JOURNAL_PATH), with the boot
 // level as marker. At start-up, once the shader precompile replay has published the programs, the
 // journaled pipelines are rebuilt on below-normal-priority threads (KYTY_PIPELINE_JOURNAL_THREADS,
-// default 1) into the driver cache, the boot level's first, then the rest in the order they were
-// first needed; each rebuilt key becomes known, so the draw that needs it takes it from the driver
+// default 4, 1..8: NVIDIA ran 4 about 3.8x in parallel on a cold cache) into the driver cache, the
+// boot level's first, then the rest in the order they were first needed; each rebuilt key becomes known, so the draw that needs it takes it from the driver
 // cache with a probe (KYTY_PIPELINE_FAST_FIRST) instead of compiling. Keys the driver cache is
 // already known to hold (KYTY_PIPELINE_KNOWN) are skipped (KYTY_PIPELINE_JOURNAL_FORCE=1 rebuilds
 // them too). A record whose modules are not published (another translator, a program the replay
@@ -5017,7 +5017,7 @@ void PipelineCache::InitializePipelineJournal() {
 		m_journal->ReleaseLoaded();
 		return;
 	}
-	m_journal_replay->Start(static_cast<uint32_t>(std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", 1), 1, 4)),
+	m_journal_replay->Start(static_cast<uint32_t>(std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", 4), 1, 8)),
 	                        force);
 	if (EnvU64("KYTY_PIPELINE_JOURNAL_WAIT", 0) != 0) m_journal_replay->Wait();
 }
