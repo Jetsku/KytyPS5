@@ -152,6 +152,102 @@ private:
 	std::thread             m_writer;
 };
 
+// A journal of keyed records next to the shader journal (KYTY_PIPELINE_JOURNAL and
+// KYTY_PIPELINE_KNOWN, pipelineCache.cpp): each record is a 64-bit key (a pipeline's content hash)
+// with an opaque payload, kept once per key, in the order the keys were first recorded. The file
+// has the shader journal's layout (a header with an identity, then checksummed records; a damaged
+// tail keeps the intact prefix, another identity discards the file). Records are appended by a
+// writer thread, or, with `sealed_writes`, only up to the last Seal() when Flush() runs: the
+// known-pipeline list is written with the driver cache file, so it never names a pipeline the
+// saved driver cache cannot hold.
+class PipelineJournal {
+public:
+	struct Settings {
+		std::filesystem::path path; // empty: in memory only (nothing is loaded or written)
+		std::vector<uint8_t>  identity;
+		uint64_t              max_file_bytes    = 64ull * 1024 * 1024;
+		bool                  background_writer = true;
+		uint64_t              flush_interval_ns = 2'000'000'000ull;
+		// Flush writes only the records recorded before the last Seal().
+		bool                  sealed_writes     = false;
+		std::function<void(const std::string&)> log;
+	};
+	struct Record {
+		uint64_t             key = 0;
+		std::vector<uint8_t> payload;
+	};
+	struct Stats {
+		bool     file_found      = false;
+		bool     header_rejected = false;
+		uint64_t file_bytes      = 0;
+		uint64_t load_ns         = 0;
+		uint64_t damaged_bytes   = 0;
+		uint64_t loaded          = 0;
+		uint64_t recorded        = 0;
+		uint64_t written_bytes   = 0;
+		uint64_t write_failures  = 0;
+		bool     over_capacity   = false;
+		bool     reset           = false;
+	};
+
+	static constexpr char     FileMagic[8]  = {'K', 'Y', 'P', 'L', 'J', 'R', 'N', '1'};
+	static constexpr uint32_t FormatVersion = 1;
+	static constexpr uint32_t RecordMagic   = 0x524a4c50u; // "PLJR"
+
+	explicit PipelineJournal(Settings settings);
+	~PipelineJournal();
+	PipelineJournal(const PipelineJournal&)            = delete;
+	PipelineJournal& operator=(const PipelineJournal&) = delete;
+
+	// What the file held, in file order (immutable until ReleaseLoaded).
+	[[nodiscard]] const std::vector<Record>& Loaded() const { return m_loaded; }
+	void ReleaseLoaded();
+
+	// Whether the key was loaded or recorded (and not dropped by Reset).
+	[[nodiscard]] bool Contains(uint64_t key) const;
+	// Adds a record for a new key. False for a known key or beyond the size cap.
+	bool Add(uint64_t key, std::span<const uint8_t> payload = {});
+	// Forgets every key, loaded or recorded; the next write recreates the file (the driver cache
+	// it describes was rejected or started empty).
+	void Reset();
+	// Marks the records added so far as writable (sealed_writes).
+	void Seal();
+	// Writes the pending (sealed) records now. False when a write failed.
+	bool Flush();
+
+	[[nodiscard]] Stats GetStats() const;
+	[[nodiscard]] size_t KnownCount() const;
+	[[nodiscard]] const std::filesystem::path& Path() const { return m_settings.path; }
+
+private:
+	void Load();
+	bool AppendPending();
+	void RunWriter();
+	void Log(const std::string& message) const;
+
+	Settings            m_settings;
+	std::vector<Record> m_loaded;
+
+	mutable std::mutex                m_mutex;
+	std::unordered_set<uint64_t>      m_known;
+	std::vector<std::vector<uint8_t>> m_pending; // encoded records, in order
+	size_t                            m_sealed        = 0; // m_pending[0, m_sealed) may be written
+	uint64_t                          m_pending_bytes = 0;
+	uint64_t                          m_file_valid_bytes = 0;
+	uint64_t                          m_file_bytes       = 0;
+	bool                              m_file_ready       = false;
+	Stats                             m_stats;
+
+	std::mutex              m_write_mutex;
+	std::mutex              m_writer_mutex;
+	std::condition_variable m_writer_cv;
+	bool                    m_stop = false;
+	std::thread             m_writer;
+};
+
+// Below-normal priority for the calling thread (background compile workers; Windows only).
+void LowerCurrentThreadPriority();
+
 // Replays journal entries on worker threads.
 class ShaderPrecompiler {
 public:
