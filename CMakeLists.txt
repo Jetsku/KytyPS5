@@ -723,6 +723,15 @@ target_include_directories(shader_precompile_tests PRIVATE ${inc_headers})
 add_executable(pipeline_fast_first_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineFastFirstTests.cpp")
 target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})
 
+# KYTY_PIPELINE_JOURNAL / KYTY_PIPELINE_KNOWN: graphics pipeline snapshot serialization
+# (pipeline/pipelineLibrary.h, pipelineSnapshot.cpp).
+add_executable(pipeline_snapshot_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineSnapshotTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineSnapshot.cpp"
+)
+target_link_libraries(pipeline_snapshot_tests Vulkan::Headers)
+target_include_directories(pipeline_snapshot_tests PRIVATE ${inc_headers})
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
@@ -1113,6 +1122,24 @@ if(BUILD_TESTING)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
 	add_test(NAME pipeline_fast_first COMMAND $<TARGET_FILE:pipeline_fast_first_tests>)
 	set_tests_properties(pipeline_fast_first PROPERTIES TIMEOUT 60)
+	add_test(NAME pipeline_snapshot COMMAND $<TARGET_FILE:pipeline_snapshot_tests>)
+	set_tests_properties(pipeline_snapshot PROPERTIES TIMEOUT 30)
+	# KYTY_PIPELINE_JOURNAL: a recording run, then a run that rebuilds the journaled pipelines at
+	# start-up (forced: tests have no driver cache) and must rebuild every record exactly and find
+	# every pipeline it creates in the journal (KYTY_PIPELINE_JOURNAL_VERIFY=2).
+	add_test(NAME pipeline_journal_clean COMMAND ${CMAKE_COMMAND} -E rm -f pipeline-journal-test.pipelines
+		pipeline-journal-test.shaders)
+	set_tests_properties(pipeline_journal_clean PROPERTIES FIXTURES_SETUP pipeline_journal_files)
+	set(kyty_pipeline_journal_env "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_JOURNAL=1;KYTY_PIPELINE_JOURNAL_PATH=pipeline-journal-test.pipelines;KYTY_SHADER_PRECOMPILE=1;KYTY_SHADER_PRECOMPILE_PATH=pipeline-journal-test.shaders;KYTY_PIPELINE_PREWARM_COMPUTE=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=133")
+	add_test(NAME pipeline_journal_record COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_journal_record PROPERTIES
+		FIXTURES_REQUIRED pipeline_journal_files FIXTURES_SETUP pipeline_journal_recorded
+		ENVIRONMENT "${kyty_pipeline_journal_env}" TIMEOUT 180)
+	add_test(NAME pipeline_journal_replay COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_journal_replay PROPERTIES
+		FIXTURES_REQUIRED "pipeline_journal_files;pipeline_journal_recorded"
+		ENVIRONMENT "${kyty_pipeline_journal_env};KYTY_PIPELINE_KNOWN=1;KYTY_PIPELINE_JOURNAL_FORCE=1;KYTY_PIPELINE_JOURNAL_WAIT=1;KYTY_SHADER_PRECOMPILE_WAIT=1;KYTY_PIPELINE_JOURNAL_VERIFY=2"
+		TIMEOUT 180)
 	add_test(NAME pipeline_fast_first_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(pipeline_fast_first_rendering PROPERTIES
 		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_PROBE=0;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=130"
@@ -2109,6 +2136,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		spirv_local_arrays_tests
 		pipeline_fast_first_tests
+		pipeline_snapshot_tests
 		vram_budget_tests
 		device_compat_tests
 		shader_precompile_tests
