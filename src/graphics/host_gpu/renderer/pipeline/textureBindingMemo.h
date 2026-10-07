@@ -186,7 +186,14 @@ public:
 
 private:
 	struct Entry;
-	static constexpr uint32_t Slots    = 4096;
+	// KYTY_TEXTURE_MEMO_SLOTS (startup, default 4096, 64..4M): the number of direct-mapped entries
+	// (~1 KiB each; the size is logged once). A level binding more distinct textures per frame
+	// than that evicts entries every frame (Sky Garden: most texture sets KYTY_XFRAME_REUSE kept
+	// had lost their entries). 32768 (31 MiB): start draws' texture resolution 1.04 -> 0.85 us
+	// (Sky Garden) and 1.22 -> 0.99 us (pirate island) with KYTY_CP_COMMIT_STATS; separate
+	// launches without counters were +5.7% fps (Sky Garden, ABBA) but mixed elsewhere (launch
+	// noise of 5-10% on the pirate island), so the default stays.
+	[[nodiscard]] static uint32_t SlotCount();
 	static constexpr uint32_t KeyWords = 8;
 	using PackedKey                    = std::array<uint64_t, KeyWords>;
 
