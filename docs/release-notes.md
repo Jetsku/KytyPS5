@@ -59,6 +59,11 @@
   settings. It is the same setting (saved configurations and `--amd-cpu` keep working): on Intel CPUs it emulates the
   PS5's AMD-only instructions (EXTRQ/INSERTQ) and AMD's `VRSQRTPS` results. It is not needed on AMD CPUs. The console
   lines now read "AMD instruction patch for Intel CPUs: ...".
+- **Read-only shader buffers (AMD graphics cards):** shaders that never write their storage buffers now declare them
+  read-only, so AMD's driver can load them once per wave instead of per thread (from serbru20066666's fork, which
+  measured a lighting shader in Astro's Playroom at 3.45 -> 2.76 ms on an RX 6800 XT). No change on NVIDIA. Not
+  tested by us on AMD: if you see new graphics problems on an AMD card, try `KYTY_READONLY_BUFFERS=0` and please
+  report the result. The first launch rebuilds the shader cache.
 
 ### New defaults and how to turn each off
 
@@ -82,6 +87,7 @@ you suspect a change, and please report what it fixed.
 | `KYTY_REMAP_TRACKER_PROTECTION` | on | `0` | Restore write tracking on remapped memory views |
 | `KYTY_FIBER_GUEST_STACK` | small fibers | `0` (`all` = every fiber) | Fibers under 256 KiB run on their own guest stacks |
 | `KYTY_START_INSTANCE_SGPR` | on | `0` | Indirect draws pass their start instance to the shader |
+| `KYTY_READONLY_BUFFERS` | on | `0` | Storage buffers a shader never writes are declared read-only (faster on AMD) |
 | `KYTY_APR_HASHED_IDS` | off | `1` restores the old hashed ids | One file id per file path |
 | `KYTY_FATAL_EXIT_PROCESS` | off | `1` restores the old exit path | Fatal errors end the process with TerminateProcess |
 | `KYTY_IR_VALIDATE` | off in release | `1` runs it | Shader IR validation |
@@ -159,7 +165,8 @@ occlusion on.
 
 Please report (GPU, CPU, driver, what you did, the console text) especially from:
 - **RTX 50 series** cards (first launch after the update, ray tracing shaders, hang watchdog);
-- **AMD Radeon** cards (device lost with the patches off, water in Go-Go Archipelago);
+- **AMD Radeon** cards (device lost with the patches off, water in Go-Go Archipelago, frame rate and any new
+  graphics problems with `KYTY_READONLY_BUFFERS=0` against the default);
 - **Intel CPUs** (with "Intel CPU compatibility" on and off; the red galaxy's first arrival);
 - **8-12 GB graphics cards** (video memory full messages, stutter, frame rate with the defaults).
 
