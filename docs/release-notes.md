@@ -44,6 +44,13 @@
 - **Audio:** sounds the game sends to the DualSense speaker now play at 30% on the PC speakers (they were up to 19 dB
   louder than music and effects). Four new volume sliders (master, game sound, music, controller speaker on PC) are in
   the launcher's global Audio settings. AudioPropagation (3D sound) is implemented as an empty scene.
+- **3D object audio now plays:** a large part of Astro Bot's sound goes to the PS5's 3D audio object ports (the
+  ambisonics scene, a stereo pair and positioned per-sound effects), which Kyty used to drop. They are now mixed
+  into the game sound. Launcher: global Audio settings > "3D audio objects (game's positional sounds)" switches
+  them off (`--audio-objects off`, `KYTY_AUDIO_OBJECTS=0`), and a "3D audio objects" volume slider
+  (`--audio-objects-volume`, `KYTY_AUDIO_OBJECTS_VOLUME`, 0-200%) sets their level.
+- **Louder stereo output:** on a stereo device Kyty now downmixes the game's 7.1 output itself (front at full level)
+  instead of SDL, which played it about 13 dB quieter. `KYTY_AUDIO_STEREO_DOWNMIX=0` restores SDL's downmix.
 - **Ported from chenxiao07's fork:** protection kept on remapped memory views (fixes a "frozen model" class of bugs),
   small fibers on their own stacks (Demon's Souls job-thread crashes), indirect draws' start instance (Demon's Souls
   missing pillars and rock faces), faster guest memory search while streaming, a clean process exit after a fatal
@@ -81,6 +88,8 @@ you suspect a change, and please report what it fixed.
 | `KYTY_AUDIO_DIAG` | on | `0` | Audio port open/close lines in the console (256 lines max) |
 | `KYTY_AUDIO_PROPAGATION_RENDER` | direct sound | `silent` | AudioPropagation sources play their direct sound |
 | Audio volumes | master/main/music 100%, pad speaker on PC 30% | launcher sliders, or `KYTY_AUDIO_MASTER_VOLUME`, `KYTY_AUDIO_MAIN_VOLUME`, `KYTY_AUDIO_MUSIC_VOLUME`, `KYTY_AUDIO_PAD_SPEAKER_ON_MAIN_VOLUME` (percent, 0-200) | |
+| `KYTY_AUDIO_OBJECTS` | `1` | `0`, or untick "3D audio objects" (`--audio-objects off`) | AudioOut2 3D object ports mixed into the game sound |
+| `KYTY_AUDIO_STEREO_DOWNMIX` | on | `0` | 7.1 output downmixed to stereo by Kyty, not SDL |
 
 Optional (off by default): `KYTY_WIDE_FILL_CLEAR=1`, `KYTY_GUEST_STORAGE_REPEAT=1`, `KYTY_READBACK_MERGE_GAP_KB=64`,
 and the test tool `KYTY_VRAM_LIMIT_MB=<MiB>` (imitates a
