@@ -69,12 +69,15 @@ CodegenOptions FromEnvironment() {
 	if (const auto* cap = std::getenv("KYTY_DISPATCHER_CAP"); cap != nullptr && cap[0] != '\0') {
 		options.dispatcher_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
 	}
-	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit (renderer/meshIndirect.h: GPU-converted indirect
-	// mesh draws); unset, 0 and "empty" keep the pushed-dword-only mesh draw parameters.
-	if (const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH"); mode != nullptr) {
+	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit, or unset/empty (the default, renderer/meshIndirect.h:
+	// GPU-converted indirect mesh draws); 0 and "empty" keep the pushed-dword-only mesh draw
+	// parameters.
+	{
+		const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH");
 		options.mesh_indirect_params =
-		    std::strcmp(mode, "1") == 0 || std::strcmp(mode, "on") == 0 ||
-		    std::strcmp(mode, "verify") == 0 || std::strcmp(mode, "exit") == 0;
+		    mode == nullptr || mode[0] == '\0' || std::strcmp(mode, "1") == 0 ||
+		    std::strcmp(mode, "on") == 0 || std::strcmp(mode, "verify") == 0 ||
+		    std::strcmp(mode, "exit") == 0;
 	}
 	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
 	if (const auto* mode = std::getenv("KYTY_RT_SOFTWARE");
