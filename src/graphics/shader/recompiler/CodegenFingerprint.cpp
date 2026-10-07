@@ -69,6 +69,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.single_f2i_saturation ? 1u : 0u);
 	b.U8(options.lod_stats_gate ? 1u : 0u);
 	b.U8(options.robust_buffer_loads ? 1u : 0u);
+	b.U8(options.readonly_buffers ? 1u : 0u);
 	b.U32(static_cast<uint32_t>(options.mad_mode));
 	b.U8(options.interp_modes ? 1u : 0u);
 	b.U8(options.sample_offsets ? 1u : 0u);

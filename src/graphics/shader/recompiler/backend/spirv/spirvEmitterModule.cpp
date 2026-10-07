@@ -299,6 +299,16 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
 				}
+				if (GetCodegenOptions().readonly_buffers && !state.requirements.buffer_writes &&
+				    !state.requirements.coherent_buffers) {
+					// A program that only reads its buffers says so (serbru20066666/brunoKytyPs5
+					// def478029). The AMD driver then loads a uniform address once per wave into
+					// scalar registers, as the guest's S_BUFFER_LOAD does, instead of once per lane
+					// with the address in a vector register. Coherent (polling) loads keep the
+					// buffers writable-declared so no load can be assumed loop-invariant.
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationNonWritable);
+				}
 				if (state.requirements.coherent_buffers) {
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.

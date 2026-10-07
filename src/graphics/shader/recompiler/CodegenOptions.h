@@ -73,6 +73,12 @@ struct CodegenOptions {
 	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
 	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
 	bool robust_buffer_loads = true;
+	// KYTY_READONLY_BUFFERS=0: leave the storage buffers of a program that never stores to them
+	// (no buffer store or atomic, no coherent load) without NonWritable. With it, the AMD driver
+	// loads a uniform address once per wave into scalar registers instead of once per lane
+	// (serbru20066666/brunoKytyPs5 def478029: a lighting shader of ASTRO's PLAYROOM 3.45 -> 2.76 ms
+	// on an RX 6800 XT); other drivers may use their read-only caches.
+	bool readonly_buffers = true;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
 	// KYTY_INTERP_MODES=0: interpolate every pixel input at the pixel center with the shader-wide

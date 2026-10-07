@@ -10990,6 +10990,48 @@ size_t CountSpirvOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
   return count;
 }
 
+// KYTY_READONLY_BUFFERS (CodegenOptions::readonly_buffers): a program without buffer stores or
+// atomics declares its storage buffers NonWritable; one that stores, or the switch off, does not.
+size_t CountSpirvDecoration(const std::vector<uint32_t> &binary, uint32_t decoration) {
+  constexpr uint32_t OpDecorate = 71u;
+  size_t count = 0;
+  for (size_t i = 5; i < binary.size() && (binary[i] >> 16u) != 0u; i += binary[i] >> 16u) {
+    count += (binary[i] & 0xffffu) == OpDecorate && (binary[i] >> 16u) >= 3u &&
+                     i + 2u < binary.size() && binary[i + 2u] == decoration
+                 ? 1u
+                 : 0u;
+  }
+  return count;
+}
+
+void TestReadOnlyBuffers() {
+  constexpr uint32_t NonWritable = 24u;
+  const uint32_t load_only[] = {
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 12, 0), // buffer_load_dword v0
+      EncodeDs0(0x0d), EncodeDs1(0, 0, 0),                  // ds_write_b32 v0, v0
+      0xbf810000u,
+  };
+  const uint32_t load_store[] = {
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 12, 0), // buffer_load_dword v0
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(0, 12, 0), // buffer_store_dword v0
+      0xbf810000u,
+  };
+  const auto saved   = ShaderRecompiler::GetCodegenOptions();
+  const auto compile = [&](const auto &shader, bool readonly) {
+    auto options             = saved;
+    options.readonly_buffers = readonly;
+    ShaderRecompiler::SetCodegenOptions(options);
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(result.spirv);
+    return CountSpirvDecoration(result.spirv, NonWritable);
+  };
+  Check(compile(load_only, true) == compile(load_only, false) + 1u,
+        "read-only buffers: a load-only program did not declare its buffers NonWritable");
+  Check(compile(load_store, true) == compile(load_store, false),
+        "read-only buffers: a program that stores declared its buffers NonWritable");
+}
+
 void TestGeometryOutputGuard() {
   namespace Spirv = ShaderRecompiler::Spirv;
   const auto saved = Spirv::GetHostGeometryGuard();
@@ -15116,6 +15158,7 @@ int main(int argc, char **argv) {
   TestMeshExportStorage();
   TestMeshIndirectParams();
   TestGeometryOutputGuard();
+  TestReadOnlyBuffers();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

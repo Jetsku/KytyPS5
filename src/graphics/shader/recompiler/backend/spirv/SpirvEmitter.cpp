@@ -247,6 +247,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
+				requirements.buffer_writes |=
+				    IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Read;
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
 					Fail(program, "buffer operation has invalid memory metadata");

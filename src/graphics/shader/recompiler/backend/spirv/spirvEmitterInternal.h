@@ -75,6 +75,9 @@ struct SpirvRequirements {
 	bool buffer_int64_atomics         = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	// A buffer store or atomic anywhere in the program; without one (and without coherent loads)
+	// the storage buffers are declared NonWritable (CodegenOptions::readonly_buffers).
+	bool buffer_writes                = false;
 	bool float64                      = false;
 	// S_MEMREALTIME reads the host shader clock (OpReadClockKHR, VK_KHR_shader_clock).
 	bool shader_clock                 = false;
