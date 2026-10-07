@@ -61,6 +61,10 @@ enum DrawClass : uint32_t { ClassStart, ClassContinue, ClassOther, ClassCount };
 struct Aggregate {
 	uint64_t                           draws  = 0;
 	uint64_t                           gap    = 0; // cycles since the previous commit ended
+	uint64_t                           head_self = 0; // of which: head prepared on this thread
+	uint64_t                           head_wait = 0; // of which: waiting for a worker's head
+	uint64_t                           self_draws = 0;
+	uint64_t                           wait_draws = 0;
 	std::array<uint64_t, PhaseCount>   cycles {};
 };
 
@@ -83,6 +87,10 @@ struct State {
 	uint64_t                         begin    = 0;
 	uint64_t                         last     = 0;
 	uint64_t                         gap      = 0;
+	uint64_t                         head_self = 0;
+	uint64_t                         head_wait = 0;
+	uint64_t                         pending_self = 0;
+	uint64_t                         pending_wait = 0;
 	std::array<uint64_t, PhaseCount> cycles {};
 	DrawShape                        shape;
 	// The previous recorded draw.
@@ -177,10 +185,16 @@ void Print(State& s, uint64_t now_ns, uint64_t now_tsc) {
 			total += v;
 		}
 		const double scale = ns_per_tick * 1e-3 / static_cast<double>(c.draws);
-		std::snprintf(text, sizeof(text), " | %s %" PRIu64 " (%.1f%%) us/draw %.2f gap %.2f [",
+		std::snprintf(text, sizeof(text),
+		              " | %s %" PRIu64 " (%.1f%%) us/draw %.2f gap %.2f (headself %.2f in %.0f%% headwait "
+		              "%.2f in %.0f%%) [",
 		              class_names[k], c.draws,
 		              100.0 * static_cast<double>(c.draws) / static_cast<double>(draws),
-		              static_cast<double>(total) * scale, static_cast<double>(c.gap) * scale);
+		              static_cast<double>(total) * scale, static_cast<double>(c.gap) * scale,
+		              static_cast<double>(c.head_self) * scale,
+		              100.0 * static_cast<double>(c.self_draws) / static_cast<double>(c.draws),
+		              static_cast<double>(c.head_wait) * scale,
+		              100.0 * static_cast<double>(c.wait_draws) / static_cast<double>(c.draws));
 		line += text;
 		for (size_t p = 0; p < PhaseCount; p++) {
 			std::snprintf(text, sizeof(text), "%s%s %.2f", p == 0 ? "" : " ", phase_names[p],
@@ -249,6 +263,10 @@ void BeginDraw() {
 	s.begin        = now;
 	s.last         = now;
 	s.gap          = s.previous_end != 0 ? now - s.previous_end : 0;
+	s.head_self    = s.pending_self;
+	s.head_wait    = s.pending_wait;
+	s.pending_self = 0;
+	s.pending_wait = 0;
 	s.cycles       = {};
 }
 
@@ -357,10 +375,27 @@ void EndDraw() {
 	auto& c = s.classes[klass];
 	c.draws++;
 	c.gap += s.gap;
+	c.head_self += s.head_self;
+	c.head_wait += s.head_wait;
+	c.self_draws += s.head_self != 0 ? 1u : 0u;
+	c.wait_draws += s.head_wait != 0 ? 1u : 0u;
 	for (size_t p = 0; p < PhaseCount; p++) {
 		c.cycles[p] += s.cycles[p];
 	}
 	Print(s, NowNs(), now);
+}
+
+uint64_t Now() {
+	return Enabled() ? Tsc() : 0;
+}
+
+void NoteHead(uint64_t self_cycles, uint64_t wait_cycles) {
+	if (!Enabled()) {
+		return;
+	}
+	auto& s = GetState();
+	s.pending_self += self_cycles;
+	s.pending_wait += wait_cycles;
 }
 
 void OnFrameBoundary() {

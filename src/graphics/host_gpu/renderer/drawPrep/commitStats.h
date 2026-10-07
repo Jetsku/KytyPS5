@@ -84,6 +84,10 @@ void NoteRecorded(const DrawShape& shape);
 void EndDraw();
 // The graphics processor reset that starts a guest frame.
 void OnFrameBoundary();
+// Gap attribution (before BeginDraw): the draw-prep head this commit takes was prepared on this
+// thread (self) or waited for (wait), in TSC cycles; added to the next BeginDraw's gap split.
+[[nodiscard]] uint64_t Now();
+void NoteHead(uint64_t self_cycles, uint64_t wait_cycles);
 
 // Hash helpers for building a DrawShape.
 [[nodiscard]] uint64_t Hash(const void* data, uint64_t size, uint64_t seed = 0);

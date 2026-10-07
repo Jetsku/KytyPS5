@@ -1089,11 +1089,15 @@ Engine::Slot& Engine::ReadyHead() {
 	// per-thread scratch the preparations below use are idle here.
 	EXIT_IF(Speculative());
 	auto& slot = window.HeadPayload();
+	const auto stats_start = CommitStats::Now();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
+		if (stats_start != 0) {
+			CommitStats::NoteHead(CommitStats::Now() - stats_start, 0);
+		}
 	} else if (window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
@@ -1159,6 +1163,9 @@ Engine::Slot& Engine::ReadyHead() {
 		}
 		if (stats.stolen != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
+		}
+		if (stats_start != 0) {
+			CommitStats::NoteHead(0, CommitStats::Now() - stats_start);
 		}
 	}
 	return slot;
