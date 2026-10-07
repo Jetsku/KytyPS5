@@ -3086,6 +3086,53 @@ void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size) const noexc
 #endif
 }
 
+// KYTY_BINDING_MEMO_STATS=1 (diagnostic, default off): ObtainReadBinding outcomes, one console line
+// every 10 s (GPU thread only).
+namespace {
+struct BindingMemoStats {
+	uint64_t calls = 0, no_region = 0, empty = 0, other_key = 0, signature = 0, guard = 0,
+	         epoch = 0, stream_hits = 0, cached_hits = 0, slow_stream = 0;
+	std::chrono::steady_clock::time_point last {};
+};
+bool BindingMemoStatsEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_BINDING_MEMO_STATS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+BindingMemoStats& GetBindingMemoStats() {
+	static BindingMemoStats stats;
+	return stats;
+}
+void PrintBindingMemoStats() {
+	auto& st = GetBindingMemoStats();
+	if ((st.calls & 0xffffu) != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (st.last.time_since_epoch().count() == 0) {
+		st.last = now;
+		return;
+	}
+	if (now - st.last < std::chrono::seconds(10)) {
+		return;
+	}
+	const double c = static_cast<double>(std::max<uint64_t>(1, st.calls)) / 100.0;
+	std::printf("BindingMemoStats 10s: calls %llu hits stream %.1f%% cached %.1f%% | misses: no-region "
+	            "%.1f%% empty %.1f%% other-key %.1f%% signature %.1f%% guard %.1f%% epoch %.1f%% | slow "
+	            "path stream result %.1f%%\n",
+	            static_cast<unsigned long long>(st.calls), static_cast<double>(st.stream_hits) / c,
+	            static_cast<double>(st.cached_hits) / c, static_cast<double>(st.no_region) / c,
+	            static_cast<double>(st.empty) / c, static_cast<double>(st.other_key) / c,
+	            static_cast<double>(st.signature) / c, static_cast<double>(st.guard) / c,
+	            static_cast<double>(st.epoch) / c, static_cast<double>(st.slow_stream) / c);
+	std::fflush(stdout);
+	st      = {};
+	st.last = now;
+}
+} // namespace
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint64_t size,
                                                             BufferId id) {
 	// KYTY_BINDING_EPOCH_MEMO (bufferCache.h).
@@ -3116,15 +3163,30 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	}
 	const auto epoch  = SyncEpoch::Current();
 	const auto before = m_memory_tracker.RangeSignature(vaddr, size);
+	BindingMemoStats* stats = nullptr;
+	if (BindingMemoStatsEnabled()) [[unlikely]] {
+		stats = &GetBindingMemoStats();
+		stats->calls++;
+	}
 	if (before == 0 || memo.vaddr != vaddr || memo.size != size ||
 	    memo.kind == BindingMemoKind::Empty) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSlot);
+		if (stats != nullptr) {
+			(before == 0 ? stats->no_region
+			             : memo.kind == BindingMemoKind::Empty ? stats->empty : stats->other_key)++;
+		}
 	} else if (memo.signature != before) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSignature);
+		if (stats != nullptr) {
+			stats->signature++;
+		}
 	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
 	           memo.guard != (stream ? m_scheduler.CurrentTick()
 	                                 : m_bda_structure_epoch.load(std::memory_order_acquire))) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissGuard);
+		if (stats != nullptr) {
+			stats->guard++;
+		}
 	} else {
 		bool cross = false;
 		if (memo.epoch != epoch) {
@@ -3140,6 +3202,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			        !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
 			        m_memory_tracker.RangeSignature(vaddr, size) == before;
 			if (!cross) {
+				if (stats != nullptr) {
+					stats->epoch++;
+				}
 				if (!stream && m_binding_memo_cross) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCrossRejects);
 					m_binding_memo_totals.cross_rejects++;
@@ -3161,6 +3226,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 				}
 			}
 			std::pair<Buffer*, uint64_t> hit {nullptr, memo.offset};
+			if (stats != nullptr) {
+				(stream ? stats->stream_hits : stats->cached_hits)++;
+				PrintBindingMemoStats();
+			}
 			if (stream) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoStreamHits);
 				m_binding_memo_totals.stream_hits++;
@@ -3180,6 +3249,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	}
 	BufferId   obtained {};
 	const auto result = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
+	if (stats != nullptr) {
+		stats->slow_stream += result.first == &m_stream_buffer ? 1u : 0u;
+		PrintBindingMemoStats();
+	}
 	RecordBinding(vaddr, size, epoch, before, result, obtained);
 	return result;
 }
