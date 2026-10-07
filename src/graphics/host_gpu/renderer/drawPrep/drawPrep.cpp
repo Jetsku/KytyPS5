@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
+#include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
@@ -1346,6 +1347,7 @@ void Engine::Commit(Slot& slot) {
 	PrintDrawPrepSummary();
 	DrawRun::PrintSummary();
 	TexelImageLookup::PrintSummary();
+	XFrameReuse::PrintSummary();
 }
 
 void Engine::NoteFence() {

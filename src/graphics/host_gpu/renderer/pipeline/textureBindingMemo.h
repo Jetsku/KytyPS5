@@ -152,6 +152,12 @@ public:
 	// keep their image and description). `apply` false only checks (verify mode).
 	[[nodiscard]] bool TryRepeatResolve(TextureCache& cache, std::span<TextureBinding> bindings,
 	                                    bool apply);
+	// Diagnostics (KYTY_XFRAME_REUSE): why TryRepeatResolve fails for `bindings` (checked in the
+	// same order): 0 it would not, 1 DCC certificate, 2 the entry no longer holds the binding's tag,
+	// 3 the image is gone, unregistered, has a stencil association or awaits a rebind, 4 residency,
+	// 5 the first page's structure version moved, 6 alias partner, 7 DCC pages.
+	[[nodiscard]] uint32_t RepeatResolveFailure(TextureCache& cache,
+	                                            std::span<const TextureBinding> bindings);
 	// RebindImages for such a stage: true when, for every binding, RebindImages would neither
 	// resolve it again nor do anything but TryAcquireView's hit (sampled bindings only). With
 	// `apply` each hit's touch and view, in binding order.

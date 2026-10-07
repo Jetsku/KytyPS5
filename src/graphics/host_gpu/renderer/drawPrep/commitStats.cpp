@@ -55,6 +55,8 @@ uint64_t NowNs() {
 }
 
 constexpr size_t PhaseCount = static_cast<size_t>(Phase::Count);
+constexpr size_t SubCount   = static_cast<size_t>(Sub::Count);
+constexpr size_t ItemCount  = static_cast<size_t>(Item::Count);
 
 enum DrawClass : uint32_t { ClassStart, ClassContinue, ClassOther, ClassCount };
 
@@ -66,6 +68,8 @@ struct Aggregate {
 	uint64_t                           self_draws = 0;
 	uint64_t                           wait_draws = 0;
 	std::array<uint64_t, PhaseCount>   cycles {};
+	std::array<uint64_t, SubCount>     sub {};
+	std::array<uint64_t, ItemCount>    items {};
 };
 
 constexpr uint32_t RunBuckets = 8; // 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65+
@@ -92,6 +96,8 @@ struct State {
 	uint64_t                         pending_self = 0;
 	uint64_t                         pending_wait = 0;
 	std::array<uint64_t, PhaseCount> cycles {};
+	std::array<uint64_t, SubCount>   sub {};
+	std::array<uint64_t, ItemCount>  items {};
 	DrawShape                        shape;
 	// The previous recorded draw.
 	bool      previous_valid = false;
@@ -116,6 +122,14 @@ struct State {
 	uint64_t why_structure = 0;
 	uint64_t why_dynamic   = 0;
 	uint64_t why_writes    = 0;
+	// Starts whose pipeline and structure (DrawShape) an earlier draw of the same rendering
+	// instance, or of the same frame, recorded; and whose structure inputs the previous frame or the
+	// one before had.
+	std::unordered_set<uint64_t> instance_shapes, frame_shapes;
+	uint64_t                     instance_serial    = 0;
+	uint64_t                     start_inst_repeat  = 0;
+	uint64_t                     start_frame_repeat = 0;
+	uint64_t                     start_xf_struct12  = 0;
 	// Cross-frame.
 	std::vector<uint64_t>        frame_bind;
 	std::vector<uint64_t>        frame_struct;
@@ -201,6 +215,24 @@ void Print(State& s, uint64_t now_ns, uint64_t now_tsc) {
 			              static_cast<double>(c.cycles[p]) * scale);
 			line += text;
 		}
+		line += "] sub[";
+		static const char* const sub_names[SubCount] = {"textures", "samplers", "views", "colors",
+		                                                "depth", "acqcolor", "acqdepth", "push",
+		                                                "dynamic", "begin", "acqcand", "runrecord"};
+		for (size_t p = 0; p < SubCount; p++) {
+			std::snprintf(text, sizeof(text), "%s%s %.2f", p == 0 ? "" : " ", sub_names[p],
+			              static_cast<double>(c.sub[p]) * scale);
+			line += text;
+		}
+		static const char* const item_names[ItemCount] = {
+		    "textures", "samplers", "set-current", "set-history", "set-miss", "set-repeated",
+		    "color-hit", "color-miss", "depth-hit", "depth-miss", "target-repeat", "target-lookup"};
+		line += "] items[";
+		for (size_t p = 0; p < ItemCount; p++) {
+			std::snprintf(text, sizeof(text), "%s%s %.2f", p == 0 ? "" : " ", item_names[p],
+			              static_cast<double>(c.items[p]) / static_cast<double>(c.draws));
+			line += text;
+		}
 		line += "]";
 	}
 	const auto cont = std::max<uint64_t>(1, s.classes[ClassContinue].draws);
@@ -220,6 +252,11 @@ void Print(State& s, uint64_t now_ns, uint64_t now_tsc) {
 	              "dynamic %.0f%% writes %.0f%%",
 	              pct(s.why_first, starts), pct(s.why_instance, starts), pct(s.why_pipeline, starts),
 	              pct(s.why_structure, starts), pct(s.why_dynamic, starts), pct(s.why_writes, starts));
+	line += text;
+	std::snprintf(text, sizeof(text),
+	              " | start repeats: instance %.1f%% frame %.1f%% xframe struct f-1|2 %.1f%%",
+	              pct(s.start_inst_repeat, starts), pct(s.start_frame_repeat, starts),
+	              pct(s.start_xf_struct12, starts));
 	line += text;
 	line += " | runs (len:runs/draws)";
 	static const char* const bucket_names[RunBuckets] = {"1",    "2",     "3-4",   "5-8",
@@ -244,6 +281,7 @@ void Print(State& s, uint64_t now_ns, uint64_t now_tsc) {
 	s.same_buffers = s.same_push = s.same_tables = s.same_index = s.same_vertex = s.same_all = 0;
 	s.why_first = s.why_instance = s.why_pipeline = s.why_structure = s.why_dynamic =
 	    s.why_writes                                                 = 0;
+	s.start_inst_repeat = s.start_frame_repeat = s.start_xf_struct12 = 0;
 	s.frames = s.xf_draws = s.xf_bind_1 = s.xf_bind_12 = s.xf_struct_1 = s.xf_struct_12 =
 	    s.xf_bind_in                                                    = 0;
 	s.interval_ns  = now_ns;
@@ -268,6 +306,8 @@ void BeginDraw() {
 	s.pending_self = 0;
 	s.pending_wait = 0;
 	s.cycles       = {};
+	s.sub          = {};
+	s.items        = {};
 }
 
 void Mark(Phase phase) {
@@ -357,6 +397,19 @@ void EndDraw() {
 		if (klass == ClassStart) {
 			EndRun(s);
 		}
+		const uint64_t shape_key = b.structure ^ (b.pipeline * 0x9e3779b97f4a7c15ull);
+		if (b.rendering_serial != s.instance_serial) {
+			s.instance_shapes.clear();
+			s.instance_serial = b.rendering_serial;
+		}
+		if (klass == ClassStart) {
+			s.start_inst_repeat += s.instance_shapes.contains(shape_key) ? 1u : 0u;
+			s.start_frame_repeat += s.frame_shapes.contains(shape_key) ? 1u : 0u;
+			s.start_xf_struct12 +=
+			    s.struct_1.contains(b.struct_input) || s.struct_2.contains(b.struct_input) ? 1u : 0u;
+		}
+		s.instance_shapes.insert(shape_key);
+		s.frame_shapes.insert(shape_key);
 		s.run_length++;
 		s.previous       = b;
 		s.previous_valid = true;
@@ -382,7 +435,30 @@ void EndDraw() {
 	for (size_t p = 0; p < PhaseCount; p++) {
 		c.cycles[p] += s.cycles[p];
 	}
+	for (size_t p = 0; p < SubCount; p++) {
+		c.sub[p] += s.sub[p];
+	}
+	for (size_t p = 0; p < ItemCount; p++) {
+		c.items[p] += s.items[p];
+	}
 	Print(s, NowNs(), now);
+}
+
+void AddSub(Sub sub, uint64_t cycles) {
+	auto& s = GetState();
+	if (s.active) {
+		s.sub[static_cast<size_t>(sub)] += cycles;
+	}
+}
+
+void AddItems(Item item, uint64_t count) {
+	if (!Enabled()) {
+		return;
+	}
+	auto& s = GetState();
+	if (s.active) {
+		s.items[static_cast<size_t>(item)] += count;
+	}
 }
 
 uint64_t Now() {
@@ -413,6 +489,7 @@ void OnFrameBoundary() {
 	s.frame_bind.clear();
 	s.frame_struct.clear();
 	s.bind_frame_set.clear();
+	s.frame_shapes.clear();
 	// A frame boundary is never inside a run of one rendering instance's draws.
 	EndRun(s);
 	s.previous_valid = false;

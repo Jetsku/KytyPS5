@@ -587,6 +587,47 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 	return true;
 }
 
+uint32_t TextureBindingMemo::RepeatResolveFailure(TextureCache&                    cache,
+                                                 std::span<const TextureBinding> bindings) {
+	if (!m_entries) {
+		return 2;
+	}
+	for (const auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % SlotCount()];
+		if (binding.memo_tag != 0 && entry.tag == binding.memo_tag && entry.dcc &&
+		    !cache.MetadataStateHolds(entry.dcc_noop)) {
+			return 1;
+		}
+	}
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % SlotCount()];
+		if (binding.memo_tag == 0 || entry.tag != binding.memo_tag || entry.image != binding.image_id) {
+			return 2;
+		}
+		if (entry.null_image) {
+			continue;
+		}
+		const auto* image = cache.m_slot_images.try_get(entry.image);
+		if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind) {
+			return 3;
+		}
+		if (entry.requested_first < image->resident_first) {
+			return 4;
+		}
+		if (cache.PageVersion(entry.page) != entry.page_version) {
+			return 5;
+		}
+		if (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) {
+			return 6;
+		}
+		if (entry.dcc && !cache.MetadataPagesHold(entry.dcc_noop)) {
+			return 7;
+		}
+	}
+	return 0;
+}
+
 bool TextureBindingMemo::TryRepeatViews(TextureCache& cache, std::span<TextureBinding> bindings,
                                         bool apply) {
 	if (!m_entries) {

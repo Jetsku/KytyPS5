@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -1338,14 +1339,20 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 		return false;
 	}
 	auto&      totals  = m_draw_sequence_totals;
+	bool       xframe  = false; // the set came from the cross-frame store
 	const auto matches = [&](const ShaderRecompiler::IR::CompiledShaderInfo*  set_program,
 	                         const std::vector<ShaderRecompiler::IR::DescriptorValue>& words) {
 		return set_program == &program && std::ranges::equal(words, snapshot.images);
 	};
-	if (!matches(prepared.texture_program, prepared.texture_words)) {
+	if (matches(prepared.texture_program, prepared.texture_words)) {
+		CommitStats::AddItems(CommitStats::Item::TexSetCurrent, 1);
+	} else {
 		auto&      history = prepared.texture_history;
 		const auto found   = std::ranges::find_if(
             history, [&](const auto& set) { return matches(set.program, set.words); });
+		CommitStats::AddItems(found == history.end() ? CommitStats::Item::TexSetMiss
+		                                             : CommitStats::Item::TexSetHistory,
+		                      1);
 		if (found == history.end()) {
 			// New words: the current set becomes the most recent earlier one, and the caller
 			// resolves into the oldest one's vectors (their capacity is reused).
@@ -1355,29 +1362,51 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 				std::swap(history.front().words, prepared.texture_words);
 				std::swap(history.front().images, prepared.images);
 			}
-			prepared.texture_program = nullptr;
-			return false;
+			// KYTY_XFRAME_REUSE (drawPrep/xframeReuse.h): the set that fell out of the history
+			// (now in prepared) moves into the cross-frame store, and a stored set of these words
+			// becomes the current one, validated below like the current set's. Otherwise the caller
+			// resolves into the vectors the store gave back.
+			if (!XFrameReuse::Enabled() || !TakeStoredTextureSet(program, snapshot, prepared)) {
+				prepared.texture_program = nullptr;
+				return false;
+			}
+			xframe = true;
+		} else {
+			// An earlier set of these words becomes the current one (the current set takes its
+			// place); its bindings are validated below like the current set's.
+			std::swap(found->program, prepared.texture_program);
+			std::swap(found->words, prepared.texture_words);
+			std::swap(found->images, prepared.images);
+			totals.texture_history_hits++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureHistoryHits);
 		}
-		// An earlier set of these words becomes the current one (the current set takes its
-		// place); its bindings are validated below like the current set's.
-		std::swap(found->program, prepared.texture_program);
-		std::swap(found->words, prepared.texture_words);
-		std::swap(found->images, prepared.images);
-		totals.texture_history_hits++;
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureHistoryHits);
 	}
 	if (prepared.images.empty()) {
 		return false;
 	}
 	auto&      texture_cache = m_context.GetTextureCache();
-	const bool verify        = DrawSequenceVerifyMode() != 0;
+	const bool xframe_verify = xframe && XFrameReuse::VerifyMode();
+	const bool verify        = DrawSequenceVerifyMode() != 0 || xframe_verify;
 	if (!m_texture_memo.TryRepeatResolve(texture_cache, prepared.images, !verify)) {
 		totals.texture_misses++;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureMisses);
+		if (xframe && XFrameReuse::StatsEnabled()) {
+			XFrameReuse::GetTotals()
+			    .failures[m_texture_memo.RepeatResolveFailure(texture_cache, prepared.images) & 7u]
+			    .fetch_add(1, std::memory_order_relaxed);
+		}
 		return false;
+	}
+	if (xframe) {
+		auto& xframe_totals = XFrameReuse::GetTotals();
+		xframe_totals.repeated.fetch_add(1, std::memory_order_relaxed);
+		xframe_totals.bindings.fetch_add(prepared.images.size(), std::memory_order_relaxed);
+		// Verify mode: RebindImages compares the views it acquires with the entries' views.
+		prepared.xframe_verify_views = xframe_verify;
 	}
 	totals.texture_repeats++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureRepeats);
+	CommitStats::AddItems(CommitStats::Item::TexSetRepeated, 1);
 	const auto storage = [](const TextureBinding& binding) {
 		return binding.desc.type == TextureCache::BindingType::Storage;
 	};
@@ -1392,7 +1421,13 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 			const auto claimed_image = binding.image_id;
 			const auto claimed_tag   = binding.memo_tag;
 			ResolveTexture(program.info.images[i], snapshot.images[i], binding);
-			if (binding.image_id != claimed_image || binding.memo_tag != claimed_tag) {
+			if (xframe_verify) {
+				XFrameReuse::GetTotals().verify_checks.fetch_add(1, std::memory_order_relaxed);
+				if (binding.image_id != claimed_image || binding.memo_tag != claimed_tag) {
+					XFrameReuse::ReportMismatch(binding.image_id != claimed_image ? "image" : "memo entry",
+					                            i);
+				}
+			} else if (binding.image_id != claimed_image || binding.memo_tag != claimed_tag) {
 				totals.verify_mismatches++;
 				ReportDrawSequenceMismatch("a repeated stage texture binding");
 			}
@@ -1418,6 +1453,30 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 	return true;
 }
 
+bool RenderExecutor::TakeStoredTextureSet(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                                          PreparedBindings&                               prepared) {
+	auto& totals = XFrameReuse::GetTotals();
+	totals.new_sets.fetch_add(1, std::memory_order_relaxed);
+	if (!m_xframe_sets) {
+		m_xframe_sets = std::make_unique<XFrameTextureSets>(XFrameReuse::SlotCount());
+	}
+	auto& store = *m_xframe_sets;
+	if (prepared.texture_program != nullptr) {
+		store.Put(prepared.texture_program, prepared.texture_words, prepared.images);
+		totals.stored.fetch_add(1, std::memory_order_relaxed);
+	}
+	const std::span<const ShaderRecompiler::IR::DescriptorValue> words(snapshot.images);
+	const bool found = store.Take(&program, words, XFrameTextureSets::Hash(&program, words),
+	                              prepared.texture_program, prepared.texture_words, prepared.images);
+	totals.used.store(store.Used(), std::memory_order_relaxed);
+	totals.evictions.store(store.Evictions(), std::memory_order_relaxed);
+	if (found) {
+		totals.found.fetch_add(1, std::memory_order_relaxed);
+	}
+	return found;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared, DrawPrep::StagePlan* plan,
                                      bool keep_images) {
@@ -1426,6 +1485,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
+	prepared.xframe_verify_views = false;
 	prepared.plan             = plan;
 	prepared.plan_shader_data = false;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
@@ -1440,6 +1500,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const bool verify = plan != nullptr && DrawPrep::BindingsVerifyMode() != 0;
 	// KYTY_DRAW_RUN continuation: the texture and sampler bindings are the previous draw's (the
 	// same program, T# and S# words; RenderExecutor::DrawRunCandidate).
+	CommitStats::SubScope texture_scope(CommitStats::Sub::Textures);
 	if (!keep_images && !RepeatStageTextures(program, snapshot, prepared)) {
 		// KYTY_DRAW_PREP_BINDINGS textures: the memo hashes the preparing worker computed.
 		const auto count  = static_cast<uint32_t>(program.info.images.size());
@@ -1513,6 +1574,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
 	}
+	texture_scope.Stop();
+	CommitStats::SubScope sampler_scope(CommitStats::Sub::Samplers);
 	// KYTY_DRAW_PREP_BINDINGS samplers: the handles the worker found (never evicted); a null one is
 	// resolved here as before.
 	const bool plan_samplers = plan != nullptr && plan->samplers_valid &&
@@ -1542,6 +1605,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		DrawPrep::GetBindingTotals().samplers_used.fetch_add(planned_samplers,
 		                                                      std::memory_order_relaxed);
 	}
+	sampler_scope.Stop();
 	// KYTY_DRAW_PREP_BINDINGS userdata: the worker's shader data (user dwords and mip-statistics
 	// fields, memory offsets zero) is taken as it is; RebindBuffers only packs the offsets in.
 	const auto dwords = program.bindings.ShaderDataDwords();
@@ -1883,7 +1947,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	    std::ranges::none_of(program.info.images, [](const auto& resource) {
 		    return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic;
 	    })) {
-		const bool verify = DrawSequenceVerifyMode() != 0;
+		const bool verify = DrawSequenceVerifyMode() != 0 || prepared.xframe_verify_views;
 		if (m_texture_memo.TryRepeatViews(texture_cache, images, !verify)) {
 			m_draw_sequence_totals.view_repeats++;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceViewRepeats);
@@ -2001,7 +2065,13 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 	if (verify_views) {
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			if (images[i].image_view != m_claimed_views[i]) {
+			if (prepared.xframe_verify_views) {
+				// KYTY_XFRAME_REUSE=verify: the views of a set taken from the cross-frame store.
+				XFrameReuse::GetTotals().verify_checks.fetch_add(1, std::memory_order_relaxed);
+				if (images[i].image_view != m_claimed_views[i]) {
+					XFrameReuse::ReportMismatch("view", i);
+				}
+			} else if (images[i].image_view != m_claimed_views[i]) {
 				m_draw_sequence_totals.verify_mismatches++;
 				ReportDrawSequenceMismatch("a repeated stage texture view");
 			}
@@ -2027,11 +2097,14 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_bvh) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDraws);
 	}
-	for (auto* stage: stages) {
-		if (keep_images) {
-			break;
+	{
+		const CommitStats::SubScope views(CommitStats::Sub::Views);
+		for (auto* stage: stages) {
+			if (keep_images) {
+				break;
+			}
+			RebindImages(*stage);
 		}
-		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {

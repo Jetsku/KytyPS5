@@ -913,6 +913,12 @@ add_executable(texel_image_lookup_tests EXCLUDE_FROM_ALL
 target_link_libraries(texel_image_lookup_tests common fmt::fmt)
 target_include_directories(texel_image_lookup_tests PRIVATE ${inc_headers})
 
+add_executable(texture_set_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TextureSetCacheTests.cpp"
+)
+target_link_libraries(texture_set_cache_tests common fmt::fmt xxhash)
+target_include_directories(texture_set_cache_tests PRIVATE ${inc_headers})
+
 add_executable(image_cache_gc_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImageCacheGcPolicyTests.cpp"
 )
@@ -1066,6 +1072,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME texel_image_lookup COMMAND $<TARGET_FILE:texel_image_lookup_tests>)
+	add_test(NAME texture_set_cache COMMAND $<TARGET_FILE:texture_set_cache_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME image_clear_range COMMAND $<TARGET_FILE:image_clear_range_tests>)
 	add_test(NAME clear_register_decode COMMAND $<TARGET_FILE:clear_register_decode_tests>)
