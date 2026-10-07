@@ -639,7 +639,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            const ComputePipelineCreateHook* create_hook) {
+                            const ComputePipelineCreateHook* create_hook,
+                            vk::Result* result_out) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -690,6 +691,24 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (result_out != nullptr) {
+		// The caller can live without this pipeline (an optional ray-tracing kernel): report the
+		// failure instead of stopping the emulator, and give back what was created for it.
+		*result_out = result;
+		if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+			if (result == vk::Result::eSuccess) {
+				*result_out = vk::Result::eErrorUnknown;
+			}
+			if (pipeline.pipeline != nullptr) {
+				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+				pipeline.pipeline = nullptr;
+			}
+			ReleasePipelineLayout(graphics, pipeline.pipeline_layout, pipeline.descriptor_set_layout);
+			pipeline.pipeline_layout       = nullptr;
+			pipeline.descriptor_set_layout = nullptr;
+		}
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

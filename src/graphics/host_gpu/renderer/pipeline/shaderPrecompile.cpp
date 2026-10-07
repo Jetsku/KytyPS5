@@ -435,6 +435,21 @@ ShaderJournal::Stats ShaderJournal::GetStats() {
 ShaderPrecompiler::ShaderPrecompiler(const ShaderJournal& journal, Settings settings, CompileFn compile)
     : m_journal(journal), m_settings(std::move(settings)), m_compile(std::move(compile)) {
 	m_total = m_journal.Entries().size();
+	if (m_settings.priority_source && m_total != 0) {
+		const auto& sources = m_journal.Sources();
+		const auto& entries = m_journal.Entries();
+		std::vector<char> priority(sources.size(), 0);
+		for (size_t i = 0; i < sources.size(); i++) priority[i] = m_settings.priority_source(sources[i]) ? 1 : 0;
+		m_order.reserve(entries.size());
+		for (uint32_t i = 0; i < entries.size(); i++) {
+			if (entries[i].source < priority.size() && priority[entries[i].source] != 0) m_order.push_back(i);
+		}
+		const auto first = m_order.size();
+		for (uint32_t i = 0; i < entries.size(); i++) {
+			if (entries[i].source >= priority.size() || priority[entries[i].source] == 0) m_order.push_back(i);
+		}
+		if (first == 0) m_order.clear(); // nothing to move
+	}
 	if (m_settings.max_entries != 0) m_total = std::min<uint64_t>(m_total, m_settings.max_entries);
 	m_begin_ns    = NowNs();
 	m_reported_ns = m_begin_ns;
@@ -524,7 +539,7 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 	while (!m_stop.load(std::memory_order_acquire)) {
 		const auto next = m_next.fetch_add(1, std::memory_order_relaxed);
 		if (next >= m_total) break;
-		const auto& entry = entries[next];
+		const auto& entry = entries[m_order.empty() ? next : m_order[next]];
 		Outcome     outcome = Outcome::Failed;
 		try {
 			outcome = m_compile(sources[entry.source], entry);

@@ -77,7 +77,14 @@ CodegenOptions FromEnvironment() {
 		    std::strcmp(mode, "verify") == 0 || std::strcmp(mode, "exit") == 0;
 	}
 	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
-	options.rt_software  = EnvFlag("KYTY_RT_SOFTWARE", options.rt_software);
+	if (const auto* mode = std::getenv("KYTY_RT_SOFTWARE");
+	    mode != nullptr && mode[0] != '\0' && std::strcmp(mode, "auto") != 0) {
+		options.rt_software      = std::strcmp(mode, "0") != 0;
+		options.rt_software_auto = false;
+	}
+	if (const auto* mode = std::getenv("KYTY_RT_FUNCTION"); mode != nullptr && mode[0] != '\0') {
+		options.rt_function = std::min<uint32_t>(static_cast<uint32_t>(std::strtoul(mode, nullptr, 10)), 2u);
+	}
 	options.rt_type6     = EnvFlag("KYTY_RT_TYPE6", options.rt_type6);
 	options.bda_writes        = EnvFlag("KYTY_BDA_WRITES", options.bda_writes);
 	if (const auto* budget = std::getenv("KYTY_RT_NODE_BUDGET");
@@ -117,6 +124,19 @@ bool LoopGuardApplies(uint64_t shader_hash) {
 
 void SetCodegenOptions(const CodegenOptions& options) {
 	Storage() = options;
+}
+
+namespace {
+thread_local int g_rt_function_override = -1;
+} // namespace
+
+uint32_t RtFunctionMode() {
+	return g_rt_function_override >= 0 ? static_cast<uint32_t>(g_rt_function_override)
+	                                   : Storage().rt_function;
+}
+
+void SetThreadRtFunctionOverride(int mode) {
+	g_rt_function_override = mode;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

@@ -27,6 +27,14 @@ struct BvhOperands {
 // t_denom, I_num, J_num} and a box pointer the sorted hit children, exactly as the instruction.
 uint32_t EmitBvhNodeTest(ValueEmitContext& ctx, const BvhOperands& operands);
 
+// KYTY_RT_FUNCTION (default 1): defines the module's single software BVH node test function
+// (state.bvh_node_test_function): the node test of EmitBvhNodeTest with its operands as parameters,
+// called by every IMAGE_BVH*_INTERSECT_RAY site instead of being inlined at each. A shader with n
+// sites then carries one copy of the 300k-word traversal helpers instead of n. Does nothing for a
+// program without software BVH instructions, or with KYTY_RT_FUNCTION=0 (sites inline the test).
+// Emitted before the guest function (like get_bda_pointer); needs info.uses_dma.
+void DefineBvhNodeTestFunction(EmitterState& state);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 
 #endif

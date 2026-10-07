@@ -497,6 +497,16 @@ void GraphicContext::ClearRetiredImages() {
 	m_retired_image_bytes = 0;
 }
 
+uint64_t GraphicContext::ReleaseRetainedMemory() {
+	uint64_t bytes = 0;
+	{
+		std::scoped_lock lock(m_retired_image_mutex);
+		bytes = m_retired_image_bytes;
+	}
+	ClearRetiredImages();
+	return bytes;
+}
+
 void GraphicContext::TrimRetiredImages() {
 	const auto idle = RetiredImageIdleLimit();
 	if (idle.count() == 0 || allocator == nullptr) {

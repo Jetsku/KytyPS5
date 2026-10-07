@@ -372,8 +372,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	// A software ray-tracing kernel whose pipeline is still being built, or any RT kernel after one
+	// failed to build (rtSession.h), is skipped: the lighting it feeds lags or stays as it was.
+	auto* pipeline_or_null =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_or_null == nullptr) {
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_or_null;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	// The native dispatch size bounds workgroup ids for write-range proofs.
@@ -506,7 +513,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_or_null =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_or_null == nullptr) {
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_or_null;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.

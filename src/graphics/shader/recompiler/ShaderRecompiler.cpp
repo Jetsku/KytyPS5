@@ -26,6 +26,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <mutex>
@@ -964,6 +966,46 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return result;
 }
 
+// A shader with BVH instructions: its module size on the log (one line per shader) and, with
+// KYTY_RT_DUMP_DIR=<dir>, the module itself (rt_<stage>_<hash>.spv) for spirv-val and spirv-opt.
+static void NoteBvhKernelModule(const IR::Program& ir, const std::vector<uint32_t>& spirv,
+                                const ShaderStageInputInfo& input_info) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> noted;
+	{
+		std::scoped_lock lock(mutex);
+		if (!noted.insert(ir.shader_hash ^ (static_cast<uint64_t>(ir.stage) << 56) ^ spirv.size()).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "KYTY_RT_SOFTWARE: {} shader 0x{:016x} SPIR-V module is {} words (KYTY_RT_FUNCTION={}).\n",
+	    StageName(ir.stage), ir.shader_hash, spirv.size(), GetCodegenOptions().rt_function));
+	const auto* dump_dir = std::getenv("KYTY_RT_DUMP_DIR");
+	if (dump_dir == nullptr || dump_dir[0] == '\0') {
+		return;
+	}
+	const auto path = std::string(dump_dir) +
+	                  fmt::format("/rt_{}_{:016x}_{}.spv", StageName(ir.stage), ir.shader_hash,
+	                              spirv.size());
+	if (std::FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+		std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), file);
+		std::fclose(file);
+	}
+	if (RtFunctionMode() == 0) {
+		return;
+	}
+	// The same module with the node test inlined at each instruction (KYTY_RT_FUNCTION=0), for
+	// comparisons: rt_<stage>_<hash>_<words>.inline.spv.
+	SetThreadRtFunctionOverride(0);
+	auto inlined = Spirv::EmitProgram(ir, input_info);
+	SetThreadRtFunctionOverride(-1);
+	if (std::FILE* file = std::fopen((path + ".inline.spv").c_str(), "wb"); file != nullptr) {
+		std::fwrite(inlined.data(), sizeof(uint32_t), inlined.size(), file);
+		std::fclose(file);
+	}
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
@@ -1002,6 +1044,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	if (ir.info.uses_bvh) {
+		NoteBvhKernelModule(ir, spirv, options.input_info);
+	}
 	CompileResult result;
 	if (options.plain_mip_stats_variant && IR::UsesMipStats(ir)) {
 		result.spirv_plain = Spirv::EmitProgram(ir, options.input_info, false);

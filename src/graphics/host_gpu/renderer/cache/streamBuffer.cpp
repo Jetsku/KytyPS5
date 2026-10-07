@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/ramStats.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -10,8 +11,11 @@
 #include "graphics/host_gpu/vramStats.h"
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
+#include <string>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -127,11 +131,37 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	const auto        create        = [&] {
+		return static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	};
+	auto result = create();
 	if (result != vk::Result::eSuccess) {
+		// Out of budget (VRAM full: a big texture pack, a smaller card). Not fatal: release what is
+		// only retained for reuse and retry, then retry past the budget. Windows (WDDM) then pages
+		// the allocation to system memory, slower but running; only a refusal of that stops here.
 		graphics.LogMemoryBudget();
+		const auto released = graphics.ReleaseRetainedMemory();
+		result              = create();
+		bool over_budget    = false;
+		if (result != vk::Result::eSuccess) {
+			allocation_info.flags &= ~static_cast<VmaAllocationCreateFlags>(
+			    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+			result      = create();
+			over_budget = result == vk::Result::eSuccess;
+		}
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Kyty VRAM: a {}-byte buffer did not fit the memory budget; released {} retained bytes "
+			    "and retried: {}\n",
+			    size, released,
+			    result != vk::Result::eSuccess
+			        ? vk::to_string(result)
+			        : std::string(over_budget ? "created past the budget (may page to system memory)"
+			                                  : "created")));
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 

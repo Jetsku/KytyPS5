@@ -169,6 +169,11 @@ public:
 		uint64_t max_entries = 0;
 		// Workers run below normal priority (the game's threads come first).
 		bool     low_priority = true;
+		// Entries of the sources this accepts are replayed first, in file order, then the rest in
+		// file order (also under max_entries: the cap drops the last of the rest). Called once per
+		// source, from the constructor. The software ray-tracing kernels use it: their pipelines
+		// take seconds to build and the game needs them at its first lighting pass.
+		std::function<bool(const ShaderJournal::Source&)> priority_source;
 		// Called on each worker thread when it starts (name, priority).
 		std::function<void(uint32_t worker)> thread_init;
 		std::function<void(const std::string&)> log;
@@ -212,6 +217,8 @@ private:
 	uint64_t             m_total = 0;
 	uint64_t             m_begin_ns = 0;
 
+	// Replay order (indices into the journal's entries) when priority_source reordered them.
+	std::vector<uint32_t> m_order;
 	std::atomic<uint64_t> m_next {0};
 	std::atomic<bool>     m_stop {false};
 	std::atomic<uint64_t> m_done {0}, m_compiled {0}, m_present {0}, m_skipped {0}, m_failed {0};

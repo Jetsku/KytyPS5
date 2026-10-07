@@ -20,11 +20,11 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 28 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders, dispatcher_cap,
-// rt_node_budget.
+// Members: 29 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders, dispatcher_cap,
+// rt_node_budget, rt_function.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 80, "CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 88, "CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -96,6 +96,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.fold_lane_masks ? 1u : 0u);
 	b.U8(options.rt_stub ? 1u : 0u);
 	b.U8(options.rt_software ? 1u : 0u);
+	b.U32(options.rt_function);
 	b.U8(options.rt_type6 ? 1u : 0u);
 	b.U8(options.bda_writes ? 1u : 0u);
 	b.U32(options.rt_node_budget);

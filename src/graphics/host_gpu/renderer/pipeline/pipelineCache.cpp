@@ -10,6 +10,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
+#include "common/sehGuard.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -23,6 +24,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/rtSession.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderCodeSnapshot.h"
@@ -134,6 +136,19 @@ std::string PipelineCacheTitleId() {
 		return {};
 	}
 	return title_id;
+}
+
+// A hint, not a decoder: whether a code word is shaped like IMAGE_BVH_INTERSECT_RAY or
+// IMAGE_BVH64_INTERSECT_RAY (MIMG family, opcode 0xe6/0xe7 with the opcode's top bit in bit 0). A
+// literal can look like one; the only use is ordering the shader precompile replay.
+bool MayContainBvhIntersect(std::span<const uint32_t> code) {
+	for (const auto word: code) {
+		const auto opcode = (word >> 18u) & 0x7fu;
+		if ((word >> 26u) == 0x3cu && (word & 1u) != 0 && (opcode == 0x66u || opcode == 0x67u)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 template <typename... Args>
@@ -2907,6 +2922,9 @@ struct PipelineCache::ProgramCache {
 
 	// Shader precompile (shaderPrecompile.h; KYTY_SHADER_PRECOMPILE): null when off.
 	ShaderJournal* journal = nullptr;
+	// Called by the precompile replay for each software RT compute program it publishes: starts the
+	// background build of the kernel's pipeline, so that the game finds it built. May be empty.
+	std::function<void(const ShaderComputeInputInfo&, const ShaderProgram&)> rt_prewarm;
 
 	template <typename InputInfo>
 	static constexpr ShaderJournal::Kind JournalKind() {
@@ -2998,11 +3016,19 @@ struct PipelineCache::ProgramCache {
 		};
 		ShaderReadAttempt attempt;
 		scratch.published_new = false;
-		CompileAndPublish(params, input_info, entry.push_data_cursor, key, runtime,
-		                  ShaderRecompiler::IR::ThreadEvaluationScratch(), scratch, prep, attempt, true,
-		                  false, true);
+		const auto* published =
+		    CompileAndPublish(params, input_info, entry.push_data_cursor, key, runtime,
+		                      ShaderRecompiler::IR::ThreadEvaluationScratch(), scratch, prep,
+		                      attempt, true, false, true);
 		if (!scratch.published_new) return Outcome::Skipped;
 		g_compile_totals.replayed.fetch_add(1, std::memory_order_relaxed);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (rt_prewarm && published != nullptr && published->program.info.uses_bvh) {
+				uint32_t cursor = entry.push_data_cursor;
+				const auto program = Bind(*published, input_info, prep, cursor);
+				rt_prewarm(input_info, program);
+			}
+		}
 		return Outcome::Compiled;
 	}
 
@@ -4021,6 +4047,215 @@ struct PipelineCache::PrefetchState {
 	PipelineCompileQueue queue;
 };
 
+// Background pipeline builds of the software ray-tracing kernels (TryGetComputePipeline, rtSession.h).
+// A kernel's pipeline is built on a worker, outside m_mutex and off the command processor; the CP
+// publishes it into m_compute_pipelines the first time it sees the build done.
+struct PipelineCache::RtState {
+	struct Built {
+		std::unique_ptr<Pipeline> pipeline;
+		std::string               error; // not empty: the build failed
+		uint64_t                  ns          = 0;
+		uint64_t                  shader_hash = 0;
+		uint64_t                  program_id  = 0;
+	};
+	struct Job {
+		std::shared_future<std::shared_ptr<Built>> future;
+		uint64_t                                   ticket       = 0;
+		uint64_t                                   shader_hash  = 0;
+		uint64_t                                   requested_ns = 0;
+		bool                                       asked        = false; // a dispatch has asked
+		bool                                       consumed     = false; // published or failed
+		bool                                       logged_skip  = false;
+	};
+	struct BuildContext {
+		PipelineCache*                cache  = nullptr;
+		const ShaderComputeInputInfo* info   = nullptr;
+		vk::ShaderModule              module = nullptr;
+		Built*                        built  = nullptr;
+		vk::Result                    result = vk::Result::eSuccess;
+	};
+
+	static uint32_t WaitBudgetMs() {
+		if (EnvU64("KYTY_RT_PIPELINE_ASYNC", 1) == 0) return UINT32_MAX;
+		return static_cast<uint32_t>(std::min<uint64_t>(EnvU64("KYTY_RT_PIPELINE_WAIT_MS", 250), 600000));
+	}
+
+	explicit RtState(PipelineCache& owner)
+	    : cache(owner), wait_ms(WaitBudgetMs()),
+	      queue(static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 2), 1, 4)), 64) {
+		PipelineCacheLog("Software RT pipelines: built on {} background thread(s); a dispatch waits at most {} "
+		                 "for its kernel's pipeline, then is skipped until it is ready "
+		                 "(KYTY_RT_PIPELINE_WAIT_MS; KYTY_RT_PIPELINE_ASYNC=0 waits for it)",
+		                 std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 2), 1, 4),
+		                 wait_ms == UINT32_MAX ? std::string("for ever") : std::to_string(wait_ms) + " ms");
+	}
+
+	// The driver call, kept free of objects with destructors that matter: a structured exception
+	// inside the driver unwinds past this frame (Common::CallCatchingStructuredException).
+	static void BuildSafely(void* raw) {
+		auto& context = *static_cast<BuildContext*>(raw);
+		try {
+			context.built->pipeline = std::make_unique<Pipeline>();
+			CreatePipelineInternal(context.cache->m_graphics, *context.built->pipeline, *context.info,
+			                       context.module, context.cache->m_driver_cache, nullptr,
+			                       &context.result);
+		} catch (const std::exception& error) {
+			context.built->error = error.what();
+			context.result       = vk::Result::eErrorUnknown;
+		} catch (...) {
+			context.built->error = "unknown exception";
+			context.result       = vk::Result::eErrorUnknown;
+		}
+	}
+
+	static const ShaderRecompiler::IR::ResourceSnapshot& EmptyResources() {
+		static const ShaderRecompiler::IR::ResourceSnapshot empty {};
+		return empty;
+	}
+
+	// Under `mutex`. The job of kernel `id`, started when new; null when the queue refused it.
+	Job* Request(uint64_t id, const ShaderComputeInputInfo& input, const ShaderProgram& program) {
+		if (const auto found = jobs.find(id); found != jobs.end()) return &found->second;
+		auto& job        = jobs[id];
+		job.shader_hash  = input.stage.program->shader_hash;
+		job.ticket       = ++next_ticket;
+		job.requested_ns = CompileClockNs();
+		auto promise     = std::make_shared<std::promise<std::shared_ptr<Built>>>();
+		job.future       = promise->get_future().share();
+		// The program (and so its module) belongs to the program cache until it is destroyed, after
+		// Shutdown has joined the workers; only what the pipeline needs is copied.
+		auto info             = std::make_shared<ShaderComputeInputInfo>(input);
+		info->stage.resources = &EmptyResources();
+		const auto module      = program.module;
+		const auto shader_hash = job.shader_hash;
+		const bool queued      = queue.Submit(
+            [this, promise, info, module, id, shader_hash] {
+                Profiler::SetThreadName("RtPipeline");
+                auto built         = std::make_shared<Built>();
+                built->shader_hash = shader_hash;
+                built->program_id  = id;
+                HangWatchdog::Scope compile("rt-compute-pipeline", shader_hash, id);
+                const auto          begin = CompileClockNs();
+                BuildContext        context {&cache, info.get(), module, built.get()};
+                const auto fault = Common::CallCatchingStructuredException(&BuildSafely, &context);
+                built->ns        = CompileClockNs() - begin;
+                if (fault != 0) {
+                    built->error = fmt::format("a structured exception (0x{:08x}) inside the driver", fault);
+                } else if (context.result != vk::Result::eSuccess) {
+                    if (built->error.empty()) {
+                        built->error = "vkCreateComputePipelines returned " + vk::to_string(context.result);
+                    }
+                } else if (built->pipeline == nullptr || built->pipeline->pipeline == nullptr) {
+                    built->error = "no pipeline was created";
+                }
+                promise->set_value(std::move(built));
+            },
+            job.ticket);
+		if (!queued) {
+			jobs.erase(id);
+			return nullptr;
+		}
+		totals.requested.fetch_add(1, std::memory_order_relaxed);
+		return &jobs[id];
+	}
+
+	// The CP is done with the kernel's build (under `mutex`): publish the pipeline, or turn software
+	// RT off for the session. Null on failure.
+	Pipeline* Finish(uint64_t id, Job& job, Built& built) {
+		job.consumed         = true;
+		const auto waited_ms = (CompileClockNs() - job.requested_ns) / 1'000'000;
+		if (!built.error.empty()) {
+			totals.failed.fetch_add(1, std::memory_order_relaxed);
+			if (RtSession::MarkFailed()) {
+				PipelineCacheLog("Software RT is turned off for the rest of this session: the pipeline of "
+				                 "compute shader 0x{:016x} could not be built ({}). Dispatches of ray tracing "
+				                 "kernels are skipped from now on, so the tiled lighting and GI passes leave "
+				                 "their outputs untouched (black lighting, as with KYTY_RT_SOFTWARE=0). "
+				                 "Set KYTY_RT_SOFTWARE=0 to skip them from the start.",
+				                 job.shader_hash, built.error);
+			}
+			return nullptr;
+		}
+		Common::LockGuard lock(cache.m_mutex);
+		auto [slot, inserted] = cache.m_compute_pipelines.emplace(id, std::move(built.pipeline));
+		if (!inserted) return slot->second.get();
+		GpuOpProfiler::RegisterComputePipeline(slot->second->pipeline, id);
+		totals.published.fetch_add(1, std::memory_order_relaxed);
+		totals.build_ns.fetch_add(built.ns, std::memory_order_relaxed);
+		AtomicMax(totals.max_build_ns, built.ns);
+		g_compile_totals.cs_pipelines.fetch_add(1, std::memory_order_relaxed);
+		g_compile_totals.cs_pipeline_ns.fetch_add(built.ns, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ComputePipelinesCreated);
+		if (HangTrace::Enabled()) {
+			HangTrace::RecordCompile({.kind        = HangTrace::CompileKind::ComputePipeline,
+			                          .stage       = "cs",
+			                          .guest_hash  = job.shader_hash,
+			                          .id          = id,
+			                          .pipeline_ns = built.ns,
+			                          .total_ns    = built.ns,
+			                          .detail      = "rt-background"});
+		}
+		cache.NotePipelineCreated(built.ns);
+		PipelineCacheLog("Software RT pipeline of compute shader 0x{:016x} built in {:.0f} ms, ready {} ms "
+		                 "after it was first needed",
+		                 job.shader_hash, static_cast<double>(built.ns) / 1.0e6, waited_ms);
+		return slot->second.get();
+	}
+
+	// Exit: no new builds start, running ones finish, and pipelines nobody published are destroyed.
+	void Shutdown() {
+		if (stopped.exchange(true)) return;
+		queue.DropPending();
+		queue.Stop();
+		std::scoped_lock lock(mutex);
+		for (auto& [id, job]: jobs) {
+			(void)id;
+			if (job.consumed || !job.future.valid() ||
+			    job.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+				continue;
+			}
+			auto built = job.future.get();
+			if (built != nullptr && built->pipeline != nullptr) {
+				if (built->pipeline->pipeline != nullptr) {
+					cache.m_graphics.device.destroyPipeline(built->pipeline->pipeline, nullptr);
+				}
+				ReleasePipelineLayout(cache.m_graphics, built->pipeline->pipeline_layout,
+				                      built->pipeline->descriptor_set_layout);
+			}
+		}
+		const auto totals_now = Totals();
+		if (totals_now.requested != 0) {
+			PipelineCacheLog("Software RT pipelines: {} requested, {} published, {} failed; the command processor "
+			                 "waited {} time(s) for {:.1f} ms in all and skipped {} dispatch(es); builds took "
+			                 "{:.1f} ms (longest {:.1f} ms)",
+			                 totals_now.requested, totals_now.published, totals_now.failed, totals_now.waited,
+			                 static_cast<double>(totals_now.wait_ns) / 1.0e6, totals_now.skipped_dispatches,
+			                 static_cast<double>(totals_now.build_ns) / 1.0e6,
+			                 static_cast<double>(totals_now.max_build_ns) / 1.0e6);
+		}
+	}
+
+	struct AtomicTotals {
+		std::atomic<uint64_t> requested {0}, published {0}, failed {0}, skipped_dispatches {0}, waited {0};
+		std::atomic<uint64_t> wait_ns {0}, build_ns {0}, max_build_ns {0};
+	};
+	RtPipelineTotals Totals() const {
+		const auto get = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+		return {get(totals.requested), get(totals.published), get(totals.failed),
+		        get(totals.skipped_dispatches), get(totals.waited), get(totals.wait_ns),
+		        get(totals.build_ns), get(totals.max_build_ns)};
+	}
+
+	PipelineCache&                    cache;
+	const uint32_t                    wait_ms;
+	std::mutex                        mutex;
+	std::unordered_map<uint64_t, Job> jobs;
+	uint64_t                          next_ticket = 0;
+	std::atomic<bool>                 stopped {false};
+	AtomicTotals                      totals;
+	PipelineCompileQueue              queue;
+};
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
       m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
@@ -4072,6 +4307,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 
 PipelineCache::~PipelineCache() {
 	StopShaderPrecompile();
+	if (m_rt != nullptr) m_rt->Shutdown();
 	m_program_cache->StopBackgroundChecks();
 	if (m_prefetch != nullptr) m_prefetch->Stop();
 	LogCompileTotals();
@@ -4519,6 +4755,14 @@ void PipelineCache::InitializeShaderPrecompile() {
 	replay.threads     = static_cast<uint32_t>(std::clamp<uint64_t>(EnvU64("KYTY_SHADER_PRECOMPILE_THREADS", 2), 1, 8));
 	replay.max_entries = EnvU64("KYTY_SHADER_PRECOMPILE_MAX", 30000);
 	replay.thread_init = [](uint32_t) { Profiler::SetThreadName("ShaderPrecompile"); };
+	// The software ray-tracing kernels first (and their pipelines, started as each is published):
+	// a cold pipeline build takes seconds, and the game needs them at its first lighting pass.
+	replay.priority_source = [](const ShaderJournal::Source& source) {
+		return source.kind == ShaderJournal::Kind::Compute && MayContainBvhIntersect(source.code);
+	};
+	m_program_cache->rt_prewarm = [this](const ShaderComputeInputInfo& info, const ShaderProgram& program) {
+		PrewarmComputePipeline(info, program);
+	};
 	replay.log         = [](const std::string& message) { PipelineCacheLog("{}", message); };
 	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
 	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
@@ -5631,4 +5875,114 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	if (fast_result.snapshot == nullptr) NotePipelineCreated(create_ns);
 	return *iter->second;
 }
+
+PipelineCache::RtState& PipelineCache::Rt() {
+	std::call_once(m_rt_once, [this] { m_rt = std::make_unique<RtState>(*this); });
+	return *m_rt;
+}
+
+PipelineCache::RtPipelineTotals PipelineCache::GetRtPipelineTotals() const {
+	return m_rt != nullptr ? m_rt->Totals() : RtPipelineTotals {};
+}
+
+void PipelineCache::PrewarmComputePipeline(const ShaderComputeInputInfo& input_info,
+                                           const ShaderProgram&          compute_program) {
+	if (!compute_program || input_info.stage.program == nullptr ||
+	    !input_info.stage.program->info.uses_bvh || RtSession::Failed()) {
+		return;
+	}
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_compute_pipelines.contains(compute_program.id)) return;
+	}
+	auto&            rt = Rt();
+	std::scoped_lock lock(rt.mutex);
+	if (!rt.stopped.load(std::memory_order_acquire)) {
+		(void)rt.Request(compute_program.id, input_info, compute_program);
+	}
+}
+
+PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                              const ShaderProgram& compute_program) {
+	EXIT_IF(!compute_program || !input_info.stage);
+	if (!input_info.stage.program->info.uses_bvh) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+	const auto id = compute_program.id;
+	auto&      rt = Rt();
+	if (RtSession::Failed()) {
+		rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	{
+		Common::LockGuard lock(m_mutex);
+		if (const auto found = m_compute_pipelines.find(id); found != m_compute_pipelines.end()) {
+			return found->second.get();
+		}
+	}
+	std::shared_future<std::shared_ptr<RtState::Built>> future;
+	uint64_t                                            ticket = 0;
+	bool                                                first  = false;
+	uint64_t                                            shader_hash = input_info.stage.program->shader_hash;
+	{
+		std::scoped_lock lock(rt.mutex);
+		auto*            job = rt.Request(id, input_info, compute_program);
+		if (job == nullptr) {
+			rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
+			return nullptr;
+		}
+		if (job->consumed) {
+			// Built and published or failed earlier: the map lookup above missed, so it failed.
+			rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
+			return nullptr;
+		}
+		first       = !job->asked;
+		job->asked  = true;
+		future      = job->future;
+		ticket      = job->ticket;
+	}
+	bool ready = future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+	switch (RtSession::DecideDispatch(false, ready, first, rt.wait_ms)) {
+		case RtSession::DispatchAction::Run: break;
+		case RtSession::DispatchAction::WaitBounded: {
+			rt.queue.Promote(ticket);
+			const auto begin = CompileClockNs();
+			if (rt.wait_ms == UINT32_MAX) {
+				future.wait();
+			} else {
+				(void)future.wait_for(std::chrono::milliseconds(rt.wait_ms));
+			}
+			const auto waited = CompileClockNs() - begin;
+			rt.totals.waited.fetch_add(1, std::memory_order_relaxed);
+			rt.totals.wait_ns.fetch_add(waited, std::memory_order_relaxed);
+			AddCompileStall(waited);
+			FlushCompileStall();
+			ready = future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+			break;
+		}
+		case RtSession::DispatchAction::Skip: break;
+	}
+	if (!ready) {
+		rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
+		std::scoped_lock lock(rt.mutex);
+		if (const auto job = rt.jobs.find(id); job != rt.jobs.end() && !job->second.logged_skip) {
+			job->second.logged_skip = true;
+			PipelineCacheLog("Software RT: the pipeline of compute shader 0x{:016x} is still being built; "
+			                 "its dispatches are skipped until it is ready (the lighting it feeds lags)",
+			                 shader_hash);
+		}
+		return nullptr;
+	}
+	std::scoped_lock lock(rt.mutex);
+	auto             job = rt.jobs.find(id);
+	if (job == rt.jobs.end()) return nullptr;
+	if (job->second.consumed) {
+		Common::LockGuard map_lock(m_mutex);
+		const auto        found = m_compute_pipelines.find(id);
+		return found != m_compute_pipelines.end() ? found->second.get() : nullptr;
+	}
+	auto built = future.get();
+	return rt.Finish(id, job->second, *built);
+}
+
 } // namespace Libs::Graphics

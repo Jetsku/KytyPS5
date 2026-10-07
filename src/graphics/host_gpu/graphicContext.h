@@ -209,6 +209,9 @@ struct GraphicContext {
 	// KYTY_NATIVE_IMAGE_POOL_IDLE_MS (vma.cpp): destroys retained native images unused that long
 	// (GPU thread, from the garbage collector; rate-limited).
 	void                   TrimRetiredImages();
+	// An allocation failed for lack of device memory: destroys what is only retained for reuse
+	// (the native image pool) before the caller retries. Returns the bytes released.
+	uint64_t               ReleaseRetainedMemory();
 	// KYTY_TEXTURE_SPARSE_RESIDENCY (sparse_residency_image_enabled): creates `info` as a sparse
 	// residency image with memory bound behind levels >= first_level only (a single-layer,
 	// single-sample 2D image whose format, usage and flags support sparse residency; false and
