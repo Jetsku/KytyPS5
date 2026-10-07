@@ -1,5 +1,6 @@
 #include "common/hangWatchdog.h"
 
+#include "common/hostException.h"
 #include "common/liveSwitch.h"
 #include "kytyGitVersion.h"
 
@@ -281,6 +282,7 @@ std::string Snapshot() {
 // plus the matching executable/PDB let the next test resolve uninstrumented library waits too.
 uint32_t Unwind(CONTEXT* context, uint64_t live, uint64_t copy, uint64_t size, uint64_t* frames) {
 	uint32_t count = 0;
+	Common::HostException::EnterProbe();
 	__try {
 		while (count < 48) {
 			frames[count++]    = context->Rip;
@@ -305,6 +307,7 @@ uint32_t Unwind(CONTEXT* context, uint64_t live, uint64_t copy, uint64_t size, u
 		}
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
 	}
+	Common::HostException::LeaveProbe();
 	return count;
 }
 void WriteStacks(FILE* file) {

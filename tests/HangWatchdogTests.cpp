@@ -1,4 +1,5 @@
 #include "common/hangWatchdog.h"
+#include "common/hostException.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -6,6 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 void Check(bool ok, const char *message) {
@@ -165,6 +169,40 @@ void AutoDetection() {
   Check(!IsNvidiaBlackwell(0x1002, 0x744c, "AMD Radeon RX 7900 XTX"), "AMD");
   Check(!IsNvidiaBlackwell(0x8086, 0x2c05, "RTX 5090 lookalike"), "vendor first");
 }
+#ifdef _WIN32
+// The emulator's host fault handler ends the process for a fault it cannot resolve. A fault inside
+// EnterProbe/LeaveProbe (the watchdog's stack walk through a corrupt guest frame) must reach the
+// walker's own __except instead.
+std::atomic<int> g_terminal_faults{0};
+bool TerminalHandler(const Common::HostException::ExceptionInfo &) {
+  g_terminal_faults++;
+  return false;
+}
+// Called, not inlined: clang-cl's __try catches faults raised in callees (as RtlVirtualUnwind's
+// are), not a load inside the guarded block itself.
+__declspec(noinline) uint64_t Read(const volatile uint64_t *address) { return *address; }
+bool ReadFaults(const volatile uint64_t *address) {
+  __try {
+    (void)Read(address);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return true;
+  }
+  return false;
+}
+void ProbeFaults() {
+  Check(Common::HostException::InstallHandler(TerminalHandler), "install host fault handler");
+  const auto *bad = reinterpret_cast<const volatile uint64_t *>(0x6c5f3262);
+  Common::HostException::EnterProbe();
+  Common::HostException::EnterProbe();
+  Check(ReadFaults(bad), "nested probe fault reaches __except");
+  Common::HostException::LeaveProbe();
+  Check(ReadFaults(bad), "probe fault reaches __except");
+  Common::HostException::LeaveProbe();
+  Check(g_terminal_faults.load() == 0, "probe faults skip the terminating handler");
+  Check(ReadFaults(bad), "unprobed fault still reaches __except after the handler declines");
+  Check(g_terminal_faults.load() == 1, "unprobed fault reaches the terminating handler");
+}
+#endif
 } // namespace
 int main(int argc, char **argv) {
   if (argc > 1 && std::string_view(argv[1]) == "--fatal-shutdown") {
@@ -245,6 +283,9 @@ int main(int argc, char **argv) {
   PublicationStress();
   ConcurrentPackets();
   AutoDetection();
+#ifdef _WIN32
+  ProbeFaults();
+#endif
   HangWatchdog::NoteFatal("first mock fatal", "source/renderer.cpp", 53);
   HangWatchdog::NoteFatal("later cleanup failure", "source/cleanup.cpp", 99);
   const auto fatal = HangWatchdog::SnapshotForTest();

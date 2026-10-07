@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/threadSampler.h"
 
 #include "common/common.h"
+#include "common/hostException.h"
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
@@ -70,6 +71,7 @@ void RebaseRegisters(CONTEXT& context, uint64_t live, uint64_t copy, uint64_t si
 // cannot hold objects with destructors.
 uint32_t UnwindCopy(CONTEXT* context, uint64_t live, uint64_t copy, uint64_t size, uint64_t* frames) {
 	uint32_t count = 0;
+	Common::HostException::EnterProbe();
 	__try {
 		while (count < MaxFrames) {
 			frames[count++]    = context->Rip;
@@ -97,6 +99,7 @@ uint32_t UnwindCopy(CONTEXT* context, uint64_t live, uint64_t copy, uint64_t siz
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
 		// A corrupt frame ends the stack; the frames before it stay.
 	}
+	Common::HostException::LeaveProbe();
 	return count;
 }
 

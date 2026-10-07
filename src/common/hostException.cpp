@@ -82,6 +82,16 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static thread_local uint32_t g_probe_depth = 0;
+
+void EnterProbe() {
+	g_probe_depth++;
+}
+
+void LeaveProbe() {
+	g_probe_depth--;
+}
+
 // Fills the platform-neutral description of an access violation or illegal instruction.
 static bool DescribeException(PEXCEPTION_POINTERS exception, ExceptionInfo& info) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
@@ -137,7 +147,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	}
 
 	ExceptionInfo info {};
-	if (!DescribeException(exception, info)) {
+	if (g_probe_depth > 0 || !DescribeException(exception, info)) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
@@ -384,5 +394,10 @@ bool InstallFirstAccessHandler(Handler handler) {
 	return false;
 #endif
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void EnterProbe() {}
+void LeaveProbe() {}
+#endif
 
 } // namespace Common::HostException
