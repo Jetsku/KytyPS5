@@ -3605,11 +3605,12 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+				std::printf("Occlusion queries: treated as always visible (performance mode). If objects "
+				            "show through walls, turn on accurate occlusion queries in the launcher "
+				            "(--gpu-occlusion on, KYTY_GPU_OCCLUSION=1).\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
+			// Performance mode (KYTY_GPU_OCCLUSION=0): publish an always-visible result. The
 			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
 			// ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;

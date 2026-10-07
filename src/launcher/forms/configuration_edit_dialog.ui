@@ -279,6 +279,12 @@
           <property name="text"><string>Auto-hide cursor</string></property>
          </widget>
         </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_gpu_occlusion">
+          <property name="toolTip"><string>Off (default): occlusion queries report everything as visible, which is much faster in heavy levels but may draw objects or effects that the game hides behind walls. On: the GPU counts visible samples as on the console (slower; fixes rare visibility issues).</string></property>
+          <property name="text"><string>Accurate occlusion queries (slower; fixes rare visibility issues)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

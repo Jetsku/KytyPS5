@@ -125,6 +125,9 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --gpu-occlusion <on|off>             Accurate GPU occlusion queries (on) or always visible\n"
+	         "                                       (off, faster). Overrides KYTY_GPU_OCCLUSION (the\n"
+	         "                                       bundled preset: off).\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -432,6 +435,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-occlusion") {
+			bool on = false;
+			if (!ParseBool(value, on)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			// The renderer reads KYTY_GPU_OCCLUSION once, at the first occlusion query.
+#ifdef _WIN32
+			_putenv_s("KYTY_GPU_OCCLUSION", on ? "1" : "0");
+#else
+			setenv("KYTY_GPU_OCCLUSION", on ? "1" : "0", 1);
+#endif
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

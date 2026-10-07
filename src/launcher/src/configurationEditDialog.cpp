@@ -139,6 +139,8 @@ static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
 	for (int row = 1; row <= 4; row++) {
 		ui.audioLayout->setRowVisible(row, visible);
 	}
+	// The occlusion mode is global too (graphics row 9).
+	ui.graphicsLayout->setRowVisible(ui.checkBox_gpu_occlusion, visible);
 }
 
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
@@ -243,6 +245,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	for (const auto& mix: AudioMixSliders(*m_ui)) {
 		mix.slider->setValue(info.audio_mix.*mix.field);
 	}
+	m_ui->checkBox_gpu_occlusion->setChecked(info.gpu_occlusion_accurate);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -455,6 +458,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		for (const auto& mix: AudioMixSliders(ui)) {
 			info.audio_mix.*mix.field = mix.slider->value();
 		}
+		info.gpu_occlusion_accurate = ui.checkBox_gpu_occlusion->isChecked();
 	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());

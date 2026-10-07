@@ -322,7 +322,7 @@ void ConfigurationListWidget::WriteSettings() {
 	s->beginGroup(CONF_GLOBAL);
 	m_global_info.WriteSettings(s.get());
 	m_global_info.controller.WriteSettings(s.get());
-	m_global_info.audio_mix.WriteSettings(s.get());
+	m_global_info.WriteGlobalOnlySettings(s.get());
 	s->endGroup();
 
 	s->remove(CONF_SECTION_NAME);
@@ -367,7 +367,7 @@ void ConfigurationListWidget::ReadSettings() {
 		m_global_info.ReadSettings(s.get());
 	}
 	m_global_info.controller.ReadSettings(s.get());
-	m_global_info.audio_mix.ReadSettings(s.get());
+	m_global_info.ReadGlobalOnlySettings(s.get());
 	s->endGroup();
 
 	qDeleteAll(m_custom_infos);
@@ -420,8 +420,7 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	const auto* custom = m_custom_infos.value(item.GetInfo().game_path);
 	info->CopyGameInfoFrom(item.GetInfo());
 	info->CopyEmulatorSettingsFrom(custom != nullptr ? *custom : m_global_info);
-	info->controller = m_global_info.controller;
-	info->audio_mix  = m_global_info.audio_mix;
+	info->CopyGlobalOnlySettingsFrom(m_global_info);
 	if (custom != nullptr && !custom->elf.isEmpty()) {
 		info->elf = custom->elf;
 	}
@@ -800,8 +799,7 @@ void ConfigurationListWidget::delete_configuartion() {
 void ConfigurationListWidget::edit_global_settings() {
 	Configuration info;
 	info.CopyEmulatorSettingsFrom(m_global_info);
-	info.controller = m_global_info.controller;
-	info.audio_mix  = m_global_info.audio_mix;
+	info.CopyGlobalOnlySettingsFrom(m_global_info);
 	info.name = tr("Global settings");
 
 	ConfigurationEditDialog dlg(info, this);
@@ -812,8 +810,7 @@ void ConfigurationListWidget::edit_global_settings() {
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
-		m_global_info.controller     = info.controller;
-		m_global_info.audio_mix      = info.audio_mix;
+		m_global_info.CopyGlobalOnlySettingsFrom(info);
 		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
 		const bool game_dirs_changed = game_dirs != m_game_dirs;
 		m_game_dirs                  = game_dirs;

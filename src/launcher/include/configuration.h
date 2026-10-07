@@ -141,6 +141,23 @@ public:
 	ControllerSettings controller;
 	// So do the audio mix levels.
 	AudioMixSettings audio_mix;
+	// And the occlusion mode: false = the bundled preset's (performance: always visible),
+	// true = accurate GPU occlusion queries (--gpu-occlusion on).
+	bool gpu_occlusion_accurate = false;
+
+	void WriteGlobalOnlySettings(QSettings* s) const {
+		audio_mix.WriteSettings(s);
+		s->setValue("gpu_occlusion_accurate", gpu_occlusion_accurate);
+	}
+	void ReadGlobalOnlySettings(QSettings* s) {
+		audio_mix.ReadSettings(s);
+		gpu_occlusion_accurate = s->value("gpu_occlusion_accurate", false).toBool();
+	}
+	void CopyGlobalOnlySettingsFrom(const Configuration& other) {
+		controller             = other.controller;
+		audio_mix              = other.audio_mix;
+		gpu_occlusion_accurate = other.gpu_occlusion_accurate;
+	}
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
