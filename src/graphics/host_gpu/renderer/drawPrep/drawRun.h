@@ -123,6 +123,20 @@ extern Live::Switch g_push;    // KYTY_DRAW_RUN_PUSH
 // clock tower level brackets most draws with an occlusion dump pair and a WRITE_DATA.
 // KYTY_DRAW_RUN_QUIET_OPS=0: every such operation ends the run again.
 [[nodiscard]] bool QuietOpsEnabled();
+// KYTY_DRAW_RUN_INDIRECT (default on): a native indirect draw with a prepared slot
+// (KYTY_DRAW_PREP_INDIRECT) is an engine commit. It may continue a run and seed the next one, and
+// it takes its slot's binding plan without the vertex ranges (planned from placeholder counts).
+// A continuation that would need the argument barrier (which ends rendering) falls back late.
+// Astro Bot's Ape Escape level issues about 2,300 single-record indirect draws per frame, each of
+// which used to take the whole serial path and end the run for the draw after it.
+// KYTY_DRAW_RUN_INDIRECT=0: an indirect draw is never a commit and ends the run.
+[[nodiscard]] bool IndirectRunsEnabled();
+// KYTY_DRAW_RUN_QUIET_SYNTHETIC=1 (default off: not yet measured in game; needs
+// KYTY_DRAW_RUN_QUIET_OPS): with KYTY_GPU_OCCLUSION=0 an occlusion dump is a CPU write of an always-visible result (and NoteCpWrite), which is what a
+// quiet CPU WRITE_DATA does, so it does not end a run either. Ape Escape with occlusion off issues
+// about 1,500 such dumps per frame between otherwise continuable draws.
+// Unset or 0: a synthetic dump ends the run.
+[[nodiscard]] bool QuietSyntheticEnabled();
 // what: a static name of the work, for the 10-second line's "activity by" attribution.
 void NoteForeignActivity(const char* what = "other") noexcept;
 [[nodiscard]] uint64_t ActivityEpoch() noexcept;

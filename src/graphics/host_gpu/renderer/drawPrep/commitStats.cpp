@@ -26,6 +26,10 @@ bool ReadEnabled() {
 	const auto* value = std::getenv("KYTY_CP_COMMIT_STATS");
 	return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
+bool ReadIndirectOnly() {
+	const auto* value = std::getenv("KYTY_CP_COMMIT_STATS");
+	return value != nullptr && std::strcmp(value, "indirect") == 0;
+}
 } // namespace Detail
 
 uint64_t Hash(const void* data, uint64_t size, uint64_t seed) {

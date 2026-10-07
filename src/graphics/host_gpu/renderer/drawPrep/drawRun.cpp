@@ -96,6 +96,22 @@ bool QuietOpsEnabled() {
 	return enabled;
 }
 
+bool QuietSyntheticEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_SYNTHETIC");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool IndirectRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_INDIRECT");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 uint64_t ActivityEpoch() noexcept {
 	return g_activity.load(std::memory_order_relaxed);
 }

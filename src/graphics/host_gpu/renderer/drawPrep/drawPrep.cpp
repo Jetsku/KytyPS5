@@ -1195,13 +1195,29 @@ void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& dra
 	        m_workers->window.Head() != position);
 	auto& slot     = ReadyHead();
 	auto& executor = m_renderer.GetRenderExecutor();
-	// Only the programs are offered: the binding plan's vertex ranges come from counts this draw
-	// does not have, and the draw is never a draw-run commit.
-	slot.plan.Reset();
+	// KYTY_DRAW_RUN_INDIRECT (drawRun.h): an engine commit with the slot's run key and binding
+	// plan, but not the plan's vertex ranges, which come from the placeholder counts. Otherwise only
+	// the programs are offered and the draw is never a draw-run commit.
+	const bool commit = DrawRun::IndirectRunsEnabled();
+	if (commit && slot.plan.valid) {
+		slot.plan.vertex_ranges.valid = false;
+	} else {
+		slot.plan.Reset();
+	}
 	executor.m_prepared_draw       = &slot.prepared;
-	executor.m_binding_plan        = nullptr;
+	executor.m_binding_plan        = slot.plan.valid ? &slot.plan : nullptr;
 	executor.m_binding_plan_active = false;
+	executor.m_run_key             = commit ? slot.run_key : 0;
+	executor.m_in_engine_commit    = commit;
+	CommitStats::BeginDraw();
 	draw();
+	CommitStats::EndDraw();
+	executor.m_in_engine_commit = false;
+	executor.m_run_key          = 0;
+	if (slot.plan.valid) {
+		CountCommittedPlan(executor.m_binding_plan_active);
+		slot.plan.Reset();
+	}
 	if (executor.m_prepared_draw != nullptr) {
 		// The draw returned before preparing its programs.
 		executor.m_prepared_draw = nullptr;
@@ -1271,7 +1287,9 @@ void PrintDrawPrepSummary() {
 
 void Engine::Commit(Slot& slot) {
 	Profiler::ScopedFrameWait commit_time(Profiler::FrameWait::DrawPrepCommit);
-	CommitStats::BeginDraw();
+	if (!CommitStats::IndirectOnly()) {
+		CommitStats::BeginDraw();
+	}
 	auto&      scheduler = m_renderer.GetCommandScheduler();
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto previous  = scheduler.BindRegisters(slot.registers.context,

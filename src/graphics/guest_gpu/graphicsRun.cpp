@@ -2518,6 +2518,10 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 		return;
 	}
 	g_cp_op_outcome = indexed ? "DrawIndirect cpu indexed" : "DrawIndirect cpu auto";
+	// The CPU path reads the (GPU-written) arguments: other command-processor work for a run.
+	if (DrawRun::Enabled()) {
+		DrawRun::NoteForeignActivity("DrawIndirect cpu");
+	}
 
 	m_pending_num_instances.clear();
 	if (!indexed) {
@@ -4011,15 +4015,23 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 	// An occlusion dump that keeps the rendering instance (KYTY_OCCLUSION_SPLIT) records only query
 	// commands: ExecEventWrite notes the activity when it ends the instance or waits instead.
 	// KYTY_DRAW_RUN_QUIET_OPS: so does ExecWriteData for a WRITE_DATA done on the GPU timeline.
+	// KYTY_DRAW_RUN_QUIET_SYNTHETIC: so does a synthetic occlusion dump (KYTY_GPU_OCCLUSION=0), a
+	// CPU write of an always-visible result exactly like a CPU WRITE_DATA.
+	const bool occlusion_dump =
+	    kind == OpKind::EventWrite &&
+	    static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u;
 	const bool quiet =
 	    DrawRun::QuietOpsEnabled() &&
 	    (kind == OpKind::WriteData ||
-	     (kind == OpKind::EventWrite &&
-	      static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u &&
-	      OcclusionCounter::Enabled() && OcclusionCounter::SplitEnabled()));
+	     (occlusion_dump && OcclusionCounter::Enabled() && OcclusionCounter::SplitEnabled()) ||
+	     (occlusion_dump && !OcclusionCounter::Enabled() && DrawRun::QuietSyntheticEnabled()));
+	// KYTY_DRAW_RUN_INDIRECT: so does a prepared single-record indirect draw (an engine commit).
+	const bool indirect_commit =
+	    kind == OpKind::DrawIndirect && DrawRun::IndirectRunsEnabled() &&
+	    (static_cast<const CpSeq::DrawIndirectOp*>(payload)->flags & CpSeq::IndirectFlagPrepared) != 0;
 	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
 	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch &&
-	    !quiet) {
+	    !quiet && !indirect_commit) {
 		DrawRun::NoteForeignActivity(
 		    kind == OpKind::EventWrite
 		        ? EventWriteActivityName(static_cast<const CpSeq::EventWriteOp*>(payload)->event_type)
