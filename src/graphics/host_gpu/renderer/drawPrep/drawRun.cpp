@@ -96,12 +96,12 @@ bool QuietOpsEnabled() {
 	return enabled;
 }
 
+// KYTY_DRAW_RUN_QUIET_SYNTHETIC (live): a mode change ends the current run.
+Live::Switch g_quiet_synthetic("KYTY_DRAW_RUN_QUIET_SYNTHETIC", Live::ParseDefaultOff,
+                               [](int64_t, int64_t) { NoteForeignActivity(); });
+
 bool QuietSyntheticEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_SYNTHETIC");
-		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+	return g_quiet_synthetic.On();
 }
 
 bool IndirectRunsEnabled() {
