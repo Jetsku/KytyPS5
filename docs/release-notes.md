@@ -6,9 +6,15 @@
 
 ## What's new in int17
 
+- **Galaxy map fixed:** the red trails, pillars and blocky red areas around the volcano (the hidden world) and the
+  red band at the bottom of the screen are gone. The game fast-clears one of its 64-bit render targets every frame and
+  Kyty decoded that clear with a 32-bit decoder, so the clear was dropped and old frames piled up. The same fix covers
+  R16F, RG16F, R16, RG16, R8, RG8 and B10G11R11 register clears (`KYTY_CLEAR_REGISTER_WIDE=0` restores the old
+  behaviour). This bug was also in upstream Kyty.
+
 - **Performance mode by default: occlusion queries off.** The game asks the GPU, thousands of times per frame,
   whether objects are hidden behind others. Answering those queries accurately costs about half the frame rate in
-  the heaviest levels. int16.1 now answers "visible" to all of them by default (`KYTY_GPU_OCCLUSION=0`, as other
+  the heaviest levels. int17 now answers "visible" to all of them by default (`KYTY_GPU_OCCLUSION=0`, as other
   Kyty forks do), which roughly doubles the frame rate in the snow level, the clock tower and Ape Escape.
   On the test PC (RTX 3090, Ryzen 9 7950X3D; a test build without the release build's profile optimization, which
   adds about 15%): snow 45 fps, clock tower 35, Ape Escape 38, Sky Garden 31, volcano 59.
@@ -128,8 +134,6 @@ occlusion on.
   please send the console text.
 - **AMD graphics cards:** with the two patches turned off, the GPU can stop responding ("device lost"), and the water
   in Go-Go Archipelago can make the frame rate drop sharply. On AMD, keep the patches on, or use int15.1.
-- **Galaxy map:** red trails, pillars and blocky red areas can appear on the galaxy map around the volcano (the
-  hidden world), and a red band at the bottom of the screen. Known, being investigated; it does not affect levels.
 - **Second (red) galaxy:** one player (RTX 5080, Intel CPU) crashed while arriving at Go-Go Archipelago for the first
   time (the loader read through a bad pointer). We could not reproduce it on our PC. A save from just before the red
   galaxy would help.
