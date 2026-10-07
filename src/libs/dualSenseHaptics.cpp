@@ -22,6 +22,16 @@ struct Stream {
 	SDL_AudioDeviceID           device     = 0;
 	uint64_t                    next_check = 0;
 	std::vector<float>          buffer;
+
+	// Haptics converted for pads that are not a DualSense
+	int                     rumble_pad    = -1;
+	int                     rumble_mode   = 0; // HOST_HAPTICS_*
+	uint32_t                rumble_frames = 0;
+	std::array<double, 2>   rumble_sum {};
+	std::array<uint32_t, 2> rumble_crossings {};
+	std::array<int, 2>      rumble_sign {};
+	std::array<float, 2>    rumble_freq {};
+	std::array<uint16_t, 2> rumble_last {};
 };
 
 namespace {
@@ -293,6 +303,149 @@ uint64_t QueueUsbAudio(Stream* stream, uint32_t frames) {
 	return static_cast<uint64_t>(queued + bytes) * 1000000 / (stream->freq * FRAME_BYTES);
 }
 
+// DualSense haptics are an audio stream for the two actuators. Other pads get, per 10 ms window,
+// the loudness and the main frequency (from zero crossings) of each channel: the original Steam
+// Controller plays both on its trackpad actuators, other pads rumble with the loudness only.
+constexpr uint32_t HOST_HAPTICS_WINDOW_MS  = 10;
+constexpr uint32_t HOST_HAPTICS_HOLD_MS    = 100; // stops by itself if the stream stalls
+constexpr float    HOST_HAPTICS_HYSTERESIS = 1.0f / 128;
+constexpr float    HOST_HAPTICS_MIN_FREQ   = 30.0f;
+constexpr float    HOST_HAPTICS_MAX_FREQ   = 1000.0f;
+constexpr int      HOST_HAPTICS_RUMBLE     = 1;
+constexpr int      HOST_HAPTICS_STEAM      = 2;
+
+// Must match SteamHapticEffect in the patched SDL (src/joystick/hidapi/SDL_hidapi_steam.c).
+constexpr uint32_t STEAM_HAPTIC_EFFECT_MAGIC = 0x50484353;
+struct SteamHapticEffect {
+	uint32_t magic;
+	uint16_t amplitude[2];
+	uint16_t frequency[2];
+	uint16_t duration_ms;
+};
+
+bool IsHostRumblePad(int controller) {
+	SDL_LockJoysticks();
+	const bool other_pad =
+	    controller >= 0 && SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller)) != nullptr &&
+	    SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5;
+	SDL_UnlockJoysticks();
+	return other_pad;
+}
+
+int GetHostHapticsMode(int controller) {
+	const auto id      = static_cast<SDL_JoystickID>(controller);
+	const auto vendor  = SDL_GetGamepadVendorForID(id);
+	const auto product = SDL_GetGamepadProductForID(id);
+	// Original Steam Controller: wired, wireless dongle, Bluetooth
+	const bool steam = vendor == 0x28de && (product == 0x1102 || product == 0x1142 || product == 0x1106);
+	return steam ? HOST_HAPTICS_STEAM : HOST_HAPTICS_RUMBLE;
+}
+
+void SendHostHaptics(Stream* stream, std::array<uint16_t, 2> amplitude, std::array<uint16_t, 2> frequency) {
+	const bool on = amplitude[0] != 0 || amplitude[1] != 0;
+	SDL_LockJoysticks();
+	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(stream->rumble_pad)); pad != nullptr) {
+		if (stream->rumble_mode == HOST_HAPTICS_STEAM) {
+			const SteamHapticEffect effect {STEAM_HAPTIC_EFFECT_MAGIC,
+			                                {amplitude[0], amplitude[1]},
+			                                {frequency[0], frequency[1]},
+			                                static_cast<uint16_t>(on ? HOST_HAPTICS_HOLD_MS : 0)};
+			if (!SDL_SendGamepadEffect(pad, &effect, sizeof(effect))) {
+				// An SDL without the Steam Controller haptics patch: fall back to rumble.
+				LOGF("Haptics: Steam Controller effect failed (%s), using rumble\n", SDL_GetError());
+				stream->rumble_mode = HOST_HAPTICS_RUMBLE;
+			}
+		}
+		if (stream->rumble_mode == HOST_HAPTICS_RUMBLE) {
+			// Rumble motors need more push for quiet textures to be felt
+			const auto motor = [](uint16_t a) {
+				return static_cast<uint16_t>(std::lround(std::sqrt(a / 65535.0) * 65535.0));
+			};
+			(void)SDL_RumbleGamepad(pad, motor(amplitude[0]), motor(amplitude[1]),
+			                        on ? HOST_HAPTICS_HOLD_MS : 0);
+		}
+	}
+	SDL_UnlockJoysticks();
+	stream->rumble_last = amplitude;
+}
+
+void ResetHostHaptics(Stream* stream) {
+	stream->rumble_frames    = 0;
+	stream->rumble_sum       = {};
+	stream->rumble_crossings = {};
+}
+
+void StopHostRumble(Stream* stream) {
+	if (stream->rumble_pad >= 0 && (stream->rumble_last[0] != 0 || stream->rumble_last[1] != 0)) {
+		SendHostHaptics(stream, {0, 0}, {0, 0});
+	}
+	stream->rumble_pad  = -1;
+	stream->rumble_mode = 0;
+	stream->rumble_sign = {};
+	stream->rumble_freq = {};
+	ResetHostHaptics(stream);
+}
+
+void FlushHostHaptics(Stream* stream) {
+	const float             seconds = static_cast<float>(stream->rumble_frames) / static_cast<float>(stream->freq);
+	std::array<uint16_t, 2> amplitude {};
+	std::array<uint16_t, 2> frequency {};
+	for (uint32_t ch = 0; ch < 2; ch++) {
+		const double rms = std::sqrt(stream->rumble_sum[ch] / stream->rumble_frames);
+		// Peak level of a sine with that RMS
+		const double level = std::clamp(rms * std::sqrt(2.0), 0.0, 1.0);
+		amplitude[ch]      = level < 1.0 / 256 ? 0 : static_cast<uint16_t>(std::lround(level * 65535.0));
+		if (amplitude[ch] == 0) {
+			stream->rumble_freq[ch] = 0.0f;
+			continue;
+		}
+		// A 10 ms window sees few crossings of a low tone; average over a few windows.
+		const float measured = std::clamp(static_cast<float>(stream->rumble_crossings[ch]) / (2.0f * seconds),
+		                                  HOST_HAPTICS_MIN_FREQ, HOST_HAPTICS_MAX_FREQ);
+		stream->rumble_freq[ch] =
+		    stream->rumble_freq[ch] == 0.0f ? measured : stream->rumble_freq[ch] * 0.5f + measured * 0.5f;
+		frequency[ch] = static_cast<uint16_t>(std::lround(stream->rumble_freq[ch]));
+	}
+	ResetHostHaptics(stream);
+	if (amplitude[0] == 0 && amplitude[1] == 0 && stream->rumble_last[0] == 0 && stream->rumble_last[1] == 0) {
+		return;
+	}
+	SendHostHaptics(stream, amplitude, frequency);
+}
+
+void QueueHostRumble(Stream* stream, int controller, const void* data, uint32_t first_frame,
+                     uint32_t frames, uint32_t channels, bool is_float, const int* volume, float gain) {
+	if (stream->rumble_pad != controller) {
+		StopHostRumble(stream);
+		stream->rumble_pad  = controller;
+		stream->rumble_mode = GetHostHapticsMode(controller);
+	}
+	const uint32_t window = std::max<uint32_t>(1, stream->freq * HOST_HAPTICS_WINDOW_MS / 1000);
+	for (uint32_t frame = 0; frame < frames; frame++) {
+		for (uint32_t ch = 0; ch < 2; ch++) {
+			const auto src_ch = channels == 1 ? 0 : ch;
+			const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
+			float      value  = is_float ? static_cast<const float*>(data)[index]
+			                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
+			value *= volume[src_ch] / 32768.0f * gain;
+			if (!std::isfinite(value)) {
+				continue;
+			}
+			stream->rumble_sum[ch] += static_cast<double>(value) * value;
+			const int sign = value > HOST_HAPTICS_HYSTERESIS ? 1 : (value < -HOST_HAPTICS_HYSTERESIS ? -1 : 0);
+			if (sign != 0) {
+				if (stream->rumble_sign[ch] != 0 && sign != stream->rumble_sign[ch]) {
+					stream->rumble_crossings[ch]++;
+				}
+				stream->rumble_sign[ch] = sign;
+			}
+		}
+		if (++stream->rumble_frames >= window) {
+			FlushHostHaptics(stream);
+		}
+	}
+}
+
 } // namespace
 
 Stream* Open(uint32_t freq, bool speaker) {
@@ -304,6 +457,7 @@ Stream* Open(uint32_t freq, bool speaker) {
 
 void Close(Stream* stream) {
 	if (stream != nullptr) {
+		StopHostRumble(stream);
 		CloseDevice(stream);
 		delete stream;
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -325,6 +479,14 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	frames -= first_frame;
 	if (frames == 0) {
 		return 0;
+	}
+	if (!stream->speaker && IsHostRumblePad(controller)) {
+		// No DualSense to play on: the port keeps pacing itself as it does without a device.
+		QueueHostRumble(stream, controller, data, first_frame, frames, channels, is_float, volume, gain);
+		return 0;
+	}
+	if (stream->rumble_pad >= 0) {
+		StopHostRumble(stream);
 	}
 	const bool wireless = IsWireless(controller);
 	if (!wireless && !CanUseDevice(controller)) {

@@ -51,10 +51,18 @@ struct ControllerSettings {
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
 
+	// Original Steam Controller through SDL's HIDAPI driver (Steam must be closed)
+	bool steam_controller    = false;
+	int  steam_haptics_gain  = 100; // percent, 0-1000
+	bool steam_left_touchpad = true;
+
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
+		s->setValue("controller_steam_controller", steam_controller);
+		s->setValue("controller_steam_haptics_gain", steam_haptics_gain);
+		s->setValue("controller_steam_left_touchpad", steam_left_touchpad);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -67,6 +75,11 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
+		steam_controller    = s->value("controller_steam_controller", false).toBool();
+		bool      gain_ok   = false;
+		const int gain      = s->value("controller_steam_haptics_gain", 100).toInt(&gain_ok);
+		steam_haptics_gain  = gain_ok ? qBound(0, gain, 1000) : 100;
+		steam_left_touchpad = s->value("controller_steam_left_touchpad", true).toBool();
 	}
 };
 

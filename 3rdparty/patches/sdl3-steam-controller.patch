@@ -1,0 +1,451 @@
+diff --git a/src/joystick/SDL_gamepad.c b/src/joystick/SDL_gamepad.c
+index dd5b416..3f116e7 100644
+--- a/src/joystick/SDL_gamepad.c
++++ b/src/joystick/SDL_gamepad.c
+@@ -1250,7 +1250,7 @@ static GamepadMapping_t *SDL_CreateMappingForHIDAPIGamepad(SDL_GUID guid)
+ 
+         if (SDL_IsJoystickSteamController(vendor, product)) {
+             // Steam controllers have 2 back paddle buttons
+-            SDL_strlcat(mapping_string, "paddle1:b11,paddle2:b12,", sizeof(mapping_string));
++            SDL_strlcat(mapping_string, "paddle1:b11,paddle2:b12,touchpad:b13,", sizeof(mapping_string));
+         } else if (SDL_IsJoystickSteamDeck(vendor, product)) {
+             // The Steam Deck's built-in controller has QAM, 4 back buttons, L/R trackpads, and L/R capacitive touch sticks
+             SDL_strlcat(mapping_string, "misc1:b11,paddle1:b12,paddle2:b13,paddle3:b14,paddle4:b15,touchpad:b17,misc2:b16,misc3:b19,misc4:b18", sizeof(mapping_string));
+diff --git a/src/joystick/hidapi/SDL_hidapi_steam.c b/src/joystick/hidapi/SDL_hidapi_steam.c
+index cb6add7..cc8988c 100644
+--- a/src/joystick/hidapi/SDL_hidapi_steam.c
++++ b/src/joystick/hidapi/SDL_hidapi_steam.c
+@@ -54,6 +54,7 @@ enum
+ {
+     SDL_GAMEPAD_BUTTON_STEAM_RIGHT_PADDLE = 11,
+     SDL_GAMEPAD_BUTTON_STEAM_LEFT_PADDLE,
++    SDL_GAMEPAD_BUTTON_STEAM_TOUCHPAD, // touchpad:b13 in the gamepad mapping
+     SDL_GAMEPAD_NUM_STEAM_BUTTONS,
+ };
+ 
+@@ -298,7 +299,33 @@ static int WriteSegmentToSteamControllerPacketAssembler(SteamControllerPacketAss
+ 
+ #define BLE_MAX_READ_RETRIES 8
+ 
++static SDL_SpinLock s_feature_report_spinlock;
++static SDL_Mutex *s_feature_report_lock;
++
++static SDL_Mutex *GetFeatureReportLock(void)
++{
++    SDL_LockSpinlock(&s_feature_report_spinlock);
++    if (!s_feature_report_lock) {
++        s_feature_report_lock = SDL_CreateMutex();
++    }
++    SDL_UnlockSpinlock(&s_feature_report_spinlock);
++    return s_feature_report_lock;
++}
++
++static int SetFeatureReportUnlocked(SDL_HIDAPI_Device *dev, const unsigned char uBuffer[65], int nActualDataLen);
++
+ static int SetFeatureReport(SDL_HIDAPI_Device *dev, const unsigned char uBuffer[65], int nActualDataLen)
++{
++    SDL_Mutex *lock = GetFeatureReportLock();
++    int nRet;
++
++    SDL_LockMutex(lock);
++    nRet = SetFeatureReportUnlocked(dev, uBuffer, nActualDataLen);
++    SDL_UnlockMutex(lock);
++    return nRet;
++}
++
++static int SetFeatureReportUnlocked(SDL_HIDAPI_Device *dev, const unsigned char uBuffer[65], int nActualDataLen)
+ {
+     int nRet = -1;
+ 
+@@ -1004,6 +1031,74 @@ static bool UpdateSteamControllerState(const uint8_t *pData, int nDataSize, Stea
+ 
+ /*****************************************************************************************************/
+ 
++// Diagnostics: SDL_JOYSTICK_HIDAPI_STEAM_RUMBLE_LOG=<file> appends haptics activity to that file
++static void SteamRumbleLog(const char *fmt, ...)
++{
++    const char *path = SDL_getenv("SDL_JOYSTICK_HIDAPI_STEAM_RUMBLE_LOG");
++    SDL_IOStream *io;
++    char line[256];
++    va_list ap;
++    int len;
++
++    if (!path || !*path) {
++        return;
++    }
++    len = SDL_snprintf(line, sizeof(line), "[%llu ms] ", (unsigned long long)SDL_GetTicks());
++    va_start(ap, fmt);
++    len += SDL_vsnprintf(line + len, sizeof(line) - len - 2, fmt, ap);
++    va_end(ap);
++    len = SDL_min(len, (int)sizeof(line) - 2);
++    line[len++] = 10;
++    io = SDL_IOFromFile(path, "ab");
++    if (io) {
++        SDL_WriteIO(io, line, len);
++        SDL_CloseIO(io);
++    }
++}
++
++/* Haptics for the two trackpad actuators.
++ *
++ * Plain rumble maps the low frequency motor to the left pad and the high frequency motor to the right one.
++ * SDL_SendGamepadEffect() also takes a SteamHapticEffect, an amplitude and frequency per pad, so that
++ * audio-driven haptics (such as converted DualSense haptics) keep their character.
++ *
++ * Each pad plays a train of pulses at the requested frequency; the duty cycle sets the strength.
++ * Sending a feature report takes about 3 ms over the wireless dongle, so a thread sends the latest
++ * values and callers never wait for the controller.
++ */
++#define STEAM_HAPTIC_EFFECT_MAGIC 0x50484353 // 'SCHP'
++
++typedef struct
++{
++    Uint32 magic;
++    Uint16 amplitude[2]; // left pad, right pad: 0-65535
++    Uint16 frequency[2]; // Hz
++    Uint16 duration_ms;
++} SteamHapticEffect;
++
++#define STEAM_HAPTIC_LEFT          0
++#define STEAM_HAPTIC_RIGHT         1
++#define STEAM_HAPTIC_WINDOW_US     60000 // length of each pulse train
++#define STEAM_HAPTIC_REFRESH_MS    40    // renewal of a steady value, before its train ends
++#define STEAM_HAPTIC_MIN_FREQ      30
++#define STEAM_HAPTIC_MAX_FREQ      1000
++#define STEAM_HAPTIC_FULL_DUTY     0.05f // duty cycle at full amplitude and 100% gain
++#define STEAM_HAPTIC_MAX_DUTY      0.5f
++#define STEAM_RUMBLE_LOW_FREQ      125
++#define STEAM_RUMBLE_HIGH_FREQ     250
++
++typedef struct
++{
++    SDL_Mutex *lock;
++    SDL_Condition *cond;
++    SDL_Thread *thread;
++    bool quit;
++    bool dirty;
++    Uint16 amplitude[2];
++    Uint16 frequency[2];
++    Uint64 until; // ticks when the effect ends, 0 = until changed
++} SteamHapticState;
++
+ typedef struct
+ {
+     SDL_HIDAPI_Device *device;
+@@ -1016,8 +1111,19 @@ typedef struct
+     SteamControllerPacketAssembler m_assembler;
+     SteamControllerStateInternal_t m_state;
+     SteamControllerStateInternal_t m_last_state;
++
++    SteamHapticState haptics;
++
++    bool leftpad_touchpad;
++    bool leftpad_touch_down;
++    bool leftpad_touch_blocked; // clicked as a D-pad; hidden until the finger lifts
++    float leftpad_touch_x;
++    float leftpad_touch_y;
+ } SDL_DriverSteam_Context;
+ 
++static void StartSteamHaptics(SDL_HIDAPI_Device *device, SDL_DriverSteam_Context *ctx);
++static void StopSteamHaptics(SDL_DriverSteam_Context *ctx);
++
+ static bool IsDongle(Uint16 product_id)
+ {
+     return (product_id == USB_PRODUCT_VALVE_STEAM_CONTROLLER_DONGLE);
+@@ -1259,11 +1365,20 @@ static bool HIDAPI_DriverSteam_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joyst
+ 
+     InitializeSteamControllerPacketAssembler(&ctx->m_assembler, device->is_bluetooth);
+ 
++    StartSteamHaptics(device, ctx);
++
+     // Initialize the joystick capabilities
+     joystick->nbuttons = SDL_GAMEPAD_NUM_STEAM_BUTTONS;
+     joystick->naxes = SDL_GAMEPAD_AXIS_COUNT;
+     joystick->nhats = 1;
+ 
++    ctx->leftpad_touchpad = SDL_GetHintBoolean("SDL_JOYSTICK_HIDAPI_STEAM_LEFTPAD_TOUCHPAD", true);
++    ctx->leftpad_touch_down = false;
++    ctx->leftpad_touch_blocked = false;
++    if (ctx->leftpad_touchpad) {
++        SDL_PrivateJoystickAddTouchpad(joystick, 1);
++    }
++
+     if (IsDongle(device->product_id)) {
+         joystick->connection_state = SDL_JOYSTICK_CONNECTION_WIRELESS;
+     }
+@@ -1277,10 +1392,202 @@ static bool HIDAPI_DriverSteam_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joyst
+     return true;
+ }
+ 
++static float GetSteamHapticGain(void)
++{
++    // Percentage, 100 = default strength
++    const char *hint = SDL_GetHint("SDL_JOYSTICK_HIDAPI_STEAM_RUMBLE_GAIN");
++    int gain = hint ? SDL_atoi(hint) : 100;
++    return SDL_clamp(gain, 0, 1000) / 100.0f;
++}
++
++static bool SendSteamHapticPulse(SDL_HIDAPI_Device *device, int side, Uint16 amplitude, Uint16 frequency, float gain)
++{
++    unsigned char buf[65];
++    FeatureReportMsg *msg = (FeatureReportMsg *)(buf + 1);
++    Uint32 period_us = 1000000 / SDL_clamp(frequency, STEAM_HAPTIC_MIN_FREQ, STEAM_HAPTIC_MAX_FREQ);
++    Uint32 on_us = 0;
++    Uint16 count = 0;
++
++    if (amplitude > 0 && gain > 0.0f) {
++        float duty = SDL_min(amplitude / 65535.0f * STEAM_HAPTIC_FULL_DUTY * gain, STEAM_HAPTIC_MAX_DUTY);
++        on_us = SDL_max((Uint32)(period_us * duty), 10);
++        count = (Uint16)((STEAM_HAPTIC_WINDOW_US + period_us - 1) / period_us);
++    }
++
++    SDL_zero(buf);
++    msg->header.type = ID_TRIGGER_HAPTIC_PULSE;
++    msg->header.length = 7; // which_pad, pulse_duration, pulse_interval, pulse_count
++    msg->payload.fireHapticPulse.which_pad = (side == STEAM_HAPTIC_LEFT) ? 1 : 0;
++    msg->payload.fireHapticPulse.pulse_duration = (unsigned short)on_us;
++    msg->payload.fireHapticPulse.pulse_interval = (unsigned short)(count ? period_us - on_us : 0);
++    msg->payload.fireHapticPulse.pulse_count = count;
++
++    return SetFeatureReport(device, buf, 2 + 1 + msg->header.length) >= 0;
++}
++
++static bool SteamHapticChanged(Uint16 amplitude, Uint16 frequency, Uint16 sent_amplitude, Uint16 sent_frequency)
++{
++    // A new train restarts the pulse phase, so small changes wait for the next refresh
++    if ((amplitude == 0) != (sent_amplitude == 0)) {
++        return true;
++    }
++    if (amplitude == 0) {
++        return false;
++    }
++    return SDL_abs((int)amplitude - (int)sent_amplitude) * 8 > (int)sent_amplitude ||
++           SDL_abs((int)frequency - (int)sent_frequency) * 8 > (int)sent_frequency;
++}
++
++static int SDLCALL SteamHapticThread(void *data)
++{
++    SDL_HIDAPI_Device *device = (SDL_HIDAPI_Device *)data;
++    SDL_DriverSteam_Context *ctx = (SDL_DriverSteam_Context *)device->context;
++    SteamHapticState *haptics = &ctx->haptics;
++    Uint16 sent_amplitude[2] = { 0, 0 };
++    Uint16 sent_frequency[2] = { 0, 0 };
++    Uint64 sent_time[2] = { 0, 0 };
++    Uint64 stats_time = SDL_GetTicks();
++    int stats_reports = 0, stats_failures = 0;
++    Uint16 stats_peak = 0;
++
++    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
++
++    SDL_LockMutex(haptics->lock);
++    while (!haptics->quit) {
++        Uint64 now = SDL_GetTicks();
++        Uint16 amplitude[2], frequency[2];
++        bool send[2];
++        Sint32 wait_ms = -1;
++        float gain;
++        int side;
++
++        if (haptics->until && now >= haptics->until) {
++            haptics->amplitude[0] = haptics->amplitude[1] = 0;
++            haptics->until = 0;
++        }
++        for (side = 0; side < 2; ++side) {
++            amplitude[side] = haptics->amplitude[side];
++            frequency[side] = haptics->frequency[side];
++            send[side] = SteamHapticChanged(amplitude[side], frequency[side], sent_amplitude[side], sent_frequency[side]) ||
++                         (amplitude[side] && now >= sent_time[side] + STEAM_HAPTIC_REFRESH_MS);
++            if (!send[side] && amplitude[side]) {
++                Sint32 due = (Sint32)(sent_time[side] + STEAM_HAPTIC_REFRESH_MS - now);
++                wait_ms = (wait_ms < 0) ? due : SDL_min(wait_ms, due);
++            }
++        }
++        if (!send[0] && !send[1]) {
++            if (haptics->until) {
++                Sint32 due = (Sint32)(haptics->until - now);
++                wait_ms = (wait_ms < 0) ? due : SDL_min(wait_ms, due);
++            }
++            if (!haptics->dirty) {
++                SDL_WaitConditionTimeout(haptics->cond, haptics->lock, SDL_max(wait_ms, -1));
++            }
++            haptics->dirty = false;
++            continue;
++        }
++        haptics->dirty = false;
++        SDL_UnlockMutex(haptics->lock);
++
++        gain = GetSteamHapticGain();
++        for (side = 0; side < 2; ++side) {
++            if (!send[side]) {
++                continue;
++            }
++            if (SendSteamHapticPulse(device, side, amplitude[side], frequency[side], gain)) {
++                ++stats_reports;
++            } else {
++                ++stats_failures;
++            }
++            sent_amplitude[side] = amplitude[side];
++            sent_frequency[side] = frequency[side];
++            sent_time[side] = SDL_GetTicks();
++            stats_peak = SDL_max(stats_peak, amplitude[side]);
++        }
++        if (now >= stats_time + 1000) {
++            if (stats_reports || stats_failures) {
++                SteamRumbleLog("haptics: %d reports/s, %d failed, peak amplitude %u, last L %u@%uHz R %u@%uHz",
++                               stats_reports, stats_failures, stats_peak,
++                               amplitude[0], frequency[0], amplitude[1], frequency[1]);
++            }
++            stats_time = now;
++            stats_reports = stats_failures = 0;
++            stats_peak = 0;
++        }
++
++        SDL_LockMutex(haptics->lock);
++    }
++    SDL_UnlockMutex(haptics->lock);
++
++    // Leave the actuators quiet
++    for (int side = 0; side < 2; ++side) {
++        if (sent_amplitude[side]) {
++            SendSteamHapticPulse(device, side, 0, 0, 0.0f);
++        }
++    }
++    return 0;
++}
++
++static void StartSteamHaptics(SDL_HIDAPI_Device *device, SDL_DriverSteam_Context *ctx)
++{
++    SteamHapticState *haptics = &ctx->haptics;
++
++    SDL_zerop(haptics);
++    haptics->lock = SDL_CreateMutex();
++    haptics->cond = SDL_CreateCondition();
++    if (haptics->lock && haptics->cond) {
++        haptics->thread = SDL_CreateThread(SteamHapticThread, "SDL Steam Controller haptics", device);
++    }
++    SteamRumbleLog("Steam Controller opened by patched SDL %d.%d.%d (bluetooth=%d, haptics thread %s)",
++                   SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_MICRO_VERSION, device->is_bluetooth,
++                   haptics->thread ? "running" : "FAILED");
++}
++
++static void StopSteamHaptics(SDL_DriverSteam_Context *ctx)
++{
++    SteamHapticState *haptics = &ctx->haptics;
++
++    if (haptics->thread) {
++        SDL_LockMutex(haptics->lock);
++        haptics->quit = true;
++        SDL_SignalCondition(haptics->cond);
++        SDL_UnlockMutex(haptics->lock);
++        SDL_WaitThread(haptics->thread, NULL);
++    }
++    if (haptics->cond) {
++        SDL_DestroyCondition(haptics->cond);
++    }
++    if (haptics->lock) {
++        SDL_DestroyMutex(haptics->lock);
++    }
++    SDL_zerop(haptics);
++}
++
++static bool SetSteamHaptics(SDL_DriverSteam_Context *ctx, Uint16 left, Uint16 left_freq, Uint16 right, Uint16 right_freq, Uint32 duration_ms)
++{
++    SteamHapticState *haptics = &ctx->haptics;
++
++    if (!haptics->thread) {
++        return SDL_SetError("Steam Controller haptics thread isn't running");
++    }
++    SDL_LockMutex(haptics->lock);
++    haptics->amplitude[STEAM_HAPTIC_LEFT] = left;
++    haptics->frequency[STEAM_HAPTIC_LEFT] = left_freq;
++    haptics->amplitude[STEAM_HAPTIC_RIGHT] = right;
++    haptics->frequency[STEAM_HAPTIC_RIGHT] = right_freq;
++    haptics->until = duration_ms ? SDL_GetTicks() + duration_ms : 0;
++    haptics->dirty = true;
++    SDL_SignalCondition(haptics->cond);
++    SDL_UnlockMutex(haptics->lock);
++    return true;
++}
++
+ static bool HIDAPI_DriverSteam_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble)
+ {
+-    // You should use the full Steam Input API for rumble support
+-    return SDL_Unsupported();
++    SDL_DriverSteam_Context *ctx = (SDL_DriverSteam_Context *)device->context;
++
++    // SDL stops the rumble itself when its duration ends
++    return SetSteamHaptics(ctx, low_frequency_rumble, STEAM_RUMBLE_LOW_FREQ, high_frequency_rumble, STEAM_RUMBLE_HIGH_FREQ, 0);
+ }
+ 
+ static bool HIDAPI_DriverSteam_RumbleJoystickTriggers(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint16 left_rumble, Uint16 right_rumble)
+@@ -1290,8 +1597,7 @@ static bool HIDAPI_DriverSteam_RumbleJoystickTriggers(SDL_HIDAPI_Device *device,
+ 
+ static Uint32 HIDAPI_DriverSteam_GetJoystickCapabilities(SDL_HIDAPI_Device *device, SDL_Joystick *joystick)
+ {
+-    // You should use the full Steam Input API for extended capabilities
+-    return 0;
++    return SDL_JOYSTICK_CAP_RUMBLE;
+ }
+ 
+ static bool HIDAPI_DriverSteam_SetJoystickLED(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint8 red, Uint8 green, Uint8 blue)
+@@ -1302,6 +1608,14 @@ static bool HIDAPI_DriverSteam_SetJoystickLED(SDL_HIDAPI_Device *device, SDL_Joy
+ 
+ static bool HIDAPI_DriverSteam_SendJoystickEffect(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, const void *data, int size)
+ {
++    if (size == sizeof(SteamHapticEffect) && ((const SteamHapticEffect *)data)->magic == STEAM_HAPTIC_EFFECT_MAGIC) {
++        SteamHapticEffect effect;
++        SDL_memcpy(&effect, data, sizeof(effect));
++        return SetSteamHaptics((SDL_DriverSteam_Context *)device->context,
++                               effect.amplitude[STEAM_HAPTIC_LEFT], effect.frequency[STEAM_HAPTIC_LEFT],
++                               effect.amplitude[STEAM_HAPTIC_RIGHT], effect.frequency[STEAM_HAPTIC_RIGHT],
++                               effect.duration_ms);
++    }
+     if (size == 65) {
+         if (SetFeatureReport(device, data, size) < 0) {
+             return SDL_SetError("Couldn't write feature report");
+@@ -1431,6 +1745,8 @@ static bool HIDAPI_DriverSteam_UpdateDevice(SDL_HIDAPI_Device *device)
+ 
+                 SDL_SendJoystickButton(timestamp, joystick, SDL_GAMEPAD_BUTTON_BACK,
+                                           ((ctx->m_state.ulButtons & STEAM_BUTTON_MENU_MASK) != 0));
++                SDL_SendJoystickButton(timestamp, joystick, SDL_GAMEPAD_BUTTON_STEAM_TOUCHPAD,
++                                          (ctx->leftpad_touchpad && (ctx->m_state.ulButtons & STEAM_BUTTON_MENU_MASK) != 0));
+ 
+                 SDL_SendJoystickButton(timestamp, joystick, SDL_GAMEPAD_BUTTON_START,
+                                           ((ctx->m_state.ulButtons & STEAM_BUTTON_ESCAPE_MASK) != 0));
+@@ -1463,6 +1779,27 @@ static bool HIDAPI_DriverSteam_UpdateDevice(SDL_HIDAPI_Device *device)
+                 SDL_SendJoystickHat(timestamp, joystick, 0, hat);
+             }
+ 
++            if (ctx->leftpad_touchpad) {
++                const bool finger = (ctx->m_state.ulButtons & STEAM_LEFTPAD_FINGERDOWN_MASK) != 0;
++                bool down;
++
++                if (!finger) {
++                    ctx->leftpad_touch_blocked = false;
++                } else if (ctx->m_state.ulButtons & STEAM_BUTTON_LEFTPAD_CLICKED_MASK) {
++                    ctx->leftpad_touch_blocked = true;
++                }
++                down = finger && !ctx->leftpad_touch_blocked;
++                if (down) {
++                    // UpdateSteamControllerState() adds 1000 while a finger is down; up is positive
++                    ctx->leftpad_touch_x = SDL_clamp(((int)ctx->m_state.sLeftPadX - 1000 + 32768) / 65535.0f, 0.0f, 1.0f);
++                    ctx->leftpad_touch_y = SDL_clamp((32767 - ((int)ctx->m_state.sLeftPadY - 1000)) / 65535.0f, 0.0f, 1.0f);
++                }
++                if (down || ctx->leftpad_touch_down) {
++                    SDL_SendJoystickTouchpad(timestamp, joystick, 0, 0, down, ctx->leftpad_touch_x, ctx->leftpad_touch_y, down ? 1.0f : 0.0f);
++                    ctx->leftpad_touch_down = down;
++                }
++            }
++
+             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, (int)ctx->m_state.sTriggerL * 2 - 32768);
+             SDL_SendJoystickAxis(timestamp, joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, (int)ctx->m_state.sTriggerR * 2 - 32768);
+ 
+@@ -1504,6 +1841,8 @@ static void HIDAPI_DriverSteam_CloseJoystick(SDL_HIDAPI_Device *device, SDL_Joys
+     SDL_RemoveHintCallback(SDL_HINT_JOYSTICK_HIDAPI_STEAM_HOME_LED,
+                            SDL_HomeLEDHintChanged, ctx);
+ 
++    StopSteamHaptics(ctx);
++
+     CloseSteamController(device);
+ }
+ 

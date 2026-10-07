@@ -388,6 +388,49 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
         </item>
        </layout>
       </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="label_controller_steam">
+        <property name="text"><string>Steam Controller:</string></property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QCheckBox" name="checkBox_controller_steam">
+        <property name="toolTip"><string>Use the original Steam Controller as a DualSense: gyro, haptics on the trackpads, left trackpad as the touchpad. Close Steam completely first, otherwise it keeps the controller.</string></property>
+        <property name="text"><string>Use as DualSense (close Steam first)</string></property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="label_controller_steam_gain">
+        <property name="text"><string>Steam haptics strength:</string></property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <layout class="QHBoxLayout" name="controllerSteamGainLayout">
+        <item>
+         <widget class="QSlider" name="slider_controller_steam_gain">
+          <property name="toolTip"><string>Strength of the trackpad haptics; 100% is the default. Vibration intensity above scales it too.</string></property>
+          <property name="maximum"><number>1000</number></property>
+          <property name="singleStep"><number>10</number></property>
+          <property name="pageStep"><number>50</number></property>
+          <property name="value"><number>100</number></property>
+          <property name="orientation"><enum>Qt::Horizontal</enum></property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="label_controller_steam_gain_value">
+          <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+          <property name="text"><string>100%</string></property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item row="5" column="1">
+       <widget class="QCheckBox" name="checkBox_controller_steam_touchpad">
+        <property name="toolTip"><string>Touching the left trackpad moves a finger on the DualSense touchpad; clicking it stays the D-pad, Back is the touchpad click.</string></property>
+        <property name="text"><string>Left trackpad as touchpad</string></property>
+        <property name="checked"><bool>true</bool></property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>

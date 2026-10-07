@@ -98,6 +98,29 @@ if(APPLE)
 	# SDL's built-in iconv fallback does not support CP932.
 	set(SDL_SYSTEM_ICONV ON CACHE BOOL "Use system iconv for CP932 conversion" FORCE)
 endif()
+# Steam Controller haptics and touchpad for SDL's HIDAPI driver (SDL 3.4.16). SDL is a submodule, so the patch
+# is applied to its working tree once; a tree that already has it is left alone.
+find_package(Git REQUIRED)
+set(KYTY_SDL3_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/sdl3-steam-controller.patch")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KYTY_SDL3_PATCH}")
+execute_process(
+	COMMAND "${GIT_EXECUTABLE}" apply --reverse --check --ignore-whitespace "${KYTY_SDL3_PATCH}"
+	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/SDL3"
+	RESULT_VARIABLE KYTY_SDL3_PATCH_APPLIED
+	OUTPUT_QUIET ERROR_QUIET
+)
+if(NOT KYTY_SDL3_PATCH_APPLIED EQUAL 0)
+	execute_process(
+		COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace "${KYTY_SDL3_PATCH}"
+		WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/SDL3"
+		RESULT_VARIABLE KYTY_SDL3_PATCH_RESULT
+		ERROR_VARIABLE KYTY_SDL3_PATCH_ERROR
+	)
+	if(NOT KYTY_SDL3_PATCH_RESULT EQUAL 0)
+		message(FATAL_ERROR "Cannot apply ${KYTY_SDL3_PATCH} to 3rdparty/SDL3:\n${KYTY_SDL3_PATCH_ERROR}")
+	endif()
+	message(STATUS "SDL3: applied sdl3-steam-controller.patch")
+endif()
 add_subdirectory(SDL3)
 
 add_library(Vulkan-Headers INTERFACE)

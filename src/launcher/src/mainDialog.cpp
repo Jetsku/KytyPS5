@@ -21,6 +21,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -35,6 +36,8 @@
 
 #if defined(_WIN32)
 #include <windows.h> // IWYU pragma: keep
+
+#include <tlhelp32.h>
 #endif
 
 // IWYU pragma: no_include <minwindef.h>
@@ -402,6 +405,77 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 }
 #endif
 
+#if defined(_WIN32)
+static bool IsSteamRunning() {
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	PROCESSENTRY32W entry {};
+	entry.dwSize = sizeof(entry);
+	bool found   = false;
+	for (bool ok = Process32FirstW(snapshot, &entry) != 0; ok && !found;
+	     ok      = Process32NextW(snapshot, &entry) != 0) {
+		found = _wcsicmp(entry.szExeFile, L"steam.exe") == 0;
+	}
+	CloseHandle(snapshot);
+	return found;
+}
+#endif
+
+// Steam keeps the Steam Controller to itself, so the emulator's driver would not see it
+static bool ConfirmSteamClosed(QWidget* parent) {
+#if defined(_WIN32)
+	if (!IsSteamRunning()) {
+		return true;
+	}
+	QMessageBox box(QMessageBox::Warning, QObject::tr("Steam is running"),
+	                QObject::tr("Steam Controller mode is on, but Steam is running and keeps the "
+	                            "controller: the game will not see it.\n\nClose Steam first."),
+	                QMessageBox::NoButton, parent);
+	auto* close_button  = box.addButton(QObject::tr("Close Steam"), QMessageBox::AcceptRole);
+	auto* launch_button = box.addButton(QObject::tr("Launch anyway"), QMessageBox::DestructiveRole);
+	box.addButton(QMessageBox::Cancel);
+	box.setDefaultButton(close_button);
+	box.exec();
+	if (box.clickedButton() == launch_button) {
+		return true;
+	}
+	if (box.clickedButton() != close_button) {
+		return false;
+	}
+
+	const QSettings registry(QStringLiteral("HKEY_CURRENT_USER\\Software\\Valve\\Steam"),
+	                         QSettings::NativeFormat);
+	const QString steam_exe = registry.value(QStringLiteral("SteamExe")).toString();
+	if (steam_exe.isEmpty() || !QProcess::startDetached(steam_exe, {QStringLiteral("-shutdown")})) {
+		QMessageBox::critical(parent, QObject::tr("Error"),
+		                      QObject::tr("Could not ask Steam to exit. Close it from the tray."));
+		return false;
+	}
+	QApplication::setOverrideCursor(Qt::WaitCursor);
+	QElapsedTimer timer;
+	timer.start();
+	bool running = true;
+	while ((running = IsSteamRunning()) && timer.elapsed() < 30000) {
+		QApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 250);
+		QThread::msleep(250);
+	}
+	QApplication::restoreOverrideCursor();
+	if (running) {
+		QMessageBox::critical(parent, QObject::tr("Error"),
+		                      QObject::tr("Steam did not exit in 30 seconds. Close it from the tray."));
+		return false;
+	}
+	// Let the controller come back to the HID driver
+	QThread::msleep(1000);
+	return true;
+#else
+	(void)parent;
+	return true;
+#endif
+}
+
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
 
@@ -449,6 +523,20 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
+	{
+		// The emulator's SDL reads these as hints from the environment (Steam Controller driver patch)
+		auto env = QProcessEnvironment::systemEnvironment();
+		if (info.controller.steam_controller) {
+			env.insert(QStringLiteral("SDL_JOYSTICK_HIDAPI_STEAM"), QStringLiteral("1"));
+			env.insert(QStringLiteral("SDL_JOYSTICK_HIDAPI_STEAM_RUMBLE_GAIN"),
+			           QString::number(info.controller.steam_haptics_gain));
+			env.insert(QStringLiteral("SDL_JOYSTICK_HIDAPI_STEAM_LEFTPAD_TOUCHPAD"),
+			           info.controller.steam_left_touchpad ? QStringLiteral("1") : QStringLiteral("0"));
+		} else {
+			env.remove(QStringLiteral("SDL_JOYSTICK_HIDAPI_STEAM"));
+		}
+		process->setProcessEnvironment(env);
+	}
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
@@ -509,15 +597,20 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 }
 
 void MainDialogPrivate::Run() {
-	m_running_item = m_ui->widget->GetSelectedItem();
-	if (m_running_item == nullptr) {
+	auto* item = m_ui->widget->GetSelectedItem();
+	if (item == nullptr) {
 		return;
 	}
 
+	auto info = m_ui->widget->CreateConfiguration(*item);
+	if (info->controller.steam_controller && !ConfirmSteamClosed(m_main_dialog)) {
+		return;
+	}
+
+	m_running_item = item;
 	m_running_item->SetRunning(true);
 	m_lightbar.Stop();
 
-	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
 	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
