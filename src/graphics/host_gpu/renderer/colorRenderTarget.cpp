@@ -148,15 +148,16 @@ bool SameImageDesc(const TextureCache::ImageDesc& a, const TextureCache::ImageDe
 	const auto& [b_data, b_stencil, b_meta, b_htile_clear_mask, b_pixel_format, b_guest_format,
 	             b_image_type, b_extent, b_resources, b_pitch, b_bytes_per_block, b_samples,
 	             b_tile_mode, b_bgra16, b_mip_layout] = b_info;
-	const auto& [a_range, a_kind, a_control, a_dcc_clear_word, a_compression,
+	const auto& [a_range, a_kind, a_control, a_dcc_clear_word, a_dcc_clear_word1, a_compression,
 	             a_stencil_compressed, a_dcc_clear_register_valid, a_dcc_alpha_msb] = a_meta;
-	const auto& [b_range, b_kind, b_control, b_dcc_clear_word, b_compression,
+	const auto& [b_range, b_kind, b_control, b_dcc_clear_word, b_dcc_clear_word1, b_compression,
 	             b_stencil_compressed, b_dcc_clear_register_valid, b_dcc_alpha_msb] = b_meta;
 	const auto& [a_cmask_range, a_clear_word0, a_clear_word1, a_cmask_valid] = a_cmask;
 	const auto& [b_cmask_range, b_clear_word0, b_clear_word1, b_cmask_valid] = b_cmask;
 	// ImageViewInfo::operator== compares all of its fields.
 	return a_data == b_data && a_stencil == b_stencil && a_range == b_range && a_kind == b_kind &&
 	       a_control == b_control && a_dcc_clear_word == b_dcc_clear_word &&
+	       a_dcc_clear_word1 == b_dcc_clear_word1 &&
 	       a_compression == b_compression && a_stencil_compressed == b_stencil_compressed &&
 	       a_dcc_clear_register_valid == b_dcc_clear_register_valid &&
 	       a_dcc_alpha_msb == b_dcc_alpha_msb && a_htile_clear_mask == b_htile_clear_mask &&
@@ -552,6 +553,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.kind                     = ImageMetadataKind::Dcc;
 		desc.info.metadata.range                    = {rt.dcc_addr.addr, metadata_size.size};
 		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.dcc_clear_word1          = rt.clear_word1.word1;
 		desc.info.metadata.dcc_clear_register_valid = true;
 		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
 	}

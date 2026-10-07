@@ -216,9 +216,13 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 	const auto  format   = desc.view_info.format;
 	if (code == 0x20) {
 		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
+		// KYTY_CLEAR_REGISTER_WIDE (imageInfo.h): both CLEAR_WORDs, so 64-bit targets decode.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.dcc_clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.dcc_clear_word, clear);
+		       (ClearRegisterWideEnabled()
+		            ? DecodePackedColorClear64(format, metadata.dcc_clear_word,
+		                                       metadata.dcc_clear_word1, clear)
+		            : DecodePackedColorClear(format, metadata.dcc_clear_word, clear));
 	}
 	clear = {};
 	if (code == 0x00) {
@@ -312,6 +316,34 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 // holds depth (same memory reused as depth and colour, e.g. Astro Bot's D32S8 targets reused as RG16F
 // DCC targets) or to a stencil plane record. Neither can take a colour clear and the description's
 // metadata is not theirs, so the materialisation does nothing for them (reported a few times).
+// KYTY_CLEAR_TRACE=1 (diagnostic): one stderr line per metadata address and outcome of the DCC/CMASK
+// clear materialisation.
+void ClearTrace(const char* site, const char* outcome, uint64_t metadata, uint64_t metadata_size,
+                uint64_t data, uint64_t data_size, uint32_t width, uint32_t height, uint32_t extra) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLEAR_TRACE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	if (!enabled) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	const uint64_t key = metadata ^ (std::hash<std::string_view> {}(site) * 31u) ^
+	                     (std::hash<std::string_view> {}(outcome) << 1u) ^ (uint64_t {extra} << 48u);
+	{
+		std::scoped_lock lock(mutex);
+		if (!seen.insert(key).second) {
+			return;
+		}
+	}
+	std::fprintf(stderr,
+	             "ClearTrace: %s %s meta=0x%" PRIx64 "+0x%" PRIx64 " data=0x%" PRIx64 "+0x%" PRIx64
+	             " %ux%u extra=0x%x\n",
+	             site, outcome, metadata, metadata_size, data, data_size, width, height, extra);
+	std::fflush(stderr);
+}
+
 bool ColourMetadataTargetsDepth(const char* site, ImageId id, const Image& image) {
 	if (!image.info.IsDepth() && !image.depth_id) {
 		return false;
@@ -2984,6 +3016,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	const auto range = desc.info.metadata.range;
+	ClearTrace("DCC", "enter", range.address, range.size, desc.info.data.address, desc.info.data.size,
+	           desc.info.extent.width, desc.info.extent.height,
+	           desc.info.resources.levels | (static_cast<uint32_t>(desc.type) << 8u) |
+	               (static_cast<uint32_t>(desc.info.metadata.dcc_clear_word) << 16u));
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
@@ -3039,10 +3075,22 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			pages     = noop != nullptr && CaptureMetadataPages(range, decided);
 		}
 		const uint32_t known_byte = known ? (*known & 0xffu) : 0u;
+		if (known && !(unaliased && *known == known_byte * 0x01010101u)) {
+			ClearTrace("DCC", unaliased ? "known-nonuniform" : "known-aliased", range.address, range.size,
+			           desc.info.data.address, desc.info.data.size, desc.info.extent.width,
+			           desc.info.extent.height, *known);
+		} else if (!known) {
+			ClearTrace("DCC", "gpu-written-no-known-fill", range.address, range.size, desc.info.data.address,
+			           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, 0);
+		}
 		if (known && unaliased && *known == known_byte * 0x01010101u) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DccKnownFillClears);
 			vk::ClearValue clear {};
-			if (!DecodeDccClear(desc, static_cast<uint8_t>(known_byte), clear.color)) {
+			const bool known_decoded = DecodeDccClear(desc, static_cast<uint8_t>(known_byte), clear.color);
+			ClearTrace("DCC", known_decoded ? "known-clear" : "known-not-clear-code", range.address, range.size,
+			           desc.info.data.address, desc.info.data.size, desc.info.extent.width,
+			           desc.info.extent.height, known_byte);
+			if (!known_decoded) {
 				// Decided by the GPU-dirty state, the recorded fill and the images over the bytes.
 				if (pages) {
 					decided.fill_generation = fill_generation;
@@ -3083,6 +3131,9 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			++m_gpu_dcc_attempts;
 			++m_dcc_decision_effects;
 			const auto outcome = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
+			ClearTrace("DCC", "gpu-outcome", range.address, range.size, desc.info.data.address,
+			           desc.info.data.size, desc.info.extent.width, desc.info.extent.height,
+			           static_cast<uint32_t>(outcome));
 			const bool native  = outcome == Profiler::FrameEvent::DccGpuRecords ||
 			                    outcome == Profiler::FrameEvent::DccGpuReuses;
 			m_dcc_noop_refusal = native ? Profiler::FrameEvent::TargetRecordDccNative
@@ -3242,6 +3293,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 		if (!decoded) {
+			ClearTrace("DCC", "cpu-not-clear-code", address, slice_size, desc.info.data.address,
+			           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, code);
 			if (diagnostic_readback != 0) {
 				TraceDccDiagnostic(
 				    "DCC_SLICE id=%" PRIu64 " slice=%u address=0x%" PRIx64 " bytes=%" PRIu64
@@ -3255,6 +3308,14 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read DCC metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+			{
+				const auto diff = std::find_if(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte != code; });
+				const auto same = static_cast<uint64_t>(std::count(bytes.begin(), bytes.end(), code));
+				ClearTrace("DCC", "cpu-nonuniform", address, slice_size, desc.info.data.address,
+				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height,
+				           static_cast<uint32_t>(diff - bytes.begin()) |
+				               (static_cast<uint32_t>(same * 255u / bytes.size()) << 24u));
+			}
 			if (diagnostic_readback != 0) {
 				TraceDccDiagnostic(
 				    "DCC_SLICE id=%" PRIu64 " slice=%u address=0x%" PRIx64 " bytes=%" PRIu64
@@ -3273,6 +3334,9 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			                      image_first + slice, 1},
 			                     clear, "dcc-cpu-fallback");
 		}
+		ClearTrace("DCC", cleared ? "cpu-cleared" : "cpu-rejected", address, slice_size,
+		           desc.info.data.address, desc.info.data.size, desc.info.extent.width,
+		           desc.info.extent.height, code);
 		if (!cleared) {
 			// Rejected (reported): the guest's clear key stays; nothing is published as cleared.
 			continue;
@@ -3337,6 +3401,8 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	    view.layer_count == 0 || metadata_base_layer >= layers ||
 	    view.layer_count > layers - metadata_base_layer) {
 		Profiler::CountFrameEvent(Event::CmaskFastClearShape);
+		ClearTrace("CMASK", "shape", range.address, range.size, desc.info.data.address, desc.info.data.size,
+		           desc.info.extent.width, desc.info.extent.height, layers);
 		description_noop();
 		return;
 	}
@@ -3370,6 +3436,8 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 			// Bytes some image also covers are not proven to be this surface's CMASK.
 			if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
 				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
+				ClearTrace("CMASK", "aliased", metadata.address, metadata.size, desc.info.data.address,
+				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 				continue;
 			}
 		}
@@ -3405,6 +3473,9 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 			}
 		}
 		if (!value || *value != 0) {
+			ClearTrace("CMASK", !value ? "nonuniform" : (*value == UINT32_MAX ? "expanded" : "uniform-nonzero"),
+			           metadata.address, metadata.size, desc.info.data.address, desc.info.data.size,
+			           desc.info.extent.width, desc.info.extent.height, value ? *value : 0u);
 			// 0xFFFFFFFF: every tile expanded (no pending clear). Anything else: some tiles are not
 			// fast-cleared (or the bytes encode nothing a single-sample surface uses).
 			Profiler::CountFrameEvent(value && *value == UINT32_MAX ? Event::CmaskFastClearExpanded
@@ -3427,6 +3498,8 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		// clearing again what the draws wrote meanwhile. FillBuffer can fault: no texture lock.
 		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
 		Profiler::CountFrameEvent(Event::CmaskFastClears);
+		ClearTrace("CMASK", "cleared", metadata.address, metadata.size, desc.info.data.address,
+		           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 	}
 	// Why this decision is not a provable no-op, when it is not (instrumentation).
 	const bool any_native = std::ranges::find(native, uint8_t {1}) != native.end();
@@ -3460,6 +3533,9 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	                         ? TryMaterializeGpuMetadataClear(*helper, id, desc, range,
 	                                                          metadata_base_layer, values, 1u, true)
 	                         : Event::DccFallbackDisabled;
+	ClearTrace("CMASK", "native-outcome", range.address, range.size, desc.info.data.address,
+	           desc.info.data.size, desc.info.extent.width, desc.info.extent.height,
+	           static_cast<uint32_t>(outcome));
 	if (outcome == Event::DccGpuRecords || outcome == Event::DccGpuReuses) {
 		Profiler::CountFrameEvent(outcome == Event::DccGpuRecords
 		                              ? Event::CmaskFastClearInspections
