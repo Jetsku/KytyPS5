@@ -522,7 +522,7 @@ static void PrintGpuCapabilities(GraphicContext& graphics, const vk::PhysicalDev
 		vk::PhysicalDeviceMemoryProperties2         memory2 {};
 		memory2.pNext = &budget_props;
 		graphics.physical_device.getMemoryProperties2(&memory2);
-		budget = fmt::format("budget {} (already in use {})",
+		budget = fmt::format("budget {} (used by this process {})",
 		                     FormatBytes(budget_props.heapBudget[vram_heap]),
 		                     FormatBytes(budget_props.heapUsage[vram_heap]));
 	}
