@@ -77,10 +77,10 @@ public:
 	// The contended acquisition (the caller's try_lock failed). With parking off it spins until
 	// the lock is free: reading only with pause when `shared_spin`, else retrying the acquisition
 	// back to back (the two historical spin loops). Returns true when it parked.
-	bool LockContended(bool shared_spin = true) noexcept {
+	bool LockContended(bool shared_spin = true, bool allow_parking = true) noexcept {
 		HangWatchdog::Scope wait("resource-parking-lock", reinterpret_cast<uint64_t>(this), 0,
 		                         HangWatchdog::Enabled() ? m_state.load(std::memory_order_relaxed) : 0);
-		if (!TrackerLockParkEnabled()) {
+		if (!allow_parking || !TrackerLockParkEnabled()) {
 			for (;;) {
 				if (shared_spin) {
 					while (m_state.load(std::memory_order_relaxed) != 0) {

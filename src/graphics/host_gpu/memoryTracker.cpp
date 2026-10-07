@@ -11,6 +11,9 @@ MemoryTracker::MemoryTracker(PageManager& page_manager, bool track_cpu_mutations
                              FaultPolicy fault_policy)
     : m_page_manager(page_manager), m_track_cpu_mutations(track_cpu_mutations),
       m_fault_policy(fault_policy) {
+#if defined(__linux__) && defined(__x86_64__)
+	TrackerParking::InitializeBeforeGuestPublication();
+#endif
 	if (m_fault_policy.ahead_pages == 0 ||
 	    (m_fault_policy.ahead_pages & (m_fault_policy.ahead_pages - 1)) != 0 ||
 	    m_fault_policy.ahead_pages > TRACKER_REGION_PAGES) {
