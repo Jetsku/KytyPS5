@@ -190,6 +190,31 @@
           </item>
          </layout>
         </item>
+        <item row="5" column="0">
+         <widget class="QLabel" name="label_audio_objects">
+          <property name="text"><string>3D audio objects:</string></property>
+         </widget>
+        </item>
+        <item row="5" column="1">
+         <layout class="QHBoxLayout" name="audio_objects_layout">
+          <item>
+           <widget class="QSlider" name="slider_audio_objects">
+            <property name="toolTip"><string>Sound effects the game places in 3D (PS5 3D audio object ports), mixed into the game sound on this PC. Game sound and master volume apply on top. 100% is unchanged.</string></property>
+            <property name="maximum"><number>200</number></property>
+            <property name="singleStep"><number>5</number></property>
+            <property name="pageStep"><number>10</number></property>
+            <property name="value"><number>100</number></property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="label_audio_objects_value">
+            <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+            <property name="text"><string>100%</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
        </layout>
       </widget>
      </item>

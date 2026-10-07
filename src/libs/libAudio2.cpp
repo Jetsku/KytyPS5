@@ -6,6 +6,7 @@
 #include "libs/audio.h"
 #include "libs/audioDiag.h"
 #include "libs/audioMix.h"
+#include "libs/audioObjects.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -13,6 +14,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -196,6 +199,10 @@ struct AudioOut2PortStateEntry {
 	std::vector<uint8_t>   pcm_data;
 	Mix::LevelMeter        meter;     // KYTY_AUDIO_LEVELS: PCM the guest set since the last report.
 	uint32_t               pcm_sets = 0;
+	// Object ports: placement attributes, and whether PCM was set since the last push (an object
+	// that is not fed again is silent, not a repeated block).
+	Objects::Params        object;
+	bool                   pcm_fresh = false;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -367,17 +374,111 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 	return false;
 }
 
+static bool audioout2_level_logging();
+
+// KYTY_AUDIO_LEVELS: what the object mix added to the bed's front pair, and the gains of the plain
+// (positioned) objects that were mixed, since the last report. Guarded by g_audioout2_port_mutex.
+struct AudioOut2ObjectMixStats {
+	Mix::LevelMeter added;
+	uint32_t        plain_objects  = 0;
+	double          plain_gain     = 0.0;
+	float           plain_gain_max = 0.0f;
+};
+static AudioOut2ObjectMixStats g_audioout2_object_mix;
+
+static bool audioout2_is_object_bed(const AudioOut2PortStateEntry& state) {
+	if ((state.port_type & 0xffu) != 0 || audioout2_port_type_is_object(state.port_type) ||
+	    state.audio_handle <= 0 || state.pcm_data.empty()) {
+		return false;
+	}
+	switch (state.audio_format) {
+		case AudioInternal::Format::FloatStereo:
+		case AudioInternal::Format::Float8Ch:
+		case AudioInternal::Format::Float8ChStd:
+		case AudioInternal::Format::Float12Ch: return true;
+		default: return false;
+	}
+}
+
+// Object ports have no output of their own: their fresh PCM is panned into the context's first
+// float main port (the bed), at the objects mix level, before the bed is played. Returns the mixed
+// bed, or the bed's own PCM when no object added anything. Caller holds g_audioout2_port_mutex.
+static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle         ctx,
+                                                const AudioOut2PortStateEntry& bed,
+                                                std::vector<float>*            mix) {
+	const float objects_gain = AudioInternal::AudioOutObjectsGain();
+	const auto  channels     = audioout2_data_format_channels(bed.data_format);
+	const auto  frames       = bed.samples_num;
+	bool        mixed        = false;
+	for (auto& object: g_audioout2_ports) {
+		if (!object.used || object.context != ctx || !audioout2_port_type_is_object(object.port_type)) {
+			continue;
+		}
+		const bool fresh = object.pcm_fresh;
+		object.pcm_fresh = false;
+		if (!fresh || objects_gain <= 0.0f || object.pcm_data.empty() ||
+		    object.audio_format != AudioInternal::Format::FloatMono || object.samples_num != frames) {
+			continue;
+		}
+		float gains[Objects::MAX_CHANNELS] {};
+		if (!Objects::SpeakerGains(object.object, channels, gains)) {
+			continue;
+		}
+		if (!mixed) {
+			const auto* pcm = reinterpret_cast<const float*>(bed.pcm_data.data());
+			mix->assign(pcm, pcm + static_cast<size_t>(frames) * channels);
+			mixed = true;
+		}
+		Objects::MixInto(mix->data(), channels, frames,
+		                 reinterpret_cast<const float*>(object.pcm_data.data()), gains, objects_gain);
+		if (audioout2_level_logging() && !Objects::IsAmbisonicsChannel(object.object.ambisonics) &&
+		    object.object.passthrough == Objects::PASSTHROUGH_NONE) {
+			auto& stats = g_audioout2_object_mix;
+			stats.plain_objects++;
+			stats.plain_gain += object.object.gain;
+			stats.plain_gain_max = std::max(stats.plain_gain_max, object.object.gain);
+		}
+	}
+	if (mixed && audioout2_level_logging()) {
+		const auto* pcm = reinterpret_cast<const float*>(bed.pcm_data.data());
+		float       added[2] {};
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			const auto index = static_cast<size_t>(frame) * channels;
+			added[0]         = (*mix)[index] - pcm[index];
+			added[1]         = (*mix)[index + 1] - pcm[index + 1];
+			g_audioout2_object_mix.added.Add(added, 1, 2, true);
+		}
+	}
+	return mixed ? static_cast<const void*>(mix->data()) : bed.pcm_data.data();
+}
+
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
 	// Keep both PCM storage and port handles alive until it returns.
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
 
+	thread_local std::vector<float> object_mix;
+
 	Common::LockGuard lock(g_audioout2_port_mutex);
+	bool objects_mixed = false;
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data.data()});
+			const void* data = state.pcm_data.data();
+			if (!objects_mixed && audioout2_is_object_bed(state)) {
+				data          = audioout2_mix_objects_locked(ctx, state, &object_mix);
+				objects_mixed = true;
+			}
+			params.push_back(AudioInternal::OutputParam {state.audio_handle, data});
+		}
+	}
+	if (!objects_mixed) {
+		// No bed to carry them: drop this push's object PCM rather than replay it later.
+		for (auto& state: g_audioout2_ports) {
+			if (state.used && state.context == ctx) {
+				state.pcm_fresh = false;
+			}
 		}
 	}
 
@@ -714,7 +815,7 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 }
 
 // KYTY_AUDIO_LEVELS: every 5 s, the PCM the guest hands each AudioOut2 port class (bed ports by
-// type, and all object ports together, which the emulator does not play), and the attribute ids
+// type, and all object ports together, which are mixed into the main bed), and the attribute ids
 // seen per class. The output ports themselves are also metered in audio.cpp.
 static bool audioout2_level_logging() {
 	static const bool enabled = [] {
@@ -779,12 +880,68 @@ static void audioout2_meter_locked(AudioOut2PortStateEntry* state, const void* p
 	if (object_ports != 0) {
 		// Normalise the power by the number of blocks a single port pushes in 5 s (~469).
 		const double blocks = 5.0 * 48000.0 / 512.0;
-		std::printf("AudioLevel: t=%.1f s AudioOut2 objects (not played): %u ports with PCM, %llu "
+		std::printf("AudioLevel: t=%.1f s AudioOut2 objects (guest PCM, mixed into the bed): %u ports, %llu "
 		            "blocks, summed rms %.1f dBFS, max peak %.1f dBFS\n",
 		            static_cast<double>(now) / 1e6, object_ports,
 		            static_cast<unsigned long long>(object_sets),
 		            Mix::LevelMeter::ToDb(std::sqrt(object_power / blocks)),
 		            Mix::LevelMeter::ToDb(object_peak));
+		auto& stats = g_audioout2_object_mix;
+		std::printf("AudioLevel: t=%.1f s AudioOut2 objects as mixed into the bed front pair (objects "
+		            "volume applied): rms %.1f dBFS peak %.1f dBFS; %u plain object blocks, mean gain %.3f, "
+		            "max gain %.3f\n",
+		            static_cast<double>(now) / 1e6, Mix::LevelMeter::ToDb(stats.added.Rms()),
+		            Mix::LevelMeter::ToDb(stats.added.Peak()), stats.plain_objects,
+		            stats.plain_objects != 0 ? stats.plain_gain / stats.plain_objects : 0.0,
+		            static_cast<double>(stats.plain_gain_max));
+		stats = {};
+	}
+	std::fflush(stdout);
+}
+
+// KYTY_AUDIO_LEVELS: the raw placement attributes of the first object ports (id, size, value),
+// then every 5 s the decoded placement of a few active objects.
+static void audioout2_log_object_attributes_locked(const AudioOut2PortStateEntry& state,
+                                                   const AudioOut2Attribute* attributes, uint32_t num) {
+	static uint32_t raw_lines[34] {}; // per attribute id (0-16), objects then other ports
+	static uint64_t last_report = 0;
+	for (uint32_t i = 0; i < num; i++) {
+		const auto& a    = attributes[i];
+		auto&       seen = raw_lines[std::min<uint32_t>(a.attribute_id, 16) +
+		                         (audioout2_port_type_is_object(state.port_type) ? 0 : 17)];
+		if (a.attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM || a.value == nullptr || seen >= 24) {
+			continue;
+		}
+		uint32_t words[4] {};
+		std::memcpy(words, a.value, std::min<size_t>(sizeof(words), static_cast<size_t>(a.value_size)));
+		float floats[4] {};
+		std::memcpy(floats, words, sizeof(floats));
+		std::printf("AudioObject: port %" PRIu64 " type 0x%x attr %u size %" PRIu64
+		            " raw %08x %08x %08x %08x float %g %g %g %g\n",
+		            static_cast<uint64_t>(state.handle), state.port_type, a.attribute_id,
+		            static_cast<uint64_t>(a.value_size), words[0], words[1], words[2], words[3], floats[0],
+		            floats[1], floats[2], floats[3]);
+		seen++;
+	}
+	const auto now = LibKernel::KernelGetProcessTime();
+	if (now - last_report < 5000000) {
+		return;
+	}
+	last_report  = now;
+	int reported = 0;
+	for (const auto& entry: g_audioout2_ports) {
+		const auto& o = entry.object;
+		if (!entry.used || !audioout2_port_type_is_object(entry.port_type) || entry.pcm_data.empty() ||
+		    Objects::IsAmbisonicsChannel(o.ambisonics) || o.passthrough != Objects::PASSTHROUGH_NONE) {
+			continue;
+		}
+		std::printf("AudioObject: t=%.1f s port %" PRIu64 " gain %.3f pos%s (%.2f, %.2f, %.2f) spread %.2f "
+		            "passthrough %u ambisonics 0x%x\n",
+		            static_cast<double>(now) / 1e6, static_cast<uint64_t>(entry.handle), o.gain,
+		            o.has_position ? "" : " (none)", o.x, o.y, o.z, o.spread, o.passthrough, o.ambisonics);
+		if (++reported == 12) {
+			break;
+		}
 	}
 	std::fflush(stdout);
 }
@@ -815,14 +972,27 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 		g_audioout2_port_mutex.Unlock();
 	}
 
-	if (has_pcm) {
+	if (has_pcm || (ids & ~(1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM)) != 0) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
-			if (pcm_data != nullptr && state->audio_format != AudioInternal::Format::Unknown) {
-				const auto* bytes = static_cast<const uint8_t*>(pcm_data);
-				state->pcm_data.assign(bytes, bytes + audioout2_pcm_size(*state));
-			} else {
-				state->pcm_data.clear();
+			if (audioout2_port_type_is_object(state->port_type)) {
+				for (uint32_t i = 0; i < num; i++) {
+					Objects::ApplyAttribute(&state->object, attributes[i].attribute_id,
+					                        attributes[i].value, attributes[i].value_size);
+				}
+			}
+			if (audioout2_level_logging()) {
+				audioout2_log_object_attributes_locked(*state, attributes, num);
+			}
+			if (has_pcm) {
+				if (pcm_data != nullptr && state->audio_format != AudioInternal::Format::Unknown) {
+					const auto* bytes = static_cast<const uint8_t*>(pcm_data);
+					state->pcm_data.assign(bytes, bytes + audioout2_pcm_size(*state));
+					state->pcm_fresh = true;
+				} else {
+					state->pcm_data.clear();
+					state->pcm_fresh = false;
+				}
 			}
 		}
 		g_audioout2_port_mutex.Unlock();

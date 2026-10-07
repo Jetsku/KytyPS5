@@ -119,7 +119,7 @@ static QString GameDirectoryKey(const QString& dir) {
 #endif
 }
 
-// The audio mix sliders (rows 1-4 of the Audio group) are global settings like the controller
+// The audio mix sliders (rows 1-5 of the Audio group) are global settings like the controller
 // group: shown only in the global settings dialog.
 struct AudioMixSlider {
 	QSlider* slider;
@@ -127,16 +127,17 @@ struct AudioMixSlider {
 	int AudioMixSettings::*field;
 };
 
-static std::array<AudioMixSlider, 4> AudioMixSliders(Ui::ConfigurationEditDialog& ui) {
+static std::array<AudioMixSlider, 5> AudioMixSliders(Ui::ConfigurationEditDialog& ui) {
 	return {{{ui.slider_audio_master, ui.label_audio_master_value, &AudioMixSettings::master},
 	         {ui.slider_audio_main, ui.label_audio_main_value, &AudioMixSettings::main},
 	         {ui.slider_audio_music, ui.label_audio_music_value, &AudioMixSettings::music},
 	         {ui.slider_audio_pad_speaker, ui.label_audio_pad_speaker_value,
-	          &AudioMixSettings::pad_speaker}}};
+	          &AudioMixSettings::pad_speaker},
+	         {ui.slider_audio_objects, ui.label_audio_objects_value, &AudioMixSettings::objects}}};
 }
 
 static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
-	for (int row = 1; row <= 4; row++) {
+	for (int row = 1; row <= 5; row++) {
 		ui.audioLayout->setRowVisible(row, visible);
 	}
 	// The occlusion mode is global too (graphics row 9).

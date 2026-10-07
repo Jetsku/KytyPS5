@@ -28,6 +28,7 @@ size_t                            g_capture_bytes = 0;
 int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
+float                             g_objects_gain = 1.0f;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -428,6 +429,77 @@ void TestPcmCopiedBeforeScratchBufferReuse() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void SetObject(AudioOut2::AudioOut2PortHandle port, const float* pcm_data, const float* position,
+               float gain) {
+	const Pcm       pcm {pcm_data};
+	const Attribute attributes[3] {{0, 0, &pcm, sizeof(pcm)},
+	                               {3, 0, position, 3 * sizeof(float)},
+	                               {1, 0, &gain, sizeof(gain)}};
+	Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(attributes), 3) == OK,
+	      "setting object attributes failed");
+}
+
+void TestObjectPortsMixIntoBed() {
+	const auto context   = CreateContext();
+	auto       bed_param = MakeParam(0x0800); // 8 ch float main bed
+	AudioOut2::AudioOut2PortHandle bed = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&bed_param), &bed) == OK,
+	      "bed create failed");
+	auto object_param      = MakeParam(0x0100); // mono float
+	object_param.port_type = 0x100;
+	AudioOut2::AudioOut2PortHandle object = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&object_param), &object) == OK,
+	      "object create failed");
+	Check(LiveDeviceCount() == 1, "object port opened an output of its own");
+
+	std::vector<float> bed_pcm(512 * 8, 0.125f);
+	std::vector<float> mono(512, 0.5f);
+	const float        right[3] {1.0f, 0.0f, 0.0f};
+	SetPcm(bed, bed_pcm.data());
+	SetObject(object, mono.data(), right, 0.5f);
+
+	const auto bytes = bed_pcm.size() * sizeof(float);
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push failed");
+	auto output = OutputPcm();
+	Check(output.size() == 1, "the object was output on its own");
+	const auto* mixed = reinterpret_cast<const float*>(output[0].data());
+	Check(std::abs(mixed[0] - 0.125f) < 1e-5f, "object on the right reached the front left");
+	// At 90 degrees right on a 7.1 bed: half the power on the front right, the rest on the right
+	// surrounds (5 and 7).
+	const float front = 0.125f + 0.25f * 0.70710677f;
+	const float side  = 0.125f + 0.25f * 0.5f;
+	Check(std::abs(mixed[1] - front) < 1e-5f, "object missing from the front right");
+	Check(std::abs(mixed[5] - side) < 1e-5f && std::abs(mixed[7] - side) < 1e-5f &&
+	          std::abs(mixed[4] - 0.125f) < 1e-5f,
+	      "object missing from the right surrounds");
+	Check(std::abs(mixed[2] - 0.125f) < 1e-5f && std::abs(mixed[8 * 511 + 1] - front) < 1e-5f,
+	      "object mixed into the wrong channels or frames");
+
+	// Not fed again: the object is silent, its last block is not repeated.
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "second push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "a stale object block was mixed again");
+
+	// The objects mix level scales it; 0 mutes it.
+	g_objects_gain = 0.0f;
+	SetPcm(bed, bed_pcm.data());
+	SetObject(object, mono.data(), right, 0.5f);
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "muted push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "objects volume 0 did not mute");
+	g_objects_gain = 1.0f;
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(object);
+	AudioOut2::AudioOut2PortDestroy(bed);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -476,6 +548,10 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	return 0;
 }
 
+float AudioOutObjectsGain() {
+	return g_objects_gain;
+}
+
 } // namespace Libs::Audio::AudioInternal
 
 namespace Libs::LibKernel {
@@ -499,6 +575,7 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	TestObjectPortsMixIntoBed();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

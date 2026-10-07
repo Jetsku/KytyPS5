@@ -109,6 +109,8 @@ static void PrintUsage() {
 	::printf("  --audio-pad-speaker-volume <0-200>  Controller-speaker sounds played on the main output\n"
 	         "                                      when no DualSense takes them. Default: %u.\n",
 	         Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
+	::printf("  --audio-objects-volume <0-200>      3D audio objects (AudioOut2 object ports), mixed into\n"
+	         "                                      the game sound. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -406,11 +408,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--audio-master-volume" || arg == "--audio-main-volume" ||
-		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume") {
+		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume" ||
+		           arg == "--audio-objects-volume") {
 			auto& target = arg == "--audio-master-volume" ? options.config.audio_master_volume
 			               : arg == "--audio-main-volume" ? options.config.audio_main_volume
 			               : arg == "--audio-music-volume"
 			                   ? options.config.audio_music_volume
+			               : arg == "--audio-objects-volume"
+			                   ? options.config.audio_objects_volume
 			                   : options.config.audio_pad_speaker_main_volume;
 			if (!ParseUint32(value, target) || target > Config::MAX_AUDIO_VOLUME) {
 				::printf("invalid %s (expected 0-%u): %s\n", arg.c_str(), Config::MAX_AUDIO_VOLUME,

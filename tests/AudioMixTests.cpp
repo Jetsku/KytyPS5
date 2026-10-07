@@ -1,5 +1,6 @@
 // Host mix categories, gains, environment overrides and the level meter (libs/audioMix.h).
 #include "libs/audioMix.h"
+#include "libs/audioObjects.h"
 
 #include <array>
 #include <cmath>
@@ -11,7 +12,8 @@
 #include <string>
 
 namespace {
-namespace Mix = Libs::Audio::Mix;
+namespace Mix     = Libs::Audio::Mix;
+namespace Objects = Libs::Audio::Objects;
 
 void Check(bool condition, const char* message) {
 	if (!condition) {
@@ -82,7 +84,8 @@ void TestEnvironment() {
 
 	std::map<std::string, const char*> env = {{"KYTY_AUDIO_MUSIC_VOLUME", "140"},
 	                                          {"KYTY_AUDIO_PAD_SPEAKER_ON_MAIN_VOLUME", "20"},
-	                                          {"KYTY_AUDIO_MAIN_VOLUME", "bad"}};
+	                                          {"KYTY_AUDIO_MAIN_VOLUME", "bad"},
+	                                          {"KYTY_AUDIO_OBJECTS_VOLUME", "60"}};
 	Mix::Settings base;
 	base.main   = 90;
 	base.master = 70;
@@ -94,6 +97,9 @@ void TestEnvironment() {
 	Check(settings.pad_on_main == 20, "pad speaker override ignored");
 	Check(settings.main == 90, "invalid override replaced the configured value");
 	Check(settings.master == 70, "unset override replaced the configured value");
+	Check(settings.objects == 60, "objects override ignored");
+	Check(Near(Mix::ObjectsGain(settings), 0.6), "objects gain");
+	Check(Near(Mix::ObjectsGain(Mix::Settings {}), 1.0), "objects default is unity");
 }
 
 void TestLevelMeter() {
@@ -123,10 +129,106 @@ void TestLevelMeter() {
 }
 } // namespace
 
+bool NearF(float a, float b) {
+	return std::abs(a - b) < 1e-4f;
+}
+
+void TestObjectAttributes() {
+	Objects::Params params;
+	const float     position[3] {1.0f, 2.0f, -3.0f};
+	Check(Objects::ApplyAttribute(&params, Objects::ATTRIBUTE_POSITION, position, sizeof(position)),
+	      "position rejected");
+	Check(params.has_position && params.x == 1.0f && params.y == 2.0f && params.z == -3.0f,
+	      "position not stored");
+	const float gain = 0.5f;
+	Check(Objects::ApplyAttribute(&params, Objects::ATTRIBUTE_GAIN, &gain, sizeof(gain)) &&
+	          params.gain == 0.5f,
+	      "gain not stored");
+	const float bad = -1.0f;
+	Check(!Objects::ApplyAttribute(&params, Objects::ATTRIBUTE_GAIN, &bad, sizeof(bad)) &&
+	          params.gain == 0.5f,
+	      "negative gain accepted");
+	const double wrong_size = 0.25;
+	Check(!Objects::ApplyAttribute(&params, Objects::ATTRIBUTE_GAIN, &wrong_size, sizeof(wrong_size)),
+	      "8-byte gain accepted");
+	const uint32_t priority = 3;
+	Check(!Objects::ApplyAttribute(&params, Objects::ATTRIBUTE_PRIORITY, &priority, sizeof(priority)),
+	      "priority changed the placement");
+	const uint32_t acn = Objects::AMBISONICS_CHANNEL | 1;
+	Check(Objects::ApplyAttribute(&params, Objects::ATTRIBUTE_AMBISONICS, &acn, sizeof(acn)) &&
+	          params.ambisonics == acn,
+	      "ambisonics not stored");
+}
+
+void TestObjectPanning() {
+	float           g[Objects::MAX_CHANNELS] {};
+	Objects::Params centre;
+	Check(Objects::SpeakerGains(centre, 2, g) && NearF(g[0], Objects::HALF_POWER) &&
+	          NearF(g[1], Objects::HALF_POWER),
+	      "an object without position is not centred");
+
+	Objects::Params right;
+	right.has_position = true;
+	right.x            = 5.0f;
+	right.gain         = 0.5f;
+	Check(Objects::SpeakerGains(right, 2, g) && NearF(g[0], 0.0f) && NearF(g[1], 0.5f),
+	      "an object on the right is not panned right with its gain");
+
+	Objects::Params front_left;
+	front_left.has_position = true;
+	front_left.x            = -1.0f;
+	front_left.z            = 1.0f;
+	Check(Objects::SpeakerGains(front_left, 2, g) && g[0] > g[1] &&
+	          NearF(g[0] * g[0] + g[1] * g[1], 1.0f),
+	      "front-left pan is not constant power");
+
+	// Behind on a 7.1 bed: fronts silent, power split over both surround pairs; downmixed with
+	// 0.707 per surround it is as loud as the same object in front.
+	Objects::Params behind;
+	behind.has_position = true;
+	behind.z            = -2.0f;
+	Check(Objects::SpeakerGains(behind, 8, g), "behind object dropped");
+	Check(NearF(g[0], 0.0f) && NearF(g[1], 0.0f) && NearF(g[2], 0.0f) && NearF(g[3], 0.0f),
+	      "behind object reached the front or LFE");
+	const float downmixed_left = Objects::HALF_POWER * (g[4] + g[6]);
+	Check(NearF(downmixed_left, Objects::HALF_POWER), "behind object changes level in a downmix");
+
+	Objects::Params diffuse = right;
+	diffuse.spread          = Objects::PI;
+	Check(Objects::SpeakerGains(diffuse, 2, g) && NearF(g[0], g[1]), "full spread is not centred");
+
+	Objects::Params passthrough;
+	passthrough.passthrough = Objects::PASSTHROUGH_LEFT;
+	Check(Objects::SpeakerGains(passthrough, 8, g) && NearF(g[0], 1.0f) && NearF(g[1], 0.0f),
+	      "left passthrough");
+
+	Objects::Params ambi_y;
+	ambi_y.ambisonics = Objects::AMBISONICS_CHANNEL | 1;
+	Check(Objects::SpeakerGains(ambi_y, 2, g) && NearF(g[0], Objects::HALF_POWER) &&
+	          NearF(g[1], -Objects::HALF_POWER),
+	      "ambisonics Y decode");
+	Objects::Params ambi_high;
+	ambi_high.ambisonics = Objects::AMBISONICS_CHANNEL | 4;
+	Check(!Objects::SpeakerGains(ambi_high, 2, g), "higher-order ambisonics not skipped");
+
+	Objects::Params silent;
+	silent.gain = 0.0f;
+	Check(!Objects::SpeakerGains(silent, 2, g), "silent object mixed");
+
+	float       bed[2 * 4] {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+	const float mono[4] {1.0f, -1.0f, 0.5f, 0.0f};
+	Objects::SpeakerGains(right, 2, g);
+	Objects::MixInto(bed, 2, 4, mono, g, 2.0f);
+	Check(NearF(bed[0], 0.1f) && NearF(bed[1], 1.1f) && NearF(bed[3], -0.9f) && NearF(bed[5], 0.6f),
+	      "MixInto with the objects gain");
+}
+
 int main() {
 	TestCategories();
 	TestGains();
 	TestEnvironment();
 	TestLevelMeter();
+	TestObjectAttributes();
+	TestObjectPanning();
 	std::puts("AudioMixTests: all cases passed");
 }

@@ -182,6 +182,8 @@ private:
 		bool        queue_primed = false;
 		int         channels_num = 0;
 		int         volume[12]   = {};
+		// A 7.1 (or 7.1.4) port on a stereo device: downmixed here instead of by SDL.
+		bool        downmix_stereo = false;
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
@@ -191,6 +193,11 @@ private:
 		uint32_t        meter_on_main = 0; // Blocks that played on the main output.
 		uint32_t        meter_blocks  = 0;
 		float           meter_gain    = 1.0f;
+		// What SDL is given (after volume, host gain and a stereo downmix), and samples beyond
+		// full scale in it.
+		bool            meter_device   = false;
+		Mix::LevelMeter device_meter;
+		uint32_t        device_clipped = 0;
 	};
 
 	struct PortIn {
@@ -274,6 +281,10 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	                                static_cast<uint32_t>(output_params.size()), blocking);
 }
 
+float AudioOutObjectsGain() {
+	return g_audio != nullptr ? Mix::ObjectsGain(g_audio->GetMixSettings()) : 1.0f;
+}
+
 } // namespace AudioInternal
 
 void Initialize() {
@@ -286,13 +297,14 @@ void Initialize() {
 	mix.main        = Config::GetAudioMainVolume();
 	mix.music       = Config::GetAudioMusicVolume();
 	mix.pad_on_main = Config::GetAudioPadSpeakerOnMainVolume();
+	mix.objects     = Config::GetAudioObjectsVolume();
 	mix             = Mix::ApplyEnvironment(mix, [](const char* name) { return std::getenv(name); });
 	g_audio->SetMixSettings(mix);
 	const char* levels = std::getenv("KYTY_AUDIO_LEVELS");
 	g_audio->SetLevelLogging(levels != nullptr && levels[0] != '\0' && levels[0] != '0');
 	std::printf("Kyty audio mix: master %u%%, main %u%%, music (BGM ports) %u%%, pad speaker on main "
-	            "output %u%%\n",
-	            mix.master, mix.main, mix.music, mix.pad_on_main);
+	            "output %u%%, 3D objects %u%%\n",
+	            mix.master, mix.main, mix.music, mix.pad_on_main, mix.objects);
 }
 
 void Shutdown() {
@@ -330,7 +342,19 @@ uint32_t Audio::BytesPerSample(Format format) {
 
 uint32_t Audio::OutputChannels(const PortOut& port) {
 	// SDL only takes up to 8 channels. Keep the guest buffer's channel count separate.
-	return std::min(port.channels_num, 8);
+	return port.downmix_stereo ? 2u : static_cast<uint32_t>(std::min(port.channels_num, 8));
+}
+
+// SDL's 7.1-to-stereo matrix keeps eight full-scale channels unclipped, so it plays the front pair
+// at 0.21 (-13.5 dB): game audio on a 7.1 bed came out far too quiet on stereo devices. Such ports
+// are downmixed here instead with the usual coefficients (front 1, centre/surrounds/heights 0.707,
+// LFE dropped). KYTY_AUDIO_STEREO_DOWNMIX=0 leaves it to SDL.
+static bool StereoDownmixEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_STEREO_DOWNMIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
 }
 
 SDL_AudioFormat Audio::SdlFormat(Format format) {
@@ -346,6 +370,19 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		return false;
 	}
 	report_default_playback_device();
+
+	port->downmix_stereo = false;
+	if (port->channels_num >= 8 && StereoDownmixEnabled()) {
+		SDL_AudioSpec device {};
+		port->downmix_stereo =
+		    SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &device, nullptr) &&
+		    device.channels == 2;
+		if (port->downmix_stereo) {
+			Diag::Print("%d-channel output on a stereo device: downmixed by Kyty (front 1, centre/"
+			            "surrounds 0.707, no LFE)",
+			            port->channels_num);
+		}
+	}
 
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
@@ -395,6 +432,43 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto output_channels  = OutputChannels(port);
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
+
+	if (port.downmix_stereo) {
+		// Both 8-channel orders have the left surrounds at 4 and 6 and the right ones at 5 and 7; the
+		// 12-channel one adds its left heights at 8 and 10 and the right ones at 9 and 11.
+		const bool is_float = FormatIsFloat(port.format);
+		float      scale[12] {};
+		for (uint32_t ch = 0; ch < channels && ch < 12; ch++) {
+			scale[ch] = static_cast<float>(port.volume[ch]) / 32768.0f * gain;
+		}
+		const auto sample = [&](uint32_t frame, uint32_t ch) {
+			const auto  index = static_cast<size_t>(frame) * channels + ch;
+			const float value = is_float ? static_cast<const float*>(data)[index]
+			                             : static_cast<float>(static_cast<const int16_t*>(data)[index]) / 32768.0f;
+			return value * scale[ch];
+		};
+		constexpr float SIDE = 0.70710677f;
+		buffer->resize(static_cast<size_t>(frames) * 2 * bytes_per_sample);
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			const float centre = sample(frame, 2);
+			float left  = sample(frame, 0) + SIDE * (centre + sample(frame, 4) + sample(frame, 6));
+			float right = sample(frame, 1) + SIDE * (centre + sample(frame, 5) + sample(frame, 7));
+			if (channels == 12) {
+				left += SIDE * (sample(frame, 8) + sample(frame, 10));
+				right += SIDE * (sample(frame, 9) + sample(frame, 11));
+			}
+			if (is_float) {
+				reinterpret_cast<float*>(buffer->data())[frame * 2]     = left;
+				reinterpret_cast<float*>(buffer->data())[frame * 2 + 1] = right;
+			} else {
+				reinterpret_cast<int16_t*>(buffer->data())[frame * 2] =
+				    static_cast<int16_t>(std::clamp(left * 32768.0f, -32768.0f, 32767.0f));
+				reinterpret_cast<int16_t*>(buffer->data())[frame * 2 + 1] =
+				    static_cast<int16_t>(std::clamp(right * 32768.0f, -32768.0f, 32767.0f));
+			}
+		}
+		return buffer->data();
+	}
 
 	bool volume_changed = gain != 1.0f;
 	for (uint32_t ch = 0; ch < channels; ch++) {
@@ -470,6 +544,15 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
+	if (port->meter_device) {
+		port->device_meter.Add(prepared_data, port->samples_num, output_channels, FormatIsFloat(port->format));
+		if (FormatIsFloat(port->format)) {
+			const auto* samples = static_cast<const float*>(prepared_data);
+			for (uint32_t i = 0; i < port->samples_num * output_channels; i++) {
+				port->device_clipped += std::abs(samples[i]) > 1.0f ? 1 : 0;
+			}
+		}
+	}
 
 	uint32_t min_queued_size = 0;
 	if (blocking) {
@@ -626,6 +709,15 @@ void Audio::MeterOutput(int port_id, PortOut* port, const void* data, bool on_ma
 	            static_cast<double>(port->meter_gain),
 	            Mix::LevelMeter::ToDb(rms * volume * port->meter_gain), port->meter_on_main,
 	            port->meter_blocks, static_cast<double>(now - port->meter_start) / 1e6);
+	if (port->device_meter.Samples() != 0) {
+		std::printf("AudioLevel: t=%.1f s port %d to SDL: %uch rms %.1f dBFS peak %.1f dBFS, %u samples "
+		            "clipped\n",
+		            static_cast<double>(now) / 1e6, port_id + 1, OutputChannels(*port),
+		            Mix::LevelMeter::ToDb(port->device_meter.Rms()),
+		            Mix::LevelMeter::ToDb(port->device_meter.Peak()), port->device_clipped);
+		port->device_meter.Reset();
+		port->device_clipped = 0;
+	}
 	std::fflush(stdout);
 	port->meter.Reset();
 	port->meter_start   = now;
@@ -710,6 +802,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 				MeterOutput(params[i].handle.GetId(), &port, params[i].data,
 				            port.stream != nullptr, main_gain);
 			}
+			port.meter_device = m_level_logging;
 			if (QueueSdlAudio(&port, params[i].data, blocking, main_gain)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;

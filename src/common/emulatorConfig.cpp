@@ -26,7 +26,8 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 	EXIT_IF(cfg.audio_master_volume > MAX_AUDIO_VOLUME || cfg.audio_main_volume > MAX_AUDIO_VOLUME ||
 	        cfg.audio_music_volume > MAX_AUDIO_VOLUME ||
-	        cfg.audio_pad_speaker_main_volume > MAX_AUDIO_VOLUME);
+	        cfg.audio_pad_speaker_main_volume > MAX_AUDIO_VOLUME ||
+	        cfg.audio_objects_volume > MAX_AUDIO_VOLUME);
 
 	*g_config = cfg;
 }
@@ -77,6 +78,10 @@ uint32_t GetAudioMusicVolume() {
 
 uint32_t GetAudioPadSpeakerOnMainVolume() {
 	return g_config->audio_pad_speaker_main_volume;
+}
+
+uint32_t GetAudioObjectsVolume() {
+	return g_config->audio_objects_volume;
 }
 
 PresentMode GetPresentMode() {
