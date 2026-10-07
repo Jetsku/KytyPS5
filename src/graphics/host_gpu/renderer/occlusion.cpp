@@ -13,6 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdarg>
+#include <filesystem>
+#include <mutex>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +27,43 @@ namespace {
 // old points, and every copy/reduction/publication is unchanged. Safe to switch per preparation.
 Live::Switch g_reset_batch("KYTY_OCCLUSION_RESET_BATCH", Live::ParseDefaultOff);
 }
+namespace {
+std::FILE*  g_debug_log = nullptr;
+std::string g_debug_trigger;
+std::mutex  g_debug_mutex;
+bool        g_debug_on = false;
+uint64_t    g_debug_checks = 0;
+bool DebugLogConfigured() {
+	static const bool configured = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_LOG");
+		if (value == nullptr || value[0] == '\0') return false;
+		g_debug_log = std::fopen(value, "w");
+		g_debug_trigger = std::string(value) + ".on";
+		return g_debug_log != nullptr;
+	}();
+	return configured;
+}
+}
+
+bool OcclusionCounter::DebugLogActive(bool any) noexcept {
+	if (!DebugLogConfigured()) return false;
+	if ((g_debug_checks++ & 255u) == 0) {
+		std::error_code ec;
+		g_debug_on = std::filesystem::exists(g_debug_trigger, ec);
+	}
+	return g_debug_on && (any || GateOpen());
+}
+
+void OcclusionCounter::DebugLog(const char* format, ...) {
+	if (g_debug_log == nullptr) return;
+	std::scoped_lock lock(g_debug_mutex);
+	std::va_list args;
+	va_start(args, format);
+	std::vfprintf(g_debug_log, format, args);
+	va_end(args);
+	std::fflush(g_debug_log);
+}
+
 bool OcclusionCounter::Enabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_GPU_OCCLUSION");
@@ -337,36 +378,26 @@ bool OcclusionCounter::WouldCount(uint32_t control) const noexcept {
 void OcclusionCounter::BreakGate(const char* reason, uint64_t address) {
 	if (m_gate_broken) return;
 	m_gate_broken = true;
-	m_open_pairs.clear();
 	std::printf("Occlusion counter: dump-pair gate disabled (%s, address=0x%016" PRIx64
 	            "); counting every instance from now on\n",
 	            reason, address);
 	std::fflush(stdout);
 }
 
-void OcclusionCounter::UpdateOpenPairs(uint64_t address) {
+void OcclusionCounter::UpdateGate(OcclusionDumpPairs::Kind kind, uint64_t address) {
+	// m_pairs (OcclusionDumpPairs) has already classified this dump. A begin dump opens its pair:
+	// every instance until its end dump is counted. Before 2026-10-06 begins were recognised by
+	// address % 16 == 0 only; Astro Bot's pairs at address % 16 == 8 then broke the gate and, worse,
+	// were never treated as visibility proxies (their end dump sits at % 16 == 0).
 	if (!GateEnabled() || m_gate_broken) return;
-	const auto begin = address & ~uint64_t {0xf};
-	const auto found = std::find(m_open_pairs.begin(), m_open_pairs.end(), begin);
-	if ((address & 0xfu) == 0) {
-		// Begin dump: every instance until its end dump is counted. A repeated begin at an open
-		// pair keeps it open (its later end still differs against the newest begin).
-		if (found == m_open_pairs.end()) {
-			if (m_open_pairs.size() >= MaxOpenPairs) {
-				BreakGate("too many open dump pairs", address);
-				return;
-			}
-			m_open_pairs.push_back(begin);
-		}
-	} else if ((address & 0xfu) == 8u) {
-		if (found == m_open_pairs.end()) {
-			// An end without an observed begin: its begin value may predate gated instances.
-			BreakGate("end dump without an open begin", address);
-			return;
-		}
-		m_open_pairs.erase(found);
-	} else {
-		BreakGate("dump address outside the begin/end pair layout", address);
+	if (m_pairs.Dropped() != m_pairs_dropped) {
+		// An open pair was forgotten (too many open, or its end never came): its instances could
+		// no longer be told apart.
+		BreakGate("an open dump pair was dropped", address);
+		return;
+	}
+	if (kind == OcclusionDumpPairs::Kind::Begin && m_pairs.OpenCount() > MaxOpenPairs) {
+		BreakGate("too many open dump pairs", address);
 	}
 }
 
@@ -584,7 +615,13 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	// the other member untouched; publish exactly those qwords. The batch shader also writes the
 	// dump's tag to the slot's last qword (never published): a slot that was not reduced before its
 	// command buffer was submitted, or one reduced for another dump, fails the check below.
-	auto publish = [this, address, slot_offset, batch, tag] {
+	const bool debug_log = DebugLogActive(true);
+	if (debug_log) {
+		DebugLog("D %u 0x%" PRIx64 " scopes=%u colors=%u depth=%u %ux%u zaddr=0x%" PRIx64 " zfmt=%u\n", tag, address,
+		         m_scopes_since_dump, m_last_scope.colors, m_last_scope.has_depth ? 1u : 0u, m_last_scope.width,
+		         m_last_scope.height, m_last_scope.depth_address, m_last_scope.depth_format);
+	}
+	auto publish = [this, address, slot_offset, batch, tag, debug_log] {
 		m_publish->Invalidate(slot_offset, batch ? PublishSlotSize : 248);
 		const auto* source = m_publish->Mapped().data() + slot_offset;
 		if (batch) {
@@ -629,6 +666,11 @@ bool OcclusionCounter::Dump(uint64_t address) {
 				}
 			}
 		}
+		if (debug_log) {
+			uint64_t db0 = 0;
+			std::memcpy(&db0, source, sizeof(db0));
+			DebugLog("P %u 0x%" PRIx64 " %" PRIu64 "\n", tag, address, db0 & ~(1ull << 63u));
+		}
 		m_context.PrepareHostBackingWrite(address, 248, RenderContext::HostWriter::Occlusion);
 		for (uint32_t db = 0; db < 16u; db++) {
 			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
@@ -656,7 +698,8 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
 	// Rendering has ended above and the value is published from everything counted so far: a
 	// begin opens its pair for the instances that follow, an end closes it after its snapshot.
-	UpdateOpenPairs(address);
+	const auto kind = m_pairs.Observe(address);
+	UpdateGate(kind, address);
 	if (HangTrace::Enabled()) {
 		HangTrace::OcclusionEvent event;
 		event.event         = "dump";
@@ -671,9 +714,10 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		event.depth_address = m_last_scope.depth_address;
 		HangTrace::RecordOcclusion(event);
 	}
-	// An end dump sits 8 bytes after its begin dump (interleaved begin/end pairs). A pair whose
-	// latest counted scope rendered only depth is a visibility proxy (e.g. a bounding box).
-	const bool sync = SyncProxyDumps() && (address & 0xfu) == 8u && m_scopes_since_dump != 0 &&
+	// An end dump sits 8 bytes after its begin dump (interleaved begin/end pairs, at any 8-byte
+	// alignment). A pair whose latest counted scope rendered only depth is a visibility proxy
+	// (e.g. a bounding box).
+	const bool sync = SyncProxyDumps() && kind == OcclusionDumpPairs::Kind::End && m_scopes_since_dump != 0 &&
 	                  m_last_scope.colors == 0 && m_last_scope.has_depth;
 	m_scopes_since_dump = 0;
 	m_last_scope        = {};
