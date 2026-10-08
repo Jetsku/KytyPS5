@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
 #include <thread>
 
 namespace Libs::Graphics::GpuBreadcrumbs {
@@ -187,14 +188,15 @@ void Initialize(GraphicContext& graphics, bool device_coherent) {
 	std::fflush(stdout);
 	g_active.store(true, std::memory_order_release);
 	// KYTY_GPU_BREADCRUMBS_PROBE_S=<n> (test): print the markers every n seconds, three times, to
-	// check on a healthy device that every queue's markers advance.
+	// check on a healthy device that every queue's markers advance (the third as a loss dump).
 	if (const auto* probe = std::getenv("KYTY_GPU_BREADCRUMBS_PROBE_S"); probe != nullptr) {
 		const auto seconds = std::strtoul(probe, nullptr, 10);
 		if (seconds != 0) {
 			std::thread([seconds] {
 				for (int i = 0; i < 3 && Active(); i++) {
 					std::this_thread::sleep_for(std::chrono::seconds(seconds));
-					PrintState("probe", false);
+					// The last one formats as after a loss, to test that output too.
+					PrintState(i < 2 ? "probe" : "probe, formatted as after a loss", i == 2);
 				}
 			}).detach();
 		}
@@ -306,32 +308,31 @@ void PrintState(const char* when, bool loss) {
 			std::printf("    idle: its last command buffer completed\n");
 			continue;
 		}
-		// The queue's operations in [first, last]; others' sequences interleave and are skipped.
-		uint64_t printed = 0;
-		uint64_t skipped = 0;
+		// The queue's operations in [first, last] (others' sequences interleave): the oldest and the
+		// newest ones, oldest first.
+		std::vector<DiagnosticCheckpoint> ops;
 		const auto first = flight.Count() > 4096 ? flight.last - 4096 : flight.first;
-		for (uint64_t s = flight.last + 1; s-- > first;) {
+		for (uint64_t s = first; s <= flight.last; s++) {
 			DiagnosticCheckpoint c {};
-			if (!LookupDiagnosticCheckpoint(s, &c) || c.queue != q) {
-				continue;
+			if (LookupDiagnosticCheckpoint(s, &c) && c.queue == q) {
+				ops.push_back(c);
 			}
-			if (printed == DumpMaxLines) {
-				skipped++;
-				continue;
+		}
+		constexpr size_t Ends = DumpMaxLines / 2;
+		for (size_t i = 0; i < ops.size(); i++) {
+			if (ops.size() > 2 * Ends && i == Ends) {
+				std::printf("    ... %zu more operation(s) of this queue in flight ...\n", ops.size() - 2 * Ends);
+				i = ops.size() - Ends;
 			}
-			const char* mark = s == flight.first ? "oldest unfinished" : s == flight.last ? "newest begun" : "in flight";
-			PrintCheckpoint(mark, c);
-			printed++;
+			const auto& c = ops[i];
+			PrintCheckpoint(c.sequence == flight.first  ? "oldest unfinished"
+			                : c.sequence == flight.last ? "newest begun"
+			                                            : "in flight",
+			                c);
 		}
-		if (skipped != 0) {
-			std::printf("    ... and %" PRIu64 " older operation(s) of this queue in flight\n", skipped);
-		}
-		if (DiagnosticCheckpoint oldest {};
-		    loss && LookupDiagnosticCheckpoint(flight.first, &oldest) && oldest.queue == q) {
-			std::printf("    -> the oldest unfinished operation of this queue is #%" PRIu64
-			            " (%s): the likely hang\n",
-			            flight.first, DiagnosticOpName(oldest.op));
-			LOGF("    -> likely hang: #%" PRIu64 " (%s)\n", flight.first, DiagnosticOpName(oldest.op));
+		if (loss && !ops.empty() && ops.front().sequence == flight.first) {
+			std::printf("    -> the likely hang is this queue's oldest unfinished operation:\n");
+			PrintCheckpoint("likely hang", ops.front());
 		}
 	}
 	std::fflush(stdout);
