@@ -64,9 +64,23 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          set -o pipefail
           cmake --build _Build/linux --target launcher kyty_emulator page_manager_tests memory_tracker_tests \
             lru_cache_tests virtual_memory_allocation_tests resource_tracking_tests scalar_provenance_tests \
-            resource_materialization_tests shader_vertex_metadata_tests device_compat_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests device_compat_tests --parallel \
+            -- -k 0 2>&1 | tee linux-build.log
+
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first errors as annotations.
+          if [ -f linux-build.log ]; then
+            grep -E 'error:|FAILED:|undefined reference|fatal' linux-build.log | sort -u | head -n 40 |
+              while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+          else
+            echo "::error::linux-build.log was not written"
+          fi
 
       - name: Test
         shell: bash
