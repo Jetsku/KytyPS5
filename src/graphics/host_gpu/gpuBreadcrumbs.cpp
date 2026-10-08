@@ -114,7 +114,7 @@ uint32_t ChooseMemoryType(const vk::PhysicalDeviceMemoryProperties& memory, uint
 } // namespace
 
 // The markers of every queue and the operations each may still run (Dump, the probe).
-void PrintState(const char* when);
+void PrintState(const char* when, bool loss);
 
 bool Requested(bool has_amd_buffer_marker, bool has_nv_checkpoints) {
 	if (!has_amd_buffer_marker) {
@@ -194,7 +194,7 @@ void Initialize(GraphicContext& graphics, bool device_coherent) {
 			std::thread([seconds] {
 				for (int i = 0; i < 3 && Active(); i++) {
 					std::this_thread::sleep_for(std::chrono::seconds(seconds));
-					PrintState("probe");
+					PrintState("probe", false);
 				}
 			}).detach();
 		}
@@ -269,7 +269,7 @@ void NoteShader(uint64_t address, uint64_t hash) noexcept {
 	slot.address.store(address, std::memory_order_release);
 }
 
-void PrintState(const char* when) {
+void PrintState(const char* when, bool loss) {
 	const std::lock_guard lock(g_state_mutex);
 	if (!Active() || g_mapped == nullptr) {
 		return;
@@ -326,7 +326,8 @@ void PrintState(const char* when) {
 		if (skipped != 0) {
 			std::printf("    ... and %" PRIu64 " older operation(s) of this queue in flight\n", skipped);
 		}
-		if (DiagnosticCheckpoint oldest {}; LookupDiagnosticCheckpoint(flight.first, &oldest) && oldest.queue == q) {
+		if (DiagnosticCheckpoint oldest {};
+		    loss && LookupDiagnosticCheckpoint(flight.first, &oldest) && oldest.queue == q) {
 			std::printf("    -> the oldest unfinished operation of this queue is #%" PRIu64
 			            " (%s): the likely hang\n",
 			            flight.first, DiagnosticOpName(oldest.op));
@@ -340,7 +341,7 @@ void Dump() {
 	if (!Active() || g_dumped.test_and_set(std::memory_order_acq_rel)) {
 		return;
 	}
-	PrintState("after the device loss");
+	PrintState("after the device loss", true);
 }
 
 } // namespace Libs::Graphics::GpuBreadcrumbs
