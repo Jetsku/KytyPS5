@@ -113,6 +113,18 @@ struct CodegenOptions {
 	// (unwritten particle slots in Astro Bot's mesh-particle emitter 0x4dd1f85484fc31f2, unlinked
 	// nodes in its GI ray-bundle linked lists).
 	PsLiveExec ps_live_exec = PsLiveExec::AppendConsume;
+	// KYTY_PS_HELPER_ATOMICS_SKIP=0: a pixel shader's helper invocations run the compare-exchange
+	// loops of emulated read-modify-writes (sub-dword stores, float min/max, INC/DEC; AtomicUpdate in
+	// spirvEmitterInternal.h) like the other lanes. By default they skip them: Vulkan does not perform
+	// a helper invocation's atomics and leaves their results undefined, so the loop's exit test need
+	// never hold in a helper lane and the wave can spin until a device reset (AMD keeps helper lanes
+	// in the wave). Skipping changes nothing observable: a helper's atomic has no effect and no
+	// defined result.
+	bool ps_helper_atomics_skip = true;
+	// KYTY_VOLATILE_LOADS=1 (diagnostic, default 0): every buffer, scalar-buffer and BDA (FLAT/GLOBAL,
+	// indirect V#) access is Volatile, not only MUBUF accesses with GLC/DLC. A guest loop that polls
+	// memory written by another workgroup or queue then rereads it instead of a cached or hoisted value.
+	bool volatile_loads = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -121,6 +133,10 @@ struct CodegenOptions {
 	// guarded shaders' results when it fires. Off unless both variables are set.
 	uint32_t              loop_guard_budget = 0;
 	std::vector<uint64_t> loop_guard_shaders;
+	// KYTY_LOOP_GUARD_SHADERS=all: every shader is guarded (with KYTY_LOOP_GUARD). An exhausted
+	// invocation also records its shader hash (GDS dwords end - LoopGuardHashGdsFromEnd and the one
+	// after), which the "Loop guard" report names: one run finds a shader that never leaves a loop.
+	bool loop_guard_all = false;
 	// KYTY_SRT_VARIANT_READS=1: a scalar read whose address is only known inside the shader (not a
 	// valid runtime value: e.g. a BVH traversal's loop-carried instance pointer, or data the GPU
 	// produces) is planned as a runtime read instead of a flat SRT slot. A flat slot is evaluated
@@ -214,6 +230,8 @@ struct CodegenOptions {
 inline constexpr uint32_t RtNodeBudgetGdsFromEnd = 2;
 inline constexpr uint32_t RtNodeStatsGdsFromEnd  = 3;
 inline constexpr uint32_t RtNodeStatsBins        = 24;
+// KYTY_LOOP_GUARD: the low and high dwords of the last exhausted shader's hash, past the RT bins.
+inline constexpr uint32_t LoopGuardHashGdsFromEnd = RtNodeStatsGdsFromEnd + RtNodeStatsBins + 1;
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);

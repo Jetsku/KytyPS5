@@ -229,6 +229,14 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
 			}
+			// KYTY_PS_HELPER_ATOMICS_SKIP: emulated read-modify-writes (AtomicUpdate) of pixel shaders
+			// test gl_HelperInvocation.
+			if (program.stage == ShaderType::Pixel && GetCodegenOptions().ps_helper_atomics_skip) {
+				const auto buffer = IR::BufferAccessOf(inst.GetOpcode());
+				requirements.helper_invocation |=
+				    buffer == IR::BufferAccess::Write || buffer == IR::BufferAccess::Atomic ||
+				    IR::ImageOpcodeInfoOf(inst.GetOpcode()).access == IR::ImageAccess::Atomic;
+			}
 			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
 			if (address_access != IR::AddressAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;

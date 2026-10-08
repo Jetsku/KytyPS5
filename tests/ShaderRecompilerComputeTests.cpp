@@ -51173,12 +51173,14 @@ int main(int argc, char **argv) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();
     GiProbeTests::CheckLoopGuardCodegen();
+    GiProbeTests::CheckPixelHelperAtomicsCodegen();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gi-probe-only") == 0) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();
     GiProbeTests::CheckLoopGuardCodegen();
+    GiProbeTests::CheckPixelHelperAtomicsCodegen();
     VulkanHarness vulkan;
     GiProbeTests::CheckPixelAppendHelperElection(&vulkan);
     GiProbeTests::CheckPixelAppendLiveExec(&vulkan);

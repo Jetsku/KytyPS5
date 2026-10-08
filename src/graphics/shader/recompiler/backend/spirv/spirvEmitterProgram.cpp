@@ -246,6 +246,16 @@ void EmitLoopGuardReport(EmitterState& state) {
 	                          ConstantU32(state, spv::ScopeDevice),
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
 	                          ConstantU32(state, 1));
+	// Which shader: its hash, low dword at LoopGuardHashGdsFromEnd, high dword in the next one.
+	const auto hash = state.program.shader_hash;
+	for (uint32_t word = 0; word < 2; word++) {
+		const auto replaced = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAtomicExchange, TypeU32(state), replaced,
+		    GdsDwordFromEnd(state, LoopGuardHashGdsFromEnd - word), ConstantU32(state, spv::ScopeDevice),
+		    ConstantU32(state, spv::MemorySemanticsMaskNone),
+		    ConstantU32(state, static_cast<uint32_t>(hash >> (32u * word))));
+	}
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 }
