@@ -20,6 +20,18 @@ static int g_failed = 0;
 	} while (0)
 
 int main() {
+	// KYTY_PIPELINE_FAST_FIRST values: a number (0 off), or "nvidia" (on for vendor 0x10de only).
+	{
+		CHECK(!FastFirstForVendor(nullptr, 0x10deu));
+		CHECK(!FastFirstForVendor("", 0x10deu));
+		CHECK(!FastFirstForVendor("0", 0x10deu));
+		CHECK(FastFirstForVendor("1", 0x1002u));
+		CHECK(FastFirstForVendor("nvidia", 0x10deu));
+		CHECK(!FastFirstForVendor("nvidia", 0x1002u));
+		CHECK(!FastFirstForVendor("nvidia", 0x8086u));
+		CHECK(!FastFirstForVendor("amd", 0x1002u));
+	}
+
 	// Retire list: nothing expires early, expired entries leave in order, age 0 keeps all.
 	{
 		FastFirstRetireList<int> list;

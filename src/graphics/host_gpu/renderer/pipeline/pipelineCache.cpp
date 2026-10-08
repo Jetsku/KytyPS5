@@ -4050,7 +4050,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	} else if (PipelineLibraryRequested()) {
 		PipelineCacheLog("Graphics pipeline libraries: requested but not supported by the device");
 	}
-	if (PipelineFastFirstRequested()) {
+	if (PipelineFastFirstRequested(m_graphics.GetPhysicalDeviceProperties().vendorID)) {
 		if (m_library != nullptr) {
 			PipelineCacheLog("Pipeline fast-first: KYTY_PIPELINE_LIBRARY already links pipelines "
 			                 "without optimization; fast-first is off");

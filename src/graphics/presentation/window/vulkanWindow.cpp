@@ -695,7 +695,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// Only used by the driver-cache probes of the library path and KYTY_PIPELINE_FAST_FIRST; the
 	// default device stays unchanged.
 	graphics.pipeline_creation_cache_control_enabled =
-	    (graphics.pipeline_library_enabled || Libs::Graphics::PipelineFastFirstRequested()) &&
+	    (graphics.pipeline_library_enabled ||
+	     Libs::Graphics::PipelineFastFirstRequested(graphics.GetPhysicalDeviceProperties().vendorID)) &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
 	     pipeline_library_extension ? "true" : "false",
