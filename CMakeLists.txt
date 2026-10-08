@@ -1883,6 +1883,11 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
+	# KYTY_READBACK_FLUSH_SIDE: a guest read of the unsubmitted recording's bytes is a side copy.
+	add_test(NAME buffer_cache_readback_flush_side
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-flush-side-only)
+	set_tests_properties(buffer_cache_readback_flush_side PROPERTIES
+		ENVIRONMENT "KYTY_READBACK_FLUSH_SIDE=1;KYTY_READBACK_SIDE_WRITES=1")
 	# A storage descriptor is prepared on tick N, an upload submits N, and its producer is
 	# recorded on N+1. The control deliberately observes the old value; the fix must observe
 	# the producer. Turning off side readback also removes the stale-value race.

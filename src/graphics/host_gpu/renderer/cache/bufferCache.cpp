@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -245,6 +246,30 @@ Live::Switch g_readback_merge_gap("KYTY_READBACK_MERGE_GAP_KB", [](const char* v
 	return static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 64 * 1024)) *
 	       1024;
 });
+
+// KYTY_READBACK_FLUSH_SIDE (live, default 0): a guest-thread read of GPU-written bytes that the
+// unsubmitted recording wrote (or that an address-writing shader in it may have written) is served
+// by a side copy instead of a drain. The command processor submits the recording (the drain
+// submits it as well), which makes those bytes ones an already submitted recording wrote, issues
+// the side copy that waits for it on the GPU, and returns; the guest thread then waits for the
+// copy's publication, as for any side readback, while the command processor continues. The bytes,
+// their publication and the protection rules are the side path's; only the command processor no
+// longer waits for the GPU to finish everything queued before it serves the next op.
+Live::Switch g_readback_flush_side("KYTY_READBACK_FLUSH_SIDE", Live::ParseDefaultOff);
+std::atomic<uint64_t> g_readback_flush_side_copies {0};
+
+// KYTY_READBACK_SIDE_WRITES (live, default 0): a guest write fault on a GPU-owned page (from a
+// guest thread) takes the side path as well, instead of a drain. The command processor issues the
+// side copy of the page's GPU-written bytes (submitting the current recording first when it wrote
+// them, as KYTY_READBACK_FLUSH_SIDE does for reads) and returns; the faulting thread waits for the
+// copy's publication, which leaves the page clean and write-protected, and returns from the fault
+// without the CPU-dirty transition. The write then faults once more, now on a clean page, and that
+// fault makes the page CPU-dirty and writable on the faulting thread, as any write fault does
+// (a GPU writer recorded meanwhile makes it GPU-owned again: the second fault starts over). The
+// drain made the page CPU-dirty on the command processor right after waiting for the GPU; the
+// bytes the write sees and the order against newer writers are the same.
+Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOff);
+std::atomic<uint64_t> g_readback_side_writes_copies {0};
 
 // The number of regions copies (source ascending) give when a copy starting at most `gap` bytes
 // after the previous region's source end joins it.
@@ -1592,13 +1617,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 
-	// Writes need the CPU-dirty transition of the drain path. Guest-thread reads use side copies;
-	// GPU-thread reads do too (KYTY_READBACK_SIDE_GPU_THREAD, default on) and wait for the copy
-	// themselves: it waits only for the producing recording, not for the current one, and the
-	// current recording is neither split nor submitted.
+	// Writes need the CPU-dirty transition of the drain path (or, KYTY_READBACK_SIDE_WRITES, of
+	// a second fault). Guest-thread reads use side copies; GPU-thread reads do too
+	// (KYTY_READBACK_SIDE_GPU_THREAD, default on) and wait for the copy themselves: it waits only
+	// for the producing recording, not for the current one, and the current recording is neither
+	// split nor submitted.
 	const bool gpu_thread = GuestGpu::IsGpuThread();
-	const bool side_path =
-	    m_side != nullptr && !is_write && (!gpu_thread || SideReadbackGpuThreadEnabled());
+	const bool side_write = is_write && !gpu_thread && m_side != nullptr && g_readback_side_writes.On();
+	const bool side_path  = m_side != nullptr && (!is_write || side_write) &&
+	                       (!gpu_thread || SideReadbackGpuThreadEnabled());
 	if (OverlapsPendingSideReadback(page_begin, page_end)) {
 		// Another fault already copies these pages (or an eager copy publishes them): wait for
 		// (or finish) its publication instead of copying again. Writes and GPU-thread reads must
@@ -1635,6 +1662,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (!is_write) {
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
+			CpGaps::Note(is_write ? CpGaps::Event::DrainWrite : CpGaps::Event::DrainOther);
 			ReadMemoryDrain(vaddr, size, is_write, trace);
 		});
 		record(std::nullopt);
@@ -1667,6 +1695,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			default: Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackOther); break;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadDrains);
+		CpGaps::Note(CpGaps::Event::DrainGpuThread);
 		ReadMemoryDrain(vaddr, size, false, trace);
 		record(std::nullopt);
 		return;
@@ -1674,11 +1703,32 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 	std::shared_ptr<SideReadback> issued;
 	auto                          result = SideIssueResult::Other;
-	gpu.SendCommandSync([&, this, vaddr, size] {
-		NoteEagerRead(vaddr, size, false);
+	gpu.SendCommandSync([&, this, vaddr, size, is_write] {
+		if (!is_write) {
+			NoteEagerRead(vaddr, size, false);
+		}
 		result = TryIssueSideReadback(vaddr, size, issued);
+		if ((result == SideIssueResult::CurrentWriter || result == SideIssueResult::Unbounded) &&
+		    (g_readback_flush_side.On() || is_write)) {
+			// KYTY_READBACK_FLUSH_SIDE (reads) / KYTY_READBACK_SIDE_WRITES: submit the writing
+			// recording, then copy aside.
+			CpGaps::Note(CpGaps::Event::SideFlushes);
+			(void)m_scheduler.FlushObservable();
+			result = TryIssueSideReadback(vaddr, size, issued);
+			if (result == SideIssueResult::Issued) {
+				CpGaps::Note(CpGaps::Event::SideFlushCopies);
+				g_readback_flush_side_copies.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if (result == SideIssueResult::Issued && is_write) {
+			g_readback_side_writes_copies.fetch_add(1, std::memory_order_relaxed);
+		}
 		if (result != SideIssueResult::Issued && result != SideIssueResult::Pending) {
-			ReadMemoryDrain(vaddr, size, false, trace);
+			CpGaps::Note(is_write                                   ? CpGaps::Event::DrainWrite
+			             : result == SideIssueResult::CurrentWriter ? CpGaps::Event::DrainCurrentWriter
+			             : result == SideIssueResult::Unbounded     ? CpGaps::Event::DrainUnbounded
+			                                                        : CpGaps::Event::DrainOther);
+			ReadMemoryDrain(vaddr, size, is_write, trace);
 		}
 	});
 	switch (result) {
@@ -1719,6 +1769,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			break;
 	}
 	record(std::nullopt);
+}
+
+uint64_t BufferCache::ReadbackFlushSideCopies() noexcept {
+	return g_readback_flush_side_copies.load(std::memory_order_relaxed);
+}
+
+uint64_t BufferCache::ReadbackSideWriteCopies() noexcept {
+	return g_readback_side_writes_copies.load(std::memory_order_relaxed);
 }
 
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,

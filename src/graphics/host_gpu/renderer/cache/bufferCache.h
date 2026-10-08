@@ -189,6 +189,11 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_READBACK_FLUSH_SIDE (bufferCache.cpp): guest reads served by a side copy after the
+	// command processor submitted the recording that wrote their bytes (process-wide; tests).
+	[[nodiscard]] static uint64_t ReadbackFlushSideCopies() noexcept;
+	// KYTY_READBACK_SIDE_WRITES: guest write faults on GPU-owned pages served by a side copy.
+	[[nodiscard]] static uint64_t ReadbackSideWriteCopies() noexcept;
 	// A native-buffer revision only: callers must separately rule out newer image ownership.
 	// No buffer is created or synchronized. CPU-dirty and pending-publication ranges have no token.
 	[[nodiscard]] std::optional<BufferContentRevision> GetContentRevision(uint64_t vaddr,

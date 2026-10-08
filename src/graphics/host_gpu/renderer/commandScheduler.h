@@ -46,6 +46,9 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
+	// Submits the current recording with an observable completion (as Wait does for the current
+	// tick, without the wait) and begins the next one; returns the submitted tick.
+	uint64_t       FlushObservable();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {}, bool force_completion = false);

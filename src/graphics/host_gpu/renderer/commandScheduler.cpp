@@ -242,6 +242,13 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+uint64_t CommandScheduler::FlushObservable() {
+	CheckActive();
+	const auto tick = Submit({}, true);
+	BeginNext();
+	return tick;
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit({}, true);
 	m_master.Wait(tick);
