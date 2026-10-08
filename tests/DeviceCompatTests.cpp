@@ -1,5 +1,6 @@
 // Device-capability choices (graphics/host_gpu/deviceCompat.h) for the subgroup sizes, features and
 // formats that NVIDIA, AMD and Intel GPUs report.
+#include "graphics/host_gpu/breadcrumbLogic.h"
 #include "graphics/host_gpu/deviceCompat.h"
 
 #include <cstdint>
@@ -177,6 +178,39 @@ void TestImageCreateFallbacks() {
 	       "block-compressed formats are BC1 to BC7");
 }
 
+void TestComputeWave64Split() {
+	// KYTY_COMPUTE_WAVE64=0 on AMD: compute_wave64 off and host subgroup 32, so a wave64 program
+	// requires 32 lanes (two guest lanes per invocation, as on NVIDIA) and a wave32 one still 32.
+	const SubgroupSizeControl split {.min_size = 32, .max_size = 64, .enabled = true, .compute = true,
+	                                 .compute_wave64 = false};
+	Expect(ComputeSubgroupSize(split, 64, 32) == 32, "AMD split: wave64 requires 32");
+	Expect(ComputeSubgroupSize(split, 32, 32) == 32, "AMD split: wave32 requires 32");
+	// Pixel and mesh stages keep one host subgroup per guest wave (the default 64 for wave64).
+	Expect(GraphicsSubgroupSize(split, true, 32, 64) == 32, "AMD split: wave32 pixel requires 32");
+	Expect(GraphicsSubgroupSize(split, true, 64, 64) == 64, "AMD split: wave64 pixel requires 64");
+}
+
+void TestBreadcrumbs() {
+	using namespace Libs::Graphics::Breadcrumbs;
+	Expect(SequenceFromMarker(0, 100) == 0, "breadcrumbs: no marker");
+	Expect(SequenceFromMarker(42, 100) == 42, "breadcrumbs: marker below the newest");
+	Expect(SequenceFromMarker(100, 100) == 100, "breadcrumbs: the newest marker");
+	Expect(SequenceFromMarker(101, 100) == 0, "breadcrumbs: a marker above the newest in the first window");
+	const uint64_t window = uint64_t {1} << 32u;
+	Expect(SequenceFromMarker(5, window + 10) == window + 5, "breadcrumbs: second window");
+	Expect(SequenceFromMarker(0xfffffff0u, window + 10) == 0xfffffff0u,
+	       "breadcrumbs: a marker of the previous window");
+	// Begun 7, everything before 5 completed: 5..7 may still run, 5 is the oldest unfinished.
+	const auto a = QueueInFlight(7, 5);
+	Expect(a.first == 5 && a.last == 7 && a.Count() == 3, "breadcrumbs: in flight 5..7");
+	// Begun and done-before equal: that one operation was running.
+	const auto b = QueueInFlight(9, 9);
+	Expect(b.first == 9 && b.last == 9 && b.Count() == 1, "breadcrumbs: one running operation");
+	Expect(QueueInFlight(0, 0).Empty(), "breadcrumbs: a queue that never began anything");
+	const auto c = QueueInFlight(3, 0);
+	Expect(c.first == 1 && c.last == 3, "breadcrumbs: nothing completed yet");
+}
+
 void TestDepthClamp() {
 	// With VK_EXT_depth_clip_enable (NVIDIA, as before): always clamped, clipping set apart.
 	Expect(DepthClampEnable(true, true) && DepthClampEnable(true, false),
@@ -243,6 +277,8 @@ int main() {
 	TestDepthClamp();
 	TestNvidiaArchitecture();
 	TestQuirkMode();
+	TestComputeWave64Split();
+	TestBreadcrumbs();
 	if (g_failures != 0) {
 		std::printf("DeviceCompatTests: failed: %d check(s)\n", g_failures);
 		return 1;

@@ -1,5 +1,6 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -36,6 +37,11 @@ const char* OpName(uint32_t op) {
 		case 7: return "EopWriteBackFlip";
 		case 8: return "EopOnlyFlip";
 		case 9: return "DispatchIndirect";
+		case GpuBreadcrumbs::OpCommandBufferEnd: return "CommandBufferEnd";
+		case GpuBreadcrumbs::OpSideReadback: return "SideReadback";
+		case GpuBreadcrumbs::OpSideReadbackEnd: return "SideReadbackEnd";
+		case GpuBreadcrumbs::OpUploadDma: return "UploadDma";
+		case GpuBreadcrumbs::OpUploadDmaEnd: return "UploadDmaEnd";
 		default: return "Unknown";
 	}
 }
@@ -55,6 +61,34 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
 }
 
+}
+
+const char* DiagnosticOpName(uint32_t op) {
+	return OpName(op);
+}
+
+uint64_t RecordDiagnosticSequence(const DiagnosticCheckpoint& checkpoint) {
+	const std::lock_guard lock(g_checkpoint_mutex);
+	const auto sequence = ++g_checkpoint_sequence;
+	auto& slot = g_checkpoints[sequence % CHECKPOINT_RING_SIZE];
+	slot = checkpoint;
+	slot.sequence = sequence;
+	return sequence;
+}
+
+bool LookupDiagnosticCheckpoint(uint64_t sequence, DiagnosticCheckpoint* checkpoint) {
+	const std::lock_guard lock(g_checkpoint_mutex);
+	const auto& slot = g_checkpoints[sequence % CHECKPOINT_RING_SIZE];
+	if (sequence == 0 || slot.sequence != sequence) {
+		return false;
+	}
+	*checkpoint = slot;
+	return true;
+}
+
+uint64_t NewestDiagnosticSequence() {
+	const std::lock_guard lock(g_checkpoint_mutex);
+	return g_checkpoint_sequence;
 }
 
 bool DeviceFaultDiagnosticsEnabled() {
@@ -142,8 +176,11 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool que
 	            tick, DeviceFaultDiagnosticsEnabled());
 	LOGF("--- Device loss: submission/wait tick=%" PRIu64 " ---\n", tick);
 	DumpDeviceFault(graphics);
+	GpuBreadcrumbs::Dump();
 	if (!graphics.diagnostic_checkpoints_enabled || graphics.queue == nullptr) {
-		std::printf("  NV checkpoints unavailable; enable KYTY_DEVICE_FAULT_DIAGNOSTICS=1 before launch for supported driver diagnostics.\n");
+		if (!GpuBreadcrumbs::Active()) {
+			std::printf("  No GPU breadcrumbs: NV checkpoints and VK_AMD_buffer_marker breadcrumbs are off (KYTY_DEVICE_FAULT_DIAGNOSTICS=1, KYTY_GPU_BREADCRUMBS).\n");
+		}
 		std::fflush(stdout);
 		return;
 	}

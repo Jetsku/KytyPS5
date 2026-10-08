@@ -11,6 +11,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -1038,6 +1039,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.compute_subgroup_size_control_enabled ||
 	    (supported_features13.subgroupSizeControl == VK_TRUE &&
 	     subgroup_size_control.minSubgroupSize < subgroup_size_control.maxSubgroupSize);
+	// KYTY_COMPUTE_WAVE64=0 (diagnostic, default 1): wave64 compute programs take the two-lanes-per-
+	// invocation path on required 32-wide subgroups, as on NVIDIA, instead of native 64-wide ones.
+	// Only where compute pipelines can require 32 (DeviceCompat::ComputeSubgroupSize then does).
+	if (const auto* wave64 = std::getenv("KYTY_COMPUTE_WAVE64");
+	    wave64 != nullptr && std::strcmp(wave64, "0") == 0) {
+		const bool can_require_32 =
+		    graphics.subgroup_size_control_enabled &&
+		    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
+		    subgroup_size_control.minSubgroupSize <= 32 && subgroup_size_control.maxSubgroupSize >= 32 &&
+		    subgroup_size_control.minSubgroupSize < subgroup_size_control.maxSubgroupSize;
+		if (can_require_32) {
+			graphics.compute_subgroup_size_control_enabled = false;
+			graphics.compute_wave64_split                  = true;
+		}
+		std::printf("Kyty compute wave64 (KYTY_COMPUTE_WAVE64=0): %s\n",
+		            can_require_32 ? "two guest lanes per invocation on required 32-wide subgroups"
+		                           : "unchanged, the device cannot require 32-wide compute subgroups");
+		std::fflush(stdout);
+	}
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -1251,6 +1271,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.device_fault_enabled = true;
 		}
 	}
+	// KYTY_GPU_BREADCRUMBS: device-uncached marker memory (gpuBreadcrumbs.cpp).
+	vk::PhysicalDeviceCoherentMemoryFeaturesAMD coherent_memory {};
+	if (HasExtension(device_extensions, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceCoherentMemoryFeaturesAMD supported_coherent {};
+		vk::PhysicalDeviceFeatures2                 coherent_query {};
+		coherent_query.pNext = &supported_coherent;
+		physical_device.getFeatures2(&coherent_query);
+		if (supported_coherent.deviceCoherentMemory) {
+			coherent_memory.deviceCoherentMemory  = VK_TRUE;
+			coherent_memory.pNext                 = const_cast<void*>(create_info.pNext);
+			create_info.pNext                     = &coherent_memory;
+			graphics.device_coherent_memory_enabled = true;
+		}
+	}
 	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
 	if (graphics.maintenance8_enabled) {
 		maintenance8.maintenance8 = VK_TRUE;
@@ -1299,6 +1333,64 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		std::fflush(stdout);
 	}
 	return device;
+}
+
+// KYTY_DEVICE_FAULT_DIAGNOSTICS=1: the device facts that decide AMD/NVIDIA code paths, on the
+// console (players send console text, not the log file): driver, queues, memory heaps (a
+// host-visible VRAM heap of 2 GiB or more is resizable BAR / Smart Access Memory), subgroups.
+static void PrintDeviceReport(const GraphicContext& graphics) {
+	const auto&                          physical = graphics.physical_device;
+	vk::PhysicalDeviceDriverProperties   driver {};
+	vk::PhysicalDeviceProperties2        properties {};
+	properties.pNext = &driver;
+	physical.getProperties2(&properties);
+	const auto& p = properties.properties;
+	std::printf("Device report: %s, vendor 0x%04x device 0x%04x, driver %s (%s), driver version 0x%08x, "
+	            "Vulkan %u.%u.%u, timestamp period %.3f ns\n",
+	            p.deviceName.data(), p.vendorID, p.deviceID, driver.driverName.data(),
+	            driver.driverInfo.data(), p.driverVersion, VK_VERSION_MAJOR(p.apiVersion),
+	            VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion),
+	            static_cast<double>(p.limits.timestampPeriod));
+	uint32_t family_count = 0;
+	physical.getQueueFamilyProperties(&family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(family_count);
+	physical.getQueueFamilyProperties(&family_count, families.data());
+	for (uint32_t i = 0; i < family_count; i++) {
+		std::printf("Device report: queue family %u: %u queue(s), flags 0x%x, timestamp bits %u%s%s\n", i,
+		            families[i].queueCount,
+		            static_cast<uint32_t>(static_cast<VkQueueFlags>(families[i].queueFlags)),
+		            families[i].timestampValidBits, i == graphics.queue_family ? " (graphics)" : "",
+		            i == graphics.transfer_queue_family ? " (upload DMA)" : "");
+	}
+	const auto& memory = graphics.GetPhysicalDeviceMemoryProperties();
+	for (uint32_t h = 0; h < memory.memoryHeapCount; h++) {
+		std::string types;
+		for (uint32_t t = 0; t < memory.memoryTypeCount; t++) {
+			if (memory.memoryTypes[t].heapIndex == h) {
+				types += fmt::format(" {}:0x{:x}", t,
+				                     static_cast<uint32_t>(static_cast<VkMemoryPropertyFlags>(
+				                         memory.memoryTypes[t].propertyFlags)));
+			}
+		}
+		std::printf("Device report: heap %u: %.0f MiB, flags 0x%x, types%s\n", h,
+		            static_cast<double>(memory.memoryHeaps[h].size) / (1024.0 * 1024.0),
+		            static_cast<uint32_t>(static_cast<VkMemoryHeapFlags>(memory.memoryHeaps[h].flags)),
+		            types.c_str());
+	}
+	std::printf("Device report: subgroups default %u, min %u, max %u, required-size stages 0x%x, compute "
+	            "wave64 %s%s; side queue %s; sparse buffer %s, sparse image %s; depth feedback loop %s; mesh "
+	            "shaders %s; device-coherent memory %s\n",
+	            graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
+	            static_cast<uint32_t>(static_cast<VkShaderStageFlags>(graphics.required_subgroup_size_stages)),
+	            graphics.SupportsComputeWave64() ? "native" : "two lanes per invocation",
+	            graphics.compute_wave64_split ? " (KYTY_COMPUTE_WAVE64=0)" : "",
+	            graphics.side_queue_index != 0 ? "queue 1" : "shared",
+	            graphics.sparse_residency_buffer_enabled ? "on" : "off",
+	            graphics.sparse_residency_image_enabled ? "on" : "off",
+	            graphics.attachment_feedback_loop_enabled ? "yes" : "no (GENERAL layout)",
+	            graphics.mesh_shader_enabled ? "yes" : "no",
+	            graphics.device_coherent_memory_enabled ? "enabled" : "off");
+	std::fflush(stdout);
 }
 
 static void VulkanGetExtensions(VulkanExtensions& r) {
@@ -1765,6 +1857,17 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
 		}
+		// KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h): buffer markers, in device-uncached memory where
+		// VK_AMD_device_coherent_memory offers it (VulkanCreateDevice enables its feature).
+		if (GpuBreadcrumbs::Requested(
+		        HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME),
+		        graphic_ctx.diagnostic_checkpoints_enabled)) {
+			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			graphic_ctx.gpu_breadcrumbs_requested = true;
+			if (HasExtension(available_extensions, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
+			}
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
@@ -1853,6 +1956,12 @@ void WindowContext::CreateVulkan() {
 		                            &graphic_ctx.transfer_queue);
 		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
 	}
+	if (graphic_ctx.gpu_breadcrumbs_requested) {
+		GpuBreadcrumbs::Initialize(graphic_ctx, graphic_ctx.device_coherent_memory_enabled);
+	}
+	if (DeviceFaultDiagnosticsEnabled()) {
+		PrintDeviceReport(graphic_ctx);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1892,6 +2001,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		GpuBreadcrumbs::Shutdown(graphic_ctx);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

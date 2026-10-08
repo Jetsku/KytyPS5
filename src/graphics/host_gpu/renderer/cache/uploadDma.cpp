@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -256,6 +257,13 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 	vk::CommandBufferBeginInfo begin {};
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	RequireVulkanSuccess(command.begin(&begin), "begin upload DMA command buffer");
+	if (GpuBreadcrumbs::Active()) {
+		GpuBreadcrumbs::Write(command, GpuBreadcrumbs::Queue::Transfer,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Transfer,
+		                                           {.op   = GpuBreadcrumbs::OpUploadDma,
+		                                            .arg0 = static_cast<uint32_t>(jobs.size()),
+		                                            .arg4 = jobs.back().value}));
+	}
 	std::vector<vk::BufferCopy> regions;
 	uint64_t                    reuse_tick = 0;
 	for (size_t first = 0; first < jobs.size();) {
@@ -270,6 +278,11 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 		command.copyBuffer(jobs[first].source, m_ring->Handle(), static_cast<uint32_t>(regions.size()),
 		                   regions.data());
 		first = last;
+	}
+	if (GpuBreadcrumbs::Active()) {
+		GpuBreadcrumbs::Write(command, GpuBreadcrumbs::Queue::Transfer,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Transfer,
+		                                           {.op = GpuBreadcrumbs::OpUploadDmaEnd, .arg4 = jobs.back().value}));
 	}
 	RequireVulkanSuccess(command.end(), "end upload DMA command buffer");
 

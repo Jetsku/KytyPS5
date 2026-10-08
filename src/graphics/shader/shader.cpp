@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -489,6 +490,8 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());
 	std::copy(user_data.begin(), user_data.end(), params.user_data.begin() + user_data_base);
+	// KYTY_GPU_BREADCRUMBS: names the shaders of the operations a device-loss report lists.
+	GpuBreadcrumbs::NoteShader(shader_addr, params.hash);
 	return params;
 }
 
