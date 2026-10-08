@@ -51,6 +51,7 @@ $Configs = @(
         KYTY_TEXTURE_SPARSE_RESIDENCY = '0'; KYTY_BDA_PAGETABLE_SPARSE = '0'; KYTY_TEXTURE_STAGING_REBAR = '0'
         KYTY_FUNCTION_ARRAY_SHRINK = '0'; KYTY_PIPELINE_FAST_FIRST = '0'; KYTY_SUBMISSION_MODE = 'direct'
         KYTY_VOLATILE_LOADS = '1' } }
+    @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' } }
     @{ Name = 'helper-fix';       Text = 'helper lanes skip pixel-shader compare-exchange loops (new fix)'; Env = [ordered]@{ KYTY_PS_HELPER_ATOMICS_SKIP = '1' } }
     @{ Name = 'wave64-split';     Text = 'wave64 compute shaders on 32-wide subgroups, as on NVIDIA';  Env = [ordered]@{ KYTY_COMPUTE_WAVE64 = '0' } }
     @{ Name = 'loop-guard';       Text = 'every shader loop ends after 200000 iterations and is named'; Env = [ordered]@{
@@ -65,7 +66,6 @@ $Configs = @(
     @{ Name = 'volatile-loads';   Text = 'every shader memory read is volatile (polling loops reread)'; Env = [ordered]@{ KYTY_VOLATILE_LOADS = '1' } }
     @{ Name = 'lane-opts-off';    Text = 'no EXEC-select elimination and no native lane reductions';    Env = [ordered]@{ KYTY_EXEC_SELECTS = '0'; KYTY_LANE_REDUCTIONS = '0' } }
     @{ Name = 'shrink-off';       Text = 'function-storage arrays not shrunk';                          Env = [ordered]@{ KYTY_FUNCTION_ARRAY_SHRINK = '0' } }
-    @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' } }
     @{ Name = 'submit-direct';    Text = 'submissions from the CP thread (no submission worker)';       Env = [ordered]@{ KYTY_SUBMISSION_MODE = 'direct' } }
     @{ Name = 'baseline-log';     Text = 'baseline again, with the emulator log file (device details)';  Env = [ordered]@{}; LogFile = $true }
 )
