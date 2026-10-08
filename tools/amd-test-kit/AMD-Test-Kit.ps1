@@ -50,7 +50,7 @@ $Configs = @(
         KYTY_PS_HELPER_ATOMICS_SKIP = '1'; KYTY_COMPUTE_WAVE64 = '0'; KYTY_SIDE_QUEUE = '0'; KYTY_UPLOAD_DMA = '0'
         KYTY_TEXTURE_SPARSE_RESIDENCY = '0'; KYTY_BDA_PAGETABLE_SPARSE = '0'; KYTY_TEXTURE_STAGING_REBAR = '0'
         KYTY_FUNCTION_ARRAY_SHRINK = '0'; KYTY_PIPELINE_FAST_FIRST = '0'; KYTY_SUBMISSION_MODE = 'direct'
-        KYTY_VOLATILE_LOADS = '1' } }
+        KYTY_VOLATILE_LOADS = '1'; KYTY_DRAW_RUN = '0' } }
     @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' } }
     @{ Name = 'helper-fix';       Text = 'helper lanes skip pixel-shader compare-exchange loops (new fix)'; Env = [ordered]@{ KYTY_PS_HELPER_ATOMICS_SKIP = '1' } }
     @{ Name = 'wave64-split';     Text = 'wave64 compute shaders on 32-wide subgroups, as on NVIDIA';  Env = [ordered]@{ KYTY_COMPUTE_WAVE64 = '0' } }
@@ -59,6 +59,7 @@ $Configs = @(
     @{ Name = 'sparse-off';       Text = 'no sparse residency (textures and the BDA page table)';      Env = [ordered]@{
         KYTY_TEXTURE_SPARSE_RESIDENCY = '0'; KYTY_BDA_PAGETABLE_SPARSE = '0' } }
     @{ Name = 'queues-off';       Text = 'neither extra queue (side copies and upload DMA on queue 0)'; Env = [ordered]@{ KYTY_SIDE_QUEUE = '0'; KYTY_UPLOAD_DMA = '0' } }
+    @{ Name = 'drawrun-off';      Text = 'no draw-run reuse (it starts at the title scene)';           Env = [ordered]@{ KYTY_DRAW_RUN = '0' } }
     @{ Name = 'dma-off';          Text = 'no upload DMA queue (transfer-only queue family)';            Env = [ordered]@{ KYTY_UPLOAD_DMA = '0' } }
     @{ Name = 'sidequeue-off';    Text = 'no second graphics queue for side copies';                    Env = [ordered]@{ KYTY_SIDE_QUEUE = '0' } }
     @{ Name = 'rebar-off';        Text = 'no texture staging ring in VRAM (Smart Access Memory path)';  Env = [ordered]@{ KYTY_TEXTURE_STAGING_REBAR = '0' } }
@@ -67,6 +68,7 @@ $Configs = @(
     @{ Name = 'lane-opts-off';    Text = 'no EXEC-select elimination and no native lane reductions';    Env = [ordered]@{ KYTY_EXEC_SELECTS = '0'; KYTY_LANE_REDUCTIONS = '0' } }
     @{ Name = 'shrink-off';       Text = 'function-storage arrays not shrunk';                          Env = [ordered]@{ KYTY_FUNCTION_ARRAY_SHRINK = '0' } }
     @{ Name = 'submit-direct';    Text = 'submissions from the CP thread (no submission worker)';       Env = [ordered]@{ KYTY_SUBMISSION_MODE = 'direct' } }
+    @{ Name = 'recorder-off';     Text = 'commands recorded on the CP thread (no recorder thread)';    Env = [ordered]@{ KYTY_CP_RECORDER = '0' } }
     @{ Name = 'baseline-log';     Text = 'baseline again, with the emulator log file (device details)';  Env = [ordered]@{}; LogFile = $true }
 )
 # Run only when the baseline did not lose the device (the breadcrumbs may change the timing).
