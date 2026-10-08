@@ -252,6 +252,8 @@ if ([IO.File]::Exists($presetPath)) {
     $json = [IO.File]::ReadAllText($presetPath) | ConvertFrom-Json
     foreach ($p in $json.PSObject.Properties) { $preset[$p.Name] = [string]$p.Value }
 }
+# "-Only a,b" arrives as one string through AMD-Test-Kit.cmd (powershell -File).
+$Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $selected = @($Configs | Where-Object { $Only.Count -eq 0 -or $Only -contains $_.Name })
 if ($selected.Count -eq 0) { throw "No configuration matches -Only $($Only -join ','). Names: $(($Configs | ForEach-Object Name) -join ', ')" }
 
@@ -329,6 +331,7 @@ try {
         $start = Get-Date
         $proc = Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $EmulatorDir -PassThru `
             -RedirectStandardOutput $log -RedirectStandardError $err
+        $null = $proc.Handle # keeps the exit code readable after the process ends
         $videoClosed = $null
         $lostAt = $null
         $verdict = ''
@@ -387,7 +390,11 @@ try {
     try {
         $sysEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $kitStart } -ErrorAction SilentlyContinue |
             Where-Object { $_.ProviderName -match 'Display|amdkmdag|amdkmdap|amdfendr|dxgkrnl|nvlddmkm|Graphics' -or $_.Id -eq 4101 })
-        foreach ($e in $sysEvents) { $events.Add(("System {0:o} {1} id {2}: {3}" -f $e.TimeCreated, $e.ProviderName, $e.Id, ($e.Message -replace '\s+', ' '))) }
+        foreach ($e in $sysEvents) {
+            $text = if ($e.Message) { $e.Message -replace '\s+', ' ' } else { '(no message text) data: ' + (($e.Properties | ForEach-Object { [string]$_.Value }) -join '; ') }
+            if ($text.Length -gt 600) { $text = $text.Substring(0, 600) }
+            $events.Add(("System {0:o} {1} id {2}: {3}" -f $e.TimeCreated, $e.ProviderName, $e.Id, $text))
+        }
         $appEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $kitStart } -ErrorAction SilentlyContinue |
             Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting' -and $_.Message -match 'kyty|LiveKernelEvent|141|117' })
         foreach ($e in $appEvents) { $events.Add(("Application {0:o} {1} id {2}: {3}" -f $e.TimeCreated, $e.ProviderName, $e.Id, ($e.Message -replace '\s+', ' ' | ForEach-Object { if ($_.Length -gt 600) { $_.Substring(0, 600) } else { $_ } }))) }
