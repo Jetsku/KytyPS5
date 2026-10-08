@@ -128,7 +128,10 @@ public:
 	// overlap instead of each lookup waiting for its own (the 32,768-slot table is 2 MiB; the
 	// slot load was 4.1% of the command processor at the Sky Garden start view). No state
 	// changes: every key, signature, epoch and guard check of the lookup still runs.
-	void PrefetchReadBinding(uint64_t vaddr, uint64_t size) const noexcept;
+	// KYTY_CP_BINDING_BATCH_PREFETCH=find: the hints are issued earlier, by RenderExecutor::
+	// FindBuffers for each read binding it discovers (before the stages' image work), instead of a
+	// separate pass in RebindBuffers. `at_find` says which caller asks.
+	void PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find = false) const noexcept;
 	// A writable binding whose shader can only write `written` (sub-ranges of [vaddr, vaddr +
 	// size), e.g. from a write-range proof): the whole range is synchronized as for any binding,
 	// but only `written` becomes GPU-owned (dirty, protected, write-ticked).
@@ -434,17 +437,27 @@ private:
 	// BindingEpochMemoCrossHits / CrossRejects, and why lookups missed (BindingEpochMemoMiss*).
 	// In verify mode a cross-epoch hit finding CPU-dirty pages with the signature unchanged is a
 	// mismatch, not a race.
+	// KYTY_BINDING_MEMO_TOUCH (default off, live): a cache-buffer hit skips TouchBuffer when this
+	// memo already touched its buffer in the current GC tick (`touched`): the buffer's LRU item then
+	// holds that tick, so the touch would change nothing (LeastRecentlyUsedCache::Touch returns at
+	// once). A hit takes the buffer from `buffer` either way: the slot vector's object (slots live in
+	// a deque, and the structure guard rules out the buffer's deletion).
 	enum class BindingMemoKind : uint8_t { Empty, Stream, Cached };
-	struct BindingMemo {
+	// One 64-byte line per slot (the table is cache-line aligned). Ranges of 4 GiB or more are
+	// never memoized (no storage binding is that large).
+	struct alignas(64) BindingMemo {
 		uint64_t        vaddr     = 0;
-		uint64_t        size      = 0;
+		uint32_t        size      = 0;
+		BindingMemoKind kind      = BindingMemoKind::Empty;
 		uint64_t        epoch     = 0;
 		uint64_t        signature = 0;
 		uint64_t        guard     = 0; // stream: tick; cached: buffer structure epoch
 		uint64_t        offset    = 0;
-		BufferId        id;
-		BindingMemoKind kind = BindingMemoKind::Empty;
+		Buffer*         buffer    = nullptr; // the cache buffer (or the stream buffer)
+		uint64_t        touched   = UINT64_MAX; // cached: the GC tick of the memo's last touch
 	};
+	static_assert(sizeof(BindingMemo) == 64);
+	static constexpr uint64_t BindingMemoMaxSize = uint64_t {1} << 32u;
 	static constexpr size_t BindingMemoSlots = 2048;
 	// KYTY_CP_COMMIT=bindslots: 32,768 slots, indexed by the hash's top 15 bits (11 above).
 	static constexpr size_t BindingMemoSlotsLarge = 32768;
@@ -475,6 +488,19 @@ private:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferNow(uint64_t vaddr, uint64_t size,
 	                                                           bool is_written, bool is_texel_buffer,
 	                                                           BufferId id, BufferId* obtained);
+	// KYTY_BINDING_LEAN_MISS (default off, live; 1, verify, exit). A read binding that missed its
+	// memo, whose range has no CPU-dirty page (the tracker's lock-free mirror, exact on this thread:
+	// only it clears those bits) while its signature is still the one read before the memo lookup,
+	// and whose buffer from FindBuffers (`id`) is still registered and covers it: the normal path
+	// would decide no stream copy (that needs a CPU-dirty page), keep `id` (FindBuffer would return
+	// it), find nothing to upload, and record the memo under that signature. This takes the same
+	// result and records the same memo from that one query, instead of ObtainBufferNow's and
+	// RecordBinding's several queries and signatures. Anything else takes the normal path.
+	// verify: the normal path runs as well and decides the binding; a different buffer or offset
+	// while the signature is unchanged is a mismatch (BindingLeanMissVerifyMismatches; exit stops).
+	[[nodiscard]] bool TryLeanReadMiss(uint64_t vaddr, uint64_t size, uint64_t epoch,
+	                                   uint64_t before, BufferId id,
+	                                   std::pair<Buffer*, uint64_t>& result);
 	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
 	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
 	// `cross`: the hit came from another epoch (KYTY_BINDING_MEMO_CROSS_EPOCH).
@@ -702,6 +728,11 @@ private:
 		uint64_t cached_hits       = 0; // cross-epoch hits included
 		uint64_t cross_hits        = 0;
 		uint64_t cross_rejects     = 0;
+		uint64_t touch_skips       = 0; // KYTY_BINDING_MEMO_TOUCH
+		uint64_t lean_misses       = 0; // KYTY_BINDING_LEAN_MISS
+		uint64_t lean_verify_checks     = 0;
+		uint64_t lean_verify_mismatches = 0;
+		uint64_t lean_verify_races      = 0;
 		uint64_t records           = 0;
 		uint64_t verify_checks     = 0;
 		uint64_t verify_mismatches = 0;
