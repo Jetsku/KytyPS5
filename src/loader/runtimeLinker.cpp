@@ -766,6 +766,8 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 	if (Libs::Graphics::FaultCost::MapEnabled()) {
 		Libs::Graphics::FaultCost::SetFaultInstruction(info->exception_address);
 	}
+	// The faulting instruction runs again when this handler returns (KYTY_READBACK_SIDE_WRITES).
+	const Libs::Graphics::FaultCost::RetriedFaultScope retried;
 	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
 	if (HangTrace::Enabled()) {
 		HangTrace::ClearFaultContext();

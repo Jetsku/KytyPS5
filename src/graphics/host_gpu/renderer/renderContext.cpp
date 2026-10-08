@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
@@ -110,6 +111,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
+	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
 	// Live cost numbers (faultCost.h); the slow-PC simulation's wait comes first, outside every lock.
 	const auto start = FaultCost::NowNs();
 	FaultCost::SimulateFault();
@@ -372,6 +374,7 @@ void RenderContext::NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allo
 }
 
 void RenderContext::RunGarbageCollector() {
+	const CpGaps::Scope gap(CpGaps::Cat::Gc);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

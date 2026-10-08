@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/gpuTouchedPages.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
@@ -296,7 +297,10 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
-		command();
+		{
+			const CpGaps::Scope gap(CpGaps::Cat::Service);
+			command();
+		}
 		// Service commands (mapping changes, readbacks, deferred label writes) change guest
 		// memory outside the command stream (syncEpoch.h).
 		SyncEpoch::Advance();
@@ -1262,6 +1266,8 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::RaiseCurrentThreadPriority();
 	// KYTY_CPU_RESERVE: its own physical core.
 	Common::PlaceCurrentThread(Common::ThreadRole::Cp);
+	// KYTY_CP_GAP_STATS (drawPrep/cpGaps.h): this thread's time by cause.
+	CpGaps::AttachThread();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	// KYTY_LIVE_FILE (common/liveSwitch.h): live switches, applied at this thread's flips.
@@ -1284,6 +1290,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
+				const CpGaps::Scope gap(CpGaps::Cat::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -1335,6 +1342,7 @@ void GuestGpu::ThreadRun(void* data) {
 					                              reinterpret_cast<uint64_t>(gpu),
 					                              gpu->m_submission_count);
 					gpu->m_processing = false;
+					const CpGaps::Scope gap(CpGaps::Cat::Blocked);
 					if (!wakeups) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					} else {
@@ -1384,6 +1392,7 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			HangWatchdog::Scope service("cp-service-execute", reinterpret_cast<uint64_t>(gpu));
+			const CpGaps::Scope gap(CpGaps::Cat::Service);
 			command();
 			SyncEpoch::Advance();
 			// KYTY_DRAW_RUN: a service command is other command-processor work.
@@ -1414,7 +1423,11 @@ void GuestGpu::ThreadRun(void* data) {
 		                        submission.frame_fence);
 		HangWatchdog::DebugDelay("queue", submission.queue_id);
 		Live::CpSliceBegin(); // CP busy time in the "Live:" lines (KYTY_LIVE_FILE only)
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			const CpGaps::Scope gap(CpGaps::Cat::Slice);
+			complete = gpu->Process(submission);
+		}
 		HangWatchdog::NoteQueue(
 		    submission.queue_id, submission.sequence,
 		    complete ? "complete"
@@ -1487,6 +1500,7 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 	if (first_slice && submission.reset_processor && submission.type != SubmissionType::Compute) {
 		CommitStats::OnFrameBoundary();
+		CpGaps::NoteFrame();
 	}
 	if (first_slice && RepeatTrace::Enabled()) {
 		// KYTY_CP_REPEAT_TRACE: a guest frame starts with the processor reset after
@@ -1611,6 +1625,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		// sceAgcSuspendPoint.
 		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
 			CommitStats::OnFrameBoundary();
+			CpGaps::NoteFrame();
 		}
 	}
 	cp.BufferInit();
@@ -4001,10 +4016,33 @@ private:
 };
 } // namespace
 
+// KYTY_CP_GAP_STATS: an op's category (drawPrep/cpGaps.h).
+static CpGaps::Cat OpGapCat(CpSeq::OpKind kind) {
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::DrawIndex:
+		case OpKind::DrawAuto:
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti: return CpGaps::Cat::DrawOp;
+		case OpKind::DispatchDirect:
+		case OpKind::DispatchIndirect: return CpGaps::Cat::DispatchOp;
+		case OpKind::EndOfPipe:
+		case OpKind::ReleaseMem: return CpGaps::Cat::EndOfPipe;
+		case OpKind::EventWrite: return CpGaps::Cat::EventWrite;
+		case OpKind::WriteData: return CpGaps::Cat::WriteData;
+		case OpKind::DmaData: return CpGaps::Cat::DmaData;
+		case OpKind::WaitRegMem:
+		case OpKind::WaitFlipDone: return CpGaps::Cat::WaitOp;
+		case OpKind::Flip: return CpGaps::Cat::FlipOp;
+		default: return CpGaps::Cat::OtherOp;
+	}
+}
+
 CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
                                           const void* data) {
 	using CpSeq::OpKind;
 	std::optional<CpOpTimer> op_timer;
+	const CpGaps::Scope      gap(OpGapCat(kind));
 	if (CpOpStatsEnabled()) [[unlikely]] {
 		op_timer.emplace(kind == OpKind::EventWrite
 		                     ? EventWriteActivityName(
@@ -5110,6 +5148,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
                                                      std::span<const uint32_t> commands,
                                                      bool&                     handoff) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Resolve");
+	const CpGaps::Scope gap(CpGaps::Cat::Resolver);
 	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
 	handoff                   = false;
 	execution.m_suspended     = false;
@@ -5143,6 +5182,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// The sequencer has not produced the next op yet: spin briefly, then let other queues
 			// and services run while it parses.
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
+			const CpGaps::Scope       starved_gap(CpGaps::Cat::Starved);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
 			const auto start    = CpNowNs();
 			bool       produced = false;

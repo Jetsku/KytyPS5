@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -3342,14 +3343,24 @@ struct PipelineCache::ProgramCache {
 		if (ResourceReuseEnabled()) reuse_lock = std::unique_lock(m_reuse_mutex);
 
 		auto& key = scratch.key;
-		BuildKey(params, input_info, key);
-		const auto* source = FindSourceMemo(key, scratch);
+		const SourceEntry* source = nullptr;
+		{
+			// KYTY_CP_GAP_STATS (drawPrep/cpGaps.h): the program lookup's parts on the GPU thread.
+			const CpGaps::Scope gap(CpGaps::Cat::ProgKey);
+			BuildKey(params, input_info, key);
+			source = FindSourceMemo(key, scratch);
+		}
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
 			return {};
 		}
 		const auto runtime = speculative ? MakeSpeculativeRuntime(params) : MakeRuntime(params, read_attempt);
 		if (source != nullptr) {
-			if (!Materialize(*source, runtime, evaluation, scratch, prep, read_attempt)) return {};
+			bool materialized = false;
+			{
+				const CpGaps::Scope gap(CpGaps::Cat::ProgMaterialize);
+				materialized = Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+			}
+			if (!materialized) return {};
 			if (ResourceReuseEnabled() && ResourceDependencyCacheEnabled() &&
 			    source->reuse.current.prepared_reads.Valid()) {
 				const auto* cached = PermutationAt(*source, source->reuse.current.permutation_index);
@@ -3361,8 +3372,13 @@ struct PipelineCache::ProgramCache {
 					return Bind(*cached, input_info, prep, push_data_cursor);
 				}
 			}
-			if (const auto* permutation = FindPermutationMemo(*source, key.stage, prep.specialization,
-			                                                  push_data_cursor, scratch)) {
+			const Permutation* permutation = nullptr;
+			{
+				const CpGaps::Scope gap(CpGaps::Cat::ProgPermutation);
+				permutation = FindPermutationMemo(*source, key.stage, prep.specialization,
+				                                  push_data_cursor, scratch);
+			}
+			if (permutation != nullptr) {
 				if (ResourceReuseEnabled()) {
 					source->reuse.current.permutation_index = permutation->index;
 				}
@@ -6414,7 +6430,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info,
                                                StagePrep&                   stage_prep) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	std::optional<CpGaps::Scope> prepare_gap;
+	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	prepare_gap.reset();
 	// Use one effective size for the cache key, LDS declaration, and access bounds.
 	const auto max_lds_dwords =
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;

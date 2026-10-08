@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -202,6 +203,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	KYTY_GPU_OP_SITE("dispatch");
+	// KYTY_CP_GAP_STATS: this scope's phases (drawPrep/cpGaps.h).
+	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopReadyOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -260,9 +263,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info,
 	                                                   m_compute_prep);
+	CpGaps::Phase(CpGaps::Cat::DispatchOp);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -372,6 +377,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
 	// A software ray-tracing kernel whose pipeline is still being built, or any RT kernel after one
 	// failed to build (rtSession.h), is skipped: the lighting it feeds lags or stays as it was.
 	auto* pipeline_or_null =
@@ -382,11 +388,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	auto& pipeline = *pipeline_or_null;
 	auto& bindings = m_compute_bindings;
+	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
 	// The native dispatch size bounds workgroup ids for write-range proofs.
 	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
 	bindings.has_dispatch_groups = true;
 	FindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -399,8 +407,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		EXIT_IF(!program.info.uses_dma);
 		m_context.GetBufferCache().PrepareBdaWrites();
 	}
+	CpGaps::Phase(CpGaps::Cat::DispatchRebind);
 	RebindImages(bindings);
 	RebindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
@@ -492,6 +502,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode) {
 	KYTY_GPU_OP_SITE("dispatch.indirect");
+	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopReadyOperations();
@@ -506,8 +517,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_compute_prep);
+	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -521,10 +534,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	auto& pipeline = *pipeline_or_null;
 	auto& bindings = m_compute_bindings;
+	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
 	FindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -538,12 +553,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		EXIT_IF(!program.info.uses_dma);
 		m_context.GetBufferCache().PrepareBdaWrites();
 	}
+	CpGaps::Phase(CpGaps::Cat::DispatchRebind);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
 	buffer.BeginEmission();

@@ -93,7 +93,10 @@ public:
 	// Reads use a side copy when every dirty byte they need was written by an already submitted
 	// recording (KYTY_READBACK_SIDE_COPY=0 disables it). GPU-thread reads wait for their copy in
 	// place (KYTY_READBACK_SIDE_GPU_THREAD=0 makes them drain instead).
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// `retried_write`: a write fault whose instruction runs again after the handler returns
+	// (KYTY_READBACK_SIDE_WRITES may then leave the page clean for that second fault).
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                  bool retried_write = false);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
 	// Returns how many of them were eager copies.
@@ -189,6 +192,11 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_READBACK_FLUSH_SIDE (bufferCache.cpp): guest reads served by a side copy after the
+	// command processor submitted the recording that wrote their bytes (process-wide; tests).
+	[[nodiscard]] static uint64_t ReadbackFlushSideCopies() noexcept;
+	// KYTY_READBACK_SIDE_WRITES: guest write faults on GPU-owned pages served by a side copy.
+	[[nodiscard]] static uint64_t ReadbackSideWriteCopies() noexcept;
 	// A native-buffer revision only: callers must separately rule out newer image ownership.
 	// No buffer is created or synchronized. CPU-dirty and pending-publication ranges have no token.
 	[[nodiscard]] std::optional<BufferContentRevision> GetContentRevision(uint64_t vaddr,

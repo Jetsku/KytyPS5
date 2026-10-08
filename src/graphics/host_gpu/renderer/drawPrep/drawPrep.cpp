@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
@@ -1094,6 +1095,7 @@ Engine::Slot& Engine::ReadyHead() {
 	const auto stats_start = CommitStats::Now();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
+		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
@@ -1104,6 +1106,7 @@ Engine::Slot& Engine::ReadyHead() {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
+		const CpGaps::Scope gap(CpGaps::Cat::HeadWait);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
 		const auto occupancy = window.Occupancy();
 		HangWatchdog::Scope wait("draw-prep-head", reinterpret_cast<uint64_t>(&window),
@@ -1150,6 +1153,10 @@ Engine::Slot& Engine::ReadyHead() {
 			// P3c: an adopted slot whose speculative preparation had not finished yet.
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchAdoptedWaits);
 		}
+		CpGaps::Relabel(slot.after_stop == 1   ? CpGaps::Cat::HeadWait
+		                : slot.after_stop == 2 ? CpGaps::Cat::HeadWaitStart
+		                : occupancy <= 2       ? CpGaps::Cat::HeadWaitShallow
+		                                       : CpGaps::Cat::HeadWaitDeep);
 		if (slot.after_stop == 1) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsBarrier);
 			Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWaitBarrier, 1, stats.spin_ns);
@@ -1218,9 +1225,12 @@ void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& dra
 	executor.m_binding_plan_active = false;
 	executor.m_run_key             = commit ? slot.run_key : 0;
 	executor.m_in_engine_commit    = commit;
-	CommitStats::BeginDraw();
-	draw();
-	CommitStats::EndDraw();
+	{
+		const CpGaps::Scope gap(CpGaps::Cat::Commit);
+		CommitStats::BeginDraw();
+		draw();
+		CommitStats::EndDraw();
+	}
 	executor.m_in_engine_commit = false;
 	executor.m_run_key          = 0;
 	if (slot.plan.valid) {
@@ -1296,6 +1306,7 @@ void PrintDrawPrepSummary() {
 
 void Engine::Commit(Slot& slot) {
 	Profiler::ScopedFrameWait commit_time(Profiler::FrameWait::DrawPrepCommit);
+	const CpGaps::Scope       gap(CpGaps::Cat::Commit);
 	if (!CommitStats::IndirectOnly()) {
 		CommitStats::BeginDraw();
 	}
