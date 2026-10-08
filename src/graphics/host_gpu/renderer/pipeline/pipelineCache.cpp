@@ -4673,10 +4673,10 @@ struct PipelineCache::ListState {
 // signature) in _PipelineCache/<title>.pipelines.journal (KYTY_PIPELINE_JOURNAL_PATH), with the boot
 // level as marker. At start-up, once the shader precompile replay has published the programs, the
 // journaled pipelines (and the usable pipelines of a KYTY_PIPELINE_LIST) are rebuilt on
-// below-normal-priority threads (KYTY_PIPELINE_JOURNAL_THREADS, default 4, 1..16: NVIDIA ran 4 about
-// 3.8x in parallel on a cold cache) into the driver cache: the boot level's first, then this PC's own
-// journal in the order the pipelines were first needed, then the list's, those recorded in the most
-// levels first. Each rebuilt key becomes known, so the draw that needs it takes it from the driver
+// below-normal-priority threads (KYTY_PIPELINE_JOURNAL_THREADS, default 4, 8 with a list, 1..16:
+// NVIDIA ran 4 about 3.8x in parallel on a cold cache) into the driver cache: the boot level's
+// first, then this PC's own journal in the order the pipelines were first needed, then the list's,
+// those recorded in the most levels first. Each rebuilt key becomes known, so the draw that needs it takes it from the driver
 // cache with a probe (KYTY_PIPELINE_FAST_FIRST) instead of compiling. Keys the driver cache is already
 // known to hold (KYTY_PIPELINE_KNOWN) are skipped (KYTY_PIPELINE_JOURNAL_FORCE=1 rebuilds them too). A
 // record whose modules are not published (another translator with other bindings, a program the
@@ -5165,7 +5165,9 @@ void PipelineCache::InitializePipelineJournal() {
 	}
 	replay.low_priority = !prepare;
 	replay.report_ns    = prepare ? 5'000'000'000ull : 10'000'000'000ull;
-	const auto threads  = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", prepare ? 8 : 4), 1, 16);
+	// With a pipeline list (a first start builds hundreds at once) 8: a cold spring_punch_sky_aztec
+	// stalled 5.5 s on 8 threads, 10.3 s on 4 (the level needs ~290 pipelines in its first 20 s).
+	const auto threads  = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_JOURNAL_THREADS", prepare || list ? 8 : 4), 1, 16);
 	replay.Start(static_cast<uint32_t>(threads), force);
 	if (EnvU64("KYTY_PIPELINE_JOURNAL_WAIT", 0) != 0) replay.Wait();
 }
