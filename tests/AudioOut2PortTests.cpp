@@ -3,12 +3,15 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -24,6 +27,7 @@ std::vector<int>                  g_live_devices;
 std::vector<int>                  g_device_backed_handles;
 std::vector<bool>                 g_output_blocking;
 std::vector<std::vector<uint8_t>> g_output_pcm;
+std::vector<std::array<float, 2>> g_output_gains;
 size_t                            g_capture_bytes = 0;
 int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
@@ -104,14 +108,21 @@ PortParam MakeParam(uint32_t data_format = 0x200) {
 	return param;
 }
 
-AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4) {
+AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4, uint32_t max_object_ports = 0) {
 	ContextParam param {};
+	param.max_object_ports                    = max_object_ports;
 	param.queue_depth                         = queue_depth;
 	param.num_grains                          = 512;
 	AudioOut2::AudioOut2ContextHandle context = 0;
 	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
 	      "context create failed");
 	return context;
+}
+
+AudioOut2::AudioOut2PortHandle CreatePort(AudioOut2::AudioOut2ContextHandle context, const PortParam& param) {
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK, "port create failed");
+	return port;
 }
 
 void TestUserSupportedAttributes() {
@@ -193,6 +204,13 @@ void SetPcm(AudioOut2::AudioOut2PortHandle port, const void* data) {
 	      "setting PCM failed");
 }
 
+template <typename T>
+void SetAttribute(AudioOut2::AudioOut2PortHandle port, uint32_t id, const T& value) {
+	const Attribute attribute {id, 0, &value, sizeof(value)};
+	Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) == OK,
+	      "setting attribute failed");
+}
+
 void ResetOutputCalls() {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.clear();
@@ -212,6 +230,23 @@ void CaptureOutputPcm(size_t bytes) {
 std::vector<std::vector<uint8_t>> OutputPcm() {
 	std::lock_guard lock(g_device_mutex);
 	return g_output_pcm;
+}
+
+std::vector<std::vector<uint8_t>> PushPcm(AudioOut2::AudioOut2ContextHandle context, size_t bytes) {
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "PCM push failed");
+	auto output = OutputPcm();
+	CaptureOutputPcm(0);
+	return output;
+}
+
+void CheckSamples(const std::vector<uint8_t>& pcm, std::initializer_list<float> frame, const char* message) {
+	Check(!pcm.empty() && pcm.size() % (frame.size() * sizeof(float)) == 0, "incorrect PCM size");
+	for (size_t i = 0; i < pcm.size() / sizeof(float); i++) {
+		float sample;
+		std::memcpy(&sample, pcm.data() + i * sizeof(float), sizeof(float));
+		Check(std::abs(sample - *(frame.begin() + i % frame.size())) < 0.000001f, message);
+	}
 }
 
 void TestSlotReuse() {
@@ -518,6 +553,50 @@ void TestObjectPortsMixIntoBed() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestPortGainAndValidation() {
+	const auto context = CreateContext();
+	const auto port = CreatePort(context, MakeParam());
+	std::vector<float> pcm(512 * 2, 0.25f);
+	SetPcm(port, pcm.data());
+	auto check_output = [&](const std::array<float, 2>& gain, float expected_pcm) {
+		CheckSamples(PushPcm(context, pcm.size() * sizeof(float)).at(0), {expected_pcm},
+		             "gain modified stored PCM");
+		std::lock_guard lock(g_device_mutex);
+		Check(g_output_gains.size() == 1 && g_output_gains[0] == gain,
+		      "incorrect per-channel gain forwarded to backend");
+	};
+	check_output({1.0f, 1.0f}, 0.25f);
+	for (const std::array<float, 2> gain: {std::array {2.0f, 0.5f}, {0.0f, 0.0f}, {1.0f, 1.0f}}) {
+		SetAttribute(port, 1, gain);
+		check_output(gain, 0.25f);
+		check_output(gain, 0.25f);
+	}
+
+	const std::array gain {0.5f, 0.25f};
+	SetAttribute(port, 1, gain);
+	std::fill(pcm.begin(), pcm.end(), 0.75f);
+	SetPcm(port, pcm.data());
+	check_output(gain, 0.75f);
+
+	// Kyty keeps returning OK for a gain it cannot use (upstream returns INVALID_PARAM and drops the
+	// whole call): the last valid gains stay in place.
+	for (const float invalid: {-1.0f, std::numeric_limits<float>::infinity(),
+	                           std::numeric_limits<float>::quiet_NaN()}) {
+		const std::array invalid_gain {1.0f, invalid};
+		const Attribute  attribute {1, 0, &invalid_gain, sizeof(invalid_gain)};
+		Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) == OK,
+		      "invalid gain failed the call");
+		check_output(gain, 0.75f);
+	}
+	for (const Attribute attribute: {Attribute {1, 0, nullptr, sizeof(gain)},
+	                                Attribute {1, 0, &gain, sizeof(float)}}) {
+		Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) == OK,
+		      "malformed gain failed the call");
+		check_output(gain, 0.75f);
+	}
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -557,10 +636,14 @@ bool AudioOutHasDevice(int handle) {
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	g_output_gains.clear();
 	if (g_capture_bytes != 0) {
 		for (uint32_t i = 0; i < num; i++) {
 			const auto* bytes = static_cast<const uint8_t*>(params[i].data);
 			g_output_pcm.emplace_back(bytes, bytes + g_capture_bytes);
+			g_output_gains.push_back(params[i].gains != nullptr
+			                             ? std::array {params[i].gains[0], params[i].gains[1]}
+			                             : std::array {1.0f, 1.0f});
 		}
 	}
 	return 0;
@@ -598,6 +681,7 @@ int main() {
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestObjectPortsMixIntoBed();
+	TestPortGainAndValidation();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

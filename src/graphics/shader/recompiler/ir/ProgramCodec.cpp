@@ -18,17 +18,17 @@ namespace {
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
-// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 12;
+// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
 // ImageResource 20; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
-// ShaderInfo 10; DescriptorBinding 2; BindingLayout 6; WriteRangeNode 6; WriteRangeAccess 5;
-// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectImage
-// 7); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// ShaderInfo 10; DescriptorBinding 2; BindingLayout 7; WriteRangeNode 6; WriteRangeAccess 5;
+// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
+// 11, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 28;
 // ResourceSpecialization 2 (Buffer 3, Image 10).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
-static_assert(sizeof(BufferResource) == 36, "IR::BufferResource changed: update ProgramCodec");
+static_assert(sizeof(BufferResource) == 72, "IR::BufferResource changed: update ProgramCodec");
 static_assert(sizeof(ImageResource) == 80, "IR::ImageResource changed: update ProgramCodec");
 static_assert(sizeof(SamplerResource) == 16, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
@@ -36,15 +36,15 @@ static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramC
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
 static_assert(sizeof(ShaderInfo) == 192, "IR::ShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorBinding) == 32, "IR::DescriptorBinding changed: update ProgramCodec");
-static_assert(sizeof(BindingLayout) == 64, "IR::BindingLayout changed: update ProgramCodec");
+static_assert(sizeof(BindingLayout) == 72, "IR::BindingLayout changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeNode) == 24, "IR::WriteRangeNode changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: update ProgramCodec");
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
-static_assert(sizeof(CompiledShaderInfo) == 344, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 200, "IR::DescriptorSource changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource::IndirectImage) == 56,
-              "IR::DescriptorSource::IndirectImage changed: update ProgramCodec");
+static_assert(sizeof(CompiledShaderInfo) == 352, "IR::CompiledShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource) == 240, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 96,
+              "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update ProgramCodec");
 static_assert(sizeof(ResourcePlan::EvaluationOperand) == 16,
@@ -353,6 +353,10 @@ void Write(CodecWriter& w, const BufferResource& v) {
 	w.Bool(v.atomic);
 	w.Bool(v.formatted);
 	w.Bool(v.scalar);
+	w.U32(v.indirect_root);
+	w.U32(v.indirect_mapping_offset);
+	w.U32(v.indirect_search_iterations);
+	w.Words(v.indirect_resources);
 }
 
 void Read(CodecReader& r, BufferResource& v) {
@@ -368,6 +372,10 @@ void Read(CodecReader& r, BufferResource& v) {
 	v.atomic             = r.Bool();
 	v.formatted          = r.Bool();
 	v.scalar             = r.Bool();
+	v.indirect_root              = r.U32();
+	v.indirect_mapping_offset    = r.U32();
+	v.indirect_search_iterations = r.U32();
+	v.indirect_resources         = r.Words();
 }
 
 void Write(CodecWriter& w, const ImageResource& v) {
@@ -670,6 +678,7 @@ void Read(CodecReader& r, ShaderInfo& v) {
 
 void Write(CodecWriter& w, const BindingLayout& v) {
 	w.U32(v.push_data_start_dword);
+	w.U32(v.dispatch_thread_dword);
 	w.U32(v.memory_offset_dword);
 	w.U32(v.memory_offset_count);
 	w.U32(v.mip_stats_count);
@@ -679,6 +688,7 @@ void Write(CodecWriter& w, const BindingLayout& v) {
 
 void Read(CodecReader& r, BindingLayout& v) {
 	v.push_data_start_dword = r.U32();
+	v.dispatch_thread_dword = r.U32();
 	v.memory_offset_dword   = r.U32();
 	v.memory_offset_count   = r.U32();
 	v.mip_stats_count       = r.U32();
@@ -724,15 +734,26 @@ public:
 				if (!ValueOf(dword)) return false;
 			}
 			w.U32(source.dword_count);
-			w.Bool(source.indirect_image.has_value());
-			if (source.indirect_image) {
-				const auto& image = *source.indirect_image;
-				w.U32(image.material_source);
+			w.Bool(source.indirect_descriptor.has_value());
+			if (source.indirect_descriptor) {
+				const auto& image = *source.indirect_descriptor;
+				w.Bool(image.selector.has_value());
+				if (image.selector) {
+					w.U32(image.selector->source);
+					w.U32(image.selector->stride);
+					w.U32(image.selector->offset);
+				}
 				w.U32(image.table_source);
-				w.U32(image.selector_stride);
-				w.U32(image.selector_offset);
 				w.U32(image.table_offset);
-				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
+				w.U32(image.table_immediate);
+				w.U32(image.table_stride);
+				w.U32(image.table_record_bytes);
+				w.Bool(image.table_scalar);
+				w.U32(image.workgroup_axis);
+				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
+				    !ValueOf(image.selector_mask)) {
+					return false;
+				}
 			}
 		}
 		w.U32(static_cast<uint32_t>(p.control_flow.size()));
@@ -946,13 +967,25 @@ public:
 			}
 			source.dword_count = r.U32();
 			if (r.Bool()) {
-				auto& image = source.indirect_image.emplace(DescriptorSource::IndirectImage {});
-				image.material_source = r.U32();
-				image.table_source    = r.U32();
-				image.selector_stride = r.U32();
-				image.selector_offset = r.U32();
-				image.table_offset    = r.U32();
-				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
+				auto& image =
+				    source.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor {});
+				if (r.Bool()) {
+					auto& selector  = image.selector.emplace();
+					selector.source = r.U32();
+					selector.stride = r.U32();
+					selector.offset = r.U32();
+				}
+				image.table_source       = r.U32();
+				image.table_offset       = r.U32();
+				image.table_immediate    = r.U32();
+				image.table_stride       = r.U32();
+				image.table_record_bytes = r.U32();
+				image.table_scalar       = r.Bool();
+				image.workgroup_axis     = r.U32();
+				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
+				    !ValueOf(image.selector_mask)) {
+					return false;
+				}
 			}
 			if (r.Failed()) return false;
 		}

@@ -377,7 +377,7 @@ private:
 
 template <bool Optimize>
 bool MaterializeIndirectImage(const ResourcePlan& program,
-                              const DescriptorSource::IndirectImage& indirect,
+                              const DescriptorSource::IndirectDescriptor& indirect,
                               const DescriptorValue& material_value,
                               const DescriptorValue& table_value, uint32_t image_index,
                               const SrtRuntime& runtime, SrtWalker& clean,
@@ -396,7 +396,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	}
 	auto& keys = scratch.material_keys;
 	keys.clear();
-	if (indirect.material_source == UINT32_MAX) {
+	if (!indirect.selector) {
 		uint32_t key_count = 0;
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
 		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
@@ -421,8 +421,8 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.reserve(std::popcount(mask));
 		while (mask != 0u) {
 			const auto index = std::countr_zero(mask);
-			const auto offset = static_cast<uint64_t>(indirect.selector_offset) +
-			                    static_cast<uint64_t>(index) * indirect.selector_stride;
+			const auto offset = static_cast<uint64_t>(indirect.selector->offset) +
+			                    static_cast<uint64_t>(index) * indirect.selector->stride;
 			if (offset > UINT32_MAX) return false;
 			uint32_t key = 0;
 			if (!ReadScalarTable(material_base, UINT64_MAX, static_cast<uint32_t>(offset),
@@ -435,12 +435,12 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	} else {
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-		    material.Stride() != indirect.selector_stride) {
+		    material.Stride() != indirect.selector->stride) {
 			return false;
 		}
 		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
-		const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-		const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
+		const auto step = std::gcd<uint64_t>(indirect.selector->stride, uint64_t {1} << 32u);
+		const auto residue = static_cast<uint64_t>(indirect.selector->offset) % step;
 		const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
 		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 		if (probe_count > MaxIndirectImageProbes) {
@@ -884,11 +884,33 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 	return blocks;
 }
 
+// ResolveComputeBufferFill proves complete workgroups and matching requested extents, so every
+// dispatch-bound predicate accepted here is true for every invocation covered by the fill.
+static bool IsFullDispatchPredicate(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value == Value(true)) return true;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 32) return false;
+	if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return IsFullDispatchPredicate(inst->Arg(0), depth + 1) &&
+		       IsFullDispatchPredicate(inst->Arg(1), depth + 1);
+	}
+	if (inst->GetOpcode() != ValueOpcode::ULessThan32) return false;
+	const auto* global = inst->Arg(0).Resolve().TryInstruction();
+	const auto* extent = inst->Arg(1).Resolve().TryInstruction();
+	if (global == nullptr || global->GetOpcode() != ValueOpcode::GetBuiltin ||
+	    global->Arg(0).Resolve() != Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)) ||
+	    extent == nullptr || extent->GetOpcode() != ValueOpcode::GetDispatchThreadExtent)
+		return false;
+	const auto axis = global->Arg(1).Resolve();
+	return axis.IsImmediate() && axis.U32() < 3 && extent->Arg(0).Resolve() == axis;
+}
+
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
 // arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
-static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis,
+static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis, Value guard,
                                                       uint32_t depth = 0) {
-	value = value.Resolve();
+	value = ResolveActiveU32(value, guard);
 	if (depth > 32 || value.GetType() != Type::U32) {
 		return {};
 	}
@@ -912,8 +934,8 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	    op != ValueOpcode::ShiftLeftLogical32) {
 		return {};
 	}
-	auto left  = FillIndex(inst->Arg(0), axis, depth + 1);
-	auto right = FillIndex(inst->Arg(1), axis, depth + 1);
+	auto left  = FillIndex(inst->Arg(0), axis, guard, depth + 1);
+	auto right = FillIndex(inst->Arg(1), axis, guard, depth + 1);
 	if (!left || !right) {
 		return {};
 	}
@@ -969,6 +991,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	UniformFillPlan result;
 	result.fill.resource = memory.resource;
 	Value data;
+	Value guard(true);
 	if (store->GetOpcode() == ValueOpcode::ImageWrite) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
@@ -979,7 +1002,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		const auto* address = store->Arg(1).ResolveInstruction();
 		if (address == nullptr || address->GetOpcode() != ValueOpcode::MakeImageAddress) return {};
 		for (uint32_t axis = 0; axis < 3; ++axis) {
-			const auto index = FillIndex(address->Arg(axis), axis);
+			const auto index = FillIndex(address->Arg(axis), axis, guard);
 			if (!index || (*index)[0] != 0) return {};
 			if (axis < 2) {
 				if ((*index)[1] != 1 || (*index)[2] == 0) return {};
@@ -1001,20 +1024,22 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
 		const auto           store_op = std::ranges::find(stores, op);
 		if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
-		    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
+		    store->Arg(3).Resolve() != Value(0u))
 			return {};
+		guard = store->Arg(5).Resolve();
+		if (!IsFullDispatchPredicate(guard)) return {};
 		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
 		    memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
 			return {};
-		const auto address = FillIndex(store->Arg(1), 0);
+		const auto address = FillIndex(store->Arg(1), 0, guard);
 		if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
 		result.fill.kind = UniformFillKind::Buffer;
 		result.fill.group_stride[0] = static_cast<uint32_t>((*address)[2]);
 		result.fill.words = memory.data_dwords;
 		data = store->Arg(4);
 	}
-	data = data.Resolve();
+	data = ResolveActiveU32(data, guard);
 	const auto*          vector = data.TryInstruction();
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
 	                                 ValueOpcode::CompositeConstructU32x3,
@@ -1023,7 +1048,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
 		return {};
 	for (uint32_t i = 0; i < result.fill.words; ++i) {
-		const auto word = result.fill.words == 1 ? data : vector->Arg(i);
+		const auto word = ResolveActiveU32(result.fill.words == 1 ? data : vector->Arg(i), guard);
 		if (word.GetType() != Type::U32 ||
 		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
 			return {};
@@ -1079,10 +1104,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& source: program.descriptor_sources) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
-		target.indirect_image = source.indirect_image;
-		if (target.indirect_image.has_value()) {
-			target.indirect_image->key_count = Clone(target.indirect_image->key_count);
-			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
+		target.indirect_descriptor = source.indirect_descriptor;
+		if (target.indirect_descriptor.has_value()) {
+			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
+			target.indirect_descriptor->selector_first =
+			    Clone(target.indirect_descriptor->selector_first);
+			target.indirect_descriptor->selector_mask =
+			    Clone(target.indirect_descriptor->selector_mask);
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);
@@ -1103,14 +1131,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
-		if (source == nullptr || !source->indirect_image.has_value()) {
+		if (source == nullptr || !source->indirect_descriptor.has_value()) {
 			continue;
 		}
+		const auto& indirect = *source->indirect_descriptor;
 		plan.requires_specialization_memory = true;
-		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
-		                   plan.clean_flat_slots, source->indirect_image->selector_mask);
-		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
-		                   plan.clean_flat_slots);
+		MarkCleanFlatSlots(plan, indirect.selector ? Source(plan, indirect.selector->source) : nullptr,
+		                   plan.clean_flat_slots, indirect.selector_mask);
+		MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
 	}
 	BuildSrtReadRuns(plan);
 	BuildSrtEvaluationRecipes(plan);
@@ -1161,8 +1189,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	}
 	const bool masked_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
 		const auto* source = Source(program, image.source);
-		return source != nullptr && source->indirect_image.has_value() &&
-		       !source->indirect_image->selector_mask.IsEmpty();
+		return source != nullptr && source->indirect_descriptor.has_value() &&
+		       !source->indirect_descriptor->selector_mask.IsEmpty();
 	});
 	if (masked_image &&
 	    (program.has_address_writes ||
@@ -1276,16 +1304,16 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (source == nullptr) {
 				return false;
 			}
-			if (source->indirect_image.has_value()) {
+			if (source->indirect_descriptor.has_value()) {
 				snapshot.images[i] = {.dword_count = 8u};
 				if (!active.empty() && !active[image.source]) {
 					continue;
 				}
-				const auto& indirect = *source->indirect_image;
+				const auto& indirect = *source->indirect_descriptor;
 				DescriptorValue material;
 				DescriptorValue table;
-				if ((indirect.material_source != UINT32_MAX &&
-				     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+				if ((indirect.selector &&
+				     !clean.EvaluateDescriptor(indirect.selector->source, material)) ||
 				    !clean.EvaluateDescriptor(indirect.table_source, table) ||
 				    !MaterializeIndirectImage<Optimize>(program, indirect, material, table, i, observed,
 				                                         clean, scratch, snapshot, specialization)) {

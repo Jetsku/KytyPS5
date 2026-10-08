@@ -345,7 +345,7 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 
 void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
 	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
-	                         input_info.pixel->alpha_blend_source_remap;
+	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
@@ -404,16 +404,23 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
-				case ExportTargetKind::Mrt:
+				case ExportTargetKind::Mrt: {
 					if (alpha_remap && export_info.index != 0) {
 						break;
 					}
-					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
+					const auto slot = input_info.pixel->dual_source_blending
+					                      ? 0u : ShaderPixelExportTarget(input_info.pixel->target_shader_mask,
+					                                                    export_info.index);
+					if (slot >= 8) {
+						break;
+					}
+					AddOutput(info, StageOutputKind::Mrt, export_info.index, slot,
 					          fmt::format("out_mrt_{}", export_info.index));
 					if (alpha_remap) {
-						AddOutput(info, StageOutputKind::Mrt, 1, 1, "out_mrt_1");
+						AddOutput(info, StageOutputKind::Mrt, 1, 0, "out_mrt_1");
 					}
 					break;
+				}
 				default: break;
 			}
 		}

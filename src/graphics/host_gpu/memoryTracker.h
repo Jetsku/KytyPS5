@@ -270,12 +270,11 @@ public:
 		}
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		const bool  keep_hot              = hot_aware && !is_written;
 		const auto  frame                 = Frame();
 		uint32_t    demoted               = 0;
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			demoted += manager->CollectUpload(
 			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
@@ -327,11 +326,10 @@ public:
 		static_assert(std::is_nothrow_invocable_v<LateRangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<LateUploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		const auto  frame                 = Frame();
 		uint32_t    demoted               = 0;
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			demoted += manager->CollectUpload(
 			    manager->GetCpuAddr() + offset, bytes, false, frame, m_hot_count,

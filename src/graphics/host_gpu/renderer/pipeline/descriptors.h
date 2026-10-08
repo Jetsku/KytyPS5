@@ -52,6 +52,7 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
+	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
 	// Workgroup count of a direct compute dispatch, for write-range proofs that bound addresses
 	// by workgroup ids. Unknown for draws and indirect dispatches.

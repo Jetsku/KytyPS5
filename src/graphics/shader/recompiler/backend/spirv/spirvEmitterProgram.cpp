@@ -736,6 +736,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
 			                  inst.GetOpcode() != IR::ValueOpcode::SharedMemoryBarrier &&
+			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
 				emit_instruction(lane, inst);
 			}
@@ -1229,6 +1230,17 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
 	}
 	EmitGeometryOutputDefaults(state);
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
+		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
+		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
+		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
+		                                     ConstantU32(state, LdsDwordCount(state)));
+	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);

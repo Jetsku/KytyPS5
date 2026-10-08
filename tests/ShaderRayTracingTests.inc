@@ -162,6 +162,13 @@ void TestRayTracingStub() {
             a16_64.opcode == O::IMAGE_BVH64_INTERSECT_RAY && a16(a16_64) &&
             a16_64.image_address_components == 9,
         "BVH address dword counts do not follow the ISA");
+  // Captured 016c1ab44ee6a526 (upstream dbf66b7f4): BVH64 NSA, pointer v2:v7, final inverse
+  // component v5.
+  const auto nsa64 = decode({0xf19c9f07u, 0x00090202u, 0x28263607u, 0x221f1e29u, 0x00050403u});
+  Check(nsa64.opcode == O::IMAGE_BVH64_INTERSECT_RAY && nsa64.word_count == 5 &&
+            nsa64.image_address_components == 12 && nsa64.data_dwords == 4 && nsa64.image_r128 &&
+            nsa64.src0.reg == 2 && nsa64.image_nsa_addr[0] == 7 && nsa64.image_nsa_addr[10] == 5,
+        "captured BVH64 NSA pointer or final ray component was not decoded");
 
   // Encodings the ISA forbids are rejected rather than guessed.
   for (const auto &[word0, word1, nsa_word, text] :

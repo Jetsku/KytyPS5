@@ -978,6 +978,8 @@ public:
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
 	                     DrawPrep::StagePlan* plan = nullptr, bool keep_images = false);
 	void                           FindBuffers(PreparedBindings& bindings);
+	// Each stage's FindBuffers in order (upstream's form of the call).
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	// keep_images (KYTY_DRAW_RUN continuation): no image transition is recorded; the images are in

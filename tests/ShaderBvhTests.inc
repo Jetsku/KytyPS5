@@ -1351,7 +1351,7 @@ double TimeCase(VulkanHarness *vulkan, const TestCase &test, u32 repeats, u32 sa
   for (u32 sample = 0; sample < samples; ++sample) {
     double elapsed_us = 0;
     vulkan->Dispatch(test, compiled, buffer, gds ? &gds_buffer : nullptr, nullptr, nullptr,
-                     nullptr, nullptr, repeats, &elapsed_us);
+                     nullptr, nullptr, {}, repeats, &elapsed_us);
     times.push_back(elapsed_us * 1000.0);
   }
   vulkan->DestroyBuffer(&gds_buffer);

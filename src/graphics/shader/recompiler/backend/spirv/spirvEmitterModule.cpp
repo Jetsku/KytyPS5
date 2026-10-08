@@ -69,14 +69,11 @@ uint32_t TypeU32(EmitterState& state) {
 }
 
 uint32_t TypeU64(EmitterState& state) {
-	return TypeU32Vector(state, 2);
-}
-
-uint32_t TypeScalarU64(EmitterState& state) {
-	if (state.native_u64_type == 0) {
-		state.native_u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
+	if (state.u64_type == 0) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
 	}
-	return state.native_u64_type;
+	return state.u64_type;
 }
 
 uint32_t TypeU32Pair(EmitterState& state) {
@@ -125,7 +122,8 @@ uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
 }
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
-	EXIT_IF(components < 2u || components > 4u);
+	EXIT_IF(components < 1u || components > 4u);
+	if (components == 1u) return TypeU32(state);
 	return components == 2u ? TypeU32Pair(state) : TypeU32Vector(state, components);
 }
 
@@ -156,46 +154,32 @@ uint32_t TypeFunction(EmitterState& state) {
 	return state.function_type;
 }
 
-uint32_t StorageRuntimeArrayType(EmitterState& state) {
-	return state.builder.DecoratedType(
-	    spv::OpTypeRuntimeArray,
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}}, TypeU32(state));
+uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits) {
+	return bits == 32u   ? TypeU32(state)
+	       : bits == 64u ? TypeU64(state)
+	                     : state.builder.Type(spv::OpTypeInt, bits, 0);
 }
 
-uint32_t StorageBufferType(EmitterState& state) {
+uint32_t StorageRuntimeArrayType(EmitterState& state, uint32_t bits) {
+	return state.builder.DecoratedType(
+	    spv::OpTypeRuntimeArray,
+	    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}},
+	    TypeStorageBufferElement(state, bits));
+}
+
+uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32) {
 	return state.builder.DecoratedType(spv::OpTypeStruct,
 	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
 	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
-	                                   StorageRuntimeArrayType(state));
+	                                   StorageRuntimeArrayType(state, bits));
 }
 
-uint32_t TypeStorageBufferPointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state));
+uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, bits));
 }
 
-uint32_t TypeStorageBufferElementPointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state));
-}
-
-uint32_t StorageU64RuntimeArrayType(EmitterState& state) {
-	return state.builder.DecoratedType(
-	    spv::OpTypeRuntimeArray,
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint64_t)}}}, TypeScalarU64(state));
-}
-
-uint32_t StorageBufferU64Type(EmitterState& state) {
-	return state.builder.DecoratedType(spv::OpTypeStruct,
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
-	                                   StorageU64RuntimeArrayType(state));
-}
-
-uint32_t TypeStorageBufferU64Pointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferU64Type(state));
-}
-
-uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, TypeScalarU64(state));
+uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, TypeStorageBufferElement(state, bits));
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -203,7 +187,7 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 }
 
 uint32_t TypePhysicalU64Pointer(EmitterState& state) {
-	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeScalarU64(state));
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU64(state));
 }
 
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
@@ -288,40 +272,49 @@ void DefineDescriptors(EmitterState& state) {
 			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
 		};
 		switch (binding.kind) {
-			case IR::DescriptorBindingKind::Buffers:
+			case IR::DescriptorBindingKind::Buffers: {
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				if (state.requirements.buffer_u8) {
+					state.storage_buffer_u8_variable =
+					    Define(ArrayType(StorageBufferType(state, 8)), "buffers_u8");
+				}
+				if (state.requirements.buffer_u16) {
+					state.storage_buffer_u16_variable =
+					    Define(ArrayType(StorageBufferType(state, 16)), "buffers_u16");
+				}
 				if (state.requirements.buffer_int64_atomics) {
 					state.storage_buffer_u64_variable =
-					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationAliased);
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
-					                            spv::DecorationAliased);
+					    Define(ArrayType(StorageBufferType(state, 64)), "buffers_u64");
 				}
-				if (GetCodegenOptions().readonly_buffers && !state.requirements.buffer_writes &&
-				    !state.requirements.coherent_buffers) {
-					// A program that only reads its buffers says so (serbru20066666/brunoKytyPs5
-					// def478029). The AMD driver then loads a uniform address once per wave into
-					// scalar registers, as the guest's S_BUFFER_LOAD does, instead of once per lane
-					// with the address in a vector register. Coherent (polling) loads keep the
-					// buffers writable-declared so no load can be assumed loop-invariant.
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationNonWritable);
-				}
-				if (state.requirements.coherent_buffers) {
+				// A program that only reads its buffers says so (serbru20066666/brunoKytyPs5
+				// def478029). The AMD driver then loads a uniform address once per wave into
+				// scalar registers, as the guest's S_BUFFER_LOAD does, instead of once per lane
+				// with the address in a vector register. Coherent (polling) loads keep the
+				// buffers writable-declared so no load can be assumed loop-invariant.
+				const bool read_only = GetCodegenOptions().readonly_buffers &&
+				                       !state.requirements.buffer_writes &&
+				                       !state.requirements.coherent_buffers;
+				for (const auto variable: {state.storage_buffer_variable, state.storage_buffer_u8_variable,
+				                           state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
+					if (variable == 0) continue;
+					if (state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
+					    state.storage_buffer_u64_variable != 0) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+					}
+					if (read_only) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationCoherent);
-					if (state.storage_buffer_u64_variable != 0) {
-						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
-						                            spv::DecorationCoherent);
+					if (state.requirements.coherent_buffers) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
 					}
 				}
 				break;
+			}
 			case IR::DescriptorBindingKind::BdaPagetable:
-				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");
+				state.bda_pagetable_variable = Define(StorageBufferType(state, 64), "bda_pagetable");
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
@@ -342,6 +335,17 @@ void DefineDescriptors(EmitterState& state) {
 				break;
 			case IR::DescriptorBindingKind::Gds:
 				state.gds_variable = Define(StorageBufferType(state), "gds");
+				break;
+			case IR::DescriptorBindingKind::SharedMemory:
+				state.lds_variable = Define(StorageBufferType(state), "lds_dwords");
+				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
+				if (state.requirements.shared_int64_atomics) {
+					state.lds_u64_variable = Define(StorageBufferType(state, 64), "lds_qwords");
+					state.builder.AddAnnotation(spv::OpDecorate, state.lds_u64_variable, spv::DecorationCoherent);
+					for (const auto variable: {state.lds_variable, state.lds_u64_variable}) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+					}
+				}
 				break;
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(binding.kind) ==
@@ -388,14 +392,14 @@ uint32_t ConstantBool(EmitterState& state, bool value) {
 }
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(spv::OpConstantComposite, TypeU64(state),
-	                              ConstantU32(state, static_cast<uint32_t>(value)),
-	                              ConstantU32(state, static_cast<uint32_t>(value >> 32u)));
+	return state.builder.Constant(spv::OpConstant, TypeU64(state), static_cast<uint32_t>(value),
+	                              static_cast<uint32_t>(value >> 32u));
 }
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {
-	EXIT_IF(components < 2u || components > 4u);
+	EXIT_IF(components < 1u || components > 4u);
 	const auto            zero = ConstantU32(state, 0);
+	if (components == 1u) return zero;
 	std::vector<uint32_t> values(components, zero);
 	return state.builder.Constant(spv::OpConstantComposite, TypeU32Composite(state, components),
 	                              values);
@@ -476,6 +480,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
 		case IR::StageInputKind::BaryCoordNoPerspective: return spv::BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return spv::BuiltInWorkgroupId;
+		case IR::StageInputKind::NumWorkgroups: return spv::BuiltInNumWorkgroups;
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
@@ -544,15 +549,19 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
+	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
+	                             const char* name) {
+		if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
+			    return input.kind == kind;
+		    })) {
+			state.inputs.push_back({{kind, 0, components, name}});
+		}
+	};
+	if (IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+	}
 	if (state.lane_count == 2) {
-		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
-		                             const char* name) {
-			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
-				    return input.kind == kind;
-			    })) {
-				state.inputs.push_back({{kind, 0, components, name}});
-			}
-		};
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
@@ -584,6 +593,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
+			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
 			case IR::StageInputKind::GlobalInvocationId: type = TypeU32Vector(state, 3); break;
 			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
@@ -811,6 +821,13 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	if (state.requirements.buffer_u8) {
+		state.builder.RequireExtension("SPV_KHR_8bit_storage");
+		state.builder.RequireCapability(spv::CapabilityStorageBuffer8BitAccess);
+	}
+	if (state.requirements.buffer_u16) {
+		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
+	}
 	if (UsesPhysicalAddresses(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -820,7 +837,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
 	}
-	if (state.requirements.shared_int64_atomics) {
+	if (state.requirements.shared_int64_atomics &&
+	    state.lds_storage_class == spv::StorageClassWorkgroup) {
 		state.builder.RequireVersion(0x00010400u);
 		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
 		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
@@ -848,8 +866,9 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
-	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
+	if (state.lane_count == 2 || state.requirements.subgroup_barrier ||
+	    state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
+	    state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {

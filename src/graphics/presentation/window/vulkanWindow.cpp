@@ -63,6 +63,12 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
+	vk::PhysicalDeviceVulkan11Features features {};
+	features.storageBuffer16BitAccess = VK_TRUE;
+	return features;
+}
+
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.samplerMirrorClampToEdge  = VK_TRUE;
@@ -71,6 +77,8 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.storageBuffer8BitAccess   = VK_TRUE;
+	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
 
@@ -224,6 +232,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		depth_clip_control.pNext = &depth_clip_enable;
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
+		vk::PhysicalDeviceVulkan11Features features11 {};
 #if defined(__APPLE__)
 		features12.pNext = &depth_clip_control;
 #else
@@ -231,6 +240,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		fragment_barycentric.pNext = &depth_clip_control;
 		features12.pNext           = &fragment_barycentric;
 #endif
+		features11.pNext       = features12.pNext;
+		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
 
@@ -268,6 +279,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
 		              required_features12.samplerMirrorClampToEdge);
+		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
+		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
+		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
+		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
 		              required_features12.timelineSemaphore);
 		check_feature(features12.shaderOutputLayer, "shaderOutputLayer",
@@ -278,6 +293,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.bufferDeviceAddress);
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
 		              required_features12.shaderBufferInt64Atomics);
+		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
+		              "shaderSampledImageArrayNonUniformIndexing",
+		              required_features12.shaderSampledImageArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
@@ -710,13 +728,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	depth_clip_control.pNext  = &image_view_min_lod;
 	depth_clip_control.depthClipControl = VK_TRUE;
 
-	// Indirect draws' start instance reaches the shaders as gl_BaseInstance.
-	vk::PhysicalDeviceShaderDrawParametersFeatures draw_parameters {};
-	draw_parameters.pNext                = &depth_clip_control;
-	draw_parameters.shaderDrawParameters = VK_TRUE;
+	// Indirect draws' start instance reaches the shaders as gl_BaseInstance, and byte-aligned
+	// buffers use native 16-bit storage (upstream c3f496271). Both are Vulkan 1.1 features: the
+	// device create info may carry VkPhysicalDeviceVulkan11Features or the older per-feature
+	// structs it supersedes (ShaderDrawParameters), not both.
+	auto features11                 = WindowContext::RequiredVulkan11Features();
+	features11.pNext                = &depth_clip_control;
+	features11.shaderDrawParameters = VK_TRUE;
 
 	auto features12  = WindowContext::RequiredVulkan12Features();
-	features12.pNext = &draw_parameters;
+	features12.pNext = &features11;
 	// drawIndirectCount is set below, once the supported features are known.
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};

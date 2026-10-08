@@ -1684,7 +1684,7 @@ void BenchExecSelects(VulkanHarness *vulkan) {
         auto buffer = vulkan->CreateStorageBuffer(name, test.initial, test.initial.size());
         double us = 0.0;
         vulkan->Dispatch(test, variant.compiled, buffer, nullptr, nullptr, nullptr, nullptr,
-                         nullptr, Repeats, &us);
+                         nullptr, {}, Repeats, &us);
         if (round != 0) {
           variant.best_us = std::min(variant.best_us, us);
         }

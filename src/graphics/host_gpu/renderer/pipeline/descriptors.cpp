@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/hangTrace.h"
@@ -88,7 +89,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
-		case BindingKind::MipStats: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::MipStats:
+		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -194,11 +196,15 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// A proven write range narrows what becomes GPU-owned and which images go stale; everything
 	// else about the binding (synchronization, descriptor range) is unchanged.
 	const bool narrowed = resource.written && written_ranges != nullptr;
+	// Raw reads synchronize GPU image aliases like formatted ones only with the opt-in setting
+	// (upstream 743fdc699 / 470669c67).
+	const bool sync_images =
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
 	const auto lookup_start = BufferLookupStats::Now();
 	auto [buffer, offset] =
 	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
 	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                     resource.formatted, id);
+	                                                     sync_images, id);
 	if (lookup_start != 0) {
 		// KYTY_BUFFER_LOOKUP_STATS.
 		const auto outcome = BufferLookupStats::TakeOutcome();
@@ -212,7 +218,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	if (adjustment >= 256 || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
@@ -1512,6 +1518,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
+	prepared.shared_memory      = {};
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
 	if (!keep_images) {
@@ -1709,6 +1716,11 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		DrawPrep::GetBindingTotals().ranges_used.fetch_add(1, std::memory_order_relaxed);
 	}
 	const bool verify = use_plan && DrawPrep::BindingsVerifyMode() != 0;
+	const auto& graphics = m_context.GetGraphics();
+	const uint64_t unbounded_read_limit = std::min<uint64_t>(
+	    uint64_t {256} * 1024 * 1024,
+	    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+	        (graphics.StorageMinAlignment() - 1));
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint64_t address = 0;
 		uint64_t size    = 0;
@@ -1760,12 +1772,26 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		if (size > unbounded_read_limit && !program.info.buffers[i].written &&
+		    DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]).NumRecords() ==
+		        UINT32_MAX) {
+			// Upstream #1066 (e5dcfdb87): a read through an unbounded V# (NUM_RECORDS = ~0) binds
+			// at most 256 MiB, within the storage-buffer range limit. Only sizes past the limit
+			// decode the V# here, so the plan and serial ranges above stay as they are.
+			size = unbounded_read_limit;
+		}
 		if (const auto& resource = program.info.buffers[i]; !resource.written && !resource.formatted) {
 			// KYTY_CP_BINDING_BATCH_PREFETCH=find (BufferCache::PrefetchReadBinding).
 			cache.PrefetchReadBinding(address, size, true);
 		}
 		BufferLookupStats::PartScope find_scope(BufferLookupStats::Part::FindCall);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+	}
+}
+
+void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+	for (auto* stage: stages) {
+		FindBuffers(*stage);
 	}
 }
 
@@ -2012,17 +2038,84 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			verify_views = true;
 		}
 	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	const auto count        = static_cast<uint32_t>(program.info.images.size());
+	const auto needs_rebind = [&](uint32_t i) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
-			ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+		return old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
+		       old_image->binding.needs_rebind;
+	};
+	const auto rebind = [&](uint32_t i) {
+		if (const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
+		    old_image != nullptr) {
+			old_image->binding = {};
 		}
+		ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
+		BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
+	};
+	const auto acquire_view = [&](uint32_t i) {
+		auto& binding = images[i];
+		binding.mip_views.clear();
+		const auto& resource = program.info.images[i];
+		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+			EXIT_IF(resource.mip_count == 0u ||
+			        resource.mip_count != binding.desc.view_info.level_count);
+			binding.mip_views.reserve(resource.mip_count);
+			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
+				auto desc = binding.desc;
+				desc.view_info.base_level += mip;
+				desc.view_info.level_count = 1;
+				// The shader selects the mip after applying the guest minimum LOD.
+				desc.view_info.min_lod = 0;
+				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
+			}
+			binding.image_view = binding.mip_views.front();
+		} else if (!m_texture_memo.TryAcquireView(texture_cache, binding)) {
+			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			m_texture_memo.RecordView(binding, binding.image_view);
+		}
+		auto&      image   = texture_cache.GetImage(binding.image_id);
+		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		image.usage.storage |= storage;
+		image.usage.texture |= !storage;
+		texture_cache.NoteExactRangeStaleUse(image, storage);
+	};
+	// KYTY_DRAW_SEQUENCE_VERIFY / KYTY_XFRAME_REUSE=verify: the views claimed above.
+	const auto check_claimed_views = [&] {
+		if (!verify_views) {
+			return;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			if (prepared.xframe_verify_views) {
+				// KYTY_XFRAME_REUSE=verify: the views of a set taken from the cross-frame store.
+				XFrameReuse::GetTotals().verify_checks.fetch_add(1, std::memory_order_relaxed);
+				if (images[i].image_view != m_claimed_views[i]) {
+					XFrameReuse::ReportMismatch("view", i);
+				}
+			} else if (images[i].image_view != m_claimed_views[i]) {
+				m_draw_sequence_totals.verify_mismatches++;
+				ReportDrawSequenceMismatch("a repeated stage texture view");
+			}
+		}
+	};
+	uint32_t first_rebind = count;
+	for (uint32_t i = 0; i < count; i++) {
+		if (needs_rebind(i)) {
+			first_rebind = i;
+			break;
+		}
+	}
+	if (first_rebind != count) {
+		// Upstream a2f851788: a binding's rebind can replace the image an earlier binding of the
+		// stage resolved to, so each view is acquired before the next binding rebinds. Only a stage
+		// with a binding to rebind (an image changed) takes this order, without view runs.
+		for (uint32_t i = 0; i < count; i++) {
+			if (i >= first_rebind && needs_rebind(i)) {
+				rebind(i);
+			}
+			acquire_view(i);
+		}
+		check_claimed_views();
+		return;
 	}
 	// KYTY_DRAW_PREP_BINDINGS texturememo (P4b-2): runs of TryAcquireView hits take the
 	// texture-cache lock once (TextureBindingMemo::TryAcquireViewRun); the first binding a run does
@@ -2030,7 +2123,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const bool view_runs = prepared.plan != nullptr && prepared.plan->texture_tags_valid &&
 	                       TextureBindingMemo::Enabled();
 	const bool verify_runs  = view_runs && DrawPrep::BindingsVerifyMode() != 0;
-	const auto count        = static_cast<uint32_t>(program.info.images.size());
 	uint32_t   view_run_end = 0; // verify: [i, view_run_end) predicted as run hits
 	const auto run_length   = [&](uint32_t first) {
         uint32_t end = first;
@@ -2070,53 +2162,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const auto claimed_view = verify_runs && i < view_run_end
 		                              ? m_claimed_run_views[i - (view_run_end - m_claimed_run_views.size())]
 		                              : vk::ImageView {};
-		auto& binding = images[i];
-		binding.mip_views.clear();
-		const auto& resource = program.info.images[i];
-		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
-			binding.mip_views.reserve(resource.mip_count);
-			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
-				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
-				desc.view_info.level_count = 1;
-				// The shader selects the mip after applying the guest minimum LOD.
-				desc.view_info.min_lod = 0;
-				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
-			}
-			binding.image_view = binding.mip_views.front();
-		} else if (!m_texture_memo.TryAcquireView(texture_cache, binding)) {
-			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
-			m_texture_memo.RecordView(binding, binding.image_view);
-		}
-		auto&      image   = texture_cache.GetImage(binding.image_id);
-		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		image.usage.storage |= storage;
-		image.usage.texture |= !storage;
-		texture_cache.NoteExactRangeStaleUse(image, storage);
+		acquire_view(i);
 		if (verify_runs && i < view_run_end) {
 			// A predicted run hit acquires the entry's view.
 			DrawPrep::CountBindingVerifyCheck();
-			if (binding.image_view != claimed_view) {
+			if (images[i].image_view != claimed_view) {
 				DrawPrep::ReportBindingMismatch("texture view run", i);
 			}
 		}
 	}
-	if (verify_views) {
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			if (prepared.xframe_verify_views) {
-				// KYTY_XFRAME_REUSE=verify: the views of a set taken from the cross-frame store.
-				XFrameReuse::GetTotals().verify_checks.fetch_add(1, std::memory_order_relaxed);
-				if (images[i].image_view != m_claimed_views[i]) {
-					XFrameReuse::ReportMismatch("view", i);
-				}
-			} else if (images[i].image_view != m_claimed_views[i]) {
-				m_draw_sequence_totals.verify_mismatches++;
-				ReportDrawSequenceMismatch("a repeated stage texture view");
-			}
-		}
-	}
+	check_claimed_views();
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -2567,12 +2622,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 					case BindingKind::FlattenedSrt:
 					case BindingKind::ShaderData:
+					case BindingKind::SharedMemory:
 					case BindingKind::Gds: {
 						const vk::DescriptorBufferInfo* view = &descriptors.gds;
 						if (binding.kind == BindingKind::FlattenedSrt) {
 							view = &descriptors.flattened_srt;
 						} else if (binding.kind == BindingKind::ShaderData) {
 							view = &descriptors.shader_data_buffer;
+						} else if (binding.kind == BindingKind::SharedMemory) {
+							view = &descriptors.shared_memory;
 						}
 						EXIT_IF(view->buffer == nullptr);
 						m_descriptor_buffers.push_back(*view);

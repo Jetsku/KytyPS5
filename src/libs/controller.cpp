@@ -70,8 +70,13 @@ struct PadTriggerEffectParam {
 	PadTriggerEffectCommand command[2];
 };
 
+struct PadTriggerEffectStateInformation {
+	int32_t state[2];
+};
+
 static_assert(sizeof(PadTriggerEffectCommand) == 56);
 static_assert(sizeof(PadTriggerEffectParam) == 120);
+static_assert(sizeof(PadTriggerEffectStateInformation) == 8);
 
 struct DualSenseEffects {
 	uint8_t enable_bits;
@@ -1229,6 +1234,23 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 	}
 
 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+}
+
+int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
+	PRINT_NAME();
+
+	LOGF("\t handle = %d\n", handle);
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (info == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	g_controller->GetTriggerEffectState(info->state);
+
+	return OK;
 }
 
 } // namespace Libs::Controller

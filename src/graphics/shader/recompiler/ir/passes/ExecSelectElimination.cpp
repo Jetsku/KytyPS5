@@ -255,9 +255,10 @@ ExternalReferences CollectExternalReferences(const Program& program) {
 		for (const auto& value: descriptor.dwords) {
 			freeze_value(value);
 		}
-		if (descriptor.indirect_image) {
-			freeze_value(descriptor.indirect_image->key_count);
-			freeze_value(descriptor.indirect_image->selector_mask);
+		if (descriptor.indirect_descriptor) {
+			freeze_value(descriptor.indirect_descriptor->key_count);
+			freeze_value(descriptor.indirect_descriptor->selector_first);
+			freeze_value(descriptor.indirect_descriptor->selector_mask);
 		}
 	}
 	for (const auto& read: program.srt_reads) {

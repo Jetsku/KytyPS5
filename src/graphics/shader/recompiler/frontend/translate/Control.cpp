@@ -206,12 +206,17 @@ void Translator::EmitControlNop() {
 	ir.Emit(IR::ValueOpcode::ControlNop);
 }
 
-void Translator::EmitWaitcnt() {
-	ir.Emit(IR::ValueOpcode::Waitcnt);
+void Translator::S_WAITCNT_VSCNT(const Decoder::Instruction& inst) {
+	const auto count = inst.src1.value & 63u;
+	// A partial or register-based count (SGPR[SDST] + SIMM16[5:0]) waits for all stores: waiting
+	// longer is always correct, and these forms were accepted (as a no-op) before StoreCompletion.
+	if (inst.src0.kind == Decoder::OperandKind::Null && count == 63u) {
+		return;
+	}
+	ir.Emit(IR::ValueOpcode::StoreCompletion);
 }
 
 void Translator::S_WAITCNT(const Decoder::Instruction& inst) {
-	EmitWaitcnt();
 	if (!lds_write_pending || !LdsWaitcntBarrierEnabled()) {
 		return;
 	}
@@ -313,6 +318,7 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
                                  const Decoder::Operand& false_source) {
+	// Preserve per-word expressions for descriptor tracking and mask provenance.
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);

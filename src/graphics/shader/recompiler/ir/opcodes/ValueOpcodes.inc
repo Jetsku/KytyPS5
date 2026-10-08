@@ -7,6 +7,7 @@ VALUE_OPCODE(ReferenceU32, Void, U32)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
+VALUE_OPCODE(GetDispatchThreadExtent, U32, U32)
 VALUE_OPCODE(GetShaderBase, U64)
 // S_MEMREALTIME: the host GPU clock scaled toward 100 MHz (Spirv::HostShaderClock).
 VALUE_OPCODE(ReadClockRealtime64, U64)
@@ -176,6 +177,7 @@ VALUE_OPCODE(FPOrdGreaterThanEqual32, U1, F32, F32)
 VALUE_OPCODE(FPUnordGreaterThanEqual32, U1, F32, F32)
 VALUE_OPCODE(FPIsNan32, U1, F32)
 VALUE_OPCODE(FPCmpClass32, U1, F32, U32)
+VALUE_OPCODE(FPCmpClass16, U1, U32, U32)
 
 VALUE_OPCODE(FPAdd32, F32, F32, F32)
 VALUE_OPCODE(FPSub32, F32, F32, F32)
@@ -358,7 +360,7 @@ VALUE_OPCODE(GetInterpolationParameter, U32, U32, U32, U32)
 VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 
 VALUE_OPCODE(ControlNop, Void)
-VALUE_OPCODE(Waitcnt, Void)
+VALUE_OPCODE(StoreCompletion, Void)
 VALUE_OPCODE(Barrier, Void)
 VALUE_OPCODE(SharedMemoryBarrier, Void)
 VALUE_OPCODE(Sendmsg, Void)

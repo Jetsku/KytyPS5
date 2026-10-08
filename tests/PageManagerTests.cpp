@@ -3,12 +3,14 @@
 #include "graphics/host_gpu/parkingLock.h"
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <semaphore>
 #include <string>
@@ -126,6 +128,7 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
+std::mutex g_protection_log_mutex;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
@@ -136,8 +139,11 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
-  g_protection_calls++;
-  g_protection_ranges.push_back({vaddr, size});
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_protection_calls++;
+    g_protection_ranges.push_back({vaddr, size});
+  }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
@@ -743,6 +749,34 @@ void TestDeferredReleaseStress(DeferMode mode) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestConcurrentSharedWatchers() {
+  constexpr size_t worker_count = 8;
+  PageManager manager;
+  auto *memory = Allocate(TRACKER_PAGE_SIZE);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  bool watched = false;
+  std::barrier phase(worker_count, [&]() noexcept {
+    watched = !watched;
+    Check(Protection(memory) == (watched ? PAGE_READONLY : PAGE_READWRITE),
+          "concurrent watchers lost protection or failed to restore writes");
+  });
+  std::vector<std::jthread> workers;
+  for (size_t i = 0; i < worker_count; i++) {
+    workers.emplace_back([&] {
+      for (size_t round = 0; round < 100; round++) {
+        manager.UpdatePageWatchers<true>(address, TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+        manager.UpdatePageWatchers<false>(address, TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 // The spin-then-park lock: mutual exclusion under contention with long holds, and parking.
 void TestParkingLock() {
   Libs::Graphics::ParkingSpinLock lock;
@@ -891,6 +925,7 @@ int main(int argc, char **argv) {
   TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestConcurrentSharedWatchers();
   TestFatalPaths();
 
   // The synchronous paths again, checked by verify mode after every change.
@@ -904,6 +939,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestConcurrentSharedWatchers();
   const auto verify_after = PageManager::GetDeferStats();
   Check(verify_after.verify_checks > verify_before.verify_checks &&
             verify_after.verify_mismatches == verify_before.verify_mismatches,

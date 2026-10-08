@@ -36,9 +36,9 @@ namespace {
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update CloneProgram");
 static_assert(sizeof(Block) == 9256, "IR::Block changed: update CloneProgram");
 static_assert(sizeof(ResourcePlan) == 704, "IR::ResourcePlan changed: update CloneProgram");
-static_assert(sizeof(Program) == 1000, "IR::Program changed: update CloneProgram");
+static_assert(sizeof(Program) == 1008, "IR::Program changed: update CloneProgram");
 static_assert(sizeof(BlockInfo) == 192, "IR::BlockInfo changed: update CloneProgram");
-static_assert(sizeof(DescriptorSource) == 200, "IR::DescriptorSource changed: update CloneProgram");
+static_assert(sizeof(DescriptorSource) == 240, "IR::DescriptorSource changed: update CloneProgram");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update CloneProgram");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update CloneProgram");
 static_assert(sizeof(ResourcePlan::EvaluationRecipe) == 120,
@@ -140,9 +140,10 @@ bool CloneProgram(const Program& source, Program& target) {
 			for (const auto& value: descriptor.dwords) {
 				if (!map.Owns(value)) return false;
 			}
-			if (descriptor.indirect_image &&
-			    (!map.Owns(descriptor.indirect_image->key_count) ||
-			     !map.Owns(descriptor.indirect_image->selector_mask))) {
+			if (descriptor.indirect_descriptor &&
+			    (!map.Owns(descriptor.indirect_descriptor->key_count) ||
+			     !map.Owns(descriptor.indirect_descriptor->selector_first) ||
+			     !map.Owns(descriptor.indirect_descriptor->selector_mask))) {
 				return false;
 			}
 		}
@@ -229,9 +230,10 @@ bool CloneProgram(const Program& source, Program& target) {
 		for (auto& value: copy.dwords) {
 			value = map.Map(value);
 		}
-		if (copy.indirect_image) {
-			copy.indirect_image->key_count     = map.Map(copy.indirect_image->key_count);
-			copy.indirect_image->selector_mask = map.Map(copy.indirect_image->selector_mask);
+		if (copy.indirect_descriptor) {
+			copy.indirect_descriptor->key_count     = map.Map(copy.indirect_descriptor->key_count);
+			copy.indirect_descriptor->selector_first = map.Map(copy.indirect_descriptor->selector_first);
+			copy.indirect_descriptor->selector_mask = map.Map(copy.indirect_descriptor->selector_mask);
 		}
 	}
 	target.control_flow.reserve(source.control_flow.size());

@@ -810,9 +810,9 @@ void BuildSrtArithmeticTapes(ResourcePlan& program) {
 	};
 	for (const auto& descriptor: program.descriptor_sources) {
 		for (uint32_t i = 0; i < descriptor.dword_count; ++i) mark_root(descriptor.dwords[i]);
-		if (descriptor.indirect_image.has_value()) {
-			mark_root(descriptor.indirect_image->selector_mask);
-			mark_root(descriptor.indirect_image->key_count);
+		if (descriptor.indirect_descriptor.has_value()) {
+			mark_root(descriptor.indirect_descriptor->selector_mask);
+			mark_root(descriptor.indirect_descriptor->key_count);
 		}
 	}
 	for (const auto& read: program.srt_reads) mark_root(read.value);

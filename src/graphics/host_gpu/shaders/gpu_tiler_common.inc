@@ -36,6 +36,9 @@ layout(set = 0, binding = 2, std140) uniform Push {
 	uint tail_x;
 	uint tail_y;
 	uint tail;
+	// TileManager::Push order: the colour transform fields precede the image variant fields.
+	uint color_transform;
+	uint to_host;
 	uint image_x;
 	uint image_y;
 	uint image_layer;
@@ -83,8 +86,16 @@ void store_element(uint src, ivec3 coord) {
 }
 #endif
 #else
+#include "gpu_tiler_color.inc"
+
 void copy_element(uint src, uint dst) {
-	if (ELEMENT_BYTES >= 4) {
+	if ((ELEMENT_BYTES == 4u || ELEMENT_BYTES == 8u) && params.color_transform != 0u) {
+		uvec2 value = uvec2(input_buffer.data[src >> 2], 0u);
+		if (ELEMENT_BYTES == 8u) value.y = input_buffer.data[(src >> 2) + 1u];
+		value = transform_color(value, params.color_transform, TILE == 0u);
+		output_buffer.data[dst >> 2] = value.x;
+		if (ELEMENT_BYTES == 8u) output_buffer.data[(dst >> 2) + 1u] = value.y;
+	} else if (ELEMENT_BYTES >= 4) {
 		for (uint i = 0; i < ELEMENT_BYTES; i += 4) {
 			output_buffer.data[(dst + i) >> 2] = input_buffer.data[(src + i) >> 2];
 		}

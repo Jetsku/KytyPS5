@@ -90,6 +90,16 @@ namespace {
 Live::Switch g_pipeline_prefetch("KYTY_PIPELINE_PREFETCH", Live::ParseDefaultOff);
 Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDefaultOff);
 
+uint8_t RemapSourceAlphaFactor(uint8_t factor) {
+	switch (static_cast<Prospero::BlendFactor>(factor)) {
+		case Prospero::BlendFactor::kSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Alpha);
+		case Prospero::BlendFactor::kOneMinusSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+		default: return factor;
+	}
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -3353,7 +3363,11 @@ struct PipelineCache::ProgramCache {
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
 			return {};
 		}
-		const auto runtime = speculative ? MakeSpeculativeRuntime(params) : MakeRuntime(params, read_attempt);
+		auto runtime = speculative ? MakeSpeculativeRuntime(params) : MakeRuntime(params, read_attempt);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			// Image descriptor tables indexed by the workgroup id (upstream 0ee880090).
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
 		if (source != nullptr) {
 			bool materialized = false;
 			{
@@ -6257,7 +6271,7 @@ void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vert
 void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
 	const auto& blend    = context.GetBlendControl(0);
 	const bool  blending = blend.enable && !context.GetRenderTarget(0).info.blend_bypass;
-	pixel_info.alpha_blend_source_remap = false;
+	pixel_info.alpha_blend_source = ShaderAlphaBlendSource::None;
 	pixel_info.dual_source_blending =
 	    blending && (BlendFactorIsDualSource(blend.color_srcblend) ||
 	                 BlendFactorIsDualSource(blend.color_destblend) ||
@@ -6271,15 +6285,27 @@ void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& p
 	           pixel_info.target_output_mode[0] != 7 &&
 	           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 	                       std::end(pixel_info.target_output_mode),
-	                       [](uint8_t mode) { return mode == 0; }) &&
-	           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
-	               BlendMappingSupport::SourceAlpha) {
-		// The export mapping moves alpha out of the fourth channel: MRT1 carries logical alpha
-		// as a second blend source (KYTY_BLEND_ALPHA_REMAP, upstream 73615c31f).
-		pixel_info.alpha_blend_source_remap = true;
-		pixel_info.dual_source_blending     = true;
-		pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-		pixel_info.target_export_mapping[1] = {};
+	                       [](uint8_t mode) { return mode == 0; })) {
+		// The export mapping moves alpha out of the fourth channel: MRT1 carries logical alpha,
+		// or the per-channel source factors, as a second blend source (KYTY_BLEND_ALPHA_REMAP;
+		// upstream 73615c31f, 0bef3fc0d, 94e7d239d).
+		switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
+			case BlendMappingSupport::SourceAlpha:
+				pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
+				break;
+			case BlendMappingSupport::SourceAlphaOne:
+				pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
+				break;
+			case BlendMappingSupport::SourceAlphaZero:
+				pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
+				break;
+			default: break;
+		}
+		if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+			pixel_info.dual_source_blending     = true;
+			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+			pixel_info.target_export_mapping[1] = {};
+		}
 	}
 }
 
@@ -6434,19 +6460,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	prepare_gap.reset();
-	// Use one effective size for the cache key, LDS declaration, and access bounds.
-	const auto max_lds_dwords =
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
-	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
-			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
-		}
-	}
-	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
+	// LDS beyond the device's shared-memory limit lives in a device buffer instead of being
+	// clamped (upstream b0bbaef1e; RenderExecutor binds it per dispatch, BindSharedMemory).
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
@@ -6584,10 +6601,14 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
 		static_params.blend_enable[slot]         = bc.enable && !rt.info.blend_bypass;
 		if (BlendAlphaRemapEnabled()) {
-			// Upstream 73615c31f: logical alpha through MRT1 (ApplyDualSourceBlending), or no
-			// blending where the export mapping cannot be blended correctly.
-			const bool alpha_remap =
-			    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
+			// Upstream 73615c31f, 0bef3fc0d, 94e7d239d, 96011cc5c: logical alpha or the mapped
+			// source factors through MRT1 (ApplyDualSourceBlending), blended as the second source,
+			// or no blending where the export mapping cannot be blended correctly.
+			auto alpha_source = ShaderAlphaBlendSource::None;
+			if (slot == 0 && ps_input_info != nullptr) {
+				alpha_source = ps_input_info->alpha_blend_source;
+			}
+			const bool alpha_remap = alpha_source != ShaderAlphaBlendSource::None;
 			if (static_params.blend_enable[slot] && !alpha_remap &&
 			    ClassifyBlendMapping(bc, color.export_mapping) != BlendMappingSupport::Direct) {
 				static_params.blend_enable[slot] = false;
@@ -6600,7 +6621,30 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 					    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 				}
 			}
+			if (alpha_remap && static_params.blend_enable[slot]) {
+				// The second source's factors replace the source-alpha ones; one shared equation.
+				auto blend = bc;
+				switch (alpha_source) {
+					case ShaderAlphaBlendSource::SourceAlpha:
+						blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
+						blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+						break;
+					case ShaderAlphaBlendSource::SourceAlphaOne:
+					case ShaderAlphaBlendSource::SourceAlphaZero:
+						// The second source carries the mapped source factor; its alpha stays
+						// logical Sa.
+						blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+						blend.color_destblend =
+						    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+						break;
+					case ShaderAlphaBlendSource::None: break;
+				}
+				static_params.color_srcblend[slot]       = blend.color_srcblend;
+				static_params.color_destblend[slot]      = blend.color_destblend;
+				static_params.separate_alpha_blend[slot] = false;
+			}
 			if (alpha_remap) {
+				// Kept in the key (its layout is persisted); the factors above carry the remap.
 				static_params.blend_alpha_source_remap = true;
 			}
 		}

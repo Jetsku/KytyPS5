@@ -76,6 +76,8 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x5bu, Opcode::BUFFER_ATOMIC_XOR_X2, 2, 32},
     {0x71u, Opcode::BUFFER_GL0_INV, 0, 32},
     {0x72u, Opcode::BUFFER_GL1_INV, 0, 32},
+    {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -122,6 +124,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
     {0x3bu, Opcode::DS_READ_I16, 1, 16, true},   {0x3cu, Opcode::DS_READ_U16, 1, 16},
     {0x3du, Opcode::DS_CONSUME, 1, 32},          {0x3eu, Opcode::DS_APPEND, 1, 32},
+    {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
@@ -227,6 +230,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
 		case Opcode::DS_APPEND: return 0u;
+		case Opcode::DS_ORDERED_COUNT: return 1u;
 		default: return IsDsWriteOpcode(opcode) || IsDsAtomicOpcode(opcode) ? 2u : 1u;
 	}
 }
@@ -320,6 +324,9 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
+	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X) {
+		inst.dst.sdwa_sel = 4u;
+	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
 	DecodeScalarSource(soffset, pc, inst.src2);
@@ -370,7 +377,6 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word0  = code[word_index];
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t offset = word0 & 0xfffu;
-	const uint32_t dlc    = (word0 >> 12u) & 1u;
 	const uint32_t lds    = (word0 >> 13u) & 1u;
 	const uint32_t seg    = (word0 >> 14u) & 0x3u;
 	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
@@ -382,9 +388,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.pc             = pc;
 	inst.word_count     = 2;
 	inst.offset         = seg == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
+	inst.dlc            = ((word0 >> 12u) & 1u) != 0;
 	inst.glc            = ((word0 >> 16u) & 1u) != 0;
 	inst.slc            = ((word0 >> 17u) & 1u) != 0;
-	inst.dlc            = dlc != 0u;
 	inst.family         = Family::FLAT;
 	inst.opcode_id      = opcode;
 	inst.memory_segment = seg;
@@ -392,8 +398,8 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	// GLC/SLC/DLC only select cache policy for loads and stores; the host path accesses
-	// memory coherently, so they are accepted as hints.
+	// GLC/SLC/DLC only select cache policy for loads and stores and are accepted as hints;
+	// GLC/DLC loads keep their coherence (MemoryInfoFromDecoded).
 	if (lds != 0 || seg == 3u) {
 		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
 		return;
@@ -441,6 +447,14 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
+	}
+	if (inst.opcode == Opcode::DS_ORDERED_COUNT) {
+		// Keep OFFSET1's wave type as well as its add/swap selector for GDS addressing.
+		inst.offset           = offset0 & 0xfcu;
+		inst.secondary_offset = offset1;
+		if (!inst.gds || ((offset1 >> 4u) & 3u) > 1u || ((offset1 >> 6u) & 3u) != 0u) {
+			SetUnsupported(inst, Family::DS, opcode, "DS ordered count variant is not implemented");
+		}
 	}
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");

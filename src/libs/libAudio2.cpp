@@ -196,6 +196,9 @@ struct AudioOut2PortStateEntry {
 	uint32_t               samples_num   = 512;
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
+	// Non-object ports: the per-channel gain attribute, applied when the port is played (upstream
+	// c86c8b4d9). An object's gain is one of its placement attributes (`object`).
+	std::array<float, 16>  gains {};
 	std::vector<uint8_t>   pcm_data;
 	Mix::LevelMeter        meter;     // KYTY_AUDIO_LEVELS: PCM the guest set since the last report.
 	uint32_t               pcm_sets = 0;
@@ -236,7 +239,9 @@ static constexpr int AUDIO_OUT2_ERROR_INVALID_PARAM               = -2144960511;
 static constexpr int AUDIO_OUT2_ERROR_BUSY                        = -2144960505; /* 0x80268007 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
+static constexpr int AUDIO_OUT2_ERROR_OUT_OF_RESOURCE             = -2144960510; /* 0x80268002 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_DEFAULT  = 1;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
@@ -427,6 +432,13 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle         c
 		if (!mixed) {
 			const auto* pcm = reinterpret_cast<const float*>(bed.pcm_data.data());
 			mix->assign(pcm, pcm + static_cast<size_t>(frames) * channels);
+			// The bed's own gain attribute scales its channels, not the objects mixed into them.
+			if (std::any_of(bed.gains.begin(), bed.gains.begin() + channels,
+			                [](float gain) { return gain != 1.0f; })) {
+				for (size_t index = 0; index < mix->size(); index++) {
+					(*mix)[index] *= bed.gains[index % channels];
+				}
+			}
 			mixed = true;
 		}
 		Objects::MixInto(mix->data(), channels, frames,
@@ -444,8 +456,8 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle         c
 		float       added[2] {};
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			const auto index = static_cast<size_t>(frame) * channels;
-			added[0]         = (*mix)[index] - pcm[index];
-			added[1]         = (*mix)[index + 1] - pcm[index + 1];
+			added[0]         = (*mix)[index] - pcm[index] * bed.gains[0];
+			added[1]         = (*mix)[index + 1] - pcm[index + 1] * bed.gains[1];
 			g_audioout2_object_mix.added.Add(added, 1, 2, true);
 		}
 	}
@@ -472,7 +484,9 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 				data          = audioout2_mix_objects_locked(ctx, state, &object_mix);
 				objects_mixed = true;
 			}
-			params.push_back(AudioInternal::OutputParam {state.audio_handle, data});
+			// A mixed bed already carries its gains.
+			params.push_back(AudioInternal::OutputParam {
+			    state.audio_handle, data, data == state.pcm_data.data() ? state.gains.data() : nullptr});
 		}
 	}
 	if (!objects_mixed) {
@@ -540,8 +554,6 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(ctx == nullptr);
 
-	*ctx = g_audioout2_next_context.fetch_add(1, std::memory_order_relaxed);
-
 	g_audioout2_context_mutex.Lock();
 	auto* state = audioout2_find_context_locked(0);
 	if (state == nullptr) {
@@ -552,7 +564,11 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 			}
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(state == nullptr);
+	if (state == nullptr) {
+		g_audioout2_context_mutex.Unlock();
+		return Diag::Error("sceAudioOut2ContextCreate", AUDIO_OUT2_ERROR_OUT_OF_RESOURCE, 0);
+	}
+	*ctx               = g_audioout2_next_context.fetch_add(1, std::memory_order_relaxed);
 	*state             = AudioOut2ContextState {};
 	state->used        = true;
 	state->handle      = *ctx;
@@ -735,6 +751,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		port_state->sampling_freq = params->sampling_freq;
 		port_state->samples_num   = samples_num;
 		port_state->audio_format  = audio_format;
+		port_state->gains.fill(1.0f);
 	}
 	g_audioout2_port_mutex.Unlock();
 	g_audioout2_context_mutex.Unlock();
@@ -950,7 +967,9 @@ static void audioout2_log_object_attributes_locked(const AudioOut2PortStateEntry
 
 int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
-	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
+	if (num != 0 && attributes == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
 
 	const void* pcm_data = nullptr;
 	bool        has_pcm  = false;
@@ -981,6 +1000,22 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				for (uint32_t i = 0; i < num; i++) {
 					Objects::ApplyAttribute(&state->object, attributes[i].attribute_id,
 					                        attributes[i].value, attributes[i].value_size);
+				}
+			} else {
+				// One finite, non-negative gain per channel; any other value keeps the last gains.
+				const auto channels = audioout2_data_format_channels(state->data_format);
+				for (uint32_t i = 0; i < num; i++) {
+					const auto& attribute = attributes[i];
+					if (attribute.attribute_id != AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN ||
+					    attribute.value == nullptr || attribute.value_size != channels * sizeof(float)) {
+						continue;
+					}
+					auto gains = state->gains;
+					std::memcpy(gains.data(), attribute.value, attribute.value_size);
+					if (std::all_of(gains.begin(), gains.begin() + channels,
+					                [](float gain) { return std::isfinite(gain) && gain >= 0.0f; })) {
+						state->gains = gains;
+					}
 				}
 			}
 			if (audioout2_level_logging()) {

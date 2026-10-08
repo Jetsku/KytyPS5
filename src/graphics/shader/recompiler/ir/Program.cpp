@@ -211,6 +211,18 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
+Value ResolveActiveU32(Value value, Value active) {
+	for (uint32_t depth = 0; depth <= 32; ++depth) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
+		    inst->Arg(0).Resolve() != active)
+			return value;
+		value = inst->Arg(1);
+	}
+	return {};
+}
+
 bool HasShaderMemoryWrites(const Program& program) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

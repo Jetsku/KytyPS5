@@ -3370,6 +3370,15 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (!thread->name.empty()) {
+#if defined(__APPLE__)
+		pthread_setname_np(thread->name.substr(0, 63).c_str());
+#else
+		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
+	}
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Apply the guest's priority to this thread directly. The attribute carries it as well, but

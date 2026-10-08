@@ -38,6 +38,8 @@ struct SrtRuntime {
 	// address. Without it, only addresses that are never mapped read 0 (the first 64 KiB and
 	// non-canonical addresses), where the in-place read would fault with nothing to resolve it.
 	SrtMappedRange is_guest_mapped = nullptr;
+	// Dispatch workgroup counts (compute). No descriptor this planner tracks reads them yet.
+	std::span<const uint32_t> workgroup_counts;
 };
 
 // Addresses no guest or host mapping can contain: the first 64 KiB (never mapped on Windows, Linux

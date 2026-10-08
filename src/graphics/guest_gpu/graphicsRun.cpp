@@ -2420,7 +2420,8 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 
 CpSeq::DrawIndirectOp CommandProcessor::IndirectDrawOp(uint32_t data_offset,
                                                       uint32_t draw_initiator, bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	// Indexed records select the DMA index source (0), auto-index records generated indices (2).
+	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	CpSeq::DrawIndirectOp op;
 	op.args_base           = m_draw_indirect_args_base_addr;
@@ -2477,7 +2478,12 @@ static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t ind
 	return draw;
 }
 
-void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
+// `registers` (the SH locations the CP patches with a record's offsets) is not applied: native
+// (GPU-read) records never reach the CPU, and the start instance reaches its SGPR in the shader
+// (KYTY_START_INSTANCE_SGPR, recorded by the PM4 handler).
+void CommandProcessor::DrawIndirect(uint32_t data_offset,
+                                    [[maybe_unused]] IndirectDrawRegisters registers,
+                                    uint32_t draw_initiator, bool indexed) {
 	// KYTY_DRAW_PREP_INDIRECT (drawPrep.h): the draw's programs are prepared in a window slot.
 	auto*      engine  = m_draw_prep.get();
 	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
@@ -2574,8 +2580,9 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
-                                         uint32_t stride_in_bytes, uint32_t draw_initiator,
-                                         bool indexed) {
+                                         uint32_t                 stride_in_bytes,
+                                         [[maybe_unused]] IndirectDrawRegisters registers,
+                                         uint32_t draw_initiator, bool indexed) {
 	auto op               = IndirectDrawOp(data_offset, draw_initiator, indexed);
 	op.count_addr         = reinterpret_cast<uint64_t>(count_addr);
 	op.max_count_or_count = max_count_or_count;

@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -283,7 +284,7 @@ void TestInvariantIndirectImageMaterialization() {
   const auto source = fixture->program.info.images[0].source;
   Check(source < fixture->program.descriptor_sources.size() &&
             fixture->program.descriptor_sources[source]
-                .indirect_image.has_value(),
+                .indirect_descriptor.has_value(),
         "indirect image source was not retained for runtime proof");
   const auto image_handle =
       std::ranges::find_if(*fixture->block, [](const Inst &inst) {
@@ -546,11 +547,11 @@ void TestInvariantIndirectImageMaterialization() {
   const auto record_source = record_immediate->program.info.images[0].source;
   Check(record_source < record_immediate->program.descriptor_sources.size() &&
             record_immediate->program.descriptor_sources[record_source]
-                .indirect_image.has_value() &&
+                .indirect_descriptor.has_value() &&
             record_immediate->program.descriptor_sources[record_source]
-                    .indirect_image->selector_offset == 8u &&
+                    .indirect_descriptor->selector->offset == 8u &&
             record_immediate->program.descriptor_sources[record_source]
-                    .indirect_image->selector_stride == 224u,
+                    .indirect_descriptor->selector->stride == 224u,
         "the record immediate was not folded into the selector offset");
 }
 
@@ -629,9 +630,9 @@ void TestGuardedDirectImageTable() {
                  fixture.AddMemory(memory, 0x128));
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
-    Check(indirect && indirect->material_source == UINT32_MAX &&
-              indirect->selector_stride == 0u && indirect->table_offset == 344u &&
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && !indirect->selector.has_value() &&
+              indirect->table_offset == 344u &&
               indirect->key_count.Resolve().IsImmediate() &&
               indirect->key_count.Resolve().U32() == 32u &&
               fixture.program.descriptor_sources[indirect->table_source].dword_count == 2u,
@@ -796,8 +797,8 @@ void TestBoundedComputeImageLoop() {
                  fixture.AddMemory(sample, 0x29c));
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
-    Check(indirect && indirect->material_source == UINT32_MAX &&
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && !indirect->selector.has_value() &&
               indirect->table_offset == 0x6b0u &&
               indirect->key_count.Resolve() == count.Resolve(),
           "bounded compute loop lost its runtime image count");
@@ -1032,9 +1033,9 @@ void TestUniformizedMaterialImageKeys() {
                  fixture.AddMemory(output_memory, 0x1b00u), done);
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
-    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
-    Check(indirect && indirect->selector_stride == 0x90u &&
-              indirect->selector_offset == 0xc00u &&
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && indirect->selector && indirect->selector->stride == 0x90u &&
+              indirect->selector->offset == 0xc00u &&
               indirect->table_offset == 0x20e0u &&
               !indirect->selector_mask.IsEmpty() &&
               indirect->key_count.Resolve().IsImmediate() &&
@@ -1045,7 +1046,7 @@ void TestUniformizedMaterialImageKeys() {
   auto plan = make_plan(false, false);
   Check(plan.requires_specialization_memory &&
             plan.descriptor_sources[plan.info.images[0].source]
-                .indirect_image->selector_mask.Resolve().TryInstruction() != nullptr,
+                .indirect_descriptor->selector_mask.Resolve().TryInstruction() != nullptr,
         "uniformized image mask did not survive extraction");
   LinearTestMemory memory;
   memory.words.resize(0x23000u / 4u);
@@ -2543,6 +2544,33 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+void TestBufferStoreUsesItsOwnActiveValue() {
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  const auto guard = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+  const auto other_guard = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+  const auto inner = fixture.Emit(ValueOpcode::SelectU32, {guard, Value(9u), lane});
+  const auto data = fixture.Emit(ValueOpcode::SelectU32, {guard, inner, lane});
+  const auto handle = fixture.Buffer({Value(0x1000u), Value(4u << 16u),
+                                       Value(64u), Value(0x16204u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  const auto store = [&](Value active) {
+    return fixture.Emit(ValueOpcode::StoreBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), data, active},
+        fixture.AddMemory(memory, 0));
+  };
+  const auto matching = store(guard);
+  const auto different = store(other_guard);
+  ConstantPropagationPass(fixture.program.blocks);
+  Check(matching.Instruction()->Arg(4).Resolve() == Value(9u),
+        "buffer store retained data from its inactive lanes");
+  Check(different.Instruction()->Arg(4).Resolve() == data.Resolve() &&
+            data.Resolve().Instruction()->GetOpcode() == ValueOpcode::SelectU32,
+        "buffer store changed a shared value outside its own EXEC mask");
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -2909,7 +2937,8 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
             static_cast<uint32_t>(DescriptorBindingKind::MipStats) == 55u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u,
+            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -3336,6 +3365,7 @@ int main() {
     Run("loop-variant record reads", TestLoopVariantRecordReads);
     Run("loop-variant image dropped", TestLoopVariantImageIsDropped);
     Run("loop-invariant reads stay flat", TestLoopInvariantReadsStayFlat);
+    Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
@@ -3391,3 +3421,4 @@ void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 #include "graphics/shader/recompiler/ir/Value.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
+#include "graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"

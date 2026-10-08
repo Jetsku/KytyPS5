@@ -46,7 +46,7 @@ public:
 private:
 	uint32_t F32() { return TypeF32(s); }
 	uint32_t U32() { return TypeU32(s); }
-	uint32_t U64() { return TypeScalarU64(s); }
+	uint32_t U64() { return TypeU64(s); }
 	uint32_t Bool() { return TypeBool(s); }
 	uint32_t U32x4() { return TypeU32Vector(s, 4); }
 	uint32_t Cu(uint32_t value) { return ConstantU32(s, value); }
