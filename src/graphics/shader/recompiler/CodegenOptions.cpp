@@ -47,8 +47,12 @@ CodegenOptions FromEnvironment() {
 	if (const auto* budget = std::getenv("KYTY_LOOP_GUARD"); budget != nullptr) {
 		options.loop_guard_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));
 	}
+	options.ps_helper_atomics_skip =
+	    EnvFlag("KYTY_PS_HELPER_ATOMICS_SKIP", options.ps_helper_atomics_skip);
+	options.volatile_loads         = EnvFlag("KYTY_VOLATILE_LOADS", options.volatile_loads);
 	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {
-		std::string_view text(list);
+		options.loop_guard_all = std::strcmp(list, "all") == 0 || std::strcmp(list, "*") == 0;
+		std::string_view text(options.loop_guard_all ? "" : list);
 		while (!text.empty()) {
 			const auto comma = text.find(',');
 			const auto token = std::string(text.substr(0, comma));
@@ -122,8 +126,8 @@ const CodegenOptions& GetCodegenOptions() {
 bool LoopGuardApplies(uint64_t shader_hash) {
 	const auto& options = Storage();
 	return options.loop_guard_budget != 0 &&
-	       std::ranges::find(options.loop_guard_shaders, shader_hash) !=
-	           options.loop_guard_shaders.end();
+	       (options.loop_guard_all || std::ranges::find(options.loop_guard_shaders, shader_hash) !=
+	                                      options.loop_guard_shaders.end());
 }
 
 void SetCodegenOptions(const CodegenOptions& options) {

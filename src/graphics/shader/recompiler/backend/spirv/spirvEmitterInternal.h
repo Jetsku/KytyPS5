@@ -658,7 +658,7 @@ inline uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limi
 }
 
 template <typename Fn>
-uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+uint32_t AtomicUpdateLoop(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
@@ -700,6 +700,26 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	return observed;
 }
 
+// KYTY_PS_HELPER_ATOMICS_SKIP (CodegenOptions::ps_helper_atomics_skip): whether a pixel shader's CAS
+// loops leave out helper invocations (gl_HelperInvocation declared, SpirvRequirements).
+[[nodiscard]] bool PixelHelperAtomicsSkipped(const EmitterState& state);
+
+// A read-modify-write of one dword as a compare-exchange loop (sub-dword stores, float min/max,
+// INC/DEC). Vulkan does not perform a helper invocation's atomics and leaves their results
+// undefined, so in a helper lane the loop's exit test (exchanged == observed) depends on whatever the
+// driver returns and need never become true: the wave then spins until a device reset (an AMD-only
+// hang where helper lanes stay in the wave for derivatives). Helper lanes skip the loop and read
+// zero, which is what their discarded atomic may return anyway.
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	if (PixelHelperAtomicsSkipped(state)) {
+		const auto live = Unary(state, spv::OpLogicalNot, TypeBool(state), EmitIsHelperInvocation(state));
+		return EmitValueOrZeroIfCondition(state, live, [&]() {
+			return AtomicUpdateLoop(state, pointer, kind, std::forward<Fn>(desired));
+		});
+	}
+	return AtomicUpdateLoop(state, pointer, kind, std::forward<Fn>(desired));
+}
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_ */

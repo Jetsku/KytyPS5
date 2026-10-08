@@ -20,7 +20,7 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 29 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders, dispatcher_cap,
+// Members: 32 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders, dispatcher_cap,
 // rt_node_budget, rt_function.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
@@ -102,6 +102,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.bda_writes ? 1u : 0u);
 	b.U32(options.rt_node_budget);
 	b.U8(options.rt_node_stats ? 1u : 0u);
+	b.U8(options.ps_helper_atomics_skip ? 1u : 0u);
+	b.U8(options.loop_guard_all ? 1u : 0u);
+	b.U8(options.volatile_loads ? 1u : 0u);
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();

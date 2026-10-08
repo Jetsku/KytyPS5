@@ -226,6 +226,10 @@ void CheckFingerprint() {
   options_differ("dispatcher_cap", [](CodegenOptions &o) { o.dispatcher_cap++; });
   options_differ("ir_linear_uses", [](CodegenOptions &o) { o.ir_linear_uses = !o.ir_linear_uses; });
   options_differ("fold_lane_masks", [](CodegenOptions &o) { o.fold_lane_masks = !o.fold_lane_masks; });
+  options_differ("ps_helper_atomics_skip",
+                 [](CodegenOptions &o) { o.ps_helper_atomics_skip = !o.ps_helper_atomics_skip; });
+  options_differ("loop_guard_all", [](CodegenOptions &o) { o.loop_guard_all = !o.loop_guard_all; });
+  options_differ("volatile_loads", [](CodegenOptions &o) { o.volatile_loads = !o.volatile_loads; });
 
   // Host state the emitter reads.
   namespace Spirv = ShaderRecompiler::Spirv;

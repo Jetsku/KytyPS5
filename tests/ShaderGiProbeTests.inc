@@ -367,6 +367,56 @@ void CheckLoopGuardCodegen() {
               "a guarded shader lacks the loop-guard counter, its GDS binding or its report");
     }
   }
+  // KYTY_LOOP_GUARD_SHADERS=all: an unlisted shader is guarded too, and its report also records
+  // the shader hash (two GDS exchanges).
+  {
+    auto options = GetCodegenOptions();
+    options.loop_guard_budget = 64u;
+    options.loop_guard_shaders = {1u};
+    options.loop_guard_all = true;
+    ScopedCodegenOptions scoped(options);
+    const auto compiled = CompileCase(test, 32u);
+    Require(name, "SPIR-V",
+            CodegenTests::CountSpirv(compiled.spirv, "OpName %loop_guard") == 1u &&
+                CodegenTests::CountSpirv(compiled.spirv, "OpAtomicIAdd") == atomics_off + 1u &&
+                CodegenTests::CountSpirv(compiled.spirv, "OpAtomicExchange") == 2u,
+            "KYTY_LOOP_GUARD_SHADERS=all did not guard the shader or record its hash");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// CPU only: KYTY_PS_HELPER_ATOMICS_SKIP. A pixel shader's BUFFER_STORE_BYTE is an emulated
+// read-modify-write (a compare-exchange loop); helper invocations skip it by default, which declares
+// gl_HelperInvocation, and with the switch off the shader is as before.
+void CheckPixelHelperAtomicsCodegen() {
+  constexpr const char *name = "PixelHelperAtomicsCodegen";
+  const ShaderRecompiler::CodegenOptions defaults;
+  Require(name, "defaults", defaults.ps_helper_atomics_skip,
+          "KYTY_PS_HELPER_ATOMICS_SKIP=1 is not the default");
+  for (const bool skip : {false, true}) {
+    auto options = GetCodegenOptions();
+    options.ps_helper_atomics_skip = skip;
+    options.ps_append_live_election = false;
+    options.ps_live_exec = PsLiveExec::Off;
+    ScopedCodegenOptions scoped(options);
+    GraphicsCase test;
+    test.name = name;
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1u, 0x5au);
+    AppendVMovU32(&code, 31u, 0u);
+    AppendBufferStoreOpcode(&code, 0x18u, 1u, 31u); // buffer_store_byte v1, v31, s[48:51] offen
+    code.push_back(EncodeVop1(0x01u, 2u, InlineU32(0u)));
+    code.push_back(EncodeExp0(0u, 0xfu, true, false, true));
+    code.push_back(EncodeExp1(2u, 2u, 2u, 2u));
+    code.push_back(0xbf810000u);
+    test.fragment_code = code;
+    const auto compiled = CompileFragmentCase(test);
+    const auto helpers = CodegenTests::CountSpirv(compiled.spirv, "BuiltIn HelperInvocation");
+    const auto cas = CodegenTests::CountSpirv(compiled.spirv, "OpAtomicCompareExchange");
+    Require(name, "SPIR-V", cas == 1u, "the byte store is not one compare-exchange loop");
+    Require(name, "SPIR-V", helpers == (skip ? 1u : 0u),
+            "gl_HelperInvocation declaration does not follow KYTY_PS_HELPER_ATOMICS_SKIP");
+  }
   std::printf("[host]    %-32s ok\n", name);
 }
 

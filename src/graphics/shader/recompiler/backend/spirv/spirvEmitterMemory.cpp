@@ -209,8 +209,11 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 		                          bda);
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask, alignment);
+		// KYTY_VOLATILE_LOADS: FLAT/GLOBAL and indirect-V# reads too.
+		const auto access = GetCodegenOptions().volatile_loads
+		                        ? spv::MemoryAccessAlignedMask | spv::MemoryAccessVolatileMask
+		                        : spv::MemoryAccessAlignedMask;
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, access, alignment);
 		return value;
 	});
 }

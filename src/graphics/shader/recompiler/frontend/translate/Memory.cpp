@@ -173,6 +173,12 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
 	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
 	                  (decoded.glc || decoded.dlc);
+	// KYTY_VOLATILE_LOADS=1 (diagnostic): every buffer access is Volatile, so a guest loop polling memory
+	// another workgroup or dispatch writes always rereads it (CodegenOptions::volatile_loads).
+	if (GetCodegenOptions().volatile_loads && !buffer_atomic &&
+	    (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer)) {
+		memory.coherent = true;
+	}
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {

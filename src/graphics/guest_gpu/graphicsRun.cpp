@@ -3648,11 +3648,13 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 // word is read without waiting for the GPU (a diagnostic) and reported when it changes.
 static void NoteLoopGuardHits(RenderContext& renderer) {
 	const auto& options = Libs::Graphics::ShaderRecompiler::GetCodegenOptions();
-	if (options.loop_guard_budget == 0 || options.loop_guard_shaders.empty()) {
+	if (options.loop_guard_budget == 0 ||
+	    (options.loop_guard_shaders.empty() && !options.loop_guard_all)) {
 		return;
 	}
 	const auto mapped = renderer.GetBufferCache().GetGdsBuffer()->Mapped();
-	if (mapped.size() < sizeof(uint32_t)) {
+	constexpr auto hash_from_end = Libs::Graphics::ShaderRecompiler::LoopGuardHashGdsFromEnd;
+	if (mapped.size() < (hash_from_end + 1u) * sizeof(uint32_t)) {
 		return;
 	}
 	static uint32_t reported = 0;
@@ -3660,10 +3662,15 @@ static void NoteLoopGuardHits(RenderContext& renderer) {
 	std::memcpy(&hits, mapped.data() + mapped.size() - sizeof(uint32_t), sizeof(hits));
 	if (hits != reported) {
 		reported = hits;
+		// The last exhausted shader (KYTY_LOOP_GUARD_SHADERS=all names it; written by every one).
+		uint32_t hash_words[2] = {};
+		std::memcpy(hash_words, mapped.data() + mapped.size() - hash_from_end * sizeof(uint32_t),
+		            sizeof(hash_words));
+		const uint64_t hash = hash_words[0] | (uint64_t {hash_words[1]} << 32u);
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "Loop guard: {} invocations of the guarded shaders exhausted the {}-iteration loop "
-		    "budget (KYTY_LOOP_GUARD)\n",
-		    hits, options.loop_guard_budget));
+		    "budget (KYTY_LOOP_GUARD); last one in shader 0x{:016x}\n",
+		    hits, options.loop_guard_budget, hash));
 	}
 }
 

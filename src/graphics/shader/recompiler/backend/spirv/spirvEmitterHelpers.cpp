@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
@@ -142,6 +144,11 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+bool PixelHelperAtomicsSkipped(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel && GetCodegenOptions().ps_helper_atomics_skip &&
+	       state.helper_invocation_variable != 0;
 }
 
 uint32_t EmitIsHelperInvocation(EmitterState& state) {
