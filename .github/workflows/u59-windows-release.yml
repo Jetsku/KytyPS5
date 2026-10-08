@@ -163,6 +163,10 @@ jobs:
           }
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
+          # AMD device-lost test kit (only on branches that have it).
+          if (Test-Path -LiteralPath 'tools/amd-test-kit') {
+            Copy-Item -Path 'tools/amd-test-kit/*' -Destination $release
+          }
           # libFont's fallback font: the emulator looks for it under its working directory (the launcher starts it
           # in its own folder) when the build-time source path does not exist, as on every user's PC.
           $fonts = Join-Path $release '3rdparty/tracy/profiler/src/font'

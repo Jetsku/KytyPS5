@@ -1,4 +1,37 @@
-# KytyPS5 U59 int16.1 — Astro Bot with full lighting, GI and ray tracing, performance-mode occlusion
+# KytyPS5 U59 int16.1 AMD test — for AMD Radeon cards that crash ("device lost") after the intro video
+
+> **This is a test build for AMD Radeon owners whose game stops with "device lost" / ErrorDeviceLost, usually right
+> after the intro video.** Everyone else: please keep using int16.1.
+
+## What this build is
+
+int16.1 plus crash diagnostics for AMD graphics cards and an automatic test kit. We have no AMD card ourselves, so
+one test session on your PC tells us which part of the emulator makes the GPU stop responding.
+
+- **GPU breadcrumbs:** after a device loss the console now names what the GPU was running (queue, operation and
+  shader). They switch on with `KYTY_DEVICE_FAULT_DIAGNOSTICS=1`, which the test kit sets for you.
+- **One new fix on by default:** pixel-shader helper lanes skip the compare-exchange loops that emulate some stores
+  and atomics (`KYTY_PS_HELPER_ATOMICS_SKIP=0` restores the old code). It is safe on NVIDIA.
+- **New option** `KYTY_PIPELINE_FAST_FIRST=nvidia`: quick unoptimized pipeline builds only on NVIDIA.
+- Everything else is the same as int16.1.
+
+## How to test (about 35 minutes, hands off)
+
+1. Copy your working int16.1 folder (with its `_Patches`, `_PipelineCache` and `_SaveData`) to a new folder, then
+   unzip this build into the new folder and let it overwrite the files.
+2. Start `launcher.exe` from the new folder once, check that Astro Bot and your usual patches are listed, then close
+   the launcher again. Do not start the game from it.
+3. Double-click `AMD-Test-Kit.cmd` and leave the PC alone. The game opens and closes by itself about 19 times, each
+   time with one setting changed. The screen may go black for a few seconds when the GPU resets; that is expected.
+4. When it says "Send this file: ...AMD-Test-Results-<date>.zip", send us that zip.
+
+The kit changes nothing outside its results folder. The zip contains the emulator's console logs, your OS, GPU,
+driver, CPU and RAM, and Windows' records of display-driver resets during the test. `AMD-TEST-KIT-README.txt` has
+the details and options.
+
+---
+
+# int16.1 release notes
 
 > int16.1 is the int16 pre-release plus low-risk fixes and a much faster default for heavy levels. If anything works
 > worse than in the int16 pre-release or int15, please report it (with your GPU and CPU model).
