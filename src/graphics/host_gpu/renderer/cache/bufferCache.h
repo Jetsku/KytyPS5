@@ -313,6 +313,8 @@ private:
 	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
+	// KYTY_BUFFER_LOOKUP_STATS: the kind of the last SynchronizeBdaBuffersNow (BufferLookupStats::Part).
+	uint8_t m_bda_pass_kind = 0;
 	// KYTY_BDA_SYNC_EPOCH_VERIFY: the full scan a skipped pass replaced.
 	void VerifyBdaEpochSkip(const RangeSet& mapped_ranges);
 	// KYTY_WRITTEN_SYNC_SKIP (default on; =0 off): a written synchronization (not a BDA pass; GPU

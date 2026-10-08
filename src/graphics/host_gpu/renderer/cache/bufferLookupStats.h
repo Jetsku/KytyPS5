@@ -41,6 +41,13 @@ enum class Part : uint8_t {
 	ReadRecord,  // ObtainReadBinding miss: RecordBinding
 	ReadTouch,   // ObtainReadBinding cache-buffer hit: the slot record and TouchBuffer
 	FindCall,    // FindBuffers: the BufferCache::FindBuffer calls (per binding)
+	BdaSkip,     // SynchronizeBdaBuffers: skipped (same sync epoch and buffer structure)
+	BdaNone,     // a pass that found nothing logged (epochs unchanged, no hot runs)
+	BdaHot,      // a pass over the recorded hot runs only
+	BdaLog,      // a dirty-log pass (KYTY_BDA_DIRTY_LOG)
+	BdaFull,     // a full scan of every mapped buffer
+	BdaFullNew,  // of which: the buffer structure changed since the last scan
+	CreateBuffer, // BufferCache::CreateBuffer (with its joins)
 	Count
 };
 

@@ -101,7 +101,8 @@ void Print(State& s) {
 	    "texel", "written", "narrow", "null"};
 	static const char* const part_names[PartCount] = {
 	    "findbuf",  "bda",    "prefetch",  "wranges",   "invalidate", "mipstats",
-	    "tables",   "descr",  "read-now",  "read-rec",  "read-touch", "find-call"};
+	    "tables",   "descr",  "read-now",  "read-rec",  "read-touch", "find-call",
+	    "bda-skip", "bda-none", "bda-hot", "bda-log", "bda-full", "bda-full-new", "create"};
 	static const char* const miss_names[MissCount] = {"no-region", "empty", "other-key",
 	                                                  "signature", "guard", "epoch"};
 	std::string line;

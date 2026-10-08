@@ -2505,6 +2505,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+	const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::CreateBuffer);
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -4390,6 +4391,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto structure  = m_bda_structure_epoch.load(std::memory_order_acquire);
 	if (m_bda_epoch_skip && sync_epoch == m_bda_synced_epoch &&
 	    structure == m_bda_synced_structure) {
+		BufferLookupStats::AddPart(BufferLookupStats::Part::BdaSkip, 0);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochSkips);
 		m_bda_epoch_totals.skips++;
 		if (m_bda_epoch_verify != 0) {
@@ -4417,7 +4419,12 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto fault_epoch     = m_memory_tracker.FaultMutationEpoch();
 	const auto uploaded_before = m_bda_pass_upload_bytes;
 	m_bda_count_uploads        = same_submission;
+	const auto pass_start      = BufferLookupStats::Now();
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	if (pass_start != 0) {
+		BufferLookupStats::AddPart(static_cast<BufferLookupStats::Part>(m_bda_pass_kind),
+		                           BufferLookupStats::Now() - pass_start);
+	}
 	m_bda_count_uploads = false;
 	m_bda_epoch_totals.passes++;
 	if (same_submission) {
@@ -4528,7 +4535,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	const bool structure_holds = m_bda_incremental_sync && cpu_epoch != UINT64_MAX &&
 	                             structure_epoch != UINT64_MAX &&
 	                             structure_epoch == m_bda_scanned_structure_epoch;
+	using LookupPart = BufferLookupStats::Part;
+	m_bda_pass_kind  = static_cast<uint8_t>(LookupPart::BdaFull);
 	if (structure_holds && cpu_epoch == m_bda_scanned_cpu_epoch) {
+		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaNone);
 		if (m_bda_hot_ranges.empty()) {
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
@@ -4537,6 +4547,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			return;
 		}
 		BdaSyncStats stats;
+		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaHot);
 		if (SynchronizeBdaHotRanges(stats)) {
 			FaultCost::NoteBdaPass(1, stats.upload_bytes);
 			m_bda_pass_upload_bytes += stats.upload_bytes;
@@ -4554,8 +4565,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			return;
 		}
 		// A recorded buffer is gone although the structure epoch held: scan everything.
+		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaFull);
 	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
-	           SynchronizeBdaDirtied(mapped_ranges)) {
+	           (m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaLog),
+	            SynchronizeBdaDirtied(mapped_ranges))) {
 		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
 		if (m_bda_log_verify != 0) {
@@ -4581,6 +4594,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 
 	BdaSyncStats stats;
+	m_bda_pass_kind = static_cast<uint8_t>(
+	    m_bda_incremental_sync && structure_epoch != m_bda_scanned_structure_epoch
+	        ? LookupPart::BdaFullNew
+	        : LookupPart::BdaFull);
 	if (m_bda_hot_sync) {
 		m_bda_hot_ranges.clear();
 		stats.hot_ranges = &m_bda_hot_ranges;
