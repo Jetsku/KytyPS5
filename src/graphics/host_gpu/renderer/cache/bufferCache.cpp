@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/renderer/cache/bufferLookupStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -72,8 +73,15 @@ uint64_t UploadRingSize() {
 
 Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
 Live::Switch g_binding_memo_prefetch("KYTY_CP_BINDING_MEMO_PREFETCH", Live::ParseDefaultOff);
-// KYTY_CP_BINDING_BATCH_PREFETCH (BufferCache::PrefetchReadBinding).
-Live::Switch g_binding_batch_prefetch("KYTY_CP_BINDING_BATCH_PREFETCH", Live::ParseDefaultOn);
+// KYTY_CP_BINDING_BATCH_PREFETCH (BufferCache::PrefetchReadBinding): 0 off, find (2) from
+// FindBuffers, anything else (default) from RebindBuffers.
+int64_t ParseBatchPrefetch(const char* value) {
+	if (value != nullptr && std::strcmp(value, "find") == 0) {
+		return 2;
+	}
+	return Live::ParseDefaultOn(value);
+}
+Live::Switch g_binding_batch_prefetch("KYTY_CP_BINDING_BATCH_PREFETCH", ParseBatchPrefetch);
 std::atomic<uint64_t> g_binding_hot_generation {1};
 void BindingHotChanged(int64_t, int64_t) {
 	// The live registry serializes callbacks. Saturation makes lookups clear the tier each time.
@@ -84,6 +92,20 @@ void BindingHotChanged(int64_t, int64_t) {
 }
 Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOff,
                                BindingHotChanged);
+// 0 when unset, empty or "0"; 2 for "verify", 3 for "exit"; 1 otherwise.
+int64_t ParseOnVerifyExit(const char* value) {
+	if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 2;
+	}
+	return std::strcmp(value, "exit") == 0 ? 3 : 1;
+}
+// KYTY_BINDING_MEMO_TOUCH (BufferCache::BindingMemo).
+Live::Switch g_binding_memo_touch("KYTY_BINDING_MEMO_TOUCH", Live::ParseDefaultOff);
+// KYTY_BINDING_LEAN_MISS (BufferCache::TryLeanReadMiss): 0 (default) off, 1 on, verify (2), exit (3).
+Live::Switch g_binding_lean_miss("KYTY_BINDING_LEAN_MISS", ParseOnVerifyExit);
 
 // KYTY_FAULT_AHEAD_ADAPT (live): the fault-ahead window of write faults
 // (MemoryTracker::SetFaultAheadOverride, applied at every guest flip).
@@ -2550,6 +2572,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+	const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::CreateBuffer);
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
@@ -3134,14 +3157,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-	if (!is_written && !is_texel_buffer && m_binding_memo != nullptr && GuestGpu::IsGpuThread()) {
+	if (!is_written && !is_texel_buffer && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
+	    GuestGpu::IsGpuThread()) {
 		return ObtainReadBinding(vaddr, size, id);
 	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
 }
 
-void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size) const noexcept {
-	if (m_binding_memo == nullptr || !g_binding_batch_prefetch.On()) {
+void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find) const noexcept {
+	if (m_binding_memo == nullptr || g_binding_batch_prefetch.Get() != (at_find ? 2 : 1)) {
 		return;
 	}
 	const auto* slot =
@@ -3230,23 +3254,32 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	}
 	const auto epoch  = SyncEpoch::Current();
 	const auto before = m_memory_tracker.RangeSignature(vaddr, size);
+	const bool key    = memo.kind != BindingMemoKind::Empty && memo.vaddr == vaddr && memo.size == size;
 	BindingMemoStats* stats = nullptr;
 	if (BindingMemoStatsEnabled()) [[unlikely]] {
 		stats = &GetBindingMemoStats();
 		stats->calls++;
 	}
-	if (before == 0 || memo.vaddr != vaddr || memo.size != size ||
-	    memo.kind == BindingMemoKind::Empty) {
+	using LookupOutcome = BufferLookupStats::Outcome;
+	using LookupMiss    = BufferLookupStats::Miss;
+	if (BufferLookupStats::Enabled() && BufferLookupStats::KeysEnabled()) [[unlikely]] {
+		BufferLookupStats::NoteKey(vaddr, size, m_memory_tracker.Frame());
+	}
+	if (before == 0 || !key) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSlot);
 		if (stats != nullptr) {
 			(before == 0 ? stats->no_region
 			             : memo.kind == BindingMemoKind::Empty ? stats->empty : stats->other_key)++;
 		}
+		BufferLookupStats::AddMiss(before == 0                            ? LookupMiss::NoRegion
+		                           : memo.kind == BindingMemoKind::Empty ? LookupMiss::Empty
+		                                                                  : LookupMiss::OtherKey);
 	} else if (memo.signature != before) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSignature);
 		if (stats != nullptr) {
 			stats->signature++;
 		}
+		BufferLookupStats::AddMiss(LookupMiss::Signature);
 	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
 	           memo.guard != (stream ? m_scheduler.CurrentTick()
 	                                 : m_bda_structure_epoch.load(std::memory_order_acquire))) {
@@ -3254,6 +3287,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 		if (stats != nullptr) {
 			stats->guard++;
 		}
+		BufferLookupStats::AddMiss(LookupMiss::Guard);
 	} else {
 		bool cross = false;
 		if (memo.epoch != epoch) {
@@ -3265,13 +3299,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			MemoryTracker::DirtyState relaxed;
 			bool                     cpu_only = false;
 			cross = !stream && m_binding_memo_cross &&
-			        QueryUploadSnapshot(m_memory_tracker, vaddr, size, relaxed, cpu_only) && !relaxed.cpu &&
-			        !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+			        QueryUploadSnapshot(m_memory_tracker, vaddr, size, relaxed, cpu_only) &&
+			        !relaxed.cpu && !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
 			        m_memory_tracker.RangeSignature(vaddr, size) == before;
 			if (!cross) {
 				if (stats != nullptr) {
 					stats->epoch++;
 				}
+				BufferLookupStats::AddMiss(LookupMiss::Epoch);
 				if (!stream && m_binding_memo_cross) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCrossRejects);
 					m_binding_memo_totals.cross_rejects++;
@@ -3301,11 +3336,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoStreamHits);
 				m_binding_memo_totals.stream_hits++;
 				hit.first = &m_stream_buffer;
+				BufferLookupStats::SetOutcome(LookupOutcome::MemoStream);
 			} else {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCachedHits);
 				m_binding_memo_totals.cached_hits++;
-				hit.first = &m_slot_buffers[memo.id];
-				TouchBuffer(*hit.first);
+				const BufferLookupStats::PartScope touch_scope(BufferLookupStats::Part::ReadTouch);
+				hit.first = memo.buffer;
+				if (!g_binding_memo_touch.On()) {
+					TouchBuffer(*hit.first);
+				} else {
+					// KYTY_BINDING_MEMO_TOUCH (bufferCache.h).
+					if (memo.touched != m_gc_tick) {
+						TouchBuffer(*hit.first);
+						memo.touched = m_gc_tick;
+					} else {
+						m_binding_memo_totals.touch_skips++;
+					}
+				}
+				BufferLookupStats::SetOutcome(cross ? LookupOutcome::MemoCross : LookupOutcome::MemoHit);
 			}
 			if (m_binding_memo_verify != 0) {
 				const auto copy = memo;
@@ -3314,14 +3362,92 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			return hit;
 		}
 	}
-	BufferId   obtained {};
-	const auto result = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
+	if (std::pair<Buffer*, uint64_t> lean {};
+	    g_binding_lean_miss.On() && TryLeanReadMiss(vaddr, size, epoch, before, id, lean)) {
+		return lean;
+	}
+	BufferId                     obtained {};
+	BufferLookupStats::PartScope now_scope(BufferLookupStats::Part::ReadNow);
+	const auto                   result = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
+	now_scope.Stop();
 	if (stats != nullptr) {
 		stats->slow_stream += result.first == &m_stream_buffer ? 1u : 0u;
 		PrintBindingMemoStats();
 	}
+	BufferLookupStats::SetOutcome(result.first == &m_stream_buffer ? LookupOutcome::MissStream
+	                                                               : LookupOutcome::MissCached);
+	const BufferLookupStats::PartScope record_scope(BufferLookupStats::Part::ReadRecord);
 	RecordBinding(vaddr, size, epoch, before, result, obtained);
 	return result;
+}
+
+bool BufferCache::TryLeanReadMiss(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
+                                  BufferId id, std::pair<Buffer*, uint64_t>& result) {
+	if (before == 0 || !m_relaxed_queries || IsBufferInvalid(id) ||
+	    !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		return false;
+	}
+	const BufferLookupStats::PartScope lean_scope(BufferLookupStats::Part::ReadNow);
+	bool cpu_dirty = true;
+	if (!m_memory_tracker.QueryCpuDirtyRelaxed(vaddr, size, cpu_dirty) || cpu_dirty ||
+	    m_memory_tracker.RangeSignature(vaddr, size) != before) {
+		return false;
+	}
+	const auto structure = m_bda_structure_epoch.load(std::memory_order_acquire);
+	if (structure == UINT64_MAX) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[id];
+	result       = {&buffer, buffer.Offset(vaddr)};
+	m_binding_memo_totals.lean_misses++;
+	BufferLookupStats::SetOutcome(BufferLookupStats::Outcome::MissLean);
+	if (g_binding_lean_miss.Get() >= 2) {
+		// The normal path decides (and synchronizes) the binding.
+		m_binding_memo_totals.lean_verify_checks++;
+		BufferId   obtained {};
+		const auto normal = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
+		if (normal != result) {
+			if (m_memory_tracker.RangeSignature(vaddr, size) != before) {
+				m_binding_memo_totals.lean_verify_races++;
+			} else {
+				m_binding_memo_totals.lean_verify_mismatches++;
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+					std::fprintf(stderr,
+					             "BindingLeanMissVerify: the normal path bound another buffer or "
+					             "offset: addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+					             vaddr, size);
+				}
+				if (g_binding_lean_miss.Get() == 3) {
+					EXIT("BindingLeanMissVerify: the normal path bound another buffer or offset: "
+					     "addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+					     vaddr, size);
+				}
+			}
+		}
+		result = normal;
+		RecordBinding(vaddr, size, epoch, before, normal, obtained);
+		return true;
+	}
+	TouchBuffer(buffer);
+	// RecordBinding's cache-buffer entry, with the signature the decision was taken under.
+	BindingMemo entry;
+	entry.vaddr     = vaddr;
+	entry.size      = static_cast<uint32_t>(size);
+	entry.epoch     = epoch;
+	entry.offset    = result.second;
+	entry.signature = before;
+	entry.guard     = structure;
+	entry.buffer    = &buffer;
+	entry.touched   = m_gc_tick;
+	entry.kind      = BindingMemoKind::Cached;
+	BindingMemoSlot(vaddr, size) = entry;
+	if (m_binding_hot_enabled) {
+		BindingHotMemoSlot(vaddr, size) = entry;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoRecords);
+	m_binding_memo_totals.records++;
+	return true;
 }
 
 void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
@@ -3331,9 +3457,10 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 	}
 	BindingMemo entry;
 	entry.vaddr  = vaddr;
-	entry.size   = size;
+	entry.size   = static_cast<uint32_t>(size);
 	entry.epoch  = epoch;
 	entry.offset = result.second;
+	entry.buffer = result.first;
 	if (result.first == &m_stream_buffer) {
 		// The decision and the copy saw one tracker state: no transition since `before`.
 		if (m_memory_tracker.RangeSignature(vaddr, size) != before) {
@@ -3361,7 +3488,8 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 		}
 		entry.signature = after;
 		entry.guard     = structure;
-		entry.id        = id;
+		// The normal path touched the buffer in this tick (ObtainBufferNow).
+		entry.touched   = m_gc_tick;
 		entry.kind      = BindingMemoKind::Cached;
 	}
 	BindingMemoSlot(vaddr, size) = entry;
@@ -3378,7 +3506,7 @@ std::pair<Buffer*, uint64_t> BufferCache::VerifyBindingHit(const BindingMemo&   
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoVerifyChecks);
 	m_binding_memo_totals.verify_checks++;
 	const auto vaddr = memo.vaddr;
-	const auto size  = memo.size;
+	const uint64_t size = memo.size;
 	// The tracker bits the hit relied on and the decision the normal path takes from them. A
 	// transition since the hit's signature read (a guest write fault) raced this check.
 	const auto state          = m_memory_tracker.QueryDirty(vaddr, size);
@@ -4330,6 +4458,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto structure  = m_bda_structure_epoch.load(std::memory_order_acquire);
 	if (m_bda_epoch_skip && sync_epoch == m_bda_synced_epoch &&
 	    structure == m_bda_synced_structure) {
+		BufferLookupStats::AddPart(BufferLookupStats::Part::BdaSkip, 0);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochSkips);
 		m_bda_epoch_totals.skips++;
 		if (m_bda_epoch_verify != 0) {
@@ -4357,7 +4486,12 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto fault_epoch     = m_memory_tracker.FaultMutationEpoch();
 	const auto uploaded_before = m_bda_pass_upload_bytes;
 	m_bda_count_uploads        = same_submission;
+	const auto pass_start      = BufferLookupStats::Now();
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	if (pass_start != 0) {
+		BufferLookupStats::AddPart(static_cast<BufferLookupStats::Part>(m_bda_pass_kind),
+		                           BufferLookupStats::Now() - pass_start);
+	}
 	m_bda_count_uploads = false;
 	m_bda_epoch_totals.passes++;
 	if (same_submission) {
@@ -4468,7 +4602,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	const bool structure_holds = m_bda_incremental_sync && cpu_epoch != UINT64_MAX &&
 	                             structure_epoch != UINT64_MAX &&
 	                             structure_epoch == m_bda_scanned_structure_epoch;
+	using LookupPart = BufferLookupStats::Part;
+	m_bda_pass_kind  = static_cast<uint8_t>(LookupPart::BdaFull);
 	if (structure_holds && cpu_epoch == m_bda_scanned_cpu_epoch) {
+		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaNone);
 		if (m_bda_hot_ranges.empty()) {
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
@@ -4477,6 +4614,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			return;
 		}
 		BdaSyncStats stats;
+		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaHot);
 		if (SynchronizeBdaHotRanges(stats)) {
 			FaultCost::NoteBdaPass(1, stats.upload_bytes);
 			m_bda_pass_upload_bytes += stats.upload_bytes;
@@ -4494,8 +4632,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			return;
 		}
 		// A recorded buffer is gone although the structure epoch held: scan everything.
+		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaFull);
 	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
-	           SynchronizeBdaDirtied(mapped_ranges)) {
+	           (m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaLog),
+	            SynchronizeBdaDirtied(mapped_ranges))) {
 		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
 		if (m_bda_log_verify != 0) {
@@ -4521,6 +4661,10 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 
 	BdaSyncStats stats;
+	m_bda_pass_kind = static_cast<uint8_t>(
+	    m_bda_incremental_sync && structure_epoch != m_bda_scanned_structure_epoch
+	        ? LookupPart::BdaFullNew
+	        : LookupPart::BdaFull);
 	if (m_bda_hot_sync) {
 		m_bda_hot_ranges.clear();
 		stats.hot_ranges = &m_bda_hot_ranges;

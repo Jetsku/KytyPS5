@@ -1400,6 +1400,22 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
 	set_tests_properties(binding_epoch_memo_cross_off PROPERTIES
 		ENVIRONMENT "KYTY_BINDING_MEMO_CROSS_EPOCH=0")
+	add_test(NAME binding_epoch_memo_touch_lean
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	set_tests_properties(binding_epoch_memo_touch_lean PROPERTIES
+		ENVIRONMENT "KYTY_BINDING_MEMO_TOUCH=1;KYTY_BINDING_LEAN_MISS=1")
+	# KYTY_BINDING_MEMO_TOUCH / KYTY_BINDING_LEAN_MISS (live): default table, the bindslots table,
+	# and with the memo's verify mode.
+	add_test(NAME binding_memo_lookup
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-memo-lookup-only)
+	add_test(NAME binding_memo_lookup_bindslots
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-memo-lookup-only)
+	set_tests_properties(binding_memo_lookup_bindslots PROPERTIES
+		ENVIRONMENT "KYTY_CP_COMMIT=bindslots")
+	add_test(NAME binding_memo_lookup_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-memo-lookup-only)
+	set_tests_properties(binding_memo_lookup_verify PROPERTIES
+		ENVIRONMENT "KYTY_BINDING_EPOCH_MEMO_VERIFY=exit")
 	# KYTY_WRITTEN_SYNC_SKIP: default, verify mode, off.
 	add_test(NAME written_sync_skip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)

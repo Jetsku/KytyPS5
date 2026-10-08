@@ -9141,6 +9141,163 @@ public:
     }
   }
 
+  // KYTY_BINDING_MEMO_TOUCH and KYTY_BINDING_LEAN_MISS (bufferCache.h), both live: a hit in the GC
+  // tick its memo last touched the buffer in skips the touch; a read binding of clean pages inside
+  // a known buffer takes the lean miss, binds what the normal path binds, and is then a memo hit;
+  // a CPU write still makes the next binding upload; the verify mode agrees with the normal path.
+  void CheckBindingMemoLookup() {
+    constexpr const char *name = "BindingMemoLookup";
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t first_offset = 0x10000; // a cache buffer (above CACHING_PAGESIZE)
+    constexpr uint64_t first_size = 0x8000;
+    constexpr uint64_t lean_offset = first_offset + 0x100; // inside the first range's buffer
+    constexpr uint64_t lean_size = 0x5000;
+    constexpr uint64_t verify_offset = first_offset + 0x200;
+    static_assert(first_size > BufferCache::CACHING_PAGESIZE &&
+                  lean_size > BufferCache::CACHING_PAGESIZE);
+
+    const auto stage = [](const char *text) {
+      Live::Testing::StageText(text);
+      Live::OnCpFlip();
+    };
+    stage("KYTY_BINDING_MEMO_TOUCH=0\nKYTY_BINDING_LEAN_MISS=0\n");
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "binding-lookup direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "binding-lookup fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 41 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const bool memo_on = BufferCacheTestAccess::BindingMemoEnabled(cache);
+      const int verify = BufferCacheTestAccess::BindingMemoVerify(cache);
+      const auto totals = [&] { return BufferCacheTestAccess::BindingMemoTotals(cache); };
+      using Binding = std::pair<Libs::Graphics::Buffer *, uint64_t>;
+      using Totals = decltype(BufferCacheTestAccess::BindingMemoTotals(cache));
+      // As RenderExecutor binds: FindBuffers' buffer first, then the binding.
+      const auto bind = [&](uint64_t offset, uint64_t size) {
+        const auto id = cache.FindBuffer(base + offset, size);
+        return cache.ObtainBuffer(base + offset, size, false, false, id);
+      };
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      Binding first{};
+      Binding lean{};
+      Binding rewritten{};
+      OnGpuThread(context, [&] {
+        (void)bind(first_offset, first_size); // creates the region and the buffer
+        first = bind(first_offset, first_size);
+
+        // Touch elision: the record touched the buffer in this tick, so hits skip the touch.
+        stage("KYTY_BINDING_MEMO_TOUCH=1\n");
+        const Totals touch0 = totals();
+        const auto touched = bind(first_offset, first_size);
+        (void)bind(first_offset, first_size);
+        Require(name, "touch skipped in the same tick",
+                touched == first && (!memo_on || (totals().touch_skips >= touch0.touch_skips + 1 &&
+                                                   totals().cached_hits == touch0.cached_hits + 2)),
+                "a hit in the tick of its memo's touch touched the buffer again, or missed");
+
+        // Lean miss: clean pages of the first range's buffer, a new key.
+        stage("KYTY_BINDING_LEAN_MISS=1\n");
+        const Totals lean0 = totals();
+        lean = bind(lean_offset, lean_size);
+        const auto lean_again = bind(lean_offset, lean_size);
+        Require(name, "lean miss",
+                lean.first == first.first && lean.second == first.second + (lean_offset - first_offset) &&
+                    lean_again == lean &&
+                    (!memo_on || verify != 0 ||
+                     (totals().lean_misses == lean0.lean_misses + 1 &&
+                      totals().cached_hits == lean0.cached_hits + 1)),
+                "a clean range of a known buffer did not take the lean miss, bound elsewhere, or "
+                "was not reused");
+        // A CPU write: the range is CPU-dirty, so the normal path uploads it.
+        cpu_write(lean_offset + 0x40, 0x7e57c0deu);
+        const Totals write0 = totals();
+        rewritten = bind(lean_offset, lean_size);
+        Require(name, "write ends the lean path",
+                rewritten == lean && totals().lean_misses == write0.lean_misses &&
+                    totals().cached_hits == write0.cached_hits,
+                "a binding of a CPU-dirty range took the lean path or a memo hit");
+
+        // Verify: the normal path decides, and agrees.
+        stage("KYTY_BINDING_LEAN_MISS=verify\n");
+        const Totals verify0 = totals();
+        const auto verified = bind(verify_offset, lean_size);
+        Require(name, "lean verify",
+                verified.first == first.first &&
+                    verified.second == first.second + (verify_offset - first_offset) &&
+                    (!memo_on || (totals().lean_verify_checks == verify0.lean_verify_checks + 1 &&
+                                  totals().lean_verify_mismatches == 0)),
+                "the lean-miss verify mode did not check, or disagreed with the normal path");
+      });
+      scheduler.Finish();
+      auto readback = CreateHostBuffer(name, lean_size, vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::BufferCopy copy{rewritten.second, 0, lean_size};
+      scheduler.Current().Handle().copyBuffer(rewritten.first->Handle(), readback.buffer, 1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                   vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                   nullptr, 1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, readback, static_cast<uint32_t>(lean_size / 4));
+      DestroyBuffer(&readback);
+      Require(name, "uploaded bytes",
+              std::memcmp(words.data(), memory + lean_offset, lean_size) == 0,
+              "the range bound after the CPU write lost it");
+      Require(name, "verify agrees", totals().verify_mismatches == 0,
+              "the memo's verify mode found a hit the normal path disagrees with");
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "binding-lookup direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "binding-lookup direct-memory allocation release failed");
+    stage("KYTY_BINDING_MEMO_TOUCH=\nKYTY_BINDING_LEAN_MISS=\n");
+    std::printf("[host]    %-32s ok (memo %s)\n", name,
+                BufferCacheTestAccess::BindingMemoEnabled(context.GetBufferCache()) ? "on" : "off");
+  }
+
   // KYTY_WRITTEN_SYNC_SKIP (BufferCache::SynchronizeBuffer): a writable binding of a range the
   // GPU already owns entirely is not synchronized again; one with pages a CPU write took back
   // uploads them.
@@ -52229,6 +52386,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBindingEpochMemo(true);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--binding-memo-lookup-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBindingMemoLookup();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--written-sync-skip-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckWrittenSyncSkip();
@@ -52725,6 +52887,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBdaSyncPerSubmission();
   vulkan.CheckBindingEpochMemo();
+  vulkan.CheckBindingMemoLookup();
   vulkan.CheckWrittenSyncSkip();
   vulkan.CheckFalseSharingWrites();
   vulkan.CheckShaderUploadDedup();

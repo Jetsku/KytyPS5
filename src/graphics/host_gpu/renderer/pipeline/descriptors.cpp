@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cache/bufferLookupStats.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -32,6 +33,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -179,7 +181,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
+	using LookupOutcome = BufferLookupStats::Outcome;
 	if (address == 0 || size == 0) {
+		BufferLookupStats::AddBinding(LookupOutcome::Null, 0);
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
@@ -190,10 +194,21 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// A proven write range narrows what becomes GPU-owned and which images go stale; everything
 	// else about the binding (synchronization, descriptor range) is unchanged.
 	const bool narrowed = resource.written && written_ranges != nullptr;
+	const auto lookup_start = BufferLookupStats::Now();
 	auto [buffer, offset] =
 	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
 	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                     resource.formatted, id);
+	if (lookup_start != 0) {
+		// KYTY_BUFFER_LOOKUP_STATS.
+		const auto outcome = BufferLookupStats::TakeOutcome();
+		BufferLookupStats::AddBinding(narrowed            ? LookupOutcome::WrittenNarrow
+		                              : resource.written   ? LookupOutcome::Written
+		                              : resource.formatted ? LookupOutcome::Texel
+		                                                   : outcome,
+		                              BufferLookupStats::Now() - lookup_start);
+	}
+	BufferLookupStats::PartScope descriptor_scope(BufferLookupStats::Part::Descriptor);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -208,12 +223,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
 	                                           : size + adjustment;
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
+	descriptor_scope.Stop();
+	const auto invalidate_start = resource.written ? BufferLookupStats::Now() : 0;
 	if (narrowed) {
 		for (const auto& range: *written_ranges) {
 			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
 		}
 	} else if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	}
+	if (invalidate_start != 0) {
+		BufferLookupStats::AddPart(BufferLookupStats::Part::Invalidate,
+		                           BufferLookupStats::Now() - invalidate_start);
 	}
 	const char* access = "Read";
 	if (resource.written && resource.read) {
@@ -1669,6 +1690,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
+	const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::FindBuffer);
 
 	prepared.buffer_sources.clear();
 	prepared.buffer_sources.reserve(program.info.buffers.size());
@@ -1738,6 +1760,11 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		if (const auto& resource = program.info.buffers[i]; !resource.written && !resource.formatted) {
+			// KYTY_CP_BINDING_BATCH_PREFETCH=find (BufferCache::PrefetchReadBinding).
+			cache.PrefetchReadBinding(address, size, true);
+		}
+		BufferLookupStats::PartScope find_scope(BufferLookupStats::Part::FindCall);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -1894,6 +1921,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
 	// KYTY_CP_BINDING_BATCH_PREFETCH: the memo slots of every read binding first, so their cache
 	// misses overlap (a hint only; the lookups below are unchanged).
+	BufferLookupStats::PartScope prefetch_scope(BufferLookupStats::Part::Prefetch);
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& source   = prepared.buffer_sources[i];
 		const auto& resource = program.info.buffers[i];
@@ -1901,19 +1929,28 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			m_context.GetBufferCache().PrefetchReadBinding(source.address, source.size);
 		}
 	}
+	prefetch_scope.Stop();
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t   buffer_offset = 0;
+		const auto ranges_start  = program.info.buffers[i].written ? BufferLookupStats::Now() : 0;
 		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
 		                                                write_ranges_evaluated, write_scratch);
+		if (ranges_start != 0) {
+			BufferLookupStats::AddPart(BufferLookupStats::Part::WriteRanges,
+			                           BufferLookupStats::Now() - ranges_start);
+		}
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
 	}
 	prepared.mip_stats_canary = false;
+	BufferLookupStats::PartScope mip_scope(BufferLookupStats::Part::MipStats);
 	prepared.mip_stats_active = plan_shader_data
 	                                ? prepared.plan->mip_stats_active
 	                                : WriteMipStatsFields(program, snapshot, prepared.shader_data);
+	mip_scope.Stop();
+	const BufferLookupStats::PartScope tables_scope(BufferLookupStats::Part::Tables);
 	// Upload sites: stage type and table kind (the dedup checks the site's last entry first).
 	const auto site = static_cast<uint32_t>(program.stage) * 2u;
 	prepared.fresh_upload = false;
@@ -1928,6 +1965,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		bool fresh                  = false;
 		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data, site + 1u, &fresh);
 		prepared.fresh_upload |= fresh;
+	}
+	if (BufferLookupStats::Enabled()) {
+		BufferLookupStats::NoteStage(SyncEpoch::Current());
 	}
 }
 
@@ -2089,6 +2129,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		uses_bvh |= stage->runtime->program->info.uses_bvh;
 	}
 	if (uses_dma) {
+		const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::PrepareBda);
 		m_context.PrepareBda();
 	}
 	CommitStats::Mark(CommitStats::Phase::FindBuffers);
