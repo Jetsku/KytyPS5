@@ -122,6 +122,7 @@ std::vector<uint8_t> EncodeSource(const ShaderJournal::Source& source) {
 	PutWords(payload, source.static_state);
 	PutWords(payload, source.code);
 	PutBytes(payload, source.input_info);
+	if (!source.back_code.empty()) PutWords(payload, source.back_code);
 	return payload;
 }
 
@@ -238,7 +239,7 @@ void ShaderJournal::Load() {
 				                                       static_cast<size_t>(payload_size));
 				if (XXH3_64bits(payload.data(), payload.size()) != checksum) break;
 				Cursor cursor(payload);
-				if (kind == RecordSource) {
+				if (kind == RecordSource || kind == RecordMergedSource) {
 					Source source;
 					source.stage                   = cursor.Get<uint32_t>();
 					const auto source_kind         = cursor.Get<uint8_t>();
@@ -250,6 +251,7 @@ void ShaderJournal::Load() {
 					source.static_state            = cursor.Words();
 					source.code                    = cursor.Words();
 					source.input_info              = cursor.Bytes();
+					if (kind == RecordMergedSource) source.back_code = cursor.Words();
 					source.code_size               = static_cast<uint32_t>(source.code.size());
 					if (!cursor.Ok() || source_kind > static_cast<uint8_t>(Kind::Compute)) break;
 					source.kind = static_cast<Kind>(source_kind);
@@ -295,6 +297,69 @@ void ShaderJournal::ReleaseLoaded() {
 	m_entries = {};
 }
 
+ShaderJournal::Appended ShaderJournal::AppendReplayOnly(std::vector<Source> sources, const std::vector<Entry>& entries) {
+	Appended appended;
+	// Loaded sources by identity, and the loaded entries.
+	std::unordered_multimap<uint64_t, uint32_t> loaded;
+	for (uint32_t i = 0; i < m_sources.size(); i++) loaded.emplace(SourceDigest(m_sources[i]), i);
+	std::unordered_set<uint64_t> loaded_entries;
+	for (const auto& entry: m_entries) {
+		loaded_entries.insert(EntryDigest(entry.source, entry.push_data_cursor, entry.specialization));
+	}
+	std::vector<uint32_t> index_of(sources.size(), UINT32_MAX);
+	for (size_t i = 0; i < sources.size(); i++) {
+		if (sources[i].code.empty() || sources[i].code.size() != sources[i].code_size) continue;
+		const auto digest = SourceDigest(sources[i]);
+		const auto range  = loaded.equal_range(digest);
+		for (auto it = range.first; it != range.second; ++it) {
+			if (SameIdentity(m_sources[it->second], sources[i])) {
+				index_of[i] = it->second;
+				break;
+			}
+		}
+	}
+	for (const auto& entry: entries) {
+		if (entry.source >= sources.size()) continue;
+		auto& index = index_of[entry.source];
+		if (index == UINT32_MAX) {
+			if (sources[entry.source].code.empty() || sources[entry.source].code.size() != sources[entry.source].code_size) {
+				continue;
+			}
+			index = static_cast<uint32_t>(m_sources.size());
+			loaded.emplace(SourceDigest(sources[entry.source]), index);
+			m_sources.push_back(std::move(sources[entry.source]));
+			appended.sources++;
+		}
+		if (!loaded_entries.insert(EntryDigest(index, entry.push_data_cursor, entry.specialization)).second) continue;
+		m_entries.push_back({index, entry.push_data_cursor, entry.specialization});
+		appended.entries++;
+	}
+	return appended;
+}
+
+namespace {
+
+// The identity bytes of a journal header (magic, format version, identity, XXH3-64 of the rest).
+bool ReadHeaderIdentity(const std::filesystem::path& path, const char (&magic)[8], uint32_t version,
+                        std::vector<uint8_t>& identity) {
+	std::ifstream in(path, std::ios::binary);
+	char          file_magic[8] {};
+	uint32_t      file_version = 0, size = 0;
+	if (!in.read(file_magic, 8) || std::memcmp(file_magic, magic, 8) != 0 ||
+	    !in.read(reinterpret_cast<char*>(&file_version), 4) || file_version != version ||
+	    !in.read(reinterpret_cast<char*>(&size), 4) || size > 1024 * 1024) {
+		return false;
+	}
+	identity.resize(size);
+	return size == 0 || static_cast<bool>(in.read(reinterpret_cast<char*>(identity.data()), size));
+}
+
+} // namespace
+
+bool ShaderJournal::ReadIdentity(const std::filesystem::path& path, std::vector<uint8_t>& identity) {
+	return ReadHeaderIdentity(path, FileMagic, FormatVersion, identity);
+}
+
 bool ShaderJournal::HasSource(const Source& identity) {
 	std::scoped_lock lock(m_mutex);
 	const auto       range = m_by_digest.equal_range(SourceDigest(identity));
@@ -330,7 +395,7 @@ void ShaderJournal::Record(Source source, uint32_t push_data_cursor,
 		id = m_next_source++;
 		m_known.push_back(IdentityOf(source));
 		m_by_digest.emplace(digest, id);
-		AppendRecord(records, RecordSource, encoded);
+		AppendRecord(records, source.back_code.empty() ? RecordSource : RecordMergedSource, encoded);
 		m_stats.recorded_sources++;
 	}
 	const auto entry_digest = EntryDigest(id, push_data_cursor, specialization);
@@ -430,7 +495,266 @@ ShaderJournal::Stats ShaderJournal::GetStats() {
 	return m_stats;
 }
 
+// PipelineJournal ----------------------------------------------------------------------------
+
+namespace {
+
+// Record: magic, payload size, key, XXH3-64 of key and payload, payload.
+constexpr size_t PipelineRecordHeaderBytes = 4 + 4 + 8 + 8;
+
+uint64_t PipelineRecordChecksum(uint64_t key, std::span<const uint8_t> payload) {
+	return XXH3_64bits_withSeed(payload.data(), payload.size(), key);
+}
+
+std::vector<uint8_t> BuildPipelineHeader(const std::vector<uint8_t>& identity) {
+	std::vector<uint8_t> header(PipelineJournal::FileMagic,
+	                            PipelineJournal::FileMagic + sizeof(PipelineJournal::FileMagic));
+	Put<uint32_t>(header, PipelineJournal::FormatVersion);
+	PutBytes(header, identity);
+	Put<uint64_t>(header, XXH3_64bits(header.data(), header.size()));
+	return header;
+}
+
+} // namespace
+
+PipelineJournal::PipelineJournal(Settings settings): m_settings(std::move(settings)) {
+	Load();
+	if (m_settings.background_writer) {
+		m_writer = std::thread([this] { RunWriter(); });
+	}
+}
+
+PipelineJournal::~PipelineJournal() {
+	{
+		std::scoped_lock lock(m_writer_mutex);
+		m_stop = true;
+	}
+	m_writer_cv.notify_all();
+	if (m_writer.joinable()) m_writer.join();
+	if (!m_settings.sealed_writes) Flush();
+}
+
+void PipelineJournal::Log(const std::string& message) const {
+	if (m_settings.log) m_settings.log(message);
+}
+
+void PipelineJournal::Load() {
+	if (m_settings.path.empty()) return; // in memory only
+	const auto           begin = NowNs();
+	std::vector<uint8_t> file;
+	std::error_code      error;
+	const auto           size = std::filesystem::file_size(m_settings.path, error);
+	if (!error) {
+		if (std::ifstream in(m_settings.path, std::ios::binary); in) {
+			file.resize(static_cast<size_t>(size));
+			if (!file.empty() &&
+			    !in.read(reinterpret_cast<char*>(file.data()), static_cast<std::streamsize>(file.size()))) {
+				file.clear();
+			}
+		}
+		m_stats.file_found = !file.empty();
+		m_stats.file_bytes = file.size();
+	}
+	if (!file.empty()) {
+		const auto header = BuildPipelineHeader(m_settings.identity);
+		if (file.size() < header.size() || std::memcmp(file.data(), header.data(), header.size()) != 0) {
+			m_stats.header_rejected = true;
+		} else {
+			size_t position = header.size();
+			while (file.size() - position >= PipelineRecordHeaderBytes) {
+				uint32_t magic = 0, payload_size = 0;
+				uint64_t key = 0, checksum = 0;
+				std::memcpy(&magic, file.data() + position, 4);
+				std::memcpy(&payload_size, file.data() + position + 4, 4);
+				std::memcpy(&key, file.data() + position + 8, 8);
+				std::memcpy(&checksum, file.data() + position + 16, 8);
+				if (magic != RecordMagic ||
+				    payload_size > file.size() - position - PipelineRecordHeaderBytes) {
+					break;
+				}
+				const std::span<const uint8_t> payload(file.data() + position + PipelineRecordHeaderBytes,
+				                                       payload_size);
+				if (PipelineRecordChecksum(key, payload) != checksum) break;
+				if (m_known.insert(key).second) {
+					m_loaded.push_back({key, std::vector<uint8_t>(payload.begin(), payload.end())});
+				}
+				position += PipelineRecordHeaderBytes + payload_size;
+			}
+			m_file_valid_bytes    = position;
+			m_stats.damaged_bytes = file.size() - position;
+		}
+	}
+	m_stats.loaded  = m_loaded.size();
+	m_file_bytes    = m_file_valid_bytes;
+	m_stats.load_ns = NowNs() - begin;
+	if (m_stats.header_rejected) {
+		Log(m_settings.path.string() + " is from another device, driver, salt or format and is replaced");
+	}
+}
+
+void PipelineJournal::ReleaseLoaded() {
+	m_loaded = {};
+}
+
+bool PipelineJournal::ReadIdentity(const std::filesystem::path& path, std::vector<uint8_t>& identity) {
+	return ReadHeaderIdentity(path, FileMagic, FormatVersion, identity);
+}
+
+bool PipelineJournal::Contains(uint64_t key) const {
+	std::scoped_lock lock(m_mutex);
+	return m_known.contains(key);
+}
+
+size_t PipelineJournal::KnownCount() const {
+	std::scoped_lock lock(m_mutex);
+	return m_known.size();
+}
+
+bool PipelineJournal::Add(uint64_t key, std::span<const uint8_t> payload) {
+	std::scoped_lock lock(m_mutex);
+	if (m_known.contains(key)) return false;
+	const auto bytes = PipelineRecordHeaderBytes + payload.size();
+	if (m_file_bytes + m_pending_bytes + bytes + 64 > m_settings.max_file_bytes) {
+		m_stats.over_capacity = true;
+		return false;
+	}
+	m_known.insert(key);
+	std::vector<uint8_t> record;
+	record.reserve(bytes);
+	Put<uint32_t>(record, RecordMagic);
+	Put<uint32_t>(record, static_cast<uint32_t>(payload.size()));
+	Put<uint64_t>(record, key);
+	Put<uint64_t>(record, PipelineRecordChecksum(key, payload));
+	record.insert(record.end(), payload.begin(), payload.end());
+	m_pending_bytes += record.size();
+	m_pending.push_back(std::move(record));
+	m_stats.recorded++;
+	return true;
+}
+
+void PipelineJournal::Reset() {
+	std::scoped_lock write_lock(m_write_mutex);
+	std::scoped_lock lock(m_mutex);
+	m_known.clear();
+	m_pending.clear();
+	m_pending_bytes = 0;
+	m_sealed        = 0;
+	m_stats.reset   = true;
+	if (m_settings.path.empty()) return;
+	// The stale keys leave the file now, not at the next write (there may be none).
+	std::error_code error;
+	if (!m_settings.path.parent_path().empty()) {
+		std::filesystem::create_directories(m_settings.path.parent_path(), error);
+	}
+	std::ofstream out(m_settings.path, std::ios::binary | std::ios::trunc);
+	const auto    header = BuildPipelineHeader(m_settings.identity);
+	out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+	out.flush();
+	m_file_ready       = static_cast<bool>(out);
+	m_file_valid_bytes = m_file_ready ? header.size() : 0;
+	m_file_bytes       = m_file_valid_bytes;
+}
+
+void PipelineJournal::Seal() {
+	std::scoped_lock lock(m_mutex);
+	m_sealed = m_pending.size();
+}
+
+bool PipelineJournal::AppendPending() {
+	std::scoped_lock                  write_lock(m_write_mutex);
+	std::vector<std::vector<uint8_t>> batch;
+	uint64_t                          batch_bytes = 0;
+	{
+		std::scoped_lock lock(m_mutex);
+		const auto count = m_settings.sealed_writes ? m_sealed : m_pending.size();
+		if (count == 0) return true;
+		if (m_settings.path.empty()) { // in memory only: nothing to write
+			m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(count));
+			m_pending_bytes = 0;
+			for (const auto& record: m_pending) m_pending_bytes += record.size();
+			m_sealed = 0;
+			return true;
+		}
+		batch.assign(std::make_move_iterator(m_pending.begin()),
+		             std::make_move_iterator(m_pending.begin() + static_cast<std::ptrdiff_t>(count)));
+		m_pending.erase(m_pending.begin(), m_pending.begin() + static_cast<std::ptrdiff_t>(count));
+		m_sealed = 0;
+		for (const auto& record: batch) batch_bytes += record.size();
+		m_pending_bytes -= batch_bytes;
+	}
+	bool            ok = true;
+	std::error_code error;
+	if (!m_file_ready) {
+		if (!m_settings.path.parent_path().empty()) {
+			std::filesystem::create_directories(m_settings.path.parent_path(), error);
+		}
+		if (m_file_valid_bytes != 0) {
+			std::filesystem::resize_file(m_settings.path, m_file_valid_bytes, error);
+			ok = !error;
+		} else {
+			std::ofstream out(m_settings.path, std::ios::binary | std::ios::trunc);
+			const auto    header = BuildPipelineHeader(m_settings.identity);
+			out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+			out.flush();
+			ok = static_cast<bool>(out);
+			if (ok) {
+				m_file_valid_bytes = header.size();
+				std::scoped_lock lock(m_mutex);
+				m_file_bytes = std::max<uint64_t>(m_file_bytes, header.size());
+			}
+		}
+		m_file_ready = ok;
+	}
+	if (ok) {
+		std::ofstream out(m_settings.path, std::ios::binary | std::ios::app);
+		for (const auto& record: batch) {
+			out.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size()));
+		}
+		out.flush();
+		ok = static_cast<bool>(out);
+	}
+	std::scoped_lock lock(m_mutex);
+	if (ok) {
+		m_stats.written_bytes += batch_bytes;
+		m_file_bytes += batch_bytes;
+	} else {
+		m_stats.write_failures++;
+		const auto restored = batch.size();
+		m_pending.insert(m_pending.begin(), std::make_move_iterator(batch.begin()),
+		                 std::make_move_iterator(batch.end()));
+		m_pending_bytes += batch_bytes;
+		if (m_settings.sealed_writes) m_sealed += restored;
+	}
+	return ok;
+}
+
+bool PipelineJournal::Flush() {
+	return AppendPending();
+}
+
+void PipelineJournal::RunWriter() {
+	std::unique_lock lock(m_writer_mutex);
+	while (!m_stop) {
+		m_writer_cv.wait_for(lock, std::chrono::nanoseconds(m_settings.flush_interval_ns), [this] { return m_stop; });
+		if (m_stop) break;
+		lock.unlock();
+		AppendPending();
+		lock.lock();
+	}
+}
+
+PipelineJournal::Stats PipelineJournal::GetStats() const {
+	std::scoped_lock lock(m_mutex);
+	return m_stats;
+}
+
 // ShaderPrecompiler --------------------------------------------------------------------------
+
+void LowerCurrentThreadPriority() {
+#if defined(_WIN32)
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
 
 ShaderPrecompiler::ShaderPrecompiler(const ShaderJournal& journal, Settings settings, CompileFn compile)
     : m_journal(journal), m_settings(std::move(settings)), m_compile(std::move(compile)) {

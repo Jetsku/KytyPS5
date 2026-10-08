@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -60,15 +61,30 @@ struct GraphicContext;
 // renderer uses (pipeline/shaders.cpp). The copy owns everything it points to and does not move.
 class GraphicsPipelineSnapshot {
 public:
-	// Null when `info` uses anything the copy does not reproduce exactly.
+	// Null when `info` uses anything the copy does not reproduce exactly. allow_mesh also copies
+	// mesh-shader pipelines (no vertex input; stages may require their subgroup size), which the
+	// library path cannot link.
 	[[nodiscard]] static std::unique_ptr<GraphicsPipelineSnapshot>
-	Capture(const vk::GraphicsPipelineCreateInfo& info);
+	Capture(const vk::GraphicsPipelineCreateInfo& info, bool allow_mesh = false);
 
 	GraphicsPipelineSnapshot(const GraphicsPipelineSnapshot&)            = delete;
 	GraphicsPipelineSnapshot& operator=(const GraphicsPipelineSnapshot&) = delete;
 
 	// The monolithic create info, pointing into this object.
 	[[nodiscard]] const vk::GraphicsPipelineCreateInfo& Info() const { return m_create; }
+
+	// Every field of the create info as words, with each shader module replaced by `module_hash`
+	// of it and without the layout (KYTY_PIPELINE_KNOWN and KYTY_PIPELINE_JOURNAL key pipelines by
+	// this plus the layout signature). False when a module has no hash (0).
+	using ModuleHashFn = std::function<uint64_t(vk::ShaderModule)>;
+	[[nodiscard]] bool Serialize(std::vector<uint32_t>& out, const ModuleHashFn& module_hash) const;
+	// The snapshot Serialize wrote, with the modules `module_for` gives for the hashes and `layout`.
+	// Null when the words are malformed or a module is missing (null).
+	using ModuleLookupFn = std::function<vk::ShaderModule(uint64_t)>;
+	[[nodiscard]] static std::unique_ptr<GraphicsPipelineSnapshot>
+	Deserialize(std::span<const uint32_t> words, const ModuleLookupFn& module_for, vk::PipelineLayout layout);
+	// The module hashes Serialize wrote (vertex first), without looking modules up.
+	[[nodiscard]] static std::vector<uint64_t> SerializedModules(std::span<const uint32_t> words);
 
 private:
 	friend class GraphicsPipelineLibrary;
@@ -80,6 +96,8 @@ private:
 	std::vector<vk::Format>                                    m_color_formats;
 	std::vector<vk::PipelineShaderStageCreateInfo>             m_stages;
 	std::vector<std::string>                                   m_stage_names;
+	std::vector<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo> m_stage_subgroups; // 0: none
+	bool                                                       m_mesh = false;
 	vk::PipelineVertexInputStateCreateInfo                     m_vertex_input {};
 	std::vector<vk::VertexInputBindingDescription>             m_bindings;
 	std::vector<vk::VertexInputAttributeDescription>           m_attributes;
