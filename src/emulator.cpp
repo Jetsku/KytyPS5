@@ -11,6 +11,7 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -190,6 +191,9 @@ void Run(const RunOptions& options) {
 	}
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
+	// The renderer, created during Init before /app0 is mounted, reads shader code from it
+	// (KYTY_PIPELINE_LIST).
+	Libs::Graphics::SetPipelineListExecutable(options.app0_dir / options.elf.filename());
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 

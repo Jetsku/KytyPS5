@@ -106,6 +106,18 @@ public:
 	// Frees Sources() and Entries() (after the replay is done; nothing may use them then).
 	void ReleaseLoaded();
 
+	// Adds sources and entries (entry.source indexes `sources`) to what the replay reads, after the
+	// loaded ones, without journaling them (KYTY_PIPELINE_LIST): a source with a loaded source's
+	// identity and an entry equal to a loaded one are not added again. Before the replay starts.
+	struct Appended {
+		uint64_t sources = 0, entries = 0;
+	};
+	Appended AppendReplayOnly(std::vector<Source> sources, const std::vector<Entry>& entries);
+
+	// The identity in a journal file's header (tools: kyty_pipeline_list reads journals of any
+	// device). False when the file is not a shader journal.
+	[[nodiscard]] static bool ReadIdentity(const std::filesystem::path& path, std::vector<uint8_t>& identity);
+
 	// Whether a source with this identity is journaled already (loaded or recorded this run); the
 	// caller then needs not fill code and input_info.
 	[[nodiscard]] bool HasSource(const Source& identity);
@@ -217,6 +229,8 @@ public:
 
 	[[nodiscard]] Stats GetStats() const;
 	[[nodiscard]] size_t KnownCount() const;
+	// The identity in a pipeline journal file's header (tools). False when it is not one.
+	[[nodiscard]] static bool ReadIdentity(const std::filesystem::path& path, std::vector<uint8_t>& identity);
 	[[nodiscard]] const std::filesystem::path& Path() const { return m_settings.path; }
 
 private:

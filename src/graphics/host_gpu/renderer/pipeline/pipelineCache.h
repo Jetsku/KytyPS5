@@ -391,13 +391,17 @@ private:
 	// The driver cache started from a file (not empty).
 	bool                          m_driver_cache_loaded = false;
 	// Keys of pipelines the driver cache holds (KYTY_PIPELINE_KNOWN, written with the driver cache
-	// file; in memory only when just KYTY_PIPELINE_JOURNAL is on); null when both are off.
+	// file; in memory only when just KYTY_PIPELINE_JOURNAL or KYTY_PIPELINE_LIST is on); null when all
+	// are off.
 	std::unique_ptr<PipelineJournal> m_known;
 	// The graphics pipelines the game needed in earlier runs, by content key (KYTY_PIPELINE_JOURNAL);
 	// recorded as they are created and rebuilt on background threads at start-up. Null when off.
 	std::unique_ptr<PipelineJournal> m_journal;
 	struct JournalReplay;
 	std::unique_ptr<JournalReplay> m_journal_replay;
+	// The loaded pipeline list (KYTY_PIPELINE_LIST) until the replays take its content; null when off.
+	struct ListState;
+	std::unique_ptr<ListState> m_list;
 	// Background builds of every replayed compute program's pipeline (KYTY_PIPELINE_PREWARM_COMPUTE).
 	struct ComputePrewarm;
 	std::unique_ptr<ComputePrewarm> m_compute_prewarm;
@@ -447,7 +451,10 @@ private:
 
 	void InitializeDriverCache();
 	void InitializeKnownPipelines();
+	void InitializePipelineList();
 	void InitializePipelineJournal();
+	// KYTY_PIPELINE_LIST_PREPARE: builds the list's shaders and pipelines, saves and ends the process.
+	[[noreturn]] void RunListPrepare();
 	// Stops the journal replay and the compute prewarm (before the shader replay and the program
 	// cache they use go).
 	void StopBackgroundPipelines();

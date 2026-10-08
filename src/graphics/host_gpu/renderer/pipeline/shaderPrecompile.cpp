@@ -295,6 +295,69 @@ void ShaderJournal::ReleaseLoaded() {
 	m_entries = {};
 }
 
+ShaderJournal::Appended ShaderJournal::AppendReplayOnly(std::vector<Source> sources, const std::vector<Entry>& entries) {
+	Appended appended;
+	// Loaded sources by identity, and the loaded entries.
+	std::unordered_multimap<uint64_t, uint32_t> loaded;
+	for (uint32_t i = 0; i < m_sources.size(); i++) loaded.emplace(SourceDigest(m_sources[i]), i);
+	std::unordered_set<uint64_t> loaded_entries;
+	for (const auto& entry: m_entries) {
+		loaded_entries.insert(EntryDigest(entry.source, entry.push_data_cursor, entry.specialization));
+	}
+	std::vector<uint32_t> index_of(sources.size(), UINT32_MAX);
+	for (size_t i = 0; i < sources.size(); i++) {
+		if (sources[i].code.empty() || sources[i].code.size() != sources[i].code_size) continue;
+		const auto digest = SourceDigest(sources[i]);
+		const auto range  = loaded.equal_range(digest);
+		for (auto it = range.first; it != range.second; ++it) {
+			if (SameIdentity(m_sources[it->second], sources[i])) {
+				index_of[i] = it->second;
+				break;
+			}
+		}
+	}
+	for (const auto& entry: entries) {
+		if (entry.source >= sources.size()) continue;
+		auto& index = index_of[entry.source];
+		if (index == UINT32_MAX) {
+			if (sources[entry.source].code.empty() || sources[entry.source].code.size() != sources[entry.source].code_size) {
+				continue;
+			}
+			index = static_cast<uint32_t>(m_sources.size());
+			loaded.emplace(SourceDigest(sources[entry.source]), index);
+			m_sources.push_back(std::move(sources[entry.source]));
+			appended.sources++;
+		}
+		if (!loaded_entries.insert(EntryDigest(index, entry.push_data_cursor, entry.specialization)).second) continue;
+		m_entries.push_back({index, entry.push_data_cursor, entry.specialization});
+		appended.entries++;
+	}
+	return appended;
+}
+
+namespace {
+
+// The identity bytes of a journal header (magic, format version, identity, XXH3-64 of the rest).
+bool ReadHeaderIdentity(const std::filesystem::path& path, const char (&magic)[8], uint32_t version,
+                        std::vector<uint8_t>& identity) {
+	std::ifstream in(path, std::ios::binary);
+	char          file_magic[8] {};
+	uint32_t      file_version = 0, size = 0;
+	if (!in.read(file_magic, 8) || std::memcmp(file_magic, magic, 8) != 0 ||
+	    !in.read(reinterpret_cast<char*>(&file_version), 4) || file_version != version ||
+	    !in.read(reinterpret_cast<char*>(&size), 4) || size > 1024 * 1024) {
+		return false;
+	}
+	identity.resize(size);
+	return size == 0 || static_cast<bool>(in.read(reinterpret_cast<char*>(identity.data()), size));
+}
+
+} // namespace
+
+bool ShaderJournal::ReadIdentity(const std::filesystem::path& path, std::vector<uint8_t>& identity) {
+	return ReadHeaderIdentity(path, FileMagic, FormatVersion, identity);
+}
+
 bool ShaderJournal::HasSource(const Source& identity) {
 	std::scoped_lock lock(m_mutex);
 	const auto       range = m_by_digest.equal_range(SourceDigest(identity));
@@ -529,6 +592,10 @@ void PipelineJournal::Load() {
 
 void PipelineJournal::ReleaseLoaded() {
 	m_loaded = {};
+}
+
+bool PipelineJournal::ReadIdentity(const std::filesystem::path& path, std::vector<uint8_t>& identity) {
+	return ReadHeaderIdentity(path, FileMagic, FormatVersion, identity);
 }
 
 bool PipelineJournal::Contains(uint64_t key) const {
