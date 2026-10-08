@@ -4095,6 +4095,7 @@ struct PipelineCache::RtState {
 	// inside the driver unwinds past this frame (Common::CallCatchingStructuredException).
 	static void BuildSafely(void* raw) {
 		auto& context = *static_cast<BuildContext*>(raw);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 		try {
 			context.built->pipeline = std::make_unique<Pipeline>();
 			CreatePipelineInternal(context.cache->m_graphics, *context.built->pipeline, *context.info,
@@ -4107,6 +4108,12 @@ struct PipelineCache::RtState {
 			context.built->error = "unknown exception";
 			context.result       = vk::Result::eErrorUnknown;
 		}
+#else
+		// Builds without exceptions (the Linux build): failures come back in context.result.
+		context.built->pipeline = std::make_unique<Pipeline>();
+		CreatePipelineInternal(context.cache->m_graphics, *context.built->pipeline, *context.info, context.module,
+		                       context.cache->m_driver_cache, nullptr, &context.result);
+#endif
 	}
 
 	static const ShaderRecompiler::IR::ResourceSnapshot& EmptyResources() {
