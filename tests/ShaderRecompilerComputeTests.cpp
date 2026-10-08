@@ -7753,12 +7753,20 @@ public:
     cache.ReadMemory(base + offset, 4);
     Require(name, "newer value", backing() == 0x0badf00du,
             "the read after the newer writer did not return its bytes");
-    // KYTY_READBACK_SIDE_WRITES: a guest write fault on the GPU-owned page (the tracker's flush
-    // callback, ReadMemory with is_write) is a side copy that leaves the page clean; the second
-    // fault (InvalidateMemory as a write fault) makes it CPU-dirty.
+    // KYTY_READBACK_SIDE_WRITES: a write fault the exception handler retries (the tracker's flush
+    // callback, ReadMemory with is_write and retried_write) is a side copy that leaves the page
+    // clean; the second fault (InvalidateMemory as a write fault) makes it CPU-dirty. Without a
+    // retry (an emulator write reported to the caches) the write still drains.
+    gpu_write(0x1badf00du);
+    const auto drain_copies = BufferCache::ReadbackSideWriteCopies();
+    cache.ReadMemory(base + offset, 4, true);
+    Require(name, "write without retry", BufferCache::ReadbackSideWriteCopies() == drain_copies &&
+                                              cache.IsRegionCpuModified(page, 0x1000) &&
+                                              backing() == 0x1badf00du,
+            "a write without a second fault did not drain to a CPU-dirty page");
     gpu_write(0x600df00du);
     const auto write_copies = BufferCache::ReadbackSideWriteCopies();
-    cache.ReadMemory(base + offset, 4, true);
+    cache.ReadMemory(base + offset, 4, true, true);
     Require(name, "write side copy", BufferCache::ReadbackSideWriteCopies() == write_copies + 1,
             "the write fault was not served by a side copy");
     Require(name, "write value", backing() == 0x600df00du,

@@ -1149,6 +1149,22 @@ void SetFaultInstruction(uint64_t rip) noexcept {
 	t_fault_rip = rip;
 }
 
+namespace {
+thread_local bool t_retried_fault = false;
+} // namespace
+
+RetriedFaultScope::RetriedFaultScope() noexcept: m_previous(t_retried_fault) {
+	t_retried_fault = true;
+}
+
+RetriedFaultScope::~RetriedFaultScope() {
+	t_retried_fault = m_previous;
+}
+
+bool InRetriedFault() noexcept {
+	return t_retried_fault;
+}
+
 void MapInFault(bool inside) noexcept {
 	t_in_fault = inside;
 }

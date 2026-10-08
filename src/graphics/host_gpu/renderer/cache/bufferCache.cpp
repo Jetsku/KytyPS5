@@ -247,28 +247,32 @@ Live::Switch g_readback_merge_gap("KYTY_READBACK_MERGE_GAP_KB", [](const char* v
 	       1024;
 });
 
-// KYTY_READBACK_FLUSH_SIDE (live, default 0): a guest-thread read of GPU-written bytes that the
-// unsubmitted recording wrote (or that an address-writing shader in it may have written) is served
-// by a side copy instead of a drain. The command processor submits the recording (the drain
-// submits it as well), which makes those bytes ones an already submitted recording wrote, issues
-// the side copy that waits for it on the GPU, and returns; the guest thread then waits for the
-// copy's publication, as for any side readback, while the command processor continues. The bytes,
-// their publication and the protection rules are the side path's; only the command processor no
-// longer waits for the GPU to finish everything queued before it serves the next op.
+// KYTY_READBACK_FLUSH_SIDE (live, default 0; =1 on): a guest-thread read of
+// GPU-written bytes that the unsubmitted recording wrote (or that an address-writing shader in it
+// may have written) is served by a side copy instead of a drain. The command processor submits the
+// recording (the drain submits it as well), which makes those bytes ones an already submitted
+// recording wrote, issues the side copy that waits for it on the GPU, and returns; the guest thread
+// then waits for the copy's publication, as for any side readback, while the command processor
+// continues. The bytes, their publication and the protection rules are the side path's; only the
+// command processor no longer waits for the GPU to finish everything queued before it serves the
+// next op.
 Live::Switch g_readback_flush_side("KYTY_READBACK_FLUSH_SIDE", Live::ParseDefaultOff);
 std::atomic<uint64_t> g_readback_flush_side_copies {0};
 
-// KYTY_READBACK_SIDE_WRITES (live, default 0): a guest write fault on a GPU-owned page (from a
-// guest thread) takes the side path as well, instead of a drain. The command processor issues the
-// side copy of the page's GPU-written bytes (submitting the current recording first when it wrote
-// them, as KYTY_READBACK_FLUSH_SIDE does for reads) and returns; the faulting thread waits for the
-// copy's publication, which leaves the page clean and write-protected, and returns from the fault
-// without the CPU-dirty transition. The write then faults once more, now on a clean page, and that
-// fault makes the page CPU-dirty and writable on the faulting thread, as any write fault does
-// (a GPU writer recorded meanwhile makes it GPU-owned again: the second fault starts over). The
-// drain made the page CPU-dirty on the command processor right after waiting for the GPU; the
-// bytes the write sees and the order against newer writers are the same.
-Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOff);
+// KYTY_READBACK_SIDE_WRITES (live, default on; =0 drains as before): a write fault on a GPU-owned
+// page, taken by the exception handler on a thread other than the command processor (so that the
+// faulting instruction runs again), takes the side path as well, instead of a drain. The command
+// processor issues the side copy of the page's GPU-written bytes (submitting the current recording
+// first when it wrote them, as KYTY_READBACK_FLUSH_SIDE does for reads) and returns; the faulting
+// thread waits for the copy's publication, which leaves the page clean and write-protected, and
+// returns from the fault without the CPU-dirty transition. The write then faults once more, now on
+// a clean page, and that fault makes the page CPU-dirty and writable on the faulting thread, as any
+// write fault does (a GPU writer recorded meanwhile makes it GPU-owned again: the second fault
+// starts over). The drain made the page CPU-dirty on the command processor right after waiting for
+// the GPU; the bytes the write sees and the order against newer writers are the same. Other
+// CPU-dirty transitions (emulator writes reported through InvalidateMemory, direct HandleFault
+// calls) still drain: nothing faults again after them.
+Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOn);
 std::atomic<uint64_t> g_readback_side_writes_copies {0};
 
 // The number of regions copies (source ascending) give when a copy starting at most `gap` bytes
@@ -1408,10 +1412,14 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 		m_memory_tracker.InvalidateRegion(vaddr, size, flush);
 		return;
 	}
+	// KYTY_READBACK_SIDE_WRITES: only a fault taken by the exception handler is retried.
+	const auto fault_flush = [this, vaddr, size] {
+		ReadMemory(vaddr, size, true, FaultCost::InRetriedFault());
+	};
 	// Pages fault-ahead opens take writes without faulting: forget their fills first, exactly as
 	// for the faulting range (never GPU-dirty pages, so fills of GPU-owned ranges survive).
 	m_memory_tracker.InvalidateRegionOnWriteFault(
-	    vaddr, size, flush,
+	    vaddr, size, fault_flush,
 	    [this](uint64_t address, uint64_t bytes) noexcept { ForgetKnownFills(address, bytes); });
 }
 
@@ -1588,7 +1596,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool retried_write) {
 	HangWatchdog::Scope       read("buffer-readback", vaddr, size, 0, 0, is_write);
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ReadMemory);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -1623,7 +1631,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// for the producing recording, not for the current one, and the current recording is neither
 	// split nor submitted.
 	const bool gpu_thread = GuestGpu::IsGpuThread();
-	const bool side_write = is_write && !gpu_thread && m_side != nullptr && g_readback_side_writes.On();
+	const bool side_write = is_write && retried_write && !gpu_thread && m_side != nullptr &&
+	                        g_readback_side_writes.On();
 	const bool side_path  = m_side != nullptr && (!is_write || side_write) &&
 	                       (!gpu_thread || SideReadbackGpuThreadEnabled());
 	if (OverlapsPendingSideReadback(page_begin, page_end)) {

@@ -144,6 +144,20 @@ using ThreadDescriber = int (*)(char* name, uint64_t size);
 void SetThreadDescriber(ThreadDescriber describer) noexcept;
 // The faulting instruction of the fault the calling thread is resolving (host exception handler).
 void SetFaultInstruction(uint64_t rip) noexcept;
+// The calling thread resolves a host exception in the exception handler: the faulting instruction
+// runs again when the handler returns, so a write that leaves its page protected faults once more
+// (KYTY_READBACK_SIDE_WRITES relies on that second fault). Direct HandleFault calls are not.
+class RetriedFaultScope {
+public:
+	RetriedFaultScope() noexcept;
+	~RetriedFaultScope();
+	RetriedFaultScope(const RetriedFaultScope&)            = delete;
+	RetriedFaultScope& operator=(const RetriedFaultScope&) = delete;
+
+private:
+	bool m_previous = false;
+};
+[[nodiscard]] bool InRetriedFault() noexcept;
 enum class Part : uint8_t { Buffer = 0, Texture = 1, Reconcile = 2, Count = 3 };
 struct FaultRecord {
 	uint64_t address     = 0;
