@@ -44,6 +44,9 @@ inline constexpr uint32_t PipelineJournalPayloadMagic = 0x314a4c50u; // "PLJ1"
                                            uint32_t push_data_cursor, std::span<const uint32_t> static_state,
                                            std::span<const uint8_t> specialization);
 [[nodiscard]] uint64_t PermutationIdentity(const ShaderJournal::Source& source, const ShaderJournal::Entry& entry);
+// A program source's guest hash from its code: XXH3-64 of the code, or for a merged stage the XXH3-64
+// of the two halves' XXH3-64 hashes (shader.cpp, the NGG GS front and back halves).
+[[nodiscard]] uint64_t MergedSourceHash(std::span<const uint32_t> code, std::span<const uint32_t> back_code);
 inline constexpr uint64_t PlainModuleIdentitySalt = 0x9E3779B97F4A7C15ull;
 
 // KYPLST1: a shareable, keys-only list of the pipelines a game needs (KYTY_PIPELINE_LIST,
@@ -70,7 +73,7 @@ void                                SetPipelineListExecutable(const std::filesys
 namespace PipelineList {
 
 inline constexpr char     FileMagic[8]  = {'K', 'Y', 'P', 'L', 'S', 'T', '1', '\0'};
-inline constexpr uint32_t FormatVersion = 1;
+inline constexpr uint32_t FormatVersion = 2;
 
 enum class SectionId : uint32_t {
 	Info         = 1,
@@ -101,6 +104,10 @@ struct Shader {
 	uint32_t code_size = 0; // words
 	uint64_t code_hash_low = 0, code_hash_high = 0; // XXH3-128 of the code bytes
 	uint64_t prefix_hash = 0; // XXH3-64 of the first min(64, size) code bytes (relocation search)
+	// A merged stage's back half (Source::back_code), located the same way; size 0: none.
+	uint64_t back_offset    = 0;
+	uint32_t back_code_size = 0; // words
+	uint64_t back_hash_low = 0, back_hash_high = 0, back_prefix_hash = 0;
 	// The program source identity (ShaderJournal::Source; `hash` is the XXH3-64 of the code bytes).
 	uint32_t              stage                   = 0;
 	ShaderJournal::Kind   kind                    = ShaderJournal::Kind::Vertex;

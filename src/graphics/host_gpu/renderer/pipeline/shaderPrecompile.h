@@ -67,6 +67,9 @@ public:
 		std::vector<uint32_t> code;
 		// The stage input info struct, bytes as in memory, with its runtime pointers cleared.
 		std::vector<uint8_t>  input_info;
+		// A merged stage's second half (the NGG GS back half of a mesh program; empty otherwise):
+		// `hash` is then the XXH3-64 of the two halves' code hashes.
+		std::vector<uint32_t> back_code;
 	};
 	struct Entry {
 		uint32_t             source = 0; // index into Sources()
@@ -92,6 +95,9 @@ public:
 	static constexpr uint32_t RecordMagic   = 0x524a484bu; // "KHJR"
 	static constexpr uint32_t RecordSource  = 1;
 	static constexpr uint32_t RecordEntry   = 2;
+	// A source with a back half (Source::back_code). Builds without it stop reading the file there
+	// (and drop the rest on their next write).
+	static constexpr uint32_t RecordMergedSource = 3;
 
 	explicit ShaderJournal(Settings settings);
 	// Writes pending records.

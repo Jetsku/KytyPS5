@@ -122,6 +122,7 @@ std::vector<uint8_t> EncodeSource(const ShaderJournal::Source& source) {
 	PutWords(payload, source.static_state);
 	PutWords(payload, source.code);
 	PutBytes(payload, source.input_info);
+	if (!source.back_code.empty()) PutWords(payload, source.back_code);
 	return payload;
 }
 
@@ -238,7 +239,7 @@ void ShaderJournal::Load() {
 				                                       static_cast<size_t>(payload_size));
 				if (XXH3_64bits(payload.data(), payload.size()) != checksum) break;
 				Cursor cursor(payload);
-				if (kind == RecordSource) {
+				if (kind == RecordSource || kind == RecordMergedSource) {
 					Source source;
 					source.stage                   = cursor.Get<uint32_t>();
 					const auto source_kind         = cursor.Get<uint8_t>();
@@ -250,6 +251,7 @@ void ShaderJournal::Load() {
 					source.static_state            = cursor.Words();
 					source.code                    = cursor.Words();
 					source.input_info              = cursor.Bytes();
+					if (kind == RecordMergedSource) source.back_code = cursor.Words();
 					source.code_size               = static_cast<uint32_t>(source.code.size());
 					if (!cursor.Ok() || source_kind > static_cast<uint8_t>(Kind::Compute)) break;
 					source.kind = static_cast<Kind>(source_kind);
@@ -393,7 +395,7 @@ void ShaderJournal::Record(Source source, uint32_t push_data_cursor,
 		id = m_next_source++;
 		m_known.push_back(IdentityOf(source));
 		m_by_digest.emplace(digest, id);
-		AppendRecord(records, RecordSource, encoded);
+		AppendRecord(records, source.back_code.empty() ? RecordSource : RecordMergedSource, encoded);
 		m_stats.recorded_sources++;
 	}
 	const auto entry_digest = EntryDigest(id, push_data_cursor, specialization);

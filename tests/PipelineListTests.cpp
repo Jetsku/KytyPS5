@@ -353,6 +353,75 @@ void TestResolve() {
 	}
 }
 
+// A merged stage (NGG mesh program: GS front half and back half): both halves are located,
+// resolved and checked, and the shader journal keeps the back half.
+void TestMergedStage() {
+	auto source      = SourceOf(Code(11, 160), ShaderJournal::Kind::Vertex, 5, InputSizes[0]);
+	source.back_code = Code(12, 96);
+	source.hash      = MergedSourceHash(source.code, source.back_code);
+	ShaderJournal::Source back_only;
+	back_only.code = source.back_code;
+	std::vector<uint64_t> offsets;
+	const auto            image = Image({source, back_only}, offsets);
+	const std::vector<ShaderJournal::Entry> entries = {{0, 0, {4}}};
+
+	PipelineList::Builder     builder(TestInfo());
+	PipelineList::ExportStats stats;
+	builder.AddJournals({source}, entries, {}, LocatorFor(image), stats);
+	const auto file = builder.Finish();
+	CHECK(file.shaders.size() == 1 && file.shaders[0].offset == offsets[0] && file.shaders[0].back_offset == offsets[1] &&
+	      file.shaders[0].back_code_size == 96);
+	PipelineList::File decoded;
+	CHECK(PipelineList::Decode(PipelineList::Encode(file), decoded) && decoded.shaders.size() == 1 &&
+	      decoded.shaders[0].back_hash_high == file.shaders[0].back_hash_high);
+	{
+		PipelineList::ResolveStats rs;
+		const auto resolved = PipelineList::Resolve(decoded, InputSizes, ReaderFor(image), {}, rs);
+		CHECK(rs.resolved == 1 && resolved.sources[0].back_code == source.back_code && resolved.sources[0].code == source.code);
+		CHECK(!resolved.entries.empty() &&
+		      PermutationIdentity(resolved.sources[0], resolved.entries[0]) == PermutationIdentity(source, entries[0]));
+	}
+	{
+		auto changed = image;
+		changed[offsets[1] + 8] ^= 2; // the back half differs
+		PipelineList::ResolveStats rs;
+		const auto resolved = PipelineList::Resolve(decoded, InputSizes, ReaderFor(changed),
+		                                            [&](PipelineList::CodeFile) { return changed; }, rs);
+		CHECK(rs.resolved == 0 && rs.mismatched == 1 && !resolved.usable[0] && resolved.entries.empty());
+	}
+	// Without the back half in the executable the source is not exported.
+	{
+		std::vector<uint64_t>     front_offsets;
+		const auto                front_only = Image({source}, front_offsets);
+		PipelineList::Builder     b(TestInfo());
+		PipelineList::ExportStats s;
+		b.AddJournals({source}, entries, {}, LocatorFor(front_only), s);
+		CHECK(s.sources_unlocated == 1 && b.Finish().shaders.empty());
+	}
+	// The shader journal file keeps the back half.
+	const auto path = std::filesystem::temp_directory_path() / "pipeline-list-tests.shaders.journal";
+	std::filesystem::remove(path);
+	{
+		ShaderJournal::Settings settings;
+		settings.path              = path;
+		settings.identity          = {1, 2, 3};
+		settings.background_writer = false;
+		ShaderJournal journal(std::move(settings));
+		journal.Record(source, 0, entries[0].specialization);
+		CHECK(journal.Flush());
+	}
+	{
+		ShaderJournal::Settings settings;
+		settings.path              = path;
+		settings.identity          = {1, 2, 3};
+		settings.background_writer = false;
+		ShaderJournal journal(std::move(settings));
+		CHECK(journal.Sources().size() == 1 && journal.Sources()[0].back_code == source.back_code &&
+		      journal.Sources()[0].code == source.code && journal.Entries().size() == 1);
+	}
+	std::filesystem::remove(path);
+}
+
 void TestMerge() {
 	// Two recording runs: the same shaders, one pipeline state shared, other levels.
 	auto                  a = MakeRecording("level_a", vk::PrimitiveTopology::eTriangleList);
@@ -438,6 +507,7 @@ void TestRewrite() {
 int main() {
 	TestExportAndRoundTrip();
 	TestResolve();
+	TestMergedStage();
 	TestMerge();
 	TestReplayInput();
 	TestRewrite();

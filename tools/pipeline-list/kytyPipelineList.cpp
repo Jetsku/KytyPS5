@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -130,10 +131,12 @@ int Export(const Arguments& args) {
 	std::printf("%s %s, executable %zu bytes\n", info.title_id.c_str(), info.app_version.c_str(), image.size());
 	// The journals; every source's code located in one pass over the executable.
 	struct Run {
-		std::unique_ptr<ShaderJournal>   shaders;
+		std::shared_ptr<ShaderJournal>   shaders;
 		std::unique_ptr<PipelineJournal> pipelines;
 	};
 	std::vector<Run> runs;
+	// A shader journal named in several pairs (one per level's pipeline journal) is loaded once.
+	std::map<std::string, std::shared_ptr<ShaderJournal>> loaded_shaders;
 	bool             have_sizes = false;
 	for (size_t i = 0; i < args.shaders.size(); i++) {
 		std::vector<uint8_t> shader_identity, pipeline_identity;
@@ -154,11 +157,15 @@ int Export(const Arguments& args) {
 		info.input_info_sizes = sizes;
 		have_sizes            = true;
 		Run run;
-		ShaderJournal::Settings shader_settings;
-		shader_settings.path              = args.shaders[i];
-		shader_settings.identity          = shader_identity;
-		shader_settings.background_writer = false;
-		run.shaders                       = std::make_unique<ShaderJournal>(std::move(shader_settings));
+		auto& shared = loaded_shaders[args.shaders[i]];
+		if (shared == nullptr) {
+			ShaderJournal::Settings shader_settings;
+			shader_settings.path              = args.shaders[i];
+			shader_settings.identity          = shader_identity;
+			shader_settings.background_writer = false;
+			shared                            = std::make_shared<ShaderJournal>(std::move(shader_settings));
+		}
+		run.shaders = shared;
 		PipelineJournal::Settings pipeline_settings;
 		pipeline_settings.path              = args.pipelines[i];
 		pipeline_settings.identity          = pipeline_identity;
@@ -171,11 +178,15 @@ int Export(const Arguments& args) {
 	}
 	std::vector<PipelineList::CodeQuery> queries;
 	std::map<std::pair<uint64_t, uint64_t>, size_t> query_of;
-	for (const auto& run: runs) {
-		for (const auto& source: run.shaders->Sources()) {
-			const std::span bytes(reinterpret_cast<const uint8_t*>(source.code.data()), source.code.size() * 4);
-			const auto      query = PipelineList::QueryFor(bytes);
-			if (query_of.try_emplace({query.hash.low, query.hash.high}, queries.size()).second) queries.push_back(query);
+	for (const auto& [path, journal]: loaded_shaders) {
+		(void)path;
+		for (const auto& source: journal->Sources()) {
+			for (const auto* code: {&source.code, &source.back_code}) {
+				if (code->empty()) continue;
+				const std::span bytes(reinterpret_cast<const uint8_t*>(code->data()), code->size() * 4);
+				const auto      query = PipelineList::QueryFor(bytes);
+				if (query_of.try_emplace({query.hash.low, query.hash.high}, queries.size()).second) queries.push_back(query);
+			}
 		}
 	}
 	const auto found = PipelineList::FindCode(image, queries);
@@ -250,10 +261,11 @@ int Info(const Arguments& args) {
 	std::vector<std::pair<uint32_t, std::vector<uint8_t>>> sections;
 	(void)PipelineList::DecodeSections(bytes, sections);
 	for (const auto& [id, raw]: sections) std::printf("  section %u: %zu raw bytes\n", id, raw.size());
-	size_t kinds[3] = {}, code_bytes = 0;
+	size_t kinds[3] = {}, code_bytes = 0, merged = 0;
 	for (const auto& shader: file.shaders) {
 		kinds[static_cast<size_t>(shader.kind)]++;
-		code_bytes += shader.code_size * 4u;
+		code_bytes += (shader.code_size + shader.back_code_size) * 4u;
+		merged += shader.back_code_size != 0 ? 1 : 0;
 	}
 	size_t mesh = 0, stages[3] = {};
 	std::vector<size_t> per_level(file.levels.size());
@@ -262,8 +274,8 @@ int Info(const Arguments& args) {
 		stages[std::min<size_t>(2, pipeline.stages.size())]++;
 		for (const auto level: pipeline.levels) per_level[level]++;
 	}
-	std::printf("  shaders %zu (vertex %zu, pixel %zu, compute %zu; %zu code bytes referenced)\n", file.shaders.size(),
-	            kinds[0], kinds[1], kinds[2], code_bytes);
+	std::printf("  shaders %zu (vertex %zu, pixel %zu, compute %zu; %zu merged stages; %zu code bytes referenced)\n",
+	            file.shaders.size(), kinds[0], kinds[1], kinds[2], merged, code_bytes);
 	std::printf("  permutations %zu, pipelines %zu (%zu mesh, %zu without a pixel stage)\n", file.permutations.size(),
 	            file.pipelines.size(), mesh, stages[1]);
 	for (size_t i = 0; i < file.levels.size(); i++) std::printf("  level %s: %zu pipelines\n", file.levels[i].c_str(), per_level[i]);
@@ -318,9 +330,10 @@ int Verify(const Arguments& args) {
 	uint64_t                   code_bytes = 0;
 	for (size_t i = 0; i < resolved.sources.size(); i++) {
 		if (!resolved.usable[i]) continue;
-		const auto& code = resolved.sources[i].code;
-		windows.Add({reinterpret_cast<const uint8_t*>(code.data()), code.size() * 4});
-		code_bytes += code.size() * 4;
+		for (const auto* code: {&resolved.sources[i].code, &resolved.sources[i].back_code}) {
+			windows.Add({reinterpret_cast<const uint8_t*>(code->data()), code->size() * 4});
+			code_bytes += code->size() * 4;
+		}
 	}
 	for (const auto& path: args.shaders) {
 		std::vector<uint8_t> identity;
@@ -334,8 +347,10 @@ int Verify(const Arguments& args) {
 		settings.background_writer = false;
 		ShaderJournal journal(std::move(settings));
 		for (const auto& source: journal.Sources()) {
-			windows.Add({reinterpret_cast<const uint8_t*>(source.code.data()), source.code.size() * 4});
-			code_bytes += source.code.size() * 4;
+			for (const auto* code: {&source.code, &source.back_code}) {
+				windows.Add({reinterpret_cast<const uint8_t*>(code->data()), code->size() * 4});
+				code_bytes += code->size() * 4;
+			}
 		}
 	}
 	std::printf("known code: %llu bytes of %llu listed shaders (%llu resolved) and %zu journal(s): %zu windows (%llu "

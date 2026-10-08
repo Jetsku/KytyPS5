@@ -3151,7 +3151,8 @@ struct PipelineCache::ProgramCache {
 
 	// Journals a published permutation's inputs. Only programs whose guest hash is the content
 	// hash of their code are journaled (every headerless shader: Astro Bot's all), so that a
-	// replayed source can only stand for the code it names; merged-stage back halves are not.
+	// replayed source can only stand for the code it names; a merged stage (an NGG mesh program with
+	// its GS back half) when its hash is that of the two halves' content hashes.
 	// `specialization_bytes` and `code_words` are filled when the persistent program cache already
 	// encoded and copied them. Cost: once per new permutation, on its compile.
 	template <typename InputInfo>
@@ -3162,7 +3163,7 @@ struct PipelineCache::ProgramCache {
 	                        std::vector<uint8_t>& specialization_bytes,
 	                        const std::vector<uint32_t>& code_words) {
 		static_assert(std::is_trivially_copyable_v<InputInfo>);
-		if (!params.back_code.empty() || code.empty() || key.code_size != code.size()) return;
+		if (code.empty() || key.code_size != code.size()) return;
 		ShaderJournal::Source source;
 		source.stage                   = static_cast<uint32_t>(key.stage);
 		source.kind                    = JournalKind<InputInfo>();
@@ -3183,7 +3184,14 @@ struct PipelineCache::ProgramCache {
 					std::memcpy(source.code.data(), code.data(), code.size_bytes());
 				}
 			}
-			if (XXH3_64bits(source.code.data(), source.code.size() * sizeof(uint32_t)) != key.hash) {
+			if (!params.back_code.empty()) {
+				source.back_code.resize(params.back_code.size());
+				if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(params.back_code.data()),
+				                                               source.back_code.data(), params.back_code.size_bytes())) {
+					std::memcpy(source.back_code.data(), params.back_code.data(), params.back_code.size_bytes());
+				}
+			}
+			if (MergedSourceHash(source.code, source.back_code) != key.hash) {
 				return;
 			}
 			InputInfo copy = input_info;
@@ -3253,10 +3261,11 @@ struct PipelineCache::ProgramCache {
 		ShaderParams params;
 		if (source.code.empty() || source.code.size() != source.code_size ||
 		    source.user_data_count > params.user_data.size() ||
-		    XXH3_64bits(source.code.data(), source.code.size() * sizeof(uint32_t)) != source.hash) {
+		    MergedSourceHash(source.code, source.back_code) != source.hash) {
 			return Outcome::Skipped;
 		}
 		params.code            = source.code;
+		params.back_code       = source.back_code;
 		params.user_data_count = source.user_data_count;
 		params.hash            = source.hash;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;

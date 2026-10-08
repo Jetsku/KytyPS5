@@ -119,6 +119,11 @@ std::vector<uint8_t> EncodeShaders(const std::vector<PipelineList::Shader>& shad
 		Put<uint64_t>(out, s.code_hash_low);
 		Put<uint64_t>(out, s.code_hash_high);
 		Put<uint64_t>(out, s.prefix_hash);
+		Put<uint64_t>(out, s.back_offset);
+		Put<uint32_t>(out, s.back_code_size);
+		Put<uint64_t>(out, s.back_hash_low);
+		Put<uint64_t>(out, s.back_hash_high);
+		Put<uint64_t>(out, s.back_prefix_hash);
 		Put<uint32_t>(out, s.stage);
 		Put<uint8_t>(out, static_cast<uint8_t>(s.kind));
 		Put<uint64_t>(out, s.hash);
@@ -180,7 +185,7 @@ bool DecodeLevels(std::span<const uint8_t> bytes, std::vector<std::string>& leve
 
 bool DecodeShaders(std::span<const uint8_t> bytes, std::vector<PipelineList::Shader>& shaders) {
 	Reader     r(bytes);
-	const auto count = r.Count(74);
+	const auto count = r.Count(110);
 	shaders.reserve(count);
 	for (uint32_t i = 0; i < count && !r.Failed(); i++) {
 		PipelineList::Shader s;
@@ -190,6 +195,11 @@ bool DecodeShaders(std::span<const uint8_t> bytes, std::vector<PipelineList::Sha
 		s.code_hash_low           = r.Get<uint64_t>();
 		s.code_hash_high          = r.Get<uint64_t>();
 		s.prefix_hash             = r.Get<uint64_t>();
+		s.back_offset             = r.Get<uint64_t>();
+		s.back_code_size          = r.Get<uint32_t>();
+		s.back_hash_low           = r.Get<uint64_t>();
+		s.back_hash_high          = r.Get<uint64_t>();
+		s.back_prefix_hash        = r.Get<uint64_t>();
 		s.stage                   = r.Get<uint32_t>();
 		const auto kind           = r.Get<uint8_t>();
 		s.hash                    = r.Get<uint64_t>();
@@ -201,7 +211,7 @@ bool DecodeShaders(std::span<const uint8_t> bytes, std::vector<PipelineList::Sha
 		s.input_info              = r.Bytes();
 		if (file != static_cast<uint32_t>(PipelineList::CodeFile::Executable) ||
 		    kind > static_cast<uint8_t>(ShaderJournal::Kind::Compute) || s.code_size == 0 ||
-		    s.code_size > (64u << 20u) / 4u) {
+		    s.code_size > (64u << 20u) / 4u || s.back_code_size > (64u << 20u) / 4u) {
 			return false;
 		}
 		s.file = static_cast<PipelineList::CodeFile>(file);
@@ -402,6 +412,13 @@ uint64_t PermutationIdentity(uint32_t stage, uint64_t hash, uint32_t user_data_c
 	words.insert(words.end(), static_state.begin(), static_state.end());
 	return XXH3_64bits_withSeed(specialization.data(), specialization.size(),
 	                            XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
+}
+
+uint64_t MergedSourceHash(std::span<const uint32_t> code, std::span<const uint32_t> back_code) {
+	const uint64_t front = XXH3_64bits(code.data(), code.size_bytes());
+	if (back_code.empty()) return front;
+	const uint64_t hashes[] = {front, XXH3_64bits(back_code.data(), back_code.size_bytes())};
+	return XXH3_64bits(hashes, sizeof(hashes));
 }
 
 uint64_t PermutationIdentity(const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
@@ -700,8 +717,9 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 			stats.sources_unlocated++;
 			continue;
 		}
-		const auto offset = locate(source.code);
-		if (!offset.has_value()) {
+		const auto offset      = locate(source.code);
+		const auto back_offset = source.back_code.empty() ? std::optional<uint64_t> {0} : locate(source.back_code);
+		if (!offset.has_value() || !back_offset.has_value()) {
 			stats.sources_unlocated++;
 			continue;
 		}
@@ -714,6 +732,15 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 		shader.code_hash_low           = hash.low;
 		shader.code_hash_high          = hash.high;
 		shader.prefix_hash             = CodePrefixHash(bytes);
+		if (!source.back_code.empty()) {
+			const auto back      = AsBytes(source.back_code);
+			const auto back_hash = CodeHash(back);
+			shader.back_offset      = *back_offset;
+			shader.back_code_size   = static_cast<uint32_t>(source.back_code.size());
+			shader.back_hash_low    = back_hash.low;
+			shader.back_hash_high   = back_hash.high;
+			shader.back_prefix_hash = CodePrefixHash(back);
+		}
 		shader.stage                   = source.stage;
 		shader.kind                    = source.kind;
 		shader.hash                    = source.hash;
@@ -823,12 +850,81 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 	Resolved out;
 	out.sources.resize(file.shaders.size());
 	out.usable.assign(file.shaders.size(), false);
+	stats.shaders += file.shaders.size();
+	// A shader's code pieces: the code and, for a merged stage, its back half. Each is read at its
+	// recorded offset and checked by its hashes; the ones that do not match are searched for in the
+	// whole file.
+	struct Piece {
+		size_t                shader = 0;
+		bool                  back   = false;
+		CodeQuery             query;
+		uint64_t              offset = 0;
+		std::vector<uint32_t> code;
+		bool                  found = false;
+	};
+	std::vector<Piece> pieces;
+	std::vector<bool>  readable(file.shaders.size(), true);
+	for (size_t i = 0; i < file.shaders.size(); i++) {
+		const auto& s = file.shaders[i];
+		if (s.input_info.size() != input_info_sizes[static_cast<size_t>(s.kind)]) {
+			stats.other_input_layout++;
+			continue;
+		}
+		for (const bool back: {false, true}) {
+			if (back && s.back_code_size == 0) continue;
+			Piece piece;
+			piece.shader            = i;
+			piece.back              = back;
+			piece.offset            = back ? s.back_offset : s.offset;
+			piece.query.size_bytes  = (back ? s.back_code_size : s.code_size) * 4u;
+			piece.query.prefix_hash = back ? s.back_prefix_hash : s.prefix_hash;
+			piece.query.hash        = back ? Hash128 {s.back_hash_low, s.back_hash_high} : Hash128 {s.code_hash_low, s.code_hash_high};
+			piece.code.resize(piece.query.size_bytes / 4u);
+			const std::span bytes(reinterpret_cast<uint8_t*>(piece.code.data()), piece.query.size_bytes);
+			if (!read(s.file, piece.offset, bytes)) {
+				readable[i] = false;
+			} else {
+				piece.found = CodeHash(bytes) == piece.query.hash;
+			}
+			pieces.push_back(std::move(piece));
+		}
+	}
 	std::vector<size_t>    relocate;
 	std::vector<CodeQuery> queries;
-	stats.shaders += file.shaders.size();
-	const auto accept = [&](size_t i, std::vector<uint32_t> code) {
-		const auto& s      = file.shaders[i];
-		auto&       source = out.sources[i];
+	for (size_t p = 0; p < pieces.size(); p++) {
+		if (pieces[p].found) continue;
+		relocate.push_back(p);
+		queries.push_back(pieces[p].query);
+	}
+	if (!relocate.empty() && read_image) {
+		const auto image = read_image(CodeFile::Executable);
+		const auto found = image.empty() ? std::vector<std::optional<uint64_t>>(queries.size()) : FindCode(image, queries);
+		for (size_t q = 0; q < relocate.size(); q++) {
+			if (!found[q].has_value()) continue;
+			auto& piece = pieces[relocate[q]];
+			std::memcpy(piece.code.data(), image.data() + *found[q], piece.query.size_bytes);
+			piece.found  = true;
+			piece.offset = *found[q];
+		}
+	}
+	std::vector<uint8_t> moved(file.shaders.size(), 0);
+	std::vector<uint8_t> missing(file.shaders.size(), 0);
+	for (const auto& piece: pieces) {
+		missing[piece.shader] |= piece.found ? 0 : 1;
+		moved[piece.shader] |= piece.found && piece.offset != (piece.back ? file.shaders[piece.shader].back_offset
+		                                                                  : file.shaders[piece.shader].offset)
+		                           ? 1
+		                           : 0;
+	}
+	for (auto& piece: pieces) {
+		const auto  i = piece.shader;
+		const auto& s = file.shaders[i];
+		if (missing[i] != 0) continue;
+		auto& source = out.sources[i];
+		if (piece.back) {
+			source.back_code = std::move(piece.code);
+			continue;
+		}
 		source.stage                   = s.stage;
 		source.kind                    = s.kind;
 		source.hash                    = s.hash;
@@ -839,53 +935,20 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 		source.plain_mip_stats_variant = s.plain_mip_stats_variant;
 		source.static_state            = s.static_state;
 		source.input_info              = s.input_info;
-		source.code                    = std::move(code);
-		out.usable[i]                  = true;
-		stats.resolved++;
-	};
-	const auto matches = [](const Shader& s, std::span<const uint8_t> bytes) {
-		return CodeHash(bytes) == Hash128 {s.code_hash_low, s.code_hash_high} &&
-		       XXH3_64bits(bytes.data(), bytes.size()) == s.hash;
-	};
-	for (size_t i = 0; i < file.shaders.size(); i++) {
-		const auto& s = file.shaders[i];
-		if (s.input_info.size() != input_info_sizes[static_cast<size_t>(s.kind)]) {
-			stats.other_input_layout++;
-			continue;
-		}
-		std::vector<uint32_t> code(s.code_size);
-		const std::span       bytes(reinterpret_cast<uint8_t*>(code.data()), code.size() * sizeof(uint32_t));
-		if (!read(s.file, s.offset, bytes)) {
-			stats.unreadable++;
-		} else if (matches(s, bytes)) {
-			accept(i, std::move(code));
-			continue;
-		}
-		relocate.push_back(i);
-		CodeQuery query;
-		query.size_bytes  = s.code_size * 4;
-		query.prefix_hash = s.prefix_hash;
-		query.hash        = {s.code_hash_low, s.code_hash_high};
-		queries.push_back(query);
+		source.code                    = std::move(piece.code);
 	}
-	if (!relocate.empty() && read_image) {
-		const auto image = read_image(CodeFile::Executable);
-		const auto found = image.empty() ? std::vector<std::optional<uint64_t>>(queries.size())
-		                                 : FindCode(image, queries);
-		for (size_t q = 0; q < relocate.size(); q++) {
-			const auto  i = relocate[q];
-			const auto& s = file.shaders[i];
-			if (!found[q].has_value()) {
-				stats.mismatched++;
-				continue;
-			}
-			std::vector<uint32_t> code(s.code_size);
-			std::memcpy(code.data(), image.data() + *found[q], code.size() * sizeof(uint32_t));
-			stats.relocated++;
-			accept(i, std::move(code));
+	for (size_t i = 0; i < file.shaders.size(); i++) {
+		if (file.shaders[i].input_info.size() != input_info_sizes[static_cast<size_t>(file.shaders[i].kind)]) continue;
+		auto& source = out.sources[i];
+		if (missing[i] != 0 || MergedSourceHash(source.code, source.back_code) != file.shaders[i].hash) {
+			source = {};
+			stats.mismatched++;
+			if (!readable[i]) stats.unreadable++;
+			continue;
 		}
-	} else {
-		stats.mismatched += relocate.size();
+		out.usable[i] = true;
+		stats.resolved++;
+		stats.relocated += moved[i];
 	}
 	out.permutation_entry.assign(file.permutations.size(), UINT32_MAX);
 	stats.permutations += file.permutations.size();
