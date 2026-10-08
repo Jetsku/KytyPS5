@@ -4435,11 +4435,14 @@ struct PipelineCache::RtState {
 		if (!built.error.empty()) {
 			totals.failed.fetch_add(1, std::memory_order_relaxed);
 			if (RtSession::MarkFailed()) {
-				PipelineCacheLog("Software RT is turned off for the rest of this session: the pipeline of "
-				                 "compute shader 0x{:016x} could not be built ({}). Dispatches of ray tracing "
-				                 "kernels are skipped from now on, so the tiled lighting and GI passes leave "
-				                 "their outputs untouched (black lighting, as with KYTY_RT_SOFTWARE=0). "
-				                 "Set KYTY_RT_SOFTWARE=0 to skip them from the start.",
+				// Black lighting until the next launch: make it stand out in the console and log.
+				PipelineCacheLog("\n{0}\nWARNING: Software RT is turned off for the rest of this session: the "
+				                 "pipeline of compute shader 0x{1:016x} could not be built ({2}). Dispatches of "
+				                 "ray tracing kernels are skipped from now on, so the tiled lighting and GI "
+				                 "passes leave their outputs untouched (black lighting, as with "
+				                 "KYTY_RT_SOFTWARE=0). Restart the game to try again; set KYTY_RT_SOFTWARE=0 "
+				                 "to skip them from the start.\n{0}",
+				                 std::string_view("****************************************************************"),
 				                 job.shader_hash, built.error);
 			}
 			return nullptr;

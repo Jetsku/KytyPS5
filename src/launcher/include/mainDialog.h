@@ -24,6 +24,10 @@ public:
 
 	void RunInterpreter(QProcess* process, const Configuration& info);
 
+	// u59-preset.json was not applied: a warning line in the window, and a message box once the
+	// emulator was found.
+	void SetPresetWarning(const QString& text);
+
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 

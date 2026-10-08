@@ -690,6 +690,19 @@ add_executable(game_patch_filter_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GamePatchFilterTests.cpp"
 )
 target_include_directories(game_patch_filter_tests PRIVATE ${inc_headers})
+
+# u59-preset.json (common/u59Preset.h): parsing and lookup for the launcher, the emulator's startup
+# warnings, the shipped tools/u59-preset.json, and the code defaults that make it optional.
+add_executable(u59_preset_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/U59PresetTests.cpp"
+)
+target_link_libraries(u59_preset_tests common)
+target_include_directories(u59_preset_tests PRIVATE ${inc_headers})
+target_compile_definitions(u59_preset_tests PRIVATE
+	KYTY_U59_PRESET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
+if(LINUX)
+	target_link_libraries(u59_preset_tests Threads::Threads)
+endif()
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
@@ -1135,6 +1148,7 @@ if(BUILD_TESTING)
 	add_test(NAME live_switch COMMAND $<TARGET_FILE:live_switch_tests>)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
 	add_test(NAME game_patch_filter COMMAND $<TARGET_FILE:game_patch_filter_tests>)
+	add_test(NAME u59_preset COMMAND $<TARGET_FILE:u59_preset_tests>)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
 	add_test(NAME gi_probe_codegen
@@ -2191,6 +2205,7 @@ if(BUILD_TESTING)
 		lod_stats_report_tests
 		occlusion_pairs_tests
 		game_patch_filter_tests
+		u59_preset_tests
 		lru_cache_tests
 		spirv_local_arrays_tests
 		pipeline_fast_first_tests
