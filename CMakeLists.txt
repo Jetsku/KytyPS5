@@ -1171,6 +1171,16 @@ if(BUILD_TESTING)
 	# KYTY_DISPATCHER_CAP: an endless loop in a dispatcher-fallback shader ends on the GPU.
 	add_test(NAME dispatcher_cap
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
+	# KYTY_WAVE32_CLUSTERS: where wave32 programs keep their own 32 lanes of a wider host subgroup
+	# (AMD vertex/mesh/pixel), and the shader and wave-branch cases with the cluster code forced on (the
+	# wave-reduction codegen checks expect native reductions, which clusters replace by the scan).
+	add_test(NAME wave32_clusters
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave32-clusters-only)
+	add_test(NAME wave32_clusters_shader_cases
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-cases-only)
+	add_test(NAME wave32_clusters_wave_branch
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-branch-only)
+	set_tests_properties(wave32_clusters_shader_cases wave32_clusters_wave_branch PROPERTIES ENVIRONMENT "KYTY_WAVE32_CLUSTERS=force")
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)

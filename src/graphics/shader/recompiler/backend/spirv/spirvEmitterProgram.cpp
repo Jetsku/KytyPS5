@@ -932,7 +932,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	                          other_half == nullptr || half == 0 ? Def(predicate)
 	                                                             : other_half->Def(predicate));
 	if (other_half == nullptr) {
-		return low;
+		return EmitWaveBallot(state, low);
 	}
 	const auto high      = state.builder.AllocateId();
 	const auto low_word  = state.builder.AllocateId();
@@ -948,6 +948,15 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	if (state.wave_clusters) {
+		// The wave's own word (EmitWaveBallot); FindILsb of 0 is -1, as FindLSB of an empty ballot.
+		const auto bits   = state.builder.AllocateId();
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits, ballot, 0);
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), result, GlslStd450(state),
+		                          GLSLstd450FindILsb, bits);
+		return result;
+	}
 	if (other_half == nullptr) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
@@ -979,7 +988,7 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
-		                          lane);
+		                          EmitHostLane(state, lane));
 		return low;
 	}
 	const auto physical_lane =

@@ -125,6 +125,10 @@ struct EmitterState {
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// KYTY_WAVE32_CLUSTERS (Spirv::WaveClustersActive): a wave32 program on a host subgroup that may
+	// hold two guest waves keeps each to its own 32 lanes (EmitSubgroupLocalInvocationId,
+	// EmitHostLane, EmitWaveBallot).
+	bool                                             wave_clusters           = false;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
@@ -425,7 +429,18 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 
+// The invocation's guest lane: SubgroupLocalInvocationId (+32 in the second half of a two-lane
+// invocation; its low 5 bits with KYTY_WAVE32_CLUSTERS).
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+
+// KYTY_WAVE32_CLUSTERS: the host subgroup lane of guest lane `lane` of this invocation's wave (the
+// wave's first host lane plus lane & 31); `lane` unchanged without clusters. Every
+// OpGroupNonUniformShuffle index goes through it.
+uint32_t EmitHostLane(EmitterState& state, uint32_t lane);
+
+// KYTY_WAVE32_CLUSTERS: a subgroup ballot reduced to this invocation's wave, its 32 bits in the
+// first word and zero in the others; `ballot` unchanged without clusters.
+uint32_t EmitWaveBallot(EmitterState& state, uint32_t ballot);
 
 // Loads gl_HelperInvocation (declared when SpirvRequirements::helper_invocation is set).
 uint32_t EmitIsHelperInvocation(EmitterState& state);

@@ -143,7 +143,50 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
+	if (state.wave_clusters) {
+		return EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, 31));
+	}
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+namespace {
+
+// The raw SubgroupLocalInvocationId (KYTY_WAVE32_CLUSTERS only).
+uint32_t LoadHostSubgroupLane(EmitterState& state) {
+	if (state.subgroup_local_invocation_id_variable == 0) {
+		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
+	                          state.subgroup_local_invocation_id_variable);
+	return value;
+}
+
+} // namespace
+
+uint32_t EmitHostLane(EmitterState& state, uint32_t lane) {
+	if (!state.wave_clusters) {
+		return lane;
+	}
+	const auto wave_base =
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, LoadHostSubgroupLane(state), ConstantU32(state, ~31u));
+	return EmitBinaryU32(state, spv::OpBitwiseOr, wave_base,
+	                     EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31)));
+}
+
+uint32_t EmitWaveBallot(EmitterState& state, uint32_t ballot) {
+	if (!state.wave_clusters) {
+		return ballot;
+	}
+	const auto word = EmitBinaryU32(state, spv::OpShiftRightLogical, LoadHostSubgroupLane(state),
+	                                ConstantU32(state, 5));
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), bits, ballot, word);
+	const auto zero   = ConstantU32(state, 0);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, bits, zero,
+	                          zero, zero);
+	return result;
 }
 
 bool PixelHelperAtomicsSkipped(const EmitterState& state) {
@@ -238,7 +281,7 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
-	return EmitBallotLaneActiveBool(state, active_ballot, lane);
+	return EmitBallotLaneActiveBool(state, EmitWaveBallot(state, active_ballot), lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();

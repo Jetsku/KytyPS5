@@ -1080,6 +1080,29 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		                           : "unchanged, the device cannot require 32-wide compute subgroups");
 		std::fflush(stdout);
 	}
+	{
+		// KYTY_WAVE32_CLUSTERS: the stages whose wave32 programs can share a host subgroup with a
+		// second guest wave (a default size above 32 the pipeline cannot narrow; vertex-like stages
+		// never require a size).
+		namespace Spirv = ShaderRecompiler::Spirv;
+		const bool wide = graphics.subgroup_size > 32u;
+		const Spirv::HostWaveClusters clusters {
+		    .vertex = wide,
+		    .pixel  = wide && graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eFragment, 32u) == 0u,
+		    .mesh   = wide && graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, 32u) == 0u};
+		Spirv::SetHostWaveClusters(clusters);
+		if (wide) {
+			const auto mode = ShaderRecompiler::GetCodegenOptions().wave32_clusters;
+			std::printf("Kyty wave32 clusters (KYTY_WAVE32_CLUSTERS=%s): %u-wide host subgroups; wave32 "
+			            "vertex/pixel/mesh programs keep their own 32 lanes in %s%s%s\n",
+			            mode == ShaderRecompiler::Wave32Clusters::Off     ? "0, OFF"
+			            : mode == ShaderRecompiler::Wave32Clusters::Force ? "force"
+			                                                              : "auto",
+			            graphics.subgroup_size, clusters.vertex ? "vertex " : "",
+			            clusters.pixel ? "pixel " : "", clusters.mesh ? "mesh" : "");
+			std::fflush(stdout);
+		}
+	}
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -1412,6 +1435,19 @@ static void PrintDeviceReport(const GraphicContext& graphics) {
 	            graphics.attachment_feedback_loop_enabled ? "yes" : "no (GENERAL layout)",
 	            graphics.mesh_shader_enabled ? "yes" : "no",
 	            graphics.device_coherent_memory_enabled ? "enabled" : "off");
+	{
+		namespace Recompiler = ShaderRecompiler;
+		const auto mode      = Recompiler::GetCodegenOptions().wave32_clusters;
+		const auto clusters  = Recompiler::Spirv::GetHostWaveClusters();
+		const auto stage     = [mode](bool host) {
+			return mode == Recompiler::Wave32Clusters::Force ? "on (forced)"
+			       : mode == Recompiler::Wave32Clusters::Off ? (host ? "OFF (needed)" : "off")
+			       : host                                    ? "on"
+			                                                 : "not needed";
+		};
+		std::printf("Device report: wave32 clusters (KYTY_WAVE32_CLUSTERS): vertex %s, pixel %s, mesh %s\n",
+		            stage(clusters.vertex), stage(clusters.pixel), stage(clusters.mesh));
+	}
 	std::fflush(stdout);
 }
 

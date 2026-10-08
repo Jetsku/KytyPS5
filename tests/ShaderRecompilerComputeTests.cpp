@@ -1882,6 +1882,8 @@ struct GraphicsCase {
   // Guest memory the shader's scalar loads read through (byte address = index * 4); empty:
   // none, only the user data is known.
   std::vector<u32> memory;
+  // The pixel shader's wave size (SPI_PS_IN_CONTROL.PS_W32_EN).
+  u32 wave_size = 64;
 };
 
 struct CompiledShader {
@@ -2673,6 +2675,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
   options.dump_ir = false;
+  options.wave_size = test.wave_size;
+  pixel_info.wave_size = test.wave_size;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
   options.plain_mip_stats_variant = plain_variant;
@@ -55051,6 +55055,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 
 #include "ShaderCodegenTests.inc"
 #include "ShaderGiProbeTests.inc"
+#include "ShaderWaveClusterTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
 #include "ShaderBvhTests.inc"
@@ -55094,6 +55099,18 @@ int main(int argc, char **argv) {
     GiProbeTests::CheckPixelAppendLiveExec(&vulkan);
     GiProbeTests::CheckPixelWqmLiveExec(&vulkan);
     GiProbeTests::CheckLoopGuardEndsEndlessLoop(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave32-clusters-codegen-only") == 0) {
+    WaveClusterTests::CheckWaveClusterSelection();
+    WaveClusterTests::CheckLdsWaitcntBarrierScope(nullptr);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave32-clusters-only") == 0) {
+    WaveClusterTests::CheckWaveClusterSelection();
+    VulkanHarness vulkan;
+    WaveClusterTests::CheckWaveClusterWaterfall(&vulkan);
+    WaveClusterTests::CheckLdsWaitcntBarrierScope(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dispatcher-cap-only") == 0) {

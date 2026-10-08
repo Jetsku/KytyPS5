@@ -30,6 +30,33 @@ enum class PsLiveExec : uint8_t {
 	All,
 };
 
+// Where a wave32 graphics program keeps each guest wave to its own 32 lanes of the host subgroup
+// (KYTY_WAVE32_CLUSTERS).
+enum class Wave32Clusters : uint8_t {
+	// Never: a host subgroup wider than 32 runs two guest waves as one (the behaviour before).
+	Off,
+	// In the stages the device layer reports as wider than 32 (Spirv::HostWaveClusters).
+	Auto,
+	// In every wave32 program but hull shaders, compute included (a test of the emitted code on
+	// 32-wide hosts, where it must give the same results).
+	Force,
+};
+
+// How S_WAITCNT lgkmcnt(0) after LDS writes orders them for the other lanes of the wave
+// (KYTY_LDS_WAITCNT_BARRIER).
+enum class LdsWaitcntBarrier : uint8_t {
+	// No barrier (the behaviour before the ISA-accuracy change; pink particle clouds on the title
+	// screen, blue artifacts in Astro's Playroom).
+	Off,
+	// OpMemoryBarrier at subgroup scope: every lane of a guest wave lives in one host subgroup
+	// (a split wave64 runs two lanes per invocation), so this is all lgkmcnt(0) promises.
+	Subgroup,
+	// OpMemoryBarrier at workgroup scope (int16.1). The AMD driver turns a workgroup-scope fence in
+	// a mesh shader into a workgroup barrier; reached by only some waves (inside S_CBRANCH_EXECZ
+	// regions other waves skip) it hangs the GPU.
+	Workgroup,
+};
+
 // Switches for code-generation changes that must stay revertible at runtime. Every field is read
 // from its environment variable once (first use); tests may replace the whole set. Programs are
 // cached in memory only and the driver pipeline cache is keyed by the SPIR-V code, so changing a
@@ -255,6 +282,24 @@ struct CodegenOptions {
 	// [2^k, 2^(k+1)), at end - RtNodeStatsGdsFromEnd - k), reported at flips. A diagnostic for the
 	// budget.
 	bool rt_node_stats = false;
+	// KYTY_WAVE32_CLUSTERS=0|auto|force (default auto), see Wave32Clusters. A wave32 vertex, mesh or
+	// pixel program on a host subgroup wider than its wave (AMD: 64 in those stages, which cannot
+	// require 32) shares the subgroup with another guest wave. Without clusters its EXEC, VCC and
+	// ballot words read the first 32 lanes of the subgroup, its lane reads and V_READFIRSTLANE take
+	// lanes of the other wave, and V_MBCNT counts them: a waterfall or work-list loop of the second
+	// wave never removes its own lanes and spins until a device reset, and DS_APPEND hands its lanes
+	// duplicate indices. With clusters each guest wave uses host lanes 32k..32k+31 only: lane ids
+	// are the low 5 bits, ballots take the wave's own word, shuffles stay in the wave, lane reads
+	// are not broadcast across the subgroup, and lane reductions use the emulated scan.
+	Wave32Clusters wave32_clusters = Wave32Clusters::Auto;
+	// KYTY_LDS_WAITCNT_BARRIER=subgroup|workgroup|0 (default subgroup), see LdsWaitcntBarrier. An
+	// S_WAITCNT lgkmcnt(0) with an LDS write pending since the last barrier, in compute and mesh
+	// shaders (the other stages keep LDS per invocation), gets a memory barrier so lanes see each
+	// other's writes. It orders only the wave's own LDS operations, so it is never an execution
+	// barrier and never wider than the subgroup by default: Astro Bot's title-screen particle mesh
+	// shader 0xc739f9614016bed4 (VS 0x20c94d46ce55a14b) has three in S_CBRANCH_EXECZ regions, and
+	// with workgroup scope it lost the device on AMD at the next S_BARRIER.
+	LdsWaitcntBarrier lds_waitcnt_barrier = LdsWaitcntBarrier::Subgroup;
 };
 
 // GDS dwords, counted from the end of GDS, that KYTY_RT_NODE_BUDGET and KYTY_RT_NODE_STATS report

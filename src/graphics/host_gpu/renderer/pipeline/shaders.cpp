@@ -294,7 +294,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			static std::atomic_bool logged {false};
 			if (!logged.exchange(true)) {
 				LOGF("Vulkan subgroup: wave%u %s shader on a %u-wide host subgroup the device "
-				     "cannot narrow; its lane operations mix two waves\n",
+				     "cannot narrow; KYTY_WAVE32_CLUSTERS keeps each wave to its own lanes\n",
 				     wave_size, is_mesh ? "mesh" : "pixel", graphics.subgroup_size);
 			}
 		}

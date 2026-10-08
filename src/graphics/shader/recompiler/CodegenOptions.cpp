@@ -101,6 +101,18 @@ CodegenOptions FromEnvironment() {
 		options.rt_node_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));
 	}
 	options.rt_node_stats = EnvFlag("KYTY_RT_NODE_STATS", options.rt_node_stats);
+	if (const auto* mode = std::getenv("KYTY_LDS_WAITCNT_BARRIER"); mode != nullptr && mode[0] != '\0') {
+		options.lds_waitcnt_barrier = std::strcmp(mode, "0") == 0 || std::strcmp(mode, "off") == 0
+		                                  ? LdsWaitcntBarrier::Off
+		                              : std::strcmp(mode, "workgroup") == 0 ? LdsWaitcntBarrier::Workgroup
+		                                                                    : LdsWaitcntBarrier::Subgroup;
+	}
+	if (const auto* mode = std::getenv("KYTY_WAVE32_CLUSTERS"); mode != nullptr && mode[0] != '\0') {
+		options.wave32_clusters = std::strcmp(mode, "0") == 0 || std::strcmp(mode, "off") == 0
+		                              ? Wave32Clusters::Off
+		                          : std::strcmp(mode, "force") == 0 ? Wave32Clusters::Force
+		                                                            : Wave32Clusters::Auto;
+	}
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;
