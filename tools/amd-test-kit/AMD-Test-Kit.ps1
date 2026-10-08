@@ -8,7 +8,7 @@
 # u59-preset.json. The kit writes only its results folder and zip.
 #
 # Optional parameters (AMD-Test-Kit.cmd passes them through):
-#   -Only baseline,dma-off     run only these configurations (names from the list below)
+#   -Only fix,barrier-old      run only these configurations (names from the lists below)
 #   -SecondsAfterVideo 45      how long a run continues after the intro video closes
 #   -MaxSeconds 300            hard limit per run
 #   -GamePath <folder>         the game folder, if the kit cannot find it in Kyty.ini
@@ -36,23 +36,28 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
 # ------------------------------------------------------------------------------------------------
-# Configurations. Every run has the GPU breadcrumbs on. "baseline" is the published int16.1
-# behaviour (the bundled u59-preset.json, with this build's new helper-lane fix turned off); every
-# other entry changes one thing from it. Order: the most informative first.
+# Configurations. Every run has the GPU breadcrumbs on. "fix" is this build as released (the
+# bundled u59-preset.json and the new defaults); every other entry changes one thing from it. Order:
+# the most informative first. The AMD test 1 runs named the hanging draw: Astro Bot's title-screen
+# particle mesh shader (VS 0x20c94d46ce55a14b, merged program 0xc739f9614016bed4, PS
+# 0xef31694ed8d87754). It has no loops; its LDS waitcnt barriers sit where only some waves go.
 $Common = [ordered]@{
     KYTY_DEVICE_FAULT_DIAGNOSTICS = '1'
     KYTY_GPU_BREADCRUMBS          = '1'
-    KYTY_PS_HELPER_ATOMICS_SKIP   = '0'
 }
+$HangShaders = '0xc739f9614016bed4,0x20c94d46ce55a14b,0xef31694ed8d87754'
 $Configs = @(
-    @{ Name = 'baseline';         Text = 'as int16.1, breadcrumbs on';                                  Env = [ordered]@{} }
-    @{ Name = 'all-safe';         Text = 'every suspect below off and every fix on, at once';            Env = [ordered]@{
-        KYTY_PS_HELPER_ATOMICS_SKIP = '1'; KYTY_COMPUTE_WAVE64 = '0'; KYTY_SIDE_QUEUE = '0'; KYTY_UPLOAD_DMA = '0'
-        KYTY_TEXTURE_SPARSE_RESIDENCY = '0'; KYTY_BDA_PAGETABLE_SPARSE = '0'; KYTY_TEXTURE_STAGING_REBAR = '0'
-        KYTY_FUNCTION_ARRAY_SHRINK = '0'; KYTY_PIPELINE_FAST_FIRST = '0'; KYTY_SUBMISSION_MODE = 'direct'
-        KYTY_VOLATILE_LOADS = '1'; KYTY_DRAW_RUN = '0' } }
+    @{ Name = 'fix';              Text = 'this build: LDS waitcnt barrier at subgroup scope, wave32 clusters'; Env = [ordered]@{} }
+    @{ Name = 'barrier-old';      Text = 'LDS waitcnt barrier at workgroup scope again (as int16.1 and AMD test 1)'; Env = [ordered]@{ KYTY_LDS_WAITCNT_BARRIER = 'workgroup' } }
+    @{ Name = 'barrier-off';      Text = 'no LDS waitcnt barrier (the community workaround; pink clouds expected)'; Env = [ordered]@{ KYTY_LDS_WAITCNT_BARRIER = '0' } }
+    @{ Name = 'old-loop-guard';   Text = 'barrier-old with a loop guard on the hanging draw''s shaders'; Env = [ordered]@{
+        KYTY_LDS_WAITCNT_BARRIER = 'workgroup'; KYTY_LOOP_GUARD = '200000'; KYTY_LOOP_GUARD_SHADERS = $HangShaders } }
+    @{ Name = 'clusters-off';     Text = 'fix without wave32 clusters (wave32 programs share 64-wide subgroups)'; Env = [ordered]@{ KYTY_WAVE32_CLUSTERS = '0' } }
+    @{ Name = 'fix-long';         Text = 'fix again for 2 minutes at the title, with the emulator log file'; Env = [ordered]@{}; LogFile = $true; Seconds = 120 }
+)
+# Earlier suspects, not run by default; -Only <name> runs them.
+$MoreConfigs = @(
     @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' } }
-    @{ Name = 'helper-fix';       Text = 'helper lanes skip pixel-shader compare-exchange loops (new fix)'; Env = [ordered]@{ KYTY_PS_HELPER_ATOMICS_SKIP = '1' } }
     @{ Name = 'wave64-split';     Text = 'wave64 compute shaders on 32-wide subgroups, as on NVIDIA';  Env = [ordered]@{ KYTY_COMPUTE_WAVE64 = '0' } }
     @{ Name = 'loop-guard';       Text = 'every shader loop ends after 200000 iterations and is named'; Env = [ordered]@{
         KYTY_LOOP_GUARD = '200000'; KYTY_LOOP_GUARD_SHADERS = 'all' } }
@@ -60,19 +65,9 @@ $Configs = @(
         KYTY_TEXTURE_SPARSE_RESIDENCY = '0'; KYTY_BDA_PAGETABLE_SPARSE = '0' } }
     @{ Name = 'queues-off';       Text = 'neither extra queue (side copies and upload DMA on queue 0)'; Env = [ordered]@{ KYTY_SIDE_QUEUE = '0'; KYTY_UPLOAD_DMA = '0' } }
     @{ Name = 'drawrun-off';      Text = 'no draw-run reuse (it starts at the title scene)';           Env = [ordered]@{ KYTY_DRAW_RUN = '0' } }
-    @{ Name = 'dma-off';          Text = 'no upload DMA queue (transfer-only queue family)';            Env = [ordered]@{ KYTY_UPLOAD_DMA = '0' } }
-    @{ Name = 'sidequeue-off';    Text = 'no second graphics queue for side copies';                    Env = [ordered]@{ KYTY_SIDE_QUEUE = '0' } }
-    @{ Name = 'rebar-off';        Text = 'no texture staging ring in VRAM (Smart Access Memory path)';  Env = [ordered]@{ KYTY_TEXTURE_STAGING_REBAR = '0' } }
-    @{ Name = 'live-exec-all';    Text = 'every pixel shader starts without helper lanes in EXEC';      Env = [ordered]@{ KYTY_PS_LIVE_EXEC = 'all' } }
-    @{ Name = 'volatile-loads';   Text = 'every shader memory read is volatile (polling loops reread)'; Env = [ordered]@{ KYTY_VOLATILE_LOADS = '1' } }
-    @{ Name = 'lane-opts-off';    Text = 'no EXEC-select elimination and no native lane reductions';    Env = [ordered]@{ KYTY_EXEC_SELECTS = '0'; KYTY_LANE_REDUCTIONS = '0' } }
-    @{ Name = 'shrink-off';       Text = 'function-storage arrays not shrunk';                          Env = [ordered]@{ KYTY_FUNCTION_ARRAY_SHRINK = '0' } }
-    @{ Name = 'submit-direct';    Text = 'submissions from the CP thread (no submission worker)';       Env = [ordered]@{ KYTY_SUBMISSION_MODE = 'direct' } }
-    @{ Name = 'recorder-off';     Text = 'commands recorded on the CP thread (no recorder thread)';    Env = [ordered]@{ KYTY_CP_RECORDER = '0' } }
-    @{ Name = 'baseline-log';     Text = 'baseline again, with the emulator log file (device details)';  Env = [ordered]@{}; LogFile = $true }
+    @{ Name = 'helper-old';       Text = 'helper lanes run pixel-shader compare-exchange loops (int16.1)'; Env = [ordered]@{ KYTY_PS_HELPER_ATOMICS_SKIP = '0' } }
+    @{ Name = 'no-breadcrumbs';   Text = 'fix without breadcrumbs';                                     Env = [ordered]@{ KYTY_GPU_BREADCRUMBS = '0' } }
 )
-# Run only when the baseline did not lose the device (the breadcrumbs may change the timing).
-$IfBaselineSurvives = @{ Name = 'no-breadcrumbs'; Text = 'baseline without breadcrumbs'; Env = [ordered]@{ KYTY_GPU_BREADCRUMBS = '0' } }
 # ------------------------------------------------------------------------------------------------
 function Write-Step([string]$text) { Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $text) }
 
@@ -254,8 +249,8 @@ if ([IO.File]::Exists($presetPath)) {
 }
 # "-Only a,b" arrives as one string through AMD-Test-Kit.cmd (powershell -File).
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$selected = @($Configs | Where-Object { $Only.Count -eq 0 -or $Only -contains $_.Name })
-if ($selected.Count -eq 0) { throw "No configuration matches -Only $($Only -join ','). Names: $(($Configs | ForEach-Object Name) -join ', ')" }
+$selected = @(if ($Only.Count -eq 0) { $Configs } else { @($Configs) + @($MoreConfigs) | Where-Object { $Only -contains $_.Name } })
+if ($selected.Count -eq 0) { throw "No configuration matches -Only $($Only -join ','). Names: $((@($Configs) + @($MoreConfigs) | ForEach-Object Name) -join ', ')" }
 
 if ($CaptureFromLauncher) {
     if (Get-Process kyty_emulator -ErrorAction SilentlyContinue) { throw 'Close the running game first.' }
@@ -274,7 +269,7 @@ if (-not $launch.Patch -and $launch.Source -ne 'launcher process') {
     Write-Host "WARNING: no patch file _Patches\$($launch.Title).json next to the emulator: the game would run WITHOUT the launcher patches." -ForegroundColor Yellow
     Write-Host "         Copy your _Patches folder from your int16.1 folder, or turn the patches on once in this launcher, then start the kit again." -ForegroundColor Yellow
 }
-Write-Step ("Runs:         {0} ({1}), about {2} minutes" -f $selected.Count, (($selected | ForEach-Object Name) -join ', '), [math]::Ceiling($selected.Count * 1.7))
+Write-Step ("Runs:         {0} ({1}), about {2} minutes" -f $selected.Count, (($selected | ForEach-Object Name) -join ', '), [math]::Ceiling($selected.Count * 1.7 + 1.5))
 if ($ListOnly) { foreach ($c in $selected) { Write-Host ("  {0,-14} {1}" -f $c.Name, $c.Text) }; return }
 if (Get-Process kyty_emulator -ErrorAction SilentlyContinue) { throw 'A kyty_emulator.exe is already running. Close the game (and the launcher) first.' }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -329,6 +324,7 @@ try {
             $arguments = $arguments -replace '--printf-output-file\s+("[^"]*"|\S+)', ('--printf-output-file "' + $kytyLog + '"')
         }
         $start = Get-Date
+        $after = if ($c.ContainsKey('Seconds')) { [int]$c.Seconds } else { $SecondsAfterVideo }
         $proc = Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $EmulatorDir -PassThru `
             -RedirectStandardOutput $log -RedirectStandardError $err
         $null = $proc.Handle # keeps the exit code readable after the process ends
@@ -343,7 +339,7 @@ try {
             if (-not $lostAt -and $text -cmatch '--- Device loss:|ErrorDeviceLost|VK_ERROR_DEVICE_LOST') { $lostAt = $now; Write-Step '  device lost' }
             if ($proc.HasExited) { break }
             if ($lostAt -and ($now - $lostAt).TotalSeconds -ge 15) { break }
-            if ($videoClosed -and ($now - $videoClosed).TotalSeconds -ge $SecondsAfterVideo) { break }
+            if ($videoClosed -and ($now - $videoClosed).TotalSeconds -ge $after) { break }
             if (($now - $start).TotalSeconds -ge $MaxSeconds) { break }
         }
         $exited = $proc.HasExited
@@ -357,16 +353,13 @@ try {
         if ($lostAt) { $verdict = "DEVICE LOST $since".Trim() }
         elseif ($exited -and $text -match 'Fatal Error|Unhandled host exception') { $verdict = 'CRASHED (other error, see log)' }
         elseif ($exited) { $verdict = "EXITED (code $($proc.ExitCode))" }
-        elseif ($videoClosed) { $verdict = "OK: still running $SecondsAfterVideo s after the video" }
+        elseif ($videoClosed) { $verdict = "OK: still running $after s after the video" }
         else { $verdict = "NO VIDEO END within $MaxSeconds s (stopped by the kit)" }
         $title = ''
         if ($text -match 'Title ID: (\S+)') { $title = $matches[1] }
         $results.Add([pscustomobject]@{ Run = $name; Verdict = $verdict; Switches = $changed; Title = $title; Seconds = [int]((Get-Date) - $start).TotalSeconds })
         Write-Step "  -> $verdict"
         if ($text -match 'Loop guard: (\d+) invocations[^\r\n]*shader (0x[0-9a-f]+)') { Write-Step "  loop guard fired: $($matches[1]) invocations, shader $($matches[2])" }
-        if ($c.Name -eq 'baseline' -and -not $lostAt -and -not ($queue | Where-Object { $_.Name -eq $IfBaselineSurvives.Name })) {
-            $queue.Insert($qi + 1, $IfBaselineSurvives)
-        }
         if ($kytyLog -and [IO.File]::Exists($kytyLog)) {
             # Keep the start (device setup) and the end (the crash) of a large log.
             $info = New-Object IO.FileInfo($kytyLog)

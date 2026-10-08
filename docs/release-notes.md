@@ -1,3 +1,41 @@
+# KytyPS5 U59 int16.1 AMD test 2 — the fix for the "device lost" after the intro video on AMD Radeon cards
+
+> **This is a test build for AMD Radeon owners whose game stops with "device lost" / ErrorDeviceLost, usually right
+> after the intro video, at the title screen.** Everyone else: please keep using int16.1.
+
+## What this build is
+
+AMD test 1 showed which draw the GPU was stuck in: the title screen's particle draw (a mesh shader). That shader
+waits at a barrier for part of its workgroup that never arrives, because of an extra memory barrier the emulator
+adds after shared-memory (LDS) writes. This build has the fix, plus a second fix found while checking it:
+
+- **LDS barrier fix (on by default):** the barrier added at `S_WAITCNT lgkmcnt(0)` is now limited to the wave's own
+  lanes (subgroup scope) instead of the whole workgroup. `KYTY_LDS_WAITCNT_BARRIER=workgroup` restores int16.1,
+  `KYTY_LDS_WAITCNT_BARRIER=0` removes the barrier (the workaround from the GitHub issue, which shows pink particle
+  clouds on the title screen).
+- **Wave32 fix (on by default, AMD only):** AMD runs vertex, mesh and pixel shaders 64 lanes wide, so two 32-lane
+  game waves share one. Each wave now keeps to its own 32 lanes (`KYTY_WAVE32_CLUSTERS=0` turns this off).
+- On NVIDIA both fixes leave the image and the speed unchanged.
+- Everything else is the same as AMD test 1 (int16.1 plus the GPU breadcrumbs and the helper-lane fix).
+
+## How to test (about 15 minutes, hands off)
+
+1. Copy your working int16.1 folder (with its `_Patches`, `_PipelineCache` and `_SaveData`) to a new folder, then
+   unzip this build into the new folder and let it overwrite the files.
+2. Start `launcher.exe` from the new folder once, check that Astro Bot and your usual patches are listed, then close
+   the launcher again. Do not start the game from it.
+3. Double-click `AMD-Test-Kit.cmd` and leave the PC alone. The game opens and closes by itself 6 times. Two of the
+   runs bring back the old setting on purpose, so the screen may go black for a few seconds when the GPU resets;
+   that is expected.
+4. When it says "Send this file: ...AMD-Test-Results-<date>.zip", send us that zip (and, if you can, a note on whether
+   the title screen showed pink clouds in the runs that kept going).
+
+You can also just play: this build should get past the title screen on its own. The kit changes nothing outside its
+results folder. The zip contains the emulator's console logs, your OS, GPU, driver, CPU and RAM, and Windows' records
+of display-driver resets during the test. `AMD-TEST-KIT-README.txt` has the details and options.
+
+---
+
 # KytyPS5 U59 int16.1 AMD test — for AMD Radeon cards that crash ("device lost") after the intro video
 
 > **This is a test build for AMD Radeon owners whose game stops with "device lost" / ErrorDeviceLost, usually right
