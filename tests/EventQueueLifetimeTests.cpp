@@ -233,12 +233,18 @@ void TestDuplicateAddPreservesEventState(bool legacy) {
 	      "duplicate add updates deadline metadata");
 	Check(timer_event.data == 0 && timer_event.udata == reinterpret_cast<void*>(0x2222),
 	      "deadline trigger retains updated duplicate metadata");
-	for (uintptr_t value: {0x9abcu, 0xdef0u})
-		Check(EventQueue::KernelTriggerEvent(queue, 17, EventQueue::KERNEL_EVFILT_VIDEO_OUT,
-		                                     reinterpret_cast<void*>(value)) == OK, "queue bounded read payload");
-	for (intptr_t value: {0x9abcu, 0xdef0u})
-		Check(EventQueue::KernelWaitEqueue(queue, events, 1, &out, &timeout) == OK && out == 1 &&
-		          events[0].data == value, "capacity-one reads preserve pending event order");
+	// Upstream afbb322b3: two triggers stay two pending events in the per-trigger queue. A coalesced
+	// queue (the default) keeps one pending state per event with the newest data, as a kqueue does.
+	if (legacy) {
+		for (uintptr_t value: {0x9abcu, 0xdef0u})
+			Check(EventQueue::KernelTriggerEvent(queue, 17, EventQueue::KERNEL_EVFILT_VIDEO_OUT,
+			                                     reinterpret_cast<void*>(value)) == OK,
+			      "queue bounded read payload");
+		for (intptr_t value: {0x9abcu, 0xdef0u})
+			Check(EventQueue::KernelWaitEqueue(queue, events, 1, &out, &timeout) == OK && out == 1 &&
+			          events[0].data == value,
+			      "capacity-one reads preserve pending event order");
+	}
 
 	auto retained_owner = weak_original.lock();
 	Check(retained_owner != nullptr, "original owner alive before delete");

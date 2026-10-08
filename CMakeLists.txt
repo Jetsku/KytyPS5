@@ -1241,6 +1241,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	set_tests_properties(graphics_pipeline_rasterization_skip_inactive_ps PROPERTIES
 		ENVIRONMENT "KYTY_SKIP_INACTIVE_PS=1")
+	# KYTY_BLEND_ALPHA_REMAP (upstream 0bef3fc0d, 94e7d239d, 96011cc5c): logical alpha from the
+	# second blend source, opt-in here.
+	add_test(NAME graphics_pipeline_rasterization_blend_alpha_remap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
+	set_tests_properties(graphics_pipeline_rasterization_blend_alpha_remap PROPERTIES
+		ENVIRONMENT "KYTY_BLEND_ALPHA_REMAP=1")
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME guest_stack_exit

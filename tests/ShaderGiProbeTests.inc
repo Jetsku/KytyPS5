@@ -385,9 +385,10 @@ void CheckLoopGuardCodegen() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// CPU only: KYTY_PS_HELPER_ATOMICS_SKIP. A pixel shader's BUFFER_STORE_BYTE is an emulated
+// CPU only: KYTY_PS_HELPER_ATOMICS_SKIP. A pixel shader's BUFFER_ATOMIC_INC is an emulated
 // read-modify-write (a compare-exchange loop); helper invocations skip it by default, which declares
-// gl_HelperInvocation, and with the switch off the shader is as before.
+// gl_HelperInvocation, and with the switch off the shader is as before. (BUFFER_STORE_BYTE was the
+// case here until byte stores became native 8-bit stores, upstream c3f496271.)
 void CheckPixelHelperAtomicsCodegen() {
   constexpr const char *name = "PixelHelperAtomicsCodegen";
   const ShaderRecompiler::CodegenOptions defaults;
@@ -404,7 +405,7 @@ void CheckPixelHelperAtomicsCodegen() {
     std::vector<u32> code;
     AppendVMovU32(&code, 1u, 0x5au);
     AppendVMovU32(&code, 31u, 0u);
-    AppendBufferStoreOpcode(&code, 0x18u, 1u, 31u); // buffer_store_byte v1, v31, s[48:51] offen
+    AppendBufferStoreOpcode(&code, 0x3cu, 1u, 31u); // buffer_atomic_inc v1, v31, s[48:51] offen
     code.push_back(EncodeVop1(0x01u, 2u, InlineU32(0u)));
     code.push_back(EncodeExp0(0u, 0xfu, true, false, true));
     code.push_back(EncodeExp1(2u, 2u, 2u, 2u));
@@ -413,7 +414,7 @@ void CheckPixelHelperAtomicsCodegen() {
     const auto compiled = CompileFragmentCase(test);
     const auto helpers = CodegenTests::CountSpirv(compiled.spirv, "BuiltIn HelperInvocation");
     const auto cas = CodegenTests::CountSpirv(compiled.spirv, "OpAtomicCompareExchange");
-    Require(name, "SPIR-V", cas == 1u, "the byte store is not one compare-exchange loop");
+    Require(name, "SPIR-V", cas == 1u, "the atomic increment is not one compare-exchange loop");
     Require(name, "SPIR-V", helpers == (skip ? 1u : 0u),
             "gl_HelperInvocation declaration does not follow KYTY_PS_HELPER_ATOMICS_SKIP");
   }
