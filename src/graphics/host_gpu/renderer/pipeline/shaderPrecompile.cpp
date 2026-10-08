@@ -865,11 +865,16 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 		if (next >= m_total) break;
 		const auto& entry = entries[m_order.empty() ? next : m_order[next]];
 		Outcome     outcome = Outcome::Failed;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 		try {
 			outcome = m_compile(sources[entry.source], entry);
 		} catch (const std::exception&) {
 			outcome = Outcome::Failed;
 		}
+#else
+		// Builds without exceptions (the Linux build): a failing compile reports Failed itself.
+		outcome = m_compile(sources[entry.source], entry);
+#endif
 		NoteDone(outcome);
 	}
 	if (m_workers_running.fetch_sub(1, std::memory_order_acq_rel) == 1) {
