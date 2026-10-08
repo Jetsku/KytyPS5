@@ -3551,11 +3551,12 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+				std::printf("Occlusion queries: treated as always visible (performance mode). If objects "
+				            "show through walls, turn on accurate occlusion queries in the launcher "
+				            "(--gpu-occlusion on, KYTY_GPU_OCCLUSION=1).\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
+			// Performance mode (KYTY_GPU_OCCLUSION=0): publish an always-visible result. The
 			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
 			// ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
@@ -3594,6 +3595,65 @@ static void NoteLoopGuardHits(RenderContext& renderer) {
 		    "Loop guard: {} invocations of the guarded shaders exhausted the {}-iteration loop "
 		    "budget (KYTY_LOOP_GUARD)\n",
 		    hits, options.loop_guard_budget));
+	}
+}
+
+// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS (KYTY_RT_SOFTWARE): the invocations that exhausted the
+// BVH node budget and, with the statistics, how many node tests invocations ran, by power of two.
+// The mapped GDS words are read without waiting for the GPU (a diagnostic): the budget line when
+// its count changes, the histogram at most every 300 flips.
+static void NoteRtNodeCounts(RenderContext& renderer) {
+	namespace Recompiler = Libs::Graphics::ShaderRecompiler;
+	const auto& options  = Recompiler::GetCodegenOptions();
+	if (!options.rt_software || (options.rt_node_budget == 0 && !options.rt_node_stats)) {
+		return;
+	}
+	const auto     mapped = renderer.GetBufferCache().GetGdsBuffer()->Mapped();
+	constexpr auto Needed = Recompiler::RtNodeStatsGdsFromEnd + Recompiler::RtNodeStatsBins;
+	if (mapped.size() < Needed * sizeof(uint32_t)) {
+		return;
+	}
+	const auto word = [&](uint32_t from_end) {
+		uint32_t value = 0;
+		std::memcpy(&value, mapped.data() + mapped.size() - from_end * sizeof(uint32_t),
+		            sizeof(value));
+		return value;
+	};
+	if (options.rt_node_budget != 0) {
+		static uint32_t reported = 0;
+		const auto      hits     = word(Recompiler::RtNodeBudgetGdsFromEnd);
+		if (hits != reported) {
+			reported = hits;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "RT node budget: {} invocations exhausted the {}-test BVH node budget; their node "
+			    "tests missed from then on and they left their loops (KYTY_RT_NODE_BUDGET)\n",
+			    hits, options.rt_node_budget));
+		}
+	}
+	if (options.rt_node_stats) {
+		static uint32_t flips = 0;
+		static std::array<uint32_t, Recompiler::RtNodeStatsBins> reported {};
+		if (flips++ % 300u != 0u) {
+			return;
+		}
+		std::array<uint32_t, Recompiler::RtNodeStatsBins> bins {};
+		for (uint32_t bin = 0; bin < bins.size(); bin++) {
+			bins[bin] = word(Recompiler::RtNodeStatsGdsFromEnd + bin);
+		}
+		if (bins == reported) {
+			return;
+		}
+		reported = bins;
+		std::string text;
+		for (uint32_t bin = 0; bin < bins.size(); bin++) {
+			if (bins[bin] != 0) {
+				text += fmt::format(" [{},{}):{}", 1u << bin, 2ull << bin, bins[bin]);
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "RT node stats: invocations by BVH node tests per lane, since start{} "
+		    "(KYTY_RT_NODE_STATS)\n",
+		    text));
 	}
 }
 
@@ -3638,6 +3698,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 	switch (static_cast<CpSeq::FlipVariant>(op.variant)) {
 		case CpSeq::FlipVariant::Plain: {
 			NoteLoopGuardHits(m_renderer);
+			NoteRtNodeCounts(m_renderer);
 			if (GraphicsRunDebugDumpEnabled()) {
 				LOGF("CommandProcessor::Flip()\n");
 			}
@@ -3653,6 +3714,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 		}
 		case CpSeq::FlipVariant::Label: {
 			NoteLoopGuardHits(m_renderer);
+			NoteRtNodeCounts(m_renderer);
 			auto& command = CurrentBuffer();
 
 			if (GraphicsRunDebugDumpEnabled()) {
@@ -3678,6 +3740,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			const auto eop_event_type = op.eop_event_type;
 			const auto cache_action   = op.cache_action;
 			NoteLoopGuardHits(m_renderer);
+			NoteRtNodeCounts(m_renderer);
 			auto& command = CurrentBuffer();
 
 			if (GraphicsRunDebugDumpEnabled()) {

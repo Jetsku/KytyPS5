@@ -35,6 +35,12 @@ struct UploadHostCopy;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// KYTY_BDA_WRITES=1 (or =verify): shaders store and do atomics through V#s they compute, through
+// BDA, and the renderer settles each such dispatch synchronously (BufferCache::SettleBdaWrites).
+[[nodiscard]] bool BdaWritesEnabled();
+// KYTY_BDA_WRITES=verify: dropped writes and written pages under a GPU-modified image are fatal.
+[[nodiscard]] bool BdaWritesVerify();
+
 struct BufferContentRevision {
 	BufferId id;
 	uint64_t write_revision;
@@ -49,6 +55,14 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Fault buffer layout: the fault bitmap (1 bit per page). With KYTY_BDA_WRITES it grows by the
+	// written-page bitmap of the same shape and then the dropped-write counter (writes to pages
+	// without a cache buffer), in that order.
+	static constexpr uint64_t FAULT_BITMAP_WORDS      = CACHING_NUMPAGES / 32;
+	static constexpr uint64_t BDA_WRITE_BITMAP_WORD   = FAULT_BITMAP_WORDS;
+	static constexpr uint64_t BDA_DROPPED_WRITES_WORD = 2 * FAULT_BITMAP_WORDS;
+	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE =
+	    (2 * FAULT_BITMAP_WORDS + 4) * sizeof(uint32_t);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -209,6 +223,15 @@ public:
 	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
 	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
 	void               ReportVram();
+	// KYTY_BDA_WRITES (Profiling/analysis/BDA-WRITES-DESIGN.md v2). Before recording a dispatch whose
+	// program writes through BDA (ShaderInfo::bda_writes): clears the written-page bitmap on first
+	// use, forgets every known fill, and moves GPU-modified images that overlap cache buffers into
+	// their buffers when image writebacks are on (counted either way). GPU thread.
+	void PrepareBdaWrites();
+	// Right after recording that dispatch: waits for it (a synchronous settle, before the command
+	// processor continues) and takes every page it wrote into GPU ownership exactly as a writable
+	// binding over the page would, so no later reader sees the page as clean. GPU thread.
+	void SettleBdaWrites(uint64_t shader_hash);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -501,6 +524,9 @@ private:
 		std::vector<uint8_t>    snapshot; // verify: their guest bytes when the pages were released
 		bool                    verify = false;
 	};
+	// SettleBdaWrites for the written pages [vaddr, vaddr + size): the parts inside cache buffers.
+	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
+	                           uint64_t& settled_pages);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	// `early`: the pages are released before the publication lands (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,

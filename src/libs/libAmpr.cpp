@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -131,6 +132,21 @@ template <typename T>
 static bool WriteGuest(uint64_t addr, const T& value) {
 	return WriteGuestBytes(addr, &value, sizeof(T));
 }
+
+// APR file ids are given one per resolved path (from chenxiao07 3248e3726). The FNV-1a hash of the
+// guest path collided: Astro Bot's 168,875 /app0 entries hold 6 colliding pairs (one is the galaxy
+// map's nx_ui_worldmap_bot_icon~~159.odxb with enemy_hand_ghost_anim_mat.anim), Demon's Souls' 13
+// pairs drew "?" models; whichever path of a pair was resolved last served the reads of both.
+// KYTY_APR_HASHED_IDS=1 restores the hashed ids.
+static bool UseHashedFileIds() {
+	static const bool hashed = [] {
+		const char* v = std::getenv("KYTY_APR_HASHED_IDS");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	return hashed;
+}
+
+static uint32_t g_next_file_id = 1;
 
 static uint32_t ComputeFileId(const char* guest_path) {
 	uint32_t hash = 2166136261u;
@@ -272,6 +288,9 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
+				if (!AprShared::UseHashedFileIds()) {
+					info.file_id = it->second.file_id = AprShared::g_next_file_id++;
+				}
 				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;

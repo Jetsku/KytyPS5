@@ -47,6 +47,16 @@ const TransitSkipConfig& TransitSkip() {
 	return config;
 }
 
+// KYTY_GUEST_STORAGE_REPEAT (Image::GuestTransitScope): default off.
+bool GuestStorageRepeatEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GUEST_STORAGE_REPEAT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+thread_local bool g_guest_transit = false;
+
 constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWrite |
                                                 vk::AccessFlagBits2::eShaderWrite |
                                                 vk::AccessFlagBits2::eMemoryWrite;
@@ -236,6 +246,14 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+Image::GuestTransitScope::GuestTransitScope(): m_previous(g_guest_transit) {
+	g_guest_transit = GuestStorageRepeatEnabled();
+}
+
+Image::GuestTransitScope::~GuestTransitScope() {
+	g_guest_transit = m_previous;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -251,6 +269,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
+	const bool guest                  = g_guest_transit;
 
 	Barriers barriers;
 	if (partial || has_subresource_states) {
@@ -272,7 +291,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eShaderWrite |
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
+				    static_cast<bool>(subresource_state.access_mask & write_access) &&
+				    !(guest && subresource_state.guest);
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -291,7 +311,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
+					subresource_state = {destination_stage, destination_access, destination_layout,
+					                     guest};
 				}
 			}
 		}
@@ -305,7 +326,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		                                vk::AccessFlagBits2::eMemoryWrite;
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		    (!repeated_write || (guest && state.guest))) {
 			return {};
 		}
 
@@ -327,7 +348,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
-	state = {destination_stage, destination_access, destination_layout};
+	state = {destination_stage, destination_access, destination_layout, guest};
 	return barriers;
 }
 

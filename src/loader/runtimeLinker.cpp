@@ -784,7 +784,7 @@ static void ReportReciprocalSqrtTraps(double seconds, uint64_t frames) {
 	previous           = current;
 	const auto& bench  = Libs::Graphics::FaultCost::StartupBenchmark();
 	const auto  rate   = seconds > 0 ? static_cast<double>(traps) / seconds : 0.0;
-	std::printf("Kyty AMD CPU patch: last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
+	std::printf("Kyty AMD instruction patch (Intel CPUs): last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
 	            frames != 0 ? static_cast<double>(traps) / static_cast<double>(frames) : 0.0, rate);
 	if (bench.valid) {
 		std::printf(", ~%.1f CPU cores busy trapping (%.2f us per trap round trip)",
@@ -853,6 +853,38 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The faulting host call chain, unwound from the fault context (symbolize the addresses
+		// with llvm-symbolizer --obj=kyty_emulator.exe). A frame without unwind data (guest code)
+		// continues from the return address at RSP while that is readable.
+		if (info->native_context != nullptr) {
+			CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host call chain:");
+			for (int frame = 0; frame < 32 && context.Rip != 0; frame++) {
+				std::printf("%s 0x%016" PRIx64, (frame % 4 == 0) ? "\n " : "",
+				            static_cast<uint64_t>(context.Rip));
+				DWORD64     image_base = 0;
+				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+				if (function == nullptr) {
+					if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) {
+						break;
+					}
+					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+					context.Rsp += sizeof(uint64_t);
+					continue;
+				}
+				// The unwind reads saved registers and the return address from this frame.
+				if (!IsReadableRange(context.Rsp, 512)) {
+					break;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 establisher  = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+				                 &handler_data, &establisher, nullptr);
+			}
+			std::printf("\n");
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
@@ -1953,7 +1985,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                emulate_amd ? "AMD instruction patch for Intel CPUs" : "Guest red-zone protection",
 			                module_name));
 		}
 		if (emulate_amd) {
@@ -2014,7 +2046,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
 			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+			    fmt::format("AMD instruction patch for Intel CPUs: {} {} ({})\n", module_name, status, details));
 			if (totals.reciprocal_sqrt.found != 0) {
 				// The live log's VRSQRTPS trap rate: sites without a native trampoline still trap.
 				Libs::Graphics::FaultCost::SetPeriodicReporter(ReportReciprocalSqrtTraps);

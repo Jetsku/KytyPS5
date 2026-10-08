@@ -103,6 +103,12 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --audio-master-volume <0-200>       Volume of everything on the main output. Default: 100.\n");
+	::printf("  --audio-main-volume <0-200>         Game sound (main ports). Default: 100.\n");
+	::printf("  --audio-music-volume <0-200>        Music on BGM ports. Default: 100.\n");
+	::printf("  --audio-pad-speaker-volume <0-200>  Controller-speaker sounds played on the main output\n"
+	         "                                      when no DualSense takes them. Default: %u.\n",
+	         Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -111,7 +117,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --amd-cpu                            Intel CPU compatibility: emulate the PS5's AMD-only\n"
+	         "                                       instructions (EXTRQ/INSERTQ, AMD VRSQRTPS results).\n"
+	         "                                       Not needed on AMD CPUs.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -119,6 +127,9 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --gpu-occlusion <on|off>             Accurate GPU occlusion queries (on) or always visible\n"
+	         "                                       (off, faster). Overrides KYTY_GPU_OCCLUSION (the\n"
+	         "                                       bundled preset: off).\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -394,6 +405,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--audio-master-volume" || arg == "--audio-main-volume" ||
+		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume") {
+			auto& target = arg == "--audio-master-volume" ? options.config.audio_master_volume
+			               : arg == "--audio-main-volume" ? options.config.audio_main_volume
+			               : arg == "--audio-music-volume"
+			                   ? options.config.audio_music_volume
+			                   : options.config.audio_pad_speaker_main_volume;
+			if (!ParseUint32(value, target) || target > Config::MAX_AUDIO_VOLUME) {
+				::printf("invalid %s (expected 0-%u): %s\n", arg.c_str(), Config::MAX_AUDIO_VOLUME,
+				         value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -414,6 +437,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-occlusion") {
+			bool on = false;
+			if (!ParseBool(value, on)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			// The renderer reads KYTY_GPU_OCCLUSION once, at the first occlusion query.
+#ifdef _WIN32
+			_putenv_s("KYTY_GPU_OCCLUSION", on ? "1" : "0");
+#else
+			setenv("KYTY_GPU_OCCLUSION", on ? "1" : "0", 1);
+#endif
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1397,12 +1399,59 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 		    address != 0 && address < gpu_limit && sizeof(word) < gpu_limit - address &&
 		    m_runtime.try_read_clean_backing(m_runtime.userdata, address, {&word, 1});
 		if (!probed) {
+			if (!InPlaceReadable(address)) {
+				// No guest page backs the address, so the in-place read would fault with nothing
+				// to resolve it. Read 0, as the GPU does from an unmapped page. The read is not
+				// certifiable: a prepared-read capture of this materialization is rejected.
+				NoteUnmappedRead(address);
+				ObserveSrtRead(m_runtime, address, {&word, 1}, false);
+				result = 0;
+				return true;
+			}
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 	}
 	ObserveSrtRead(m_runtime, address, {&word, 1}, true);
 	result = word;
 	return true;
+}
+
+// Every flat SRT read of a plan is evaluated before the dispatch, including loads the shader only
+// executes on some paths. Astro Bot's tiled lighting (78af8e26) loads a TLAS pointer from its SRT
+// and then header fields through it, behind an EXEC branch taken only by lanes that trace a
+// shadow ray; the pointer is null while no TLAS exists. The in-place read goes through the guest
+// mapping, where a page the tracker protects faults into its handler and is read back, but an
+// address outside every guest mapping faults with nothing to resolve it.
+bool SrtWalker::InPlaceReadable(uint64_t address) {
+	if (NeverMappedAddress(address, sizeof(uint32_t))) {
+		return false;
+	}
+	if (m_runtime.is_guest_mapped == nullptr || (address >> 12u) == m_mapped_page) {
+		return true;
+	}
+	// Reads are dword-aligned, so a dword never crosses the page.
+	if (!m_runtime.is_guest_mapped(address, sizeof(uint32_t))) {
+		return false;
+	}
+	m_mapped_page = address >> 12u;
+	return true;
+}
+
+void SrtWalker::NoteUnmappedRead(uint64_t address) const {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::SrtUnmappedReads);
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> logged;
+	{
+		std::scoped_lock lock(mutex);
+		const auto key = m_program.shader_hash ^ (static_cast<uint64_t>(m_program.stage) << 58u);
+		if (!logged.insert(key).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "SRT: {} shader 0x{:016x} reads unmapped address 0x{:x} before its dispatch; the read "
+	    "returns 0, as the GPU reads an unmapped page, and the dispatch runs.\n",
+	    StageName(m_program.stage), m_program.shader_hash, address));
 }
 
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
@@ -1975,6 +2024,43 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
+}
+
+bool FindVariantFlatRead(const ResourcePlan& program, uint32_t& pc) {
+	std::unordered_set<const Inst*> visited;
+	std::vector<Value>              pending;
+	for (const auto& read: program.srt_reads) {
+		const auto* read_inst = read.value.Resolve().TryInstruction();
+		if (read_inst == nullptr) {
+			continue;
+		}
+		// The read's address operands; the value it reads does not matter.
+		pending.clear();
+		for (size_t index = 0; index < read_inst->NumArgs(); index++) {
+			pending.push_back(read_inst->Arg(index));
+		}
+		while (!pending.empty()) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				const auto invariant = ResolveInvariantPhi(program, value);
+				if (invariant.IsEmpty()) {
+					pc = read_inst->Flags<MemoryFlags>().pc;
+					return true;
+				}
+				pending.push_back(invariant);
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+		}
+	}
+	return false;
 }
 
 void BuildSrtPlan(Program& program, bool variant_reads) {

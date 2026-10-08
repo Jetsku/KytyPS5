@@ -4,6 +4,8 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
+#include "libs/audioDiag.h"
+#include "libs/audioMix.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -11,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -190,6 +194,8 @@ struct AudioOut2PortStateEntry {
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
 	std::vector<uint8_t>   pcm_data;
+	Mix::LevelMeter        meter;     // KYTY_AUDIO_LEVELS: PCM the guest set since the last report.
+	uint32_t               pcm_sets = 0;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -459,6 +465,11 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	     "\t queue_depth = %" PRIu32 ", num_grains = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(buffer_size), *ctx,
 	     state->queue_depth, state->num_grains);
+	Diag::Print("sceAudioOut2ContextCreate -> context %" PRIu64 " (max ports %" PRIu32
+	            ", queue depth %" PRIu32 ", %" PRIu32 " grains, flags 0x%x, buffer 0x%" PRIx64
+	            " size 0x%" PRIx64 ")",
+	            *ctx, params->max_ports, params->queue_depth, params->num_grains, params->flags,
+	            reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(buffer_size));
 
 	return OK;
 }
@@ -466,6 +477,7 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
+	Diag::Print("sceAudioOut2ContextDestroy(context %" PRIu64 ")", ctx);
 
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
@@ -587,7 +599,9 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	const auto* context_state = audioout2_find_context_locked(ctx);
 	if (context_state == nullptr) {
 		g_audioout2_context_mutex.Unlock();
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		Diag::Print("sceAudioOut2PortCreate: unknown context %" PRIu64 " (port type 0x%x)", ctx,
+		            params->port_type);
+		return Diag::Error("sceAudioOut2PortCreate", AUDIO_OUT2_ERROR_INVALID_PARAM, 1);
 	}
 	const auto samples_num = context_state->num_grains == 0 ? 512u : context_state->num_grains;
 
@@ -596,7 +610,9 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	    g_audioout2_users.end()) {
 		g_audioout2_port_mutex.Unlock();
 		g_audioout2_context_mutex.Unlock();
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		Diag::Print("sceAudioOut2PortCreate: unknown user handle %" PRIu64 " (port type 0x%x)",
+		            static_cast<uint64_t>(params->user_handle), params->port_type);
+		return Diag::Error("sceAudioOut2PortCreate", AUDIO_OUT2_ERROR_INVALID_PARAM, 2);
 	}
 	AudioOut2PortStateEntry* port_state = nullptr;
 	for (auto& candidate: g_audioout2_ports) {
@@ -621,7 +637,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	g_audioout2_context_mutex.Unlock();
 
 	if (port_state == nullptr) {
-		return AUDIO_OUT2_ERROR_PORT_FULL;
+		return Diag::Error("sceAudioOut2PortCreate", AUDIO_OUT2_ERROR_PORT_FULL, params->port_type);
 	}
 
 	int audio_handle = 0;
@@ -640,10 +656,21 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	g_audioout2_port_mutex.Unlock();
 	if (!reserved) {
 		audioout2_close_audio_handle(audio_handle);
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return Diag::Error("sceAudioOut2PortCreate", AUDIO_OUT2_ERROR_INVALID_PARAM, 3);
 	}
 
 	*port = next_port;
+
+	// Object ports can be created per sound; the first ones and every non-object port suffice.
+	if (!audioout2_port_type_is_object(params->port_type) || next_port <= 16) {
+		Diag::Print("sceAudioOut2PortCreate(context %" PRIu64 ", type 0x%x, format 0x%x, %" PRIu32
+		            " Hz, flags 0x%x, user %" PRIu64 ") -> port %" PRIu64 ", %u frames, %u ch, "
+		            "output handle %d%s",
+		            ctx, params->port_type, params->data_format, params->sampling_freq,
+		            params->flags, static_cast<uint64_t>(params->user_handle), next_port,
+		            samples_num, audioout2_data_format_channels(params->data_format), audio_handle,
+		            audio_format == AudioInternal::Format::Unknown ? " (format not played)" : "");
+	}
 
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();
@@ -662,17 +689,104 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	PRINT_NAME();
 	LOGF("\t port = 0x%016" PRIx64 "\n", port);
 
-	int audio_handle = 0;
+	int      audio_handle = 0;
+	bool     found        = false;
+	uint16_t port_type    = 0;
 	g_audioout2_port_mutex.Lock();
 	if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 		audio_handle = state->audio_handle;
+		port_type    = state->port_type;
+		found        = true;
 		*state       = AudioOut2PortStateEntry {};
 	}
 	g_audioout2_port_mutex.Unlock();
 
+	if (!found) {
+		Diag::Print("sceAudioOut2PortDestroy(port %" PRIu64 "): no such port", port);
+	} else if (!audioout2_port_type_is_object(port_type) || port <= 16) {
+		Diag::Print("sceAudioOut2PortDestroy(port %" PRIu64 ", type 0x%x, output handle %d)", port,
+		            port_type, audio_handle);
+	}
+
 	audioout2_close_audio_handle(audio_handle);
 
 	return OK;
+}
+
+// KYTY_AUDIO_LEVELS: every 5 s, the PCM the guest hands each AudioOut2 port class (bed ports by
+// type, and all object ports together, which the emulator does not play), and the attribute ids
+// seen per class. The output ports themselves are also metered in audio.cpp.
+static bool audioout2_level_logging() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_LEVELS");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+static void audioout2_meter_locked(AudioOut2PortStateEntry* state, const void* pcm,
+                                   uint32_t attribute_mask) {
+	static uint64_t report_start = 0;
+	static uint32_t seen_masks[3] {};
+	const bool      object = audioout2_port_type_is_object(state->port_type);
+	const int       klass  = object ? 2 : ((state->port_type & 0xffu) == 1 ? 1 : 0);
+	if ((seen_masks[klass] | attribute_mask) != seen_masks[klass]) {
+		seen_masks[klass] |= attribute_mask;
+		std::printf("AudioLevel: AudioOut2 %s port type 0x%x attribute ids mask 0x%x\n",
+		            object ? "object" : "bed", state->port_type, seen_masks[klass]);
+	}
+	if (pcm != nullptr) {
+		const bool is_float = (state->data_format & 0x7fu) != 1;
+		state->meter.Add(pcm, state->samples_num, audioout2_data_format_channels(state->data_format),
+		                 is_float);
+		state->pcm_sets++;
+	}
+	const auto now = LibKernel::KernelGetProcessTime();
+	if (report_start == 0) {
+		report_start = now;
+	}
+	if (now - report_start < 5000000) {
+		return;
+	}
+	report_start = now;
+	// Objects: the power sum over all object ports (as if mixed incoherently), their peak and
+	// how many carried PCM.
+	double   object_power = 0.0;
+	double   object_peak  = 0.0;
+	uint32_t object_ports = 0;
+	uint64_t object_sets  = 0;
+	for (auto& entry: g_audioout2_ports) {
+		if (!entry.used || entry.pcm_sets == 0) {
+			continue;
+		}
+		if (audioout2_port_type_is_object(entry.port_type)) {
+			const double rms = entry.meter.Rms();
+			object_power += rms * rms * (static_cast<double>(entry.pcm_sets));
+			object_peak = std::max(object_peak, entry.meter.Peak());
+			object_ports++;
+			object_sets += entry.pcm_sets;
+		} else {
+			std::printf("AudioLevel: t=%.1f s AudioOut2 port %llu type 0x%x: %u PCM blocks, rms %.1f "
+			            "dBFS peak %.1f dBFS%s\n",
+			            static_cast<double>(now) / 1e6, static_cast<unsigned long long>(entry.handle),
+			            entry.port_type, entry.pcm_sets, Mix::LevelMeter::ToDb(entry.meter.Rms()),
+			            Mix::LevelMeter::ToDb(entry.meter.Peak()),
+			            entry.audio_handle > 0 ? "" : " (not played)");
+		}
+		entry.meter.Reset();
+		entry.pcm_sets = 0;
+	}
+	if (object_ports != 0) {
+		// Normalise the power by the number of blocks a single port pushes in 5 s (~469).
+		const double blocks = 5.0 * 48000.0 / 512.0;
+		std::printf("AudioLevel: t=%.1f s AudioOut2 objects (not played): %u ports with PCM, %llu "
+		            "blocks, summed rms %.1f dBFS, max peak %.1f dBFS\n",
+		            static_cast<double>(now) / 1e6, object_ports,
+		            static_cast<unsigned long long>(object_sets),
+		            Mix::LevelMeter::ToDb(std::sqrt(object_power / blocks)),
+		            Mix::LevelMeter::ToDb(object_peak));
+	}
+	std::fflush(stdout);
 }
 
 int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
@@ -681,7 +795,9 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 
 	const void* pcm_data = nullptr;
 	bool        has_pcm  = false;
+	uint32_t    ids      = 0;
 	for (uint32_t i = 0; i < num; i++) {
+		ids |= attributes[i].attribute_id < 32 ? (1u << attributes[i].attribute_id) : 0x80000000u;
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
 			AudioOut2Pcm pcm {};
@@ -689,6 +805,14 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			pcm_data = pcm.data;
 			has_pcm  = true;
 		}
+	}
+
+	if (audioout2_level_logging()) {
+		g_audioout2_port_mutex.Lock();
+		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
+			audioout2_meter_locked(state, pcm_data, ids);
+		}
+		g_audioout2_port_mutex.Unlock();
 	}
 
 	if (has_pcm) {
@@ -748,20 +872,25 @@ int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* han
 	g_audioout2_users.push_back(*handle);
 	LOGF("\t user_id = %" PRIu32 ", handle = 0x%016" PRIx64 "\n", user_id,
 	     static_cast<uint64_t>(*handle));
+	Diag::Print("sceAudioOut2UserCreate(user id %" PRIu32 ") -> user handle %" PRIu64, user_id,
+	            static_cast<uint64_t>(*handle));
 	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 	PRINT_NAME();
 	LOGF("\t handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(handle));
+	Diag::Print("sceAudioOut2UserDestroy(user handle %" PRIu64 ")", static_cast<uint64_t>(handle));
 	Common::LockGuard lock(g_audioout2_port_mutex);
 	const auto it = std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle);
 	if (it == g_audioout2_users.end()) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return Diag::Error("sceAudioOut2UserDestroy", AUDIO_OUT2_ERROR_INVALID_PARAM,
+		                   static_cast<int64_t>(handle));
 	}
 	if (std::any_of(g_audioout2_ports.begin(), g_audioout2_ports.end(),
 	                [handle](const auto& port) { return port.used && port.user == handle; })) {
-		return AUDIO_OUT2_ERROR_BUSY;
+		return Diag::Error("sceAudioOut2UserDestroy", AUDIO_OUT2_ERROR_BUSY,
+		                   static_cast<int64_t>(handle));
 	}
 	g_audioout2_users.erase(it);
 	return OK;
@@ -771,12 +900,14 @@ int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle
                                                        uint32_t* context_attributes,
                                                        uint32_t* port_attributes) {
 	if (context_attributes == nullptr || port_attributes == nullptr) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return Diag::Error("sceAudioOut2UserGetSupportedAttributes", AUDIO_OUT2_ERROR_INVALID_PARAM,
+		                   0);
 	}
 	Common::LockGuard lock(g_audioout2_port_mutex);
 	if (std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle) ==
 	    g_audioout2_users.end()) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return Diag::Error("sceAudioOut2UserGetSupportedAttributes", AUDIO_OUT2_ERROR_INVALID_PARAM,
+		                   static_cast<int64_t>(handle));
 	}
 	*context_attributes = 0;
 	*port_attributes    = 1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM;
@@ -826,7 +957,9 @@ int KYTY_SYSV_ABI AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handl
 	     reinterpret_cast<uint64_t>(*handle), reinterpret_cast<uint64_t>(vbap_params),
 	     reinterpret_cast<uint64_t>(ambi_params));
 
-	return (*handle != nullptr ? OK : AUDIO_OUT2_ERROR_PORT_FULL);
+	return (*handle != nullptr
+	            ? OK
+	            : Diag::Error("sceAudioOut2SpeakerArrayCreate", AUDIO_OUT2_ERROR_PORT_FULL, 0));
 }
 
 int KYTY_SYSV_ABI AudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handle) {
@@ -917,7 +1050,7 @@ int KYTY_SYSV_ABI AudioOut2Set3DLatency(uint32_t user_id, uint32_t output, uint3
 	     output, latency_us);
 
 	if (output > AUDIO_OUT2_MASTERING_OUTPUT_RECORDING) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return Diag::Error("sceAudioOut2Set3DLatency", AUDIO_OUT2_ERROR_INVALID_PARAM, output);
 	}
 
 	g_audioout2_latency_mutex.Lock();
@@ -938,7 +1071,9 @@ int KYTY_SYSV_ABI AudioOut2Set3DLatency(uint32_t user_id, uint32_t output, uint3
 	}
 	g_audioout2_latency_mutex.Unlock();
 
-	return (free_state != nullptr ? OK : AUDIO_OUT2_ERROR_PORT_FULL);
+	return (free_state != nullptr
+	            ? OK
+	            : Diag::Error("sceAudioOut2Set3DLatency", AUDIO_OUT2_ERROR_PORT_FULL, user_id));
 }
 
 int KYTY_SYSV_ABI AudioOut2MasteringInit(uint32_t flags) {
@@ -962,7 +1097,8 @@ int KYTY_SYSV_ABI AudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* sta
 	     reinterpret_cast<uint64_t>(state), output, static_cast<uint64_t>(user));
 
 	if (state == nullptr) {
-		return AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM;
+		return Diag::Error("sceAudioOut2MasteringGetState",
+		                   AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM, output);
 	}
 
 	const auto states_id = state->states_id;
@@ -993,7 +1129,9 @@ int KYTY_SYSV_ABI AudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* sta
 			full_state->limiter_states.descriptor.size = sizeof(AudioOut2MasteringLimiterStates);
 			return OK;
 		}
-		default: return AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID;
+		default:
+			return Diag::Error("sceAudioOut2MasteringGetState",
+			                   AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID, states_id);
 	}
 }
 

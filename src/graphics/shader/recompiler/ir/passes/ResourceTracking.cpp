@@ -84,15 +84,16 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	Tracker(Program& program, bool indirect_scalar_buffers)
+	Tracker(Program& program, bool indirect_scalar_buffers, bool bda_writes)
 	    : m_program(program), m_info(program.info),
-	      m_indirect_scalar_buffers(indirect_scalar_buffers) {
+	      m_indirect_scalar_buffers(indirect_scalar_buffers), m_bda_writes(bda_writes) {
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
-		m_shader_writes = HasShaderMemoryWrites(program);
+		m_info.uses_dma   = false;
+		m_info.bda_writes = false;
+		m_shader_writes   = HasShaderMemoryWrites(program);
 	}
 
 	void Run() {
@@ -1225,12 +1226,20 @@ private:
 		if (buffer != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
 			               source)) {
-				// An S_BUFFER_LOAD through a V# the shader computed (KYTY_SRT_VARIANT_READS, e.g.
-				// a BVH instance's record) reads through BDA like the vector raw loads below.
-				const bool indirect_scalar = m_indirect_scalar_buffers &&
-				                             memory.kind == ResourceKind::ScalarBuffer &&
-				                             memory.SupportsIndirectBufferLoad(op);
-				if (!indirect_scalar &&
+				// KYTY_SRT_VARIANT_READS: an S_BUFFER_LOAD through a V# the shader computed (e.g. a
+				// BVH instance's record) or any raw vector load through one reads through BDA like
+				// the raw DWORD x2-x4 loads below.
+				const bool indirect_variant =
+				    m_indirect_scalar_buffers &&
+				    ((memory.kind == ResourceKind::ScalarBuffer &&
+				      memory.SupportsIndirectBufferLoad(op)) ||
+				     (memory.kind == ResourceKind::Buffer && memory.SupportsIndirectRawLoad(op)));
+				// KYTY_BDA_WRITES: a raw store or atomic through one writes through BDA (compute
+				// only: the renderer settles each dispatch of such a program synchronously).
+				const bool indirect_write = m_bda_writes && memory.kind == ResourceKind::Buffer &&
+				                            m_program.stage == ShaderType::Compute &&
+				                            memory.SupportsIndirectRawWrite(op);
+				if (!indirect_variant && !indirect_write &&
 				    (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op))) {
 					if (m_indirect_scalar_buffers) {
 						MarkUnresolved(flags.pc);
@@ -1240,8 +1249,19 @@ private:
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a raw DWORD x2/x3/x4 load");
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
+				auto& indirect = m_program.memory_info[flags.index];
+				indirect.kind  = ResourceKind::IndirectBuffer;
+				if (m_indirect_scalar_buffers || indirect_write) {
+					// No bound buffer: resource-control-flow planning skips it (it has no source).
+					indirect.resource = NoIndirectBufferResource;
+				}
+				if (indirect_write) {
+					// An unbounded writer: every memo and verdict that trusts buffer contents is
+					// retired when it is recorded (CommitBindings, has_address_writes).
+					m_info.bda_writes             = true;
+					m_program.has_address_writes = true;
+				}
+				m_info.uses_dma = true;
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
@@ -1356,11 +1376,12 @@ private:
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 	bool                                       m_indirect_scalar_buffers = false;
+	bool                                       m_bda_writes              = false;
 	uint32_t                                   m_unresolved_pc = UINT32_MAX;
 
 public:
 	// KYTY_SRT_VARIANT_READS: a descriptor the shader computes at runtime that has no BDA path
-	// (an image, a sampler, a single-dword vector load). Planning it at runtime removed the flat
+	// (an image, a sampler, a formatted access, or a write without KYTY_BDA_WRITES). Planning it at runtime removed the flat
 	// slot that would have failed to evaluate and dropped the dispatch, so the program is dropped
 	// here instead of failing: never worse than without the switch.
 	void MarkUnresolved(uint32_t pc) { m_unresolved_pc = std::min(m_unresolved_pc, pc); }
@@ -1369,8 +1390,8 @@ public:
 
 } // namespace
 
-uint32_t TrackResources(Program& program, bool indirect_scalar_buffers) {
-	Tracker tracker(program, indirect_scalar_buffers);
+uint32_t TrackResources(Program& program, bool indirect_scalar_buffers, bool bda_writes) {
+	Tracker tracker(program, indirect_scalar_buffers, bda_writes);
 	tracker.Run();
 	return tracker.UnresolvedPc();
 }

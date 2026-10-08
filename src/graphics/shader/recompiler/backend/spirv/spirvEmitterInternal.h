@@ -146,6 +146,9 @@ struct EmitterState {
 	uint32_t                   helper_invocation_variable            = 0;
 	// KYTY_LOOP_GUARD: the invocation's loop-iteration count (a Function variable).
 	uint32_t                   loop_guard_variable                   = 0;
+	// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS: BVH instruction executions of this invocation
+	// (Function u32; both halves of a two-lane invocation add to it).
+	uint32_t                   bvh_node_count_variable               = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -199,6 +202,7 @@ uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);
+uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
@@ -546,6 +550,12 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+
+// 64-bit (OpTypeInt 64) guest/device address constant.
+uint32_t EmitDeviceAddressConstant(EmitterState& state, uint64_t value);
+// Guest address (64-bit int) -> device address of the same byte through the BDA page table, or 0
+// (and a recorded fault) when the page is not mapped. Requires program.info.uses_dma.
+uint32_t EmitBdaDeviceAddress(ValueEmitContext& ctx, uint32_t guest_address);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

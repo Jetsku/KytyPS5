@@ -880,7 +880,12 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	const uint32_t status_dwords = inst.tfe || inst.lwe ? 1u : 0u;
 	include_vector(inst.dst, memory_family ? std::max(inst.data_dwords, 1u) + status_dwords : 1u);
 	include_vector(inst.dst2);
-	include_vector(inst.src0);
+	const bool bvh = inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	                 inst.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY;
+	// A contiguous BVH address spans 8-12 VGPRs from VADDR (only VADDR with NSA).
+	include_vector(inst.src0, bvh && inst.image_nsa_dwords == 0u
+	                              ? std::max(inst.image_address_components, 1u)
+	                              : 1u);
 	include_vector(inst.src1);
 	include_vector(inst.src2);
 	include_vector(inst.src3);
@@ -1391,7 +1396,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 		lds_write_pending = translator.LdsWritePending();
 	}
-	IR::ValidateProgram(result, false);
+	if (IR::ValidationEnabled()) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 

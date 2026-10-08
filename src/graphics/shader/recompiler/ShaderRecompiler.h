@@ -27,11 +27,21 @@ struct CompileOptions {
 	bool                        plain_mip_stats_variant = false;
 };
 
+// A function an S_SWAPPC_B64 call jumps to, as the dispatch's user data gives it: `address` is the
+// value of user SGPRs s[user_sgpr:user_sgpr+1]; the callee returns through s[return_sgpr:+1].
+struct CallTarget {
+	uint64_t address     = 0;
+	uint32_t user_sgpr   = 0;
+	uint32_t return_sgpr = 0;
+};
+
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
 	bool        skip_dispatch = false;
+	// Only for a program skipped because it calls through S_SWAPPC_B64 (KYTY_SRT_VARIANT_READS).
+	std::vector<CallTarget> call_targets;
 };
 
 struct CompileResult {

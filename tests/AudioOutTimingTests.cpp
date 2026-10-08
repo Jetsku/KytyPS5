@@ -32,6 +32,7 @@ bool                                 fail_open = false, fail_put = false, stalle
 bool                                 pad_connected = false, pad_bluetooth = false;
 uint64_t                             pad_queue_us = 0;
 int                                  clears = 0;
+float                                last_put_sample = 0.0f; // First sample of the last queued block.
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -80,10 +81,13 @@ int GetAudioStreamQueued(SDL_AudioStream* stream) {
 	                        state.spec.channels);
 }
 
-bool PutAudioStreamData(SDL_AudioStream* stream, const void*, int bytes) {
+bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 	now += processing;
 	if (fail_put) {
 		return false;
+	}
+	if (data != nullptr && bytes >= static_cast<int>(sizeof(float))) {
+		last_put_sample = *static_cast<const float*>(data);
 	}
 	auto& state = GetStream(stream);
 	Drain(state);
@@ -368,6 +372,46 @@ void TestControllerSpeakerPacing() {
 	      "stalled USB speaker waited longer than one audio block");
 }
 
+void TestMixGains() {
+	namespace Mix = Libs::Audio::Mix;
+	Fixture f;
+	f.pcm.fill(0.5f);
+
+	// Unity settings leave every port's samples alone.
+	const auto main  = f.Open(256, Mix::PORT_TYPE_MAIN);
+	const auto bgm   = f.Open(256, Mix::PORT_TYPE_BGM);
+	const auto pad   = f.Open(256, Mix::PORT_TYPE_PADSPK);
+	const auto voice = f.Open(256, Mix::PORT_TYPE_VOICE);
+	for (const auto port: {main, bgm, pad, voice}) {
+		last_put_sample = 0.0f;
+		f.Output(port, false);
+		Check(last_put_sample == 0.5f, "unity mix changed the samples");
+	}
+
+	Mix::Settings settings;
+	settings.master      = 50;
+	settings.main        = 100;
+	settings.music       = 200;
+	settings.pad_on_main = 25;
+	f.audio.SetMixSettings(settings);
+	const auto played = [&f](Audio::Id port) {
+		last_put_sample = -1.0f;
+		f.Output(port, false);
+		return last_put_sample;
+	};
+	Check(played(main) == 0.25f, "main port did not get master x main gain");
+	Check(played(voice) == 0.25f, "voice port is not in the main category");
+	Check(played(bgm) == 0.5f, "BGM port did not get master x music gain");
+	Check(played(pad) == 0.0625f, "pad speaker on the main output did not get its gain");
+
+	// A DualSense that takes the pad speaker gets the samples instead; the main output gets none.
+	f.audio.AudioOutClose(pad);
+	pad_connected       = true;
+	pad_queue_us        = 1000;
+	const auto pad_ds   = f.Open(256, Mix::PORT_TYPE_PADSPK);
+	Check(played(pad_ds) == -1.0f, "pad speaker played on the main output with a DualSense");
+}
+
 void TestInvalidBatchSize() {
 	Libs::Audio::AudioOut::AudioOutOutputParam param {};
 	for (const auto count: {0u, 33u}) {
@@ -397,6 +441,7 @@ int main() {
 	TestFallbackUsesEachPortsPeriod();
 	TestFailedQueueUsesFallbackClock();
 	TestControllerSpeakerPacing();
+	TestMixGains();
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	Check(streams.empty(), "output stream leaked");

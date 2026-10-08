@@ -32,6 +32,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -442,9 +443,36 @@ bool NativeDccEnabled() {
 	return enabled;
 }
 
+// A strict SRT read that failed because no guest page can back the address: never-mapped
+// addresses, and with KYTY_SRT_VARIANT_READS any address outside the GPU-mapped guest ranges. No
+// synchronization could make such a read succeed, so the materialization would stop the emulator;
+// it reads 0 instead, as the GPU reads an unmapped page (SrtWalker::InPlaceReadable does the same
+// for the in-place reads).
+bool ReadsUnmappedGuestMemory(uint64_t address, std::span<uint32_t> values) {
+	const auto size = values.size_bytes();
+	if (!ShaderRecompiler::IR::NeverMappedAddress(address, size) &&
+	    (!ShaderRecompiler::GetCodegenOptions().srt_variant_reads ||
+	     LibKernel::Memory::IsGpuMapped(address, size))) {
+		return false;
+	}
+	std::fill(values.begin(), values.end(), 0u);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::SrtUnmappedReads);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "SRT: a resource read of unmapped address 0x{:x} (0x{:x} bytes) before a dispatch or "
+		    "draw returns 0, as the GPU reads an unmapped page.\n",
+		    address, size));
+	}
+	return true;
+}
+
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	const bool read = !values.empty() &&
 	    LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	if (!read && !values.empty() && ReadsUnmappedGuestMemory(address, values)) {
+		return true;
+	}
 	if (!read && userdata != nullptr) {
 		static_cast<ShaderReadAttempt*>(userdata)->Missing(address, values.size_bytes());
 	}
@@ -709,6 +737,78 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		} else {
 			file.Write(data, size);
 		}
+	}
+}
+
+// The code of each function a skipped S_SWAPPC_B64 program calls (ShaderRecompiler CallTarget), next
+// to the program's own dump: original/callee_<stage>_<program hash>_<callee address>.bin. It holds
+// the callee from its first instruction up to and including the first S_SETPC_B64 (or null-
+// destination S_SWAPPC_B64) through the return pair, at most 4 KiB; a literal equal to that
+// encoding would end it early. Only guest memory the GPU can read is copied: through the clean
+// backing, else in place inside the GPU-mapped ranges; an unreadable callee logs a line instead.
+void DumpCallTargets(const char* stage_name, uint64_t shader_hash,
+                     std::span<const ShaderRecompiler::CallTarget> targets) {
+	if (!Config::GraphicsDebugDumpEnabled() || targets.empty()) {
+		return;
+	}
+	constexpr size_t MaxWords   = 1024; // 4 KiB
+	constexpr size_t ChunkWords = 64;
+	for (const auto& target: targets) {
+		std::vector<uint32_t> words(MaxWords);
+		size_t                read = 0;
+		if ((target.address & 3u) == 0u) {
+			while (read < MaxWords) {
+				const auto chunk   = std::span(words).subspan(read, std::min(ChunkWords, MaxWords - read));
+				const auto address = target.address + read * sizeof(uint32_t);
+				if (!LibKernel::Memory::TryReadGpuCleanBacking(address, chunk.data(),
+				                                              chunk.size_bytes())) {
+					if (ShaderRecompiler::IR::NeverMappedAddress(address, chunk.size_bytes()) ||
+					    !LibKernel::Memory::IsGpuMapped(address, chunk.size_bytes())) {
+						break;
+					}
+					std::memcpy(chunk.data(), reinterpret_cast<const void*>(address),
+					            chunk.size_bytes());
+				}
+				read += chunk.size();
+			}
+		}
+		size_t end      = read;
+		bool   returned = false;
+		for (size_t i = 0; i < read; i++) {
+			const auto word = words[i];
+			const bool sop1 = (word >> 23u) == 0x17du;
+			const auto op   = (word >> 8u) & 0xffu;
+			const auto sdst = (word >> 16u) & 0x7fu;
+			if (sop1 && (word & 0xffu) == target.return_sgpr &&
+			    (op == 0x20u || (op == 0x21u && sdst == 125u))) {
+				end      = i + 1;
+				returned = true;
+				break;
+			}
+		}
+		if (end == 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_SRT_VARIANT_READS: callee 0x{:x} of {} shader 0x{:016x} is not readable "
+			    "guest memory; not dumped.\n",
+			    target.address, stage_name, shader_hash));
+			continue;
+		}
+		const auto path = Config::GetShaderLogFolder() / "original" /
+		                  fmt::format("callee_{}_{:016x}_{:012x}.bin", stage_name, shader_hash,
+		                              target.address);
+		Common::File::CreateDirectories(path.parent_path());
+		Common::File file(path);
+		if (file.IsInvalid()) {
+			const auto path_text = Common::PathToString(path);
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+			continue;
+		}
+		file.Write(words.data(), end * sizeof(uint32_t));
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_SRT_VARIANT_READS: dumped callee 0x{:x} (s[{}:{}]) of {} shader 0x{:016x}: {} "
+		    "bytes, {}.\n",
+		    target.address, target.user_sgpr, target.user_sgpr + 1u, stage_name, shader_hash,
+		    end * sizeof(uint32_t), returned ? "up to its return" : "no return within the dump"));
 	}
 }
 
@@ -1270,8 +1370,9 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t>              user_dependencies;
 		bool                               projected_key = false;
 		PermutationList                    permutations;
-		// Set under the exclusive programs lock; may be set on an already published entry.
-		std::atomic<bool>                  skip_dispatch {false};
+		// Set under the exclusive programs lock; may be set on an already published entry. Also
+		// set without it by Materialize for a plan that can never materialize (SkipVariantPlan).
+		mutable std::atomic<bool>          skip_dispatch {false};
 		// Mutated in place by reuse-mode refreshes; only touched under m_reuse_mutex.
 		mutable ReuseState                 reuse;
 		// The source's unmodified translation for further permutations (KYTY_TRANSLATION_CACHE),
@@ -1579,6 +1680,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .try_read_clean_backing = SrtReadRunsEnabled() ? TryReadShaderCleanBacking : nullptr,
 		    .share_clean_values = SharedResourceEvaluationEnabled(),
+		    // KYTY_SRT_VARIANT_READS: an in-place flat read outside the GPU-mapped guest ranges
+		    // reads 0 (a garbage or null pointer the shader only follows on some paths). Without
+		    // the switch only never-mapped addresses do (SrtWalker::InPlaceReadable).
+		    .is_guest_mapped = ShaderRecompiler::GetCodegenOptions().srt_variant_reads
+		                           ? LibKernel::Memory::IsGpuMapped
+		                           : nullptr,
 		};
 	}
 
@@ -1667,6 +1774,43 @@ struct PipelineCache::ProgramCache {
 		return false;
 	}
 
+	// A plan that failed to materialize with no guest range left to synchronize. When one of its
+	// flat SRT reads has a loop-carried address (a BVH traversal's instance record) and
+	// KYTY_SRT_VARIANT_READS is off, no evaluation before the dispatch can ever produce it: skip
+	// the source's dispatches and draws with one console line per shader instead of stopping the
+	// emulator. Every other such failure still exits. A concurrent Get of the same source may
+	// still materialize once more; it fails the same way.
+	static bool SkipVariantPlan(const SourceEntry& source) {
+		const auto& plan = source.resource_plan;
+		uint32_t    pc   = 0;
+		if (ShaderRecompiler::GetCodegenOptions().srt_variant_reads ||
+		    !ShaderRecompiler::IR::FindVariantFlatRead(plan, pc)) {
+			return false;
+		}
+		if (source.skip_dispatch.exchange(true, std::memory_order_relaxed)) {
+			return true;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::VariantPlanSkips);
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> logged;
+		{
+			std::scoped_lock lock(mutex);
+			if (!logged.insert(plan.shader_hash ^ static_cast<uint64_t>(plan.stage)).second) {
+				return true;
+			}
+		}
+		std::string stage = ProgramStageName(plan.stage);
+		std::ranges::transform(stage, stage.begin(), [](unsigned char c) {
+			return static_cast<char>(std::toupper(c));
+		});
+		PipelineCacheLog("{} shader 0x{:016x} reads SRT data through a loop-carried address "
+		                 "(pc=0x{:08x}), which no evaluation before the dispatch can produce; its "
+		                 "dispatches and draws are skipped (KYTY_SRT_VARIANT_READS=1 compiles such "
+		                 "reads).",
+		                 stage, plan.shader_hash, pc);
+		return true;
+	}
+
 	// Materializes one stage and records a readiness failure for the retry loop.
 	bool Materialize(const SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                 ShaderRecompiler::IR::EvaluationScratch& evaluation, ProgramScratch& scratch,
@@ -1683,6 +1827,9 @@ struct PipelineCache::ProgramCache {
 		if (clean_compiles && DrawPrep::Speculative()) return false;
 		// An unsuccessful optional uniform-fill/active-source probe is harmless if the
 		// complete refresh succeeded. Only a failed refresh requests a retry.
+		if (read_attempt.count == 0 && SkipVariantPlan(source)) {
+			return false; // not a readiness failure: the caller skips the dispatch or draw
+		}
 		if (!NativeDccEnabled() || read_attempt.count == 0) {
 			// A failure no read can fix (an unsupported descriptor format, a specialization the
 			// recompiler rejects): the stage gets no program and its draws/dispatches are dropped
@@ -2533,6 +2680,11 @@ struct PipelineCache::ProgramCache {
 				translate_now();
 			}
 			if (translated.skip_dispatch) {
+				// Skipped ray-tracing shaders are never compiled; dump their guest code here.
+				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
+				                   params.code, translated.decoded_dump);
+				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash,
+				                translated.call_targets);
 				if (disk_on) {
 					disk->AddSource(disk_key, true, {});
 				}

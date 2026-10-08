@@ -14869,7 +14869,21 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
+  if (argc >= 3 && std::strcmp(argv[1], "--bvh-validate") == 0) {
+    return ValidateBvhShaderFiles(argc, argv) == 0 ? 0 : 1;
+  }
+  if (argc >= 3 && std::strcmp(argv[1], "--bvh-files") == 0) {
+    return TranslateBvhShaderFiles(argc, argv) == 0 ? 0 : 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
+    TestRayTracingDispatchDetection();
+    TestRayTracingStub();
+    TestTraversalLoopBreakRegion();
+    return 0;
+  }
   TestRayTracingDispatchDetection();
+  TestRayTracingStub();
+  TestTraversalLoopBreakRegion();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

@@ -10,6 +10,16 @@
 #include <fmt/format.h>
 #include <string>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace Common {
 
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
@@ -49,6 +59,19 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 void DbgExit(int status) {
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
+#if defined(_WIN32)
+	// From chenxiao07/KytyPS5 150517a8a. std::_Exit is ExitProcess: it kills the other threads
+	// wherever they are, then runs every DLL's detach routine on this thread, where a driver's can
+	// wait forever on what a killed thread held (a crashed emulator stayed a one-thread process that
+	// could not be killed, holding its memory and the exe). KYTY_FATAL_EXIT_PROCESS=1 keeps _Exit.
+	static const bool exit_process = [] {
+		const char* value = std::getenv("KYTY_FATAL_EXIT_PROCESS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!exit_process) {
+		TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+	}
+#endif
 	std::_Exit(status);
 }
 

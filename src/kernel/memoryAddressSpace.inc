@@ -1725,8 +1725,18 @@ private:
 		if (search_start >= search_end || size > search_end - search_start) {
 			return 0;
 		}
-		for (const auto& [base, range_size]: m_free) {
-			const auto candidate = AlignUp(std::max(base, search_start), alignment);
+		// The free ranges are sorted and disjoint: a range below the one holding search_start can
+		// hold no candidate, nor can one starting at or past search_end. Scanning every range from
+		// the bottom of the address space, again for each guest reservation a hint-less mapping skips
+		// (FindGuestFreeRange), held m_mutex long enough to stall ProtectTransient on the render
+		// thread (chenxiao07/KytyPS5 839a57d26: up to 15 ms per wait while streaming). Same result.
+		auto it = m_free.upper_bound(search_start);
+		if (it != m_free.begin()) {
+			--it;
+		}
+		for (; it != m_free.end() && it->first < search_end; ++it) {
+			const auto& [base, range_size] = *it;
+			const auto candidate           = AlignUp(std::max(base, search_start), alignment);
 			if (candidate < search_end && size <= search_end - candidate &&
 			    GuestFreeRangeContains(base, range_size, candidate, size)) {
 				return candidate;

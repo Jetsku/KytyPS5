@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -22,6 +24,20 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
 
+	// KYTY_BDA_WRITES. Before a dispatch that writes through BDA: clears the written-page bitmap and
+	// the dropped-write counter the first time (the fault buffer's second half, see BufferCache).
+	void PrepareBdaWrites();
+	// After it: records the compaction of the written-page bitmap into page addresses (clearing
+	// the bitmap) and a copy of the dropped-write counter (then clearing it), submits, waits for
+	// that tick and returns what the dispatch wrote. overflow: more pages than the list holds
+	// (the bits past it are lost; the caller must settle conservatively).
+	struct BdaWrites {
+		std::vector<uint64_t> pages;
+		uint32_t              dropped  = 0;
+		bool                  overflow = false;
+	};
+	[[nodiscard]] BdaWrites CollectBdaWrites();
+
 private:
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
@@ -33,6 +49,10 @@ private:
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;
+	// KYTY_BDA_WRITES only (created on first use).
+	vk::Pipeline                               m_bda_pages_pipeline = nullptr;
+	std::unique_ptr<Buffer>                    m_bda_download;
+	bool                                       m_bda_region_cleared = false;
 };
 
 } // namespace Libs::Graphics

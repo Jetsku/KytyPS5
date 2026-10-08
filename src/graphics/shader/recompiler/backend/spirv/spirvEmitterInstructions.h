@@ -255,6 +255,9 @@ inline constexpr auto EmitLoadAddressU32        = EmitLoadMemory;
 inline constexpr auto EmitStoreAddressU8        = EmitStoreMemory;
 inline constexpr auto EmitStoreAddressU16       = EmitStoreMemory;
 inline constexpr auto EmitStoreAddressU32       = EmitStoreMemory;
+// IMAGE_BVH*_INTERSECT_RAY software lowering and stub (spirvEmitterRayTracing.cpp).
+uint32_t              EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvhIntersectRayStub(EmitterState& state, uint32_t node_lo);
 inline constexpr auto EmitLoadBufferU8          = EmitLoadMemory;
 inline constexpr auto EmitLoadBufferU16         = EmitLoadMemory;
 inline constexpr auto EmitLoadBufferU32         = EmitLoadMemory;

@@ -242,6 +242,14 @@ VALUE_OPCODE(LoadAddressU32, U32, AddressResource, U32, U32, U1)
 VALUE_OPCODE(StoreAddressU8, Void, AddressResource, U32, U32, U8, U1)
 VALUE_OPCODE(StoreAddressU16, Void, AddressResource, U32, U32, U16, U1)
 VALUE_OPCODE(StoreAddressU32, Void, AddressResource, U32, U32, U32, U1)
+// IMAGE_BVH*_INTERSECT_RAY (KYTY_RT_SOFTWARE): one ray/BVH-node test, RDNA2 result layout.
+// GetAddressResource(T# base lo, hi), T# dwords 0-3, node pointer lo/hi, ray extent, origin xyz,
+// direction xyz, inverse direction xyz (f32 bits; A16 already widened), EXEC.
+VALUE_OPCODE(BvhIntersectRay, U32x4, AddressResource, U32x4, U32, U32, U32, U32, U32, U32, U32,
+             U32, U32, U32, U32, U32, U1)
+// KYTY_RT_STUB: the "no intersection" result for node pointer (low dword). Opaque on purpose, so
+// traversal code after it is not folded away (which reshapes the CFG the game was compiled to).
+VALUE_OPCODE(BvhIntersectRayStub, U32x4, U32)
 VALUE_OPCODE(LoadBufferU8, U8, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU16, U16, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU32, U32, BufferResource, U32, U32, U32, U1)

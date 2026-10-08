@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -224,6 +225,17 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+bool ValidationEnabled() {
+	static const bool enabled = [] {
+		if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+			return true;
+		}
+		const auto* value = std::getenv("KYTY_IR_VALIDATE");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
@@ -477,7 +489,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
+				    !memory.SupportsIndirectRawLoad(inst.GetOpcode()) &&
+				    !(program.info.bda_writes &&
+				      memory.SupportsIndirectRawWrite(inst.GetOpcode()))) {
 					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
 				if (buffer_components > 1u &&

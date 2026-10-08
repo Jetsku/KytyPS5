@@ -383,6 +383,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	if (program.info.uses_bvh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
+	}
+	if (program.info.bda_writes) {
+		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below. The settle relies
+		// on PrepareBda's pass above having uploaded every CPU-dirty page first.
+		EXIT_IF(!program.info.uses_dma);
+		m_context.GetBufferCache().PrepareBdaWrites();
+	}
 	RebindImages(bindings);
 	RebindBuffers(bindings);
 
@@ -394,7 +403,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
+	bool has_storage_writes = HasShaderBufferWrites(input_info.stage) || program.info.bda_writes;
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& image) {
@@ -413,6 +422,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (program.info.bda_writes) {
+		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
+	}
 	// A proven uniform buffer fill leaves a known value (e.g. DCC fast-clear codes). Recording
 	// it lets consumers skip reading the range back while nothing else writes it.
 	{
@@ -504,6 +516,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	if (program.info.uses_bvh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
+	}
+	if (program.info.bda_writes) {
+		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below. The settle relies
+		// on PrepareBda's pass above having uploaded every CPU-dirty page first.
+		EXIT_IF(!program.info.uses_dma);
+		m_context.GetBufferCache().PrepareBdaWrites();
+	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
@@ -516,6 +537,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	    program.info.bda_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
@@ -546,6 +568,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (program.info.bda_writes) {
+		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
+	}
 	ResetBindings();
 }
 

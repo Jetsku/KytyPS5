@@ -414,6 +414,23 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+# KYTY_BDA_WRITES: the same compaction over the written-page bitmap, with room for 64Ki pages
+# (1 GiB) per settle.
+set(bda_write_pages_shader_spv "${gpu_tiler_generated_dir}/bda_write_pages_process.spv")
+set(bda_write_pages_shader_header "${gpu_tiler_generated_dir}/bda_write_pages_process_spv.h")
+add_custom_command(
+	OUTPUT "${bda_write_pages_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=65536
+	        -o "${bda_write_pages_shader_spv}" "${fault_buffer_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${bda_write_pages_shader_spv}
+	        -DOUTPUT=${bda_write_pages_shader_header}
+	        -DSYMBOL=BDA_WRITE_PAGES_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fault_buffer_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${bda_write_pages_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -783,6 +800,12 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(audio_diag_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioDiagTests.cpp")
+target_include_directories(audio_diag_tests PRIVATE ${inc_headers})
+
+add_executable(audio_mix_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioMixTests.cpp")
+target_include_directories(audio_mix_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
 target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
@@ -879,6 +902,11 @@ target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DI
 add_executable(image_clear_range_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ImageClearRangeTests.cpp")
 target_include_directories(image_clear_range_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# Register clear decoding (imageInfo.h, KYTY_CLEAR_REGISTER_WIDE); no Vulkan device.
+add_executable(clear_register_decode_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ClearRegisterDecodeTests.cpp")
+target_link_libraries(clear_register_decode_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(clear_register_decode_tests PRIVATE ${inc_headers})
+
 add_executable(host_input_pulse_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputPulseTests.cpp")
 target_include_directories(host_input_pulse_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
@@ -909,6 +937,10 @@ add_executable(occlusion_reset_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Occlusi
 target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
 target_link_libraries(occlusion_reset_tests common)
 add_test(NAME occlusion_reset COMMAND $<TARGET_FILE:occlusion_reset_tests>)
+
+add_executable(occlusion_pairs_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionPairsTests.cpp")
+target_include_directories(occlusion_pairs_tests PRIVATE ${inc_headers})
+add_test(NAME occlusion_pairs COMMAND $<TARGET_FILE:occlusion_pairs_tests>)
 
 # Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
 add_executable(binding_path_tests EXCLUDE_FROM_ALL
@@ -1016,6 +1048,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME image_clear_range COMMAND $<TARGET_FILE:image_clear_range_tests>)
+	add_test(NAME clear_register_decode COMMAND $<TARGET_FILE:clear_register_decode_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
@@ -1098,6 +1131,8 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME audio_diag COMMAND $<TARGET_FILE:audio_diag_tests>)
+	add_test(NAME audio_mix COMMAND $<TARGET_FILE:audio_mix_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
@@ -2008,6 +2043,11 @@ if(BUILD_TESTING)
 	add_cp_recorder_validation(stream_buffer_ring --stream-buffer-only)
 	add_cp_recorder_validation(texture_cache_layered_image --layered-image-only)
 	add_cp_recorder_validation(buffer_cache_eager_readback --readback-eager-only)
+	# KYTY_BDA_WRITES: stores and atomics through runtime V#s via BDA.
+	add_test(NAME bda_writes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-writes-only)
+	set_tests_properties(bda_writes PROPERTIES
+		ENVIRONMENT "KYTY_BDA_WRITES=1;KYTY_SRT_VARIANT_READS=1")
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
@@ -2042,12 +2082,14 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		image_clear_range_tests
+		clear_register_decode_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
 		avplayer_file_tests
 		bit_array_tests
 		lod_stats_report_tests
+		occlusion_pairs_tests
 		game_patch_filter_tests
 		lru_cache_tests
 		spirv_local_arrays_tests
@@ -2065,6 +2107,8 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
+		audio_diag_tests
+		audio_mix_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests

@@ -1390,6 +1390,10 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest, InPlac
 	return reads.RecordDigest(vaddr, size, digest);
 }
 
+bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
+}
+
 bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;

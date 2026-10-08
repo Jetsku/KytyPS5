@@ -170,7 +170,50 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_RT_STUB=1: translate IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (MIMG
+	// 0xe6/0xe7) as "no intersection" for every lane instead of skipping compute dispatches that
+	// contain them (and failing other stages). A box node returns four invalid child pointers
+	// (0xffffffff); a triangle node returns t_num=+inf, t_denom=1.0 and zero in dwords 2-3 (a
+	// cleared hit_status in triangle return mode 0). Diagnostic only: it never reports a hit.
+	bool rt_stub = false;
+	// KYTY_RT_SOFTWARE (default 1): translate the BVH instructions exactly in software (IR
+	// BvhIntersectRay, lowered in the SPIR-V backend; spec: RT-SOFTWARE-DESIGN.md). Takes precedence
+	// over KYTY_RT_STUB. Astro Bot's own tiled deferred lighting and its GI probe tracing contain
+	// these instructions; without a BVH mode their whole dispatches are skipped, which leaves the
+	// scene unlit (black robots on the title screen). KYTY_RT_SOFTWARE=0 with KYTY_RT_STUB=1 keeps
+	// the passes but lets every ray miss (no ray-traced shadows); KYTY_RT_SOFTWARE=0 alone restores
+	// the old skip.
+	bool rt_software = true;
+	// KYTY_RT_TYPE6=0 (with KYTY_RT_SOFTWARE): node type 6 misses (four invalid children) like
+	// RDNA2's user node, instead of being decoded as the PS5 shared-exponent box.
+	bool rt_type6 = true;
+	// KYTY_BDA_WRITES=1 (or =verify): raw stores and atomics through a V# the shader computes
+	// (Psr's BVH builders) write guest memory through BDA instead of failing resource tracking. The
+	// renderer settles each such dispatch synchronously: it waits for it and marks the pages it wrote
+	// GPU-owned before the CP continues (BDA-WRITES-DESIGN.md). Default 1: Astro Bot's BVH builders
+	// need it once its game patches are off; KYTY_BDA_WRITES=0 restores the old refusal.
+	bool bda_writes = true;
+	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
+	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
+	// lose the device. Past the budget every node test misses without reading memory, the
+	// invocation takes each loop's exit edge (as KYTY_LOOP_GUARD does), and at return it adds one to
+	// GDS dword end - RtNodeBudgetGdsFromEnd, which the command processor reports at flips ("RT
+	// node budget"). Every invocation of a wave executes the instruction for each node the wave's
+	// packet traversal visits, so the count is the wave's traversal length. The default is a safety
+	// net far above expected traversals (KYTY_RT_NODE_STATS measures them).
+	uint32_t rt_node_budget = 8192;
+	// KYTY_RT_NODE_STATS=1 (with KYTY_RT_SOFTWARE): at return, each invocation that ran node tests
+	// adds one to the GDS dword of its per-lane count's power of two (bin k holds counts in
+	// [2^k, 2^(k+1)), at end - RtNodeStatsGdsFromEnd - k), reported at flips. A diagnostic for the
+	// budget.
+	bool rt_node_stats = false;
 };
+
+// GDS dwords, counted from the end of GDS, that KYTY_RT_NODE_BUDGET and KYTY_RT_NODE_STATS report
+// through (the last one is KYTY_LOOP_GUARD's).
+inline constexpr uint32_t RtNodeBudgetGdsFromEnd = 2;
+inline constexpr uint32_t RtNodeStatsGdsFromEnd  = 3;
+inline constexpr uint32_t RtNodeStatsBins        = 24;
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);

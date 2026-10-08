@@ -131,6 +131,9 @@ enum class FrameEvent : uint32_t {
 	SrtProbeMisses,
 	SrtProbeBytes,
 	SrtProbeBatchHits,
+	// Flat SRT reads of an address no guest page backs, read as 0 instead of faulting
+	// (SrtWalker::InPlaceReadable).
+	SrtUnmappedReads,
 	ResourceReuseHits,
 	ResourceReuseMisses,
 	ResourceReuseValidationBytes,
@@ -190,6 +193,10 @@ enum class FrameEvent : uint32_t {
 	DrawIndirectFallback,
 	// Later draws that inherited a native indirect draw's instance count and read it back.
 	DrawIndirectInstanceReads,
+	// Compute dispatches and draws that ran a program with IMAGE_BVH*_INTERSECT_RAY translated
+	// by KYTY_RT_STUB (every ray misses).
+	RtStubDispatches,
+	RtStubDraws,
 	// KYTY_GPU_TIMING: command buffers without a usable timestamp pair (ring full, results
 	// unavailable, ambiguous wrap, or pending samples over capacity). Busy/idle exclude them.
 	GpuTimingDropped,
@@ -1214,6 +1221,20 @@ enum class FrameEvent : uint32_t {
 	// decision's certificate, and memo lookups whose certificate no longer held.
 	CpCommitTexDccRecords,
 	CpCommitTexDccRejects,
+	// KYTY_BDA_WRITES: synchronous settles of dispatches that write through BDA, the pages they
+	// took into GPU ownership, writes dropped for lack of a cache buffer, written pages that
+	// overlapped a GPU-modified image at settle, and GPU-modified images that overlapped a cache
+	// buffer before such a dispatch (preserved into their buffers when image writebacks are on).
+	BdaSettles,
+	BdaSettlePages,
+	BdaDroppedWrites,
+	BdaAliasHits,
+	BdaAliasedImages,
+	// Written pages the guest also wrote during the dispatch (CPU-dirty at the settle).
+	BdaSettleCpuDirtyPages,
+	// Program sources whose dispatches and draws are skipped: a flat SRT read has a loop-carried
+	// address and KYTY_SRT_VARIANT_READS is off (PipelineCache SkipVariantPlan).
+	VariantPlanSkips,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -1339,6 +1360,9 @@ enum class FrameWait : uint32_t {
 	// for work the batch reads: texture staging copies still running, upload DMA transfers not
 	// submitted yet (SubmitDependency).
 	SubmitDependencyWait,
+	// KYTY_BDA_WRITES: GPU-thread time of the synchronous settle after a BDA-writing dispatch
+	// (compaction, the drain and the ownership bookkeeping).
+	BdaSettle,
 	Count,
 };
 

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
 #include <bit>
@@ -110,6 +111,115 @@ void SpendLoopGuard(EmitterState& state) {
 	                          EmitAddU32(state, count, ConstantU32(state, 1)));
 }
 
+// KYTY_RT_NODE_BUDGET: the node tests one invocation may run (both halves of a two-lane invocation
+// count), or 0 without a budget.
+uint32_t BvhNodeLimit(const EmitterState& state) {
+	const uint64_t budget = GetCodegenOptions().rt_node_budget;
+	return static_cast<uint32_t>(std::min<uint64_t>(budget * state.lane_count, UINT32_MAX - 1u));
+}
+
+// True once a node test of the invocation was refused (the count passed the limit).
+uint32_t BvhNodeBudgetExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.bvh_node_count_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, BvhNodeLimit(state)));
+	return exhausted;
+}
+
+bool BvhNodeBudgetActive(const EmitterState& state) {
+	return state.bvh_node_count_variable != 0 && GetCodegenOptions().rt_node_budget != 0;
+}
+
+// KYTY_LOOP_GUARD or KYTY_RT_NODE_BUDGET: whether this invocation leaves its loops.
+uint32_t GuardExhausted(EmitterState& state) {
+	uint32_t exhausted = 0;
+	if (state.loop_guard_variable != 0) {
+		exhausted = LoopGuardExhausted(state);
+	}
+	if (BvhNodeBudgetActive(state)) {
+		const auto bvh = BvhNodeBudgetExhausted(state);
+		if (exhausted == 0) {
+			exhausted = bvh;
+		} else {
+			const auto both = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), both, exhausted, bvh);
+			exhausted = both;
+		}
+	}
+	return exhausted;
+}
+
+uint32_t GdsDwordFromEnd(EmitterState& state, uint32_t from_end) {
+	const auto index =
+	    EmitBinaryU32(state, spv::OpISub, state.gds_length, ConstantU32(state, from_end));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.gds_variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
+void AddToGds(EmitterState& state, uint32_t pointer) {
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), previous, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                          ConstantU32(state, 1));
+}
+
+// At return: an invocation that exhausted KYTY_RT_NODE_BUDGET adds one to its GDS dword, and with
+// KYTY_RT_NODE_STATS an invocation that ran node tests adds one to its count's histogram bin.
+void EmitBvhNodeReport(EmitterState& state) {
+	if (state.bvh_node_count_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
+		return;
+	}
+	if (BvhNodeBudgetActive(state)) {
+		const auto exhausted    = BvhNodeBudgetExhausted(state);
+		const auto report_label = state.builder.AllocateId();
+		const auto merge_label  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, exhausted, report_label, merge_label);
+		EmitLabel(state, report_label);
+		AddToGds(state, GdsDwordFromEnd(state, RtNodeBudgetGdsFromEnd));
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		EmitLabel(state, merge_label);
+	}
+	if (GetCodegenOptions().rt_node_stats) {
+		const auto count = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.bvh_node_count_variable);
+		// Per guest lane: both halves of a two-lane invocation count.
+		const auto per_lane =
+		    state.lane_count == 2
+		        ? EmitBinaryU32(state, spv::OpShiftRightLogical, count, ConstantU32(state, 1))
+		        : count;
+		const auto ran = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), ran, per_lane,
+		                          ConstantU32(state, 0));
+		const auto report_label = state.builder.AllocateId();
+		const auto merge_label  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, ran, report_label, merge_label);
+		EmitLabel(state, report_label);
+		const auto msb = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), msb, GlslStd450(state),
+		                          GLSLstd450FindUMsb, per_lane);
+		const auto last_bin = ConstantU32(state, RtNodeStatsBins - 1u);
+		const auto clamp    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), clamp, GlslStd450(state),
+		                          GLSLstd450UMin, msb, last_bin);
+		const auto from_end =
+		    EmitBinaryU32(state, spv::OpIAdd, clamp, ConstantU32(state, RtNodeStatsGdsFromEnd));
+		const auto index   = EmitBinaryU32(state, spv::OpISub, state.gds_length, from_end);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.gds_variable, ConstantU32(state, 0), index);
+		AddToGds(state, pointer);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		EmitLabel(state, merge_label);
+	}
+}
+
 bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
 	return std::ranges::any_of(program.block_info, [=](const IR::BlockInfo& info) {
 		return info.terminator.loop_header && info.terminator.merge_block == target;
@@ -142,6 +252,7 @@ void EmitLoopGuardReport(EmitterState& state) {
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitLoopGuardReport(ctx.state);
+	EmitBvhNodeReport(ctx.state);
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
@@ -220,12 +331,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				return;
 			}
 			auto condition = BranchCondition(ctx, info);
-			if (ctx.state.loop_guard_variable != 0) {
-				// KYTY_LOOP_GUARD: an exhausted invocation takes whichever edge leaves a loop.
+			if (ctx.state.loop_guard_variable != 0 || BvhNodeBudgetActive(ctx.state)) {
+				// KYTY_LOOP_GUARD, KYTY_RT_NODE_BUDGET: an exhausted invocation takes whichever edge
+				// leaves a loop.
 				const bool true_exits  = IsLoopMergeBlock(program, term.true_block);
 				const bool false_exits = IsLoopMergeBlock(program, term.false_block);
 				if (true_exits != false_exits) {
-					const auto exhausted = LoopGuardExhausted(ctx.state);
+					const auto exhausted = GuardExhausted(ctx.state);
 					const auto forced    = ctx.state.builder.AllocateId();
 					if (true_exits) {
 						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced,
@@ -954,6 +1066,10 @@ void EmitProgram(EmitterState& state) {
 		state.loop_guard_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_guard_variable, "loop_guard");
 	}
+	if (IR::UsesBvhNodeCount(program)) {
+		state.bvh_node_count_variable = state.builder.AllocateId();
+		state.builder.AddName(state.bvh_node_count_variable, "bvh_node_count");
+	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
 		state.labels.emplace(block, label);
@@ -1059,6 +1175,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_guard_variable, spv::StorageClassFunction);
 	}
+	if (state.bvh_node_count_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.bvh_node_count_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -1087,6 +1208,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.bvh_node_count_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bvh_node_count_variable,
+		                          ConstantU32(state, 0));
 	}
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));

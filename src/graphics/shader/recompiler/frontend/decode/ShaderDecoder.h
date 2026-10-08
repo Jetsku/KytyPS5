@@ -661,6 +661,9 @@ enum class Opcode {
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
+	// MIMG 0xe6/0xe7: one ray/BVH-node test (RDNA2 ISA 8.2.10). Four result dwords, no sampler.
+	IMAGE_BVH_INTERSECT_RAY,
+	IMAGE_BVH64_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -828,7 +831,10 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
+// decode_bvh=false stops at the first IMAGE_BVH*_INTERSECT_RAY, marks it unsupported and sets
+// has_bvh (the shader's dispatches are then skipped); true decodes it like any other instruction.
+void DecodeProgram(std::span<const uint32_t> code, Program& program, bool decode_bvh = false);
+[[nodiscard]] bool IsBvhIntersect(const Instruction& inst);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 

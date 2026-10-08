@@ -144,6 +144,9 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
+// Whether [vaddr, vaddr + size) lies in guest memory mapped for the GPU (the renderer's mapped
+// ranges, the same ones its fault handler resolves). False before InstallGpuResources.
+[[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);

@@ -3017,6 +3017,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	KYTY_GPU_OP_SITE("draw.execute");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
+	if (m_context.GetOcclusionCounter().DebugLogActive()) {
+		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
+		                           buffer.GetShaders().GetVs().es_regs.data_addr);
+	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() &&
@@ -3577,7 +3581,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (occlusion_draw_rows && HangTrace::Enabled() && m_context.GetOcclusionCounter().Active()) {
+	const bool occlusion_debug_log = m_context.GetOcclusionCounter().DebugLogActive();
+	if ((occlusion_draw_rows && HangTrace::Enabled() && m_context.GetOcclusionCounter().Active()) ||
+	    occlusion_debug_log) {
 		// Occlusion diagnostics: the state deciding whether this draw's samples pass.
 		const auto&               regs = buffer.GetRegisters();
 		const auto&               vp   = regs.GetScreenViewport().viewports[0];
@@ -3599,7 +3605,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    di.depth_min_bounds, di.depth_max_bounds, di.stencil_test_enable ? 1 : 0,
 		    mc.cull_front ? "F" : "", mc.cull_back ? "B" : "", mc.face ? 1 : 0, vp.zmin,
 		    vp.zmax, vp.zscale, vp.zoffset, vp.xscale, vp.yscale);
-		HangTrace::RecordOcclusion(event);
+		if (occlusion_debug_log) {
+			const auto& clip = regs.GetClipControl();
+			OcclusionCounter::DebugLog(
+			    "d counted=%u n=%u inst=%u vs=0x%" PRIx64 " ps=0x%" PRIx64 " colors=%u zclip=%u/%u %s\n",
+			    m_context.GetOcclusionCounter().Active() ? 1u : 0u, draw.index_count, draw.instance_count,
+			    buffer.GetShaders().GetVs().es_regs.data_addr, buffer.GetShaders().GetPs().ps_regs.data_addr,
+			    state.color_count, clip.min_z_clip_disable ? 1u : 0u, clip.max_z_clip_disable ? 1u : 0u,
+			    event.detail.c_str());
+		}
+		if (occlusion_draw_rows && HangTrace::Enabled() && m_context.GetOcclusionCounter().Active()) {
+			HangTrace::RecordOcclusion(event);
+		}
 	}
 
 	if (!draw.IsIndexed()) {

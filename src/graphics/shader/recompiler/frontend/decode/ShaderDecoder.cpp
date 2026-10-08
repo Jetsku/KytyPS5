@@ -161,6 +161,12 @@ std::string FormatMimg(const Instruction& inst) {
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
 			break;
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Opcode::IMAGE_BVH64_INTERSECT_RAY:
+			text += fmt::format(" a16={} addr_dwords={}",
+			                    (inst.image_sample_flags & ImageSampleFlagA16) != 0u ? 1u : 0u,
+			                    inst.image_address_components);
+			break;
 		default: break;
 	}
 	if (inst.image_nsa_dwords != 0) {
@@ -409,7 +415,11 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	return result;
 }
 
-void DecodeProgram(std::span<const uint32_t> code, Program& program) {
+bool IsBvhIntersect(const Instruction& inst) {
+	return inst.family == Family::MIMG && (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u);
+}
+
+void DecodeProgram(std::span<const uint32_t> code, Program& program, bool decode_bvh) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
@@ -420,11 +430,15 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		const auto& inst = program.instructions.back();
+		auto& inst = program.instructions.back();
 		word_index += inst.word_count;
-		if (inst.family == Family::MIMG && (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u)) {
+		if (IsBvhIntersect(inst)) {
 			program.has_bvh = true;
-			return;
+			if (!decode_bvh) {
+				SetUnsupported(inst, Family::MIMG, inst.opcode_id,
+				               "BVH ray intersection is disabled (KYTY_RT_STUB=1 enables it)");
+				return;
+			}
 		}
 
 		if (IsDirectBranch(inst.opcode)) {
@@ -629,7 +643,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Opcode::IMAGE_BVH64_INTERSECT_RAY: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:

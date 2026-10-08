@@ -12,6 +12,8 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 
 namespace Libs::Graphics {
 
@@ -24,6 +26,7 @@ struct ImageMetadataInfo {
 	ImageMetadataKind   kind               = ImageMetadataKind::None;
 	uint32_t            control            = 0;
 	uint32_t            dcc_clear_word           = 0;
+	uint32_t            dcc_clear_word1          = 0; // CB_COLORn_CLEAR_WORD1 (texel bits 32..63)
 	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed = false;
 	bool                dcc_clear_register_valid = false;
@@ -428,6 +431,19 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return true;
 }
 
+// KYTY_CLEAR_REGISTER_WIDE (default 1; 0 restores the old decoding): register clears (DCC key 0x20
+// and CMASK fast clears) of 64-bit targets use CLEAR_WORD1 as well, and 16-bit-channel and
+// B10G11R11 targets are decoded. Without it Astro Bot's galaxy map kept its RGBA16F normal G-buffer
+// uncleared (DCC key 0x20): moving objects left smeared copies that the lighting turned into red
+// ribbons and bands over the nebula.
+[[nodiscard]] inline bool ClearRegisterWideEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLEAR_REGISTER_WIDE");
+		return value == nullptr || value[0] == '\0' || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // The clear colour of a CMASK fast clear: CB_COLORn_CLEAR_WORD0/1 hold the texel bits of the
 // target format (word0 the low 32 bits). 4-byte formats use word0 as DecodePackedColorClear does;
 // 8-byte formats are decoded per component. Other formats are not decoded.
@@ -483,7 +499,48 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 			next.int32[0] = static_cast<int32_t>(word0);
 			next.int32[1] = static_cast<int32_t>(word1);
 			break;
-		default: return DecodePackedColorClear(format, word0, clear);
+		default:
+			if (!ClearRegisterWideEnabled()) {
+				return DecodePackedColorClear(format, word0, clear);
+			}
+			switch (format) {
+				// Channel 0 in the low bits of word0, as for the 4-byte formats above.
+				case vk::Format::eR16Sfloat: next.float32[0] = half_to_float(halves[0]); break;
+				case vk::Format::eR16G16Sfloat:
+					next.float32[0] = half_to_float(halves[0]);
+					next.float32[1] = half_to_float(halves[1]);
+					break;
+				case vk::Format::eR16Unorm: next.float32[0] = static_cast<float>(halves[0]) / 65535.0f; break;
+				case vk::Format::eR16G16Unorm:
+					next.float32[0] = static_cast<float>(halves[0]) / 65535.0f;
+					next.float32[1] = static_cast<float>(halves[1]) / 65535.0f;
+					break;
+				case vk::Format::eR8Unorm: next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f; break;
+				case vk::Format::eR8G8Unorm:
+					next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f;
+					next.float32[1] = static_cast<float>((word0 >> 8u) & 0xffu) / 255.0f;
+					break;
+				case vk::Format::eB10G11R11UfloatPack32: {
+					// Unsigned 11-bit (5e6m) R and G, 10-bit (5e5m) B, R in the low bits.
+					const auto unsigned_small_float = [](uint32_t bits, uint32_t mantissa_bits) {
+						const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
+						const uint32_t exponent = bits >> mantissa_bits;
+						if (exponent == 0x1fu) {
+							return mantissa != 0 ? std::numeric_limits<float>::quiet_NaN()
+							                     : std::numeric_limits<float>::infinity();
+						}
+						const auto m = static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits);
+						return exponent == 0 ? std::ldexp(m, -14) : std::ldexp(1.0f + m, static_cast<int>(exponent) - 15);
+					};
+					next.float32[0] = unsigned_small_float(word0 & 0x7ffu, 6);
+					next.float32[1] = unsigned_small_float((word0 >> 11u) & 0x7ffu, 6);
+					next.float32[2] = unsigned_small_float(word0 >> 22u, 5);
+					next.float32[3] = 1.0f;
+					break;
+				}
+				default: return DecodePackedColorClear(format, word0, clear);
+			}
+			break;
 	}
 	clear = next;
 	return true;
@@ -501,6 +558,46 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		return true;
 	}
 	return DecodePackedColorClear(format, packed, clear);
+}
+
+// KYTY_WIDE_FILL_CLEAR=1 (default off; ported from chenxiao07/KytyPS5 e6b7fb0b1): the clear of a
+// texel whose memory a uniform fill wrote with one 32-bit word. A 32-bit texel is the packed clear
+// above, a 64- or 128-bit one holds the word in each of its 32-bit parts. A NaN or infinity
+// pattern keeps the dispatch (a clear does not keep it).
+[[nodiscard]] inline bool DecodeFilledColorClear(vk::Format format, uint32_t word,
+                                                 vk::ClearColorValue& clear) {
+	const auto half = [](uint32_t bits) {
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		const uint32_t mantissa = bits & 0x3ffu;
+		const float    value    = std::ldexp(
+            static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
+            static_cast<int>(std::max(exponent, 1u)) - 25);
+		return (bits & 0x8000u) != 0 ? -value : value;
+	};
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u) {
+				return false;
+			}
+			clear.float32 = std::array {half(word), half(word >> 16u), half(word), half(word >> 16u)};
+			return true;
+		case vk::Format::eR16G16B16A16Uint:
+			clear.uint32 = std::array {word & 0xffffu, word >> 16u, word & 0xffffu, word >> 16u};
+			return true;
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if ((word & 0x7f800000u) == 0x7f800000u) {
+				return false;
+			}
+			clear.float32 = std::array {std::bit_cast<float>(word), std::bit_cast<float>(word),
+			                            std::bit_cast<float>(word), std::bit_cast<float>(word)};
+			return true;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+			clear.uint32 = std::array {word, word, word, word};
+			return true;
+		default: return DecodeColorDwordFill(format, word, clear);
+	}
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

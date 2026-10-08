@@ -72,6 +72,21 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
+bool UsesBvhNodeCount(const Program& program) {
+	const auto& options = GetCodegenOptions();
+	if (options.rt_node_budget == 0 && !options.rt_node_stats) {
+		return false;
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::BvhIntersectRay) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 bool UsesMipStats(const Program& program) {
 	static const bool enabled = [] {
 		const auto* mode = std::getenv("KYTY_LOD_STATS_MODE");
@@ -146,8 +161,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	// KYTY_LOOP_GUARD reports through the last GDS dword, so a guarded shader always binds GDS.
-	if (UsesGds(program) || LoopGuardApplies(program.shader_hash)) {
+	// KYTY_LOOP_GUARD and the BVH node count report through GDS, so those programs bind GDS.
+	if (UsesGds(program) || LoopGuardApplies(program.shader_hash) || UsesBvhNodeCount(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (program.info.uses_dma) {

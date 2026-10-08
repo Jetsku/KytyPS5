@@ -43,6 +43,10 @@ enum class ResourceKind {
 	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
 }
 
+// MemoryInfo::resource of an IndirectBuffer access that KYTY_SRT_VARIANT_READS created: it has no
+// bound buffer and no descriptor source.
+inline constexpr uint32_t NoIndirectBufferResource = UINT32_MAX;
+
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
@@ -75,6 +79,64 @@ struct MemoryInfo {
 		return !formatted && !typed && data_bits == 32u &&
 		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
 		        opcode == ValueOpcode::LoadBufferU32x4 || opcode == ValueOpcode::ReadConstBuffer);
+	}
+	// KYTY_BDA_WRITES: raw (unformatted) stores and every buffer atomic can write through a V# the
+	// shader computes.
+	[[nodiscard]] bool SupportsIndirectRawWrite(ValueOpcode opcode) const {
+		if (formatted || typed) {
+			return false;
+		}
+		switch (opcode) {
+			case ValueOpcode::StoreBufferU8: return data_bits == 8u;
+			case ValueOpcode::StoreBufferU16: return data_bits == 16u;
+			case ValueOpcode::StoreBufferU32:
+			case ValueOpcode::StoreBufferU32x2:
+			case ValueOpcode::StoreBufferU32x3:
+			case ValueOpcode::StoreBufferU32x4: return data_bits == 32u;
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32:
+			case ValueOpcode::BufferAtomicInc32:
+			case ValueOpcode::BufferAtomicDec32:
+			case ValueOpcode::BufferAtomicFMin32:
+			case ValueOpcode::BufferAtomicFMax32:
+			case ValueOpcode::BufferAtomicSwap64:
+			case ValueOpcode::BufferAtomicCmpSwap64:
+			case ValueOpcode::BufferAtomicIAdd64:
+			case ValueOpcode::BufferAtomicISub64:
+			case ValueOpcode::BufferAtomicSMin64:
+			case ValueOpcode::BufferAtomicUMin64:
+			case ValueOpcode::BufferAtomicSMax64:
+			case ValueOpcode::BufferAtomicUMax64:
+			case ValueOpcode::BufferAtomicAnd64:
+			case ValueOpcode::BufferAtomicOr64:
+			case ValueOpcode::BufferAtomicXor64: return true;
+			default: return false;
+		}
+	}
+	// KYTY_SRT_VARIANT_READS: every raw (unformatted) vector load can read through a V# the shader
+	// computes, BUFFER_LOAD_UBYTE/USHORT/DWORD included, not only DWORDX2-X4.
+	[[nodiscard]] bool SupportsIndirectRawLoad(ValueOpcode opcode) const {
+		if (formatted || typed) {
+			return false;
+		}
+		switch (opcode) {
+			case ValueOpcode::LoadBufferU8: return data_bits == 8u;
+			case ValueOpcode::LoadBufferU16: return data_bits == 16u;
+			case ValueOpcode::LoadBufferU32:
+			case ValueOpcode::LoadBufferU32x2:
+			case ValueOpcode::LoadBufferU32x3:
+			case ValueOpcode::LoadBufferU32x4: return data_bits == 32u;
+			default: return false;
+		}
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -494,6 +556,12 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// IMAGE_BVH*_INTERSECT_RAY translated (KYTY_RT_STUB); counts the program's draws/dispatches.
+	bool                             uses_bvh           = false;
+	// KYTY_BDA_WRITES: the program stores or does atomics through a V# it computes (IndirectBuffer
+	// writes through BDA). Implies uses_dma and has_address_writes; the renderer settles each of
+	// its dispatches synchronously.
+	bool                             bda_writes         = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -802,6 +870,10 @@ bool        HasShaderMemoryWrites(const Program& program);
 [[nodiscard]] bool CloneProgram(const Program& source, Program& target);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
+// Whether translations run ValidateProgram: debug builds, or with KYTY_IR_VALIDATE=1 in release.
+// The checks only ever stop the emulator, and they were about a fifth of a release translation
+// (first-encounter hitches, precompile time; chenxiao07 a28de66fe).
+[[nodiscard]] bool ValidationEnabled();
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);

@@ -2003,9 +2003,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors, bool keep_images) {
 	bool uses_dma = false;
+	bool uses_bvh = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		uses_bvh |= stage->runtime->program->info.uses_bvh;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
@@ -2013,6 +2015,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	CommitStats::Mark(CommitStats::Phase::FindBuffers);
 	// KYTY_DRAW_RUN continuation: the views and targets are the previous draw's (checked against the
 	// image state after the buffer work, RenderExecutor::DrawRunImagesUnchanged).
+	if (uses_bvh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDraws);
+	}
 	for (auto* stage: stages) {
 		if (keep_images) {
 			break;
@@ -2337,6 +2342,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
+		// KYTY_GUEST_STORAGE_REPEAT: these are the guest draw's or dispatch's own transitions.
+		const Image::GuestTransitScope guest_transitions;
 		// KYTY_DRAW_RUN continuation: every image is in the state the previous draw's transitions
 		// left it in (RenderExecutor::DrawRunImagesUnchanged), which the bindings' layouts record.
 		for (uint32_t i = 0; !keep_images && i < program.info.images.size(); i++) {

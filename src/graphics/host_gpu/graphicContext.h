@@ -209,6 +209,9 @@ struct GraphicContext {
 	// KYTY_NATIVE_IMAGE_POOL_IDLE_MS (vma.cpp): destroys retained native images unused that long
 	// (GPU thread, from the garbage collector; rate-limited).
 	void                   TrimRetiredImages();
+	// An allocation failed for lack of device memory: destroys what is only retained for reuse
+	// (the native image pool) before the caller retries. Returns the bytes released.
+	uint64_t               ReleaseRetainedMemory();
 	// KYTY_TEXTURE_SPARSE_RESIDENCY (sparse_residency_image_enabled): creates `info` as a sparse
 	// residency image with memory bound behind levels >= first_level only (a single-layer,
 	// single-sample 2D image whose format, usage and flags support sparse residency; false and
@@ -256,6 +259,8 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// Set by a guest draw's or dispatch's bindings (KYTY_GUEST_STORAGE_REPEAT, Image::GetBarriers).
+	bool guest = false;
 };
 
 struct VulkanImage {
