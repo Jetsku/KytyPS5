@@ -1078,6 +1078,28 @@ static int ConvertSocketOptionName(int level, int option) {
 		return TCP_NODELAY;
 	}
 #if defined(_WIN32)
+	// Winsock uses the BSD values for these SOL_SOCKET options, so they pass through. It answers
+	// WSAEINVAL for an option it does not know, where the guest's FreeBSD stack reports
+	// ENOPROTOOPT.
+	if (level == 0xffff) {
+		switch (option) {
+			case 0x0001: // SO_DEBUG
+			case 0x0002: // SO_ACCEPTCONN
+			case 0x0004: // SO_REUSEADDR
+			case 0x0008: // SO_KEEPALIVE
+			case 0x0010: // SO_DONTROUTE
+			case 0x0040: // SO_USELOOPBACK
+			case 0x0080: // SO_LINGER
+			case 0x0100: // SO_OOBINLINE
+			case 0x1003: // SO_SNDLOWAT
+			case 0x1004: // SO_RCVLOWAT
+			case 0x1005: // SO_SNDTIMEO
+			case 0x1006: // SO_RCVTIMEO
+			case 0x1008: // SO_TYPE
+				return option;
+			default: return -1;
+		}
+	}
 	return option;
 #else
 	return -1;
