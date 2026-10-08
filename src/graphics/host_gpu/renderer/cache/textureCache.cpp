@@ -1847,13 +1847,21 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	// Guests reuse one allocation as depth and as color (e.g. D32F <-> R32F) every frame. Keep one
 	// image per interpretation alive and reuse it: FindImage copies the current owner's contents
 	// into a non-owner alias (SyncAliasFromOwner) instead of destroying and recreating images.
+	// A partial view that retains the cached array layout (fbf6ae400) gets that layout: an alias
+	// made for a smaller prefix of the same layers is the same image.
+	auto info = requested;
+	if (retain_cached_layout) {
+		info.data       = cached.info.data;
+		info.resources  = cached.info.resources;
+		info.mip_layout = cached.info.mip_layout;
+	}
 	const bool keep_aliases = AliasAgeByFrames() && !(cached.info.resources < requested.resources);
 	if (keep_aliases) {
 		for (const auto other_id: FindImagesInRegion(requested.data.address, requested.data.size, false)) {
 			const auto* other = m_slot_images.try_get(other_id);
 			if (other == nullptr || other_id == cached_id || !other->registered || other->depth_id ||
 			    other->backing.samples != cached.backing.samples ||
-			    !SameBacking(other->info, requested, true)) {
+			    !SameBacking(other->info, info, true)) {
 				continue;
 			}
 			if (cached.binding.is_bound || cached.binding.is_target) {
@@ -1863,12 +1871,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		}
 	}
 	RefreshImage(cached_id);
-	auto info = requested;
-	if (retain_cached_layout) {
-		info.data       = cached.info.data;
-		info.resources  = cached.info.resources;
-		info.mip_layout = cached.info.mip_layout;
-	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
