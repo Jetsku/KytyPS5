@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -643,6 +644,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
+	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
@@ -847,6 +849,7 @@ void CommandScheduler::WaitRecorded(uint64_t tick, bool from_producer) {
 
 void CommandScheduler::BeginNext() {
 	KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::BeginNext");
+	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	CheckActive();
 	BeginCommand();
 }

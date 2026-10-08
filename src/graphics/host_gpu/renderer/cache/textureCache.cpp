@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
 #include "graphics/host_gpu/renderer/image/imageClearRange.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -2301,6 +2302,7 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 	}
 	if (upload) {
 		Profiler::ScopedFrameWait upload_time(Profiler::FrameWait::TextureUpload);
+		const CpGaps::Scope       upload_gap(CpGaps::Cat::TextureUpload);
 		// Attribution only: why this refresh happens and how much of the image was dirtied.
 		const bool  first  = !image.WasEverUploaded();
 		const char* reason = image.IsBufferModified()

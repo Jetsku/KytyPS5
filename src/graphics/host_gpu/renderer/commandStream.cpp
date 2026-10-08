@@ -2,6 +2,7 @@
 #include "common/ramStats.h"
 
 #include "common/hangWatchdog.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
 #include <chrono>
 #include <cinttypes>
@@ -645,6 +646,7 @@ bool Ring::EnsureSpace(uint64_t bytes, const WaitPolicy& policy, WaitStats& stat
 		return false;
 	}
 	// The consumer may be parked on packets published without a wake.
+	const CpGaps::Scope gap(CpGaps::Cat::RecorderWait);
 	HangWatchdog::Scope wait("recorder-ring-space", reinterpret_cast<uint64_t>(this),
 	                         m_write + bytes, m_consumed_cache, 0, m_capacity);
 	Kick(stats);

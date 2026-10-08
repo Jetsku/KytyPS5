@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/watchdogSubmit.h"
 
 #include <algorithm>
@@ -101,6 +102,7 @@ void SubmitInfo::WaitHostDependencies() const {
 			start_ns = SteadyNs();
 		}
 		Profiler::ScopedFrameWait wait(Profiler::FrameWait::SubmitDependencyWait);
+		const CpGaps::Scope       gap(CpGaps::Cat::SubmitWait);
 		dependency->WaitSubmittable(value);
 	}
 	if (start_ns != 0) {

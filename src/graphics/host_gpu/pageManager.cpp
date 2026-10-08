@@ -5,6 +5,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/parkingLock.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -340,6 +341,7 @@ struct PageManager::Impl {
 		                             : MemoryStats::Counter::ProtectPages,
 		                   pages);
 		const MemoryStats::ScopedTimer timer(MemoryStats::Counter::ProtectNs);
+		const CpGaps::Scope            gap(CpGaps::Cat::Protect);
 		// The live cost numbers (faultCost.h) include the slow-PC simulation's wait, if any.
 		const auto start = FaultCost::NowNs();
 		FaultCost::SimProtectBegin(unprotect, pages);
