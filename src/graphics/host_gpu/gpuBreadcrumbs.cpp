@@ -72,9 +72,14 @@ void PrintCheckpoint(const char* mark, const DiagnosticCheckpoint& c) {
 		used += std::snprintf(shaders + used, sizeof(shaders) - static_cast<size_t>(used),
 		                      " %s=0x%016" PRIx64 "@0x%010" PRIx64, stage, ShaderHash(address), address);
 	};
-	add("VS", c.vs);
-	add("PS", c.ps);
-	add("CS", c.cs);
+	// Only the stages the operation runs: draws (DrawIndex, DrawIndexAuto) and dispatches
+	// (DispatchDirect, DispatchIndirect); the registers keep the other stages' last shaders.
+	if (c.op == 1 || c.op == 2) {
+		add("VS", c.vs);
+		add("PS", c.ps);
+	} else if (c.op == 0 || c.op == 9) {
+		add("CS", c.cs);
+	}
 	std::printf("  %s #%" PRIu64 " %s submit=%" PRIu64 " tick=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64
 	            "%s\n",
 	            mark, c.sequence, DiagnosticOpName(c.op), c.submit_id, c.tick, c.arg0, c.arg1, c.arg2,
