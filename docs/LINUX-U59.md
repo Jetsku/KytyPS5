@@ -1,11 +1,13 @@
 # U59 + Demon's Souls: Linux x86-64 build
 
-> Written for the 2026-09-30 release (`u59-windows-20260930-demons`); main has moved on since then.
+> First written for the 2026-09-30 release (`u59-windows-20260930-demons`).
 
-This branch builds the source of `u59-windows-20260930-demons`
-(commit `3ea4c7562ee5c6cdc8009367d34770fc50eb1d6e`) with two Linux portability fixes.
-It does not add U60 or RT work, game files, compatibility cheat files, firmware,
-saves or caches. This is an unofficial local build, not an upstream Linux release.
+From now on the GitHub workflow `.github/workflows/u59-linux.yml` attaches
+`KytyPS5-U59-Linux-x86_64.tar.gz` (built with Clang on Ubuntu 24.04, not tested in a game) to each release;
+extract it, keep the folder together and run `./launcher` from that folder, so it finds `u59-preset.json`
+(without the preset, lighting can render black). No game files, compatibility cheat files, firmware, saves
+or caches are distributed. This is an unofficial build, not an upstream Linux release. The general Linux
+build steps and dependencies are in the main README.
 
 ## Build
 
