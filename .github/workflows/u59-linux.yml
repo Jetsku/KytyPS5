@@ -1,0 +1,122 @@
+name: U59 Linux build
+
+# The Linux counterpart of u59-windows-release.yml: the same tags attach a Linux archive to the release the
+# Windows workflow publishes. A manual run only uploads the archive as a workflow artifact. The steps follow
+# upstream's build.yml Linux job. No PGO: the release profile is recorded with clang-cl on Windows.
+on:
+  push:
+    tags:
+      - 'u59-windows-*'
+    # Test builds without a release: push a branch named ci/linux*. A Linux archive for an existing
+    # release whose tag predates this workflow: push that release's commit plus this workflow to
+    # ci/linux-release/<tag>; the archive is attached to the release <tag>.
+    branches:
+      - 'ci/linux*'
+      - 'ci/linux-release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    if: github.repository == 'Jetsku/KytyPS5-experimental' || github.repository == 'Jetsku/KytyPS5'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out experimental source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang glslang-tools libasound2-dev libdbus-1-dev libgl1-mesa-dev libpulse-dev libudev-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev libxi-dev libxkbcommon-dev \
+            libxrandr-dev libxss-dev libxtst-dev lld ninja-build pkg-config wayland-protocols
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Configure Release
+        shell: bash
+        run: |
+          release="${GITHUB_REF_NAME#ci/linux-release/}"
+          tag="${release/u59-windows-/u59-linux-}"
+          cmake -S . -B _Build/linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKYTY_EMULATOR_IPO=ON \
+            -DKYTY_BUILD_ORIGIN=Fork \
+            -DKYTY_BUILD_REPOSITORY="$GITHUB_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="$tag" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build _Build/linux --target launcher kyty_emulator page_manager_tests memory_tracker_tests \
+            lru_cache_tests virtual_memory_allocation_tests resource_tracking_tests scalar_provenance_tests \
+            resource_materialization_tests shader_vertex_metadata_tests device_compat_tests --parallel
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir _Build/linux --output-on-failure \
+            -R '^(lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation|device_compat)$'
+
+      - name: Package portable experimental runtime
+        shell: bash
+        run: |
+          cmake --install _Build/linux --prefix _Build/linux/install
+          release="$RUNNER_TEMP/KytyPS5-U59-Linux-x86_64"
+          mkdir -p "$release"
+          cp -a _Build/linux/install/. "$release/"
+          cp tools/u59-preset.json "$release/"
+          cp docs/EXPERIMENTAL.md "$release/U59-README.md"
+          cp docs/LINUX-U59.md "$release/LINUX-U59.md"
+          cp LICENSE "$release/"
+          # libFont's fallback font, as in the Windows archive.
+          fonts="$release/3rdparty/tracy/profiler/src/font"
+          mkdir -p "$fonts"
+          cp 3rdparty/tracy/profiler/src/font/Roboto-*.ttf "$fonts/"
+          test "$(ls "$fonts"/Roboto-*.ttf | wc -l)" -eq 4
+          cp 3rdparty/SPIRV-Tools/LICENSE "$fonts/LICENSE-Apache-2.0.txt"
+          chmod a+x "$release/launcher" "$release/kyty_emulator"
+          file "$release/kyty_emulator" | grep -q 'ELF 64-bit LSB .*x86-64'
+          "$release/kyty_emulator" --help > /dev/null
+          tar -C "$release" -czf KytyPS5-U59-Linux-x86_64.tar.gz .
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-U59-Linux-x86_64
+          path: KytyPS5-U59-Linux-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/u59-windows-') || startsWith(github.ref, 'refs/heads/ci/linux-release/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release="${GITHUB_REF_NAME#ci/linux-release/}"
+          # The Windows workflow creates the release when its build finishes; wait up to 90 minutes for it.
+          for attempt in $(seq 1 90); do
+            if gh release view "$release" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              gh release upload "$release" KytyPS5-U59-Linux-x86_64.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "::error::No release $release appeared within 90 minutes; the archive is in the workflow artifacts."
+          exit 1
