@@ -36,6 +36,7 @@ struct DiagnosticCheckpoint {
 	uint64_t vs = 0;
 	uint64_t ps = 0;
 	uint64_t cs = 0;
+	uint32_t queue = 0; // GpuBreadcrumbs::Queue
 };
 
 struct GraphicContext;
@@ -44,6 +45,12 @@ struct GraphicContext;
 RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 [[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
+// Breadcrumb ring access (GpuBreadcrumbs): records and returns the sequence number; looks one up
+// (false once it left the bounded history); the newest sequence; an operation's name.
+[[nodiscard]] uint64_t RecordDiagnosticSequence(const DiagnosticCheckpoint& checkpoint);
+[[nodiscard]] bool     LookupDiagnosticCheckpoint(uint64_t sequence, DiagnosticCheckpoint* checkpoint);
+[[nodiscard]] uint64_t NewestDiagnosticSequence();
+[[nodiscard]] const char* DiagnosticOpName(uint32_t op);
 
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
@@ -56,6 +63,13 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
+	// KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h): VK_AMD_buffer_marker enabled for breadcrumbs, and
+	// VK_AMD_device_coherent_memory's deviceCoherentMemory for their buffer.
+	bool                               gpu_breadcrumbs_requested             = false;
+	bool                               device_coherent_memory_enabled        = false;
+	// KYTY_COMPUTE_WAVE64=0: wave64 compute programs run two guest lanes per invocation on 32-wide
+	// subgroups (the path NVIDIA takes) even where the device could run them natively.
+	bool                               compute_wave64_split                  = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
@@ -156,7 +170,7 @@ struct GraphicContext {
 	}
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
-		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+		return !compute_wave64_split && (subgroup_size == 64u || compute_subgroup_size_control_enabled);
 	}
 
 	// The subgroup size a graphics stage must require so that one host subgroup is one guest

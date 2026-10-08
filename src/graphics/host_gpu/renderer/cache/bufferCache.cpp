@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -1952,6 +1953,14 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	RequireVulkanSuccess(command.begin(&begin_info), "begin side-readback command buffer");
+	if (GpuBreadcrumbs::Active()) {
+		GpuBreadcrumbs::Write(command, GpuBreadcrumbs::Queue::Side,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Side,
+		                                           {.op   = GpuBreadcrumbs::OpSideReadback,
+		                                            .arg0 = static_cast<uint32_t>(bytes),
+		                                            .arg4 = chosen->begin,
+		                                            .tick = producer}));
+	}
 	// The timeline wait below orders the producer (and, on the side queue, the newest unbounded
 	// writer). On a shared queue this barrier's first scope additionally covers every earlier
 	// submission, so the copy observes all submitted work. On the side queue later queue-0 work
@@ -1984,6 +1993,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	after.size                    = side.window;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
 	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	if (GpuBreadcrumbs::Active()) {
+		GpuBreadcrumbs::Write(command, GpuBreadcrumbs::Queue::Side,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Side,
+		                                           {.op = GpuBreadcrumbs::OpSideReadbackEnd, .tick = producer}));
+	}
 	RequireVulkanSuccess(command.end(), "end side-readback command buffer");
 
 	const auto value = ++side.next_value;

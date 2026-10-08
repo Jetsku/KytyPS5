@@ -889,6 +889,14 @@ public:
 			m_owner->m_buffer.writeTimestamp2(stage, pool, query);
 		}
 	}
+	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
+	                          uint32_t marker) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->writeBufferMarkerAMD(stage, buffer, offset, marker);
+		} else {
+			m_owner->m_buffer.writeBufferMarkerAMD(stage, buffer, offset, marker);
+		}
+	}
 
 private:
 	const CommandBuffer* m_owner;

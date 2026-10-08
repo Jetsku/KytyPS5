@@ -93,6 +93,8 @@ enum class Op : uint16_t {
 	// vkUpdateDescriptorSets of one descriptor set (KYTY_RECORDER_DESCRIPTOR_SETS): a device call,
 	// not a command, replayed in stream order before the command that binds the set.
 	UpdateDescriptorSets,
+	// vkCmdWriteBufferMarkerAMD (KYTY_GPU_BREADCRUMBS, gpuBreadcrumbs.h).
+	WriteBufferMarker,
 	Count,
 };
 
@@ -350,6 +352,12 @@ struct WriteTimestampPacket {
 	vk::QueryPool pool  = nullptr;
 	uint64_t      stage = 0; // VkPipelineStageFlags2
 	uint32_t      query = 0;
+};
+struct WriteBufferMarkerPacket {
+	vk::Buffer buffer = nullptr;
+	uint64_t   offset = 0;
+	uint32_t   stage  = 0; // VkPipelineStageFlagBits
+	uint32_t   marker = 0;
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -703,6 +711,8 @@ public:
 	                          vk::Buffer destination, vk::DeviceSize offset, vk::DeviceSize stride,
 	                          vk::QueryResultFlags flags);
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query);
+	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
+	                          uint32_t marker);
 
 private:
 	class Writer;

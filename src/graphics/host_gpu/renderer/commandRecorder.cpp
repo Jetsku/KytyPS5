@@ -563,6 +563,10 @@ struct CommandRecorder::NativeExecutor {
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
 		command.writeTimestamp2(stage, pool, query);
 	}
+	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
+	                          uint32_t marker) {
+		command.writeBufferMarkerAMD(stage, buffer, offset, marker);
+	}
 };
 
 // ------------------------------------------------------------------------------------------------

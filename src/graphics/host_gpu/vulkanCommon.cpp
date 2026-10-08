@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/host_gpu/vramStats.h"
 
@@ -132,6 +133,10 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			// Another thread may see the loss first (the upload DMA worker, a side readback).
+			GpuBreadcrumbs::Dump();
+		}
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}
