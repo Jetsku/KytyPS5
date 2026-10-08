@@ -227,7 +227,6 @@ private:
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
 	                bool negate_source, bool write_64, bool negate_result = false);
 	void S_CMOV_B32(const Decoder::Instruction& inst);
-	void S_SEXT_I32(const Decoder::Instruction& inst, uint32_t bits);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
 	void SUB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
 	void SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);

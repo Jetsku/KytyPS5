@@ -257,12 +257,6 @@ void Translator::S_CMOV_B32(const Decoder::Instruction& inst) {
 	WriteOperand(inst.dst, ir.Select(ir.GetScc(), value, ReadU32(inst.dst)));
 }
 
-void Translator::S_SEXT_I32(const Decoder::Instruction& inst, uint32_t bits) {
-	const auto value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
-	                                   {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)}));
-	WriteOperand(inst.dst, value);
-}
-
 void Translator::S_SENDMSG(const Decoder::Instruction& inst) {
 	if (program.stage == ShaderType::Mesh) {
 		EXIT_NOT_IMPLEMENTED(inst.src0.value != 9u); // MSG_GS_ALLOC_REQ

@@ -19,8 +19,6 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
 		case O::S_CMOV_B32:
 		case O::S_CMOVK_I32: S_CMOV_B32(inst); return;
-		case O::S_SEXT_I32_I8: S_SEXT_I32(inst, 8u); return;
-		case O::S_SEXT_I32_I16: S_SEXT_I32(inst, 16u); return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: S_WAITCNT(inst); return;
@@ -173,6 +171,14 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_ABS_I32:
 			return SimpleInteger(inst, IR::ValueOpcode::IAbs32, IR::Type::U32, false, false, true);
+		case O::S_SEXT_I32_I8:
+		case O::S_SEXT_I32_I16: {
+			// Sign extension leaves SCC unchanged.
+			const auto bits = inst.opcode == O::S_SEXT_I32_I8 ? 8u : 16u;
+			WriteOperand(inst.dst, IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
+			    {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)})));
+			return;
+		}
 		case O::S_MUL_I32:
 		case O::S_MULK_I32:
 			return SimpleInteger(inst, IR::ValueOpcode::IMul32, IR::Type::U32, false, false, false);
