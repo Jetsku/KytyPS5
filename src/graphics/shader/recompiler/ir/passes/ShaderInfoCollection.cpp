@@ -404,16 +404,28 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
-				case ExportTargetKind::Mrt:
+				case ExportTargetKind::Mrt: {
 					if (alpha_remap && export_info.index != 0) {
 						break;
 					}
-					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
+					// KYTY_CB_SHADER_MASK_EXPORTS (target_shader_mask set): the export's colour
+					// target is the location; dual-source blending keeps the export index.
+					auto location = export_info.index;
+					if (program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+					    !input_info.pixel->dual_source_blending) {
+						location = ::Libs::Graphics::ShaderPixelExportTarget(
+						    input_info.pixel->target_shader_mask, export_info.index);
+						if (location >= 8u) {
+							break; // no colour target receives this export
+						}
+					}
+					AddOutput(info, StageOutputKind::Mrt, export_info.index, location,
 					          fmt::format("out_mrt_{}", export_info.index));
 					if (alpha_remap) {
 						AddOutput(info, StageOutputKind::Mrt, 1, 1, "out_mrt_1");
 					}
 					break;
+				}
 				default: break;
 			}
 		}

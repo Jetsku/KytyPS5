@@ -177,6 +177,9 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_linear_center_vgpr        = UINT32_MAX;
 	uint32_t                                       ps_linear_centroid_vgpr      = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	// CB_SHADER_MASK with KYTY_CB_SHADER_MASK_EXPORTS=1 (MRT export i goes to the i-th target
+	// with a non-zero nibble); UINT32_MAX otherwise (export i goes to target i).
+	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
@@ -225,6 +228,12 @@ inline uint32_t ShaderLanesPerInvocation(ShaderType stage, uint32_t wave_size,
 }
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
+// KYTY_CB_SHADER_MASK_EXPORTS=1 (startup, default off; upstream 21a1346e2): colour exports are
+// compact, as on AMD hardware: MRT export i is written to the i-th colour target whose
+// CB_SHADER_MASK nibble is non-zero. Off: export i is written to target i.
+bool     ShaderCbShaderMaskExports();
+// The colour target of MRT export `export_index` under `shader_mask`; UINT32_MAX for none.
+uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);

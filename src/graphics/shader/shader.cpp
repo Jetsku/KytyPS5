@@ -1222,10 +1222,14 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
 	}
 
-	for (int i = 0; i < 8; i++) {
+	// KYTY_CB_SHADER_MASK_EXPORTS (upstream 21a1346e2): target_output_mode is per export, the
+	// export mapping comes from the export's colour target.
+	ps_info.target_shader_mask = ShaderCbShaderMaskExports() ? sh.m_cbShaderMask : UINT32_MAX;
+	for (uint32_t i = 0; i < 8; i++) {
+		const auto slot                  = ShaderPixelExportTarget(ps_info.target_shader_mask, i);
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
-		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0
-		                                       ? target_export_mapping[i]
+		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0 && slot < 8
+		                                       ? target_export_mapping[slot]
 		                                       : Prospero::ColorComponentMapping {};
 	}
 }

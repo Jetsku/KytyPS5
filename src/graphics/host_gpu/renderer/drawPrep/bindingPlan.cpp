@@ -228,10 +228,10 @@ bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
 	if (prepared.pixel_active) {
 		for (const auto& output: prepared.pixel_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
-				if (output.index >= 32u) {
+				if (output.location >= 32u) {
 					return false;
 				}
-				mrt_mask |= 1u << output.index;
+				mrt_mask |= 1u << output.location; // the colour target (KYTY_CB_SHADER_MASK_EXPORTS)
 			}
 		}
 	}
