@@ -892,6 +892,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
 	state.num_color_attachments = 0;
+	CommitStats::SubScope color_scope(CommitStats::Sub::AcquireColor);
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
@@ -924,6 +925,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
 	}
+	color_scope.Stop();
+	CommitStats::SubScope depth_scope(CommitStats::Sub::AcquireDepth);
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
@@ -1076,6 +1079,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
 	}
+	depth_scope.Stop();
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		state.width        = limits.maxFramebufferWidth;
@@ -2099,6 +2103,7 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 	const bool verify_entries = RenderStateVerifyMode() != 0 &&
 	                            RenderStateFastEnabled(RenderStatePart::Reset) &&
 	                            !graphics_debug_dump_enabled();
+	CommitStats::SubScope color_scope(CommitStats::Sub::ColorTargets);
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) != 0) {
 			state.color_slots_written = std::max(state.color_slots_written, state.color_count + 1u);
@@ -2121,6 +2126,8 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
+	color_scope.Stop();
+	const CommitStats::SubScope depth_scope(CommitStats::Sub::DepthTarget);
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	if (verify_entries) {
 		RenderDepthInfo reference {};
@@ -2409,18 +2416,21 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 	{
 		auto&            cache = m_context.GetTextureCache();
 		std::scoped_lock lock {cache.m_lock};
+		// The record's attachments follow its textures.
+		const auto attachments = std::span<const DrawRunImage>(run.images).subspan(
+		    std::min<size_t>(run.attachments_begin, run.images.size()));
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {
 				const auto* image = cache.m_slot_images.try_get(binding.image_id);
 				if (image == nullptr) {
 					return false;
 				}
-				for (const auto& mark: run.images) {
+				for (const auto& mark: attachments) {
 					if (!mark.texture && mark.id == binding.image_id) {
 						return false;
 					}
 				}
-				if (DrawRunOverAttachment(run.images, image->info.data.address,
+				if (DrawRunOverAttachment(attachments, image->info.data.address,
 				                          image->info.data.size)) {
 					return false;
 				}
@@ -2493,6 +2503,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 				run.images.push_back(MakeDrawRunImage(binding.image_id, true));
 			}
 		}
+		run.attachments_begin = static_cast<uint32_t>(run.images.size());
 		for (uint32_t i = 0; i < state.color_count; i++) {
 			run.images.push_back(MakeDrawRunImage(state.color_info[i].image_id, false));
 		}
@@ -2502,8 +2513,9 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	}
 	// A texture over an attachment's memory (an alias of it) is synchronized from the attachment by
 	// each draw's texture resolution (SyncAliasFromOwner), which a continuation skips: no run.
+	const auto attachments = std::span<const DrawRunImage>(run.images).subspan(run.attachments_begin);
 	for (const auto& mark: run.images) {
-		if (mark.texture && DrawRunOverAttachment(run.images, mark.address, mark.size)) {
+		if (mark.texture && DrawRunOverAttachment(attachments, mark.address, mark.size)) {
 			DrawRun::GetTotals().alias_excluded.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
@@ -3363,9 +3375,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// its rendering instance, with the attachments as it left them: its acquisition, whose
 		// transitions, claims, refreshes and depth-feedback bookkeeping would all be repeats.
 		// (Verify mode checks a would-be continuation's acquisition as the continuation's.)
+		CommitStats::SubScope candidate_scope(CommitStats::Sub::AcqCandidate);
 		const bool acquire_reuse =
 		    DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify &&
 		    DrawRunAcquireCandidate(buffer, state, stages, bounded ? &written : nullptr);
+		candidate_scope.Stop();
 		if (acquire_reuse) {
 			DrawRun::GetTotals().acquire_reused.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -3439,6 +3453,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    run_verify_images && m_run.verify_valid && DrawRunPartialPush(buffer, pipeline);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
+		const CommitStats::SubScope push_scope(CommitStats::Sub::Push);
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active);
 	}
 	if (run_verify_push) {
@@ -3473,6 +3488,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto run_dynamic_emitted = g_dynamic_state_emitted;
 	if (!(m_run_active && run_dynamic)) {
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::DynamicState");
+		const CommitStats::SubScope dynamic_scope(CommitStats::Sub::Dynamic);
 		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info,
 		                         rendering, m_dynamic_state,
 		                         plan_stages && plan->viewports.valid ? &plan->viewports : nullptr);
@@ -3515,7 +3531,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			IndirectArgumentsBarrier(buffer, vk_buffer);
 		}
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
+	{
+		const CommitStats::SubScope begin_scope(CommitStats::Sub::Begin);
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+	}
 	if (m_depth_feedback.valid) {
 		NoteDepthFeedback(buffer);
 	}
@@ -3683,6 +3702,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// KYTY_DRAW_RUN: whether the next draw may continue this one (drawPrep/drawRun.h), and in verify
 	// mode what this draw's normal path computed against what a continuation would have reused.
 	if (DrawRun::Enabled()) {
+		const CommitStats::SubScope record_scope(CommitStats::Sub::RunRecord);
 		if (m_run_verify) {
 			DrawRunVerify(state, rendering, feedback_aspects, stages);
 		}
@@ -3724,6 +3744,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (CommitStats::Enabled()) [[unlikely]] {
 		CommitStats::Mark(CommitStats::Phase::Emit);
+		uint64_t textures = 0;
+		uint64_t samplers = 0;
+		for (const auto* stage: stages) {
+			textures += stage->images.size();
+			samplers += stage->samplers.size();
+		}
+		CommitStats::AddItems(CommitStats::Item::Textures, textures);
+		CommitStats::AddItems(CommitStats::Item::Samplers, samplers);
 		CommitStats::NoteRecorded(MakeCommitShape(buffer, stages, pipeline, rendering,
 		                                          m_dynamic_state, vertex_bindings, index_binding,
 		                                          draw, emit, index_source, shader_write_stages));

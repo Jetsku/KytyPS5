@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/texelImageLookup.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
@@ -1462,12 +1463,8 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	}
 
 	ImageIds result;
-	ForEachPage(address, size, [&](uint64_t page) {
-		const auto* owners = m_image_page_table.Find(page);
-		if (owners == nullptr) {
-			return;
-		}
-		owners->ForEach([&](ImageId id) {
+	TexelImageLookup::ForEachOwnerList(m_image_page_table, address, size, [&](const ImageIds& owners) {
+		owners.ForEach([&](ImageId id) {
 			auto* image = m_slot_images.try_get(id);
 			if (image == nullptr) {
 				return;
@@ -3956,14 +3953,129 @@ void TextureCache::UpdateImage(ImageId id) {
 	RefreshImage(id);
 }
 
+namespace TexelImageLookup {
+
+namespace {
+
+// Live switch (common/liveSwitch.h): every call chooses between equivalent queries.
+Live::Switch g_mode("KYTY_TEXEL_IMAGE_LOOKUP",
+                    [](const char* value) { return static_cast<int64_t>(ParseMode(value)); });
+
+Mode GetMode() {
+	return static_cast<Mode>(g_mode.Get());
+}
+
+bool StatsEnabled() {
+	static const bool enabled = [] {
+		const auto* stats  = std::getenv("KYTY_TEXEL_IMAGE_LOOKUP_STATS");
+		const auto* commit = std::getenv("KYTY_CP_COMMIT_STATS");
+		return (stats != nullptr && std::strcmp(stats, "1") == 0) ||
+		       (commit != nullptr && commit[0] != '\0' && std::strcmp(commit, "0") != 0) ||
+		       GetMode() == Mode::Verify || GetMode() == Mode::Exit;
+	}();
+	return enabled || GetMode() == Mode::Verify || GetMode() == Mode::Exit;
+}
+
+struct Totals {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> range_pages {0}; // pages a walk of the whole range visits
+	std::atomic<uint64_t> found {0};
+	std::atomic<uint64_t> verify_checks {0};
+	std::atomic<uint64_t> verify_mismatches {0};
+};
+Totals g_totals;
+
+} // namespace
+
+void PrintSummary() {
+	if (!StatsEnabled()) {
+		return;
+	}
+	static uint64_t                last_ns = 0;
+	static std::array<uint64_t, 5> last {};
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (last_ns == 0) {
+		last_ns = now;
+		return;
+	}
+	if (now - last_ns < 10'000'000'000ull) {
+		return;
+	}
+	const std::array<uint64_t, 5> values {g_totals.calls.load(std::memory_order_relaxed),
+	                                      g_totals.range_pages.load(std::memory_order_relaxed),
+	                                      g_totals.found.load(std::memory_order_relaxed),
+	                                      g_totals.verify_checks.load(std::memory_order_relaxed),
+	                                      g_totals.verify_mismatches.load(std::memory_order_relaxed)};
+	static const char* const names[] = {"page", "range", "verify", "exit"};
+	std::printf("TexelImageLookup %.0fs (%s): %" PRIu64 " calls, %" PRIu64
+	            " pages a range walk visits (%.2f per call), %" PRIu64 " found; verify %" PRIu64
+	            " checks, %" PRIu64 " mismatches\n",
+	            static_cast<double>(now - last_ns) * 1e-9, names[static_cast<uint32_t>(GetMode())],
+	            values[0] - last[0], values[1] - last[1],
+	            values[0] != last[0] ? static_cast<double>(values[1] - last[1]) /
+	                                       static_cast<double>(values[0] - last[0])
+	                                 : 0.0,
+	            values[2] - last[2], values[3] - last[3], values[4] - last[4]);
+	std::fflush(stdout);
+	last    = values;
+	last_ns = now;
+}
+
+} // namespace TexelImageLookup
+
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid,
                                          bool buffer_sync) {
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
+	using TexelImageLookup::Mode;
+	const auto mode  = TexelImageLookup::GetMode();
+	const bool stats = TexelImageLookup::StatsEnabled();
+	if (stats) {
+		TexelImageLookup::g_totals.calls.fetch_add(1, std::memory_order_relaxed);
+		TexelImageLookup::g_totals.range_pages.fetch_add(
+		    TexelImageLookup::PagesVisited(address, size, ImagePageTable::kPageBits),
+		    std::memory_order_relaxed);
+	}
 	std::scoped_lock lock {m_lock};
-	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	if (mode == Mode::Verify || mode == Mode::Exit) {
+		const auto page  = FindImageFromRangeLocked(address, size, 1, ensure_valid, buffer_sync);
+		const auto range = FindImageFromRangeLocked(address, size, size, ensure_valid, buffer_sync);
+		TexelImageLookup::g_totals.verify_checks.fetch_add(1, std::memory_order_relaxed);
+		if (page != range) {
+			const auto count =
+			    TexelImageLookup::g_totals.verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+			if (count < 64) {
+				std::printf("TexelImageLookupVerify: 0x%" PRIx64 "+0x%" PRIx64
+				            " ensure_valid=%u buffer_sync=%u: first page found image %u, the range "
+				            "walk image %u\n",
+				            address, size, ensure_valid ? 1u : 0u, buffer_sync ? 1u : 0u,
+				            static_cast<uint32_t>(page.index), static_cast<uint32_t>(range.index));
+				std::fflush(stdout);
+			}
+			if (mode == Mode::Exit) {
+				EXIT("TexelImageLookupVerify: the first-page query found a different image\n");
+			}
+		}
+		if (stats && range) {
+			TexelImageLookup::g_totals.found.fetch_add(1, std::memory_order_relaxed);
+		}
+		return range;
+	}
+	const auto selected = FindImageFromRangeLocked(
+	    address, size, TexelImageLookup::QuerySize(mode, size), ensure_valid, buffer_sync);
+	if (stats && selected) {
+		TexelImageLookup::g_totals.found.fetch_add(1, std::memory_order_relaxed);
+	}
+	return selected;
+}
+
+ImageId TextureCache::FindImageFromRangeLocked(uint64_t address, uint64_t size, uint64_t query_size,
+                                               bool ensure_valid, bool buffer_sync) {
+	ImageIds matches;
+	for (const auto id: FindImagesInRegion(address, query_size, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || owner->info.data.address != address) {
 			continue;

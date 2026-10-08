@@ -75,6 +75,9 @@ struct PreparedBindings {
 		std::vector<TextureBinding>                         images;
 	};
 	std::array<TextureSet, 3> texture_history {};
+	// KYTY_XFRAME_REUSE=verify: the current set came from the cross-frame store and passed its
+	// revalidation; RebindImages checks the views it acquires (reset by PrepareBindings).
+	bool xframe_verify_views = false;
 	// RebindBuffers: flattened_srt or shader_data_buffer was allocated for this binding (not a
 	// reused upload of the same recording), so no earlier descriptor set refers to it.
 	bool                                  fresh_upload = false;

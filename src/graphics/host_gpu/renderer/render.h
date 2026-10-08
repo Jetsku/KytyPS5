@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
+#include "graphics/host_gpu/renderer/pipeline/textureSetCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -1030,6 +1031,16 @@ private:
 	[[nodiscard]] bool RepeatStageTextures(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                       const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                                       PreparedBindings&                               prepared);
+	// KYTY_XFRAME_REUSE (drawPrep/xframeReuse.h), RepeatStageTextures for new words: moves the set
+	// in `prepared` (the one that fell out of the stage's history; none: null program) into the
+	// cross-frame store and, when the store holds a set of `program` with these T# words, makes it
+	// the current set (true; not yet revalidated). Otherwise `prepared` holds storage vectors.
+	[[nodiscard]] bool TakeStoredTextureSet(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                        const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+	                                        PreparedBindings&                               prepared);
+	using XFrameTextureSets = TextureSetCache<ShaderRecompiler::IR::CompiledShaderInfo,
+	                                          ShaderRecompiler::IR::DescriptorValue, TextureBinding>;
+	std::unique_ptr<XFrameTextureSets> m_xframe_sets;
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                        uint32_t                                        index,
 	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
@@ -1255,8 +1266,10 @@ private:
 		uint32_t          color_count      = 0;
 		uint32_t          color_slots      = 0;
 		RenderState       rendering;
-		// The textures of the recorded stages, then the attachments, as the draw left them.
+		// The textures of the recorded stages, then the attachments (from attachments_begin), as the
+		// draw left them.
 		std::vector<DrawRunImage> images;
+		uint32_t                  attachments_begin = 0;
 		// KYTY_DRAW_RUN_ACQUIRE and verify mode: the resolved targets (depth: one entry) and the
 		// scissor union (KYTY_ALIAS_BYTES claims) the attachments were acquired for.
 		std::vector<RenderColorInfo> colors;

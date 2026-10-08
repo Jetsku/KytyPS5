@@ -146,6 +146,11 @@ public:
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true,
 	                                               bool buffer_sync  = false);
+	// FindImageFromRange's selection among the images FindImagesInRegion finds for
+	// [address, address + query_size) (KYTY_TEXEL_IMAGE_LOOKUP). Caller holds m_lock.
+	[[nodiscard]] ImageId       FindImageFromRangeLocked(uint64_t address, uint64_t size,
+	                                                     uint64_t query_size, bool ensure_valid,
+	                                                     bool buffer_sync);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	// written: the draw's scissor (framebuffer pixels, unclamped); the target then owns only the
 	// 64 KiB blocks under it (KYTY_ALIAS_BYTES). nullptr: the whole image may be written.

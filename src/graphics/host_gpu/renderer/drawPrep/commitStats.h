@@ -39,6 +39,40 @@ enum class Phase : uint8_t {
 	Count
 };
 
+// Sub-phases: parts of the phases above, timed inside them (SubScope), reported per class as
+// "sub[...]" in microseconds per draw of the class (the phases still include them).
+enum class Sub : uint8_t {
+	Textures,     // PrepareBindings: texture resolution (memo runs, repeats, full resolutions)
+	Samplers,     // PrepareBindings: sampler handles
+	Views,        // RebindImages: texture views
+	ColorTargets, // colour target resolution
+	DepthTarget,  // depth target resolution
+	AcquireColor, // AcquireRenderTargets: colour attachments
+	AcquireDepth, // AcquireRenderTargets: depth attachment
+	Push,         // CommitBindings: descriptor writes, pushes or sets, push constants
+	Dynamic,      // dynamic state
+	Begin,        // BeginRendering (with the barrier flush)
+	AcqCandidate, // KYTY_DRAW_RUN_ACQUIRE: the reuse check (DrawRunAcquireCandidate)
+	RunRecord,    // KYTY_DRAW_RUN: the eligibility check and the record (DrawRunRecordDraw)
+	Count
+};
+// Per-draw counts (averaged per draw of the class): "items[...]".
+enum class Item : uint8_t {
+	Textures,
+	Samplers,
+	TexSetCurrent,  // a stage's texture set: its current set's words (RepeatStageTextures)
+	TexSetHistory,  // an earlier set of its history
+	TexSetMiss,     // new words
+	TexSetRepeated, // the found set passed TryRepeatResolve
+	ColorMemoHit,   // colour target description memo
+	ColorMemoMiss,
+	DepthMemoHit,
+	DepthMemoMiss,
+	TargetRepeat,   // a target lookup repeated (TryRepeatLookup)
+	TargetLookup,   // a full target FindImage
+	Count
+};
+
 namespace Detail {
 [[nodiscard]] bool ReadEnabled();
 [[nodiscard]] bool ReadIndirectOnly();
@@ -88,6 +122,27 @@ void OnFrameBoundary();
 // thread (self) or waited for (wait), in TSC cycles; added to the next BeginDraw's gap split.
 [[nodiscard]] uint64_t Now();
 void NoteHead(uint64_t self_cycles, uint64_t wait_cycles);
+
+void AddSub(Sub sub, uint64_t cycles);
+void AddItems(Item item, uint64_t count);
+
+class SubScope {
+public:
+	explicit SubScope(Sub sub): m_sub(sub), m_start(Enabled() ? Now() : 0) {}
+	~SubScope() { Stop(); }
+	void Stop() {
+		if (m_start != 0) {
+			AddSub(m_sub, Now() - m_start);
+			m_start = 0;
+		}
+	}
+	SubScope(const SubScope&)            = delete;
+	SubScope& operator=(const SubScope&) = delete;
+
+private:
+	Sub      m_sub;
+	uint64_t m_start;
+};
 
 // Hash helpers for building a DrawShape.
 [[nodiscard]] uint64_t Hash(const void* data, uint64_t size, uint64_t seed = 0);

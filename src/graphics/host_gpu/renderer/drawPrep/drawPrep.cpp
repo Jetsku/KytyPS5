@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/cache/texelImageLookup.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -18,6 +19,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
+#include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
@@ -1344,6 +1346,8 @@ void Engine::Commit(Slot& slot) {
 	CommitStats::EndDraw();
 	PrintDrawPrepSummary();
 	DrawRun::PrintSummary();
+	TexelImageLookup::PrintSummary();
+	XFrameReuse::PrintSummary();
 }
 
 void Engine::NoteFence() {

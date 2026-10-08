@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -186,6 +187,7 @@ ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exac
 	}
 	auto&      totals = m_draw_sequence_totals;
 	const auto full   = [&] {
+		CommitStats::AddItems(CommitStats::Item::TargetLookup, 1);
 		const auto id = cache.FindImage(desc, exact_format, record);
 		if (record->valid) {
 			totals.target_records++;
@@ -207,6 +209,7 @@ ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exac
 	}
 	totals.target_repeats++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetRepeats);
+	CommitStats::AddItems(CommitStats::Item::TargetRepeat, 1);
 	if (!verify) {
 		return record->image;
 	}
@@ -301,6 +304,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		if (memo->valid && memo->mask == mask && memo->slice_offset == render_target_slice_offset &&
 		    std::memcmp(&memo->registers, &rt, sizeof(rt)) == 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoHits);
+			CommitStats::AddItems(CommitStats::Item::ColorMemoHit, 1);
 			r.desc              = memo->desc;
 			r.guest_mip_level   = memo->guest_mip_level;
 			r.guest_array_layer = memo->guest_array_layer;
@@ -310,6 +314,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			return;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoMisses);
+		CommitStats::AddItems(CommitStats::Item::ColorMemoMiss, 1);
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {

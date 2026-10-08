@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -366,9 +367,11 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	if (TargetDescMemoEnabled() && memo.valid &&
 	    std::memcmp(&memo.registers, &z, sizeof(z)) == 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoHits);
+		CommitStats::AddItems(CommitStats::Item::DepthMemoHit, 1);
 		r.desc = memo.desc;
 	} else {
 		r.desc = MakeDepthTargetDesc(buffer, z);
+		CommitStats::AddItems(CommitStats::Item::DepthMemoMiss, 1);
 		if (TargetDescMemoEnabled()) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoMisses);
 			std::memcpy(&memo.registers, &z, sizeof(z));
