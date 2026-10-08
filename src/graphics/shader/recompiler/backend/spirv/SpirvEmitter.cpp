@@ -28,6 +28,7 @@ std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
+std::atomic_uint8_t  g_wave_clusters {0}; // HostWaveClusters: bit 0 vertex, 1 pixel, 2 mesh
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -323,7 +324,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						requirements.subgroup_local_invocation_id = true;
 					}
 					if (inst.GetOpcode() == IR::ValueOpcode::ReadLane &&
-					    GetCodegenOptions().lane_reductions &&
+					    GetCodegenOptions().lane_reductions && !WaveClustersActive(program) &&
 					    IR::MatchLaneReduction(inst, program.wave_size)) {
 						requirements.subgroup_arithmetic          = true;
 						requirements.subgroup_local_invocation_id = true;
@@ -380,6 +381,12 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 		}
 	}
+	// KYTY_WAVE32_CLUSTERS: every ballot and shuffle selects the wave's own 32 lanes by the
+	// invocation's subgroup lane.
+	if (WaveClustersActive(program) &&
+	    (requirements.subgroup_ballot || requirements.subgroup_shuffle)) {
+		requirements.subgroup_local_invocation_id = true;
+	}
 	return requirements;
 }
 
@@ -432,6 +439,38 @@ HostShaderClock GetHostShaderClock() {
 	        .shift = g_shader_clock_shift.load(std::memory_order_relaxed)};
 }
 
+void SetHostWaveClusters(const HostWaveClusters& clusters) {
+	g_wave_clusters.store(static_cast<uint8_t>((clusters.vertex ? 1u : 0u) | (clusters.pixel ? 2u : 0u) |
+	                                           (clusters.mesh ? 4u : 0u)),
+	                      std::memory_order_relaxed);
+}
+
+HostWaveClusters GetHostWaveClusters() {
+	const auto bits = g_wave_clusters.load(std::memory_order_relaxed);
+	return {.vertex = (bits & 1u) != 0u, .pixel = (bits & 2u) != 0u, .mesh = (bits & 4u) != 0u};
+}
+
+bool WaveClustersActive(const IR::Program& program) {
+	const auto mode = GetCodegenOptions().wave32_clusters;
+	if (program.wave_size != 32u || mode == Wave32Clusters::Off) {
+		return false;
+	}
+	const auto host  = GetHostWaveClusters();
+	const bool force = mode == Wave32Clusters::Force;
+	switch (program.stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationEvaluation: return force || host.vertex;
+		case ShaderType::Pixel: return force || host.pixel;
+		case ShaderType::Mesh: return force || host.mesh;
+		// Compute pipelines require the wave size (DeviceCompat::ComputeSubgroupSize), so only a test
+		// forces clusters there (it runs the wave32 compute cases through the cluster code); hull
+		// lanes are invocation ids, not subgroup lanes.
+		case ShaderType::Compute: return force;
+		default: return false;
+	}
+}
+
 int32_t RealtimeClockShift(double timestamp_period_ns) {
 	const double     rate = timestamp_period_ns > 0.0 ? 1e9 / timestamp_period_ns : 1e9;
 	constexpr double Low  = 100e6 / 1.5;
@@ -466,6 +505,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	EmitterState state(program, input_info);
 	state.mip_stats_records = mip_stats_records;
 	state.lane_count = ShaderLanesPerInvocation(program.stage, program.wave_size, input_info);
+	state.wave_clusters = state.lane_count == 1 && WaveClustersActive(program);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

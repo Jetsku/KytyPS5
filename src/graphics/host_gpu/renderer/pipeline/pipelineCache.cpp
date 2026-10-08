@@ -4952,12 +4952,19 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const auto max_lds_dwords =
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
 	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
+		// Once per shader, named (AMD reports 32 KiB; some Astro Bot compute shaders ask for 48).
+		static std::mutex                   warned_mutex;
+		static std::unordered_set<uint64_t> warned;
+		bool                                first = false;
+		{
+			const std::lock_guard lock(warned_mutex);
+			first = warned.insert(params.hash).second;
+		}
+		if (first) {
+			PipelineCacheLog("GPU warning: game compute shader 0x{:016x} requests {} bytes of LDS, "
+			                 "but the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
 			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
+			                 params.hash, input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
 		}
 	}
 	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);

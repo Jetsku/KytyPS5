@@ -282,6 +282,13 @@ void CheckFingerprint() {
   host_differs("shader clock shift", [&] {
     Spirv::SetHostShaderClock({.scope = shader_clock.scope, .shift = shader_clock.shift == 0 ? 3 : 0});
   });
+  const auto wave_clusters = Spirv::GetHostWaveClusters();
+  host_differs("wave32 clusters", [&] {
+    Spirv::SetHostWaveClusters({.vertex = !wave_clusters.vertex,
+                                .pixel = wave_clusters.pixel,
+                                .mesh = wave_clusters.mesh});
+  });
+  Spirv::SetHostWaveClusters(wave_clusters);
   Require(name, "host state restored", ShaderRecompiler::CodegenFingerprint() == base,
           "restoring the host state did not restore the fingerprint");
 
@@ -299,7 +306,8 @@ void CheckFingerprint() {
         "KYTY_NATIVE_INDIRECT_MESH", "KYTY_LDS_WAITCNT_BARRIER", "KYTY_LOD_STATS_MODE",
         "KYTY_SRT_COMPILED_RECIPES", "KYTY_SRT_DECODED_ROOTS", "KYTY_SRT_ARITHMETIC_TAPES",
         "KYTY_REALTIME_CLOCK", "KYTY_DPP_SKIP_INACTIVE", "KYTY_LANE_REDUCTIONS",
-        "KYTY_DISPATCHER_CAP", "KYTY_IR_LINEAR_USES", "KYTY_FOLD_LANE_MASKS"}) {
+        "KYTY_DISPATCHER_CAP", "KYTY_IR_LINEAR_USES", "KYTY_FOLD_LANE_MASKS",
+        "KYTY_WAVE32_CLUSTERS"}) {
     Require(name, "codegen switch list", listed(required),
             std::string("the codegen switch list misses ") + required);
   }

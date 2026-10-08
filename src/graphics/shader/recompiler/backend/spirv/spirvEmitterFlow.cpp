@@ -648,15 +648,21 @@ void EmitBarrier(EmitterState& state) {
 }
 
 void EmitSharedMemoryBarrier(EmitterState& state) {
-	// S_WAITCNT lgkmcnt(0) after LDS writes: lanes of one guest wave may live in different
-	// host invocations (and host subgroups for split wave64), so make their LDS writes
-	// visible before the wave reads the exchanged data. Only compute-like stages own
-	// workgroup memory; Vulkan rejects Workgroup memory scope elsewhere.
+	// S_WAITCNT lgkmcnt(0) after LDS writes: lanes of one guest wave live in different host
+	// invocations of one subgroup (two lanes per invocation for a split wave64), so make their
+	// LDS writes visible before the wave reads the exchanged data. Only compute-like stages own
+	// workgroup memory; Vulkan rejects Workgroup memory scope elsewhere. The wait orders only the
+	// wave's own operations, so the barrier stays at subgroup scope (KYTY_LDS_WAITCNT_BARRIER):
+	// it may sit where other waves of the workgroup do not go, and the AMD driver makes a
+	// workgroup-scope fence in a mesh shader a workgroup barrier, which then never completes.
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		return;
 	}
-	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeWorkgroup),
+	const auto scope = GetCodegenOptions().lds_waitcnt_barrier == LdsWaitcntBarrier::Workgroup
+	                       ? spv::ScopeWorkgroup
+	                       : spv::ScopeSubgroup;
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
 	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
 	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
 }
@@ -794,7 +800,8 @@ uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
 // (addresses, scalar loads, loop exits), as per-lane vector work.
 static uint32_t MarkLaneReadUniform(ValueEmitContext& ctx, const IR::Inst& inst,
                                     uint32_t shuffled) {
-	if (!GetCodegenOptions().uniform_lane_reads) {
+	// KYTY_WAVE32_CLUSTERS: the subgroup's first invocation may belong to the other guest wave.
+	if (!GetCodegenOptions().uniform_lane_reads || ctx.state.wave_clusters) {
 		return shuffled;
 	}
 	auto&      state  = ctx.state;
@@ -862,7 +869,8 @@ static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (GetCodegenOptions().lane_reductions) {
+	// KYTY_WAVE32_CLUSTERS: a subgroup reduction would cover both guest waves; the scan stays.
+	if (GetCodegenOptions().lane_reductions && !ctx.state.wave_clusters) {
 		if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {
 			// One reduction per wave: the second half of a wave64 that one invocation runs
 			// (lane_count 2) takes the first half's result, which covers the same lanes.

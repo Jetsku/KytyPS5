@@ -18,12 +18,13 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	if (state.lane_count == 2) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
-	const auto shuffled = state.builder.AllocateId();
+	const auto host_target = EmitHostLane(state, target);
+	const auto shuffled    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-	                          ConstantU32(state, spv::ScopeSubgroup), source, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), source, host_target);
 	const auto source_exec = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-	                          ConstantU32(state, spv::ScopeSubgroup), exec, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), exec, host_target);
 	const auto source_active =
 	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
@@ -1423,9 +1424,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto live =
 		    Binary(state, spv::OpLogicalAnd, TypeBool(state), exec,
 		           Unary(state, spv::OpLogicalNot, TypeBool(state), EmitIsHelperInvocation(state)));
-		elected_ballot = state.builder.AllocateId();
+		const auto live_ballot = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4),
-		                          elected_ballot, ConstantU32(state, spv::ScopeSubgroup), live);
+		                          live_ballot, ConstantU32(state, spv::ScopeSubgroup), live);
+		elected_ballot = EmitWaveBallot(state, live_ballot);
 		const auto elected_low  = state.builder.AllocateId();
 		const auto elected_high = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), elected_low,
@@ -1471,7 +1473,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
+	                          ConstantU32(state, spv::ScopeSubgroup), atomic,
+	                          EmitHostLane(state, source_lane));
 	return result;
 }
 
@@ -1655,7 +1658,8 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
 		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
-		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result, ballot, word);
+		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result,
+		                          EmitWaveBallot(state, ballot), word);
 		return result;
 	};
 	// RDNA2 permutes independently within each 32-lane half. Intersect the source
@@ -1683,7 +1687,8 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                  EmitFindUMsb32(state, writers)), lane);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0),
+	                          EmitHostLane(state, source));
 	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
 }
 

@@ -10,13 +10,10 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
-// KYTY_LDS_WAITCNT_BARRIER=0 restores the old behavior where S_WAITCNT never orders LDS.
+// KYTY_LDS_WAITCNT_BARRIER=0 restores the old behavior where S_WAITCNT never orders LDS (the
+// scope of the barrier is the emitter's, CodegenOptions::lds_waitcnt_barrier).
 bool LdsWaitcntBarrierEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_LDS_WAITCNT_BARRIER");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+	return GetCodegenOptions().lds_waitcnt_barrier != LdsWaitcntBarrier::Off;
 }
 
 std::atomic_uint32_t g_lds_waitcnt_barriers {0};
@@ -227,14 +224,17 @@ void Translator::S_WAITCNT(const Decoder::Instruction& inst) {
 		return;
 	}
 	// On hardware the wave's LDS operations complete in order, so data written by one lane
-	// is visible to every lane after lgkmcnt(0). Host lanes of one guest wave may be separate
-	// invocations or subgroups; a workgroup memory barrier makes the writes visible.
+	// is visible to every lane after lgkmcnt(0). Host lanes of one guest wave are separate
+	// invocations of one subgroup (two lanes per invocation for a split wave64); a memory
+	// barrier makes the writes visible (subgroup scope by default, KYTY_LDS_WAITCNT_BARRIER).
 	ir.Emit(IR::ValueOpcode::SharedMemoryBarrier);
 	lds_write_pending = false;
 	if (g_lds_waitcnt_barriers.fetch_add(1u, std::memory_order_relaxed) == 0u) {
 		LOGF("Shader recompiler: ordering LDS writes at S_WAITCNT lgkmcnt(0) (shader 0x%016" PRIx64
-		     ", pc 0x%08x); KYTY_LDS_WAITCNT_BARRIER=0 disables\n",
-		     program.shader_hash, inst.pc);
+		     ", pc 0x%08x) with a %s-scope memory barrier; KYTY_LDS_WAITCNT_BARRIER=0 disables\n",
+		     program.shader_hash, inst.pc,
+		     GetCodegenOptions().lds_waitcnt_barrier == LdsWaitcntBarrier::Workgroup ? "workgroup"
+		                                                                             : "subgroup");
 	}
 }
 

@@ -64,6 +64,22 @@ struct HostShaderClock {
 void            SetHostShaderClock(const HostShaderClock& clock);
 HostShaderClock GetHostShaderClock();
 
+// Graphics stages whose host subgroups can be wider than a wave32 program's wave (set once by the
+// device layer). The AMD proprietary driver runs vertex, mesh and pixel shaders on 64-wide subgroups
+// and lets only compute pipelines require 32 (requiredSubgroupSizeStages = COMPUTE), so one host
+// subgroup holds two guest waves; the emitter then keeps each wave to its own 32 lanes
+// (KYTY_WAVE32_CLUSTERS, CodegenOptions).
+struct HostWaveClusters {
+	bool vertex = false; // VS, LS and DS programs (never given a required subgroup size)
+	bool pixel  = false;
+	bool mesh   = false;
+};
+
+void             SetHostWaveClusters(const HostWaveClusters& clusters);
+HostWaveClusters GetHostWaveClusters();
+// Whether this program keeps each wave32 guest wave to its own 32 lanes of the host subgroup.
+[[nodiscard]] bool WaveClustersActive(const IR::Program& program);
+
 // Vulkan reports no rate for the shader clock. The device clock counts at the rate of timestamp
 // queries on NVIDIA (1 GHz) and AMD (the 100 MHz reference clock), and Intel's subgroup clock is
 // its timestamp counter, so the shift is taken from timestampPeriod: the one that brings the rate
