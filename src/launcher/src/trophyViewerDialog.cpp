@@ -196,8 +196,8 @@ using Common::Trophies::Progress;
 Common::Trophies::UnlockData LoadUnlocks(const Configuration& info,
                                          const QString& runtime_directory, const QString& file) {
 	const auto label = TrophyFilePattern.match(QFileInfo(file).fileName()).captured(1).toUInt();
-	return Common::Trophies::LoadUnlockData(Common::Trophies::UnlocksPath(
-	    GameContent::ToPath(runtime_directory), info.title_id.toStdString(), info.user_id, label));
+	return Common::Trophies::LoadUnlockDataMigrating(GameContent::ToPath(runtime_directory),
+	                                                 info.title_id.toStdString(), info.user_id, label);
 }
 
 Progress GetGameProgress(const Configuration* info, const QString& runtime_directory) {

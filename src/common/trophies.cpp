@@ -251,6 +251,37 @@ std::filesystem::path UnlocksPath(const std::filesystem::path& root, std::string
 	       fmt::format("trophies_{}_{}.json", user_id, service_label);
 }
 
+std::filesystem::path LegacyUnlocksPath(const std::filesystem::path& root, std::string_view title_id,
+                                        int user_id, uint32_t service_label) {
+	const auto current = UnlocksPath(root, title_id, user_id, service_label);
+	if (current.empty()) {
+		return {};
+	}
+	return root / "_SaveData" / title_id / current.filename();
+}
+
+UnlockData LoadUnlockDataMigrating(const std::filesystem::path& root, std::string_view title_id,
+                                   int user_id, uint32_t service_label) {
+	const auto path = UnlocksPath(root, title_id, user_id, service_label);
+	if (path.empty()) {
+		return {};
+	}
+	std::error_code error;
+	if (!std::filesystem::exists(path, error)) {
+		const auto legacy = LegacyUnlocksPath(root, title_id, user_id, service_label);
+		if (std::filesystem::is_regular_file(legacy, error)) {
+			auto unlocks = LoadUnlockData(legacy);
+			// Saved in the current format at the current place; if that fails, the legacy unlocks
+			// are still used for this run and the copy is tried again next time.
+			if (!unlocks.unlocked.empty()) {
+				(void)SaveUnlockData(path, unlocks);
+			}
+			return unlocks;
+		}
+	}
+	return LoadUnlockData(path);
+}
+
 UnlockData LoadUnlockData(const std::filesystem::path& path) {
 	File file(path, File::Mode::Read);
 	if (file.IsInvalid() || file.Size() > MaxUnlocksSize) {

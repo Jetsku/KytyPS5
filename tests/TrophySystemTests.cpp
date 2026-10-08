@@ -249,6 +249,40 @@ void TestUnlockPersistence(const std::filesystem::path &directory) {
   Check(!std::filesystem::exists(directory / "blocked.json.tmp"),
         "failed replacement removes temporary file");
 }
+
+// Unlocks saved by earlier fork builds at _SaveData/<title>/ are copied to _Trophies/<title>/
+// once, in the current format, and the legacy file is kept.
+void TestLegacyUnlockMigration(const std::filesystem::path &directory) {
+  const auto legacy = Trophies::LegacyUnlocksPath(directory, "PPSA01325", 1000, 0);
+  const auto current = Trophies::UnlocksPath(directory, "PPSA01325", 1000, 0);
+  Check(legacy == directory / "_SaveData/PPSA01325/trophies_1000_0.json",
+        "legacy unlock path");
+  Check(Trophies::LegacyUnlocksPath(directory, "../bad", 1000, 0).empty(),
+        "legacy path rejects unsafe title IDs");
+  Check(Trophies::LoadUnlockDataMigrating(directory, "PPSA01325", 1000, 0).unlocked.empty() &&
+            !std::filesystem::exists(current),
+        "nothing to migrate loads as empty and writes nothing");
+  std::filesystem::create_directories(legacy.parent_path());
+  {
+    Common::File file;
+    Check(file.Create(legacy), "create legacy unlock file");
+    const std::string text = R"({"unlockedTrophies":[1,11]})";
+    uint32_t written = 0;
+    file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+    file.Close();
+  }
+  const auto migrated = Trophies::LoadUnlockDataMigrating(directory, "PPSA01325", 1000, 0);
+  Check(migrated.unlocked == std::set<int>{1, 11}, "legacy unlocks are loaded");
+  Check(std::filesystem::exists(current) && std::filesystem::exists(legacy) &&
+            Trophies::LoadUnlockData(current).unlocked == std::set<int>{1, 11},
+        "legacy unlocks are copied to the current location and kept");
+  auto newer = migrated;
+  newer.unlocked.insert(12);
+  Check(Trophies::SaveUnlockData(current, newer), "save a newer unlock");
+  Check(Trophies::LoadUnlockDataMigrating(directory, "PPSA01325", 1000, 0).unlocked ==
+            std::set<int>{1, 11, 12},
+        "the current file wins once it exists");
+}
 } // namespace
 
 int main() {
@@ -256,6 +290,7 @@ int main() {
   TestEventExtraction(directory.Path());
   TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
+  TestLegacyUnlockMigration(directory.Path());
   std::printf("TrophySystemTests: all cases passed\n");
   return 0;
 }

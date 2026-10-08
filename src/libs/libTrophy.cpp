@@ -154,7 +154,7 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 		}
 	}
 	auto path    = Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto unlocks = Trophies::LoadUnlockData(path);
+	auto unlocks = Trophies::LoadUnlockDataMigrating({}, title_id, key.first, key.second);
 	return &g_states.emplace(key, TrophyState {&package, std::move(unlocks), std::move(path)})
 	            .first->second;
 }

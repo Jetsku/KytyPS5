@@ -80,6 +80,16 @@ struct Progress {
                                                 std::string_view title_id, int user_id,
                                                 uint32_t service_label);
 [[nodiscard]] UnlockData            LoadUnlockData(const std::filesystem::path& path);
+// Where this fork stored unlocks before upstream moved them to _Trophies (int16.1, int17):
+// _SaveData/<title>/trophies_<user>_<service>.json, same format without timestamps.
+[[nodiscard]] std::filesystem::path LegacyUnlocksPath(const std::filesystem::path& root,
+                                                      std::string_view title_id, int user_id,
+                                                      uint32_t service_label);
+// Loads the unlocks at UnlocksPath; when that file does not exist yet, copies the legacy file
+// there first (once, keeping the legacy file), so earlier unlocks are not lost.
+[[nodiscard]] UnlockData LoadUnlockDataMigrating(const std::filesystem::path& root,
+                                                 std::string_view title_id, int user_id,
+                                                 uint32_t service_label);
 [[nodiscard]] bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks);
 
 } // namespace Common::Trophies
