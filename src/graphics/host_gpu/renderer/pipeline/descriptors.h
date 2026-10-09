@@ -104,6 +104,11 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                          std::vector<uint32_t>&                          shader_data);
 
+// Description of the fallback image for a null shader image descriptor.
+[[nodiscard]] TextureCache::ImageDesc
+NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                TextureCache::BindingType binding);
+
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] uint32_t
