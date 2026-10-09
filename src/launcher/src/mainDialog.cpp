@@ -76,6 +76,7 @@ public:
 	void Update();
 	void FindInterpreter();
 	void Run();
+	void SetPresetWarning(const QString& text);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
 
@@ -91,6 +92,9 @@ private:
 	UpdateChecker*  m_update_checker = nullptr;
 	ControllerLightbar m_lightbar;
 	QString         m_interpreter;
+	QString         m_preset_warning;
+	QLabel*         m_preset_label   = nullptr;
+	bool            m_started        = false;
 
 	QProcess m_process;
 
@@ -204,10 +208,35 @@ void MainDialogPrivate::FindInterpreter() {
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
+	m_started = true;
+	if (!m_preset_warning.isEmpty()) {
+		QMessageBox::warning(m_main_dialog, tr("Release settings not applied"), m_preset_warning);
+	}
+
 	Update();
 	if (m_ui->check_updates_on_startup->isChecked()) {
 		m_update_checker->Check(false);
 	}
+}
+
+void MainDialogPrivate::SetPresetWarning(const QString& text) {
+	m_preset_warning = text;
+	if (m_preset_label == nullptr) {
+		m_preset_label = new QLabel(m_main_dialog);
+		m_preset_label->setWordWrap(true);
+		m_preset_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+		m_preset_label->setStyleSheet(QStringLiteral("QLabel { color: #d03030; font-weight: bold; }"));
+		m_ui->verticalLayout_4->insertWidget(0, m_preset_label);
+	}
+	m_preset_label->setText(text);
+	m_preset_label->setVisible(!text.isEmpty());
+	if (m_started && !text.isEmpty()) {
+		QMessageBox::warning(m_main_dialog, tr("Release settings not applied"), text);
+	}
+}
+
+void MainDialog::SetPresetWarning(const QString& text) {
+	m_p->SetPresetWarning(text);
 }
 
 static QString BoolArg(bool value) {

@@ -150,7 +150,10 @@ struct CodegenOptions {
 	// dropped. An S_BUFFER_LOAD through a V# read that way then reads through BDA, and a program with
 	// another such descriptor (no BDA path) is dropped, as before. Reads whose address can be
 	// evaluated before the dispatch keep their flat slots.
-	bool srt_variant_reads = false;
+	// Default on since int18 (before, only u59-preset.json set it): without it Astro Bot's tiled
+	// deferred-lighting and GI kernels are dropped, and with the game's lighting patches off lit
+	// geometry renders black. KYTY_SRT_VARIANT_READS=0 restores the old planning.
+	bool srt_variant_reads = true;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
