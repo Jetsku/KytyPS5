@@ -157,6 +157,10 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
+	// KYTY_LDS_DEVICE_BUFFER (ShaderRecompiler::PlanComputeLds): the program keeps its
+	// lds_size_dwords of LDS in the SharedMemory device buffer, one region per workgroup, instead of
+	// workgroup memory (an allocation above the device's limit).
+	bool               lds_storage                = false;
 	ShaderStageRuntime stage;
 };
 

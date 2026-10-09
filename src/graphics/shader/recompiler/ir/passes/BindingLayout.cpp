@@ -49,8 +49,10 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 	layout.descriptors.push_back({kind, std::move(resources)});
 }
 
-bool UsesGds(const Program& program) {
-	bool uses_gds = false;
+} // namespace
+
+SharedMemoryUse CollectSharedMemoryUse(const Program& program) {
+	SharedMemoryUse use;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (SharedAccessOf(inst.GetOpcode()) == SharedAccess::None) {
@@ -64,13 +66,16 @@ bool UsesGds(const Program& program) {
 			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
 				BindingFail("typed shader contains invalid shared-memory metadata");
 			}
-			uses_gds |= kind == ResourceKind::Gds;
+			use.gds |= kind == ResourceKind::Gds;
+			use.lds |= kind == ResourceKind::Lds;
 		}
 	}
-	return uses_gds;
+	return use;
 }
 
-} // namespace
+bool UsesLdsStorage(const Program& program, bool lds_storage) {
+	return lds_storage && program.stage == ShaderType::Compute && CollectSharedMemoryUse(program).lds;
+}
 
 bool UsesBvhNodeCount(const Program& program) {
 	const auto& options = GetCodegenOptions();
@@ -105,7 +110,7 @@ bool UsesMipStats(const Program& program) {
 	return false;
 }
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -162,7 +167,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
 	// KYTY_LOOP_GUARD and the BVH node count report through GDS, so those programs bind GDS.
-	if (UsesGds(program) || LoopGuardApplies(program.shader_hash) || UsesBvhNodeCount(program)) {
+	const auto shared = CollectSharedMemoryUse(program);
+	if (shared.gds || LoopGuardApplies(program.shader_hash) || UsesBvhNodeCount(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (program.info.uses_dma) {
@@ -183,6 +189,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	}
 	if (mip_stats) {
 		AddBinding(next, DescriptorBindingKind::MipStats);
+	}
+	if (UsesLdsStorage(program, lds_storage)) {
+		AddBinding(next, DescriptorBindingKind::SharedMemory);
 	}
 
 	program.bindings                = std::move(next);

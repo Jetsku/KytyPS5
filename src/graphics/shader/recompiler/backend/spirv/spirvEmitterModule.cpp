@@ -333,6 +333,20 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Gds:
 				state.gds_variable = Define(StorageBufferType(state), "gds");
 				break;
+			case IR::DescriptorBindingKind::SharedMemory:
+				// KYTY_LDS_DEVICE_BUFFER: the dispatch's LDS regions. Coherent: other invocations of
+				// the workgroup (other CUs of an AMD WGP) read what a barrier made available.
+				state.lds_variable = Define(StorageBufferType(state), "lds_dwords");
+				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
+				if (state.requirements.shared_int64_atomics) {
+					state.lds_u64_variable = Define(StorageBufferU64Type(state), "lds_qwords");
+					for (const auto variable: {state.lds_variable, state.lds_u64_variable}) {
+						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+					}
+					state.builder.AddAnnotation(spv::OpDecorate, state.lds_u64_variable,
+					                            spv::DecorationCoherent);
+				}
+				break;
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(binding.kind) ==
 				        IR::ImageResourceClass::None);
@@ -465,6 +479,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
 		case IR::StageInputKind::BaryCoordNoPerspective: return spv::BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return spv::BuiltInWorkgroupId;
+		case IR::StageInputKind::NumWorkgroups: return spv::BuiltInNumWorkgroups;
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
@@ -533,15 +548,19 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
+	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components, const char* name) {
+		if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
+			    return input.kind == kind;
+		    })) {
+			state.inputs.push_back({{kind, 0, components, name}});
+		}
+	};
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer) {
+		// The workgroup's LDS region: its index in the dispatch (EmitLdsStorageBase).
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+	}
 	if (state.lane_count == 2) {
-		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
-		                             const char* name) {
-			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
-				    return input.kind == kind;
-			    })) {
-				state.inputs.push_back({{kind, 0, components, name}});
-			}
-		};
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
@@ -572,6 +591,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
+			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
 			case IR::StageInputKind::GlobalInvocationId: type = TypeU32Vector(state, 3); break;
 			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
@@ -676,7 +696,9 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	// KYTY_CLIP_GUARD=0: no plane reserved (an AMD test 3 diagnostic).
+	if (state.program.stage == ShaderType::Vertex && GetCodegenOptions().clip_guard &&
+	    clip_distance_count + cull_distance_count < 8u &&
 	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		    return output.kind == IR::StageOutputKind::Position;
 	    })) {
@@ -808,7 +830,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
 	}
-	if (state.requirements.shared_int64_atomics) {
+	if (state.requirements.shared_int64_atomics &&
+	    state.lds_storage_class == spv::StorageClassWorkgroup) {
 		state.builder.RequireVersion(0x00010400u);
 		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
 		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);

@@ -1100,6 +1100,15 @@ if(BUILD_TESTING)
 	add_test(NAME wave32_clusters_wave_branch
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-branch-only)
 	set_tests_properties(wave32_clusters_shader_cases wave32_clusters_wave_branch PROPERTIES ENVIRONMENT "KYTY_WAVE32_CLUSTERS=force")
+	# KYTY_LDS_DEVICE_BUFFER: compute LDS above the device limit (48 KiB in some Astro Bot shaders,
+	# 32 KiB on AMD) in a device buffer. The 48 KiB exchange natively, through the AMD limit
+	# (KYTY_LDS_LIMIT_OVERRIDE) and forced, in the harness and the renderer; and every shader case
+	# with its LDS forced into the buffer.
+	add_test(NAME lds_device_buffer
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lds-device-buffer-only)
+	add_test(NAME lds_device_buffer_shader_cases
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-cases-only)
+	set_tests_properties(lds_device_buffer_shader_cases PROPERTIES ENVIRONMENT "KYTY_LDS_DEVICE_BUFFER=force")
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)

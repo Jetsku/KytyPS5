@@ -20,11 +20,11 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 31 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, loop_guard_budget, loop_guard_shaders, dispatcher_cap,
-// rt_node_budget.
+// Members: 33 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer, loop_guard_budget, loop_guard_shaders, dispatcher_cap,
+// rt_node_budget, lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 80, "CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 88,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -105,6 +105,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.volatile_loads ? 1u : 0u);
 	b.U8(static_cast<uint8_t>(options.wave32_clusters));
 	b.U8(static_cast<uint8_t>(options.lds_waitcnt_barrier));
+	b.U8(static_cast<uint8_t>(options.lds_device_buffer));
+	b.U32(options.lds_limit_override);
+	b.U8(options.ps_per_vertex ? 1u : 0u);
+	b.U8(options.clip_guard ? 1u : 0u);
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();

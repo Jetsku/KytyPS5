@@ -1267,8 +1267,7 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
 		if (mem.kind == IR::ResourceKind::Lds) {
-			const auto semantics =
-			    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
+			const auto semantics = spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(ctx.state);
 			ctx.state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(ctx.state, scope),
 			                              ConstantU32(ctx.state, semantics));
 		} else {
@@ -1346,25 +1345,34 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
-	EnsureLdsStorage(state);
+	const bool device_buffer = state.lds_storage_class == spv::StorageClassStorageBuffer;
+	if (!device_buffer) {
+		EnsureLdsStorage(state);
+	}
 	EmitIfCondition(state, ctx.Arg(inst, 2), [&]() {
 		const auto address = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 		                            ByteAddress(ctx, inst, mem), ConstantU32(state, 0xfff8u));
-		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
-		                          ConstantU32(state, 3u));
-		const auto in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index,
-		                              ConstantU32(state, LdsDwordCount(state) / 2u));
+		auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
+		                    ConstantU32(state, 3u));
+		// Device-buffer LDS: the region's bound and base in qwords (regions are whole qwords:
+		// LDS sizes are multiples of 512 bytes).
+		const auto bound = device_buffer ? EmitShiftRightConstant(state, state.lds_length, 1u)
+		                                 : ConstantU32(state, LdsDwordCount(state) / 2u);
+		const auto in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, bound);
 		EmitIfCondition(state, in_bounds, [&]() {
+			if (device_buffer) {
+				index = EmitAddU32(state, index, EmitShiftRightConstant(state, state.lds_base_dwords, 1u));
+			}
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpAccessChain,
-			                          TypePointer(state, spv::StorageClassWorkgroup, TypeScalarU64(state)),
+			                          TypePointer(state, state.lds_storage_class, TypeScalarU64(state)),
 			                          pointer, state.lds_u64_variable, ConstantU32(state, 0), index);
 			const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, 1));
 			state.builder.AddFunction(
 			    SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), state.builder.AllocateId(),
 			    pointer, ConstantU32(state, spv::ScopeWorkgroup),
-			    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
-			                           spv::MemorySemanticsWorkgroupMemoryMask), value);
+			    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state)),
+			    value);
 		});
 	});
 }

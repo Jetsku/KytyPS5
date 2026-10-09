@@ -86,7 +86,13 @@ struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {}
+	      requirements(AnalyzeProgramRequirements(program_)) {
+		if (IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+			lds_storage_class = spv::StorageClassStorageBuffer;
+		} else if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
+			lds_storage_class = spv::StorageClassWorkgroup;
+		}
+	}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
@@ -133,6 +139,14 @@ struct EmitterState {
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
+	// Where LDS lives: Workgroup memory (compute, mesh), Function (the other stages keep one copy
+	// per invocation) or StorageBuffer (KYTY_LDS_DEVICE_BUFFER: the SharedMemory binding, one
+	// region of LdsDwordCount dwords per workgroup).
+	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// StorageBuffer LDS, set at function entry: the workgroup's first dword in the buffer, and the
+	// bound of its accesses (LdsDwordCount, or 0 when the buffer holds no region for it).
+	uint32_t                                         lds_base_dwords   = 0;
+	uint32_t                                         lds_length        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -180,6 +194,14 @@ struct EmitterState {
 	std::unordered_set<const IR::Inst*> indexed_select_members;
 	std::unordered_set<const IR::Inst*> indexed_select_compares;
 };
+
+// The memory-semantics storage bit that orders LDS: workgroup memory, or uniform (storage-buffer)
+// memory when LDS lives in the device buffer.
+[[nodiscard]] inline uint32_t LdsMemorySemantics(const EmitterState& state) {
+	return state.lds_storage_class == spv::StorageClassStorageBuffer
+	           ? spv::MemorySemanticsUniformMemoryMask
+	           : spv::MemorySemanticsWorkgroupMemoryMask;
+}
 
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
@@ -669,9 +691,9 @@ inline uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limi
 template <typename Fn>
 uint32_t AtomicUpdateLoop(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-	const auto memory = [&] {
+	const auto memory = [&]() -> uint32_t {
 		switch (kind) {
-			case IR::ResourceKind::Lds: return spv::MemorySemanticsWorkgroupMemoryMask;
+			case IR::ResourceKind::Lds: return LdsMemorySemantics(state);
 			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
 			default: return spv::MemorySemanticsUniformMemoryMask;
 		}

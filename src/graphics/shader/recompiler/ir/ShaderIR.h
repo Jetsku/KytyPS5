@@ -259,6 +259,8 @@ enum class StageInputKind {
 	BaryCoordSmoothSample,
 	BaryCoordNoPerspectiveCentroid,
 	BaryCoordNoPerspectiveSample,
+	// The dispatch's workgroup counts (compute; the LDS device buffer's per-workgroup regions).
+	NumWorkgroups,
 };
 
 // How a V_INTERP_P2 read is interpolated, from the I/J pair it uses (GetAttribute flags).
@@ -371,11 +373,19 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	MipStats,
+	// KYTY_LDS_DEVICE_BUFFER: compute LDS kept in a device buffer (ShaderComputeInputInfo::
+	// lds_storage). Compute only, so it sits past the per-stage binding range (NativeBinding).
+	SharedMemory,
 	Count,
 };
 
+// Native bindings per stage group; SharedMemory (compute, group 0 only) lies past it, so the
+// graphics stages' bindings are those of the builds before it.
+inline constexpr uint32_t NativeBindingGroupStride = 56u;
+
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == NativeBindingGroupStride);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -411,8 +421,7 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	                       : stage == ShaderType::TessellationControl    ? 2u
 	                       : stage == ShaderType::TessellationEvaluation ? 3u
 	                                                                     : 0u;
-	return static_cast<uint32_t>(kind) +
-	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
+	return static_cast<uint32_t>(kind) + group * NativeBindingGroupStride;
 }
 
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {

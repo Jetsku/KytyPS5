@@ -85,7 +85,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
-		case BindingKind::MipStats: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::MipStats:
+		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -1431,6 +1432,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
+	prepared.shared_memory = {};
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
 	if (!keep_images) {
@@ -2092,9 +2094,10 @@ static void CountDescriptorPushMiss(int32_t result, std::span<const vk::WriteDes
 		Profiler::CountFrameEvent(Event::DescriptorPushMissShape);
 		return;
 	}
-	// NativeBinding(stage, kind) = kind + stage group * DescriptorBindingKind::Count.
+	// NativeBinding(stage, kind) = kind + stage group * NativeBindingGroupStride (a compute
+	// SharedMemory binding counts as Buffers here).
 	const auto kind = static_cast<BindingKind>(writes[static_cast<size_t>(result)].dstBinding %
-	                                           static_cast<uint32_t>(BindingKind::Count));
+	                                           ShaderRecompiler::IR::NativeBindingGroupStride);
 	if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
 	    ShaderRecompiler::IR::ImageResourceClass::None) {
 		Profiler::CountFrameEvent(Event::DescriptorPushMissImage);
@@ -2176,9 +2179,10 @@ private:
 		thread_local std::vector<uint64_t> words;
 		masked.assign(writes.size(), 0);
 		const auto kind_of = [](const vk::WriteDescriptorSet& write) {
-			// NativeBinding(stage, kind) = kind + stage group * DescriptorBindingKind::Count.
+			// NativeBinding(stage, kind) = kind + stage group * NativeBindingGroupStride (a compute
+			// SharedMemory binding counts as Buffers here).
 			return static_cast<BindingKind>(write.dstBinding %
-			                                static_cast<uint32_t>(BindingKind::Count));
+			                                ShaderRecompiler::IR::NativeBindingGroupStride);
 		};
 		uint32_t budget = dynamic_limit;
 		for (const bool tables: {true, false}) {
@@ -2444,12 +2448,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 					case BindingKind::FlattenedSrt:
 					case BindingKind::ShaderData:
+					case BindingKind::SharedMemory:
 					case BindingKind::Gds: {
 						const vk::DescriptorBufferInfo* view = &descriptors.gds;
 						if (binding.kind == BindingKind::FlattenedSrt) {
 							view = &descriptors.flattened_srt;
 						} else if (binding.kind == BindingKind::ShaderData) {
 							view = &descriptors.shader_data_buffer;
+						} else if (binding.kind == BindingKind::SharedMemory) {
+							// KYTY_LDS_DEVICE_BUFFER: RenderExecutor::BindComputeLds.
+							view = &descriptors.shared_memory;
 						}
 						EXIT_IF(view->buffer == nullptr);
 						m_descriptor_buffers.push_back(*view);

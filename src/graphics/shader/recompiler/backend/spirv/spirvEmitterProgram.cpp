@@ -1067,6 +1067,31 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 	std::abort();
 }
 
+// KYTY_LDS_DEVICE_BUFFER, at function entry: the workgroup's LDS region in the SharedMemory
+// buffer is the one of its index in the dispatch, x + nx * (y + ny * z), LdsStorageRegionDwords
+// apart. A workgroup the bound range holds no region for (more groups than the renderer could
+// allocate for) gets length 0: its LDS reads return 0 and its writes are dropped, as for any
+// out-of-range LDS address, instead of landing in another workgroup's region.
+static void EmitLdsStorageBase(EmitterState& state) {
+	const auto group = [&](uint32_t component) {
+		return EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, component);
+	};
+	const auto count = [&](uint32_t component) {
+		return EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, component);
+	};
+	const auto row   = EmitAddU32(state, group(1), EmitBinaryU32(state, spv::OpIMul, group(2), count(1)));
+	const auto index = EmitAddU32(state, group(0), EmitBinaryU32(state, spv::OpIMul, row, count(0)));
+	const auto region = ConstantU32(state, LdsStorageRegionDwords(LdsDwordCount(state)));
+	const auto dwords = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), dwords, state.lds_variable, 0);
+	const auto held = EmitBinaryU32(state, spv::OpUDiv, dwords, region);
+	const auto present = Binary(state, spv::OpULessThan, TypeBool(state), index, held);
+	state.lds_base_dwords = EmitSelectValueU32(
+	    state, present, EmitBinaryU32(state, spv::OpIMul, index, region), ConstantU32(state, 0));
+	state.lds_length = EmitSelectValueU32(state, present, ConstantU32(state, LdsDwordCount(state)),
+	                                      ConstantU32(state, 0));
+}
+
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	ValueEmitContext ctx(state);
@@ -1234,6 +1259,9 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
+	}
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer) {
+		EmitLdsStorageBase(state);
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

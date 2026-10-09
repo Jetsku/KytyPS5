@@ -112,7 +112,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
 	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
-	key.push_back(info.lds_size_dwords);
+	// Bit 31: LDS in the device buffer (KYTY_LDS_DEVICE_BUFFER); sizes stay below 2^16 dwords.
+	key.push_back(info.lds_size_dwords | (info.lds_storage ? 0x80000000u : 0u));
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {

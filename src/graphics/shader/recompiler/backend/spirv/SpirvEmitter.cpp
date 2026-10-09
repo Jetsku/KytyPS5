@@ -36,7 +36,7 @@ std::atomic_uint8_t  g_wave_clusters {0}; // HostWaveClusters: bit 0 vertex, 1 p
 	std::abort();
 }
 
-void ValidateNativeProgram(const IR::Program& program) {
+void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	using Kind                                             = IR::DescriptorBindingKind;
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
 	std::array<std::vector<uint32_t>, KindCount> expected;
@@ -111,6 +111,9 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const bool mip_stats = IR::UsesMipStats(program);
 	if (mip_stats) {
 		Expect(Kind::MipStats);
+	}
+	if (IR::UsesLdsStorage(program, lds_storage)) {
+		Expect(Kind::SharedMemory);
 	}
 
 	std::array<bool, KindCount> seen {};
@@ -498,7 +501,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    !program.shader_info_complete || !program.binding_layout_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	ValidateNativeProgram(program);
+	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
+	                                   input_info.compute != nullptr &&
+	                                   input_info.compute->lds_storage);
 	if (IR::ValidationEnabled()) {
 		IR::ValidateProgram(program, true);
 	}

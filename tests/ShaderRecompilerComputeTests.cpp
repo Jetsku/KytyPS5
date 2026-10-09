@@ -1879,7 +1879,15 @@ struct CompiledShader {
   std::vector<u32> packed_user_data;
   // CompileOptions::plain_mip_stats_variant (KYTY_LOD_STATS_PLAIN_VARIANT).
   std::vector<u32> spirv_plain;
+  // The compute LDS as compiled (ShaderRecompiler::PlanComputeLds): its size, and whether it
+  // lives in the SharedMemory device buffer (KYTY_LDS_DEVICE_BUFFER).
+  u32 lds_dwords = 0;
+  bool lds_storage = false;
 };
+
+// The compute LDS limit CompileCase plans with (the harness device's, once it exists; the PS5's
+// 64 KiB before), as PipelineCache::GetComputeProgram plans with the device's.
+u32 g_case_lds_limit_bytes = 65536;
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   std::array<u32, 64> data{};
@@ -2241,6 +2249,13 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.dump_ir = true;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
+  if (!compute_info.lds_storage) {
+    // KYTY_LDS_DEVICE_BUFFER / KYTY_LDS_LIMIT_OVERRIDE as the renderer applies them.
+    const auto lds = ShaderRecompiler::PlanComputeLds(compute_info.lds_size_dwords,
+                                                      g_case_lds_limit_bytes);
+    compute_info.lds_size_dwords = lds.dwords;
+    compute_info.lds_storage = lds.storage;
+  }
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
 
@@ -2314,7 +2329,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     }
     result.program.bindings = {};
     result.program.binding_layout_complete = false;
-    ShaderRecompiler::IR::AllocateBindings(result.program);
+    ShaderRecompiler::IR::AllocateBindings(result.program, 0, compute_info.lds_storage);
     const auto *shader_data = ShaderRecompiler::IR::FindBinding(
         result.program.bindings,
         ShaderRecompiler::IR::DescriptorBindingKind::ShaderData);
@@ -2356,8 +2371,11 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
   }
-  return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+  CompiledShader compiled{std::move(result.spirv), std::move(result.program),
+                          std::move(resources), std::move(packed_user_data)};
+  compiled.lds_dwords = compute_info.lds_size_dwords;
+  compiled.lds_storage = compute_info.lds_storage;
+  return compiled;
 }
 
 // Compiles one guest shader dump from Profiling/analysis/guest-shader-diagnostic (a CS, PS or
@@ -24896,6 +24914,8 @@ public:
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
+    Buffer lds_buffer;
+    vk::DescriptorBufferInfo lds_info{};
     vk::DescriptorBufferInfo flattened_info{};
     vk::DescriptorBufferInfo user_data_info{};
     vk::DescriptorBufferInfo gds_info{};
@@ -24987,6 +25007,22 @@ public:
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &user_data_info;
+      writes.push_back(write);
+    }
+    if (const auto *lds = Binding(Kind::SharedMemory); lds != nullptr) {
+      // KYTY_LDS_DEVICE_BUFFER: one region per workgroup of the dispatch, as the renderer binds.
+      const auto region = ShaderRecompiler::LdsStorageRegionDwords(compiled.lds_dwords);
+      lds_buffer = CreateStorageBuffer(
+          test.name, {},
+          size_t{region} * test.dispatch_x * test.dispatch_y * test.dispatch_z);
+      lds_info = {lds_buffer.buffer, 0, lds_buffer.size};
+      vk::WriteDescriptorSet write{};
+      write.sType = vk::StructureType::eWriteDescriptorSet;
+      write.dstSet = descriptor_set;
+      write.dstBinding = Native(Kind::SharedMemory);
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &lds_info;
       writes.push_back(write);
     }
     if (const auto *gds = Binding(Kind::Gds); gds != nullptr) {
@@ -25248,6 +25284,9 @@ public:
     }
     if (user_data_buffer.buffer != nullptr) {
       DestroyBuffer(&user_data_buffer);
+    }
+    if (lds_buffer.buffer != nullptr) {
+      DestroyBuffer(&lds_buffer);
     }
     m_device.destroyDescriptorPool(descriptor_pool, nullptr);
     m_device.destroyPipeline(pipeline, nullptr);
@@ -28736,6 +28775,8 @@ private:
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
             "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
+    g_case_lds_limit_bytes =
+        m_physical_device.getProperties().limits.maxComputeSharedMemorySize;
 
     vk::PhysicalDeviceFeatures available_features{};
     m_physical_device.getFeatures(&available_features);
@@ -45894,28 +45935,46 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   regs.cs_regs.num_thread_y = 1;
   regs.cs_regs.num_thread_z = 1;
   regs.cs_regs.wave_size = 32;
-  PipelineCache cache(graphics);
-  ShaderProgram at_limit;
-  for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
-                           uint16_t{112}, uint16_t{128}}) {
-    regs.cs_regs.lds_size = units;
-    ShaderComputeInputInfo input{};
-    PipelineCache::StagePrep stage_prep;
-    const auto program = cache.GetComputeProgram(regs, {}, input, stage_prep);
-    const auto expected = units < limit_units ? units * 128u : limit / 4u;
-    Require(name, "device allocation", input.lds_size_dwords == expected,
-            "compute LDS allocation did not respect the device limit");
-    Require(name, "pipeline creation",
-            cache.GetComputePipeline(input, program).pipeline != nullptr,
-            "clamped LDS shader did not create a Vulkan compute pipeline");
-    if (units == limit_units) {
-      at_limit = program;
-    } else if (units > limit_units) {
-      Require(name, "effective-size cache reuse", program.id == at_limit.id,
-              "equivalent clamped LDS allocations compiled separate shaders");
+  // KYTY_LDS_DEVICE_BUFFER=0 clamps (int16.1); auto, the default, moves an allocation above the
+  // limit to the device buffer at its full size.
+  const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+  for (const auto mode : {ShaderRecompiler::LdsDeviceBuffer::Off,
+                          ShaderRecompiler::LdsDeviceBuffer::Auto}) {
+    auto options = saved_options;
+    options.lds_device_buffer = mode;
+    options.lds_limit_override = 0;
+    ShaderRecompiler::SetCodegenOptions(options);
+    const bool clamp = mode == ShaderRecompiler::LdsDeviceBuffer::Off;
+    PipelineCache cache(graphics);
+    ShaderProgram at_limit;
+    for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
+                             uint16_t{112}, uint16_t{128}}) {
+      regs.cs_regs.lds_size = units;
+      ShaderComputeInputInfo input{};
+      PipelineCache::StagePrep stage_prep;
+      const auto program = cache.GetComputeProgram(regs, {}, input, stage_prep);
+      const auto expected = units <= limit_units || !clamp ? units * 128u : limit / 4u;
+      Require(name, "device allocation",
+              input.lds_size_dwords == expected &&
+                  input.lds_storage == (!clamp && units > limit_units),
+              clamp ? "compute LDS allocation did not respect the device limit"
+                    : "compute LDS above the device limit did not move to the device buffer");
+      Require(name, "pipeline creation",
+              cache.GetComputePipeline(input, program).pipeline != nullptr,
+              "LDS shader did not create a Vulkan compute pipeline");
+      if (units == limit_units) {
+        at_limit = program;
+      } else if (units > limit_units && clamp) {
+        Require(name, "effective-size cache reuse", program.id == at_limit.id,
+                "equivalent clamped LDS allocations compiled separate shaders");
+      } else if (units > limit_units) {
+        Require(name, "placement key", program.id != at_limit.id,
+                "a device-buffer LDS program reused the workgroup-memory one");
+      }
     }
   }
-  std::printf("[gpu]     %-32s ok\n", name);
+  ShaderRecompiler::SetCodegenOptions(saved_options);
+  std::printf("[gpu]     %-32s ok (clamp and device buffer)\n", name);
 }
 
 void CheckPs5GameExampleImageClearRuntimeShape() {
@@ -51148,6 +51207,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderCodegenTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderWaveClusterTests.inc"
+#include "ShaderLdsDeviceBufferTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
 #include "ShaderBvhTests.inc"
@@ -51203,6 +51263,30 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     WaveClusterTests::CheckWaveClusterWaterfall(&vulkan);
     WaveClusterTests::CheckLdsWaitcntBarrierScope(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-device-buffer-codegen-only") == 0) {
+    LdsDeviceBufferTests::CheckLdsDeviceBufferCodegen();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-device-buffer-only") == 0) {
+    LdsDeviceBufferTests::CheckLdsDeviceBufferCodegen();
+    VulkanHarness vulkan;
+    LdsDeviceBufferTests::CheckLdsDeviceBufferExchange(&vulkan);
+    LdsDeviceBufferTests::CheckLdsDeviceBufferRenderer(vulkan);
+    CheckComputeLdsLimit(vulkan);
+    {
+      // The LDS cases with 64-bit atomics and partial bounds in the device buffer.
+      CodegenTests::ScopedCodegenOptions scoped(
+          LdsDeviceBufferTests::WithLds(ShaderRecompiler::LdsDeviceBuffer::Force, 0));
+      RunCase(&vulkan, DsWideLdsPartialBounds());
+      for (bool add : {false, true}) {
+        RunCase(&vulkan, DsAtomic64Bounds(add));
+        for (u32 wave_size : {32, 64}) {
+          RunCase(&vulkan, DsAtomic64Contention(add, wave_size));
+        }
+      }
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dispatcher-cap-only") == 0) {

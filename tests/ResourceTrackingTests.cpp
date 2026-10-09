@@ -2889,8 +2889,10 @@ void TestShaderInfoAndBindingLayout() {
             NativeBinding(ShaderType::Vertex, DescriptorBindingKind::Buffers) ==
                 static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
             NativeBinding(ShaderType::Pixel, DescriptorBindingKind::Buffers) ==
-                static_cast<uint32_t>(DescriptorBindingKind::Count) +
-                    static_cast<uint32_t>(DescriptorBindingKind::Buffers),
+                NativeBindingGroupStride +
+                    static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
+            NativeBinding(ShaderType::Compute, DescriptorBindingKind::SharedMemory) ==
+                NativeBindingGroupStride,
         "fixed stage binding ranges are inconsistent");
   Check(fixture.program.bindings.user_data_registers ==
             std::vector<uint32_t>({3u, 4u}),
@@ -2909,7 +2911,9 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
             static_cast<uint32_t>(DescriptorBindingKind::MipStats) == 55u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u,
+            NativeBindingGroupStride == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -2948,8 +2952,7 @@ void TestImageBindingAbi() {
                   NativeBinding(ShaderType::Compute, *kind) ==
                       FirstImageBinding + index &&
                   NativeBinding(ShaderType::Pixel, *kind) ==
-                      static_cast<uint32_t>(DescriptorBindingKind::Count) +
-                          FirstImageBinding + index,
+                      NativeBindingGroupStride + FirstImageBinding + index,
               "generated image descriptor binding changed ABI");
         index++;
       };

@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -18,7 +19,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -29,8 +32,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -195,6 +200,87 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
+	return true;
+}
+
+// KYTY_LDS_DEVICE_BUFFER_MB (default 1024): the most memory the compute LDS device buffer may
+// take; a direct dispatch with more workgroups than it holds runs its excess workgroups without
+// LDS (their accesses read zero and drop writes), and says so once per shader.
+static uint64_t ComputeLdsMaxBytes(const GraphicContext& graphics) {
+	static const uint64_t configured = [] {
+		const auto* value = std::getenv("KYTY_LDS_DEVICE_BUFFER_MB");
+		const auto  mib   = value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : 1024u;
+		return std::max<uint64_t>(mib, 1u) << 20u;
+	}();
+	return std::min<uint64_t>(configured,
+	                          graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+}
+
+// An indirect dispatch's workgroup count is GPU data: it gets at least this much (1,365 regions
+// of 48 KiB), or the buffer as a direct dispatch grew it.
+static constexpr uint64_t LdsIndirectBytes = 64ull << 20u;
+
+bool RenderExecutor::BindComputeLds(const ShaderComputeInputInfo& input, PreparedBindings& bindings,
+                                    const uint32_t* groups) {
+	const auto& program = *input.stage.program;
+	if (ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory) == nullptr) {
+		return false;
+	}
+	auto&          graphics = m_context.GetGraphics();
+	const uint64_t region =
+	    uint64_t {ShaderRecompiler::LdsStorageRegionDwords(input.lds_size_dwords)} * sizeof(uint32_t);
+	EXIT_IF(region == 0);
+	const uint64_t max_regions = std::max<uint64_t>(ComputeLdsMaxBytes(graphics) / region, 1u);
+	uint64_t       regions     = 0;
+	if (groups != nullptr) {
+		const uint64_t count = uint64_t {groups[0]} * groups[1] * groups[2];
+		regions              = std::min(count, max_regions);
+		if (count > max_regions) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				char text[256];
+				std::snprintf(text, sizeof(text),
+				              "Kyty LDS device buffer: compute shader 0x%016" PRIx64
+				              " dispatches %" PRIu64 " workgroups of %u bytes of LDS; the buffer holds "
+				              "%" PRIu64 " (KYTY_LDS_DEVICE_BUFFER_MB), the others run without LDS\n",
+				              program.shader_hash, count, input.lds_size_dwords * 4u, max_regions);
+				Log::WriteToConsoleAndLog(text);
+			}
+		}
+	} else {
+		const auto current = m_compute_lds != nullptr ? m_compute_lds->Size() / region : 0u;
+		regions = std::min(std::max<uint64_t>(current, LdsIndirectBytes / region), max_regions);
+	}
+	regions            = std::max<uint64_t>(regions, 1u);
+	const auto needed = regions * region;
+	if (m_compute_lds == nullptr || m_compute_lds->Size() < needed) {
+		auto& scheduler = m_context.GetCommandScheduler();
+		const auto old_size = m_compute_lds != nullptr ? m_compute_lds->Size() : 0u;
+		// Grows by at least half, so a growing series of dispatches reallocates a few times only.
+		const auto size =
+		    std::min(std::max(needed, old_size + old_size / 2u), max_regions * region);
+		if (m_compute_lds != nullptr) {
+			// Recorded commands of the current tick may still use the old buffer.
+			scheduler.DeferOperation([old = std::move(m_compute_lds)]() mutable { old.reset(); });
+		}
+		m_compute_lds = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+		                                         vk::BufferUsageFlagBits::eStorageBuffer, size);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			char text[256];
+			std::snprintf(text, sizeof(text),
+			              "Kyty LDS device buffer (KYTY_LDS_DEVICE_BUFFER): %.1f MiB for compute shader "
+			              "0x%016" PRIx64 " (%u bytes of LDS per workgroup, %" PRIu64 " workgroups%s)\n",
+			              static_cast<double>(size) / (1024.0 * 1024.0), program.shader_hash,
+			              input.lds_size_dwords * 4u, regions, groups == nullptr ? ", indirect" : "");
+			Log::WriteToConsoleAndLog(text);
+		}
+	}
+	// A direct dispatch binds its own regions; an indirect one every region the buffer holds.
+	const auto range =
+	    groups != nullptr ? needed : m_compute_lds->Size() / region * region;
+	bindings.shared_memory = {m_compute_lds->Handle(), 0, range};
 	return true;
 }
 
@@ -380,6 +466,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
 	bindings.has_dispatch_groups = true;
 	FindBuffers(bindings);
+	const std::array<uint32_t, 3> lds_groups {thread_group_x, thread_group_y, thread_group_z};
+	const bool lds_storage = BindComputeLds(input_info, bindings, lds_groups.data());
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -403,7 +491,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = HasShaderBufferWrites(input_info.stage) || program.info.bda_writes;
+	// Device-buffer LDS is written like any storage buffer: the hazard barrier orders this
+	// dispatch's regions after the previous one's (the access barrier below the dispatch, after it).
+	bool has_storage_writes =
+	    lds_storage || HasShaderBufferWrites(input_info.stage) || program.info.bda_writes;
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& image) {
@@ -512,6 +603,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
 	FindBuffers(bindings);
+	const bool  lds_storage = BindComputeLds(input_info, bindings, nullptr);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -536,7 +628,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	const bool has_storage_writes = lds_storage || HasShaderBufferWrites(input_info.stage) ||
 	    program.info.bda_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==

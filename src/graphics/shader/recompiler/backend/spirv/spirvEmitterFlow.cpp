@@ -640,9 +640,10 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	// Device-buffer LDS (KYTY_LDS_DEVICE_BUFFER) is uniform memory.
 	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
 	                                       : spv::MemorySemanticsAcquireReleaseMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask;
+	                                             LdsMemorySemantics(state);
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
@@ -664,7 +665,7 @@ void EmitSharedMemoryBarrier(EmitterState& state) {
 	                       : spv::ScopeSubgroup;
 	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
 	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
-	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
+	                                                 LdsMemorySemantics(state)));
 }
 
 uint32_t EmitLaneId(EmitterState& state) {

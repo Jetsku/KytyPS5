@@ -29,6 +29,7 @@ class Shader;
 } // namespace HW
 
 struct GraphicContext;
+class Buffer;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
@@ -1070,6 +1071,12 @@ private:
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	// KYTY_LDS_DEVICE_BUFFER: binds the LDS regions of a compute program whose LDS lives in a device
+	// buffer (a SharedMemory binding): one region per workgroup of `groups` (null: an indirect
+	// dispatch, whose count the CPU does not know; it gets the buffer as it is, at least
+	// LdsIndirectBytes). Returns false when the program has no such binding.
+	bool BindComputeLds(const ShaderComputeInputInfo& input, PreparedBindings& bindings,
+	                    const uint32_t* groups);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -1079,6 +1086,9 @@ private:
 	std::unique_ptr<DrawRenderState>      m_draw_state;
 	// Program preparation output of the current dispatch; its stage runtime points here.
 	PipelineCache::StagePrep              m_compute_prep;
+	// KYTY_LDS_DEVICE_BUFFER: device-local buffer of compute LDS regions (BindComputeLds), grown
+	// on demand; a replaced one is released once the tick that used it has completed.
+	std::unique_ptr<Buffer>               m_compute_lds;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

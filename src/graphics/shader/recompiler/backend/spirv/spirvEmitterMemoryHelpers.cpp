@@ -67,8 +67,9 @@ void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
-	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
-		EXIT("function LDS was not prepared before SPIR-V function emission\n");
+	if (state.lds_storage_class != spv::StorageClassWorkgroup) {
+		EXIT("%s LDS was not prepared before SPIR-V function emission\n",
+		     state.lds_storage_class == spv::StorageClassFunction ? "function" : "device-buffer");
 	}
 	const auto define = [&](uint32_t type, uint32_t bytes) {
 		const auto array = state.builder.DecoratedType(
@@ -123,7 +124,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Lds:
 			EnsureLdsStorage(state);
 			access.object_pointer = state.lds_variable;
-			access.length         = ConstantU32(state, LdsDwordCount(state));
+			// Device-buffer LDS: indices stay region-relative (EmitMemoryElementPointer adds the
+			// region's base); a workgroup without a region sees every access out of bounds.
+			access.length         = state.lds_storage_class == spv::StorageClassStorageBuffer
+			                            ? state.lds_length
+			                            : ConstantU32(state, LdsDwordCount(state));
 			return access;
 		case IR::ResourceKind::Gds:
 			if (state.gds_variable == 0) {
@@ -179,12 +184,15 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		const auto storage_class = access.kind == IR::ResourceKind::Scratch
+		                               ? spv::StorageClassFunction
+		                               : state.lds_storage_class;
+		if (storage_class == spv::StorageClassStorageBuffer) {
+			return EmitStorageBufferElementPointer(state, access,
+			                                       EmitAddU32(state, state.lds_base_dwords, index),
+			                                       TypeStorageBufferElementPointer(state));
+		}
 		const auto pointer = state.builder.AllocateId();
-		const auto storage_class =
-		    access.kind == IR::ResourceKind::Scratch ? spv::StorageClassFunction
-		    : ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr
-		        ? spv::StorageClassWorkgroup
-		        : spv::StorageClassFunction;
 		if (access.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics) {
 			state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
 			                          pointer, access.object_pointer, ConstantU32(state, 0), index);
