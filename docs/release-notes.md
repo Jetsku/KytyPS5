@@ -1,3 +1,103 @@
+# KytyPS5 U59 int18 — AMD fixes, upstream sync, rumble for other controllers
+
+> int18 is int17 plus the fixes from the three AMD test builds, a sync with upstream Kyty, and fixes for
+> missing-preset and controller problems. The first launch after the update rebuilds the shader and program caches
+> once (the shader code generator changed), so the first minutes can stutter.
+
+## What's new in int18
+
+### AMD graphics cards
+
+- **Title-screen hang fixed:** on AMD cards the GPU could stop responding ("device lost") at the same title-screen
+  draw. A particle mesh shader waits for its own LDS writes inside branches that only some waves take; Kyty turned
+  each wait into a workgroup-wide memory barrier, which AMD's driver handles like a workgroup barrier that the other
+  waves never reach. The wait now orders only the wave's own memory (subgroup scope). `KYTY_LDS_WAITCNT_BARRIER`
+  = `subgroup` (default), `workgroup` (the old behaviour) or `0` (no barrier).
+- **Water and particle corruption fixed:** AMD runs vertex, mesh and pixel shaders with 64 lanes per subgroup, so one
+  host subgroup held two of the PS5's 32-lane waves, and shaders read the other wave's lanes and masks (stretched
+  water, pink particle clouds, loops that never end). Each wave now stays in its own 32 lanes
+  (`KYTY_WAVE32_CLUSTERS=auto`, the default; `0` turns it off, `force` applies it everywhere). The log names each
+  shader this applies to. NVIDIA is unchanged.
+- **Large compute shared memory:** some Astro Bot compute shaders (GPU skinning) ask for 48 KiB of shared memory;
+  AMD's driver allows 32 KiB, so Kyty cut it to 32 KiB and meshes with more than 682 bones could stretch. Such a
+  shader now keeps its shared memory in a video memory buffer (from upstream Kyty, with Kyty's own buffer handling).
+  `KYTY_LDS_DEVICE_BUFFER` = `auto` (default: only above the device limit), `0` (the old cut) or `force`;
+  `KYTY_LDS_DEVICE_BUFFER_MB` (default 1024) caps the buffer. NVIDIA is unchanged (48 KiB fits).
+- **Helper lanes no longer spin:** in pixel shaders, helper lanes skip the compare-exchange loops of emulated atomics,
+  which could loop forever on AMD (`KYTY_PS_HELPER_ATOMICS_SKIP=0` restores the old code).
+- **Less video memory without the preset:** `KYTY_FUNCTION_ARRAY_SHRINK` is now on by default (it was only set by
+  `u59-preset.json`). Vertex and pixel shaders emulate shared memory with a large per-lane array that AMD backs with
+  memory for every lane (about 2 MiB per wave); the shrink cuts it to what the shader can reach (at most 352 dwords in
+  every Astro Bot 1.018 shader; about 3.9 GiB less video memory on an RTX 3090). `=0` turns it off and says so in the
+  log. Two RX 6900 XT players whose launcher had not applied the preset crashed inside the driver without it.
+- **Crash reports name the module and pipeline:** a host crash now writes its fault report into the log file
+  (`_kyty.txt`), not only the console, with the module and offset of the crash (for example a driver DLL), each
+  call-chain frame's module, and what the thread was doing (a graphics or compute pipeline build, with the guest
+  shader hashes). Graphics pipeline builds are always traced in the log.
+- **Diagnostics for testers** (off or unchanged by default): `KYTY_DEVICE_FAULT_DIAGNOSTICS=1` prints a device
+  report and enables GPU breadcrumbs (`KYTY_GPU_BREADCRUMBS`), which name the GPU operations in flight after a device
+  loss; `KYTY_COMPUTE_WAVE64=0`, `KYTY_PS_PER_VERTEX=0`, `KYTY_CLIP_GUARD=0`, `KYTY_VOLATILE_LOADS=1` and
+  `KYTY_LOOP_GUARD_SHADERS=all` (with `KYTY_LOOP_GUARD=<n>`) switch off or add single shader features to narrow
+  down a driver problem.
+
+### Everyone
+
+- **Rumble for other controllers:** Xbox and other non-DualSense pads now rumble from Astro Bot's haptics (the game
+  plays its vibration as audio for the DualSense; Kyty turns it into rumble with the per-channel gains). Thanks to
+  Linky362 (PR #20).
+- **Black lighting without the preset fixed:** Astro Bot without the lighting patches no longer renders black when
+  `u59-preset.json` is not applied (launcher without the file, or `kyty_emulator` started directly):
+  `KYTY_SRT_VARIANT_READS` is now on by default (`0` turns it off). The launcher warns when `u59-preset.json` is
+  missing or invalid (it looks next to `launcher.exe` and one folder up), and the emulator prints a warning at startup
+  when the preset's settings are absent. Keep using the preset: without it the game runs much slower (about 20
+  instead of 32 fps on an RTX 3090 in the Sky Garden). A failed ray tracing pipeline build, which turns lighting off
+  until restart, is now shown as a WARNING in the console.
+- **Upstream Kyty sync:** the 151 upstream commits since the last sync were reviewed; 62 were taken and 20 partly
+  (new shader instructions and formats, native 64-bit integers and 8/16-bit storage, store-completion waits, GLC/DLC
+  memory coherence, D16 and formatted buffer access, kernel memory fixes, the main-thread window title). Upstream
+  changes that conflict with Kyty U59's own designs (resource tracking, MAD rounding, readback sizes) were left out.
+  No frame rate change was measured (Sky Garden, casino and pirate island A/B within noise). 8/16-bit storage is now
+  a required GPU feature, so very old drivers without it cannot start.
+- **Graphics fixes from upstream:** colour exports routed through `CB_SHADER_MASK` (`KYTY_CB_SHADER_MASK_EXPORTS`,
+  on through the preset), linear render-target mip chains, rendered contents kept across 1D and 2D texture aliases,
+  and streamed texture mips uploaded from partly committed sparse reservations (fixes the exit "failed to read mapped
+  guest image backing").
+- **GPU stores to untracked memory:** a shader store through a buffer descriptor computed on the GPU, to memory Kyty
+  had not cached on the GPU yet, was dropped. Such stores are now logged and copied back right after the dispatch
+  (`KYTY_BDA_STORE_LOG`, default on; `=0` restores the old drop).
+- **Smaller fixes:** a depth image alias is found again for a smaller layer prefix (no second copy), trophy unlocks
+  are copied once from the old `_SaveData` location (issue #18), and unknown socket options return the error codes the
+  game expects on Windows.
+
+### New defaults in int18
+
+| Switch | Default | Off / old behaviour | What it does |
+| --- | --- | --- | --- |
+| `KYTY_LDS_WAITCNT_BARRIER` | `subgroup` | `workgroup` (int17), `0` | Scope of the barrier after a shader waits for its LDS writes |
+| `KYTY_WAVE32_CLUSTERS` | `auto` | `0` | 32-lane waves stay in their own lanes on 64-lane host subgroups (AMD) |
+| `KYTY_LDS_DEVICE_BUFFER` | `auto` | `0` | Compute shared memory above the device limit in a video memory buffer |
+| `KYTY_PS_HELPER_ATOMICS_SKIP` | on | `0` | Pixel-shader helper lanes skip emulated atomic loops |
+| `KYTY_FUNCTION_ARRAY_SHRINK` | on | `0` | Per-lane shader arrays cut to their reachable size |
+| `KYTY_SRT_VARIANT_READS` | on | `0` | Lighting shaders run without the preset |
+| `KYTY_BDA_STORE_LOG` | on | `0` | GPU stores to untracked memory are copied back |
+| `KYTY_CB_SHADER_MASK_EXPORTS` (preset) | `1` | `0` | Colour exports routed by `CB_SHADER_MASK` |
+
+### Checked
+
+- All automated tests pass, including the new AMD-path tests (32-lane clusters and the shared-memory buffer, run on
+  an RTX 3090 with the AMD limits forced).
+- Astro Bot 1.018 on the test PC (RTX 3090, Ryzen 9 7950X3D): normal boot to the title screen and galaxy map with a
+  cold shader cache, no console errors.
+- The AMD fixes were tested by players on Radeon RX 6000 cards with the AMD test builds; please report how int18
+  runs on your AMD card.
+
+### Known issues
+
+- **AMD graphics cards:** the int17 note (device lost with the patches off, slow water in Go-Go Archipelago) should be
+  fixed; if you still see it, please send the console text and `_kyty.txt` (they now name the shader or driver
+  module).
+- The int17 known issues below still apply otherwise.
+
 # KytyPS5 U59 int17 pre-release — faster heavy levels, performance-mode occlusion, many fixes
 
 > **Pre-release.** This is int16.1 plus the newest speed work and fixes (draw batching in the clock tower and Ape
