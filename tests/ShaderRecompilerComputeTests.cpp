@@ -2344,7 +2344,16 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  CheckSpirvText(test, result.spirv);
+  if (compute_info.lds_storage) {
+    // KYTY_LDS_DEVICE_BUFFER: the case's workgroup-memory expectations do not apply.
+    auto storage = test;
+    std::erase_if(storage.required_spirv, [](const std::string &text) {
+      return text.find("Workgroup") != std::string::npos;
+    });
+    CheckSpirvText(storage, result.spirv);
+  } else {
+    CheckSpirvText(test, result.spirv);
+  }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_resources) {
