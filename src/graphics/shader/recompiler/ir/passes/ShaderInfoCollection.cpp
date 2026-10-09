@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -225,8 +226,10 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
 				const auto input = inst.Arg(0).U32();
 				const auto mode  = inst.Arg(2).U32();
+				// KYTY_PS_PER_VERTEX=0: no raw-vertex inputs (the reads take the interpolated value).
 				per_vertex[input] =
-				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
+				    GetCodegenOptions().ps_per_vertex &&
+				    (per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input));
 			}
 		}
 	}

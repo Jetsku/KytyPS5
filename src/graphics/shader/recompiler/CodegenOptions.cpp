@@ -113,6 +113,17 @@ CodegenOptions FromEnvironment() {
 		                          : std::strcmp(mode, "force") == 0 ? Wave32Clusters::Force
 		                                                            : Wave32Clusters::Auto;
 	}
+	if (const auto* mode = std::getenv("KYTY_LDS_DEVICE_BUFFER"); mode != nullptr && mode[0] != '\0') {
+		options.lds_device_buffer = std::strcmp(mode, "0") == 0 || std::strcmp(mode, "off") == 0
+		                                ? LdsDeviceBuffer::Off
+		                            : std::strcmp(mode, "force") == 0 ? LdsDeviceBuffer::Force
+		                                                              : LdsDeviceBuffer::Auto;
+	}
+	if (const auto* limit = std::getenv("KYTY_LDS_LIMIT_OVERRIDE"); limit != nullptr && limit[0] != '\0') {
+		options.lds_limit_override = static_cast<uint32_t>(std::strtoul(limit, nullptr, 0));
+	}
+	options.ps_per_vertex = EnvFlag("KYTY_PS_PER_VERTEX", options.ps_per_vertex);
+	options.clip_guard    = EnvFlag("KYTY_CLIP_GUARD", options.clip_guard);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;
@@ -158,6 +169,26 @@ uint32_t RtFunctionMode() {
 
 void SetThreadRtFunctionOverride(int mode) {
 	g_rt_function_override = mode;
+}
+
+ComputeLdsPlan PlanComputeLds(uint32_t requested_dwords, uint32_t device_limit_bytes) {
+	const auto& options = Storage();
+	ComputeLdsPlan plan;
+	plan.limit_bytes = options.lds_limit_override != 0
+	                       ? std::min(device_limit_bytes, options.lds_limit_override)
+	                       : device_limit_bytes;
+	const auto limit_dwords = plan.limit_bytes / 4u;
+	plan.dwords             = requested_dwords;
+	switch (options.lds_device_buffer) {
+		case LdsDeviceBuffer::Force: plan.storage = requested_dwords != 0; break;
+		case LdsDeviceBuffer::Auto: plan.storage = requested_dwords > limit_dwords; break;
+		case LdsDeviceBuffer::Off: break;
+	}
+	if (!plan.storage && requested_dwords > limit_dwords) {
+		plan.dwords  = limit_dwords;
+		plan.clamped = true;
+	}
+	return plan;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

@@ -698,7 +698,9 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	// KYTY_CLIP_GUARD=0: no plane reserved (an AMD test 3 diagnostic).
+	if (state.program.stage == ShaderType::Vertex && GetCodegenOptions().clip_guard &&
+	    clip_distance_count + cull_distance_count < 8u &&
 	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		    return output.kind == IR::StageOutputKind::Position;
 	    })) {

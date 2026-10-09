@@ -187,7 +187,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Lds:
 			EnsureLdsStorage(state);
 			access.object_pointer = state.lds_variable;
-			access.length         = ConstantU32(state, LdsDwordCount(state));
+			// Device-buffer LDS: indices stay region-relative (EmitMemoryElementPointer adds the
+			// region's base); a workgroup without a region sees every access out of bounds.
+			access.length = state.lds_storage_class == spv::StorageClassStorageBuffer
+			                    ? state.lds_length
+			                    : ConstantU32(state, LdsDwordCount(state));
 			return access;
 		case IR::ResourceKind::Gds:
 			if (state.gds_variable == 0) {

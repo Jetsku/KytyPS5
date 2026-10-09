@@ -2,6 +2,7 @@
 #include "common/ramStats.h"
 
 #include "common/assert.h"
+#include "common/crashContext.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
@@ -4009,6 +4010,11 @@ struct PipelineCache::FastFirstState {
 		// optimized build fills the cache.
 		auto fast_info = info;
 		fast_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		const auto                  outer = Common::CrashContext::Current();
+		Common::CrashContext::Scope note("graphics pipeline unoptimized build (VS, PS)", outer.a,
+		                                 outer.b);
+		LOGF("PipelineTrace: graphics unoptimized build VS=0x%016" PRIx64 " PS=0x%016" PRIx64 "\n",
+		     outer.a, outer.b);
 		const auto begin  = CompileClockNs();
 		const auto result = device.createGraphicsPipelines(nullptr, 1, &fast_info, nullptr, pipeline);
 		if (result != vk::Result::eSuccess || *pipeline == nullptr) {
@@ -4065,6 +4071,8 @@ struct PipelineCache::FastFirstState {
 		}
 		auto fast_info = info;
 		fast_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		const auto                  outer = Common::CrashContext::Current();
+		Common::CrashContext::Scope note("compute pipeline unoptimized build (CS)", outer.a);
 		const auto begin  = CompileClockNs();
 		const auto result = device.createComputePipelines(nullptr, 1, &fast_info, nullptr, pipeline);
 		if (result != vk::Result::eSuccess || *pipeline == nullptr) {
@@ -4084,20 +4092,30 @@ struct PipelineCache::FastFirstState {
 
 	// The pipeline is cached under the key: hand its optimized compile to a worker. The slot was
 	// reserved by the fast build.
-	void EnqueueGraphics(const GraphicsPipelineKey* key, vk::Pipeline fast, GraphicsFast& in) {
+	void EnqueueGraphics(const GraphicsPipelineKey* key, vk::Pipeline fast, GraphicsFast& in,
+	                     uint64_t vs_hash, uint64_t ps_hash) {
 		const auto fast_ns = in.fast_ns;
 		const auto known   = in.key;
 		scheduler.Submit(
-		    [this, key, fast, fast_ns, known, snapshot = std::move(in.snapshot)] {
+		    [this, key, fast, fast_ns, known, vs_hash, ps_hash, snapshot = std::move(in.snapshot)] {
+			    Common::CrashContext::Scope note("graphics pipeline optimized build (VS, PS)", vs_hash,
+			                                     ps_hash);
+			    LOGF("PipelineTrace: graphics optimized build begin VS=0x%016" PRIx64
+			         " PS=0x%016" PRIx64 "\n",
+			         vs_hash, ps_hash);
 			    OptimizeGraphics(key, fast, fast_ns, known, *snapshot);
+			    LOGF("PipelineTrace: graphics optimized build done VS=0x%016" PRIx64
+			         " PS=0x%016" PRIx64 "\n",
+			         vs_hash, ps_hash);
 		    },
 		    [this] { counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed); });
 	}
-	void EnqueueCompute(uint64_t id, vk::Pipeline fast, ComputeFast& in) {
+	void EnqueueCompute(uint64_t id, vk::Pipeline fast, ComputeFast& in, uint64_t cs_hash) {
 		const auto fast_ns = in.fast_ns;
 		const auto known   = in.key;
 		scheduler.Submit(
-		    [this, id, fast, fast_ns, known, snapshot = std::move(in.snapshot)] {
+		    [this, id, fast, fast_ns, known, cs_hash, snapshot = std::move(in.snapshot)] {
+			    Common::CrashContext::Scope note("compute pipeline optimized build (CS)", cs_hash);
 			    OptimizeCompute(id, fast, fast_ns, known, *snapshot);
 		    },
 		    [this] { counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed); });
@@ -6463,10 +6481,36 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	prepare_gap.reset();
-	// LDS beyond the device's shared-memory limit lives in a device buffer instead of being
-	// clamped (upstream b0bbaef1e; RenderExecutor binds it per dispatch, BindSharedMemory).
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	// Use one effective size and placement for the cache key, LDS declaration, and access bounds.
+	// Above the device limit (AMD reports 32 KiB; some Astro Bot compute shaders ask for 48) the
+	// LDS lives in a device buffer (upstream b0bbaef1e; RenderExecutor binds it per dispatch,
+	// BindSharedMemory; KYTY_LDS_DEVICE_BUFFER, default auto), or is clamped (=0).
+	const auto requested = input_info.lds_size_dwords;
+	const auto lds = ShaderRecompiler::PlanComputeLds(
+	    requested, m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	input_info.lds_size_dwords = lds.dwords;
+	input_info.lds_storage     = lds.storage;
+	if (requested * 4u > lds.limit_bytes) {
+		// Once per shader, named.
+		static std::mutex                   warned_mutex;
+		static std::unordered_set<uint64_t> warned;
+		bool                                first = false;
+		{
+			const std::lock_guard lock(warned_mutex);
+			first = warned.insert(params.hash).second;
+		}
+		if (first && lds.clamped) {
+			PipelineCacheLog("GPU warning: game compute shader 0x{:016x} requests {} bytes of LDS, "
+			                 "but the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
+			                 "be incorrect (KYTY_LDS_DEVICE_BUFFER=0).",
+			                 params.hash, requested * 4u, lds.limit_bytes);
+		} else if (first) {
+			PipelineCacheLog("GPU note: game compute shader 0x{:016x} requests {} bytes of LDS, "
+			                 "above the Vulkan device limit of {} bytes; its LDS lives in a device "
+			                 "buffer (KYTY_LDS_DEVICE_BUFFER).",
+			                 params.hash, requested * 4u, lds.limit_bytes);
+		}
+	}
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
@@ -7010,6 +7054,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	const uint64_t vs_hash =
+	    vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0;
+	const uint64_t ps_hash =
+	    ps_active && ps_input_info->stage.program ? ps_input_info->stage.program->shader_hash : 0;
 	const bool prefetched = ready.pipeline != nullptr;
 	auto cached = prefetched ? std::move(ready.pipeline) : std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
@@ -7049,9 +7097,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		    "graphics-pipeline",
 		    vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0, vs_id,
 		    ps_id);
+		// Always in the log, and named by a crash report on this thread: AMD test 2 players' driver
+		// crashes inside pipeline builds left no trace of the pipeline.
+		Common::CrashContext::Scope note("graphics pipeline build (VS, PS)", vs_hash, ps_hash);
+		LOGF("PipelineTrace: graphics build begin VS=0x%016" PRIx64 " PS=0x%016" PRIx64 "\n",
+		     vs_hash, ps_hash);
 		CreatePipelineInternal(m_graphics, *cached, key.rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, key.static_params, m_driver_cache,
 		                       library_hook ? &library_hook : nullptr);
+		LOGF("PipelineTrace: graphics build done VS=0x%016" PRIx64 " PS=0x%016" PRIx64 "\n",
+		     vs_hash, ps_hash);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -7068,7 +7123,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (prefetched) m_prefetch->Complete(key);
 	const bool built_fast = fast_result.snapshot != nullptr; // EnqueueGraphics takes the snapshot
 	if (built_fast) {
-		m_fast_first->EnqueueGraphics(&iter->first, created_pipeline, fast_result);
+		m_fast_first->EnqueueGraphics(&iter->first, created_pipeline, fast_result, vs_hash,
+		                              ps_hash);
 	}
 	if (library_result.path == GraphicsPipelineLibrary::Path::Linked && m_library->optimize) {
 		m_library->Enqueue({.key      = &iter->first,
@@ -7154,6 +7210,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	HangWatchdog::Scope compile(
 	    "compute-pipeline", input_info.stage.program ? input_info.stage.program->shader_hash : 0,
 	    compute_program.id);
+	const uint64_t cs_hash = input_info.stage.program ? input_info.stage.program->shader_hash : 0;
+	Common::CrashContext::Scope note("compute pipeline build (CS)", cs_hash);
 	FastFirstState::ComputeFast fast_result;
 	ComputePipelineCreateHook   fast_hook;
 	if (m_fast_first != nullptr && m_fast_first->scheduler.Stopped() == false) {
@@ -7174,7 +7232,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!inserted);
 	const bool built_fast = fast_result.snapshot != nullptr; // EnqueueCompute takes the snapshot
 	if (built_fast) {
-		m_fast_first->EnqueueCompute(compute_program.id, created_pipeline, fast_result);
+		m_fast_first->EnqueueCompute(compute_program.id, created_pipeline, fast_result, cs_hash);
 	}
 
 	const auto create_ns = CompileClockNs() - create_begin;

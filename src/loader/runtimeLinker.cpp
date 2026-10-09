@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashContext.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
@@ -32,9 +33,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <iterator>
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -807,6 +811,32 @@ static bool FirstAccessHandlerEnabled() {
 	return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
+// The module a code address lies in, as "<file name>+0x<offset>" (Windows: the loaded DLL or the
+// emulator exe); guest and generated code lie in no module. File names only, no folders.
+static std::string DescribeCodeAddress(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HMODULE module = nullptr;
+	if (address != 0 &&
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCWSTR>(address), &module) != 0 &&
+	    module != nullptr) {
+		wchar_t     path[MAX_PATH] = {};
+		const DWORD length         = GetModuleFileNameW(module, path, MAX_PATH);
+		std::wstring_view full(path, length);
+		const auto        slash = full.find_last_of(L"\\/");
+		const auto        name  = slash == std::wstring_view::npos ? full : full.substr(slash + 1);
+		char narrow[MAX_PATH * 3] = {};
+		const int bytes = WideCharToMultiByte(CP_UTF8, 0, name.data(), static_cast<int>(name.size()),
+		                                      narrow, static_cast<int>(sizeof(narrow) - 1), nullptr,
+		                                      nullptr);
+		return fmt::format("{}+0x{:x}", std::string_view(narrow, bytes > 0 ? bytes : 0),
+		                   address - reinterpret_cast<uint64_t>(module));
+	}
+#endif
+	(void)address;
+	return "no module (guest or generated code)";
+}
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -823,7 +853,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return false;
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
-	// faulted, the register file, the faulting code bytes and the top of its stack.
+	// faulted, the module the fault is in, the register file, the faulting code bytes, the top of
+	// its stack and the host call chain. One block through the log (the console and the printf
+	// file): written with std::printf it reached only the console, so a player's _kyty.txt had the
+	// "Unhandled host exception" line without it (issue reports of 2026-10-09).
+	std::string report;
+	const auto  append = [&report](fmt::string_view format, auto&&... args) {
+		fmt::vformat_to(std::back_inserter(report), format, fmt::make_format_args(args...));
+	};
+	const auto pc_module = DescribeCodeAddress(info->exception_address);
 	{
 		char thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -831,41 +869,50 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
+		append("--- Guest fault context ---\n");
+		append("thread: {}\n", thread_name);
+		append("pc: 0x{:016x} in {}\n", info->exception_address, pc_module);
+		{
+			// The driver call this thread was in (a pipeline build: its guest shader hashes).
+			char doing[160] = {};
+			Common::CrashContext::Describe(Common::CrashContext::Current(), doing, sizeof(doing));
+			if (doing[0] != '\0') {
+				append("thread was in: {}\n", doing);
+			}
+		}
+		append("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+		       "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+		       "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+		       "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+		       info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp, info->rsp,
+		       info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14, info->r15);
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+			append("code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+				append("{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
-			std::printf("\n");
+			append("\n");
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
+			append("stack:");
 			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				append("{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
-			std::printf("\n");
+			append("\n");
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// The faulting host call chain, unwound from the fault context (symbolize the addresses
-		// with llvm-symbolizer --obj=kyty_emulator.exe). A frame without unwind data (guest code)
-		// continues from the return address at RSP while that is readable.
+		// The faulting host call chain, unwound from the fault context, with each frame's module and
+		// offset (symbolize kyty_emulator.exe frames with llvm-symbolizer --obj=kyty_emulator.exe). A
+		// frame without unwind data (guest code) continues from the return address at RSP while that
+		// is readable.
 		if (info->native_context != nullptr) {
 			CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
-			std::printf("host call chain:");
+			append("host call chain:\n");
 			for (int frame = 0; frame < 32 && context.Rip != 0; frame++) {
-				std::printf("%s 0x%016" PRIx64, (frame % 4 == 0) ? "\n " : "",
-				            static_cast<uint64_t>(context.Rip));
+				append("  #{:02} 0x{:016x} {}\n", frame, static_cast<uint64_t>(context.Rip),
+				       DescribeCodeAddress(context.Rip));
 				DWORD64     image_base = 0;
 				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
 				if (function == nullptr) {
@@ -885,17 +932,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
 				                 &handler_data, &establisher, nullptr);
 			}
-			std::printf("\n");
 		}
 #endif
+		Log::WriteToConsoleAndLog(report);
 		std::fflush(stdout);
 	}
-	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
+	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
-	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+	     pc_module.c_str(), static_cast<unsigned>(info->access_violation_type),
+	     info->access_violation_vaddr);
 }
-
 static void EncodeId64(uint16_t in_id, std::string* out_id) {
 	static const char* str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
 	if (in_id < 0x40u) {

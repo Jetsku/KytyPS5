@@ -1567,8 +1567,13 @@ void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                            ByteAddress(ctx, inst, mem), ConstantU32(state, 0xfff8u));
 		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address,
 		                          ConstantU32(state, 3u));
-		const auto in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index,
-		                              ConstantU32(state, LdsDwordCount(state) / 2u));
+		// Device-buffer LDS: the region's bound in qwords (regions are whole qwords: LDS sizes are
+		// multiples of 512 bytes).
+		const auto bound = state.lds_storage_class == spv::StorageClassStorageBuffer
+		                       ? EmitBinaryU32(state, spv::OpShiftRightLogical, state.lds_length,
+		                                       ConstantU32(state, 1))
+		                       : ConstantU32(state, LdsDwordCount(state) / 2u);
+		const auto in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, bound);
 		EmitIfCondition(state, in_bounds, [&]() {
 			auto native_index = index;
 			auto semantics = spv::MemorySemanticsWorkgroupMemoryMask;

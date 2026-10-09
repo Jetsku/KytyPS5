@@ -149,7 +149,11 @@ struct EmitterState {
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
+	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds
+	// no region for it).
 	uint32_t                                         lds_base_dwords         = 0;
+	uint32_t                                         lds_length              = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};

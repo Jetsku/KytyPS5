@@ -57,6 +57,19 @@ enum class LdsWaitcntBarrier : uint8_t {
 	Workgroup,
 };
 
+// Where a compute shader's LDS lives (KYTY_LDS_DEVICE_BUFFER, PlanComputeLds).
+enum class LdsDeviceBuffer : uint8_t {
+	// Workgroup memory only; an allocation above the device limit is clamped to it (int16.1 and
+	// AMD tests 1-2: Astro Bot's 48 KiB compute shaders then write past their 32 KiB on AMD, the
+	// stretched water geometry of issue 16).
+	Off,
+	// A device buffer, one region per workgroup of the dispatch, when the allocation exceeds the
+	// device limit; workgroup memory otherwise.
+	Auto,
+	// The device buffer for every compute shader with LDS (a test of the buffer path on any host).
+	Force,
+};
+
 // Switches for code-generation changes that must stay revertible at runtime. Every field is read
 // from its environment variable once (first use); tests may replace the whole set. Programs are
 // cached in memory only and the driver pipeline cache is keyed by the SPIR-V code, so changing a
@@ -300,7 +313,37 @@ struct CodegenOptions {
 	// shader 0xc739f9614016bed4 (VS 0x20c94d46ce55a14b) has three in S_CBRANCH_EXECZ regions, and
 	// with workgroup scope it lost the device on AMD at the next S_BARRIER.
 	LdsWaitcntBarrier lds_waitcnt_barrier = LdsWaitcntBarrier::Subgroup;
+	// KYTY_LDS_DEVICE_BUFFER=auto|0|force (default auto), see LdsDeviceBuffer. Astro Bot asks for
+	// 48 KiB of LDS in some compute shaders; NVIDIA allows 48 KiB, AMD's Windows driver 32 KiB.
+	LdsDeviceBuffer lds_device_buffer = LdsDeviceBuffer::Auto;
+	// KYTY_LDS_LIMIT_OVERRIDE=<bytes> (test mode, default 0 = the device's own): treat the device's
+	// compute LDS limit as at most this many bytes, so a 48 KiB host takes the AMD path.
+	uint32_t lds_limit_override = 0;
+	// KYTY_PS_PER_VERTEX=0 (AMD test 3 diagnostic, default on): V_INTERP_MOV P10/P20 reads (a pixel
+	// shader reading raw vertex attributes) use the interpolated attribute instead of PerVertexKHR
+	// inputs and fragment barycentrics. Wrong values in those shaders; for a driver that crashes
+	// compiling per-vertex inputs (two RX 6900 XT crashes in the same VS/PS pair, AMD test 2).
+	bool ps_per_vertex = true;
+	// KYTY_CLIP_GUARD=0 (AMD test 3 diagnostic, default on): vertex shaders do not reserve a clip
+	// plane for the zero-position cull (the "emitted zero-position clip guard").
+	bool clip_guard = true;
 };
+
+// How a compute shader's LDS allocation is placed on this host (KYTY_LDS_DEVICE_BUFFER,
+// KYTY_LDS_LIMIT_OVERRIDE). dwords: the size the program declares and bounds its accesses by;
+// storage: it lives in the SharedMemory device buffer; clamped: dwords is below the request.
+struct ComputeLdsPlan {
+	uint32_t dwords      = 0;
+	uint32_t limit_bytes = 0;
+	bool     storage     = false;
+	bool     clamped     = false;
+};
+[[nodiscard]] ComputeLdsPlan PlanComputeLds(uint32_t requested_dwords, uint32_t device_limit_bytes);
+// Dwords between consecutive workgroups' regions of the LDS device buffer: the LDS size rounded up
+// to 16 bytes, so 64-bit LDS atomics stay aligned (guest sizes are multiples of 512 bytes).
+[[nodiscard]] constexpr uint32_t LdsStorageRegionDwords(uint32_t lds_dwords) {
+	return (lds_dwords + 3u) & ~3u;
+}
 
 // GDS dwords, counted from the end of GDS, that KYTY_RT_NODE_BUDGET and KYTY_RT_NODE_STATS report
 // through (the last one is KYTY_LOOP_GUARD's).

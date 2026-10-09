@@ -1240,6 +1240,11 @@ void EmitProgram(EmitterState& state) {
 	}
 	EmitGeometryOutputDefaults(state);
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
+		// The workgroup's LDS region is the one of its index in the dispatch, x + nx * (y + ny * z),
+		// LdsStorageRegionDwords apart. A workgroup the bound range holds no region for (more groups
+		// than the renderer could allocate for, RenderExecutor::BindComputeLds) gets length 0: its
+		// LDS reads return 0 and its writes are dropped, as for any out-of-range LDS address,
+		// instead of landing in another workgroup's region or past the buffer.
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
 		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
@@ -1247,8 +1252,15 @@ void EmitProgram(EmitterState& state) {
 		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
 		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
 		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
+		const auto region = ConstantU32(state, LdsStorageRegionDwords(LdsDwordCount(state)));
+		const auto dwords = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), dwords, state.lds_variable, 0);
+		const auto held    = EmitBinaryU32(state, spv::OpUDiv, dwords, region);
+		const auto present = Binary(state, spv::OpULessThan, TypeBool(state), index, held);
+		state.lds_base_dwords = EmitSelectValueU32(
+		    state, present, EmitBinaryU32(state, spv::OpIMul, index, region), ConstantU32(state, 0));
+		state.lds_length = EmitSelectValueU32(state, present, ConstantU32(state, LdsDwordCount(state)),
+		                                      ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
