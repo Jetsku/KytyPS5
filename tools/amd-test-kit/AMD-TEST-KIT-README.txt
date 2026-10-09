@@ -3,17 +3,17 @@ AMD test kit 3 for Astro Bot on AMD Radeon cards
 
 What it does
 ------------
-It starts Astro Bot 7 times in a row, each time with one emulator setting changed, and writes down
+It starts Astro Bot 6 times in a row, each time with one emulator setting changed, and writes down
 how far each start gets (device lost, crash, or still running). At the end it puts all console logs
-into one zip file. One session of about 40 minutes; a run that crashes ends early.
+into one zip file. One session of about 35 minutes; a run that crashes ends early.
 
 AMD test 2 fixed the "device lost" at the title screen. Its logs still show "Clamping LDS" once the
 game is played: one of the game's compute shaders asks for 48 KiB of shared memory (LDS), and AMD
 cards allow 32 KiB, so AMD test 2 cut it down. This build keeps that shader's shared memory in a
 GPU buffer instead. The kit also checks a crash some players see a minute into play, inside a DLL
 (a driver, or an overlay such as Steam, Epic, GOG Galaxy or OBS): one run starts the game without
-any Vulkan overlay layer, one without the quick first pipeline builds, and two avoid shader
-features of the pipeline that was being built when it crashed. Six of the runs need you to
+any Vulkan overlay layer, one without the quick first pipeline builds, and one avoids a shader
+feature of the pipeline that was being built when it crashed. Five of the runs need you to
 play: start the game, Dive In, and play the first level for a few minutes. The kit tells you before
 each of these runs and waits for Enter.
 
@@ -60,8 +60,6 @@ lds-fix           this build as it is: the 48 KiB shader's LDS in a GPU buffer  
 pervertex-off     pixel shaders without raw per-vertex inputs (the crash a minute
                   into play happened right after such a shader was compiled; some
                   shading may look slightly wrong in this run)                     (you play)
-clipguard-off     vertex shaders without the extra clip plane (the other shader of
-                  that crash)                                                      (you play)
 overlays-off      this build without the Vulkan overlay layers (Steam, Epic, GOG
                   Galaxy, OBS, fossilize; on a laptop with two GPUs also AMD's GPU
                   switching layer)                                                 (you play)
@@ -77,7 +75,8 @@ Advanced options (normally not needed)
 --------------------------------------
 -NoPlay                     only the hands-off runs
 -PlaySeconds 240            how long a played run may go on after the intro video
--Only lds-fix,lds-clamp     run only these (also: clusters-off, barrier-old, barrier-off, old-loop-guard,
-                            fix-long, lds-force and the AMD test 1 runs)
+-Only lds-fix,lds-clamp     run only these (also: shrink-off, clipguard-off, dpp-skip-off, clusters-off,
+                            barrier-old, barrier-off, old-loop-guard, fix-long, lds-force
+                            and the AMD test 1 runs)
 -SecondsAfterVideo 45       how long a hands-off run goes on after the intro video
 -TitleId PPSA21567          if the kit picks the wrong patch file

@@ -63,7 +63,6 @@ $Configs = @(
     # was compiled (PS 0x13495e6ee1376edc reads raw vertex attributes: PerVertexKHR inputs with
     # fragment barycentrics; VS 0xccc92ef7c55db46a with the zero-position clip plane).
     @{ Name = 'pervertex-off';    Text = 'pixel shaders without raw per-vertex inputs (a driver crash suspect; slightly wrong shading there)'; Env = [ordered]@{ KYTY_PS_PER_VERTEX = '0' }; Play = $true; LogFile = $true }
-    @{ Name = 'clipguard-off';    Text = 'vertex shaders without the extra clip plane (a driver crash suspect)'; Env = [ordered]@{ KYTY_CLIP_GUARD = '0' }; Play = $true }
     # A crash in a host DLL ~47 s into play on an RX 6900 XT (AMD test 2) with the Steam, EOS,
     # GOG Galaxy, fossilize and OBS Vulkan layers loaded: no implicit layer at all.
     @{ Name = 'overlays-off';     Text = 'this build without Vulkan overlay layers (Steam, Epic, GOG, OBS, ...)'; Env = [ordered]@{
@@ -74,6 +73,11 @@ $Configs = @(
 )
 # Earlier suspects, not run by default; -Only <name> runs them.
 $MoreConfigs = @(
+    # 32 KiB of scratch per lane for pixel shaders that emulate LDS when the arrays are not shrunk;
+    # this build shrinks by default (and the preset always did).
+    @{ Name = 'shrink-off';       Text = 'pixel/vertex shader LDS arrays not shrunk (32 KiB of scratch per pixel)'; Env = [ordered]@{ KYTY_FUNCTION_ARRAY_SHRINK = '0' }; Play = $true }
+    @{ Name = 'clipguard-off';    Text = 'vertex shaders without the extra clip plane (a driver crash suspect)'; Env = [ordered]@{ KYTY_CLIP_GUARD = '0' }; Play = $true }
+    @{ Name = 'dpp-skip-off';     Text = 'DPP reads from inactive lanes read zero again (KYTY_DPP_SKIP_INACTIVE=0)'; Env = [ordered]@{ KYTY_DPP_SKIP_INACTIVE = '0' }; Play = $true }
     @{ Name = 'clusters-off';     Text = 'this build without wave32 clusters (as AMD test 1; water triangles?)'; Env = [ordered]@{ KYTY_WAVE32_CLUSTERS = '0' }; Play = $true }
     @{ Name = 'barrier-old';      Text = 'LDS waitcnt barrier at workgroup scope again (as int16.1 and AMD test 1)'; Env = [ordered]@{ KYTY_LDS_WAITCNT_BARRIER = 'workgroup' } }
     @{ Name = 'barrier-off';      Text = 'no LDS waitcnt barrier (the community workaround; pink clouds expected)'; Env = [ordered]@{ KYTY_LDS_WAITCNT_BARRIER = '0' } }
@@ -270,6 +274,9 @@ if ([IO.File]::Exists($presetPath)) {
     $json = [IO.File]::ReadAllText($presetPath) | ConvertFrom-Json
     foreach ($p in $json.PSObject.Properties) { $preset[$p.Name] = [string]$p.Value }
 }
+if ($preset.Count -eq 0) {
+    Write-Host 'WARNING: no u59-preset.json next to kyty_emulator.exe: the runs use the emulator defaults, not the U59 preset.' -ForegroundColor Yellow
+}
 # "-Only a,b" arrives as one string through AMD-Test-Kit.cmd (powershell -File).
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $selected = @(if ($Only.Count -eq 0) { $Configs } else { @($Configs) + @($MoreConfigs) | Where-Object { $Only -contains $_.Name } })
@@ -305,6 +312,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $sys = [System.Collections.Generic.List[string]]::new()
 $sys.Add("Kit run $stamp; emulator $exe")
 $sys.Add("Command line: $($launch.Arguments)")
+$sys.Add("u59-preset.json: $($preset.Count) switches")
 try { $os = Get-CimInstance Win32_OperatingSystem; $sys.Add("OS: $($os.Caption) $($os.Version) build $($os.BuildNumber)") } catch {}
 try { foreach ($v in Get-CimInstance Win32_VideoController) { $sys.Add("GPU: $($v.Name); driver $($v.DriverVersion) ($($v.DriverDate)); status $($v.Status)") } } catch {}
 try { $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1; $sys.Add("CPU: $($cpu.Name)") } catch {}

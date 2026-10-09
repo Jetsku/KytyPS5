@@ -20,13 +20,19 @@ inside a DLL (a driver or a Vulkan overlay). This build:
   "graphics pipeline build (VS, PS) 0x... 0x..."), the registers and the call chain, also into the log file
   (before, that part went only to the console window). Every graphics pipeline build is logged
   (`PipelineTrace: graphics build begin/done`, and the unoptimized and optimized builds of fast-first).
-- **Two diagnostic switches for the crash a minute into play:** two RX 6900 XT players crashed inside a DLL right
-  after the same vertex/pixel shader pair was compiled; that pixel shader reads raw per-vertex attributes (fragment
-  barycentrics). `KYTY_PS_PER_VERTEX=0` replaces those reads by interpolated values (slightly wrong shading there),
-  `KYTY_CLIP_GUARD=0` drops the extra clip plane vertex shaders get. Both default on; the kit tries each.
+- **Shader shared-memory arrays shrunk by default:** pixel and vertex shaders emulate LDS with a 32 KiB array per
+  pixel; `KYTY_FUNCTION_ARRAY_SHRINK` cuts it to what the shader can reach (every such Astro Bot pixel shader to at
+  most 352 dwords). It was on only through `u59-preset.json`; now it is the default (`=0` turns it off), so a
+  missing preset cannot leave AMD reserving 32 KiB of scratch per pixel. Its lines now also reach `_kyty.txt`.
+- **Diagnostic switches for that crash:** it came right after the same vertex/pixel shader pair was compiled; that
+  pixel shader reads raw per-vertex attributes (fragment barycentrics). `KYTY_PS_PER_VERTEX=0` replaces those reads
+  by interpolated values (slightly wrong shading there), `KYTY_CLIP_GUARD=0` drops the extra clip plane vertex
+  shaders get. Both default on.
+- **Wave32 log lines:** each wave32 shader that shares a 64-wide AMD subgroup is logged once with the cross-lane
+  operations it uses (for the block-shaped cloud corruption seen in Astro's Playroom).
 - Everything else is the same as AMD test 2 (subgroup LDS barrier, wave32 clusters, GPU breadcrumbs).
 
-## How to test (about 40 minutes; you play six short runs)
+## How to test (about 35 minutes; you play five short runs)
 
 1. Copy your working int16.1 folder (with its `_Patches`, `_PipelineCache` and `_SaveData`) to a new folder, then
    unzip this build into the new folder and let it overwrite the files.
@@ -36,7 +42,7 @@ inside a DLL (a driver or a Vulkan overlay). This build:
    and play the first level until the kit closes the game (about 4 minutes after the intro video). After each played
    run it asks what you saw; press Enter if nothing looked wrong, or type a few words.
    - `lds-fix`: this build as it is.
-   - `pervertex-off` and `clipguard-off`: the two diagnostic switches above, one each.
+   - `pervertex-off`: the per-vertex diagnostic switch above.
    - `overlays-off`: no Vulkan overlay layers (Steam, Epic, GOG Galaxy, OBS, fossilize), for the crash a minute into
      play.
    - `fastfirst-off`: pipelines built optimized at once instead of a quick first build (`KYTY_PIPELINE_FAST_FIRST=0`);

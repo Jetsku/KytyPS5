@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/spirvCacheSalt.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
@@ -144,7 +145,8 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 
 namespace {
 
-// KYTY_FUNCTION_ARRAY_SHRINK=1 (default 0: off): shader modules get their per-invocation
+// KYTY_FUNCTION_ARRAY_SHRINK (default on since AMD test 3; =0 turns it off): shader modules get
+// their per-invocation
 // (Function storage) arrays shrunk to the indices they can reach (spirvLocalArrays.h). The driver
 // reserves local memory for the largest per-thread footprint of any pipeline times every thread the
 // GPU keeps resident and never returns it; the recompiler's 8192-dword LDS emulation in vertex and
@@ -152,6 +154,10 @@ namespace {
 // only reach 96 dwords. A rewritten module that fails spirv-val is not used (logged once).
 // =zero also zero-fills the shrunk arrays at function entry (OpConstantNull initializer), =poison
 // fills them with float NaNs (diagnostic: makes reads of elements no path wrote visible).
+// Default on: two RX 6900 XT players whose launcher did not apply u59-preset.json (no shrink line
+// in their logs) crashed inside the driver a minute into play, shortly after a pixel shader with
+// the unshrunk 32 KiB per-invocation LDS array was compiled; AMD backs it with scratch for every
+// resident lane (about 2 MiB per wave64 wave).
 struct ShrinkMode {
 	bool                   enabled = false;
 	SpirvLocalArrays::Init init    = SpirvLocalArrays::Init::None;
@@ -161,20 +167,27 @@ const ShrinkMode& FunctionArrayShrinkMode() {
 	static const ShrinkMode mode = [] {
 		ShrinkMode  result;
 		const auto* value = std::getenv("KYTY_FUNCTION_ARRAY_SHRINK");
-		result.enabled    = value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+		if (value == nullptr || *value == '\0') {
+			value = "1";
+		}
+		result.enabled = std::strcmp(value, "0") != 0;
+		if (!result.enabled) {
+			Log::WriteToConsoleAndLog("Kyty Function-storage arrays: not shrunk (KYTY_FUNCTION_ARRAY_SHRINK=0)\n");
+		}
 		if (result.enabled) {
 			if (std::strcmp(value, "zero") == 0) {
 				result.init = SpirvLocalArrays::Init::Zero;
 			} else if (std::strcmp(value, "poison") == 0) {
 				result.init = SpirvLocalArrays::Init::Poison;
 			}
-			std::printf("Kyty Function-storage arrays: shrunk to their proven index bound%s "
+			char text[192];
+			std::snprintf(text, sizeof(text), "Kyty Function-storage arrays: shrunk to their proven index bound%s "
 			            "(KYTY_FUNCTION_ARRAY_SHRINK=%s)\n",
 			            result.init == SpirvLocalArrays::Init::Zero     ? ", zero-filled"
 			            : result.init == SpirvLocalArrays::Init::Poison ? ", filled with NaNs (diagnostic)"
 			                                                            : "",
 			            value);
-			std::fflush(stdout);
+			Log::WriteToConsoleAndLog(text);
 		}
 		return result;
 	}();
@@ -214,13 +227,14 @@ std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint6
 	{
 		std::scoped_lock lock(log_mutex);
 		if (logged.insert(arrays + (valid ? "" : " invalid")).second) {
-			std::printf("Kyty Function-storage arrays (KYTY_FUNCTION_ARRAY_SHRINK): %s elements, %llu -> %llu "
+			char text[1024];
+			std::snprintf(text, sizeof(text), "Kyty Function-storage arrays (KYTY_FUNCTION_ARRAY_SHRINK): %s elements, %llu -> %llu "
 			            "bytes per invocation%s%s\n",
 			            arrays.c_str(), static_cast<unsigned long long>(result.bytes_before),
 			            static_cast<unsigned long long>(result.bytes_after),
 			            valid ? "" : "; the rewritten module failed validation, the original is used: ",
 			            valid ? "" : messages.c_str());
-			std::fflush(stdout);
+			Log::WriteToConsoleAndLog(text);
 		}
 	}
 	if (valid) {
