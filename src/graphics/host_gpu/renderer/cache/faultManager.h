@@ -31,10 +31,23 @@ public:
 	// the bitmap) and a copy of the dropped-write counter (then clearing it), submits, waits for
 	// that tick and returns what the dispatch wrote. overflow: more pages than the list holds
 	// (the bits past it are lost; the caller must settle conservatively).
+	// stores (KYTY_BDA_STORE_LOG): the store log, in log order; log_overflow: stores past its
+	// capacity (also counted in dropped).
+	struct BdaStore {
+		uint32_t address_low  = 0;
+		uint32_t address_high = 0;
+		uint32_t value        = 0;
+		uint32_t mask         = 0;
+		[[nodiscard]] uint64_t Address() const {
+			return address_low | (static_cast<uint64_t>(address_high) << 32u);
+		}
+	};
 	struct BdaWrites {
 		std::vector<uint64_t> pages;
-		uint32_t              dropped  = 0;
-		bool                  overflow = false;
+		std::vector<BdaStore> stores;
+		uint32_t              dropped      = 0;
+		uint32_t              log_overflow = 0;
+		bool                  overflow     = false;
 	};
 	[[nodiscard]] BdaWrites CollectBdaWrites();
 

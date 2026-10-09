@@ -56,13 +56,18 @@ public:
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 	// Fault buffer layout: the fault bitmap (1 bit per page). With KYTY_BDA_WRITES it grows by the
-	// written-page bitmap of the same shape and then the dropped-write counter (writes to pages
-	// without a cache buffer), in that order.
+	// written-page bitmap of the same shape, the dropped-write counter (writes to pages without a
+	// cache buffer) and the store log (KYTY_BDA_STORE_LOG: a u32 count, then entries of 4 words
+	// from BDA_STORE_LOG_WORD + 4: guest address low and high, the dword value and its byte mask
+	// as bits), in that order.
 	static constexpr uint64_t FAULT_BITMAP_WORDS      = CACHING_NUMPAGES / 32;
 	static constexpr uint64_t BDA_WRITE_BITMAP_WORD   = FAULT_BITMAP_WORDS;
 	static constexpr uint64_t BDA_DROPPED_WRITES_WORD = 2 * FAULT_BITMAP_WORDS;
+	static constexpr uint64_t BDA_STORE_LOG_WORD      = BDA_DROPPED_WRITES_WORD + 4;
+	static constexpr uint64_t BDA_STORE_LOG_ENTRIES   = 4096;
+	static constexpr uint64_t BDA_STORE_LOG_BYTES     = (4 + 4 * BDA_STORE_LOG_ENTRIES) * sizeof(uint32_t);
 	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE =
-	    (2 * FAULT_BITMAP_WORDS + 4) * sizeof(uint32_t);
+	    BDA_STORE_LOG_WORD * sizeof(uint32_t) + BDA_STORE_LOG_BYTES;
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -570,6 +575,13 @@ private:
 	// SettleBdaWrites for the written pages [vaddr, vaddr + size): the parts inside cache buffers.
 	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
 	                           uint64_t& settled_pages);
+	// SettleBdaWrites for the store log (KYTY_BDA_STORE_LOG): the dispatch's stores to pages without
+	// a cache buffer, in log order. Their bytes live in guest memory only: each dword is merged into
+	// the backing after the transition a guest write makes (CPU-dirty, fills forgotten, images over
+	// it invalidated). A dword something on the GPU owns after all (GPU-dirty bytes, a pending
+	// publication, a GPU-modified image) cannot be ordered against that owner here and is dropped as
+	// before. Returns the dropped stores.
+	uint32_t ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> stores, uint64_t shader_hash);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	// `early`: the pages are released before the publication lands (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,

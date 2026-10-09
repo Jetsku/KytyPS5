@@ -4922,12 +4922,55 @@ void BufferCache::PrepareBdaWrites() {
 	}
 }
 
+// KYTY_BDA_STORE_LOG_STATS=1: "BdaSettle 10s: ..." console lines while BDA-writing dispatches
+// settle (none printed: none settled). GPU thread.
+static void NoteBdaSettleStats(size_t logged, uint32_t dropped) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BDA_STORE_LOG_STATS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	static uint64_t settles = 0;
+	static uint64_t stores  = 0;
+	static uint64_t drops   = 0;
+	static uint64_t total   = 0;
+	static auto     start   = std::chrono::steady_clock::now();
+	settles++;
+	total++;
+	stores += logged;
+	drops += dropped;
+	const auto now = std::chrono::steady_clock::now();
+	const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+	if (ms < 10000) {
+		return;
+	}
+	std::printf("BdaSettle 10s: %" PRIu64 " settles, %" PRIu64 " logged stores, %" PRIu64
+	            " dropped writes in %.1f s; total %" PRIu64 " settles\n",
+	            settles, stores, drops, static_cast<double>(ms) / 1000.0, total);
+	std::fflush(stdout);
+	settles = stores = drops = 0;
+	start = now;
+}
+
 void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 	EXIT_IF(!BdaWritesEnabled());
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::BdaSettle);
 	// Records the compaction after the dispatch, submits and waits: the pages it wrote.
-	const auto writes = m_fault_manager.CollectBdaWrites();
+	auto writes = m_fault_manager.CollectBdaWrites();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
+	if (!writes.stores.empty()) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaLoggedStores, writes.stores.size());
+		writes.dropped += ApplyBdaStoreLog(writes.stores, shader_hash);
+		if (FirstBdaWriteNote(shader_hash, 5)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_BDA_STORE_LOG: CS shader 0x{:016x} stored {} dword(s) to pages without a cache "
+			    "buffer; the settle wrote them into guest memory.\n",
+			    shader_hash, writes.stores.size()));
+		}
+	}
+	NoteBdaSettleStats(writes.stores.size(), writes.dropped);
 	if (writes.dropped != 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDroppedWrites, writes.dropped);
 		if (FirstBdaWriteNote(shader_hash, 0)) {
@@ -5047,6 +5090,51 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 		// Overlapping images are rebuilt from the buffer (the Water agent's rule for BDA writes).
 		m_texture_cache.InvalidateMemoryFromGPU(start, bytes);
 	}
+}
+
+uint32_t BufferCache::ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> stores,
+                                       uint64_t shader_hash) {
+	// The guest-write transition once per dword run, before any byte lands.
+	RangeSet dwords;
+	for (const auto& store: stores) {
+		dwords.Add(store.Address() & ~uint64_t {3}, sizeof(uint32_t));
+	}
+	RangeSet refused;
+	dwords.ForEach([&](uint64_t start, uint64_t end) {
+		const auto bytes = end - start;
+		if (HasGpuDirtyBytes(start, bytes) || HasPendingBackingPublication(start, bytes) ||
+		    m_texture_cache.IsRegionGpuModified(start, bytes)) {
+			refused.Add(start, bytes);
+			return;
+		}
+		InvalidateMemory(start, bytes);
+		m_texture_cache.InvalidateMemory(start, bytes);
+	});
+	uint32_t dropped = 0;
+	for (const auto& store: stores) {
+		const auto address = store.Address() & ~uint64_t {3};
+		uint32_t   word    = 0;
+		if (refused.Intersects(address, sizeof(word)) ||
+		    !Libs::LibKernel::Memory::TryReadBacking(address, &word, sizeof(word))) {
+			dropped++;
+			continue;
+		}
+		word = (word & ~store.mask) | (store.value & store.mask);
+		if (!Libs::LibKernel::Memory::TryWriteBacking(address, &word, sizeof(word))) {
+			dropped++;
+			continue;
+		}
+		HangTrace::NoteGpuWrite(address, sizeof(word));
+	}
+	// A memory write the command processor orders before later work (syncEpoch.h).
+	SyncEpoch::Advance();
+	if (!refused.Empty() && FirstBdaWriteNote(shader_hash, 4)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_BDA_STORE_LOG: CS shader 0x{:016x} stored to bytes without a cache buffer that the "
+		    "GPU still owns; those stores are dropped.\n",
+		    shader_hash));
+	}
+	return dropped;
 }
 
 } // namespace Libs::Graphics

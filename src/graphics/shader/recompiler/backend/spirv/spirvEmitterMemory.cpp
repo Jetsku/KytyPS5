@@ -1107,19 +1107,69 @@ void RecordBdaDroppedWrite(EmitterState& state) {
 	                          ConstantU32(state, 1));
 }
 
+// KYTY_BDA_STORE_LOG: a dword store to a page without a cache buffer. The next store-log entry
+// (BufferCache::BDA_STORE_LOG_WORD) takes the dword-aligned guest address, the value and the mask of
+// the bits it replaces, and the settle writes it into guest memory; past the log's capacity the store
+// is dropped and counted as before. Entries of one invocation keep its program order.
+void LogBdaStore(EmitterState& state, uint32_t guest, uint32_t value, uint32_t mask) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAtomicIAdd, TypeU32(state), count,
+	    FaultElementPointer(state,
+	                        ConstantU32(state, static_cast<uint32_t>(BufferCache::BDA_STORE_LOG_WORD))),
+	    ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
+	    ConstantU32(state, 1));
+	const auto fits =
+	    Binary(state, spv::OpULessThan, TypeBool(state), count,
+	           ConstantU32(state, static_cast<uint32_t>(BufferCache::BDA_STORE_LOG_ENTRIES)));
+	EmitIfCondition(state, fits, [&]() {
+		const auto first = Binary(
+		    state, spv::OpIAdd, TypeU32(state),
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), count, ConstantU32(state, 2)),
+		    ConstantU32(state, static_cast<uint32_t>(BufferCache::BDA_STORE_LOG_WORD + 4u)));
+		const std::array<uint32_t, 4> words {
+		    Unary(state, spv::OpUConvert, TypeU32(state), guest),
+		    Unary(state, spv::OpUConvert, TypeU32(state),
+		          Binary(state, spv::OpShiftRightLogical, TypeU64(state), guest,
+		                 ConstantDeviceAddress(state, 32))),
+		    value, mask};
+		for (uint32_t i = 0; i < words.size(); i++) {
+			const auto index = i == 0 ? first
+			                          : Binary(state, spv::OpIAdd, TypeU32(state), first,
+			                                   ConstantU32(state, i));
+			state.builder.AddFunction(spv::OpStore, FaultElementPointer(state, index), words[i]);
+		}
+	});
+	EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), fits),
+	                [&]() { RecordBdaDroppedWrite(state); });
+}
+
+// The value and mask a store to a page without a cache buffer logs (KYTY_BDA_STORE_LOG), or none.
+struct BdaStoreLogValue {
+	uint32_t value = 0;
+	uint32_t mask  = 0;
+};
+
 // KYTY_BDA_WRITES: `write(host_address)` once `guest` (in range) is mapped to a cache buffer, after
-// recording its page; otherwise the write is dropped and counted. Returns write's value, or
-// `default_value` when out of range or dropped (an atomic then returns 0).
+// recording its page; otherwise a store with `log` is logged (KYTY_BDA_STORE_LOG) and any other write
+// is dropped and counted. Returns write's value, or `default_value` when out of range or not mapped
+// (an atomic then returns 0).
 template <typename Fn>
 uint32_t WriteBdaIfMapped(ValueEmitContext& ctx, uint32_t guest, uint32_t in_bounds, uint32_t type,
-                          uint32_t default_value, Fn&& write) {
+                          uint32_t default_value, Fn&& write,
+                          const BdaStoreLogValue* log = nullptr) {
 	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(state, in_bounds, type, default_value, [&]() {
 		const auto host    = GetBdaPointer(ctx, guest);
 		const auto present =
 		    Binary(state, spv::OpINotEqual, TypeBool(state), host, ConstantDeviceAddress(state, 0));
-		EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
-		                [&]() { RecordBdaDroppedWrite(state); });
+		EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present), [&]() {
+			if (log != nullptr) {
+				LogBdaStore(state, guest, log->value, log->mask);
+			} else {
+				RecordBdaDroppedWrite(state);
+			}
+		});
 		return EmitValueOrDefaultIfCondition(state, present, type, default_value, [&]() {
 			RecordBdaWrite(state, guest);
 			return write(host);
@@ -1146,6 +1196,24 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 			}
 			const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), access.guest,
 			                            ConstantDeviceAddress(state, ~uint64_t {3}));
+			// A byte or short replaces `mask` of the dword with `shifted`.
+			uint32_t mask    = 0;
+			uint32_t shifted = 0;
+			if (bits != 32u) {
+				const auto mask_bits = ConstantU32(state, bits == 8u ? 0xffu : 0xffffu);
+				const auto shift =
+				    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+				           Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+				                  Unary(state, spv::OpUConvert, TypeU32(state), access.guest),
+				                  ConstantU32(state, 3)),
+				           ConstantU32(state, 3));
+				mask    = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), mask_bits, shift);
+				shifted = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+				                 Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, mask_bits),
+				                 shift);
+			}
+			const BdaStoreLogValue log {bits == 32u ? value : shifted,
+			                            bits == 32u ? ConstantU32(state, ~0u) : mask};
 			(void)WriteBdaIfMapped(
 			    ctx, aligned, access.in_bounds, TypeU32(state), ConstantU32(state, 0),
 			    [&](uint32_t host) {
@@ -1157,18 +1225,6 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 					    state.builder.AddFunction(spv::OpStore, pointer, value,
 					                              spv::MemoryAccessAlignedMask, alignment);
 				    } else {
-					    const auto mask_bits = ConstantU32(state, bits == 8u ? 0xffu : 0xffffu);
-					    const auto shift =
-					        Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-					               Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-					                      Unary(state, spv::OpUConvert, TypeU32(state), access.guest),
-					                      ConstantU32(state, 3)),
-					               ConstantU32(state, 3));
-					    const auto mask =
-					        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), mask_bits, shift);
-					    const auto shifted = Binary(
-					        state, spv::OpShiftLeftLogical, TypeU32(state),
-					        Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, mask_bits), shift);
 					    (void)AtomicUpdate(
 					        state, pointer, IR::ResourceKind::IndirectBuffer, [&](uint32_t old) {
 						        return Binary(
@@ -1179,7 +1235,8 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 					        });
 				    }
 				    return ConstantU32(state, 0);
-			    });
+			    },
+			    GetCodegenOptions().bda_store_log ? &log : nullptr);
 		}
 	});
 }

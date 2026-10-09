@@ -1235,6 +1235,8 @@ enum class FrameEvent : uint32_t {
 	// Program sources whose dispatches and draws are skipped: a flat SRT read has a loop-carried
 	// address and KYTY_SRT_VARIANT_READS is off (PipelineCache SkipVariantPlan).
 	VariantPlanSkips,
+	// KYTY_BDA_STORE_LOG: stores a BDA-writing dispatch logged for pages without a cache buffer.
+	BdaLoggedStores,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

@@ -16628,19 +16628,33 @@ public:
           {8, 1, 1}, 1, 4, 1);
       const auto image = textures.FindImage(image_desc);
       ShaderProgram previous_program;
-      // KNOWN GAP (upstream 57cf08688, not in our fork): a descriptor dword written by an earlier
-      // dispatch (NUM_RECORDS here) is read from guest memory without synchronizing that GPU
-      // write, so the counted consumer sees a stale count. Off until our SRT reads synchronize
-      // GPU-written descriptor dependencies; KYTY_TEST_GPU_DESCRIPTOR_COUNT=1 runs it.
-      const bool gpu_descriptor_count = [] {
-        const char *value = std::getenv("KYTY_TEST_GPU_DESCRIPTOR_COUNT");
-        return value != nullptr && value[0] == '1';
-      }();
-      for (const auto count : {3u, 7u}) {
-        if (!gpu_descriptor_count) {
-          break;
+      // Upstream (57cf08688) reads the GPU-written NUM_RECORDS on the CPU as a descriptor
+      // dependency, which drains the writer. Our resource tracking leaves a V# with a dword the
+      // shader loads to the GPU (KYTY_BDA_WRITES: an indirect buffer written through BDA), so the
+      // count is never read back. The output page has no cache buffer (the fill is a CPU write),
+      // and BDA cannot reach it: KYTY_BDA_STORE_LOG logs those stores and the dispatch's settle
+      // writes them into guest memory. KYTY_BDA_STORE_LOG=0 drops them (the output stays the
+      // sentinel until a processed fault gives the page a buffer); this case then fails.
+      const auto check_counted_output = [&](u32 count, const char *step) {
+        cache.ReadMemory(count_output, 16u * sizeof(u32));
+        std::array<u32, 16> actual{};
+        Require(name, "counted output readback",
+                LibKernel::Memory::TryReadBacking(count_output, actual.data(), sizeof(actual)),
+                "the counted consumer output could not be read back");
+        for (u32 i = 0; i < actual.size(); i++) {
+          Require(name, "native descriptor count bound",
+                  actual[i] == (i < count ? count + i + 1u : sentinel),
+                  std::string(step) + ": GPU count " + std::to_string(count) +
+                      " wrote an incorrect output word " + std::to_string(i) + ": " +
+                      Hex(actual[i]));
         }
+      };
+      for (const auto count : {3u, 7u}) {
         cache.FillBuffer(count_output, 16u * sizeof(u32), sentinel, false);
+        // The fill is a CPU write (the guest's, before its submission): the command processor
+        // orders it before the dispatches (KYTY_BDA_SYNC_EPOCH; a fault may already have given the
+        // page a cache buffer, whose BDA pass must upload it).
+        SyncEpoch::Advance();
         shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
                              .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 15});
@@ -16665,15 +16679,14 @@ public:
         set_buffer(4, count_args, 1, 4);
         const std::array<u32, 3> packet{static_cast<u32>(count_args),
                                       static_cast<u32>(count_args >> 32u), 0x41u};
-        const auto dirty_tick = scheduler.CurrentTick();
-        // Upstream (57cf08688) drains the GPU-written descriptor dword through the buffer cache
-        // here. Our SRT reads take a clean read and synchronize on a retry (ShaderReadAttempt), which
-        // can leave the bytes GPU-owned: only the dispatch and its results are checked.
-        (void)dirty_tick;
         Require(name, "GPU count indirect dispatch",
-                CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
-                "the counted indirect dispatch was not issued");
-        const auto clean_tick = scheduler.CurrentTick();
+                CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3 &&
+                    cache.HasGpuDirtyBytes(count_args, 4),
+                "the counted indirect dispatch was not issued, or read its GPU count back");
+        // The first dispatch's own stores, before any fault processing could add a buffer.
+        check_counted_output(count, "first dispatch");
+        cache.FillBuffer(count_output, 16u * sizeof(u32), sentinel, false);
+        SyncEpoch::Advance();
         ShaderComputeInputInfo input{};
         PipelineCache::StagePrep stage_prep;
         const auto program = context.GetPipelineCache().GetComputeProgram(
@@ -16683,20 +16696,130 @@ public:
                   "a changing GPU count compiled a new shader permutation");
         }
         previous_program = program;
-        (void)clean_tick;
-        Require(name, "clean count repeat",
+        Require(name, "count repeat",
                 CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
                 "the repeated counted indirect dispatch was not issued");
-        cache.ReadMemory(count_output, 16u * sizeof(u32));
-        std::array<u32, 16> actual{};
-        Require(name, "counted output readback",
-                LibKernel::Memory::TryReadBacking(count_output, actual.data(), sizeof(actual)),
-                "the counted consumer output could not be read back");
-        for (u32 i = 0; i < actual.size(); i++) {
-          Require(name, "native descriptor count bound",
-                  actual[i] == (i < count ? count + i + 1u : sentinel),
-                  "GPU count " + std::to_string(count) + " wrote an incorrect output word " +
-                      std::to_string(i) + ": " + Hex(actual[i]));
+        check_counted_output(count, "repeat");
+      }
+
+      // A V# the shader loads with S_LOAD whose NUM_RECORDS an earlier dispatch wrote. The flat SRT
+      // read is made in place, through the guest mapping: the GPU-owned page faults and is read
+      // back, so no readiness retry is involved.
+      {
+        constexpr auto table = base + 0x70000u;
+        constexpr auto table_scratch = table + 0x100u;
+        constexpr auto table_output = base + 0x74000u;
+        static std::vector<u32> table_consumer;
+        table_consumer = {EncodeSmem0(0x02, 4, 0), EncodeSmem1(0, 125),  // s_load_dwordx4 s[4:7], s[0:1]
+                          EncodeSopp(0x0c, 0),                           // s_waitcnt
+                          EncodeVop2(0x25u, 1, InlineU32(1), 0),         // v1 = 1 + v0
+                          EncodeMubuf0(0x1cu, 0, true, false),           // buffer_store_dword v1, v0,
+                          EncodeMubuf1(1, 1, 0)};                        //   s[4:7] idxen
+        AppendEnd(&table_consumer);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(table_consumer.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(table_consumer.size() * sizeof(u32))});
+        for (const auto count : {5u, 2u}) {
+          ShaderBufferResource output_vsharp{};
+          output_vsharp.UpdateAddress48(table_output);
+          output_vsharp.fields[1] |= 4u << 16u;
+          output_vsharp.fields[2] = 0xffffffffu;  // replaced by the writer below
+          output_vsharp.fields[3] = DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+          std::memcpy(reinterpret_cast<void *>(table), output_vsharp.fields,
+                      sizeof(output_vsharp.fields));
+          cache.FillBuffer(table_output, 8u * sizeof(u32), sentinel, false);
+          SyncEpoch::Advance();
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          set_buffer(0, table + 8u, 4);
+          set_buffer(4, table_scratch, 4);
+          set_buffer(8, table_scratch + 4u, 4);
+          for (u32 i = 0; i < 3; i++) {
+            shaders.SetCsUserSgpr(12u + i, i == 0 ? count : 0u, HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+          Require(name, "GPU-owned SRT count", cache.HasGpuDirtyBytes(table + 8u, 4),
+                  "the V# count was already visible to the CPU");
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(table_consumer.data()),
+                               .num_thread_x = 8, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 2});
+          shaders.SetCsUserSgpr(0, static_cast<u32>(table), HW::UserSgprType::Unknown);
+          shaders.SetCsUserSgpr(1, static_cast<u32>(table >> 32u), HW::UserSgprType::Unknown);
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+          const bool count_synchronized = !cache.HasGpuDirtyBytes(table + 8u, 4);
+          cache.ReadMemory(table_output, 8u * sizeof(u32));
+          std::array<u32, 8> actual{};
+          Require(name, "SRT count output readback",
+                  LibKernel::Memory::TryReadBacking(table_output, actual.data(), sizeof(actual)),
+                  "the SRT consumer output could not be read back");
+          for (u32 i = 0; i < actual.size(); i++) {
+            Require(name, "SRT descriptor count bound",
+                    actual[i] == (i < count ? i + 1u : sentinel),
+                    "SRT count " + std::to_string(count) + " wrote an incorrect output word " +
+                        std::to_string(i) + ": " + Hex(actual[i]) + " (count synchronized " +
+                        std::to_string(count_synchronized) + ")");
+          }
+        }
+      }
+
+      // The same count read by S_BUFFER_LOAD and passed through V_READFIRSTLANE into the output
+      // V#'s NUM_RECORDS (upstream's descriptor dependency, 57cf08688, in scalar form). The value is
+      // evaluated before the dispatch; its in-place read faults on the GPU-owned page, which is read
+      // back, so the count is synchronized without a readiness retry.
+      {
+        constexpr auto lane_count = base + 0x78000u;
+        constexpr auto lane_scratch = lane_count + 0x100u;
+        constexpr auto lane_output = base + 0x7c000u;
+        static std::vector<u32> lane_consumer;
+        lane_consumer = {EncodeSmem0(0x08, 8, 2), EncodeSmem1(0, 125),  // s_buffer_load_dword s8, s[4:7]
+                         EncodeSopp(0x0c, 0),                           // s_waitcnt
+                         EncodeVop1(0x01, 3, 8),                        // v_mov_b32 v3, s8
+                         EncodeVop1(0x02, 2, Vgpr(3)),                  // v_readfirstlane_b32 s2, v3
+                         EncodeVop2(0x25u, 1, InlineU32(1), 0),         // v1 = 1 + v0
+                         EncodeMubuf0(0x1cu, 0, true, false),           // buffer_store_dword v1, v0,
+                         EncodeMubuf1(1, 0, 0)};                        //   s[0:3] idxen
+        AppendEnd(&lane_consumer);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(lane_consumer.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(lane_consumer.size() * sizeof(u32))});
+        for (const auto count : {6u, 3u}) {
+          cache.FillBuffer(lane_output, 8u * sizeof(u32), sentinel, false);
+          SyncEpoch::Advance();
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          set_buffer(0, lane_count, 4);
+          set_buffer(4, lane_scratch, 4);
+          set_buffer(8, lane_scratch + 4u, 4);
+          for (u32 i = 0; i < 3; i++) {
+            shaders.SetCsUserSgpr(12u + i, i == 0 ? count : 0u, HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+          Require(name, "GPU-owned lane count", cache.HasGpuDirtyBytes(lane_count, 4),
+                  "the READFIRSTLANE count was already visible to the CPU");
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(lane_consumer.data()),
+                               .num_thread_x = 8, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 8});
+          set_buffer(0, lane_output, 0, 4);
+          set_buffer(4, lane_count, 4);
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+          const bool count_synchronized = !cache.HasGpuDirtyBytes(lane_count, 4);
+          cache.ReadMemory(lane_output, 8u * sizeof(u32));
+          std::array<u32, 8> actual{};
+          Require(name, "lane count output readback",
+                  LibKernel::Memory::TryReadBacking(lane_output, actual.data(), sizeof(actual)),
+                  "the READFIRSTLANE consumer output could not be read back");
+          for (u32 i = 0; i < actual.size(); i++) {
+            Require(name, "READFIRSTLANE descriptor count bound",
+                    actual[i] == (i < count ? i + 1u : sentinel),
+                    "lane count " + std::to_string(count) + " wrote an incorrect output word " +
+                        std::to_string(i) + ": " + Hex(actual[i]) + " (count synchronized " +
+                        std::to_string(count_synchronized) + ")");
+          }
+          Require(name, "READFIRSTLANE count synchronized", count_synchronized,
+                  "the strict read of the GPU-written count did not synchronize it");
         }
       }
 
@@ -20102,9 +20225,10 @@ public:
   // KYTY_BDA_WRITES (BDA-WRITES-DESIGN.md v2): a dispatch that stores and adds through V#s it
   // selects with GPU data. The settle right after the dispatch takes the written page into GPU
   // ownership, so a guest-thread read afterwards (the fault route, as for Psr's compacted-size
-  // header read after its fence) sees the GPU's values; a write to a page without a cache buffer
-  // is dropped and leaves its page alone; unwritten pages stay clean. Needs KYTY_BDA_WRITES=1 and
-  // KYTY_SRT_VARIANT_READS=1 in the environment (ctest bda_writes).
+  // header read after its fence) sees the GPU's values; a store to a page without a cache buffer
+  // lands in guest memory through the store log (KYTY_BDA_STORE_LOG; =0: it is dropped and leaves
+  // its page alone) without making the page GPU-owned; unwritten pages stay clean. Needs
+  // KYTY_BDA_WRITES=1 and KYTY_SRT_VARIANT_READS=1 in the environment (ctest bda_writes).
   void CheckBdaWritesSettle() {
     constexpr const char *name = "BdaWritesSettle";
     constexpr uintptr_t base = 0x0000000207400000ull;
@@ -20113,7 +20237,7 @@ public:
     constexpr uint64_t table = base;               // bound through the user-data V#
     constexpr uint64_t header = base + 0x40000;    // has a cache buffer: written
     constexpr uint64_t neighbour = header + 0x4000; // the next 16 KiB page: not written
-    constexpr uint64_t unbacked = base + 0x100000; // no cache buffer: the write is dropped
+    constexpr uint64_t unbacked = base + 0x100000; // no cache buffer: the store log's write
     Require(name, "switches",
             BdaWritesEnabled() && ShaderRecompiler::GetCodegenOptions().bda_writes &&
                 ShaderRecompiler::GetCodegenOptions().srt_variant_reads,
@@ -20214,10 +20338,12 @@ public:
               header_word == 0xc0ffee42u && header_sum == 5u,
               "a guest read after the dispatch did not see the BDA store and atomic: " +
                   Hex(header_word) + " " + Hex(header_sum));
-      Require(name, "unwritten and dropped pages",
-              neighbour_word == 0x0badf00du && unbacked_word == 0u,
-              "a page the dispatch did not write changed: " + Hex(neighbour_word) + " " +
-                  Hex(unbacked_word));
+      const auto unbacked_expected =
+          ShaderRecompiler::GetCodegenOptions().bda_store_log ? 0xc0ffee42u : 0u;
+      Require(name, "unwritten and logged pages",
+              neighbour_word == 0x0badf00du && unbacked_word == unbacked_expected,
+              "a page the dispatch did not write changed, or the logged store is missing: " +
+                  Hex(neighbour_word) + " " + Hex(unbacked_word));
       context.GetGpu().SendCommandSync([&] {
         auto &scheduler = context.GetCommandScheduler();
         RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());

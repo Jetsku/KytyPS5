@@ -232,6 +232,15 @@ struct CodegenOptions {
 	// GPU-owned before the CP continues (BDA-WRITES-DESIGN.md). Default 1: Astro Bot's BVH builders
 	// need it once its game patches are off; KYTY_BDA_WRITES=0 restores the old refusal.
 	bool bda_writes = true;
+	// KYTY_BDA_STORE_LOG (default 1, with bda_writes): a raw store through such a V# to a page
+	// without a cache buffer, which BDA cannot reach, is appended to the fault buffer's store log
+	// (BufferCache::BDA_STORE_LOG_WORD) instead of being dropped; the synchronous settle writes the
+	// logged dwords into guest memory, where those bytes live (BufferCache::SettleBdaWrites). Such a
+	// page gets a cache buffer only after its fault is processed, so before this every dispatch
+	// until then lost its stores there (a counted consumer whose output V# takes NUM_RECORDS from a
+	// GPU-written count wrote nothing). Atomics there still drop (no value to return).
+	// KYTY_BDA_STORE_LOG=0 restores the drop.
+	bool bda_store_log = true;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the
