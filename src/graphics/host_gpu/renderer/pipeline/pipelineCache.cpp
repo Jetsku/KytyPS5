@@ -104,6 +104,19 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
+// Ordinary VS keys must be linked after the compiled PS interface is known.
+bool MayRelocatePixelParameters(const ShaderPixelInputInfo& pixel) {
+	for (uint32_t input = 0; input < pixel.input_num; ++input) {
+		for (uint32_t other = 0; other < input; ++other) {
+			if (ShaderPixelParameterMappedLocation(pixel, input) ==
+			        ShaderPixelParameterMappedLocation(pixel, other) &&
+			    ShaderPixelParameterIsFlat(pixel, input) !=
+			        ShaderPixelParameterIsFlat(pixel, other)) return true;
+		}
+	}
+	return false;
+}
+
 // Entries from older revisions accumulate in the driver cache; start over beyond this size.
 constexpr uint64_t MaxDriverCacheFileSize = 512ull * 1024 * 1024;
 
@@ -3182,6 +3195,8 @@ struct PipelineCache::ProgramCache {
 	                    ShaderRecompiler::IR::EvaluationScratch& evaluation,
 	                    ShaderProgram& ps_program, ShaderProgram& vs_program) {
 		KYTY_PROFILER_DETAIL_BLOCK("ProgramCache::GetParallel");
+		if (vs_info.logical_stage == ShaderType::Vertex &&
+		    MayRelocatePixelParameters(ps_info)) return false;
 		auto* worker = StagePrepWorker::Get();
 		if (worker == nullptr) return false;
 		auto& ps_key = scratch.key;
@@ -3240,6 +3255,8 @@ struct PipelineCache::ProgramCache {
 	                      StagePrep& vs_prep, uint32_t push_data_cursor,
 	                      PipelineCache::GraphicsPrograms& programs, uint64_t* compile_ns = nullptr) {
 		using Result  = PipelineCache::SpeculativeResult;
+		if (pixel_active && vs_info.logical_stage == ShaderType::Vertex &&
+		    MayRelocatePixelParameters(ps_info)) return Result::Ineligible;
 		auto& scratch = ThreadScratch();
 		auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
 		const auto initial_cursor = push_data_cursor;
@@ -4867,6 +4884,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				result.pixel = m_program_cache->Get(pixel_params, pixel_input, preps.pixel,
 				                                   push_data_cursor, read_attempt, scratch,
 				                                   evaluation);
+			}
+			if (pixel_active && !tess_active && !mesh_active &&
+			    !Prospero::IsRectList(user_config.GetPrimType())) {
+				ShaderLinkVertexPixelParameters(vertex_inputs[0], pixel_input);
 			}
 			for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
 			                     !read_attempt.materialization_failed; ++i) {

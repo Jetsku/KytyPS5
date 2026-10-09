@@ -25,6 +25,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.wave_size);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	key.push_back(info.param_alias_mask);
+	for (uint32_t destination = 0; destination < 32u; ++destination) {
+		if ((info.param_alias_mask & (1u << destination)) != 0) {
+			key.push_back(info.param_alias_source[destination]);
+		}
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {

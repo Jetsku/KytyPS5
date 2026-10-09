@@ -1,6 +1,7 @@
 #include "graphics/shader/shader.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 namespace Libs::Graphics {
 
@@ -46,6 +47,35 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
 		}
 	}
 	return ShaderPixelParameterMappedLocation(info, input);
+}
+
+void ShaderLinkVertexPixelParameters(ShaderVertexInputInfo& vertex,
+                                    const ShaderPixelInputInfo& pixel) {
+	std::array<uint32_t, 32> active {};
+	uint32_t count = 0;
+	if (pixel.stage.program != nullptr) {
+		for (const auto& input: pixel.stage.program->info.inputs) {
+			if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
+				active[count++] = input.location;
+			}
+		}
+	}
+	ShaderLinkVertexPixelParameters(vertex, pixel, std::span(active).first(count));
+}
+
+void ShaderLinkVertexPixelParameters(ShaderVertexInputInfo& vertex,
+                                     const ShaderPixelInputInfo& pixel,
+                                     std::span<const uint32_t> active_inputs) {
+	vertex.param_alias_mask = 0;
+	vertex.param_alias_source.fill(0);
+	for (const auto input: active_inputs) {
+		const auto source = ShaderPixelParameterMappedLocation(pixel, input);
+		const auto destination = ShaderPixelParameterLocation(pixel, active_inputs, input);
+		if (destination != source) {
+			vertex.param_alias_mask |= 1u << destination;
+			vertex.param_alias_source[destination] = source;
+		}
+	}
 }
 
 bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input) {
