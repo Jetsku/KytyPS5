@@ -23258,7 +23258,11 @@ public:
                         vk::AccessFlagBits2::eTransferRead, {}, scheduler.Current().Handle());
           vk::BufferImageCopy copy{};
           copy.bufferOffset = i * sizeof(u32);
-          copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+          // With upstream f53f0ca48's SameBacking (int18) the R16 2D descriptor is served by a raw D16
+          // image (PPSA04264 raw D16 textures): read its depth aspect, the same 16-bit texel.
+          copy.imageSubresource = {image.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                                   0, 0, 1};
           copy.imageExtent = {1, 1, 1};
           scheduler.Current().Handle().copyImageToBuffer(image.backing.image,
               vk::ImageLayout::eTransferSrcOptimal, output.buffer, 1, &copy);
@@ -23270,9 +23274,12 @@ public:
             vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
         RenderExecutorTestAccess::ResetBindings(executor);
         scheduler.Finish();
+        const auto contents = ReadBuffer(name, output, 2);
         Require(name, "overlapping dimension GPU contents",
-                ReadBuffer(name, output, 2) == std::vector<u32>{expected, expected},
-                "an alias replacement retired image contents before queued GPU reads");
+                contents == std::vector<u32>{expected, expected},
+                "an alias replacement retired image contents before queued GPU reads (format " +
+                    std::to_string(static_cast<u32>(format)) + ": " + std::to_string(contents[0]) +
+                    ", " + std::to_string(contents[1]) + ", expected " + std::to_string(expected) + ")");
         DestroyBuffer(&output);
       }
 
@@ -55117,6 +55124,11 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // Upstream 21a1346e2's compact colour exports, as the shipped preset sets them (code default off;
+  // the PolygonModeRasterization export-routing cases are upstream's). An explicit value wins.
+  if (std::getenv("KYTY_CB_SHADER_MASK_EXPORTS") == nullptr) {
+    SetEnvironment("KYTY_CB_SHADER_MASK_EXPORTS", "1");
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--gi-decode-inventory") == 0) {
     EnsureConfigInitialized();
     return GiProbeTests::GiDecodeInventory(argv[2], argc == 4 ? argv[3] : nullptr);

@@ -13250,6 +13250,11 @@ void TestRenderTargetReverseExportMapping() {
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
   const auto first_slot_key = MakeStageStaticKey(compiled_info);
+  // Upstream 21a1346e2's compact export ordinals: only with KYTY_CB_SHADER_MASK_EXPORTS=1 (default
+  // off in code, on through the preset; ctest shader_cfg_cb_shader_mask_exports).
+  if (!ShaderCbShaderMaskExports()) {
+    return;
+  }
   sh.m_cbShaderMask = 0xf000;
   mappings[3] = gr32.export_mapping;
   PrepareProgram(regs, sh, mappings, compiled_info);
