@@ -1520,10 +1520,10 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	return false;
 }
 
-bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	std::vector<VirtualRanges::Range> ranges;
 	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
-	    !IsInPrtAperture(vaddr, size) || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+	    !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
 		return false;
 	}
 	if (std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {

@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -10,6 +12,14 @@ constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
 constexpr uint32_t PsInputFlatShade  = 0x00000400u;
 
 } // namespace
+
+bool ShaderCbShaderMaskExports() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CB_SHADER_MASK_EXPORTS");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
 
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
 	for (uint32_t target = 0; target < 8u; target++) {

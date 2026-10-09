@@ -149,7 +149,7 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 [[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
-bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // Upstream's descriptor-dependency reader (57cf08688/783d9f8d6): on the GPU thread, GPU-dirty
 // buffer bytes are read back first, then the backing is read.
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
@@ -244,7 +244,7 @@ struct TestClampTotals {
 TestClampTotals TestClampRangeMemoTotals();
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
-// The backing store's sparse read without TryReadPrtBacking's aperture and range checks.
+// The backing store's sparse read without TryReadSparseBacking's range checks.
 bool     TestTryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);

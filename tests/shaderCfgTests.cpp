@@ -13264,6 +13264,32 @@ void TestRenderTargetReverseExportMapping() {
         "component-only shader mask changes introduced a duplicate shader variant");
 }
 
+// KYTY_CB_SHADER_MASK_EXPORTS (upstream 21a1346e2): MRT export i goes to the i-th colour target
+// with a non-zero CB_SHADER_MASK nibble; a mask of UINT32_MAX (switch off) keeps export i -> i.
+void TestCbShaderMaskExportTargets() {
+  Check(ShaderPixelExportTarget(0x00000f0fu, 0) == 0 &&
+            ShaderPixelExportTarget(0x00000f0fu, 1) == 2 &&
+            ShaderPixelExportTarget(0x00000f0fu, 2) == UINT32_MAX,
+        "compact MRT exports did not skip the CB_SHADER_MASK hole");
+  Check(ShaderPixelExportTarget(0x0000f000u, 0) == 3 &&
+            ShaderPixelExportTarget(0x0000f000u, 1) == UINT32_MAX,
+        "a single written target did not receive export 0");
+  for (uint32_t i = 0; i < 8u; i++) {
+    Check(ShaderPixelExportTarget(UINT32_MAX, i) == i,
+          "the switch-off mask did not keep export i at target i");
+  }
+  ShaderPixelInputInfo off;
+  ShaderPixelInputInfo holes;
+  holes.target_shader_mask = 0x00000f0fu;
+  ShaderPixelInputInfo holes_partial;
+  holes_partial.target_shader_mask = 0x00000301u;
+  ShaderPixelInputInfo dense;
+  dense.target_shader_mask = 0x000000ffu;
+  Check(MakeStageStaticKey(off) != MakeStageStaticKey(holes) &&
+            MakeStageStaticKey(holes) == MakeStageStaticKey(holes_partial) &&
+            MakeStageStaticKey(holes) != MakeStageStaticKey(dense),
+        "CB_SHADER_MASK targets did not key the pixel program exactly by written targets");
+}
 void TestBlendMappingClassification() {
   using Factor = Prospero::BlendFactor;
   using Support = BlendMappingSupport;
@@ -15576,6 +15602,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();
+  TestCbShaderMaskExportTargets();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();

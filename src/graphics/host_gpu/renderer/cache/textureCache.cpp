@@ -649,7 +649,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 		return false;
 	}
 	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
+	    cached.type != requested.type) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -1981,12 +1981,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
+		// A view cannot change the native image type or grow its extent.
 		if (requested.data.size == cached.info.data.size &&
-		    requested.resources == cached.info.resources && requested.type == cached.info.type &&
-		    requested.extent.width > cached.info.extent.width &&
-		    requested.extent.height >= cached.info.extent.height &&
-		    requested.extent.depth >= cached.info.extent.depth &&
-		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+		    requested.resources == cached.info.resources &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    (requested.type != cached.info.type
+		         ? requested.extent == cached.info.extent
+		         : requested.extent.width > cached.info.extent.width &&
+		               requested.extent.height >= cached.info.extent.height &&
+		               requested.extent.depth >= cached.info.extent.depth)) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
@@ -2609,7 +2612,7 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 			for (const auto& range: ranges) {
 				if (!LibKernel::Memory::TryReadBacking(base + range.offset, mapped + range.packed,
 				                                       range.size) &&
-				    !LibKernel::Memory::TryReadPrtBacking(base + range.offset,
+				    !LibKernel::Memory::TryReadSparseBacking(base + range.offset,
 				                                          mapped + range.packed, range.size)) {
 					EXIT("TextureCache: failed to read mapped guest image backing\n");
 				}
@@ -2688,7 +2691,7 @@ void TextureCache::RecordChunkHashes(Image& image) {
 		const auto end   = std::min(image.live.End(), chunks.base + uint64_t {index + 1} * chunk_size);
 		if (begin >= end ||
 		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
-		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
+		     !LibKernel::Memory::TryReadSparseBacking(begin, bytes.data(), end - begin))) {
 			chunks.hashes.clear();
 			return;
 		}
@@ -2711,7 +2714,7 @@ bool TextureCache::VerifyCleanChunks(Image& image) {
 		const auto end   = std::min(image.live.End(), chunks.base + uint64_t {index + 1} * chunk_size);
 		if (begin >= end ||
 		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
-		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
+		     !LibKernel::Memory::TryReadSparseBacking(begin, bytes.data(), end - begin))) {
 			return false;
 		}
 		if (XXH3_64bits(bytes.data(), static_cast<size_t>(end - begin)) != chunks.hashes[index]) {

@@ -15624,12 +15624,18 @@ public:
       uint32_t width, height, dimension, pitch;
       uint64_t size;
       Prospero::TileMode tile;
+      uint32_t levels = 1;
+      bool float16 = false;
     };
     const std::array cases{
         TargetCase{width, height, 0, pitch, layout.size,
                    Prospero::TileMode::kRenderTarget},
         // PPSA28068: the 1440x720 agreement target must alias its sampled texture.
         TargetCase{1440, 720, 1, 1472, 0x40b000, Prospero::TileMode::kLinear},
+        // PPSA01416: linear RGBA16F chains place the smallest mip first.
+        TargetCase{128, 128, 1, 128, 0x2be00, Prospero::TileMode::kLinear, 7, true},
+        // Upstream f53f0ca48: a 1D view of a single-texel 2D target needs its own 1D backing.
+        TargetCase{1, 1, 1, 32, 0x100, Prospero::TileMode::kLinear, 1, true},
     };
     constexpr uint64_t allocation_size = 0x410000;
 
@@ -15660,10 +15666,13 @@ public:
       HW::Shader shaders{};
       registers.SetColorBase(0, {.addr = base});
       registers.SetColorInfo(
-          0, {.format = Prospero::ChannelLayout::k8_8_8_8,
-              .channel_type = Prospero::ChannelType::kSrgb,
+          0, {.format = target.float16 ? Prospero::ChannelLayout::k16_16_16_16
+                                      : Prospero::ChannelLayout::k8_8_8_8,
+              .channel_type = target.float16 ? Prospero::ChannelType::kFloat
+                                            : Prospero::ChannelType::kSrgb,
               .channel_order = Prospero::ChannelOrder::kStandard});
-      registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+      registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1,
+                                   .num_mip_levels = target.levels - 1});
       registers.SetColorAttrib3(0,
                                 {.tile_mode = target.tile,
                                  .dimension = target.dimension,
@@ -15693,11 +15702,13 @@ public:
                   color.desc.info.type == (is_1d ? Prospero::ImageType::kColor1D
                                                   : Prospero::ImageType::kColor2D) &&
                   color.desc.info.extent == vk::Extent3D{width, height, 1} &&
-                  color.desc.info.resources == ImageSubresources{1, 1} &&
+                  color.desc.info.resources == ImageSubresources{target.levels, 1} &&
                   color.desc.info.pitch == target.pitch &&
                   color.desc.info.data.size == target.size &&
-                  color.desc.info.mip_layout[0].offset == 0 &&
-                  color.desc.info.mip_layout[0].size == target.size &&
+                  color.desc.info.mip_layout[0].offset ==
+                      (target.levels == 1 ? 0 : 0xbe00) &&
+                  color.desc.info.mip_layout[0].size ==
+                      (target.levels == 1 ? target.size : 0x20000) &&
                   color.desc.view_info.type == (is_1d ? vk::ImageViewType::e1D
                                                        : vk::ImageViewType::e2D) &&
                   image.backing.image_type == (is_1d ? vk::ImageType::e1D
@@ -15707,21 +15718,36 @@ public:
                   rendering.num_color_attachments == 1,
               "color attachment lost its dimensions or padded guest layout");
 
+      if (target.levels == 7) {
+        constexpr std::array offsets{0xbe00u, 0x3e00u, 0x1e00u, 0xe00u,
+                                     0x600u, 0x200u, 0u};
+        constexpr std::array pitches{128u, 64u, 32u, 32u, 32u, 32u, 32u};
+        for (uint32_t mip = 0; mip < target.levels; ++mip) {
+          const auto &layout = color.desc.info.mip_layout[mip];
+          Require(name, "linear mip chain", layout.offset == offsets[mip] &&
+                      layout.pitch == pitches[mip] &&
+                      layout.size == pitches[mip] * (height >> mip) * 8,
+                  "linear target mip offsets or padded pitches differ from the SDK");
+        }
+      }
+
       if (target.tile == Prospero::TileMode::kLinear) {
         vk::ClearValue clear{};
         clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
         TextureCacheTestAccess::ClearImage(
             texture_cache, scheduler.Current(), color.image_id,
-            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+            {vk::ImageAspectFlagBits::eColor, 0, target.levels, 0, 1}, clear);
         RenderExecutorTestAccess::ResetBindings(executor);
         ShaderTextureResource descriptor{{
             static_cast<uint32_t>(base >> 8u),
-            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+            (static_cast<uint32_t>(target.float16
+                                      ? Prospero::BufferFormat::k16_16_16_16Float
+                                      : Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
                 (((width - 1u) & 3u) << 30u),
             ((width - 1u) >> 2u) | ((height - 1u) << 14u),
-            DstSel(4, 5, 6, 7) |
+            DstSel(4, 5, 6, 7) | ((target.levels - 1) << 16u) |
                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
-            0, 0x00700000u, 0, 0}};
+            0, 0x00700000u | ((target.levels - 1) << 4u), 0, 0}};
         ShaderRecompiler::IR::DescriptorValue value{};
         value.dword_count = 8;
         std::copy_n(descriptor.fields, 8, value.dwords.begin());
@@ -15738,11 +15764,62 @@ public:
                     sampled.desc.info.data.size == target.size &&
                     sampled.desc.info.mip_layout == color.desc.info.mip_layout &&
                     texture_cache.FindTexture(sampled.image_id, sampled.desc) != nullptr,
-                "sampling the linear agreement target created a second image");
-        Require(name, "linear target sampled contents",
-                ReadCachedTexel(name, context, sampled.image_id,
-                                {1439, 719, 0}) == std::vector<u32>{0xffff00ffu},
-                "the sampled linear target lost its GPU-written final texel");
+                "sampling the linear target created a second image");
+        const auto expected = target.float16
+                                  ? std::vector<u32>{0x00003c00u, 0x3c003c00u}
+                                  : std::vector<u32>{0xffff00ffu};
+        for (uint32_t mip = 0; mip < target.levels; ++mip) {
+          Require(name, "linear target sampled contents",
+                  ReadCachedTexel(name, context, sampled.image_id,
+                                  {static_cast<int32_t>((width >> mip) - 1),
+                                   static_cast<int32_t>((height >> mip) - 1), 0},
+                                  {1, 1, 1}, 0, mip) == expected,
+                  "the sampled linear target lost its GPU-written final texel");
+        }
+        if (width == 1 && height == 1) {
+          for (const bool uint_view : {true, false}) {
+            descriptor.fields[1] = static_cast<uint32_t>(
+                uint_view ? Prospero::BufferFormat::k16_16_16_16UInt
+                          : Prospero::BufferFormat::k16_16_16_16Float) << 20u;
+            descriptor.fields[3] = 0x80000facu; // 1D view, linear, RGBA swizzle.
+            std::copy_n(descriptor.fields, 8, value.dwords.begin());
+            resource.numeric_class = uint_view ? Prospero::TextureNumericClass::Uint
+                                                : Prospero::TextureNumericClass::Float;
+            resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+            const auto one_d =
+                RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+            const auto one_d_view = texture_cache.FindTexture(one_d.image_id, one_d.desc);
+            const auto repeated =
+                RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+            Require(name, "1D sampled backing and reuse",
+                    one_d.image_id != color.image_id && one_d_view != nullptr &&
+                        one_d.desc.view_info.type == vk::ImageViewType::e1D &&
+                        texture_cache.GetImage(one_d.image_id).backing.image_type ==
+                            vk::ImageType::e1D &&
+                        repeated.image_id == one_d.image_id &&
+                        texture_cache.FindTexture(repeated.image_id, repeated.desc) == one_d_view &&
+                        ReadCachedTexel(name, context, one_d.image_id) == expected,
+                    "the 1D alias reused an incompatible backing or lost the rendered texel");
+
+            RenderExecutorTestAccess::ResetBindings(executor);
+            RenderExecutorTestAccess::ResolveRenderColorTarget(
+                executor, scheduler.Current(), color, 0);
+            const auto restored = RenderExecutorTestAccess::AcquireRenderTargets(
+                executor, scheduler.Current(), &color, 1, no_depth);
+            scheduler.Current().BeginRendering(restored);
+            scheduler.Current().EndRendering();
+            Require(name, "2D target restoration",
+                    color.image_id != one_d.image_id &&
+                        restored.color_attachments[0].image_view != nullptr &&
+                        texture_cache.GetImage(color.image_id).backing.image_type ==
+                            vk::ImageType::e2D &&
+                        texture_cache.GetImage(color.image_id).info.pixel_format ==
+                            vk::Format::eR16G16B16A16Sfloat &&
+                        ReadCachedTexel(name, context, color.image_id) == expected,
+                    "restoring the 2D target lost its view type or GPU-written texel");
+            RenderExecutorTestAccess::ResetBindings(executor);
+          }
+        }
       }
 
       RenderExecutorTestAccess::ResetBindings(executor);

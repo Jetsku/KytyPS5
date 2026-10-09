@@ -404,9 +404,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}
-	if (!tile && levels > 1) {
-		EXIT("linear mipmapped render targets are unsupported\n");
-	}
 	if (samples > 1 && (!tile || levels != 1)) {
 		EXIT("multisampled render targets require a single-mip tiled surface\n");
 	}
@@ -476,13 +473,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 		size         = volume_layout.block_slice_size;
 		backing_size = volume_layout.total_size;
-	} else if (tile) {
+	} else {
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
-		if (texture_tile) {
+		if (!tile || texture_tile) {
 			TileGetTextureSize(transfer_format, width, height, levels, rt.attrib3.tile_mode,
 			                   &layout, mip_sizes, mip_padded);
-			valid_layout = layout.size != 0 && layout.align == texture_tile_layout.block.block_size;
+			const auto alignment = tile ? texture_tile_layout.block.block_size : 256u;
+			valid_layout = layout.size != 0 && layout.align == alignment;
 		} else {
 			valid_layout =
 			    levels == 1 ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
@@ -500,13 +498,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
 			mip_padded[0] = {pitch, height};
 		}
-	} else {
-		size = static_cast<uint64_t>(pitch) * height * bytes_per_element * samples;
-		if (size > UINT32_MAX) {
-			EXIT("linear render-target slice exceeds the supported layout size\n");
-		}
-		mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
-		mip_padded[0] = {pitch, height};
 	}
 	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
 		EXIT("render-target memory footprint is invalid\n");
