@@ -1,8 +1,9 @@
 # AMD test kit: runs Astro Bot several times in a row, each time with one emulator switch changed,
-# and records how far each run gets. AMD test 3 starts with runs the player plays (dive in, then the
-# first level): the 48 KiB compute LDS in a device buffer against the AMD test 2 clamp, wave32
-# clusters off, and pipeline builds without the unoptimized first build. The title-screen runs of
-# AMD test 2 follow; the GPU breadcrumbs say what the GPU was running when a run loses the device.
+# and records how far each run gets. AMD test 4 targets the crash a minute into play (a null read
+# inside AMD's optimizing pipeline compiler, amdvlk64.dll+0x22240fc): the player plays this build
+# (the shaders known to crash the driver are never built optimized, and a driver fault in an
+# optimized build is caught), then the same with no optimized pipelines at all; the title-screen run
+# of AMD test 2 follows. The GPU breadcrumbs say what the GPU was running when a run loses the device.
 #
 # Put this file (and AMD-Test-Kit.cmd) next to kyty_emulator.exe and start AMD-Test-Kit.cmd.
 # Nothing in the emulator folder or the game folder is changed: every switch is set only in the
@@ -57,7 +58,24 @@ $Common = [ordered]@{
 }
 $HangShaders = '0xc739f9614016bed4,0x20c94d46ce55a14b,0xef31694ed8d87754'
 $PlayText = 'start the game, Dive In, and play the first level (near the water) until the game closes'
+# AMD test 4: every AMD test 3 run crashed in amdvlk64.dll+0x22240fc, inside the driver's optimizing
+# pipeline compiler; issue #22's log shows the optimized builds of PS 0xa6d0a69b25e2707a crash while
+# the unoptimized builds of the same pairs succeed. This build never builds pipelines with the known
+# crashing pixel shaders optimized (KYTY_PIPELINE_NO_OPT_SHADERS, built-in list for AMD), and a fault
+# inside an optimized build is caught: that pipeline stays unoptimized and its shaders are written to
+# _PipelineCache\<title>.noopt.txt (KYTY_PIPELINE_OPT_FAULT_GUARD). optimize-off builds nothing
+# optimized at all (KYTY_PIPELINE_OPTIMIZE=0): the definitive test, maybe slower on the GPU.
 $Configs = @(
+    @{ Name = 'noopt-list';       Text = 'this build: the known crashing shaders unoptimized, driver faults caught'; Env = [ordered]@{}; Play = $true; LogFile = $true }
+    @{ Name = 'optimize-off';     Text = 'no optimized pipelines at all (may run slower on the GPU)'; Env = [ordered]@{ KYTY_PIPELINE_OPTIMIZE = '0' }; Play = $true; LogFile = $true }
+    @{ Name = 'fix';              Text = 'this build at the title screen only (AMD test 2: no device lost)'; Env = [ordered]@{} }
+)
+# Earlier suspects, not run by default; -Only <name> runs them.
+$MoreConfigs = @(
+    # AMD test 4 variants: the list and the guard off, to reproduce the crash on purpose.
+    @{ Name = 'noopt-none';       Text = 'no unoptimized list and no learned shaders (the AMD test 3 builds; crash expected)'; Env = [ordered]@{ KYTY_PIPELINE_NO_OPT_SHADERS = 'none' }; Play = $true; LogFile = $true }
+    @{ Name = 'guard-off';        Text = 'the list without the driver fault guard'; Env = [ordered]@{ KYTY_PIPELINE_OPT_FAULT_GUARD = '0' }; Play = $true; LogFile = $true }
+    # AMD test 3's runs (all six crashed the same way).
     @{ Name = 'lds-fix';          Text = 'this build: 48 KiB compute LDS in a device buffer'; Env = [ordered]@{}; Play = $true; LogFile = $true }
     # Two RX 6900 XT players (driver 2.0.353) crashed in a host DLL right after the same VS/PS pair
     # was compiled (PS 0x13495e6ee1376edc reads raw vertex attributes: PerVertexKHR inputs with
@@ -69,10 +87,6 @@ $Configs = @(
         VK_LOADER_LAYERS_DISABLE = '~implicit~'; DISABLE_VK_LAYER_VALVE_steam_overlay_1 = '1' }; Play = $true }
     @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build; less stutter on AMD?)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' }; Play = $true }
     @{ Name = 'lds-clamp';        Text = 'LDS clamped to 32 KiB again (as AMD test 2)'; Env = [ordered]@{ KYTY_LDS_DEVICE_BUFFER = '0' }; Play = $true }
-    @{ Name = 'fix';              Text = 'this build at the title screen only (AMD test 2: no device lost)'; Env = [ordered]@{} }
-)
-# Earlier suspects, not run by default; -Only <name> runs them.
-$MoreConfigs = @(
     # 32 KiB of scratch per lane for pixel shaders that emulate LDS when the arrays are not shrunk;
     # this build shrinks by default (and the preset always did).
     @{ Name = 'shrink-off';       Text = 'pixel/vertex shader LDS arrays not shrunk (32 KiB of scratch per pixel)'; Env = [ordered]@{ KYTY_FUNCTION_ARRAY_SHRINK = '0' }; Play = $true }
@@ -411,6 +425,11 @@ try {
         $lds = @([regex]::Matches($text, '(Clamping LDS|its LDS lives in a device buffer)') | ForEach-Object { $_.Value } | Select-Object -Unique) -join '; '
         # The module a host crash is in (AMD test 3 prints it: "pc=0x... (amdvlk64.dll+0x...)").
         if ($text -match 'Unhandled host exception: [^\r\n]*pc=0x[0-9a-f]+ \(([^)\r\n]+)\)') { $lds = ("$lds; crash in $($matches[1])").Trim('; ') }
+        # AMD test 4: driver faults the fault guard caught, and the pipelines kept unoptimized.
+        $caught = @([regex]::Matches($text, 'Pipeline optimization: the driver faulted \(code 0x[0-9a-f]+ at ([^)\r\n]+)\) in the optimized build of ([^;\r\n]+)'))
+        if ($caught.Count) { $lds = ("$lds; $($caught.Count) driver fault(s) caught, first at $($caught[0].Groups[1].Value) in $($caught[0].Groups[2].Value)").Trim('; ') }
+        $kept = @([regex]::Matches($text, 'Pipeline optimization: [^\r\n]* kept unoptimized \(listed')).Count
+        if ($kept) { $lds = ("$lds; $kept listed pipeline(s) kept unoptimized").Trim('; ') }
         $results.Add([pscustomobject]@{ Run = $name; Verdict = $verdict; Switches = $changed; Title = $title; Seconds = [int]((Get-Date) - $start).TotalSeconds; Note = $note; Lds = $lds })
         if (-not $play) { Write-Step "  -> $verdict" }
         if ($text -match 'Loop guard: (\d+) invocations[^\r\n]*shader (0x[0-9a-f]+)') { Write-Step "  loop guard fired: $($matches[1]) invocations, shader $($matches[2])" }

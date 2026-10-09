@@ -1,3 +1,60 @@
+# KytyPS5 U59 int16.1 AMD test 4 — a workaround for the AMD driver crash a minute into play
+
+> **This is a test build for AMD Radeon owners whose game crashes a minute or so into play (AMD test 3 kit:
+> "crash in amdvlk64.dll+0x22240fc").** Everyone else: please keep using int16.1.
+
+## What this build is
+
+Every AMD test 3 run crashed in the same place: a null read inside AMD's Windows Vulkan driver (`amdvlk64.dll`), in
+the part that compiles pipelines with full optimization. It happened on an RX 6900 XT and an RX 6800 XT, with every
+setting the kit tried (wave32 clusters off as well). In issue #22's log, the optimized builds of one pixel shader
+crashed while the unoptimized builds of the same shader pairs worked. AMD's offline compiler builds every Astro Bot
+shader without trouble, and no single shader feature sets the crashing shaders apart (their near-identical
+neighbours compile fine), so this build works around the driver instead of changing the shaders:
+
+- **Known crashing shaders built unoptimized (on by default, AMD only):** pipelines that contain one of the pixel
+  shaders seen in a crash are never built with full optimization. That is four pixel shaders across the game
+  versions, so only a few pipelines skip the optimizer. The rest are built as before. `KYTY_PIPELINE_NO_OPT_SHADERS=<hash,hash,...>`
+  replaces the list, and `=none` turns it off.
+- **Crash guard for optimized builds (on by default, AMD only):** if the driver still crashes while optimizing a
+  pipeline, the emulator catches it and uses the unoptimized build of that pipeline instead. It also writes the
+  pipeline's shaders to `_PipelineCache\<title>.noopt.txt` for your GPU and driver, so later starts skip the optimizer
+  for them from the beginning. The log then says "Pipeline optimization: the driver faulted ...".
+  - A driver that crashed may be left in a bad state, so after such a crash the emulator stops saving the Vulkan
+    pipeline cache for that session.
+  - After 4 crashes in one session it stops building optimized pipelines altogether.
+  - If the game still hangs or crashes later in such a session, use the next switch.
+
+  `KYTY_PIPELINE_OPT_FAULT_GUARD=0` turns the guard off.
+- **No optimized pipelines at all: `KYTY_PIPELINE_OPTIMIZE=0`.** No pipeline is ever built with full optimization.
+  This is the definitive test of "the optimized build crashes, the unoptimized one works". It may cost GPU speed,
+  because unoptimized shader code can run slower, so it is a test switch and not the default.
+- Everything else is the same as AMD test 3. The wave32 fix stays on: the clusters-off run crashed the same way, and
+  without it the screen shows pink and colorful glitches.
+
+## How to test (about 15 minutes; you play two short runs)
+
+Do the same as for AMD test 3: copy your working folder, unzip this build over it, check the launcher once and close
+it, then double-click `AMD-Test-Kit.cmd`. The kit runs:
+
+- `noopt-list` (you play): this build as it is.
+- `optimize-off` (you play): no optimized pipelines at all (`KYTY_PIPELINE_OPTIMIZE=0`). Tell us if it stutters or
+  runs slower than `noopt-list`.
+- `fix`: the title screen only, hands off.
+
+Play the first level (near the water) until the kit closes the game. Send the zip it makes, and also your
+`_PipelineCache\<title>.noopt.txt` if it exists: it lists the pipelines the guard caught. `-Only clusters-off`
+(and the other AMD test 3 runs, `-Only noopt-none` to reproduce the crash on purpose) still work.
+
+## Astro's Playroom: clouds or smoke broken into blocks
+
+Same as in AMD test 3: start Playroom by hand twice from a command prompt in the emulator folder. The first time, run
+`set KYTY_DPP_SKIP_INACTIVE=0` and then `launcher.exe`. The second time, from a new command prompt, run
+`set KYTY_WAVE32_CLUSTERS=0` and then `launcher.exe`. Look at the same clouds each time, and send both `_kyty.txt`
+files with a note on whether the clouds changed. `AMD-TEST-KIT-README.txt` has the steps.
+
+---
+
 # KytyPS5 U59 int16.1 AMD test 3 — shared memory above the AMD limit, and a crash a minute into play
 
 > **This is a test build for AMD Radeon owners who got past the title screen with AMD test 2.** Everyone else: please
