@@ -154,6 +154,8 @@ void CheckSourceKeys() {
 
 void CheckFingerprint() {
   constexpr const char *name = "ProgramCacheFingerprint";
+  // Every switch is checked from unset: main sets KYTY_CB_SHADER_MASK_EXPORTS=1 for the export cases.
+  ScopedEnv unset_cb_shader_mask("KYTY_CB_SHADER_MASK_EXPORTS", nullptr);
   const auto version = ShaderRecompiler::CodegenVersion();
   Require(name, "codegen version",
           version.size() == 64 && std::ranges::all_of(version, [](char c) {
