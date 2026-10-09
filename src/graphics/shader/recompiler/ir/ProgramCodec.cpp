@@ -970,7 +970,7 @@ public:
 				auto& image =
 				    source.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor {});
 				if (r.Bool()) {
-					auto& selector  = image.selector.emplace();
+					auto& selector  = image.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead {});
 					selector.source = r.U32();
 					selector.stride = r.U32();
 					selector.offset = r.U32();
