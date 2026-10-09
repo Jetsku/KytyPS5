@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
+#include "common/sehGuard.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -51,6 +52,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <fmt/format.h>
 #include <limits>
@@ -3596,6 +3598,277 @@ void PipelineCache::ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pi
 	m_pipeline_generation.fetch_add(1, std::memory_order_release);
 }
 
+// Pipeline optimization policy (pipelineOptPolicy.h): pipelines never built optimized, and the
+// fault guard around the optimized builds of graphics pipelines.
+struct PipelineCache::OptPolicyState {
+	PipelineOptSettings   settings;
+	PipelineNoOptList     list;
+	std::string           device_key;
+	std::filesystem::path file; // _PipelineCache/<title>.noopt.txt; empty without a title
+	std::mutex            file_mutex;
+	// KYTY_PIPELINE_OPT_FAULT_TEST=<hash> (tests): an optimized build of a pipeline with this shader
+	// faults on purpose inside the guard, before the driver is called; =all: every optimized build.
+	// Windows only.
+	uint64_t              test_fault_hash = 0;
+	bool                  test_fault_all  = false;
+	// KYTY_PIPELINE_OPT_FAULT_LIMIT (default 4, 0 = no limit): after this many driver faults in one
+	// run no pipeline is built optimized any more.
+	uint64_t              fault_limit = 4;
+	bool                  active      = false;
+	std::atomic<bool>     optimize_off_by_faults {false};
+	// A fault happened inside a build that used the driver cache: it is no longer saved this run.
+	std::atomic<bool>     driver_cache_tainted {false};
+	std::atomic<uint64_t> kept {0}, faults {0}, guarded {0};
+};
+
+namespace {
+
+std::string FormatPipelineShaders(const PipelineShaderHashes& hashes, bool compute) {
+	if (compute) return fmt::format("compute pipeline (CS 0x{:016x})", hashes[0]);
+	std::string text = "graphics pipeline (VS";
+	for (size_t i = 0; i < 3; i++) {
+		if (hashes[i] != 0) text += fmt::format(" 0x{:016x}", hashes[i]);
+	}
+	text += fmt::format(", PS 0x{:016x})", hashes[3]);
+	return text;
+}
+
+std::string FormatHashEntry(const std::vector<uint64_t>& entry) {
+	std::string text;
+	for (const auto h: entry) {
+		if (!text.empty()) text += '+';
+		text += fmt::format("0x{:016x}", h);
+	}
+	return text;
+}
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define KYTY_OPT_NOINLINE __declspec(noinline)
+#else
+#define KYTY_OPT_NOINLINE __attribute__((noinline))
+#endif
+
+// The test fault: a read of address 0 in a callee of the guarded function (clang-cl's __try only
+// sees faults raised in callees).
+volatile uintptr_t g_opt_test_fault_address = 0;
+KYTY_OPT_NOINLINE void RaiseOptTestFault() {
+	(void)*reinterpret_cast<volatile const uint32_t*>(g_opt_test_fault_address);
+}
+
+// Plain data for CallCatchingStructuredException: nothing here needs a destructor.
+struct GuardedGraphicsBuild {
+	vk::Device                            device;
+	vk::PipelineCache                     driver_cache;
+	const vk::GraphicsPipelineCreateInfo* info     = nullptr;
+	vk::Pipeline*                         pipeline = nullptr;
+	vk::Result                            result   = vk::Result::eErrorUnknown;
+	bool                                  test_fault = false;
+};
+
+KYTY_OPT_NOINLINE void RunGuardedGraphicsBuild(void* context) {
+	auto* build = static_cast<GuardedGraphicsBuild*>(context);
+	if (build->test_fault) RaiseOptTestFault();
+	build->result =
+	    build->device.createGraphicsPipelines(build->driver_cache, 1, build->info, nullptr, build->pipeline);
+}
+
+} // namespace
+
+void PipelineCache::InitializeOptPolicy() {
+	const auto& properties = m_graphics.GetPhysicalDeviceProperties();
+	m_opt                  = std::make_unique<OptPolicyState>();
+	auto& state            = *m_opt;
+	state.settings         = PipelineOptSettingsFromEnv(properties.vendorID);
+	for (const auto hash: state.settings.shaders) {
+		state.list.Add({&hash, 1});
+	}
+	state.device_key =
+	    PipelineOptDeviceKey(properties.vendorID, properties.deviceID, properties.driverVersion);
+#ifdef _WIN32
+	// Only where the guard can catch it (elsewhere CallCatchingStructuredException just calls).
+	if (const auto* text = std::getenv("KYTY_PIPELINE_OPT_FAULT_TEST"); text != nullptr) {
+		state.test_fault_all  = std::strcmp(text, "all") == 0;
+		state.test_fault_hash = state.test_fault_all ? 0 : ParseShaderHash(text).value_or(0);
+	}
+#endif
+	state.fault_limit = EnvU64("KYTY_PIPELINE_OPT_FAULT_LIMIT", 4);
+	if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+		state.file = std::filesystem::path("_PipelineCache") / (title_id + ".noopt.txt");
+	}
+	size_t learned = 0;
+	if (!state.file.empty() && Common::File::IsFileExisting(state.file)) {
+		std::ifstream     in(state.file, std::ios::binary);
+		const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+		if (state.settings.use_learned) {
+			for (const auto& entry: ParseNoOptFile(text, state.device_key)) {
+				if (state.list.Add(entry)) learned++;
+			}
+		}
+	}
+	state.active = !state.settings.optimize || state.list.Size() != 0 ||
+	               state.settings.fault_guard || state.test_fault_hash != 0 || state.test_fault_all;
+	for (const auto& token: state.settings.bad_tokens) {
+		PipelineCacheLog("Pipeline optimization: KYTY_PIPELINE_NO_OPT_SHADERS: '{}' is not a shader "
+		                 "hash; ignored",
+		                 token);
+	}
+	const char* source = "";
+	switch (state.settings.source) {
+		case PipelineOptSettings::ListSource::None: source = "no list"; break;
+		case PipelineOptSettings::ListSource::BuiltIn: source = "the built-in AMD list"; break;
+		case PipelineOptSettings::ListSource::Env: source = "KYTY_PIPELINE_NO_OPT_SHADERS"; break;
+		case PipelineOptSettings::ListSource::Cleared:
+			source = "KYTY_PIPELINE_NO_OPT_SHADERS=none, learned pipelines not applied";
+			break;
+	}
+	if (!state.settings.optimize) {
+		PipelineCacheLog("Pipeline optimization: off (KYTY_PIPELINE_OPTIMIZE=0): every pipeline is "
+		                 "built unoptimized{}; GPU code may run slower",
+		                 PipelineFastFirstRequested(properties.vendorID)
+		                     ? " (fast-first keeps its first builds, no background optimized compiles)"
+		                     : "");
+	} else {
+		PipelineCacheLog("Pipeline optimization: on; {} shader(s) kept unoptimized ({}), {} learned "
+		                 "pipeline(s) from {} for device {}; driver fault guard {}",
+		                 state.settings.shaders.size(), source, learned,
+		                 state.file.empty() ? std::string("(no title)") : Common::PathToString(state.file),
+		                 state.device_key, state.settings.fault_guard ? "on" : "off");
+	}
+	if (state.test_fault_hash != 0 || state.test_fault_all) {
+		PipelineCacheLog("Pipeline optimization: KYTY_PIPELINE_OPT_FAULT_TEST: optimized builds {} "
+		                 "fault on purpose (a test of the fault guard)",
+		                 state.test_fault_all ? std::string("of every pipeline")
+		                                      : fmt::format("with shader 0x{:016x}", state.test_fault_hash));
+	}
+}
+
+bool PipelineCache::OptPolicyActive() const {
+	return m_opt != nullptr && m_opt->active;
+}
+
+bool PipelineCache::KeepUnoptimized(const PipelineShaderHashes& hashes, bool compute) {
+	if (!OptPolicyActive()) return false;
+	auto& state = *m_opt;
+	if (!state.settings.optimize || state.optimize_off_by_faults.load(std::memory_order_acquire)) {
+		state.kept.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	const auto entry = state.list.Match(hashes);
+	if (!entry) return false;
+	state.kept.fetch_add(1, std::memory_order_relaxed);
+	PipelineCacheLog("Pipeline optimization: {} kept unoptimized (listed: {})",
+	                 FormatPipelineShaders(hashes, compute), FormatHashEntry(*entry));
+	return true;
+}
+
+bool PipelineCache::CreateGraphicsOptimized(const vk::GraphicsPipelineCreateInfo& info,
+                                            vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
+                                            const PipelineShaderHashes& hashes, vk::Result& result) {
+	const bool test_fault =
+	    OptPolicyActive() &&
+	    (m_opt->test_fault_all ||
+	     (m_opt->test_fault_hash != 0 &&
+	      std::find(hashes.begin(), hashes.end(), m_opt->test_fault_hash) != hashes.end()));
+	if (!OptPolicyActive() || (!m_opt->settings.fault_guard && !test_fault)) {
+		result = m_graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
+		return false;
+	}
+	m_opt->guarded.fetch_add(1, std::memory_order_relaxed);
+	GuardedGraphicsBuild build {.device       = m_graphics.device,
+	                            .driver_cache = driver_cache,
+	                            .info         = &info,
+	                            .pipeline     = pipeline,
+	                            .test_fault   = test_fault};
+	uint64_t   address = 0;
+	const auto code    = Common::CallCatchingStructuredException(RunGuardedGraphicsBuild, &build, &address);
+	if (code == 0) {
+		result = build.result;
+		return false;
+	}
+	// Whatever the driver left in the output is not a pipeline.
+	*pipeline = nullptr;
+	result    = vk::Result::eErrorUnknown;
+	if (driver_cache != nullptr) m_opt->driver_cache_tainted.store(true, std::memory_order_release);
+	NoteOptimizeFault(hashes, code, address);
+	return true;
+}
+
+// After a driver fault the driver may be left in a bad state: a lock it held is never released
+// (later pipeline builds would then hang; the hang watchdog names them), or memory it was writing
+// stays half-written. What is done to limit that: the faulted build's output is dropped and never
+// destroyed, the fallback build does not use the driver pipeline cache, the cache is not saved
+// again this run (its contents may be damaged), and after KYTY_PIPELINE_OPT_FAULT_LIMIT faults no
+// pipeline is built optimized any more.
+void PipelineCache::NoteOptimizeFault(const PipelineShaderHashes& hashes, uint32_t code,
+                                      uint64_t address) {
+	auto&      state  = *m_opt;
+	const auto faults = state.faults.fetch_add(1, std::memory_order_relaxed) + 1;
+	state.list.Add(hashes);
+	const auto what  = FormatPipelineShaders(hashes, false);
+	const auto where = Common::DescribeCodeAddress(address);
+	bool       saved = false;
+	if (!state.file.empty()) {
+		std::lock_guard lock(state.file_mutex);
+		if (Common::File::CreateDirectories(state.file.parent_path())) {
+			std::ofstream out(state.file, std::ios::binary | std::ios::app);
+			if (out) {
+				out << FormatNoOptLine(state.device_key, hashes) << "  # driver fault 0x" << std::hex
+				    << code << " at " << where << "\n";
+				out.flush();
+				saved = static_cast<bool>(out);
+			}
+		}
+	}
+	PipelineCacheLog("Pipeline optimization: the driver faulted (code 0x{:08x} at {}) in the optimized "
+	                 "build of {}; the unoptimized pipeline is used instead, and these shaders stay "
+	                 "unoptimized{}. The driver may be unstable after this; if the game hangs or "
+	                 "crashes later, KYTY_PIPELINE_OPTIMIZE=0 avoids optimized builds altogether",
+	                 code, where, what,
+	                 saved ? fmt::format(" (also in later runs: {})", Common::PathToString(state.file))
+	                       : std::string(" in this run"));
+	if (state.fault_limit != 0 && faults >= state.fault_limit &&
+	    !state.optimize_off_by_faults.exchange(true, std::memory_order_acq_rel)) {
+		PipelineCacheLog("Pipeline optimization: {} driver faults in this run; no more pipelines are "
+		                 "built optimized until the game is restarted",
+		                 faults);
+	}
+}
+
+vk::Result PipelineCache::CreateGraphicsByPolicy(const vk::GraphicsPipelineCreateInfo& info,
+                                                 vk::PipelineCache driver_cache,
+                                                 vk::Pipeline*     pipeline,
+                                                 const PipelineShaderHashes& hashes) {
+	auto unoptimized = info;
+	unoptimized.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	if (KeepUnoptimized(hashes, false)) {
+		return m_graphics.device.createGraphicsPipelines(driver_cache, 1, &unoptimized, nullptr,
+		                                                 pipeline);
+	}
+	vk::Result result = vk::Result::eSuccess;
+	if (!CreateGraphicsOptimized(info, driver_cache, pipeline, hashes, result)) return result;
+	return m_graphics.device.createGraphicsPipelines(nullptr, 1, &unoptimized, nullptr, pipeline);
+}
+
+vk::Result PipelineCache::CreateComputeByPolicy(const vk::ComputePipelineCreateInfo& info,
+                                                vk::PipelineCache driver_cache,
+                                                vk::Pipeline* pipeline, uint64_t cs_hash) {
+	if (KeepUnoptimized({cs_hash, 0, 0, 0}, true)) {
+		auto unoptimized = info;
+		unoptimized.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		return m_graphics.device.createComputePipelines(driver_cache, 1, &unoptimized, nullptr,
+		                                                pipeline);
+	}
+	return m_graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, pipeline);
+}
+
+void PipelineCache::LogOptPolicyTotals() {
+	if (!OptPolicyActive()) return;
+	const auto& state = *m_opt;
+	PipelineCacheLog("Pipeline optimization: {} pipeline(s) kept unoptimized, {} optimized build(s) "
+	                 "guarded, {} driver fault(s) caught",
+	                 state.kept.load(), state.guarded.load(), state.faults.load());
+}
+
 // Fast-first pipeline creation (KYTY_PIPELINE_FAST_FIRST, pipelineFastFirst.h): the unoptimized
 // first build, the background optimized compiles and the retirement of replaced pipelines.
 struct PipelineCache::FastFirstState {
@@ -3681,12 +3954,23 @@ struct PipelineCache::FastFirstState {
 	}
 
 	vk::Result CreateGraphics(const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline* pipeline,
-	                          GraphicsFast& out) {
+	                          GraphicsFast& out, const PipelineShaderHashes& hashes) {
 		auto&      device = cache.m_graphics.device;
 		const auto plain  = [&] {
-            return device.createGraphicsPipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
+			return cache.CreateGraphicsByPolicy(info, cache.m_driver_cache, pipeline, hashes);
 		};
 		NoteSeen();
+		if (cache.KeepUnoptimized(hashes, false)) {
+			// For good (pipelineOptPolicy.h): no background compile, so the unoptimized pipeline
+			// goes into the driver cache for later runs.
+			auto kept_info = info;
+			kept_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+			LOGF("PipelineTrace: graphics unoptimized build (kept) VS=0x%016" PRIx64
+			     " PS=0x%016" PRIx64 "\n",
+			     hashes[0], hashes[3]);
+			return device.createGraphicsPipelines(cache.m_driver_cache, 1, &kept_info, nullptr,
+			                                      pipeline);
+		}
 		auto snapshot = GraphicsPipelineSnapshot::Capture(info);
 		if (snapshot == nullptr) {
 			counters.ineligible.fetch_add(1, std::memory_order_relaxed);
@@ -3737,12 +4021,18 @@ struct PipelineCache::FastFirstState {
 	}
 
 	vk::Result CreateCompute(const vk::ComputePipelineCreateInfo& info, vk::Pipeline* pipeline,
-	                         ComputeFast& out) {
+	                         ComputeFast& out, uint64_t cs_hash) {
 		auto&      device = cache.m_graphics.device;
 		const auto plain  = [&] {
-            return device.createComputePipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
+			return cache.CreateComputeByPolicy(info, cache.m_driver_cache, pipeline, cs_hash);
 		};
 		NoteSeen();
+		if (cache.KeepUnoptimized({cs_hash, 0, 0, 0}, true)) {
+			auto kept_info = info;
+			kept_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+			return device.createComputePipelines(cache.m_driver_cache, 1, &kept_info, nullptr,
+			                                     pipeline);
+		}
 		auto snapshot = ComputeSnapshot::Capture(info);
 		if (snapshot == nullptr) {
 			counters.ineligible.fetch_add(1, std::memory_order_relaxed);
@@ -3790,16 +4080,23 @@ struct PipelineCache::FastFirstState {
 	// The pipeline is cached under the key: hand its optimized compile to a worker. The slot was
 	// reserved by the fast build.
 	void EnqueueGraphics(const GraphicsPipelineKey* key, vk::Pipeline fast, GraphicsFast& in,
-	                     uint64_t vs_hash, uint64_t ps_hash) {
+	                     const PipelineShaderHashes& hashes) {
 		const auto fast_ns = in.fast_ns;
 		scheduler.Submit(
-		    [this, key, fast, fast_ns, vs_hash, ps_hash, snapshot = std::move(in.snapshot)] {
+		    [this, key, fast, fast_ns, hashes, snapshot = std::move(in.snapshot)] {
+			    const auto vs_hash = hashes[0];
+			    const auto ps_hash = hashes[3];
+			    // A fault since it was queued may have listed it (or ended optimized builds).
+			    if (cache.KeepUnoptimized(hashes, false)) {
+				    counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed);
+				    return;
+			    }
 			    Common::CrashContext::Scope note("graphics pipeline optimized build (VS, PS)", vs_hash,
 			                                     ps_hash);
 			    LOGF("PipelineTrace: graphics optimized build begin VS=0x%016" PRIx64
 			         " PS=0x%016" PRIx64 "\n",
 			         vs_hash, ps_hash);
-			    OptimizeGraphics(key, fast, fast_ns, *snapshot);
+			    OptimizeGraphics(key, fast, fast_ns, *snapshot, hashes);
 			    LOGF("PipelineTrace: graphics optimized build done VS=0x%016" PRIx64
 			         " PS=0x%016" PRIx64 "\n",
 			         vs_hash, ps_hash);
@@ -3810,6 +4107,10 @@ struct PipelineCache::FastFirstState {
 		const auto fast_ns = in.fast_ns;
 		scheduler.Submit(
 		    [this, id, fast, fast_ns, cs_hash, snapshot = std::move(in.snapshot)] {
+			    if (cache.KeepUnoptimized({cs_hash, 0, 0, 0}, true)) {
+				    counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed);
+				    return;
+			    }
 			    Common::CrashContext::Scope note("compute pipeline optimized build (CS)", cs_hash);
 			    OptimizeCompute(id, fast, fast_ns, *snapshot);
 		    },
@@ -3825,15 +4126,20 @@ struct PipelineCache::FastFirstState {
 	}
 
 	void OptimizeGraphics(const GraphicsPipelineKey* key, vk::Pipeline fast, uint64_t fast_ns,
-	                      const GraphicsPipelineSnapshot& snapshot) {
+	                      const GraphicsPipelineSnapshot& snapshot, const PipelineShaderHashes& hashes) {
 		NameThread();
 		vk::Pipeline        optimized = nullptr;
 		const auto          begin     = CompileClockNs();
 		HangWatchdog::Scope compile("graphics-pipeline-optimize",
 		                            reinterpret_cast<uint64_t>(static_cast<VkPipeline>(fast)),
 		                            key->vertex_shader_ids[0], key->ps_shader_id);
-		const auto          result = cache.m_graphics.device.createGraphicsPipelines(
-            cache.m_driver_cache, 1, &snapshot.Info(), nullptr, &optimized);
+		vk::Result result = vk::Result::eSuccess;
+		if (cache.CreateGraphicsOptimized(snapshot.Info(), cache.m_driver_cache, &optimized, hashes,
+		                                  result)) {
+			// The driver faulted: the unoptimized pipeline stays for good.
+			counters.optimize_failed.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 		Finish(result, optimized, begin, [&](uint64_t ns) {
 			cache.ReplaceFastPipeline(key, 0, fast, optimized, fast_ns, ns);
 		});
@@ -3980,10 +4286,23 @@ struct PipelineCache::PrefetchState {
 			    Profiler::SetThreadName("PipelineCompiler");
 			    Result result {std::make_unique<Pipeline>()};
 			    const auto begin = CompileClockNs();
+			    PipelineShaderHashes hashes {};
+			    hashes[0] = vertex.stage.program ? vertex.stage.program->shader_hash : 0;
+			    hashes[3] = pixel_copy && pixel_copy->stage.program
+			                    ? pixel_copy->stage.program->shader_hash
+			                    : 0;
+			    GraphicsPipelineCreateHook policy_hook;
+			    if (cache.OptPolicyActive()) {
+				    policy_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+				                      std::span<const uint32_t>, vk::Pipeline* pipeline) {
+					    return cache.CreateGraphicsByPolicy(info, cache.m_driver_cache, pipeline, hashes);
+				    };
+			    }
 			    CreatePipelineInternal(cache.m_graphics, *result.pipeline, key.rendering,
 			                           key.vertex_input, {&vertex, 1},
 			                           pixel_copy ? &*pixel_copy : nullptr, programs,
-			                           key.static_params, cache.m_driver_cache);
+			                           key.static_params, cache.m_driver_cache,
+			                           policy_hook ? &policy_hook : nullptr);
 			    result.compile_ns = CompileClockNs() - begin;
 			    compile_ns.fetch_add(result.compile_ns, std::memory_order_relaxed);
 			    g_compile_totals.gfx_pipelines.fetch_add(1, std::memory_order_relaxed);
@@ -4050,6 +4369,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	    (g_pipeline_cache_instances.fetch_add(1, std::memory_order_relaxed) + 1) << 32u,
 	    std::memory_order_relaxed);
 	InitializeDriverCache();
+	InitializeOptPolicy();
 	if (m_driver_cache != nullptr && DriverCacheSaveSettings::Get().enabled) {
 		m_saver = std::make_unique<DriverCacheSaver>(*this);
 	}
@@ -4093,6 +4413,7 @@ PipelineCache::~PipelineCache() {
 	m_program_cache->StopBackgroundChecks();
 	if (m_prefetch != nullptr) m_prefetch->Stop();
 	LogCompileTotals();
+	LogOptPolicyTotals();
 	if (m_program_disk != nullptr) {
 		const auto stats = m_program_disk->GetStats();
 		PipelineCacheLog("Program cache: lookups hit {} sources and {} permutations, missed {} and "
@@ -4351,6 +4672,13 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 	HangWatchdog::Scope snapshot(
 	    "pipeline-cache-snapshot",
 	    reinterpret_cast<uint64_t>(static_cast<VkPipelineCache>(m_driver_cache)), periodic);
+	if (m_opt != nullptr && m_opt->driver_cache_tainted.load(std::memory_order_acquire)) {
+		// NoteOptimizeFault: the driver faulted in a build that used this cache.
+		PipelineCacheLog("Vulkan pipeline cache: not saved ({}): the driver faulted in a pipeline "
+		                 "build that used it in this run",
+		                 periodic ? "periodic" : "exit");
+		return periodic ? DriverCacheSaver::WriteOversized : 0;
+	}
 	const auto begin = CompileClockNs();
 	// Synchronization: vkGetPipelineCacheData has no externally synchronized parameter (vk.xml
 	// declares none for pipelineCache), and m_driver_cache is created without
@@ -5523,10 +5851,20 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	GraphicsPipelineLibrary::Result library_result;
 	GraphicsPipelineCreateHook      library_hook;
 	FastFirstState::GraphicsFast    fast_result;
+	PipelineShaderHashes            shader_hashes {};
+	for (size_t i = 0; i < vertex_info.size() && i < 3; ++i) {
+		shader_hashes[i] = vertex_info[i].stage.program ? vertex_info[i].stage.program->shader_hash : 0;
+	}
+	shader_hashes[3] = ps_hash;
 	if (m_fast_first != nullptr && !prefetched && !m_fast_first->scheduler.Stopped()) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t>, vk::Pipeline* pipeline) {
-			return m_fast_first->CreateGraphics(info, pipeline, fast_result);
+			return m_fast_first->CreateGraphics(info, pipeline, fast_result, shader_hashes);
+		};
+	} else if (OptPolicyActive()) {
+		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+		                   std::span<const uint32_t>, vk::Pipeline* pipeline) {
+			return CreateGraphicsByPolicy(info, m_driver_cache, pipeline, shader_hashes);
 		};
 	}
 	if (m_library != nullptr) {
@@ -5568,10 +5906,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 	if (prefetched) m_prefetch->Complete(key);
 	if (fast_result.snapshot != nullptr) {
-		m_fast_first->EnqueueGraphics(&iter->first, created_pipeline, fast_result, vs_hash,
-		                              ps_hash);
+		m_fast_first->EnqueueGraphics(&iter->first, created_pipeline, fast_result, shader_hashes);
 	}
-	if (library_result.path == GraphicsPipelineLibrary::Path::Linked && m_library->optimize) {
+	if (library_result.path == GraphicsPipelineLibrary::Path::Linked && m_library->optimize &&
+	    !KeepUnoptimized(shader_hashes, false)) {
 		m_library->Enqueue({.key      = &iter->first,
 		                    .linked   = created_pipeline,
 		                    .snapshot = std::move(library_result.optimize)});
@@ -5644,7 +5982,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	ComputePipelineCreateHook   fast_hook;
 	if (m_fast_first != nullptr && m_fast_first->scheduler.Stopped() == false) {
 		fast_hook = [&](const vk::ComputePipelineCreateInfo& info, vk::Pipeline* pipeline) {
-			return m_fast_first->CreateCompute(info, pipeline, fast_result);
+			return m_fast_first->CreateCompute(info, pipeline, fast_result, cs_hash);
+		};
+	} else if (OptPolicyActive()) {
+		fast_hook = [&](const vk::ComputePipelineCreateInfo& info, vk::Pipeline* pipeline) {
+			return CreateComputeByPolicy(info, m_driver_cache, pipeline, cs_hash);
 		};
 	}
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,

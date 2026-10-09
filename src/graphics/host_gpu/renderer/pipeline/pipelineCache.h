@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineOptPolicy.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -302,6 +303,7 @@ private:
 	struct DriverCacheSaver;
 	struct LibraryState;
 	struct FastFirstState;
+	struct OptPolicyState;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -380,6 +382,10 @@ private:
 	// Unoptimized-first pipeline creation and the background optimized compiles
 	// (KYTY_PIPELINE_FAST_FIRST, pipelineFastFirst.h); null when off.
 	std::unique_ptr<FastFirstState> m_fast_first;
+	// Pipelines never built optimized and the fault guard around optimized builds
+	// (KYTY_PIPELINE_OPTIMIZE, KYTY_PIPELINE_NO_OPT_SHADERS, KYTY_PIPELINE_OPT_FAULT_GUARD;
+	// pipelineOptPolicy.h). Always set.
+	std::unique_ptr<OptPolicyState> m_opt;
 	struct PrefetchState;
 	std::unique_ptr<PrefetchState> m_prefetch;
 	// Shader precompile (KYTY_SHADER_PRECOMPILE=1, shaderPrecompile.h): the journal of compiled
@@ -402,6 +408,28 @@ private:
 	                              GraphicsPipelineKey& key) const;
 
 	void InitializeDriverCache();
+	void InitializeOptPolicy();
+	// Pipeline optimization policy (pipelineOptPolicy.h). Whether any of it applies (otherwise
+	// pipelines are built as before, without a hook).
+	[[nodiscard]] bool OptPolicyActive() const;
+	// Whether a pipeline with these shaders is built unoptimized for good: KYTY_PIPELINE_OPTIMIZE=0,
+	// a listed shader, or a learned fault. Logs the pipelines kept so for a listed shader.
+	[[nodiscard]] bool KeepUnoptimized(const PipelineShaderHashes& hashes, bool compute);
+	// A graphics pipeline build under the policy: unoptimized when KeepUnoptimized, otherwise
+	// optimized, inside the fault guard when it is on; after a fault, unoptimized without the cache.
+	vk::Result CreateGraphicsByPolicy(const vk::GraphicsPipelineCreateInfo& info,
+	                                  vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
+	                                  const PipelineShaderHashes& hashes);
+	// The optimized build itself (the guard when on). Returns true when the driver faulted: then
+	// *pipeline is null and the fault is noted (NoteOptimizeFault).
+	bool CreateGraphicsOptimized(const vk::GraphicsPipelineCreateInfo& info,
+	                             vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
+	                             const PipelineShaderHashes& hashes, vk::Result& result);
+	vk::Result CreateComputeByPolicy(const vk::ComputePipelineCreateInfo& info,
+	                                 vk::PipelineCache driver_cache, vk::Pipeline* pipeline,
+	                                 uint64_t cs_hash);
+	void NoteOptimizeFault(const PipelineShaderHashes& hashes, uint32_t code, uint64_t address);
+	void LogOptPolicyTotals();
 	void InitializeProgramDiskCache();
 	void InitializeShaderPrecompile();
 	void StopShaderPrecompile();

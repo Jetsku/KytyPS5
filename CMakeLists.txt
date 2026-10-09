@@ -723,6 +723,11 @@ target_include_directories(shader_precompile_tests PRIVATE ${inc_headers})
 add_executable(pipeline_fast_first_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineFastFirstTests.cpp")
 target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})
 
+# KYTY_PIPELINE_OPTIMIZE / KYTY_PIPELINE_NO_OPT_SHADERS / the driver fault guard (pipeline/pipelineOptPolicy.h, common/sehGuard.h).
+add_executable(pipeline_opt_policy_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineOptPolicyTests.cpp")
+target_link_libraries(pipeline_opt_policy_tests common)
+target_include_directories(pipeline_opt_policy_tests PRIVATE ${inc_headers})
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
@@ -1118,10 +1123,25 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_precompile PROPERTIES TIMEOUT 60)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
 	add_test(NAME pipeline_fast_first COMMAND $<TARGET_FILE:pipeline_fast_first_tests>)
+	add_test(NAME pipeline_opt_policy COMMAND $<TARGET_FILE:pipeline_opt_policy_tests>)
 	set_tests_properties(pipeline_fast_first PROPERTIES TIMEOUT 60)
 	add_test(NAME pipeline_fast_first_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(pipeline_fast_first_rendering PROPERTIES
 		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_PROBE=0;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=130"
+		TIMEOUT 180)
+	# KYTY_PIPELINE_OPTIMIZE=0, and the driver fault guard with every optimized build faulting on
+	# purpose (KYTY_PIPELINE_OPT_FAULT_TEST=all): the unoptimized fallbacks must render the same.
+	add_test(NAME pipeline_optimize_off_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_optimize_off_rendering PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_OPTIMIZE=0;KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_PROBE=0;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=132"
+		TIMEOUT 180)
+	add_test(NAME pipeline_opt_fault_guard_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_opt_fault_guard_rendering PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_OPT_FAULT_TEST=all;KYTY_PIPELINE_OPT_FAULT_LIMIT=0;KYTY_PIPELINE_FAST_FIRST=0;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=133"
+		TIMEOUT 180)
+	add_test(NAME pipeline_opt_fault_guard_fast_first COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_opt_fault_guard_fast_first PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_OPT_FAULT_TEST=all;KYTY_PIPELINE_OPT_FAULT_LIMIT=0;KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_PROBE=0;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=134"
 		TIMEOUT 180)
 	add_test(NAME pipeline_fast_first_draw_run COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)
 	set_tests_properties(pipeline_fast_first_draw_run PROPERTIES
@@ -2113,6 +2133,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		spirv_local_arrays_tests
 		pipeline_fast_first_tests
+		pipeline_opt_policy_tests
 		vram_budget_tests
 		device_compat_tests
 		shader_precompile_tests

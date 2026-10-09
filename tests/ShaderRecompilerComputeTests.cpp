@@ -16908,7 +16908,32 @@ public:
                 "program prefetch enabled but no program was compiled from a clean snapshot");
       }
     }
-    if (const auto* fast = std::getenv("KYTY_PIPELINE_FAST_FIRST"); fast != nullptr && std::strcmp(fast, "0") != 0) {
+    const auto* optimize   = std::getenv("KYTY_PIPELINE_OPTIMIZE");
+    const auto* fault_test = std::getenv("KYTY_PIPELINE_OPT_FAULT_TEST");
+    const bool  optimize_off = optimize != nullptr && std::strcmp(optimize, "0") == 0;
+    const bool  fault_all    = fault_test != nullptr && std::strcmp(fault_test, "all") == 0;
+    if (const auto* fast = std::getenv("KYTY_PIPELINE_FAST_FIRST");
+        fast != nullptr && std::strcmp(fast, "0") != 0 && (optimize_off || fault_all)) {
+      // pipelineOptPolicy.h: KYTY_PIPELINE_OPTIMIZE=0 keeps every pipeline unoptimized for good (no
+      // fast build to replace, no background compile); with every optimized graphics build faulting
+      // on purpose the guard keeps the fast pipelines and counts the failures.
+      std::this_thread::sleep_for(std::chrono::seconds(3));
+      const auto totals = context.GetPipelineCache().GetFastFirstTotals();
+      std::printf("[gpu]     %-32s fast-first under the opt policy: %llu seen, %llu fast builds, %llu swaps, %llu optimize failed\n",
+                  name, static_cast<unsigned long long>(totals.seen),
+                  static_cast<unsigned long long>(totals.graphics_fast + totals.compute_fast),
+                  static_cast<unsigned long long>(totals.swaps),
+                  static_cast<unsigned long long>(totals.optimize_failed));
+      if (optimize_off) {
+        Require(name, "KYTY_PIPELINE_OPTIMIZE=0 keeps the first builds",
+                totals.seen > 0 && totals.graphics_fast + totals.compute_fast == 0 && totals.swaps == 0,
+                "a pipeline was queued for an optimized build with KYTY_PIPELINE_OPTIMIZE=0");
+      } else {
+        Require(name, "the fault guard kept the fast pipelines",
+                totals.graphics_fast > 0 && totals.optimize_failed > 0,
+                "no faulted optimized build was counted");
+      }
+    } else if (const auto* fast = std::getenv("KYTY_PIPELINE_FAST_FIRST"); fast != nullptr && std::strcmp(fast, "0") != 0) {
       // The real draw path must take the unoptimized first build and later swap the optimized
       // pipeline in (the test sets KYTY_PIPELINE_FAST_FIRST_PROBE=0 so a driver-side cache cannot
       // answer the probe).
