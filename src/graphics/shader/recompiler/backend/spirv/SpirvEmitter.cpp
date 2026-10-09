@@ -7,10 +7,16 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <mutex>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -211,6 +217,51 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			}
 		}
 	}
+}
+
+// KYTY_WAVE32_CLUSTERS: one log line per wave32 graphics program that shares a wider host subgroup
+// (AMD fragment and vertex waves are 64 wide), with its cross-lane operations, so a player's log
+// names the shaders whose wave-level code runs on clusters (Playroom cloud blocks, AMD test 2).
+void NoteClusteredProgram(const IR::Program& program) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> noted;
+	{
+		const std::lock_guard lock(mutex);
+		if (!noted.insert(program.shader_hash ^ (static_cast<uint64_t>(program.stage) << 60u)).second) {
+			return;
+		}
+	}
+	uint32_t first_lane = 0, lane_rw = 0, ballot = 0, dpp = 0, swizzle = 0, permute = 0, lane_id = 0;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::ReadFirstLane: first_lane++; break;
+				case IR::ValueOpcode::ReadLane:
+				case IR::ValueOpcode::WriteLane: lane_rw++; break;
+				case IR::ValueOpcode::Ballot:
+				case IR::ValueOpcode::AnyLane: ballot++; break;
+				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::DppUpdateU32: dpp++; break;
+				case IR::ValueOpcode::SwizzleU32: swizzle++; break;
+				case IR::ValueOpcode::PermuteU32:
+				case IR::ValueOpcode::BpermuteU32:
+				case IR::ValueOpcode::Permlane16U32: permute++; break;
+				case IR::ValueOpcode::LaneId: lane_id++; break;
+				default: break;
+			}
+		}
+	}
+	char text[320];
+	std::snprintf(text, sizeof(text),
+	              "Kyty wave32 clusters: %s shader 0x%016" PRIx64
+	              " runs on a wider host subgroup (KYTY_WAVE32_CLUSTERS); cross-lane ops: "
+	              "readfirstlane %u, readlane/writelane %u, ballot/any %u, dpp %u, swizzle %u, "
+	              "permute %u, lane id %u\n",
+	              program.stage == ShaderType::Pixel ? "pixel"
+	              : program.stage == ShaderType::Mesh ? "mesh"
+	                                                  : "vertex",
+	              program.shader_hash, first_lane, lane_rw, ballot, dpp, swizzle, permute, lane_id);
+	Log::WriteToConsoleAndLog(text);
 }
 
 } // namespace
@@ -522,6 +573,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	state.mip_stats_records = mip_stats_records;
 	state.lane_count = ShaderLanesPerInvocation(program.stage, program.wave_size, input_info);
 	state.wave_clusters = state.lane_count == 1 && WaveClustersActive(program);
+	if (state.wave_clusters && program.stage != ShaderType::Compute) {
+		NoteClusteredProgram(program);
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
