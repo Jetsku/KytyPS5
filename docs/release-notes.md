@@ -1,3 +1,58 @@
+# KytyPS5 U59 int16.1 AMD test 3 — shared memory above the AMD limit, and a crash a minute into play
+
+> **This is a test build for AMD Radeon owners who got past the title screen with AMD test 2.** Everyone else: please
+> keep using int16.1.
+
+## What this build is
+
+AMD test 2 fixed the "device lost" at the title screen. Its logs still say "Clamping LDS": one of the game's compute
+shaders asks for 48 KiB of shared memory (LDS), NVIDIA allows 48 KiB, AMD 32 KiB, and the emulator cut it to 32 KiB,
+so everything that shader kept above 32 KiB read as zero. Some players also see a crash about a minute into play,
+inside a DLL (a driver or a Vulkan overlay). This build:
+
+- **LDS in a GPU buffer (on by default):** a compute shader that needs more shared memory than the card allows keeps
+  it in a GPU buffer instead, one region per workgroup (the approach of upstream b0bbaef1e). It only applies where
+  the limit is exceeded, so NVIDIA cards are unchanged. `KYTY_LDS_DEVICE_BUFFER=0` restores the AMD test 2 clamp,
+  `=force` puts every compute shader's LDS in the buffer (a test). The log now says "its LDS lives in a device
+  buffer" instead of "Clamping LDS", once per shader, with the shader's hash.
+- **Crash reports name the module and the pipeline:** an unhandled crash now prints the DLL it happened in and the
+  offset (for example `pc=0x00007ff9fc1640fc (amdvlk64.dll+0x...)`), what the thread was doing (for example
+  "graphics pipeline build (VS, PS) 0x... 0x..."), the registers and the call chain, also into the log file
+  (before, that part went only to the console window). Every graphics pipeline build is logged
+  (`PipelineTrace: graphics build begin/done`, and the unoptimized and optimized builds of fast-first).
+- **Two diagnostic switches for the crash a minute into play:** two RX 6900 XT players crashed inside a DLL right
+  after the same vertex/pixel shader pair was compiled; that pixel shader reads raw per-vertex attributes (fragment
+  barycentrics). `KYTY_PS_PER_VERTEX=0` replaces those reads by interpolated values (slightly wrong shading there),
+  `KYTY_CLIP_GUARD=0` drops the extra clip plane vertex shaders get. Both default on; the kit tries each.
+- Everything else is the same as AMD test 2 (subgroup LDS barrier, wave32 clusters, GPU breadcrumbs).
+
+## How to test (about 40 minutes; you play six short runs)
+
+1. Copy your working int16.1 folder (with its `_Patches`, `_PipelineCache` and `_SaveData`) to a new folder, then
+   unzip this build into the new folder and let it overwrite the files.
+2. Start `launcher.exe` from the new folder once, check that Astro Bot and your usual patches are listed, then close
+   the launcher again. Do not start the game from it.
+3. Double-click `AMD-Test-Kit.cmd`. Before each run marked "YOU PLAY" it waits for Enter: start the game, Dive In,
+   and play the first level until the kit closes the game (about 4 minutes after the intro video). After each played
+   run it asks what you saw; press Enter if nothing looked wrong, or type a few words.
+   - `lds-fix`: this build as it is.
+   - `pervertex-off` and `clipguard-off`: the two diagnostic switches above, one each.
+   - `overlays-off`: no Vulkan overlay layers (Steam, Epic, GOG Galaxy, OBS, fossilize), for the crash a minute into
+     play.
+   - `fastfirst-off`: pipelines built optimized at once instead of a quick first build (`KYTY_PIPELINE_FAST_FIRST=0`);
+     AMD's quick builds took about 250 ms each in an AMD test 2 log.
+   - `lds-clamp`: the AMD test 2 clamp again, to compare.
+   - `fix`: the title screen only, hands off.
+4. When it says "Send this file: ...AMD-Test-Results-<date>.zip", send us that zip, also when every run went fine:
+   the logs name the shaders that ask for more shared memory than the card has. Playing another game with this build
+   (Astro's Playroom) and seeing broken effects? Send its `_kyty.txt` too.
+
+You can also just play: this build should behave like AMD test 2 or better. The kit changes nothing outside its
+results folder. The zip contains the emulator's console logs, your notes, your OS, GPU, driver, CPU and RAM, and
+Windows' records of display-driver resets during the test. `AMD-TEST-KIT-README.txt` has the details and options.
+
+---
+
 # KytyPS5 U59 int16.1 AMD test 2 — the fix for the "device lost" after the intro video on AMD Radeon cards
 
 > **This is a test build for AMD Radeon owners whose game stops with "device lost" / ErrorDeviceLost, usually right

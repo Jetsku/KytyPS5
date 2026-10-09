@@ -1,6 +1,8 @@
-# AMD device-lost test kit: runs Astro Bot several times in a row, each time with one emulator
-# switch changed, and records how far each run gets. One session answers which switch avoids the
-# "device lost" after the intro video, and the GPU breadcrumbs say what the GPU was running.
+# AMD test kit: runs Astro Bot several times in a row, each time with one emulator switch changed,
+# and records how far each run gets. AMD test 3 starts with runs the player plays (dive in, then the
+# first level): the 48 KiB compute LDS in a device buffer against the AMD test 2 clamp, wave32
+# clusters off, and pipeline builds without the unoptimized first build. The title-screen runs of
+# AMD test 2 follow; the GPU breadcrumbs say what the GPU was running when a run loses the device.
 #
 # Put this file (and AMD-Test-Kit.cmd) next to kyty_emulator.exe and start AMD-Test-Kit.cmd.
 # Nothing in the emulator folder or the game folder is changed: every switch is set only in the
@@ -16,6 +18,8 @@
 #   -CaptureFromLauncher       instead of reading Kyty.ini, start the game once from the launcher;
 #                              the kit takes the launcher's exact command line from that process
 #   -ListOnly                  print the configurations and the command line, run nothing
+#   -NoPlay                    skip the runs the player plays (only the automatic title runs)
+#   -PlaySeconds 240           how long a played run may go on after the intro video
 #   -ExtraEnv 'KYTY_X=1,KYTY_Y=0'  extra switches for every run (if we ask for them)
 param(
     [string]$EmulatorDir = $PSScriptRoot,
@@ -26,6 +30,8 @@ param(
     [string]$TitleId = '',
     [switch]$CaptureFromLauncher,
     [switch]$ListOnly,
+    [switch]$NoPlay,
+    [int]$PlaySeconds = 240,
     [string]$OutDir = '',
     [switch]$NoZip,
     [string]$ExtraEnv = '',
@@ -36,28 +42,45 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
 # ------------------------------------------------------------------------------------------------
-# Configurations. Every run has the GPU breadcrumbs on. "fix" is this build as released (the
-# bundled u59-preset.json and the new defaults); every other entry changes one thing from it. Order:
-# the most informative first. The AMD test 1 runs named the hanging draw: Astro Bot's title-screen
-# particle mesh shader (VS 0x20c94d46ce55a14b, merged program 0xc739f9614016bed4, PS
-# 0xef31694ed8d87754). It has no loops; its LDS waitcnt barriers sit where only some waves go.
+# Configurations. Every run has the GPU breadcrumbs on. "lds-fix" and "fix" are this build as
+# released (the bundled u59-preset.json and the new defaults); every other entry changes one thing
+# from it. Order: the most informative first.
+# AMD test 3: Astro Bot asks for 48 KiB of LDS in compute shader 0x7db3d8515f263f0f (and maybe
+# others) once the game is played; AMD allows 32 KiB. AMD test 2 clamped it ("Clamping LDS" in the
+# log); this build keeps it in a device buffer (KYTY_LDS_DEVICE_BUFFER). The played runs ("Play")
+# wait for the player: start the game, Dive In, play the first level until the kit closes the game.
+# The AMD test 1 runs named the title-screen hang of test 2: the particle mesh shader (VS
+# 0x20c94d46ce55a14b, merged program 0xc739f9614016bed4, PS 0xef31694ed8d87754).
 $Common = [ordered]@{
     KYTY_DEVICE_FAULT_DIAGNOSTICS = '1'
     KYTY_GPU_BREADCRUMBS          = '1'
 }
 $HangShaders = '0xc739f9614016bed4,0x20c94d46ce55a14b,0xef31694ed8d87754'
+$PlayText = 'start the game, Dive In, and play the first level (near the water) until the game closes'
 $Configs = @(
-    @{ Name = 'fix';              Text = 'this build: LDS waitcnt barrier at subgroup scope, wave32 clusters'; Env = [ordered]@{} }
+    @{ Name = 'lds-fix';          Text = 'this build: 48 KiB compute LDS in a device buffer'; Env = [ordered]@{}; Play = $true; LogFile = $true }
+    # Two RX 6900 XT players (driver 2.0.353) crashed in a host DLL right after the same VS/PS pair
+    # was compiled (PS 0x13495e6ee1376edc reads raw vertex attributes: PerVertexKHR inputs with
+    # fragment barycentrics; VS 0xccc92ef7c55db46a with the zero-position clip plane).
+    @{ Name = 'pervertex-off';    Text = 'pixel shaders without raw per-vertex inputs (a driver crash suspect; slightly wrong shading there)'; Env = [ordered]@{ KYTY_PS_PER_VERTEX = '0' }; Play = $true; LogFile = $true }
+    @{ Name = 'clipguard-off';    Text = 'vertex shaders without the extra clip plane (a driver crash suspect)'; Env = [ordered]@{ KYTY_CLIP_GUARD = '0' }; Play = $true }
+    # A crash in a host DLL ~47 s into play on an RX 6900 XT (AMD test 2) with the Steam, EOS,
+    # GOG Galaxy, fossilize and OBS Vulkan layers loaded: no implicit layer at all.
+    @{ Name = 'overlays-off';     Text = 'this build without Vulkan overlay layers (Steam, Epic, GOG, OBS, ...)'; Env = [ordered]@{
+        VK_LOADER_LAYERS_DISABLE = '~implicit~'; DISABLE_VK_LAYER_VALVE_steam_overlay_1 = '1' }; Play = $true }
+    @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build; less stutter on AMD?)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' }; Play = $true }
+    @{ Name = 'lds-clamp';        Text = 'LDS clamped to 32 KiB again (as AMD test 2)'; Env = [ordered]@{ KYTY_LDS_DEVICE_BUFFER = '0' }; Play = $true }
+    @{ Name = 'fix';              Text = 'this build at the title screen only (AMD test 2: no device lost)'; Env = [ordered]@{} }
+)
+# Earlier suspects, not run by default; -Only <name> runs them.
+$MoreConfigs = @(
+    @{ Name = 'clusters-off';     Text = 'this build without wave32 clusters (as AMD test 1; water triangles?)'; Env = [ordered]@{ KYTY_WAVE32_CLUSTERS = '0' }; Play = $true }
     @{ Name = 'barrier-old';      Text = 'LDS waitcnt barrier at workgroup scope again (as int16.1 and AMD test 1)'; Env = [ordered]@{ KYTY_LDS_WAITCNT_BARRIER = 'workgroup' } }
     @{ Name = 'barrier-off';      Text = 'no LDS waitcnt barrier (the community workaround; pink clouds expected)'; Env = [ordered]@{ KYTY_LDS_WAITCNT_BARRIER = '0' } }
     @{ Name = 'old-loop-guard';   Text = 'barrier-old with a loop guard on the hanging draw''s shaders'; Env = [ordered]@{
         KYTY_LDS_WAITCNT_BARRIER = 'workgroup'; KYTY_LOOP_GUARD = '200000'; KYTY_LOOP_GUARD_SHADERS = $HangShaders } }
-    @{ Name = 'clusters-off';     Text = 'fix without wave32 clusters (wave32 programs share 64-wide subgroups)'; Env = [ordered]@{ KYTY_WAVE32_CLUSTERS = '0' } }
     @{ Name = 'fix-long';         Text = 'fix again for 2 minutes at the title, with the emulator log file'; Env = [ordered]@{}; LogFile = $true; Seconds = 120 }
-)
-# Earlier suspects, not run by default; -Only <name> runs them.
-$MoreConfigs = @(
-    @{ Name = 'fastfirst-off';    Text = 'pipelines built optimized at once (no unoptimized first build)'; Env = [ordered]@{ KYTY_PIPELINE_FAST_FIRST = '0' } }
+    @{ Name = 'lds-force';        Text = 'every compute shader''s LDS in the device buffer (slower; a test of the buffer path)'; Env = [ordered]@{ KYTY_LDS_DEVICE_BUFFER = 'force' }; Play = $true }
     @{ Name = 'wave64-split';     Text = 'wave64 compute shaders on 32-wide subgroups, as on NVIDIA';  Env = [ordered]@{ KYTY_COMPUTE_WAVE64 = '0' } }
     @{ Name = 'loop-guard';       Text = 'every shader loop ends after 200000 iterations and is named'; Env = [ordered]@{
         KYTY_LOOP_GUARD = '200000'; KYTY_LOOP_GUARD_SHADERS = 'all' } }
@@ -250,7 +273,9 @@ if ([IO.File]::Exists($presetPath)) {
 # "-Only a,b" arrives as one string through AMD-Test-Kit.cmd (powershell -File).
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $selected = @(if ($Only.Count -eq 0) { $Configs } else { @($Configs) + @($MoreConfigs) | Where-Object { $Only -contains $_.Name } })
+if ($NoPlay) { $selected = @($selected | Where-Object { -not ($_.ContainsKey('Play') -and $_.Play) }) }
 if ($selected.Count -eq 0) { throw "No configuration matches -Only $($Only -join ','). Names: $((@($Configs) + @($MoreConfigs) | ForEach-Object Name) -join ', ')" }
+function Test-Play($c) { return $c.ContainsKey('Play') -and $c.Play }
 
 if ($CaptureFromLauncher) {
     if (Get-Process kyty_emulator -ErrorAction SilentlyContinue) { throw 'Close the running game first.' }
@@ -269,8 +294,10 @@ if (-not $launch.Patch -and $launch.Source -ne 'launcher process') {
     Write-Host "WARNING: no patch file _Patches\$($launch.Title).json next to the emulator: the game would run WITHOUT the launcher patches." -ForegroundColor Yellow
     Write-Host "         Copy your _Patches folder from your int16.1 folder, or turn the patches on once in this launcher, then start the kit again." -ForegroundColor Yellow
 }
-Write-Step ("Runs:         {0} ({1}), about {2} minutes" -f $selected.Count, (($selected | ForEach-Object Name) -join ', '), [math]::Ceiling($selected.Count * 1.7 + 1.5))
-if ($ListOnly) { foreach ($c in $selected) { Write-Host ("  {0,-14} {1}" -f $c.Name, $c.Text) }; return }
+$played = @($selected | Where-Object { Test-Play $_ }).Count
+$minutes = ($selected.Count - $played) * 1.7 + $played * ($PlaySeconds / 60.0 + 1.7) + 1.5
+Write-Step ("Runs:         {0} ({1}), about {2} minutes; you play {3} of them" -f $selected.Count, (($selected | ForEach-Object Name) -join ', '), [math]::Ceiling($minutes), $played)
+if ($ListOnly) { foreach ($c in $selected) { Write-Host ("  {0,-16} {1}{2}" -f $c.Name, $c.Text, $(if (Test-Play $c) { ' [you play]' } else { '' })) }; return }
 if (Get-Process kyty_emulator -ErrorAction SilentlyContinue) { throw 'A kyty_emulator.exe is already running. Close the game (and the launcher) first.' }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
@@ -310,9 +337,18 @@ try {
         foreach ($k in $Common.Keys) { $envs[$k] = $Common[$k] }
         foreach ($k in $c.Env.Keys) { $envs[$k] = $c.Env[$k] }
         foreach ($pair in ($ExtraEnv -split ',' | Where-Object { $_ -match '=' })) { $kv = $pair -split '=', 2; $envs[$kv[0].Trim()] = $kv[1].Trim() }
+        # Other variables a run sets (the Vulkan loader's) go back to the user's values afterwards.
+        $outside = @{}
+        foreach ($k in $envs.Keys) { if ($k -notmatch '^(KYTY_|TRACY_)') { $outside[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') } }
         foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k, $envs[$k], 'Process') }
         $changed = ($c.Env.Keys | ForEach-Object { "$_=$($c.Env[$_])" }) -join ' '
+        $play = Test-Play $c
         Write-Step ("Run {0}/{1}: {2} - {3} {4}" -f $n, $queue.Count, $c.Name, $c.Text, $(if ($changed) { "($changed)" } else { '' }))
+        if ($play) {
+            Write-Host ("  YOU PLAY this run: {0}. The kit closes the game {1} s after the intro video;" -f $PlaySeconds, $PlayText) -ForegroundColor Cyan
+            Write-Host '  you may also close the game window yourself once you have seen enough.' -ForegroundColor Cyan
+            $null = Read-Host '  Press Enter to start this run'
+        }
         $header = "=== AMD test kit run ${name}: $($c.Text)`r`n=== switches: $changed`r`n=== started $(Get-Date -Format o)`r`n"
         [IO.File]::WriteAllText((Join-Path $OutDir "$name-env.txt"), $header + (($envs.Keys | ForEach-Object { "$_=$($envs[$_])" }) -join "`r`n"))
         $arguments = $launch.Arguments
@@ -324,7 +360,8 @@ try {
             $arguments = $arguments -replace '--printf-output-file\s+("[^"]*"|\S+)', ('--printf-output-file "' + $kytyLog + '"')
         }
         $start = Get-Date
-        $after = if ($c.ContainsKey('Seconds')) { [int]$c.Seconds } else { $SecondsAfterVideo }
+        $after = if ($c.ContainsKey('Seconds')) { [int]$c.Seconds } elseif ($play) { $PlaySeconds } else { $SecondsAfterVideo }
+        $limit = [math]::Max($MaxSeconds, $after + 120)
         $proc = Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $EmulatorDir -PassThru `
             -RedirectStandardOutput $log -RedirectStandardError $err
         $null = $proc.Handle # keeps the exit code readable after the process ends
@@ -340,7 +377,7 @@ try {
             if ($proc.HasExited) { break }
             if ($lostAt -and ($now - $lostAt).TotalSeconds -ge 15) { break }
             if ($videoClosed -and ($now - $videoClosed).TotalSeconds -ge $after) { break }
-            if (($now - $start).TotalSeconds -ge $MaxSeconds) { break }
+            if (($now - $start).TotalSeconds -ge $limit) { break }
         }
         $exited = $proc.HasExited
         if (-not $exited) {
@@ -352,13 +389,22 @@ try {
         if ($videoClosed -and $lostAt) { $since = ('{0:N1} s after the video closed' -f ($lostAt - $videoClosed).TotalSeconds) }
         if ($lostAt) { $verdict = "DEVICE LOST $since".Trim() }
         elseif ($exited -and $text -match 'Fatal Error|Unhandled host exception') { $verdict = 'CRASHED (other error, see log)' }
+        elseif ($exited -and $play -and $videoClosed) { $verdict = ('OK: closed {0:N0} s after the video (exit code {1})' -f ((Get-Date) - $videoClosed).TotalSeconds, $proc.ExitCode) }
         elseif ($exited) { $verdict = "EXITED (code $($proc.ExitCode))" }
         elseif ($videoClosed) { $verdict = "OK: still running $after s after the video" }
-        else { $verdict = "NO VIDEO END within $MaxSeconds s (stopped by the kit)" }
+        else { $verdict = "NO VIDEO END within $limit s (stopped by the kit)" }
         $title = ''
         if ($text -match 'Title ID: (\S+)') { $title = $matches[1] }
-        $results.Add([pscustomobject]@{ Run = $name; Verdict = $verdict; Switches = $changed; Title = $title; Seconds = [int]((Get-Date) - $start).TotalSeconds })
-        Write-Step "  -> $verdict"
+        $note = ''
+        if ($play) {
+            Write-Step "  -> $verdict"
+            $note = Read-Host '  What did you see? (Enter = nothing wrong; or a few words, e.g. "stretched blue triangles near the water", "stutter")'
+        }
+        $lds = @([regex]::Matches($text, '(Clamping LDS|its LDS lives in a device buffer)') | ForEach-Object { $_.Value } | Select-Object -Unique) -join '; '
+        # The module a host crash is in (AMD test 3 prints it: "pc=0x... (amdvlk64.dll+0x...)").
+        if ($text -match 'Unhandled host exception: [^\r\n]*pc=0x[0-9a-f]+ \(([^)\r\n]+)\)') { $lds = ("$lds; crash in $($matches[1])").Trim('; ') }
+        $results.Add([pscustomobject]@{ Run = $name; Verdict = $verdict; Switches = $changed; Title = $title; Seconds = [int]((Get-Date) - $start).TotalSeconds; Note = $note; Lds = $lds })
+        if (-not $play) { Write-Step "  -> $verdict" }
         if ($text -match 'Loop guard: (\d+) invocations[^\r\n]*shader (0x[0-9a-f]+)') { Write-Step "  loop guard fired: $($matches[1]) invocations, shader $($matches[2])" }
         if ($kytyLog -and [IO.File]::Exists($kytyLog)) {
             # Keep the start (device setup) and the end (the crash) of a large log.
@@ -371,6 +417,7 @@ try {
                 [IO.File]::WriteAllBytes($kytyLog, $out.ToArray())
             }
         }
+        foreach ($k in $outside.Keys) { [Environment]::SetEnvironmentVariable($k, $outside[$k], 'Process') }
         [IO.File]::AppendAllText($log, "`r`n=== AMD test kit verdict: $verdict`r`n")
         # A GPU reset takes a few seconds; let the driver settle before the next run.
         Start-Sleep -Seconds $(if ($lostAt) { 15 } else { 5 })
@@ -402,7 +449,11 @@ try {
         [IO.File]::WriteAllLines((Join-Path $OutDir 'windows-events.txt'), $events)
         $summary = [System.Collections.Generic.List[string]]::new()
         $summary.Add("AMD test kit $stamp - $($results.Count) run(s)")
-        foreach ($r in $results) { $summary.Add(("{0,-18} {1,-52} {2}" -f $r.Run, $r.Verdict, $r.Switches)) }
+        foreach ($r in $results) {
+            $summary.Add(("{0,-20} {1,-52} {2}" -f $r.Run, $r.Verdict, $r.Switches))
+            if ($r.Lds) { $summary.Add(("{0,-20} log: {1}" -f '', $r.Lds)) }
+            if ($r.Note) { $summary.Add(("{0,-20} player: {1}" -f '', $r.Note)) }
+        }
         $titles = @($results | Where-Object { $_.Title } | ForEach-Object Title | Select-Object -Unique)
         if ($launch.Title -and $titles.Count -and ($titles -notcontains $launch.Title)) {
             $summary.Add("WARNING: the kit passed the patch plan of $($launch.Title), but the game reports $($titles -join ','). Rerun with -TitleId $($titles[0]).")
