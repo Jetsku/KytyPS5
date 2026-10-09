@@ -608,6 +608,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(null_texture_desc_tests "${KYTY_TESTS_DIR}/NullTextureDescTests.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -1038,6 +1039,7 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME null_texture_desc COMMAND $<TARGET_FILE:null_texture_desc_tests>)
 	add_test(NAME registered_shader_code_on COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
 	set_tests_properties(registered_shader_code_on PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME registered_shader_code_off COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
