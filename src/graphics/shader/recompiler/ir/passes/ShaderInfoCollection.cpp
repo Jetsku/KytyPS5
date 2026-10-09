@@ -215,15 +215,18 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
+	std::array<bool, 32> used {};
 	std::array<bool, 32> per_vertex {};
 	std::array<bool, 32> interpolated {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
+				used[inst.Arg(0).U32()] = true;
 				interpolated[inst.Arg(0).U32()] = true;
 			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
 				const auto input = inst.Arg(0).U32();
 				const auto mode  = inst.Arg(2).U32();
+				used[input] = true;
 				per_vertex[input] =
 				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
 			}
@@ -242,6 +245,8 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 		}
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		// Unread parameters must not require exports from the preceding stage.
+		if (!used[input]) continue;
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
 		         per_vertex[input]);
 	}

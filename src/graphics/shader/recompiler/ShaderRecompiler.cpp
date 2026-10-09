@@ -981,6 +981,40 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		(void)IR::EliminateExecSelects(ir, per_invocation);
 	}
 
+	// Copy the export at its original control-flow/EXEC site, not an interface placeholder.
+	// Iterate only original instructions: aliases are never recursively copied.
+	if (ir.stage == ShaderType::Vertex && options.input_info.vertex != nullptr) {
+		const auto& vertex = *options.input_info.vertex;
+		if (vertex.param_alias_mask != 0) {
+			for (auto* block: ir.blocks) {
+				for (auto it = block->begin(); it != block->end();) {
+					auto& inst = *it++;
+					if (inst.GetOpcode() != IR::ValueOpcode::SetAttribute) continue;
+					const auto flags = inst.Flags<IR::ExportFlags>();
+					const auto source = ir.export_info[flags.index];
+					if (source.kind != IR::ExportTargetKind::Parameter) continue;
+					for (uint32_t destination = 0; destination < 32u; ++destination) {
+						if ((vertex.param_alias_mask & (1u << destination)) == 0 ||
+						    vertex.param_alias_source[destination] != source.index) continue;
+						auto alias = source;
+						alias.index = destination;
+						alias.target = 0x20u + destination;
+						auto alias_flags = flags;
+						alias_flags.index = static_cast<uint32_t>(ir.export_info.size());
+						ir.export_info.push_back(alias);
+						auto copy = block->PrependNewInst(it, IR::ValueOpcode::SetAttribute,
+						                                 {inst.Arg(0), inst.Arg(1)});
+						copy->SetFlags(alias_flags);
+					}
+					// Spare destinations are not sources of any active PS input.
+					// Unused guest exports must not overwrite the alias.
+					if ((vertex.param_alias_mask & (1u << source.index)) != 0) {
+						inst.Invalidate();
+					}
+				}
+			}
+		}
+	}
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword);
 	IR::AnalyzeBufferWriteRanges(ir, options.input_info);

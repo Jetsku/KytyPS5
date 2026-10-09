@@ -13851,14 +13851,13 @@ void TestNewShaderRecompilerStageInputInfo() {
   auto ps_result = RecompileForTest(shader, ps_options);
   Check(ProgramHasInput(ps_result.program, StageInputKind::FragCoord),
         "pixel FragCoord input missing from reflection");
-  Check(ProgramInputCount(ps_result.program, StageInputKind::Parameter) == 2,
-        "pixel interpolant inputs missing from reflection");
+  Check(ProgramInputCount(ps_result.program, StageInputKind::Parameter) == 0,
+        "empty pixel shader must not reflect unused interpolants");
   Check(SpirvHasDecorationValue(ps_result.spirv, 11u, 15u),
         "SPIR-V lacks FragCoord BuiltIn decoration");
-  Check(SpirvHasDecorationValue(ps_result.spirv, 30u, 0u),
-        "SPIR-V lacks interpolant Location 0 decoration");
-  Check(SpirvHasDecorationValue(ps_result.spirv, 30u, 1u),
-        "SPIR-V lacks interpolant Location 1 decoration");
+  Check(!SpirvHasDecorationValue(ps_result.spirv, 30u, 0u) &&
+            !SpirvHasDecorationValue(ps_result.spirv, 30u, 1u),
+        "empty pixel shader emitted unused interpolant locations");
   CheckSpirvBinaryValidates(ps_result.spirv);
 
   ShaderPixelInputInfo ps_pos_y_info{};
@@ -14322,6 +14321,165 @@ void TestSpirvEmissionOwnsRequirements() {
   CheckSpirvBinaryValidates(binary);
   Check((DisassembleSpirvBinary(binary).find("BuiltIn SubgroupLocalInvocationId") != std::string::npos),
         "emission reused requirements from an earlier IR version");
+}
+
+void TestOrdinaryVertexPixelAliases() {
+  const uint32_t shader[] = {EncodeExp0(0x20, 0xf), EncodeExp1(0, 1, 2, 3),
+                             0xbf810000u};
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 2;
+  pixel.interpolator_settings[1] = 0x400u;
+  const std::array<uint32_t, 2> active {0, 1};
+  const auto destination = ShaderPixelParameterLocation(pixel, active, 1);
+  Check(destination == 1, "flat/smooth alias must relocate to a spare location");
+  ShaderVertexInputInfo vertex{};
+  ShaderLinkVertexPixelParameters(vertex, pixel, active);
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  auto result = RecompileForTest(shader, options);
+  Check(SpirvHasDecorationValue(result.spirv, 30u, destination),
+        "ordinary VS must duplicate its parameter value at the relocated PS alias");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestVertexPixelAliasLinkingAndValues() {
+  using namespace ShaderRecompiler;
+  const uint32_t end[] = {0xbf810000u};
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 4;
+  pixel.interpolator_settings[1] = 0x400u;
+  pixel.interpolator_settings[2] = 1u;
+  pixel.interpolator_settings[3] = 2u; // Inactive: must not reserve location 2.
+  auto pixel_options = MakeCompileOptions(ShaderType::Pixel);
+  pixel_options.input_info.pixel = &pixel;
+  auto translated = TranslateProgram(end, pixel_options);
+  IR::IREmitter emitter(translated.program.blocks.front());
+  const auto a = emitter.Emit(IR::ValueOpcode::GetAttribute,
+                             {IR::Value(0u), IR::Value(0u)});
+  const auto b = emitter.Emit(IR::ValueOpcode::GetAttribute,
+                             {IR::Value(1u), IR::Value(0u)});
+  const auto c = emitter.Emit(IR::ValueOpcode::GetAttribute,
+                             {IR::Value(2u), IR::Value(0u)});
+  const auto data = emitter.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+                                {a, b, c, IR::Value(0u)});
+  translated.program.export_info.push_back(
+      {.kind = IR::ExportTargetKind::Mrt, .target = 0u, .index = 0u,
+       .en = 7u, .done = true});
+  emitter.Emit(IR::ValueOpcode::SetAttribute, {data, IR::Value(true)},
+               IR::ExportFlags{.index = 0u, .pc = 4u});
+  auto ps = CompileProgram(std::move(translated), pixel_options, {});
+  CheckSpirvBinaryValidates(ps.spirv);
+  Check(ProgramInputCount(ps.program, IR::StageInputKind::Parameter) == 3,
+        "compiled PS interface must include only live parameters");
+  Check(SpirvHasDecorationValue(ps.spirv, 30u, 2u),
+        "PS alias must avoid the active mapped source at location 1");
+  auto ps_info = std::move(ps.program).TakeCompiledInfo();
+  pixel.stage.program = &ps_info;
+  ShaderVertexInputInfo vertex{};
+  ShaderLinkVertexPixelParameters(vertex, pixel);
+  Check(vertex.param_alias_mask == 4u && vertex.param_alias_source[2] == 0u,
+        "VS linking must use the compiled PS active parameter order");
+  const uint32_t linked_shader[] = {
+      EncodeVop1(0x01, 0, 242), EncodeVop1(0x01, 1, 244),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x21, 0xf), EncodeExp1(1, 1, 1, 1), 0xbf810000u};
+  auto linked_options = MakeCompileOptions(ShaderType::Vertex);
+  linked_options.input_info.vertex = &vertex;
+  auto linked_vs = RecompileForTest(linked_shader, linked_options);
+  CheckSpirvBinaryValidates(linked_vs.spirv);
+  auto linked_info = std::move(linked_vs.program).TakeCompiledInfo();
+  Check(linked_info.param_export_mask == 7u,
+        "linking must preserve active source 1 and duplicate source 0 at location 2");
+  const std::array<uint32_t, 3> compiled_active {0, 1, 2};
+  for (const auto input : compiled_active) {
+    const auto location = ShaderPixelParameterLocation(pixel, compiled_active, input);
+    Check((linked_info.param_export_mask & (1u << location)) != 0u &&
+              SpirvHasDecorationValue(linked_vs.spirv, 30u, location),
+          "compiled VS/PS pair contains an unproduced pixel input location");
+  }
+
+  auto dirty = vertex;
+  dirty.param_alias_source[31] = 19u;
+  Check(MakeStageStaticKey(vertex) == MakeStageStaticKey(dirty),
+        "inactive alias payload must not change cache identity");
+  dirty.param_alias_source[2] = 1u;
+  Check(MakeStageStaticKey(vertex) != MakeStageStaticKey(dirty),
+        "alias source must specialize the vertex cache key");
+  dirty = vertex;
+  dirty.param_alias_mask = 8u;
+  Check(MakeStageStaticKey(vertex) != MakeStageStaticKey(dirty),
+        "alias destination must specialize the vertex cache key");
+  ShaderLinkVertexPixelParameters(vertex, pixel, std::array<uint32_t, 1>{0});
+  Check(vertex.param_alias_mask == 0u &&
+            std::all_of(vertex.param_alias_source.begin(), vertex.param_alias_source.end(),
+                        [](uint32_t source) { return source == 0u; }),
+        "linking another PS must clear stale aliases");
+  pixel.custom_interpolation_mask = 2u;
+  ShaderLinkVertexPixelParameters(vertex, pixel, std::array<uint32_t, 2>{0, 1});
+  Check(vertex.param_alias_mask == 0u,
+        "custom/smooth interpolation must share the original export");
+  pixel.custom_interpolation_mask = 0u;
+  ShaderLinkVertexPixelParameters(vertex, pixel, std::array<uint32_t, 2>{1, 0});
+  Check(vertex.param_alias_mask == 2u && vertex.param_alias_source[1] == 0u,
+        "flat-first active order must also produce a value alias");
+
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 242), // Nonzero values, not a zero-filled interface.
+      EncodeVop1(0x01, 1, 244),
+      EncodeSop1(0x04, 126, 129), // Per-invocation EXEC predicate.
+      EncodeExp0(0x20, 0x5, false, false, true), EncodeExp1(0, 1, 0, 1),
+      EncodeExp0(0x21, 0xf, false), EncodeExp1(1, 1, 1, 1), // Unused collision.
+      EncodeSopp(0x09, 2), // s_cbranch_execz skips the second source export.
+      EncodeExp0(0x20, 0xf, true, true, true), EncodeExp1(1, 0, 0, 0),
+      0xbf810000u};
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  uint32_t originals = 0, aliases = 0;
+  for (const auto* block : result.program.blocks) {
+    for (auto it = block->begin(); it != block->end(); ++it) {
+      if (it->GetOpcode() != IR::ValueOpcode::SetAttribute) continue;
+      const auto flags = it->Flags<IR::ExportFlags>();
+      const auto source = result.program.export_info[flags.index];
+      if (source.kind != IR::ExportTargetKind::Parameter) continue;
+      if (source.index == 1u) { ++aliases; continue; }
+      Check(source.index == 0u, "unexpected parameter in alias regression");
+      ++originals;
+      const auto copy = std::next(it);
+      Check(copy != block->end() && copy->GetOpcode() == IR::ValueOpcode::SetAttribute,
+            "alias must remain adjacent in the original control-flow block");
+      const auto copy_flags = copy->Flags<IR::ExportFlags>();
+      auto expected = source;
+      expected.index = 1u;
+      expected.target = 0x21u;
+      Check(result.program.export_info[copy_flags.index] == expected &&
+                copy_flags.pc == flags.pc && copy->Arg(0) == it->Arg(0) &&
+                copy->Arg(1) == it->Arg(1),
+            "alias changed value, EXEC, component mask, compression or export flags");
+    }
+  }
+  Check(originals == 2u && aliases == 2u,
+        "duplicate source exports must alias once each and suppress spare-slot collisions");
+  Check(DisassembleSpirvBinary(result.spirv).find("OpBranchConditional") != std::string::npos,
+        "aliased vertex exports lost per-invocation predication");
+  auto compiled_info = std::move(result.program).TakeCompiledInfo();
+  Check(compiled_info.param_export_mask == 3u,
+        "compiled export mask omitted the linked alias");
+
+  const uint32_t absent_source[] = {
+      EncodeExp0(0x21, 0xf), EncodeExp1(0, 0, 0, 0), 0xbf810000u};
+  auto absent = RecompileForTest(absent_source, options);
+  Check(!SpirvHasDecorationValue(absent.spirv, 30u, 1u),
+        "a missing source must not manufacture a zero-valued alias");
+  CheckSpirvBinaryValidates(absent.spirv);
+  ShaderVertexInputInfo plain{};
+  options.input_info.vertex = &plain;
+  auto unlinked = RecompileForTest(shader, options);
+  plain.param_alias_source.fill(31u);
+  auto still_unlinked = RecompileForTest(shader, options);
+  Check(unlinked.spirv == still_unlinked.spirv,
+        "no-alias vertex code generation must remain unchanged");
 }
 
 void TestRepeatedExportsHaveOneInterface() {
@@ -14827,6 +14985,26 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--unused-pixel-inputs-only") == 0) {
+    const uint32_t code[] = {0xbf810000u};
+    ShaderPixelInputInfo pixel{};
+    pixel.input_num = 2;
+    SetIdentityInterpolatorSettings(&pixel);
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel;
+    auto result = RecompileForTest(code, options);
+    Check(ProgramInputCount(result.program, ShaderRecompiler::IR::StageInputKind::Parameter) == 0,
+          "unused pixel parameters must not appear in the stage interface");
+    CheckSpirvBinaryValidates(result.spirv);
+    std::printf("shader_cfg --unused-pixel-inputs-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-interface-only") == 0) {
+    TestOrdinaryVertexPixelAliases();
+    TestVertexPixelAliasLinkingAndValues();
+    std::printf("shader_cfg --pixel-interface-only: ok\n");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--upsync2-only") == 0) {
     TestDisabledDebugBranches();
     TestWave32MaskProjection();
@@ -14893,6 +15071,8 @@ int main(int argc, char **argv) {
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
   TestSpirvEmissionOwnsRequirements();
+  TestOrdinaryVertexPixelAliases();
+  TestVertexPixelAliasLinkingAndValues();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
