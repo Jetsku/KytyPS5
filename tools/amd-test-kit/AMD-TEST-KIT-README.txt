@@ -54,6 +54,26 @@ closes it, and goes on by itself.
 To stop early, close the kit's console window; the zip is then not written, but the folder
 AMD-Test-Results-<date> next to kyty_emulator.exe has the logs so far.
 
+Astro's Playroom: broken clouds or smoke
+----------------------------------------
+The kit only runs Astro Bot. If clouds or smoke in Astro's Playroom break up into blocks on your
+AMD card, start Playroom twice by hand from this folder, once with each setting below, look at the
+same clouds, and send us the _kyty.txt of each start with a note on whether the clouds changed.
+
+1. Open a command prompt in this folder (type cmd in the Explorer address bar and press Enter) and
+   type:
+       set KYTY_DPP_SKIP_INACTIVE=0
+       launcher.exe
+   Start Playroom from the launcher, look at the clouds, close the game and the launcher, and keep
+   a copy of _kyty.txt.
+2. Close that command prompt, open a new one in this folder, and type:
+       set KYTY_WAVE32_CLUSTERS=0
+       launcher.exe
+   Start Playroom again, look at the same clouds, close it, and keep this _kyty.txt too.
+
+The setting only applies to the launcher started from that command prompt; nothing is changed on
+your PC.
+
 What the runs are
 -----------------
 lds-fix           this build as it is: the 48 KiB shader's LDS in a GPU buffer   (you play)

@@ -53,6 +53,28 @@ inside a DLL (a driver or a Vulkan overlay). This build:
    the logs name the shaders that ask for more shared memory than the card has. Playing another game with this build
    (Astro's Playroom) and seeing broken effects? Send its `_kyty.txt` too.
 
+## Astro's Playroom: clouds or smoke broken into blocks
+
+The kit only runs Astro Bot. If Playroom's clouds or smoke break up into blocks on your AMD card, start Playroom
+twice by hand, once with each setting, look at the same clouds, and send the `_kyty.txt` of each start with a note
+on whether the clouds changed. Open a command prompt in the emulator folder (type `cmd` in the Explorer address bar)
+and run:
+
+```
+set KYTY_DPP_SKIP_INACTIVE=0
+launcher.exe
+```
+
+Start Playroom, look at the clouds, close the game and the launcher, and keep a copy of `_kyty.txt`. Then close that
+command prompt, open a new one in the same folder, and run:
+
+```
+set KYTY_WAVE32_CLUSTERS=0
+launcher.exe
+```
+
+The setting only applies to the launcher started from that command prompt.
+
 You can also just play: this build should behave like AMD test 2 or better. The kit changes nothing outside its
 results folder. The zip contains the emulator's console logs, your notes, your OS, GPU, driver, CPU and RAM, and
 Windows' records of display-driver resets during the test. `AMD-TEST-KIT-README.txt` has the details and options.
