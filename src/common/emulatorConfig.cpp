@@ -26,7 +26,8 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 	EXIT_IF(cfg.audio_master_volume > MAX_AUDIO_VOLUME || cfg.audio_main_volume > MAX_AUDIO_VOLUME ||
 	        cfg.audio_music_volume > MAX_AUDIO_VOLUME ||
-	        cfg.audio_pad_speaker_main_volume > MAX_AUDIO_VOLUME);
+	        cfg.audio_pad_speaker_main_volume > MAX_AUDIO_VOLUME ||
+	        cfg.audio_objects_volume > MAX_AUDIO_VOLUME);
 
 	*g_config = cfg;
 }
@@ -79,6 +80,14 @@ uint32_t GetAudioPadSpeakerOnMainVolume() {
 	return g_config->audio_pad_speaker_main_volume;
 }
 
+uint32_t GetAudioObjectsVolume() {
+	return g_config->audio_objects_volume;
+}
+
+bool AudioObjectsEnabled() {
+	return g_config->audio_objects_enabled;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
@@ -101,6 +110,10 @@ bool VrEnabled() {
 
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
+}
+
+const std::string& GetAmdCpuDecision() {
+	return g_config->amd_cpu_decision;
 }
 
 uint32_t GetVblankFrequency() {
@@ -171,6 +184,10 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool SyncRawImageBuffersEnabled() {
+	return g_config->sync_raw_image_buffers;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -181,6 +198,10 @@ bool TrophyEnabled() {
 
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
+}
+
+bool SkipNoticeScreen() {
+	return g_config->skip_notice_screen;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

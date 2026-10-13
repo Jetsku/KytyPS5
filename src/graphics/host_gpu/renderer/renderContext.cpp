@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
@@ -23,8 +24,91 @@
 #include <cstring>
 #include <ctime>
 #include <shared_mutex>
+#include <thread>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace Libs::Graphics {
+
+namespace {
+
+// KYTY_RENDER_LOCK_ASYMMETRIC (RenderMutex): whether the owner's fast path is used. Requires the
+// process-wide store flush.
+bool RenderLockAsymmetric() {
+#if defined(_WIN32)
+	const auto* value = std::getenv("KYTY_RENDER_LOCK_ASYMMETRIC");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+#else
+	return false;
+#endif
+}
+
+void FlushOtherProcessorsStores() {
+#if defined(_WIN32)
+	::FlushProcessWriteBuffers();
+#endif
+}
+
+} // namespace
+
+void RenderMutex::BecomeOwner() {
+	EXIT_IF(t_owner);
+	m_mutex.Lock(); // no requester inside: a later one finds the owner
+	m_owner_exists = true;
+	m_asymmetric   = RenderLockAsymmetric();
+	m_owner_depth  = 0;
+	m_owner_locked = false;
+	t_owner        = true;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::ResignOwner() {
+	EXIT_IF(!t_owner || m_owner_depth != 0);
+	m_mutex.Lock();
+	t_owner        = false;
+	m_owner_exists = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::OwnerLockSlow() {
+	// A requester holds the mutex or is about to (or the fast path is off): out, then the mutex.
+	m_busy.store(0, std::memory_order_release);
+	m_mutex.Lock();
+	m_owner_locked = true;
+}
+
+void RenderMutex::OwnerUnlockSlow() {
+	m_owner_locked = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::RequesterLock() {
+	if (t_requester_depth++ != 0) {
+		return;
+	}
+	m_mutex.Lock();
+	if (!m_owner_exists || !m_asymmetric) {
+		return;
+	}
+	m_requested.store(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	// The owner's `busy` store is visible now if it made it, and its next acquisition sees the
+	// request.
+	FlushOtherProcessorsStores();
+	while (m_busy.load(std::memory_order_acquire) != 0) {
+		std::this_thread::yield();
+	}
+}
+
+void RenderMutex::RequesterUnlock() {
+	if (--t_requester_depth != 0) {
+		return;
+	}
+	m_requested.store(0, std::memory_order_release);
+	m_mutex.Unlock();
+}
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
@@ -110,6 +194,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
+	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
 	// Live cost numbers (faultCost.h); the slow-PC simulation's wait comes first, outside every lock.
 	const auto start = FaultCost::NowNs();
 	FaultCost::SimulateFault();
@@ -372,6 +457,7 @@ void RenderContext::NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allo
 }
 
 void RenderContext::RunGarbageCollector() {
+	const CpGaps::Scope gap(CpGaps::Cat::Gc);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

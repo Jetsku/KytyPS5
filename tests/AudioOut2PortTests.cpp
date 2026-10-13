@@ -3,12 +3,15 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -24,10 +27,13 @@ std::vector<int>                  g_live_devices;
 std::vector<int>                  g_device_backed_handles;
 std::vector<bool>                 g_output_blocking;
 std::vector<std::vector<uint8_t>> g_output_pcm;
+std::vector<std::array<float, 2>> g_output_gains;
 size_t                            g_capture_bytes = 0;
 int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
+float                             g_objects_gain = 1.0f;
+bool                              g_objects_on   = true;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -102,14 +108,21 @@ PortParam MakeParam(uint32_t data_format = 0x200) {
 	return param;
 }
 
-AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4) {
+AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4, uint32_t max_object_ports = 0) {
 	ContextParam param {};
+	param.max_object_ports                    = max_object_ports;
 	param.queue_depth                         = queue_depth;
 	param.num_grains                          = 512;
 	AudioOut2::AudioOut2ContextHandle context = 0;
 	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
 	      "context create failed");
 	return context;
+}
+
+AudioOut2::AudioOut2PortHandle CreatePort(AudioOut2::AudioOut2ContextHandle context, const PortParam& param) {
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK, "port create failed");
+	return port;
 }
 
 void TestUserSupportedAttributes() {
@@ -191,6 +204,13 @@ void SetPcm(AudioOut2::AudioOut2PortHandle port, const void* data) {
 	      "setting PCM failed");
 }
 
+template <typename T>
+void SetAttribute(AudioOut2::AudioOut2PortHandle port, uint32_t id, const T& value) {
+	const Attribute attribute {id, 0, &value, sizeof(value)};
+	Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) == OK,
+	      "setting attribute failed");
+}
+
 void ResetOutputCalls() {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.clear();
@@ -212,6 +232,23 @@ std::vector<std::vector<uint8_t>> OutputPcm() {
 	return g_output_pcm;
 }
 
+std::vector<std::vector<uint8_t>> PushPcm(AudioOut2::AudioOut2ContextHandle context, size_t bytes) {
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "PCM push failed");
+	auto output = OutputPcm();
+	CaptureOutputPcm(0);
+	return output;
+}
+
+void CheckSamples(const std::vector<uint8_t>& pcm, std::initializer_list<float> frame, const char* message) {
+	Check(!pcm.empty() && pcm.size() % (frame.size() * sizeof(float)) == 0, "incorrect PCM size");
+	for (size_t i = 0; i < pcm.size() / sizeof(float); i++) {
+		float sample;
+		std::memcpy(&sample, pcm.data() + i * sizeof(float), sizeof(float));
+		Check(std::abs(sample - *(frame.begin() + i % frame.size())) < 0.000001f, message);
+	}
+}
+
 void TestSlotReuse() {
 	const auto context = CreateContext();
 	const auto param   = MakeParam();
@@ -229,18 +266,21 @@ void TestFullTableRecovers() {
 	const auto                                  context = CreateContext();
 	const auto                                  param   = MakeParam();
 	std::vector<AudioOut2::AudioOut2PortHandle> ports;
-	ports.reserve(256);
+	ports.reserve(4096);
 
-	for (int i = 0; i < 256; i++) {
+	// The table grows to its limit (KYTY_AUDIO_OUT2_MAX_PORTS, 4096 by default) and then refuses.
+	constexpr int port_full = static_cast<int32_t>(0x80268012u);
+	int           result    = OK;
+	for (int i = 0; i < 70000; i++) {
 		AudioOut2::AudioOut2PortHandle port = 0;
-		Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
-		      "port table filled early");
+		result = AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port);
+		if (result != OK) {
+			break;
+		}
 		ports.push_back(port);
 	}
-
-	AudioOut2::AudioOut2PortHandle overflow = 0;
-	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &overflow) != OK,
-	      "full port table accepted another port");
+	Check(result == port_full, "full port table accepted another port or failed with another code");
+	Check(ports.size() == 4096, "port table limit is not 4096");
 
 	for (auto port: ports) {
 		AudioOut2::AudioOut2PortDestroy(port);
@@ -251,6 +291,53 @@ void TestFullTableRecovers() {
 	      "port table did not recover");
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// Astro Bot: max ports 20, a bed, a BGM bed, pad speaker and vibration ports, and one object port
+// per 3D voice. With the library's 256 object ports on top of its plain ports the old fixed table of
+// 256 slots answered PORT_FULL (0x80268012, detail 0x100) mid-game. Objects come and go in bursts.
+void TestObjectPortsBeyond256() {
+	ContextParam context_param {};
+	context_param.max_ports        = 20;
+	context_param.max_object_ports = 256;
+	context_param.queue_depth      = 1;
+	context_param.num_grains       = 512;
+	AudioOut2::AudioOut2ContextHandle context = 0;
+	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&context_param), nullptr, 0, &context) == OK,
+	      "context create failed");
+	std::vector<AudioOut2::AudioOut2PortHandle> plain;
+	for (const uint16_t type: {uint16_t {0}, uint16_t {1}, uint16_t {3}, uint16_t {6}}) {
+		auto param      = MakeParam(type == 6 ? 0x200 : (type == 3 ? 0x100 : 0x800));
+		param.port_type = type;
+		plain.push_back(CreatePort(context, param));
+	}
+	auto object_param      = MakeParam(0x100);
+	object_param.port_type = 0x100;
+	std::vector<AudioOut2::AudioOut2PortHandle> objects;
+	for (int i = 0; i < 300; i++) {
+		objects.push_back(CreatePort(context, object_param));
+	}
+	// Churn: destroy every other object and create new ones, many times over.
+	for (int round = 0; round < 20; round++) {
+		for (size_t i = round % 2; i < objects.size(); i += 2) {
+			AudioOut2::AudioOut2PortDestroy(objects[i]);
+			objects[i] = CreatePort(context, object_param);
+		}
+	}
+	// Every handle still resolves to its own port.
+	for (const auto port: objects) {
+		PortState state {};
+		AudioOut2::AudioOut2PortGetState(port, AsState(&state));
+		Check(state.num_channels == 1, "object port lost after churn");
+	}
+	for (const auto port: plain) {
+		AudioOut2::AudioOut2PortDestroy(port);
+	}
+	for (const auto port: objects) {
+		AudioOut2::AudioOut2PortDestroy(port);
+	}
+	AudioOut2::AudioOut2ContextDestroy(context);
+	Check(LiveDeviceCount() == 0, "object port test leaked a device");
 }
 
 void TestConcurrentCreates() {
@@ -428,6 +515,138 @@ void TestPcmCopiedBeforeScratchBufferReuse() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void SetObject(AudioOut2::AudioOut2PortHandle port, const float* pcm_data, const float* position,
+               float gain) {
+	const Pcm       pcm {pcm_data};
+	const Attribute attributes[3] {{0, 0, &pcm, sizeof(pcm)},
+	                               {3, 0, position, 3 * sizeof(float)},
+	                               {1, 0, &gain, sizeof(gain)}};
+	Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(attributes), 3) == OK,
+	      "setting object attributes failed");
+}
+
+void TestObjectPortsMixIntoBed() {
+	const auto context   = CreateContext();
+	auto       bed_param = MakeParam(0x0800); // 8 ch float main bed
+	AudioOut2::AudioOut2PortHandle bed = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&bed_param), &bed) == OK,
+	      "bed create failed");
+	auto object_param      = MakeParam(0x0100); // mono float
+	object_param.port_type = 0x100;
+	AudioOut2::AudioOut2PortHandle object = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&object_param), &object) == OK,
+	      "object create failed");
+	Check(LiveDeviceCount() == 1, "object port opened an output of its own");
+
+	std::vector<float> bed_pcm(512 * 8, 0.125f);
+	std::vector<float> mono(512, 0.5f);
+	const float        right[3] {1.0f, 0.0f, 0.0f};
+	SetPcm(bed, bed_pcm.data());
+	SetObject(object, mono.data(), right, 0.5f);
+
+	const auto bytes = bed_pcm.size() * sizeof(float);
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push failed");
+	auto output = OutputPcm();
+	Check(output.size() == 1, "the object was output on its own");
+	const auto* mixed = reinterpret_cast<const float*>(output[0].data());
+	Check(std::abs(mixed[0] - 0.125f) < 1e-5f, "object on the right reached the front left");
+	// At 90 degrees right on a 7.1 bed: half the power on the front right, the rest on the right
+	// surrounds (5 and 7).
+	const float front = 0.125f + 0.25f * 0.70710677f;
+	const float side  = 0.125f + 0.25f * 0.5f;
+	Check(std::abs(mixed[1] - front) < 1e-5f, "object missing from the front right");
+	Check(std::abs(mixed[5] - side) < 1e-5f && std::abs(mixed[7] - side) < 1e-5f &&
+	          std::abs(mixed[4] - 0.125f) < 1e-5f,
+	      "object missing from the right surrounds");
+	Check(std::abs(mixed[2] - 0.125f) < 1e-5f && std::abs(mixed[8 * 511 + 1] - front) < 1e-5f,
+	      "object mixed into the wrong channels or frames");
+
+	// Not fed again: the object is silent, its last block is not repeated.
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "second push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "a stale object block was mixed again");
+
+	// The objects mix level scales it; 0 mutes it.
+	g_objects_gain = 0.0f;
+	SetPcm(bed, bed_pcm.data());
+	SetObject(object, mono.data(), right, 0.5f);
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "muted push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "objects volume 0 did not mute");
+	g_objects_gain = 1.0f;
+
+	// Switched off: the bed is played unchanged, and the dropped block is not mixed later either.
+	g_objects_on = false;
+	SetPcm(bed, bed_pcm.data());
+	SetObject(object, mono.data(), right, 0.5f);
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "objects-off push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "objects off still mixed the object");
+	g_objects_on = true;
+	SetPcm(bed, bed_pcm.data());
+	CaptureOutputPcm(bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "objects-on push failed");
+	output = OutputPcm();
+	Check(output.size() == 1 && std::memcmp(output[0].data(), bed_pcm.data(), bytes) == 0,
+	      "a block dropped while objects were off was mixed later");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(object);
+	AudioOut2::AudioOut2PortDestroy(bed);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestPortGainAndValidation() {
+	const auto context = CreateContext();
+	const auto port = CreatePort(context, MakeParam());
+	std::vector<float> pcm(512 * 2, 0.25f);
+	SetPcm(port, pcm.data());
+	auto check_output = [&](const std::array<float, 2>& gain, float expected_pcm) {
+		CheckSamples(PushPcm(context, pcm.size() * sizeof(float)).at(0), {expected_pcm},
+		             "gain modified stored PCM");
+		std::lock_guard lock(g_device_mutex);
+		Check(g_output_gains.size() == 1 && g_output_gains[0] == gain,
+		      "incorrect per-channel gain forwarded to backend");
+	};
+	check_output({1.0f, 1.0f}, 0.25f);
+	for (const std::array<float, 2> gain: {std::array {2.0f, 0.5f}, {0.0f, 0.0f}, {1.0f, 1.0f}}) {
+		SetAttribute(port, 1, gain);
+		check_output(gain, 0.25f);
+		check_output(gain, 0.25f);
+	}
+
+	const std::array gain {0.5f, 0.25f};
+	SetAttribute(port, 1, gain);
+	std::fill(pcm.begin(), pcm.end(), 0.75f);
+	SetPcm(port, pcm.data());
+	check_output(gain, 0.75f);
+
+	// Kyty keeps returning OK for a gain it cannot use (upstream returns INVALID_PARAM and drops the
+	// whole call): the last valid gains stay in place.
+	for (const float invalid: {-1.0f, std::numeric_limits<float>::infinity(),
+	                           std::numeric_limits<float>::quiet_NaN()}) {
+		const std::array invalid_gain {1.0f, invalid};
+		const Attribute  attribute {1, 0, &invalid_gain, sizeof(invalid_gain)};
+		Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) == OK,
+		      "invalid gain failed the call");
+		check_output(gain, 0.75f);
+	}
+	for (const Attribute attribute: {Attribute {1, 0, nullptr, sizeof(gain)},
+	                                Attribute {1, 0, &gain, sizeof(float)}}) {
+		Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) == OK,
+		      "malformed gain failed the call");
+		check_output(gain, 0.75f);
+	}
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -467,13 +686,25 @@ bool AudioOutHasDevice(int handle) {
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	g_output_gains.clear();
 	if (g_capture_bytes != 0) {
 		for (uint32_t i = 0; i < num; i++) {
 			const auto* bytes = static_cast<const uint8_t*>(params[i].data);
 			g_output_pcm.emplace_back(bytes, bytes + g_capture_bytes);
+			g_output_gains.push_back(params[i].gains != nullptr
+			                             ? std::array {params[i].gains[0], params[i].gains[1]}
+			                             : std::array {1.0f, 1.0f});
 		}
 	}
 	return 0;
+}
+
+float AudioOutObjectsGain() {
+	return g_objects_gain;
+}
+
+bool AudioOutObjectsEnabled() {
+	return g_objects_on;
 }
 
 } // namespace Libs::Audio::AudioInternal
@@ -487,8 +718,87 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 
 } // namespace Libs::LibKernel
 
+namespace {
+
+// With KYTY_AUDIO_TRACE on: a bed whose PCM is never set again replays its last block (BUZZ), then
+// recovers when fresh blocks arrive. Exercises the trace path; the output itself is checked here.
+void TestRepeatedBlockTrace() {
+	const auto context = CreateContext(1);
+	const auto port    = CreatePort(context, MakeParam(0x200));
+	std::array<float, 512 * 2> pcm {};
+	pcm.fill(0.25f);
+	SetPcm(port, pcm.data());
+	for (int i = 0; i < 12; i++) {
+		const auto output = PushPcm(context, sizeof(pcm));
+		Check(output.size() == 1, "repeated block was not played");
+		CheckSamples(output[0], {0.25f, 0.25f}, "repeated block changed");
+	}
+	for (int i = 0; i < 4; i++) {
+		pcm.fill(0.1f * static_cast<float>(i + 1));
+		SetPcm(port, pcm.data());
+		const auto output = PushPcm(context, sizeof(pcm));
+		CheckSamples(output[0], {0.1f * static_cast<float>(i + 1), 0.1f * static_cast<float>(i + 1)},
+		             "fresh block not played");
+	}
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// The BUZZ detector watches only ports that carry game audio to the main device, and needs a second
+// of identical blocks.
+void TestBuzzDetectorScope() {
+	namespace AI = Libs::Audio::AudioInternal;
+	for (const uint16_t type: {uint16_t {0}, uint16_t {1}, uint16_t {2}, uint16_t {4}}) {
+		Check(AI::AudioOut2BuzzWatchesPortType(type), "game audio port type is not watched");
+	}
+	for (const uint16_t type: {uint16_t {3}, uint16_t {5}, uint16_t {6}, uint16_t {0x100}, uint16_t {0x1ff}}) {
+		Check(!AI::AudioOut2BuzzWatchesPortType(type), "pad speaker, aux, vibration or object port is watched");
+	}
+	Check(AI::AudioOut2BuzzThresholdBlocks(48000, 512) == 94, "1 s threshold at 48 kHz is not 94 blocks");
+	Check(AI::AudioOut2BuzzThresholdBlocks(24000, 512) == 47, "1 s threshold at 24 kHz is not 47 blocks");
+	Check(AI::AudioOut2BuzzThresholdBlocks(48000, 256) == 188, "1 s threshold at 256 frames is not 188 blocks");
+	Check(AI::AudioOut2BuzzThresholdBlocks(48000, 0) >= 1, "zero frame block threshold is not clamped");
+}
+
+// A steady tone on a watched port for more than a second, a pad speaker port repeating the same
+// block, then a fresh block: only the output is checked here, the episode report is a trace line.
+void TestLongRepeatEpisode() {
+	const auto context = CreateContext(1);
+	auto       pad     = MakeParam(0x200);
+	pad.port_type      = 3;
+	const auto main_port = CreatePort(context, MakeParam(0x200));
+	const auto pad_port  = CreatePort(context, pad);
+	std::array<float, 512 * 2> pcm {};
+	pcm.fill(0.25f);
+	SetPcm(main_port, pcm.data());
+	SetPcm(pad_port, pcm.data());
+	for (int i = 0; i < 100; i++) {
+		const auto output = PushPcm(context, sizeof(pcm));
+		Check(!output.empty(), "repeated block was not played");
+	}
+	pcm.fill(0.5f);
+	SetPcm(main_port, pcm.data());
+	SetPcm(pad_port, pcm.data());
+	const auto output = PushPcm(context, sizeof(pcm));
+	Check(!output.empty(), "fresh block not played after a long repeat");
+	AudioOut2::AudioOut2PortDestroy(pad_port);
+	AudioOut2::AudioOut2PortDestroy(main_port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+} // namespace
+
 int main() {
+#ifdef _WIN32
+	_putenv("KYTY_AUDIO_TRACE=1");
+#else
+	setenv("KYTY_AUDIO_TRACE", "1", 1);
+#endif
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
+	TestObjectPortsBeyond256();
+	TestRepeatedBlockTrace();
+	TestBuzzDetectorScope();
+	TestLongRepeatEpisode();
 	TestUserSupportedAttributes();
 	TestSlotReuse();
 	TestFullTableRecovers();
@@ -499,6 +809,8 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	TestObjectPortsMixIntoBed();
+	TestPortGainAndValidation();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

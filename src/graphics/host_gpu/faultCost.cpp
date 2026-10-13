@@ -181,6 +181,12 @@ uint64_t MapPeriodNs() {
 
 thread_local uint64_t t_fault_rip = 0;
 thread_local bool     t_in_fault  = false;
+// Fault split (SplitAdd) of the fault this thread resolves, and the faults in flight at its start.
+constexpr int         SplitParts = static_cast<int>(Split::Count);
+thread_local uint64_t t_split_ns[SplitParts] {};
+thread_local uint32_t t_split_calls      = 0;
+thread_local uint32_t t_split_concurrent = 0;
+std::atomic<uint32_t> g_faults_in_flight {0};
 
 enum ThreadClass : int { Cp = 0, Guest = 1, Host = 2, ThreadClasses = 3 };
 const char* const kThreadNames[ThreadClasses] = {"cp", "guest", "host"};
@@ -241,6 +247,18 @@ struct MapWindow {
 	uint64_t since[5] {};
 	uint64_t found_dirty = 0;
 	uint64_t emulator_rip = 0;
+	// Fault split, write faults only (SplitAdd).
+	uint64_t split_faults[ThreadClasses] {};
+	uint64_t split_handler_ns[ThreadClasses] {};
+	uint64_t split_ns[ThreadClasses][SplitParts] {};
+	uint64_t split_calls[ThreadClasses] {};
+	uint64_t split_concurrent[ThreadClasses] {};
+	uint64_t split_concurrent_any[ThreadClasses] {};
+	// Fault handler time by thread name (guest threads by their names).
+	std::unordered_map<std::string, std::array<uint64_t, 2>> by_thread; // faults, ns
+	// Host-call lock waits outside faults (NoteHostLockWait), by thread class.
+	uint64_t lock_waits[ThreadClasses] {};
+	uint64_t lock_wait_ns[ThreadClasses] {};
 	ProtectTable protect {};
 	uint32_t first_frame = 0;
 };
@@ -278,6 +296,24 @@ void DumpMap(const MapWindow& window, uint32_t frame, double seconds) {
 		            static_cast<double>(window.part_ns[c][0]) / n / 1e3,
 		            static_cast<double>(window.part_ns[c][1]) / n / 1e3,
 		            static_cast<double>(window.part_ns[c][2]) / n / 1e3);
+		if (window.split_faults[c] != 0) {
+			const auto w     = static_cast<double>(window.split_faults[c]);
+			const auto us    = [&](int part) { return static_cast<double>(window.split_ns[c][part]) / w / 1e3; };
+			double     split = 0;
+			for (int part = 0; part < SplitParts; part++) {
+				split += us(part);
+			}
+			const double handler = static_cast<double>(window.split_handler_ns[c]) / w / 1e3;
+			std::printf("FaultMap   %s fault split (%.1f write faults/frame, %.1f us): tracker-lock wait %.1f, "
+			            "host-lock wait %.1f, count-lock wait %.1f, host calls %.1f (%.2f calls/fault), flush %.1f, "
+			            "rest %.1f us/fault; other faults in flight at entry %.2f avg, >0 in %.0f%%\n",
+			            kThreadNames[c], per(window.split_faults[c]), handler,
+			            us(static_cast<int>(Split::TrackerLock)), us(static_cast<int>(Split::HostLock)),
+			            us(static_cast<int>(Split::CountLock)), us(static_cast<int>(Split::HostCall)),
+			            static_cast<double>(window.split_calls[c]) / w, us(static_cast<int>(Split::Flush)),
+			            std::max(0.0, handler - split), static_cast<double>(window.split_concurrent[c]) / w,
+			            100.0 * static_cast<double>(window.split_concurrent_any[c]) / w);
+		}
 	}
 	std::printf("FaultMap   same page faulted again after: same frame %.1f, 1 frame %.1f, 2 %.1f, 3 %.1f, 4-7 %.1f, "
 	            "8+ %.1f, first time %.1f (per frame)\n",
@@ -302,6 +338,25 @@ void DumpMap(const MapWindow& window, uint32_t frame, double seconds) {
 			}
 		}
 	}
+	{
+		std::vector<std::pair<std::string, std::array<uint64_t, 2>>> threads(window.by_thread.begin(),
+		                                                                     window.by_thread.end());
+		std::sort(threads.begin(), threads.end(),
+		          [](const auto& a, const auto& b) { return a.second[1] > b.second[1]; });
+		std::string line = "FaultMap   by thread:";
+		char        text[128];
+		for (size_t i = 0; i < std::min<size_t>(threads.size(), 8); i++) {
+			std::snprintf(text, sizeof(text), " %s %.1f faults %.3f ms/frame;", threads[i].first.c_str(),
+			              per(threads[i].second[0]), per(threads[i].second[1]) / 1e6);
+			line += text;
+		}
+		std::printf("%s\n", line.c_str());
+	}
+	std::printf("FaultMap   host-lock waits outside faults: cp %.1f/frame %.3f ms/frame, guest %.1f/frame %.3f "
+	            "ms/frame, host %.1f/frame %.3f ms/frame\n",
+	            per(window.lock_waits[Cp]), per(window.lock_wait_ns[Cp]) / 1e6, per(window.lock_waits[Guest]),
+	            per(window.lock_wait_ns[Guest]) / 1e6, per(window.lock_waits[Host]),
+	            per(window.lock_wait_ns[Host]) / 1e6);
 	// Top 4 MiB regions, then top 64 KiB blocks.
 	std::unordered_map<uint64_t, std::array<uint64_t, 4>> regions; // faults by class + ns
 	for (const auto& [key, block]: window.blocks) {
@@ -1149,8 +1204,47 @@ void SetFaultInstruction(uint64_t rip) noexcept {
 	t_fault_rip = rip;
 }
 
+namespace {
+thread_local bool t_retried_fault = false;
+} // namespace
+
+RetriedFaultScope::RetriedFaultScope() noexcept: m_previous(t_retried_fault) {
+	t_retried_fault = true;
+}
+
+RetriedFaultScope::~RetriedFaultScope() {
+	t_retried_fault = m_previous;
+}
+
+bool InRetriedFault() noexcept {
+	return t_retried_fault;
+}
+
 void MapInFault(bool inside) noexcept {
 	t_in_fault = inside;
+	if (inside) {
+		for (auto& ns: t_split_ns) {
+			ns = 0;
+		}
+		t_split_calls      = 0;
+		t_split_concurrent = g_faults_in_flight.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_faults_in_flight.fetch_sub(1, std::memory_order_relaxed);
+	}
+}
+
+bool SplitActive() noexcept {
+	return g_map_enabled && t_in_fault;
+}
+
+void SplitAdd(Split part, uint64_t ns) noexcept {
+	if (!g_map_enabled || !t_in_fault) {
+		return;
+	}
+	t_split_ns[static_cast<int>(part)] += ns;
+	if (part == Split::HostCall) {
+		t_split_calls++;
+	}
 }
 
 void MapFault(const FaultRecord& record) noexcept {
@@ -1170,6 +1264,16 @@ void MapFault(const FaultRecord& record) noexcept {
 	}
 	if (!record.write) {
 		window.read_faults++;
+	} else {
+		// MapInFault(false) ran just before: the thread-local split describes this fault.
+		window.split_faults[thread]++;
+		window.split_handler_ns[thread] += record.handler_ns;
+		for (int part = 0; part < SplitParts; part++) {
+			window.split_ns[thread][part] += t_split_ns[part];
+		}
+		window.split_calls[thread] += t_split_calls;
+		window.split_concurrent[thread] += t_split_concurrent;
+		window.split_concurrent_any[thread] += t_split_concurrent != 0 ? 1u : 0u;
 	}
 	if (t_fault_rip >= g_exe_begin && t_fault_rip < g_exe_end) {
 		window.emulator_rip++;
@@ -1188,6 +1292,11 @@ void MapFault(const FaultRecord& record) noexcept {
 		window.since[us < 20 ? 0 : us < 200 ? 1 : us < 2000 ? 2 : us < 20000 ? 3 : 4]++;
 		it->second = PageLast {frame, now};
 	}
+	{
+		auto& entry = window.by_thread[std::string(name, strnlen(name, sizeof(name)))];
+		entry[0]++;
+		entry[1] += record.handler_ns;
+	}
 	auto& block = window.blocks[record.address >> 16u];
 	block.faults[thread]++;
 	block.ns += record.handler_ns;
@@ -1198,6 +1307,16 @@ void MapFault(const FaultRecord& record) noexcept {
 	}
 	block.rip = t_fault_rip;
 	std::memcpy(block.thread, name, sizeof(block.thread));
+}
+
+void NoteHostLockWait(uint64_t ns) noexcept {
+	if (!g_map_enabled) {
+		return;
+	}
+	const int        thread = CurrentThreadClass(nullptr, 0);
+	std::scoped_lock lock(g_map_mutex);
+	g_map.lock_waits[thread]++;
+	g_map.lock_wait_ns[thread] += ns;
 }
 
 void MapProtect(bool unprotect, bool no_access, uint64_t pages, uint64_t ns) noexcept {

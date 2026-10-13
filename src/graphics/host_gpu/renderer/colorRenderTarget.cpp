@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -9,6 +10,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -44,7 +46,8 @@ bool CmaskFastClearEnabled() {
 }
 
 bool DrawSequenceEnabled(DrawSequencePart part) {
-	static const uint32_t parts = [] {
+	static std::atomic<int64_t> parts_once {Common::OnceUnset};
+	const auto parts = static_cast<uint32_t>(Common::Once(parts_once, [] {
 		constexpr uint32_t all = static_cast<uint32_t>(DrawSequencePart::Targets) |
 		                         static_cast<uint32_t>(DrawSequencePart::Textures);
 		const auto* value = std::getenv("KYTY_DRAW_SEQUENCE_FAST");
@@ -62,18 +65,19 @@ bool DrawSequenceEnabled(DrawSequencePart part) {
 			selected |= static_cast<uint32_t>(DrawSequencePart::Textures);
 		}
 		return selected;
-	}();
+	}));
 	return (parts & static_cast<uint32_t>(part)) != 0;
 }
 
 int DrawSequenceVerifyMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const auto* value = std::getenv("KYTY_DRAW_SEQUENCE_VERIFY");
 		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	}));
 	return mode;
 }
 
@@ -89,7 +93,8 @@ void ReportDrawSequenceMismatch(const char* what) {
 }
 
 bool RenderStateFastEnabled(RenderStatePart part) {
-	static const uint32_t parts = [] {
+	static std::atomic<int64_t> parts_once {Common::OnceUnset};
+	const auto parts = static_cast<uint32_t>(Common::Once(parts_once, [] {
 		constexpr uint32_t all = static_cast<uint32_t>(RenderStatePart::VertexCopy) |
 		                         static_cast<uint32_t>(RenderStatePart::PrepSwap) |
 		                         static_cast<uint32_t>(RenderStatePart::Reset);
@@ -111,18 +116,19 @@ bool RenderStateFastEnabled(RenderStatePart part) {
 			selected |= static_cast<uint32_t>(RenderStatePart::Reset);
 		}
 		return selected;
-	}();
+	}));
 	return (parts & static_cast<uint32_t>(part)) != 0;
 }
 
 int RenderStateVerifyMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const auto* value = std::getenv("KYTY_RENDER_STATE_VERIFY");
 		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	}));
 	return mode;
 }
 
@@ -186,6 +192,7 @@ ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exac
 	}
 	auto&      totals = m_draw_sequence_totals;
 	const auto full   = [&] {
+		CommitStats::AddItems(CommitStats::Item::TargetLookup, 1);
 		const auto id = cache.FindImage(desc, exact_format, record);
 		if (record->valid) {
 			totals.target_records++;
@@ -207,6 +214,7 @@ ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exac
 	}
 	totals.target_repeats++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetRepeats);
+	CommitStats::AddItems(CommitStats::Item::TargetRepeat, 1);
 	if (!verify) {
 		return record->image;
 	}
@@ -301,6 +309,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		if (memo->valid && memo->mask == mask && memo->slice_offset == render_target_slice_offset &&
 		    std::memcmp(&memo->registers, &rt, sizeof(rt)) == 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoHits);
+			CommitStats::AddItems(CommitStats::Item::ColorMemoHit, 1);
 			r.desc              = memo->desc;
 			r.guest_mip_level   = memo->guest_mip_level;
 			r.guest_array_layer = memo->guest_array_layer;
@@ -310,6 +319,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			return;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoMisses);
+		CommitStats::AddItems(CommitStats::Item::ColorMemoMiss, 1);
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
@@ -399,9 +409,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}
-	if (!tile && levels > 1) {
-		EXIT("linear mipmapped render targets are unsupported\n");
-	}
 	if (samples > 1 && (!tile || levels != 1)) {
 		EXIT("multisampled render targets require a single-mip tiled surface\n");
 	}
@@ -471,13 +478,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 		size         = volume_layout.block_slice_size;
 		backing_size = volume_layout.total_size;
-	} else if (tile) {
+	} else {
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
-		if (texture_tile) {
+		if (!tile || texture_tile) {
 			TileGetTextureSize(transfer_format, width, height, levels, rt.attrib3.tile_mode,
 			                   &layout, mip_sizes, mip_padded);
-			valid_layout = layout.size != 0 && layout.align == texture_tile_layout.block.block_size;
+			const auto alignment = tile ? texture_tile_layout.block.block_size : 256u;
+			valid_layout = layout.size != 0 && layout.align == alignment;
 		} else {
 			valid_layout =
 			    levels == 1 ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
@@ -495,13 +503,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
 			mip_padded[0] = {pitch, height};
 		}
-	} else {
-		size = static_cast<uint64_t>(pitch) * height * bytes_per_element * samples;
-		if (size > UINT32_MAX) {
-			EXIT("linear render-target slice exceeds the supported layout size\n");
-		}
-		mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
-		mip_padded[0] = {pitch, height};
 	}
 	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
 		EXIT("render-target memory footprint is invalid\n");
@@ -537,7 +538,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.type              = TextureCache::BindingType::RenderTarget;
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;
-	desc.info.guest_format = transfer_format;
+	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
 	desc.info.extent       = {width, height, depth};
 	desc.info.resources    = {levels, volume ? 1u : view.image_layers};

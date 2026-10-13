@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 
@@ -1338,6 +1339,17 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 	    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
 	if (TileGetTiledTextureLayout(description, layout)) {
 		SetLegacyTiledMipLayout(layout, total_size, level_sizes, padded_size);
+		return;
+	}
+	if (total_size != nullptr && total_size->size == 0 && Common::SkipInvalidEnabled()) {
+		// KYTY_SKIP_INVALID: the size stays 0, which texture binding treats as an invalid
+		// footprint (bound as null). A stale descriptor (chenxiao07/KytyPS5 4a4faf72a: format 129).
+		static std::atomic_bool logged {false};
+		if (Common::LogOnce(logged)) {
+			std::printf("Warning: texture layout of an unknown format left unsized (KYTY_SKIP_INVALID; "
+			            "logged once): format=%u %ux%u levels=%u tile=%u\n",
+			            static_cast<uint32_t>(format), width, height, levels, static_cast<uint32_t>(tile));
+		}
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {

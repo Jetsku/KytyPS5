@@ -16,10 +16,12 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <magic_enum.hpp>
 #include <vector>
 
@@ -59,6 +61,170 @@ struct OutputClock {
 		return deadline;
 	}
 };
+
+// KYTY_AUDIO_CLOCK_SKEW_PPM (testing): the sample clock paces this many ppm slower (positive) or
+// faster than the process clock, imitating a playback device whose crystal runs faster (or
+// slower) than the host's TSC. 0 by default.
+static int64_t audio_out_clock_skew_ppm() {
+	static const int64_t ppm = [] {
+		const char* value = std::getenv("KYTY_AUDIO_CLOCK_SKEW_PPM");
+		return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), -20000, 20000) : 0;
+	}();
+	return ppm;
+}
+
+static uint32_t audio_out_clock_rate(uint32_t freq) {
+	const auto ppm = audio_out_clock_skew_ppm();
+	return ppm == 0 ? freq
+	                : static_cast<uint32_t>(static_cast<int64_t>(freq) - static_cast<int64_t>(freq) * ppm / 1000000);
+}
+
+// KYTY_AUDIO_PAD_PRIME: a port that joins a batch another port already paces never gets an unpaced
+// burst, so it plays with whatever cushion it started with (often under one block: the pad
+// speaker's main-output fallback opens after the bed). Such a port, when found under one block, is
+// topped up to its target with silence instead, once, and then counts as primed. On by default;
+// KYTY_AUDIO_PAD_PRIME=0 turns it off.
+static std::atomic<int> g_pad_prime {-1};
+static bool             audio_out_pad_prime() {
+	int enabled = g_pad_prime.load(std::memory_order_relaxed);
+	if (enabled < 0) {
+		const char* value = std::getenv("KYTY_AUDIO_PAD_PRIME");
+		enabled           = value == nullptr || value[0] != '0' ? 1 : 0;
+		g_pad_prime.store(enabled, std::memory_order_relaxed);
+	}
+	return enabled != 0;
+}
+
+// The SDL queue level a blocking port keeps (KYTY_AUDIO_LATENCY_MS, 10-500; default 40 ms).
+static uint64_t audio_out_target_latency_us() {
+	static const uint64_t latency = [] {
+		const char* value = std::getenv("KYTY_AUDIO_LATENCY_MS");
+		const long  ms    = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+		return ms > 0 ? static_cast<uint64_t>(std::clamp(ms, 10L, 500L)) * 1000 : AUDIO_OUT_TARGET_LATENCY_US;
+	}();
+	return latency;
+}
+
+// KYTY_AUDIO_QUEUE_CATCHUP: a primed port whose SDL queue has fallen more than one block below its
+// target skips the sample-clock wait for that block, so the device's consumption rate, not the
+// process clock, sets the long-term pace. Without it a device that plays a few ppm faster than the
+// process clock (calibrated TSC) drains the cushion at a steady rate until the queue runs dry; the
+// port then re-primes with an unpaced burst, which a guest that cannot render ahead does not fill.
+// On by default; KYTY_AUDIO_QUEUE_CATCHUP=0 turns it off.
+static std::atomic<int> g_queue_catchup {-1}; // -1: not read yet (tests set it directly).
+static bool             audio_out_queue_catchup() {
+	int enabled = g_queue_catchup.load(std::memory_order_relaxed);
+	if (enabled < 0) {
+		const char* value = std::getenv("KYTY_AUDIO_QUEUE_CATCHUP");
+		enabled           = value == nullptr || value[0] != '0' ? 1 : 0;
+		g_queue_catchup.store(enabled, std::memory_order_relaxed);
+	}
+	return enabled != 0;
+}
+
+// KYTY_AUDIO_TRACE: per output port, what happened in the last Diag::TRACE_INTERVAL_US.
+struct OutTrace {
+	static constexpr int WAIT_BUCKETS = 8; // 0, <1, <2, <5, <10, <20, <50 ms, cleared (200 ms)
+
+	uint64_t start        = 0;
+	uint32_t writes       = 0;
+	uint32_t blocking     = 0;
+	uint64_t bytes        = 0;
+	int64_t  queued_sum   = 0;
+	int      queued_min   = INT_MAX;
+	int      queued_max   = 0;
+	int      queued_first = -1;
+	int      queued_last  = 0;
+	uint32_t low          = 0; // Writes that found less than one block queued.
+	uint32_t clears       = 0;
+	uint32_t reprimes     = 0;
+	uint32_t catch_ups    = 0;
+	uint32_t events       = 0; // Event lines printed in this window.
+	uint64_t sleep_us     = 0; // Sample-clock waits.
+	uint32_t sleeps       = 0;
+	uint64_t gap_sum      = 0; // Guest time between two submissions (its mixing time).
+	uint64_t gap_max      = 0;
+	uint32_t gaps         = 0;
+	uint32_t late_gaps    = 0; // Gaps longer than one block.
+	uint64_t last_return  = 0;
+	uint64_t total_clears = 0;
+	uint64_t total_low    = 0;
+	uint64_t total_short  = 0;
+	uint32_t pads         = 0;
+	// What the guest handed over (as sent to SDL): all-zero blocks, zero blocks right after sound
+	// (dropouts), sample jumps at block boundaries far above the block's own sample-to-sample
+	// steps (clicks), and the mean power.
+	uint32_t zero_blocks  = 0;
+	uint32_t dropouts     = 0;
+	uint32_t jumps        = 0;
+	double   power_sum    = 0.0;
+	uint64_t power_n      = 0;
+	bool     have_prev    = false;
+	bool     prev_sound   = false;
+	float    prev_last[8] {};
+
+	std::array<uint32_t, WAIT_BUCKETS> wait {};
+
+	static int WaitBucket(uint64_t us, bool cleared) {
+		if (cleared) {
+			return WAIT_BUCKETS - 1;
+		}
+		static constexpr uint64_t LIMITS[] = {1, 1000, 2000, 5000, 10000, 20000, 50000};
+		for (int i = 0; i < WAIT_BUCKETS - 1; i++) {
+			if (us < LIMITS[i]) {
+				return i;
+			}
+		}
+		return WAIT_BUCKETS - 2;
+	}
+};
+
+// Filled by SDL's device thread through the stream's get callback: what the device asked the
+// stream for and how much of it was missing (played as silence).
+struct DeviceTrace {
+	std::atomic<uint64_t> requests {0};
+	std::atomic<uint64_t> bytes {0};
+	std::atomic<uint64_t> short_requests {0};
+	std::atomic<uint64_t> short_bytes {0};
+	// Time between two requests: SDL's device thread running late (the host device then plays
+	// out whatever its own buffer holds, or a gap).
+	std::atomic<uint64_t> last_ns {0};
+	std::atomic<uint64_t> max_interval_ns {0};
+	std::atomic<uint32_t> late15 {0};
+	std::atomic<uint32_t> late30 {0};
+
+	void Reset() {
+		requests        = 0;
+		bytes           = 0;
+		short_requests  = 0;
+		short_bytes     = 0;
+		last_ns         = 0;
+		max_interval_ns = 0;
+		late15          = 0;
+		late30          = 0;
+	}
+};
+
+static void SDLCALL trace_device_request(void* userdata, SDL_AudioStream* /*stream*/,
+                                         int additional_amount, int total_amount) {
+	auto*      device = static_cast<DeviceTrace*>(userdata);
+	const auto now_ns = SDL_GetTicksNS();
+	const auto last   = device->last_ns.exchange(now_ns, std::memory_order_relaxed);
+	if (last != 0 && now_ns > last) {
+		const auto interval = now_ns - last;
+		if (interval > device->max_interval_ns.load(std::memory_order_relaxed)) {
+			device->max_interval_ns.store(interval, std::memory_order_relaxed);
+		}
+		device->late15.fetch_add(interval > 15000000 ? 1 : 0, std::memory_order_relaxed);
+		device->late30.fetch_add(interval > 30000000 ? 1 : 0, std::memory_order_relaxed);
+	}
+	device->requests.fetch_add(1, std::memory_order_relaxed);
+	device->bytes.fetch_add(static_cast<uint64_t>(std::max(total_amount, 0)), std::memory_order_relaxed);
+	if (additional_amount > 0) {
+		device->short_requests.fetch_add(1, std::memory_order_relaxed);
+		device->short_bytes.fetch_add(static_cast<uint64_t>(additional_amount), std::memory_order_relaxed);
+	}
+}
 
 static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
@@ -140,8 +306,9 @@ public:
 	};
 
 	struct OutputParam {
-		Id          handle;
-		const void* data = nullptr;
+		Id           handle;
+		const void*  data  = nullptr;
+		const float* gains = nullptr;
 	};
 
 	Audio() = default;
@@ -182,6 +349,8 @@ private:
 		bool        queue_primed = false;
 		int         channels_num = 0;
 		int         volume[12]   = {};
+		// A 7.1 (or 7.1.4) port on a stereo device: downmixed here instead of by SDL.
+		bool        downmix_stereo = false;
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
@@ -191,6 +360,15 @@ private:
 		uint32_t        meter_on_main = 0; // Blocks that played on the main output.
 		uint32_t        meter_blocks  = 0;
 		float           meter_gain    = 1.0f;
+		// What SDL is given (after volume, host gain and a stereo downmix), and samples beyond
+		// full scale in it.
+		bool            meter_device   = false;
+		Mix::LevelMeter device_meter;
+		uint32_t        device_clipped = 0;
+
+		int      trace_id = 0; // 1-based port number in trace lines.
+		bool     catch_up = false; // The last write found the queue below target (no clock wait).
+		OutTrace trace;
 	};
 
 	struct PortIn {
@@ -225,9 +403,17 @@ private:
 	static void            OpenSdlDevice(PortIn* port, Format format);
 	static void            CloseSdlDevice(PortIn* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
-	                                           std::vector<uint8_t>* buffer, float gain);
-	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain);
+	                                           std::vector<uint8_t>* buffer, float gain,
+	                                           const float* gains);
+	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
+	                          const float* gains, bool batch_paced = false);
+	static void TraceSummary(PortOut* port, uint64_t now);
+	static void TraceContent(PortOut* port, const void* data);
+
+	static DeviceTrace s_device_trace[OUT_PORTS_MAX];
 };
+
+DeviceTrace Audio::s_device_trace[Audio::OUT_PORTS_MAX];
 
 static Audio* g_audio = nullptr;
 
@@ -262,7 +448,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	for (uint32_t i = 0; i < num; i++) {
 		if (params[i].handle > 0 && params[i].data != nullptr) {
 			output_params.push_back(
-			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data});
+			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data, params[i].gains});
 		}
 	}
 
@@ -274,25 +460,44 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	                                static_cast<uint32_t>(output_params.size()), blocking);
 }
 
+float AudioOutObjectsGain() {
+	return g_audio != nullptr ? Mix::ObjectsGain(g_audio->GetMixSettings()) : 1.0f;
+}
+
+bool AudioOutObjectsEnabled() {
+	return g_audio == nullptr || g_audio->GetMixSettings().objects_enabled;
+}
+
 } // namespace AudioInternal
 
 void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
+	// Audio diagnostics reach the printf file too: players send _kyty.txt, not the console.
+	Diag::ConsoleLogWriter().store(+[](const std::string& text) { Log::WriteToConsoleAndLog(text); });
+
 	g_audio = new Audio;
+	if (Diag::TraceEnabled()) {
+		Diag::Trace("on: output target latency %.0f ms, queue catch-up %s",
+		            static_cast<double>(audio_out_target_latency_us()) / 1000.0,
+		            audio_out_queue_catchup() ? "on" : "off");
+	}
 
 	Mix::Settings mix;
 	mix.master      = Config::GetAudioMasterVolume();
 	mix.main        = Config::GetAudioMainVolume();
 	mix.music       = Config::GetAudioMusicVolume();
 	mix.pad_on_main = Config::GetAudioPadSpeakerOnMainVolume();
+	mix.objects     = Config::GetAudioObjectsVolume();
+	mix.objects_enabled = Config::AudioObjectsEnabled();
 	mix             = Mix::ApplyEnvironment(mix, [](const char* name) { return std::getenv(name); });
 	g_audio->SetMixSettings(mix);
 	const char* levels = std::getenv("KYTY_AUDIO_LEVELS");
 	g_audio->SetLevelLogging(levels != nullptr && levels[0] != '\0' && levels[0] != '0');
 	std::printf("Kyty audio mix: master %u%%, main %u%%, music (BGM ports) %u%%, pad speaker on main "
-	            "output %u%%\n",
-	            mix.master, mix.main, mix.music, mix.pad_on_main);
+	            "output %u%%, 3D objects %s %u%%\n",
+	            mix.master, mix.main, mix.music, mix.pad_on_main, mix.objects_enabled ? "on" : "off",
+	            mix.objects);
 }
 
 void Shutdown() {
@@ -330,7 +535,19 @@ uint32_t Audio::BytesPerSample(Format format) {
 
 uint32_t Audio::OutputChannels(const PortOut& port) {
 	// SDL only takes up to 8 channels. Keep the guest buffer's channel count separate.
-	return std::min(port.channels_num, 8);
+	return port.downmix_stereo ? 2u : static_cast<uint32_t>(std::min(port.channels_num, 8));
+}
+
+// SDL's 7.1-to-stereo matrix keeps eight full-scale channels unclipped, so it plays the front pair
+// at 0.21 (-13.5 dB): game audio on a 7.1 bed came out far too quiet on stereo devices. Such ports
+// are downmixed here instead with the usual coefficients (front 1, centre/surrounds/heights 0.707,
+// LFE dropped). KYTY_AUDIO_STEREO_DOWNMIX=0 leaves it to SDL.
+static bool StereoDownmixEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_STEREO_DOWNMIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
 }
 
 SDL_AudioFormat Audio::SdlFormat(Format format) {
@@ -346,6 +563,19 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		return false;
 	}
 	report_default_playback_device();
+
+	port->downmix_stereo = false;
+	if (port->channels_num >= 8 && StereoDownmixEnabled()) {
+		SDL_AudioSpec device {};
+		port->downmix_stereo =
+		    SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &device, nullptr) &&
+		    device.channels == 2;
+		if (port->downmix_stereo) {
+			Diag::Print("%d-channel output on a stereo device: downmixed by Kyty (front 1, centre/"
+			            "surrounds 0.707, no LFE)",
+			            port->channels_num);
+		}
+	}
 
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
@@ -386,7 +616,8 @@ void Audio::CloseSdlDevice(PortOut* port) {
 }
 
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
-                                       std::vector<uint8_t>* buffer, float gain) {
+                                       std::vector<uint8_t>* buffer, float gain,
+                                       const float* gains) {
 	EXIT_IF(data == nullptr);
 	EXIT_IF(buffer == nullptr);
 
@@ -396,12 +627,50 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
 
-	bool volume_changed = gain != 1.0f;
-	for (uint32_t ch = 0; ch < channels; ch++) {
-		if (port.volume[ch] != 32768) {
-			volume_changed = true;
-			break;
+	if (port.downmix_stereo) {
+		// Both 8-channel orders have the left surrounds at 4 and 6 and the right ones at 5 and 7; the
+		// 12-channel one adds its left heights at 8 and 10 and the right ones at 9 and 11.
+		const bool is_float = FormatIsFloat(port.format);
+		float      scale[12] {};
+		for (uint32_t ch = 0; ch < channels && ch < 12; ch++) {
+			scale[ch] = static_cast<float>(port.volume[ch]) / 32768.0f * gain *
+			            (gains != nullptr ? gains[ch] : 1.0f);
 		}
+		const auto sample = [&](uint32_t frame, uint32_t ch) {
+			const auto  index = static_cast<size_t>(frame) * channels + ch;
+			const float value = is_float ? static_cast<const float*>(data)[index]
+			                             : static_cast<float>(static_cast<const int16_t*>(data)[index]) / 32768.0f;
+			return value * scale[ch];
+		};
+		constexpr float SIDE = 0.70710677f;
+		buffer->resize(static_cast<size_t>(frames) * 2 * bytes_per_sample);
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			const float centre = sample(frame, 2);
+			float left  = sample(frame, 0) + SIDE * (centre + sample(frame, 4) + sample(frame, 6));
+			float right = sample(frame, 1) + SIDE * (centre + sample(frame, 5) + sample(frame, 7));
+			if (channels == 12) {
+				left += SIDE * (sample(frame, 8) + sample(frame, 10));
+				right += SIDE * (sample(frame, 9) + sample(frame, 11));
+			}
+			if (is_float) {
+				reinterpret_cast<float*>(buffer->data())[frame * 2]     = left;
+				reinterpret_cast<float*>(buffer->data())[frame * 2 + 1] = right;
+			} else {
+				reinterpret_cast<int16_t*>(buffer->data())[frame * 2] =
+				    static_cast<int16_t>(std::clamp(left * 32768.0f, -32768.0f, 32767.0f));
+				reinterpret_cast<int16_t*>(buffer->data())[frame * 2 + 1] =
+				    static_cast<int16_t>(std::clamp(right * 32768.0f, -32768.0f, 32767.0f));
+			}
+		}
+		return buffer->data();
+	}
+
+	std::array<double, 12> scales {};
+	bool                   volume_changed = false;
+	for (uint32_t ch = 0; ch < channels; ch++) {
+		scales[ch] = (static_cast<double>(port.volume[ch]) / 32768.0) * gain *
+		             (gains != nullptr ? gains[ch] : 1.0f);
+		volume_changed |= scales[ch] != 1.0;
 	}
 
 	if (!volume_changed && !reorder) {
@@ -421,8 +690,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				dst[frame * output_channels + ch] =
-				    src[frame * channels + src_ch] *
-				    (static_cast<float>(port.volume[src_ch]) / 32768.0f) * gain;
+				    static_cast<float>(src[frame * channels + src_ch] * scales[src_ch]);
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
@@ -430,8 +698,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
 				for (uint32_t ch = 0; ch < 4; ch++) {
 					dst[frame * output_channels + HEIGHT_DST[ch]] +=
-					    src[frame * channels + 8 + ch] *
-					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f) * gain;
+					    static_cast<float>(src[frame * channels + 8 + ch] * scales[8 + ch]);
 				}
 			}
 		}
@@ -442,15 +709,9 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
-				sample = static_cast<int64_t>(sample * static_cast<double>(gain));
-				if (sample > std::numeric_limits<int16_t>::max()) {
-					sample = std::numeric_limits<int16_t>::max();
-				} else if (sample < std::numeric_limits<int16_t>::min()) {
-					sample = std::numeric_limits<int16_t>::min();
-				}
-				dst[frame * output_channels + ch] = static_cast<int16_t>(sample);
+				const double sample = src[frame * channels + src_ch] * scales[src_ch];
+				dst[frame * output_channels + ch] = static_cast<int16_t>(
+				    std::clamp(sample, -32768.0, 32767.0));
 			}
 		}
 	}
@@ -458,7 +719,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain) {
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
+                          const float* gains, bool batch_paced) {
 	EXIT_IF(port == nullptr);
 
 	if (port->stream == nullptr || data == nullptr) {
@@ -466,25 +728,47 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer, gain);
+	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer, gain, gains);
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
+	if (port->meter_device) {
+		port->device_meter.Add(prepared_data, port->samples_num, output_channels, FormatIsFloat(port->format));
+		if (FormatIsFloat(port->format)) {
+			const auto* samples = static_cast<const float*>(prepared_data);
+			for (uint32_t i = 0; i < port->samples_num * output_channels; i++) {
+				port->device_clipped += std::abs(samples[i]) > 1.0f ? 1 : 0;
+			}
+		}
+	}
 
+	const bool trace       = Diag::TraceEnabled();
+	const bool was_primed  = port->queue_primed;
+	const auto frame_bytes = BytesPerSample(port->format) * output_channels;
+	const auto to_ms       = [&](int bytes) {
+		return frame_bytes != 0 && port->freq != 0
+		           ? static_cast<double>(bytes) / frame_bytes * 1000.0 / port->freq
+		           : 0.0;
+	};
 	uint32_t min_queued_size = 0;
+	int      queued_before   = -1;
+	port->catch_up           = false;
 	if (blocking) {
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0
-		        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
+		        ? static_cast<uint32_t>((audio_out_target_latency_us() + buffer_us - 1) / buffer_us)
 		        : 2u;
-		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
+		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 96u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
+		const int  queued_on_entry = queued;
+		bool       cleared         = false;
 		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearAudioStream(port->stream);
 				port->queue_primed = false;
+				cleared            = true;
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
@@ -493,10 +777,89 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		if (queued < static_cast<int>(prepared_size)) {
 			port->queue_primed = false;
 		}
+		// Below target by more than a block: the device is consuming faster than the sample clock
+		// paces this port. Write the next block without the clock wait.
+		port->catch_up = audio_out_queue_catchup() && port->queue_primed &&
+		                 queued + static_cast<int>(prepared_size) < static_cast<int>(min_queued_size);
+		queued_before = queued;
+		if (trace) {
+			const auto now    = LibKernel::KernelGetProcessTime();
+			auto&      t      = port->trace;
+			const auto waited = now - wait_start;
+			t.blocking++;
+			t.wait[OutTrace::WaitBucket(waited, cleared)]++;
+			t.catch_ups += port->catch_up ? 1 : 0;
+			if (cleared) {
+				t.clears++;
+				t.total_clears++;
+				if (t.events++ < 8) {
+					Diag::Trace("t=%.3f s port %d CLEAR: queue did not drain for %.1f ms, %d bytes "
+					            "(%.1f ms) queued on entry, %d (%.1f ms) at the clear; target %.1f ms",
+					            static_cast<double>(now) / 1e6, port->trace_id,
+					            static_cast<double>(waited) / 1000.0, queued_on_entry,
+					            to_ms(queued_on_entry), queued, to_ms(queued), to_ms(static_cast<int>(min_queued_size)));
+				}
+			}
+			if (queued < static_cast<int>(prepared_size)) {
+				t.low++;
+				t.total_low++;
+				if (t.events++ < 8) {
+					Diag::Trace("t=%.3f s port %d LOW: %d bytes (%.2f ms) queued before the write, "
+					            "under one block (%.2f ms)%s",
+					            static_cast<double>(now) / 1e6, port->trace_id, queued, to_ms(queued),
+					            to_ms(static_cast<int>(prepared_size)),
+					            was_primed ? "; was primed: re-priming" : "");
+				}
+			}
+		}
+	} else if (trace) {
+		queued_before = SDL_GetAudioStreamQueued(port->stream);
+	}
+	if (trace) {
+		auto& t = port->trace;
+		t.writes++;
+		t.bytes += prepared_size;
+		if (queued_before >= 0) {
+			t.queued_sum += queued_before;
+			t.queued_min = std::min(t.queued_min, queued_before);
+			t.queued_max = std::max(t.queued_max, queued_before);
+			if (t.queued_first < 0) {
+				t.queued_first = queued_before;
+			}
+			t.queued_last = queued_before;
+		}
+		if (was_primed && !port->queue_primed) {
+			t.reprimes++;
+		}
+	}
+
+	if (blocking && batch_paced && !port->queue_primed && queued_before >= 0 &&
+	    queued_before < static_cast<int>(prepared_size)) {
+		// Up to the target before this block, as a burst-primed port stands.
+		int pad = static_cast<int>(min_queued_size) - queued_before;
+		pad -= pad % static_cast<int>(frame_bytes);
+		if (pad > 0) {
+			const std::vector<uint8_t> silence(static_cast<size_t>(pad), 0);
+			if (SDL_PutAudioStreamData(port->stream, silence.data(), pad) && trace) {
+				port->trace.pads++;
+				if (port->trace.events++ < 8) {
+					Diag::Trace("t=%.3f s port %d PAD: %.2f ms queued in a paced batch; %.2f ms of silence "
+					            "added to reach the target",
+					            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6, port->trace_id,
+					            to_ms(queued_before), to_ms(pad));
+				}
+			}
+		}
+	}
+	if (trace) {
+		TraceContent(port, prepared_data);
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
+		if (trace) {
+			Diag::Trace("port %d: SDL_PutAudioStreamData failed: %s", port->trace_id, SDL_GetError());
+		}
 		port->queue_primed = false;
 		return false;
 	}
@@ -508,8 +871,117 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
 		port->queue_primed = true;
 	}
+	if (trace) {
+		TraceSummary(port, LibKernel::KernelGetProcessTime());
+	}
 
 	return true;
+}
+
+void Audio::TraceContent(PortOut* port, const void* data) {
+	auto&      t        = port->trace;
+	const auto channels = std::min<uint32_t>(OutputChannels(*port), 8);
+	const auto frames   = port->samples_num;
+	const bool is_float = FormatIsFloat(port->format);
+	const auto stride   = OutputChannels(*port);
+	const auto sample   = [&](uint32_t frame, uint32_t ch) {
+		const auto index = static_cast<size_t>(frame) * stride + ch;
+		return is_float ? static_cast<const float*>(data)[index]
+		                : static_cast<float>(static_cast<const int16_t*>(data)[index]) / 32768.0f;
+	};
+	if (frames == 0 || channels == 0) {
+		return;
+	}
+	bool   zero  = true;
+	double power = 0.0;
+	bool   jump  = false;
+	for (uint32_t ch = 0; ch < channels; ch++) {
+		double steps = 0.0;
+		float  prev  = sample(0, ch);
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			const float value = sample(frame, ch);
+			zero &= value == 0.0f;
+			power += static_cast<double>(value) * value;
+			if (frame != 0) {
+				steps += std::abs(value - prev);
+			}
+			prev = value;
+		}
+		const double mean_step = frames > 1 ? steps / (frames - 1) : 0.0;
+		const double boundary  = std::abs(sample(0, ch) - t.prev_last[ch]);
+		jump |= t.have_prev && boundary > 0.05 && boundary > 12.0 * mean_step + 0.02;
+		t.prev_last[ch] = sample(frames - 1, ch);
+	}
+	const double mean_power = power / (static_cast<double>(frames) * channels);
+	t.zero_blocks += zero ? 1 : 0;
+	t.dropouts += zero && t.prev_sound ? 1 : 0;
+	t.jumps += jump ? 1 : 0;
+	t.power_sum += mean_power;
+	t.power_n++;
+	t.have_prev  = true;
+	t.prev_sound = mean_power > 1e-6; // -60 dBFS
+}
+
+void Audio::TraceSummary(PortOut* port, uint64_t now) {
+	auto& t = port->trace;
+	if (t.start == 0) {
+		t.start = now;
+		return;
+	}
+	if (now - t.start < Diag::TRACE_INTERVAL_US) {
+		return;
+	}
+	const double elapsed     = static_cast<double>(now - t.start) / 1e6;
+	const auto   frame_bytes = static_cast<double>(BytesPerSample(port->format) * OutputChannels(*port));
+	const auto   to_ms       = [&](double bytes) { return bytes / frame_bytes * 1000.0 / port->freq; };
+	auto&        device      = s_device_trace[port->trace_id - 1];
+	const auto   dev_bytes   = device.bytes.exchange(0, std::memory_order_relaxed);
+	const auto   dev_req     = device.requests.exchange(0, std::memory_order_relaxed);
+	const auto   dev_short   = device.short_requests.exchange(0, std::memory_order_relaxed);
+	const auto   short_bytes = device.short_bytes.exchange(0, std::memory_order_relaxed);
+	t.total_short += dev_short;
+	const int queued_now = SDL_GetAudioStreamQueued(port->stream);
+	// The device's consumption over the window: what was put minus the change in queue level.
+	const double consumed = static_cast<double>(t.bytes) -
+	                        (t.queued_first >= 0 ? static_cast<double>(queued_now - t.queued_first) : 0.0);
+	Diag::Trace("t=%.1f s port %d %s %u Hz: %u writes (%u blocking) put %.1f Hz, device took %.1f Hz "
+	            "(requests %.1f Hz, %llu requests); queue ms min/avg/max %.1f/%.1f/%.1f first %.1f last %.1f; "
+	            "low %u, clears %u, re-primes %u, catch-ups %u; device short %llu (%.1f ms silence); wait "
+	            "hist 0/<1/<2/<5/<10/<20/<50ms/clear %u/%u/%u/%u/%u/%u/%u/%u; clock sleep %.1f ms in %u; "
+	            "guest gap avg %.2f max %.2f ms, %u over a block; totals clears %llu low %llu short %llu",
+	            static_cast<double>(now) / 1e6, port->trace_id, audio_out_port_type_name(port->type), port->freq,
+	            t.writes, t.blocking, static_cast<double>(t.bytes) / frame_bytes / elapsed,
+	            consumed / frame_bytes / elapsed, static_cast<double>(dev_bytes) / frame_bytes / elapsed,
+	            static_cast<unsigned long long>(dev_req), t.queued_min == INT_MAX ? 0.0 : to_ms(t.queued_min),
+	            t.writes != 0 ? to_ms(static_cast<double>(t.queued_sum) / t.writes) : 0.0, to_ms(t.queued_max),
+	            to_ms(std::max(t.queued_first, 0)), to_ms(t.queued_last), t.low, t.clears, t.reprimes, t.catch_ups,
+	            static_cast<unsigned long long>(dev_short), to_ms(static_cast<double>(short_bytes)), t.wait[0],
+	            t.wait[1], t.wait[2], t.wait[3], t.wait[4], t.wait[5], t.wait[6], t.wait[7],
+	            static_cast<double>(t.sleep_us) / 1000.0, t.sleeps,
+	            t.gaps != 0 ? static_cast<double>(t.gap_sum) / t.gaps / 1000.0 : 0.0,
+	            static_cast<double>(t.gap_max) / 1000.0, t.late_gaps,
+	            static_cast<unsigned long long>(t.total_clears), static_cast<unsigned long long>(t.total_low),
+	            static_cast<unsigned long long>(t.total_short));
+	const auto max_interval = device.max_interval_ns.exchange(0, std::memory_order_relaxed);
+	const auto late15       = device.late15.exchange(0, std::memory_order_relaxed);
+	const auto late30       = device.late30.exchange(0, std::memory_order_relaxed);
+	Diag::Trace("t=%.1f s port %d content: rms %.1f dBFS, %u zero blocks, %u dropouts (zero block after "
+	            "sound), %u boundary jumps, %u silence pads; device request gaps max %.1f ms, %u over 15 ms, "
+	            "%u over 30 ms",
+	            static_cast<double>(now) / 1e6, port->trace_id,
+	            t.power_n != 0 && t.power_sum > 0.0 ? 10.0 * std::log10(t.power_sum / t.power_n) : -200.0,
+	            t.zero_blocks, t.dropouts, t.jumps, t.pads, static_cast<double>(max_interval) / 1e6, late15,
+	            late30);
+	OutTrace next;
+	next.start        = now;
+	next.last_return  = t.last_return;
+	next.total_clears = t.total_clears;
+	next.total_low    = t.total_low;
+	next.total_short  = t.total_short;
+	next.have_prev    = t.have_prev;
+	next.prev_sound   = t.prev_sound;
+	std::copy(std::begin(t.prev_last), std::end(t.prev_last), std::begin(next.prev_last));
+	t = next;
 }
 
 Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
@@ -550,6 +1022,16 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			if (type != AUDIO_OUT_PORT_TYPE_VIBRATION) {
 				OpenSdlDevice(&port);
 			}
+			port.trace_id = id + 1;
+			port.trace    = {};
+			s_device_trace[id].Reset();
+			if (Diag::TraceEnabled() && port.stream != nullptr) {
+				SDL_SetAudioStreamGetCallback(port.stream, trace_device_request, &s_device_trace[id]);
+				Diag::Trace("t=%.3f s port %d open: %s, %u frames (%.2f ms), %u Hz, %d ch",
+				            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6, id + 1,
+				            audio_out_port_type_name(type), samples_num,
+				            1000.0 * samples_num / freq, freq, port.channels_num);
+			}
 			if (type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_PADSPK) {
 				port.haptics =
 				    Controller::DualSenseHaptics::Open(freq, type == AUDIO_OUT_PORT_TYPE_PADSPK);
@@ -578,6 +1060,14 @@ bool Audio::AudioOutClose(Id handle) {
 		auto& port = m_out_ports[handle.GetId()];
 
 		Diag::Print("output port %d close: %s", handle.ToInt(), audio_out_port_type_name(port.type));
+		if (Diag::TraceEnabled()) {
+			Diag::Trace("t=%.3f s port %d close: %s; totals clears %llu low %llu short %llu",
+			            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6, handle.ToInt(),
+			            audio_out_port_type_name(port.type),
+			            static_cast<unsigned long long>(port.trace.total_clears),
+			            static_cast<unsigned long long>(port.trace.total_low),
+			            static_cast<unsigned long long>(port.trace.total_short));
+		}
 		CloseSdlDevice(&port);
 		port = {};
 
@@ -626,6 +1116,15 @@ void Audio::MeterOutput(int port_id, PortOut* port, const void* data, bool on_ma
 	            static_cast<double>(port->meter_gain),
 	            Mix::LevelMeter::ToDb(rms * volume * port->meter_gain), port->meter_on_main,
 	            port->meter_blocks, static_cast<double>(now - port->meter_start) / 1e6);
+	if (port->device_meter.Samples() != 0) {
+		std::printf("AudioLevel: t=%.1f s port %d to SDL: %uch rms %.1f dBFS peak %.1f dBFS, %u samples "
+		            "clipped\n",
+		            static_cast<double>(now) / 1e6, port_id + 1, OutputChannels(*port),
+		            Mix::LevelMeter::ToDb(port->device_meter.Rms()),
+		            Mix::LevelMeter::ToDb(port->device_meter.Peak()), port->device_clipped);
+		port->device_meter.Reset();
+		port->device_clipped = 0;
+	}
 	std::fflush(stdout);
 	port->meter.Reset();
 	port->meter_start   = now;
@@ -658,6 +1157,14 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 			auto bit = bitflag & 0x1u;
 
 			if (bit == 1) {
+				if (Diag::TraceEnabled() && port.volume[i] != volume[i]) {
+					static std::atomic<int> lines {0};
+					if (lines.fetch_add(1, std::memory_order_relaxed) < 64) {
+						Diag::Trace("t=%.3f s port %d volume ch %d: %d -> %d",
+						            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
+						            handle.ToInt(), i, port.volume[i], volume[i]);
+					}
+				}
 				port.volume[i] = volume[i];
 
 				LOGF("\t port.volume[%d] = volume[%d] (%d)\n", i, i, volume[i]);
@@ -674,10 +1181,32 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
 
-	const auto&                     first_port = m_out_ports[params[0].handle.GetId()];
+	auto&                           first_port = m_out_ports[params[0].handle.GetId()];
 	std::array<bool, OUT_PORTS_MAX> paced {};
 	bool                            any_device = false;
 	uint64_t                        deadline   = 0;
+	const bool                      trace      = Diag::TraceEnabled();
+	if (trace) {
+		auto&      t     = first_port.trace;
+		const auto start = LibKernel::KernelGetProcessTime();
+		if (t.last_return != 0 && start > t.last_return) {
+			const auto gap    = start - t.last_return;
+			const auto period = first_port.freq != 0 ? 1000000ULL * first_port.samples_num / first_port.freq : 0;
+			t.gap_sum += gap;
+			t.gap_max = std::max(t.gap_max, gap);
+			t.gaps++;
+			t.late_gaps += gap > period ? 1 : 0;
+		}
+	}
+	// Which ports already pace this batch (see KYTY_AUDIO_PAD_PRIME): a port is padded only when
+	// another one does.
+	std::array<bool, OUT_PORTS_MAX> primed_before {};
+	uint32_t                        primed_count = 0;
+	for (uint32_t i = 0; i < num && blocking && audio_out_pad_prime(); i++) {
+		const auto& port = m_out_ports[params[i].handle.GetId()];
+		primed_before[i] = port.stream != nullptr && port.queue_primed;
+		primed_count += primed_before[i] ? 1 : 0;
+	}
 
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
@@ -698,7 +1227,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume,
-			    gain);
+			    gain, params[i].gains);
 			controller_uses_bluetooth =
 			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
@@ -710,15 +1239,18 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 				MeterOutput(params[i].handle.GetId(), &port, params[i].data,
 				            port.stream != nullptr, main_gain);
 			}
-			if (QueueSdlAudio(&port, params[i].data, blocking, main_gain)) {
+			port.meter_device = m_level_logging;
+			const bool paced_by_other = primed_count > (primed_before[i] ? 1u : 0u);
+			if (QueueSdlAudio(&port, params[i].data, blocking, main_gain, params[i].gains, paced_by_other)) {
 				any_device = true;
-				paced[i]   = port.queue_primed;
+				paced[i]   = port.queue_primed && !port.catch_up;
 			}
 		} else {
 			if (m_level_logging) {
 				MeterOutput(params[i].handle.GetId(), &port, params[i].data, false, gain);
 			}
 			port.queue_primed = false;
+			port.catch_up     = false;
 			// Bluetooth HID has its own sender. Let the sample clock pace a batch
 			// without another audio device, instead of waiting on the HID queue.
 			if (port.type == AUDIO_OUT_PORT_TYPE_PADSPK && !controller_uses_bluetooth) {
@@ -737,10 +1269,21 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	// Submit the whole batch before pacing it. Audible devices own its cadence while
 	// priming; silent/vibration-only batches use the same sample clock as SDL output.
 	const auto now = LibKernel::KernelGetProcessTime();
+	// One port short of its target skips the clock for the whole batch: every port gets one block
+	// per batch, so a clock kept by a fuller port would go on draining the short one. The fuller
+	// ports' own queue waits keep them at their targets.
+	bool batch_catch_up = false;
+	for (uint32_t i = 0; i < num; i++) {
+		const auto& port = m_out_ports[params[i].handle.GetId()];
+		batch_catch_up |= port.catch_up && port.stream != nullptr;
+	}
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
+		if (batch_catch_up) {
+			paced[i] = false;
+		}
 		if (blocking && (paced[i] || !any_device)) {
-			deadline = std::max(deadline, port.clock.Advance(now, port.samples_num, port.freq));
+			deadline = std::max(deadline, port.clock.Advance(now, port.samples_num, audio_out_clock_rate(port.freq)));
 		} else {
 			port.clock = {};
 		}
@@ -750,6 +1293,13 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	}
 	if (deadline > now) {
 		Common::Thread::SleepMicro(deadline - now);
+		if (trace) {
+			first_port.trace.sleep_us += deadline - now;
+			first_port.trace.sleeps++;
+		}
+	}
+	if (trace) {
+		first_port.trace.last_return = LibKernel::KernelGetProcessTime();
 	}
 
 	return first_port.samples_num;

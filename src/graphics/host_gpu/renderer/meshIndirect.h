@@ -52,9 +52,12 @@ class StreamBuffer;
 // indirect draw.
 //
 // KYTY_NATIVE_INDIRECT_MESH:
-//   unset | empty  provably empty indirect mesh draws only; every other one reads its record
+//   empty          provably empty indirect mesh draws only; every other one reads its record
 //                  (the mesh shaders are generated without the indirect branch);
-//   1 | on         also the GPU conversion for the other ones;
+//   unset | 1 | on also the GPU conversion for the other ones. The default since int16: at the
+//                  Sky Garden start view the CPU path's record reads (SideReadbackState::Wait,
+//                  5.5% of command-processor samples) cost about 2.1 ms per flip
+//                  (30.5 -> 28.5 ms/flip, 32.7 -> 35.1 fps, occlusion off, no game patch);
 //   verify         on, and every conversion is compared after its recording completes with
 //                  Convert() of the argument bytes the GPU read (MeshIndirectVerifyMismatches);
 //   exit           verify, stopping on the first difference;

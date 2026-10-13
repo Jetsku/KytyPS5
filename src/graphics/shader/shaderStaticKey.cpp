@@ -25,6 +25,19 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.wave_size);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	key.push_back(static_cast<uint32_t>(info.start_instance_sgpr));
+	// Relocated PS parameters (ShaderLinkVertexPixelParameters). Only keys with aliases get these
+	// words, so the keys of every other vertex shader (and the shipped pipeline lists) stay as before;
+	// the tag cannot be mistaken for the clip-space flag that follows otherwise.
+	if (info.param_alias_mask != 0) {
+		key.push_back(0x7A11A5u);
+		key.push_back(info.param_alias_mask);
+		for (uint32_t destination = 0; destination < 32u; ++destination) {
+			if ((info.param_alias_mask & (1u << destination)) != 0) {
+				key.push_back(info.param_alias_source[destination]);
+			}
+		}
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -91,8 +104,12 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
-	key.push_back(static_cast<uint32_t>(info.alpha_blend_source_remap));
+	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	if (const auto mask = info.target_shader_mask; mask != UINT32_MAX) {
+		// KYTY_CB_SHADER_MASK_EXPORTS: which targets are written decides export locations.
+		key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
+	}
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
@@ -112,7 +129,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
 	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
-	key.push_back(info.lds_size_dwords);
+	// Bit 31: LDS in the device buffer (KYTY_LDS_DEVICE_BUFFER); sizes stay below 2^16 dwords.
+	key.push_back(info.lds_size_dwords | (info.lds_storage ? 0x80000000u : 0u));
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {

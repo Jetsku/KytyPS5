@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 
 #include <atomic>
 #include <barrier>
@@ -20,6 +21,18 @@ static int g_failed = 0;
 	} while (0)
 
 int main() {
+	// KYTY_PIPELINE_FAST_FIRST values: a number (0 off), or "nvidia" (on for vendor 0x10de only).
+	{
+		CHECK(!FastFirstForVendor(nullptr, 0x10deu));
+		CHECK(!FastFirstForVendor("", 0x10deu));
+		CHECK(!FastFirstForVendor("0", 0x10deu));
+		CHECK(FastFirstForVendor("1", 0x1002u));
+		CHECK(FastFirstForVendor("nvidia", 0x10deu));
+		CHECK(!FastFirstForVendor("nvidia", 0x1002u));
+		CHECK(!FastFirstForVendor("nvidia", 0x8086u));
+		CHECK(!FastFirstForVendor("amd", 0x1002u));
+	}
+
 	// Retire list: nothing expires early, expired entries leave in order, age 0 keeps all.
 	{
 		FastFirstRetireList<int> list;
@@ -167,10 +180,38 @@ int main() {
 		CHECK(skipped == 0);
 	}
 
+	// The "Pipelines 10s" line: interval deltas by kind, quiet intervals skipped.
+	{
+		PipelineStatsValues before;
+		before.gfx_fast  = 5;
+		before.gfx_cp_ns = 1'000'000;
+		PipelineStatsValues now = before;
+		CHECK(!PipelineStatsChanged(now, before));
+		now.gfx_hit       = 3;
+		now.gfx_fast      = 7;
+		now.gfx_full      = 1;
+		now.cs_fast       = 2;
+		now.gfx_cp_ns     = 6'000'000;
+		now.cs_cp_ns      = 500'000;
+		now.programs      = 4;
+		now.journal_built = 9;
+		CHECK(PipelineStatsChanged(now, before));
+		const auto line = FormatPipelineStats(now, before, 2'500'000, 10.0);
+		CHECK(line.find("Pipelines 10s: gfx 6 (hit 3, fast 2, full 1, other 0)") == 0);
+		CHECK(line.find("cs 2 (hit 0, fast 2, full 0; prewarmed 0)") != std::string::npos);
+		CHECK(line.find("CP wait 5.5 ms (gfx 5.0, cs 0.5;") != std::string::npos);
+		CHECK(line.find("worst 2.5)") != std::string::npos);
+		CHECK(line.find("shaders 4 ") != std::string::npos);
+		CHECK(line.find("journal 9 built") != std::string::npos);
+		// A counter that went backwards (another cache instance) reads as zero, not a wrap.
+		PipelineStatsValues lower;
+		CHECK(FormatPipelineStats(lower, now, 0, 10.0).find("gfx 0 (hit 0") != std::string::npos);
+	}
+
 	if (g_failed != 0) {
 		std::printf("PipelineFastFirstTests: %d checks failed\n", g_failed);
 		return 1;
 	}
-	std::puts("Pipeline fast-first: retire list, log gate, report, cap, parallelism and drain passed");
+	std::puts("Pipeline fast-first: retire list, log gate, report, cap, parallelism, drain and the stats line passed");
 	return 0;
 }

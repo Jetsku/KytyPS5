@@ -144,12 +144,18 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
+// After a clean coherence-log check of the range over [since, now] (DrawPrep::Validate,
+// KYTY_DRAW_PREP_CLEAN_SINCE): IsGpuCleanForRead with page verdicts kept since `since`.
+[[nodiscard]] bool     IsGpuCleanForReadSince(uint64_t vaddr, uint64_t size, uint64_t since);
 // Whether [vaddr, vaddr + size) lies in guest memory mapped for the GPU (the renderer's mapped
 // ranges, the same ones its fault handler resolves). False before InstallGpuResources.
 [[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
-bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// Upstream's descriptor-dependency reader (57cf08688/783d9f8d6): on the GPU thread, GPU-dirty
+// buffer bytes are read back first, then the backing is read.
+bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.
 [[nodiscard]] uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size);
@@ -239,6 +245,10 @@ struct TestClampTotals {
 	uint64_t verify_races      = 0;
 };
 TestClampTotals TestClampRangeMemoTotals();
+void     TestBeforeNextBackingMap(callback_func_t callback);
+void     TestSetBackingReadCallback(callback_func_t callback);
+// The backing store's sparse read without TryReadSparseBacking's range checks.
+bool     TestTryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);

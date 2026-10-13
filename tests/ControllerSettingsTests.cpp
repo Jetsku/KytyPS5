@@ -350,6 +350,17 @@ void TestTriggerEffectState() {
 	int32_t    state[2] = {-1, -1};
 	GetTriggerEffectState(state);
 	Check(state[0] == 0 && state[1] == 0, "a trigger without an effect reported a state");
+	// The ABI call checks its handle before its output, with libScePad's codes (upstream #1132).
+	PadTriggerEffectStateInformation info {{-1, -1}};
+	Check(PadGetTriggerEffectState(2, &info) == PAD_ERROR_INVALID_HANDLE && info.state[0] == -1 &&
+	          info.state[1] == -1,
+	      "invalid trigger handle changed the output");
+	Check(PadGetTriggerEffectState(2, nullptr) == PAD_ERROR_INVALID_HANDLE,
+	      "trigger state checked the output before the handle");
+	Check(PadGetTriggerEffectState(1, nullptr) == PAD_ERROR_INVALID_ARG,
+	      "trigger state accepted a null output");
+	Check(PadGetTriggerEffectState(1, &info) == OK && info.state[0] == 0 && info.state[1] == 0,
+	      "unset trigger effects did not report off");
 
 	PadTriggerEffectParam param {};
 	param.trigger_mask       = 3;

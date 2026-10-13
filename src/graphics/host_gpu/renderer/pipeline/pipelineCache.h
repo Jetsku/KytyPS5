@@ -28,6 +28,7 @@ struct GraphicContext;
 class ProgramDiskCache;
 class ShaderJournal;
 class ShaderPrecompiler;
+class PipelineJournal;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
@@ -129,6 +130,8 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Built by the start-up compute prewarm and not used by a dispatch yet (statistics only).
+		bool                    prewarmed             = false;
 	};
 
 	struct GraphicsPrograms {
@@ -193,6 +196,15 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);
+	// Draw-prep (KYTY_DRAW_PREP_DISPATCH): GetComputeProgram as a speculative preparation, as
+	// PrepareGraphicsProgramsSpeculative for a draw (every read through the active recorder,
+	// nothing synchronized; published programs only, or clean compiles with
+	// KYTY_PIPELINE_PREFETCH_PROGRAMS). input_info holds the dispatch's workgroup counts and
+	// thread-dimension mode on entry (DrawPrep::MakeComputeInputInfo).
+	[[nodiscard]] SpeculativeResult PrepareComputeProgramSpeculative(
+	    const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	    ShaderComputeInputInfo& input_info, StagePrep& stage_prep, ShaderProgram& program,
+	    uint64_t* compile_ns = nullptr);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -271,6 +283,26 @@ public:
 	void NotePlannedPipeline(const RenderDepthInfo& depth, const ShaderPixelInputInfo* ps_input_info);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// The pipeline a compute dispatch runs, or null when the dispatch must be skipped. Programs
+	// without software BVH instructions get GetComputePipeline's (built on this thread). A
+	// software ray-tracing kernel (program.info.uses_bvh, KYTY_RT_SOFTWARE) builds on a background
+	// thread: its first dispatch waits up to KYTY_RT_PIPELINE_WAIT_MS (default 250) for it, then
+	// every dispatch is skipped until it is ready, so a cold 300k-word compile (17 s on an RTX 50
+	// GPU) never freezes the command processor; the lighting it feeds lags. Null also, for every
+	// RT kernel, once any RT pipeline failed to build (rtSession.h: software RT is then off for the
+	// session, logged once). KYTY_RT_PIPELINE_ASYNC=0 builds in the background but waits for it.
+	[[nodiscard]] Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                              const ShaderProgram&          compute_program);
+	// Starts the background build of an RT kernel's pipeline without waiting (the shader precompile
+	// replay: the game's first dispatch then finds it built). Does nothing for other programs.
+	void PrewarmComputePipeline(const ShaderComputeInputInfo& input_info,
+	                            const ShaderProgram&          compute_program);
+	// RT kernels' pipelines: published, failed, and the time the CP waited for them (tests, log).
+	struct RtPipelineTotals {
+		uint64_t requested = 0, published = 0, failed = 0, skipped_dispatches = 0, waited = 0;
+		uint64_t wait_ns = 0, build_ns = 0, max_build_ns = 0;
+	};
+	[[nodiscard]] RtPipelineTotals GetRtPipelineTotals() const;
 
 	// Process-wide totals of the program caches (tests and diagnostics): permutations created
 	// (emitted or reloaded), TranslateProgram runs, and the persistent program cache's reloads and
@@ -365,6 +397,23 @@ private:
 	std::unique_ptr<ProgramDiskCache> m_program_disk;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// The driver cache started from a file (not empty).
+	bool                          m_driver_cache_loaded = false;
+	// Keys of pipelines the driver cache holds (KYTY_PIPELINE_KNOWN, written with the driver cache
+	// file; in memory only when just KYTY_PIPELINE_JOURNAL or KYTY_PIPELINE_LIST is on); null when all
+	// are off.
+	std::unique_ptr<PipelineJournal> m_known;
+	// The graphics pipelines the game needed in earlier runs, by content key (KYTY_PIPELINE_JOURNAL);
+	// recorded as they are created and rebuilt on background threads at start-up. Null when off.
+	std::unique_ptr<PipelineJournal> m_journal;
+	struct JournalReplay;
+	std::unique_ptr<JournalReplay> m_journal_replay;
+	// The loaded pipeline list (KYTY_PIPELINE_LIST) until the replays take its content; null when off.
+	struct ListState;
+	std::unique_ptr<ListState> m_list;
+	// Background builds of every replayed compute program's pipeline (KYTY_PIPELINE_PREWARM_COMPUTE).
+	struct ComputePrewarm;
+	std::unique_ptr<ComputePrewarm> m_compute_prewarm;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -382,6 +431,14 @@ private:
 	std::unique_ptr<FastFirstState> m_fast_first;
 	struct PrefetchState;
 	std::unique_ptr<PrefetchState> m_prefetch;
+	// The 10 s "Pipelines" console line (KYTY_PIPELINE_STATS=1, pipelineStats.h); null when off.
+	struct StatsReporter;
+	std::unique_ptr<StatsReporter> m_stats_reporter;
+	// Background pipeline builds of software RT kernels (TryGetComputePipeline).
+	struct RtState;
+	std::unique_ptr<RtState> m_rt;
+	std::once_flag           m_rt_once;
+	[[nodiscard]] RtState&   Rt();
 	// Shader precompile (KYTY_SHADER_PRECOMPILE=1, shaderPrecompile.h): the journal of compiled
 	// permutations' inputs and the background replay of the entries an earlier run left in it.
 	std::unique_ptr<ShaderJournal>     m_shader_journal;
@@ -402,6 +459,21 @@ private:
 	                              GraphicsPipelineKey& key) const;
 
 	void InitializeDriverCache();
+	void InitializeKnownPipelines();
+	void InitializePipelineList();
+	void InitializePipelineJournal();
+	// KYTY_PIPELINE_LIST_PREPARE: builds the list's shaders and pipelines, saves and ends the process.
+	[[noreturn]] void RunListPrepare();
+	// Stops the journal replay and the compute prewarm (before the shader replay and the program
+	// cache they use go).
+	void StopBackgroundPipelines();
+	[[nodiscard]] bool IsKnownPipeline(uint64_t key) const;
+	void               NoteKnownPipeline(uint64_t key);
+	// Journals a graphics pipeline the game created (content key, words of GraphicsContent);
+	// `guest` holds the stages' guest hashes (pixel last) for the verify log.
+	void NoteJournalPipeline(uint64_t key, std::span<const uint32_t> words, uint32_t snapshot_words,
+	                         std::span<const std::pair<uint64_t, uint64_t>> identities,
+	                         const std::array<uint64_t, 4>& guest);
 	void InitializeProgramDiskCache();
 	void InitializeShaderPrecompile();
 	void StopShaderPrecompile();
@@ -451,7 +523,10 @@ using ComputePipelineCreateHook =
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            const ComputePipelineCreateHook* create_hook = nullptr);
+                            const ComputePipelineCreateHook* create_hook = nullptr,
+                            // Not null: a failed creation is returned here (and cleaned up)
+                            // instead of stopping the emulator.
+                            vk::Result* result_out = nullptr);
 
 } // namespace Libs::Graphics
 

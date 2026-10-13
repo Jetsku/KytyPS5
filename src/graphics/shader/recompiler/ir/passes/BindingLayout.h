@@ -5,7 +5,17 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0);
+void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0,
+                      bool lds_storage = false);
+
+struct SharedMemoryResources {
+	bool lds = false;
+	bool gds = false;
+};
+
+// Whether the shader accesses LDS (DS operations) and GDS. The Buffers group always binds every
+// tracked buffer (memory_offset_count == info.buffers.size()).
+SharedMemoryResources CollectSharedMemory(const Program& program);
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 

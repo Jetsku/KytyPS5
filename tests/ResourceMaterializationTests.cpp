@@ -621,6 +621,137 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// KYTY_SRT_TRACE (SrtWalker.h): a plan whose handle comes from user data, with four adjacent
+// flat reads (one batched run), user data arithmetic and a select on a guest word. Refreshes
+// replayed from a trace must equal the walk for any user data and guest words, including when a
+// guard fails: the flat run crossing a page (a shorter run) and the select taking the other arm.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan TracedPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &value_block = AddValueBlock(program);
+
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  program.memory_info.push_back(memory);
+  auto &low = value_block.AppendNewInst(ValueOpcode::GetUserData,
+                                        {Value(static_cast<ScalarReg>(1))});
+  auto &high = value_block.AppendNewInst(ValueOpcode::GetUserData,
+                                         {Value(static_cast<ScalarReg>(2))});
+  auto &handle = value_block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                           {Value(&low), Value(&high)});
+  auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
+  std::array<Value, 4> flat;
+  for (uint32_t i = 0; i < flat.size(); i++) {
+    auto &raw = value_block.AppendNewInst(
+        ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(i * 4u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40 + i * 4u});
+    program.srt_reads.push_back({Value(&raw), i});
+    flat[i] = Value(&value_block.AppendNewInst(ValueOpcode::ReadConst,
+                                               {Value(&srt), Value(i)}));
+  }
+  auto &user_data = value_block.AppendNewInst(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &sum = value_block.AppendNewInst(ValueOpcode::IAdd32,
+                                        {flat[0], Value(&user_data)});
+  auto &nonzero = value_block.AppendNewInst(ValueOpcode::INotEqual32,
+                                            {flat[3], Value(0u)});
+  auto &select = value_block.AppendNewInst(
+      ValueOpcode::SelectU32, {Value(&nonzero), flat[1], Value(&user_data)});
+  DescriptorSource source;
+  source.dwords[0] = Value(&sum);
+  source.dwords[1] = Value(&select);
+  source.dwords[2] = flat[2];
+  source.dwords[3] = flat[3];
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return ExtractResourcePlan(program);
+}
+
+void TestTraceReplayMatchesWalk() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  alignas(4096) static std::array<uint32_t, 2048> pages{};
+  const auto plan = TracedPlan();
+  struct Case {
+    uint32_t offset; // in words: 1022 puts the four words across a page boundary
+    uint32_t user;
+    std::array<uint32_t, 4> words;
+  };
+  const std::array<Case, 6> cases{{
+      {0, 7u, {0x10000u, 0x00100000u, 0x40u, 0x00027facu}},
+      {16, 0x100u, {0x20000u, 0x00200000u, 0x80u, 0x00027facu}},
+      {1022, 0x30u, {0x30000u, 0x00300000u, 0xc0u, 0x00027facu}},
+      {32, 0x55u, {0x40000u, 0x00400000u, 0x100u, 0u}}, // the select's other arm
+      {48, 0xfffffff0u, {0x50000u, 0x00500000u, 0x140u, 0x00027facu}},
+      {64, 9u, {0x60000u, 0x00600000u, 0x180u, 0u}},
+  }};
+  struct Result {
+    bool ok = false;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+  };
+  const auto run = [&](const Case &c, Result &result) {
+    for (uint32_t i = 0; i < 4; i++) {
+      pages[c.offset + i] = c.words[i];
+    }
+    const auto address = reinterpret_cast<uint64_t>(&pages[c.offset]);
+    const std::array<uint32_t, 3> user_data{
+        c.user, static_cast<uint32_t>(address),
+        static_cast<uint32_t>(address >> 32u)};
+    const SrtRuntime speculative{.user_data = user_data,
+                                 .read_memory = StrictRead,
+                                 .read_specialization_memory = StrictRead,
+                                 .try_read_clean_backing = CleanProbe,
+                                 .share_clean_values = false};
+    result.ok = MaterializeResources(plan, speculative, result.snapshot,
+                                     result.specialization);
+  };
+  const auto same = [](const Result &left, const Result &right) {
+    return left.ok == right.ok &&
+           left.snapshot.flattened_srt == right.snapshot.flattened_srt &&
+           left.snapshot.buffers == right.snapshot.buffers &&
+           left.snapshot.user_data == right.snapshot.user_data &&
+           left.specialization == right.specialization;
+  };
+  g_probe_memory = {};
+  Live::Testing::StageText("KYTY_SRT_TRACE=0\n");
+  Live::OnCpFlip();
+  std::array<Result, cases.size()> expected;
+  for (size_t i = 0; i < cases.size(); i++) {
+    run(cases[i], expected[i]);
+    Check(expected[i].ok, "traced plan reference materialization failed");
+  }
+  Check(expected[0].snapshot.buffers[0].dwords[1] == 0x00100000u &&
+            expected[3].snapshot.buffers[0].dwords[1] == 0x55u,
+        "traced plan select did not pick both arms");
+  // exit: every refresh that used a trace is evaluated again and any difference stops.
+  const auto served_before = SrtTraceSession::ServedRefreshes();
+  Live::Testing::StageText("KYTY_SRT_TRACE=exit\n");
+  Live::OnCpFlip();
+  // Repeats record, then serve; the page-crossing and other-arm cases fail guards.
+  for (uint32_t round = 0; round < 6; round++) {
+    for (size_t i = 0; i < cases.size(); i++) {
+      const size_t index = round % 2u == 0u ? i : (i * 5u + round) % cases.size();
+      for (uint32_t repeat = 0; repeat < 3; repeat++) {
+        Result result;
+        run(cases[index], result);
+        Check(same(result, expected[index]), "traced refresh differed from the walk");
+      }
+    }
+  }
+  SrtTraceSession::PrintStats();
+  Check(SrtTraceSession::ServedRefreshes() > served_before,
+        "no refresh was served from a trace");
+  Live::Testing::StageText("KYTY_SRT_TRACE=0\n");
+  Live::OnCpFlip();
+  Check(g_probe_memory.strict_failures == 0, "traced refreshes reported failed reads");
+}
+
 } // namespace
 
 namespace Common {
@@ -649,6 +780,7 @@ int main() {
   TestSealedPlanEvaluatesConcurrently();
   TestSpeculativeRuntimeMatchesSerial();
   TestRecordedPreparationCertifies();
+  TestTraceReplayMatchesWalk();
   }
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

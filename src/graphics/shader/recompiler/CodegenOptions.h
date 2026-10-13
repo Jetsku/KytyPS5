@@ -30,6 +30,46 @@ enum class PsLiveExec : uint8_t {
 	All,
 };
 
+// Where a wave32 graphics program keeps each guest wave to its own 32 lanes of the host subgroup
+// (KYTY_WAVE32_CLUSTERS).
+enum class Wave32Clusters : uint8_t {
+	// Never: a host subgroup wider than 32 runs two guest waves as one (the behaviour before).
+	Off,
+	// In the stages the device layer reports as wider than 32 (Spirv::HostWaveClusters).
+	Auto,
+	// In every wave32 program but hull shaders, compute included (a test of the emitted code on
+	// 32-wide hosts, where it must give the same results).
+	Force,
+};
+
+// How S_WAITCNT lgkmcnt(0) after LDS writes orders them for the other lanes of the wave
+// (KYTY_LDS_WAITCNT_BARRIER).
+enum class LdsWaitcntBarrier : uint8_t {
+	// No barrier (the behaviour before the ISA-accuracy change; pink particle clouds on the title
+	// screen, blue artifacts in Astro's Playroom).
+	Off,
+	// OpMemoryBarrier at subgroup scope: every lane of a guest wave lives in one host subgroup
+	// (a split wave64 runs two lanes per invocation), so this is all lgkmcnt(0) promises.
+	Subgroup,
+	// OpMemoryBarrier at workgroup scope (int16.1). The AMD driver turns a workgroup-scope fence in
+	// a mesh shader into a workgroup barrier; reached by only some waves (inside S_CBRANCH_EXECZ
+	// regions other waves skip) it hangs the GPU.
+	Workgroup,
+};
+
+// Where a compute shader's LDS lives (KYTY_LDS_DEVICE_BUFFER, PlanComputeLds).
+enum class LdsDeviceBuffer : uint8_t {
+	// Workgroup memory only; an allocation above the device limit is clamped to it (int16.1 and
+	// AMD tests 1-2: Astro Bot's 48 KiB compute shaders then write past their 32 KiB on AMD, the
+	// stretched water geometry of issue 16).
+	Off,
+	// A device buffer, one region per workgroup of the dispatch, when the allocation exceeds the
+	// device limit; workgroup memory otherwise.
+	Auto,
+	// The device buffer for every compute shader with LDS (a test of the buffer path on any host).
+	Force,
+};
+
 // Switches for code-generation changes that must stay revertible at runtime. Every field is read
 // from its environment variable once (first use); tests may replace the whole set. Programs are
 // cached in memory only and the driver pipeline cache is keyed by the SPIR-V code, so changing a
@@ -73,6 +113,12 @@ struct CodegenOptions {
 	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
 	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
 	bool robust_buffer_loads = true;
+	// KYTY_READONLY_BUFFERS=0: leave the storage buffers of a program that never stores to them
+	// (no buffer store or atomic, no coherent load) without NonWritable. With it, the AMD driver
+	// loads a uniform address once per wave into scalar registers instead of once per lane
+	// (serbru20066666/brunoKytyPs5 def478029: a lighting shader of ASTRO's PLAYROOM 3.45 -> 2.76 ms
+	// on an RX 6800 XT); other drivers may use their read-only caches.
+	bool readonly_buffers = true;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
 	// KYTY_INTERP_MODES=0: interpolate every pixel input at the pixel center with the shader-wide
@@ -113,6 +159,18 @@ struct CodegenOptions {
 	// (unwritten particle slots in Astro Bot's mesh-particle emitter 0x4dd1f85484fc31f2, unlinked
 	// nodes in its GI ray-bundle linked lists).
 	PsLiveExec ps_live_exec = PsLiveExec::AppendConsume;
+	// KYTY_PS_HELPER_ATOMICS_SKIP=0: a pixel shader's helper invocations run the compare-exchange
+	// loops of emulated read-modify-writes (sub-dword stores, float min/max, INC/DEC; AtomicUpdate in
+	// spirvEmitterInternal.h) like the other lanes. By default they skip them: Vulkan does not perform
+	// a helper invocation's atomics and leaves their results undefined, so the loop's exit test need
+	// never hold in a helper lane and the wave can spin until a device reset (AMD keeps helper lanes
+	// in the wave). Skipping changes nothing observable: a helper's atomic has no effect and no
+	// defined result.
+	bool ps_helper_atomics_skip = true;
+	// KYTY_VOLATILE_LOADS=1 (diagnostic, default 0): every buffer, scalar-buffer and BDA (FLAT/GLOBAL,
+	// indirect V#) access is Volatile, not only MUBUF accesses with GLC/DLC. A guest loop that polls
+	// memory written by another workgroup or queue then rereads it instead of a cached or hoisted value.
+	bool volatile_loads = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -121,6 +179,10 @@ struct CodegenOptions {
 	// guarded shaders' results when it fires. Off unless both variables are set.
 	uint32_t              loop_guard_budget = 0;
 	std::vector<uint64_t> loop_guard_shaders;
+	// KYTY_LOOP_GUARD_SHADERS=all: every shader is guarded (with KYTY_LOOP_GUARD). An exhausted
+	// invocation also records its shader hash (GDS dwords end - LoopGuardHashGdsFromEnd and the one
+	// after), which the "Loop guard" report names: one run finds a shader that never leaves a loop.
+	bool loop_guard_all = false;
 	// KYTY_SRT_VARIANT_READS=1: a scalar read whose address is only known inside the shader (not a
 	// valid runtime value: e.g. a BVH traversal's loop-carried instance pointer, or data the GPU
 	// produces) is planned as a runtime read instead of a flat SRT slot. A flat slot is evaluated
@@ -128,7 +190,10 @@ struct CodegenOptions {
 	// dropped. An S_BUFFER_LOAD through a V# read that way then reads through BDA, and a program with
 	// another such descriptor (no BDA path) is dropped, as before. Reads whose address can be
 	// evaluated before the dispatch keep their flat slots.
-	bool srt_variant_reads = false;
+	// Default on since int18 (before, only u59-preset.json set it): without it Astro Bot's tiled
+	// deferred-lighting and GI kernels are dropped, and with the game's lighting patches off lit
+	// geometry renders black. KYTY_SRT_VARIANT_READS=0 restores the old planning.
+	bool srt_variant_reads = true;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
@@ -184,6 +249,20 @@ struct CodegenOptions {
 	// the passes but lets every ray miss (no ray-traced shadows); KYTY_RT_SOFTWARE=0 alone restores
 	// the old skip.
 	bool rt_software = true;
+	// KYTY_RT_SOFTWARE=auto (the default; also what an unset or empty variable means): software RT
+	// on, whatever the GPU. "1" forces it on, "0" turns it off. The switch for users whose GPU or
+	// driver fails the ray tracing kernels (a game that crashes right after the first lighting
+	// dispatches, device loss on AMD): KYTY_RT_SOFTWARE=0 skips those dispatches again. A pipeline
+	// the driver fails to build for such a kernel turns software RT off for the session on its own
+	// (rtSession.h). rt_software_auto only records which spelling selected the mode.
+	bool rt_software_auto = true;
+	// KYTY_RT_FUNCTION=0|1|2 (with KYTY_RT_SOFTWARE; default 1): how a BVH instruction lowers. 1: the
+	// node test (box and triangle tests, traversal helpers, ~100k SPIR-V words) is ONE function per
+	// module that every BVH instruction calls (OpFunctionCall); a kernel with three instructions
+	// was 322k words with the test inlined at each. 2: the same with the DontInline function
+	// control, so the driver does not inline it again. 0: inline at every site (the pre-int16
+	// code, for comparisons).
+	uint32_t rt_function = 1;
 	// KYTY_RT_TYPE6=0 (with KYTY_RT_SOFTWARE): node type 6 misses (four invalid children) like
 	// RDNA2's user node, instead of being decoded as the PS5 shared-exponent box.
 	bool rt_type6 = true;
@@ -193,6 +272,15 @@ struct CodegenOptions {
 	// GPU-owned before the CP continues (BDA-WRITES-DESIGN.md). Default 1: Astro Bot's BVH builders
 	// need it once its game patches are off; KYTY_BDA_WRITES=0 restores the old refusal.
 	bool bda_writes = true;
+	// KYTY_BDA_STORE_LOG (default 1, with bda_writes): a raw store through such a V# to a page
+	// without a cache buffer, which BDA cannot reach, is appended to the fault buffer's store log
+	// (BufferCache::BDA_STORE_LOG_WORD) instead of being dropped; the synchronous settle writes the
+	// logged dwords into guest memory, where those bytes live (BufferCache::SettleBdaWrites). Such a
+	// page gets a cache buffer only after its fault is processed, so before this every dispatch
+	// until then lost its stores there (a counted consumer whose output V# takes NUM_RECORDS from a
+	// GPU-written count wrote nothing). Atomics there still drop (no value to return).
+	// KYTY_BDA_STORE_LOG=0 restores the drop.
+	bool bda_store_log = true;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the
@@ -207,13 +295,63 @@ struct CodegenOptions {
 	// [2^k, 2^(k+1)), at end - RtNodeStatsGdsFromEnd - k), reported at flips. A diagnostic for the
 	// budget.
 	bool rt_node_stats = false;
+	// KYTY_WAVE32_CLUSTERS=0|auto|force (default auto), see Wave32Clusters. A wave32 vertex, mesh or
+	// pixel program on a host subgroup wider than its wave (AMD: 64 in those stages, which cannot
+	// require 32) shares the subgroup with another guest wave. Without clusters its EXEC, VCC and
+	// ballot words read the first 32 lanes of the subgroup, its lane reads and V_READFIRSTLANE take
+	// lanes of the other wave, and V_MBCNT counts them: a waterfall or work-list loop of the second
+	// wave never removes its own lanes and spins until a device reset, and DS_APPEND hands its lanes
+	// duplicate indices. With clusters each guest wave uses host lanes 32k..32k+31 only: lane ids
+	// are the low 5 bits, ballots take the wave's own word, shuffles stay in the wave, lane reads
+	// are not broadcast across the subgroup, and lane reductions use the emulated scan.
+	Wave32Clusters wave32_clusters = Wave32Clusters::Auto;
+	// KYTY_LDS_WAITCNT_BARRIER=subgroup|workgroup|0 (default subgroup), see LdsWaitcntBarrier. An
+	// S_WAITCNT lgkmcnt(0) with an LDS write pending since the last barrier, in compute and mesh
+	// shaders (the other stages keep LDS per invocation), gets a memory barrier so lanes see each
+	// other's writes. It orders only the wave's own LDS operations, so it is never an execution
+	// barrier and never wider than the subgroup by default: Astro Bot's title-screen particle mesh
+	// shader 0xc739f9614016bed4 (VS 0x20c94d46ce55a14b) has three in S_CBRANCH_EXECZ regions, and
+	// with workgroup scope it lost the device on AMD at the next S_BARRIER.
+	LdsWaitcntBarrier lds_waitcnt_barrier = LdsWaitcntBarrier::Subgroup;
+	// KYTY_LDS_DEVICE_BUFFER=auto|0|force (default auto), see LdsDeviceBuffer. Astro Bot asks for
+	// 48 KiB of LDS in some compute shaders; NVIDIA allows 48 KiB, AMD's Windows driver 32 KiB.
+	LdsDeviceBuffer lds_device_buffer = LdsDeviceBuffer::Auto;
+	// KYTY_LDS_LIMIT_OVERRIDE=<bytes> (test mode, default 0 = the device's own): treat the device's
+	// compute LDS limit as at most this many bytes, so a 48 KiB host takes the AMD path.
+	uint32_t lds_limit_override = 0;
+	// KYTY_PS_PER_VERTEX=0 (AMD test 3 diagnostic, default on): V_INTERP_MOV P10/P20 reads (a pixel
+	// shader reading raw vertex attributes) use the interpolated attribute instead of PerVertexKHR
+	// inputs and fragment barycentrics. Wrong values in those shaders; for a driver that crashes
+	// compiling per-vertex inputs (two RX 6900 XT crashes in the same VS/PS pair, AMD test 2).
+	bool ps_per_vertex = true;
+	// KYTY_CLIP_GUARD=0 (AMD test 3 diagnostic, default on): vertex shaders do not reserve a clip
+	// plane for the zero-position cull (the "emitted zero-position clip guard").
+	bool clip_guard = true;
 };
+
+// How a compute shader's LDS allocation is placed on this host (KYTY_LDS_DEVICE_BUFFER,
+// KYTY_LDS_LIMIT_OVERRIDE). dwords: the size the program declares and bounds its accesses by;
+// storage: it lives in the SharedMemory device buffer; clamped: dwords is below the request.
+struct ComputeLdsPlan {
+	uint32_t dwords      = 0;
+	uint32_t limit_bytes = 0;
+	bool     storage     = false;
+	bool     clamped     = false;
+};
+[[nodiscard]] ComputeLdsPlan PlanComputeLds(uint32_t requested_dwords, uint32_t device_limit_bytes);
+// Dwords between consecutive workgroups' regions of the LDS device buffer: the LDS size rounded up
+// to 16 bytes, so 64-bit LDS atomics stay aligned (guest sizes are multiples of 512 bytes).
+[[nodiscard]] constexpr uint32_t LdsStorageRegionDwords(uint32_t lds_dwords) {
+	return (lds_dwords + 3u) & ~3u;
+}
 
 // GDS dwords, counted from the end of GDS, that KYTY_RT_NODE_BUDGET and KYTY_RT_NODE_STATS report
 // through (the last one is KYTY_LOOP_GUARD's).
 inline constexpr uint32_t RtNodeBudgetGdsFromEnd = 2;
 inline constexpr uint32_t RtNodeStatsGdsFromEnd  = 3;
 inline constexpr uint32_t RtNodeStatsBins        = 24;
+// KYTY_LOOP_GUARD: the low and high dwords of the last exhausted shader's hash, past the RT bins.
+inline constexpr uint32_t LoopGuardHashGdsFromEnd = RtNodeStatsGdsFromEnd + RtNodeStatsBins + 1;
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);
@@ -222,6 +360,12 @@ inline constexpr uint32_t RtNodeStatsBins        = 24;
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
 // while no shader is being compiled.
 void SetCodegenOptions(const CodegenOptions& options);
+
+// The BVH lowering mode in effect on this thread: rt_function, unless this thread overrides it
+// (KYTY_RT_DUMP_DIR also emits each RT module inline, mode 0, for size and build-time comparisons).
+[[nodiscard]] uint32_t RtFunctionMode();
+// -1 clears the override.
+void SetThreadRtFunctionOverride(int mode);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

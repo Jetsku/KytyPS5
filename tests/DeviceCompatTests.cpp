@@ -1,5 +1,6 @@
 // Device-capability choices (graphics/host_gpu/deviceCompat.h) for the subgroup sizes, features and
 // formats that NVIDIA, AMD and Intel GPUs report.
+#include "graphics/host_gpu/breadcrumbLogic.h"
 #include "graphics/host_gpu/deviceCompat.h"
 
 #include <cstdint>
@@ -177,6 +178,39 @@ void TestImageCreateFallbacks() {
 	       "block-compressed formats are BC1 to BC7");
 }
 
+void TestComputeWave64Split() {
+	// KYTY_COMPUTE_WAVE64=0 on AMD: compute_wave64 off and host subgroup 32, so a wave64 program
+	// requires 32 lanes (two guest lanes per invocation, as on NVIDIA) and a wave32 one still 32.
+	const SubgroupSizeControl split {.min_size = 32, .max_size = 64, .enabled = true, .compute = true,
+	                                 .compute_wave64 = false};
+	Expect(ComputeSubgroupSize(split, 64, 32) == 32, "AMD split: wave64 requires 32");
+	Expect(ComputeSubgroupSize(split, 32, 32) == 32, "AMD split: wave32 requires 32");
+	// Pixel and mesh stages keep one host subgroup per guest wave (the default 64 for wave64).
+	Expect(GraphicsSubgroupSize(split, true, 32, 64) == 32, "AMD split: wave32 pixel requires 32");
+	Expect(GraphicsSubgroupSize(split, true, 64, 64) == 64, "AMD split: wave64 pixel requires 64");
+}
+
+void TestBreadcrumbs() {
+	using namespace Libs::Graphics::Breadcrumbs;
+	Expect(SequenceFromMarker(0, 100) == 0, "breadcrumbs: no marker");
+	Expect(SequenceFromMarker(42, 100) == 42, "breadcrumbs: marker below the newest");
+	Expect(SequenceFromMarker(100, 100) == 100, "breadcrumbs: the newest marker");
+	Expect(SequenceFromMarker(101, 100) == 0, "breadcrumbs: a marker above the newest in the first window");
+	const uint64_t window = uint64_t {1} << 32u;
+	Expect(SequenceFromMarker(5, window + 10) == window + 5, "breadcrumbs: second window");
+	Expect(SequenceFromMarker(0xfffffff0u, window + 10) == 0xfffffff0u,
+	       "breadcrumbs: a marker of the previous window");
+	// Begun 7, everything before 5 completed: 5..7 may still run, 5 is the oldest unfinished.
+	const auto a = QueueInFlight(7, 5);
+	Expect(a.first == 5 && a.last == 7 && a.Count() == 3, "breadcrumbs: in flight 5..7");
+	// Begun and done-before equal: that one operation was running.
+	const auto b = QueueInFlight(9, 9);
+	Expect(b.first == 9 && b.last == 9 && b.Count() == 1, "breadcrumbs: one running operation");
+	Expect(QueueInFlight(0, 0).Empty(), "breadcrumbs: a queue that never began anything");
+	const auto c = QueueInFlight(3, 0);
+	Expect(c.first == 1 && c.last == 3, "breadcrumbs: nothing completed yet");
+}
+
 void TestDepthClamp() {
 	// With VK_EXT_depth_clip_enable (NVIDIA, as before): always clamped, clipping set apart.
 	Expect(DepthClampEnable(true, true) && DepthClampEnable(true, false),
@@ -186,6 +220,54 @@ void TestDepthClamp() {
 	Expect(DepthClampEnable(false, false), "no extension, Z clipping off: clamp");
 }
 
+void TestNvidiaArchitecture() {
+	// Device IDs as vulkan.gpuinfo.org reports them.
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1e87) == NvidiaArchitecture::Turing, "RTX 2080 is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1e81) == NvidiaArchitecture::Turing,
+	       "RTX 2080 SUPER is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1e07) == NvidiaArchitecture::Turing, "RTX 2080 Ti is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1f08) == NvidiaArchitecture::Turing, "RTX 2060 is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2182) == NvidiaArchitecture::Turing, "GTX 1660 Ti is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1f82) == NvidiaArchitecture::Turing, "GTX 1650 is Turing");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2204) == NvidiaArchitecture::Ampere, "RTX 3090 is Ampere");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2504) == NvidiaArchitecture::Ampere, "RTX 3060 is Ampere");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x20b0) == NvidiaArchitecture::Ampere, "A100 is Ampere");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2684) == NvidiaArchitecture::Ada, "RTX 4090 is Ada");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x2b85) == NvidiaArchitecture::Blackwell,
+	       "RTX 5090 is Blackwell");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x1b80) == NvidiaArchitecture::PascalOrOlder,
+	       "GTX 1080 is Pascal");
+	Expect(GuessNvidiaArchitecture(0x1002, 0x1e87) == NvidiaArchitecture::NotNvidia,
+	       "an AMD device ID in the Turing range is not NVIDIA");
+	Expect(GuessNvidiaArchitecture(0x10de, 0x3100) == NvidiaArchitecture::Unknown,
+	       "a future ID is unknown");
+	// Only Turing gets the geometry output guard automatically.
+	Expect(GeometryOutputGuardAutomatic(NvidiaArchitecture::Turing), "guard: auto on Turing");
+	Expect(!GeometryOutputGuardAutomatic(NvidiaArchitecture::Ampere) &&
+	           !GeometryOutputGuardAutomatic(NvidiaArchitecture::Ada) &&
+	           !GeometryOutputGuardAutomatic(NvidiaArchitecture::Blackwell) &&
+	           !GeometryOutputGuardAutomatic(NvidiaArchitecture::NotNvidia),
+	       "guard: auto off elsewhere");
+}
+
+void TestQuirkMode() {
+	Expect(ParseQuirkMode(nullptr) == QuirkMode::Auto && ParseQuirkMode("") == QuirkMode::Auto &&
+	           ParseQuirkMode("auto") == QuirkMode::Auto && ParseQuirkMode("maybe") == QuirkMode::Auto,
+	       "quirk mode: unset, empty, auto and unknown text are auto");
+	Expect(ParseQuirkMode("1") == QuirkMode::On && ParseQuirkMode("on") == QuirkMode::On &&
+	           ParseQuirkMode("ON") == QuirkMode::On && ParseQuirkMode("true") == QuirkMode::On,
+	       "quirk mode: 1/on/true force on");
+	Expect(ParseQuirkMode("0") == QuirkMode::Off && ParseQuirkMode("off") == QuirkMode::Off &&
+	           ParseQuirkMode("False") == QuirkMode::Off,
+	       "quirk mode: 0/off/false force off");
+	Expect(ParseQuirkMode("onx") == QuirkMode::Auto && ParseQuirkMode("o") == QuirkMode::Auto,
+	       "quirk mode: prefixes are not matches");
+	Expect(ResolveQuirk(QuirkMode::Auto, true) && !ResolveQuirk(QuirkMode::Auto, false),
+	       "quirk: auto follows the device");
+	Expect(ResolveQuirk(QuirkMode::On, false) && !ResolveQuirk(QuirkMode::Off, true),
+	       "quirk: on/off override the device");
+}
+
 } // namespace
 
 int main() {
@@ -193,6 +275,10 @@ int main() {
 	TestGraphicsSubgroupSize();
 	TestImageCreateFallbacks();
 	TestDepthClamp();
+	TestNvidiaArchitecture();
+	TestQuirkMode();
+	TestComputeWave64Split();
+	TestBreadcrumbs();
 	if (g_failures != 0) {
 		std::printf("DeviceCompatTests: failed: %d check(s)\n", g_failures);
 		return 1;

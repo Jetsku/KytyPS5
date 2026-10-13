@@ -57,6 +57,7 @@ struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
 	std::atomic_bool paused    = false;
+	std::atomic<uint64_t> presented_frames {0};
 };
 
 struct WindowContext {
@@ -64,6 +65,7 @@ struct WindowContext {
 	~WindowContext();
 	KYTY_CLASS_NO_COPY(WindowContext);
 
+	[[nodiscard]] static vk::PhysicalDeviceVulkan11Features RequiredVulkan11Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
 	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
@@ -71,7 +73,7 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
+	void UpdateTitle(uint64_t frame_num, double current_fps);
 	/// Resizes the drawable surface to the given pixel dimensions.
 	/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on a
 	/// nonpositive one.

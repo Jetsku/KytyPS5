@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -44,7 +45,6 @@ struct GpuTileInfo {
 class TileManager final {
 public:
 	enum class D16Direction { Promote, Demote };
-	enum class ColorTransform { None, SwapBgra16 };
 
 	struct Result {
 		vk::Buffer buffer = nullptr;
@@ -67,7 +67,8 @@ public:
 
 	// The returned device-local buffer remains alive through the current scheduler tick.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos);
+	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
+	                            ColorTransform transform = ColorTransform::None);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, std::span<const GpuTileInfo> infos);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
@@ -102,8 +103,8 @@ public:
 	void                 TrimScratchPool();
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
-	[[nodiscard]] Result SwapBgra16(Result input);
-	void                 SwapBgra16(Result input, Result output);
+	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
+	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
 
 private:
 	friend struct TileManagerTestAccess;
@@ -127,6 +128,10 @@ private:
 		uint32_t tail_x;
 		uint32_t tail_y;
 		uint32_t tail;
+		// ColorTransform: applied by the buffer tiling passes and TransformColor (whose push
+		// constants end at to_host, gpu_tiler_color_transform.comp).
+		uint32_t color_transform;
+		uint32_t to_host;
 		// Image variants only: the element's image texel is (image_x + x, image_y + y) of layer
 		// image_layer + z.
 		uint32_t image_x;
@@ -167,7 +172,7 @@ private:
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
 	             std::vector<Dispatch>& dispatches,
 	             std::span<const vk::BufferImageCopy> image_regions = {}, uint32_t image_texel = 1,
-	             bool image_layer_views = false);
+	             bool image_layer_views = false, ColorTransform transform = ColorTransform::None);
 	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
@@ -190,7 +195,6 @@ private:
 	void VerifyOnCompletion(const char* operation, uint64_t guest_address, vk::Buffer expected,
 	                        uint64_t expected_offset, vk::Buffer actual, uint64_t actual_offset,
 	                        uint64_t size, std::vector<std::pair<uint64_t, uint64_t>> ranges);
-	void                       SwapBgra16(Result input, Result output, uint32_t pixels);
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
@@ -205,11 +209,11 @@ private:
 	                                        m_image_pipelines {};
 	// Per [load][log2 element bytes]: 0 unknown, 1 usable, 2 unusable.
 	std::array<uint8_t, DirectionCount * BytesPerElementCount> m_image_view_support {};
-	vk::Pipeline                            m_d16_to_d24  = nullptr;
-	vk::Pipeline                            m_d16_to_d32  = nullptr;
-	vk::Pipeline                            m_d24_to_d16  = nullptr;
-	vk::Pipeline                            m_d32_to_d16  = nullptr;
-	vk::Pipeline                            m_swap_bgra16 = nullptr;
+	vk::Pipeline                            m_d16_to_d24      = nullptr;
+	vk::Pipeline                            m_d16_to_d32      = nullptr;
+	vk::Pipeline                            m_d24_to_d16      = nullptr;
+	vk::Pipeline                            m_d32_to_d16      = nullptr;
+	vk::Pipeline                            m_color_transform = nullptr;
 	// Completed scratch buffers kept for reuse (KYTY_TILER_SCRATCH_POOL). Returned by the
 	// deferred completion callback, so a pooled buffer is never in use by the GPU.
 	std::mutex                              m_scratch_mutex;

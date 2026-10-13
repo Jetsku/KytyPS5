@@ -162,6 +162,13 @@ void TestRayTracingStub() {
             a16_64.opcode == O::IMAGE_BVH64_INTERSECT_RAY && a16(a16_64) &&
             a16_64.image_address_components == 9,
         "BVH address dword counts do not follow the ISA");
+  // Captured 016c1ab44ee6a526 (upstream dbf66b7f4): BVH64 NSA, pointer v2:v7, final inverse
+  // component v5.
+  const auto nsa64 = decode({0xf19c9f07u, 0x00090202u, 0x28263607u, 0x221f1e29u, 0x00050403u});
+  Check(nsa64.opcode == O::IMAGE_BVH64_INTERSECT_RAY && nsa64.word_count == 5 &&
+            nsa64.image_address_components == 12 && nsa64.data_dwords == 4 && nsa64.image_r128 &&
+            nsa64.src0.reg == 2 && nsa64.image_nsa_addr[0] == 7 && nsa64.image_nsa_addr[10] == 5,
+        "captured BVH64 NSA pointer or final ray component was not decoded");
 
   // Encodings the ISA forbids are rejected rather than guessed.
   for (const auto &[word0, word1, nsa_word, text] :
@@ -265,6 +272,76 @@ std::vector<uint32_t> TraversalLoopBreakRegionCode() {
       EncodeSopp(0x02, 0xfff5u),        // 11: s_branch outer
       EncodeSopp(0x01),                 // 12: done: s_endpgm
   };
+}
+
+// KYTY_RT_FUNCTION: the software node test is one SPIR-V function per module that every BVH
+// instruction calls, not a copy at each instruction (a kernel with three instructions was 322k
+// words). A pixel shader with three instructions whose results all reach the export keeps all
+// three alive.
+struct BvhModuleShape {
+  uint32_t named_functions = 0; // OpFunction results named "bvh_node_test"
+  uint32_t calls = 0;           // OpFunctionCall instructions of that function
+  uint32_t functions = 0;       // every OpFunction
+  size_t words = 0;
+};
+
+BvhModuleShape InspectBvhModule(const std::vector<uint32_t> &spirv) {
+  BvhModuleShape shape;
+  shape.words = spirv.size();
+  uint32_t function_id = 0;
+  for (size_t at = 5; at < spirv.size();) {
+    const uint32_t opcode = spirv[at] & 0xffffu;
+    const uint32_t count = spirv[at] >> 16u;
+    if (count == 0) break;
+    if (opcode == 5 /* OpName */ && count >= 3) {
+      const char *text = reinterpret_cast<const char *>(&spirv[at + 2]);
+      if (std::strcmp(text, "bvh_node_test") == 0) function_id = spirv[at + 1];
+    } else if (opcode == 54 /* OpFunction */) {
+      shape.functions++;
+      if (function_id != 0 && spirv[at + 2] == function_id) shape.named_functions++;
+    } else if (opcode == 57 /* OpFunctionCall */ && function_id != 0 &&
+               spirv[at + 3] == function_id) {
+      shape.calls++;
+    }
+    at += count;
+  }
+  return shape;
+}
+
+void TestRayTracingSharedFunction() {
+  const std::array pixel_code{
+      0xf1989f01u, 0x00081014u, // image_bvh_intersect_ray v[16:19]
+      0xf1989f01u, 0x00081414u, // image_bvh_intersect_ray v[20:23]
+      0xf1989f01u, 0x00081814u, // image_bvh_intersect_ray v[24:27]
+      EncodeExp0(0x00, 0xf, true, false, true), EncodeExp1(16, 20, 24, 17),
+      EncodeSopp(0x01)};
+  const auto compile = [&](uint32_t function_mode) {
+    const ScopedRtStub software(false, true);
+    auto options = ShaderRecompiler::GetCodegenOptions();
+    options.rt_function = function_mode;
+    ShaderRecompiler::SetCodegenOptions(options);
+    auto compiled = RecompileForTest(pixel_code, MakeCompileOptions(ShaderType::Pixel));
+    Check(!compiled.spirv.empty() && compiled.program.info.uses_bvh,
+          "three-instruction BVH pixel program did not compile");
+    CheckSpirvBinaryValidates(compiled.spirv);
+    return InspectBvhModule(compiled.spirv);
+  };
+  const auto inlined = compile(0);
+  const auto shared = compile(1);
+  const auto no_inline = compile(2);
+  Check(inlined.named_functions == 0 && inlined.calls == 0,
+        "KYTY_RT_FUNCTION=0 emitted the node test function");
+  Check(shared.named_functions == 1, "the BVH node test function is not defined exactly once");
+  Check(shared.calls == 3, "three BVH instructions did not make three calls of the function");
+  Check(shared.functions == inlined.functions + 1,
+        "the BVH node test function is not the only added function");
+  Check(no_inline.named_functions == 1 && no_inline.calls == 3,
+        "KYTY_RT_FUNCTION=2 changed the function structure");
+  // The shared module carries about one node test, the inline one three.
+  Check(shared.words * 2 < inlined.words,
+        "the shared BVH module is not much smaller than the inlined one");
+  std::printf("BVH node test: inline %zu words, one function %zu words (3 sites)\n", inlined.words,
+              shared.words);
 }
 
 void TestTraversalLoopBreakRegion() {

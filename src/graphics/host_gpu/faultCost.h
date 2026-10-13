@@ -144,6 +144,20 @@ using ThreadDescriber = int (*)(char* name, uint64_t size);
 void SetThreadDescriber(ThreadDescriber describer) noexcept;
 // The faulting instruction of the fault the calling thread is resolving (host exception handler).
 void SetFaultInstruction(uint64_t rip) noexcept;
+// The calling thread resolves a host exception in the exception handler: the faulting instruction
+// runs again when the handler returns, so a write that leaves its page protected faults once more
+// (KYTY_READBACK_SIDE_WRITES relies on that second fault). Direct HandleFault calls are not.
+class RetriedFaultScope {
+public:
+	RetriedFaultScope() noexcept;
+	~RetriedFaultScope();
+	RetriedFaultScope(const RetriedFaultScope&)            = delete;
+	RetriedFaultScope& operator=(const RetriedFaultScope&) = delete;
+
+private:
+	bool m_previous = false;
+};
+[[nodiscard]] bool InRetriedFault() noexcept;
 enum class Part : uint8_t { Buffer = 0, Texture = 1, Reconcile = 2, Count = 3 };
 struct FaultRecord {
 	uint64_t address     = 0;
@@ -156,6 +170,18 @@ void MapFault(const FaultRecord& record) noexcept;
 void MapProtect(bool unprotect, bool no_access, uint64_t pages, uint64_t ns) noexcept;
 // Inside the tracker's write-fault resolution on this thread (protection calls count as "in fault").
 void MapInFault(bool inside) noexcept;
+// Fault split (with the fault map): where a write fault's handler time goes on its own thread,
+// as "FaultMap   <thread> fault split" lines: waits for a memory-tracker region lock, for the page
+// manager's host-call lock (held across another thread's protection call) and count lock, the
+// protection calls this thread makes, GPU-data flushes (readbacks of GPU-dirty pages), the rest
+// (bookkeeping); and how many other faults were in flight when it began.
+enum class Split : uint8_t { TrackerLock = 0, HostLock, CountLock, HostCall, Flush, Count };
+// The calling thread resolves a write fault and the fault map is on.
+[[nodiscard]] bool SplitActive() noexcept;
+void               SplitAdd(Split part, uint64_t ns) noexcept;
+// A contended wait for a page-manager host-call lock outside a write fault (fault map on): the
+// command processor's re-protections waiting behind guest threads' calls and the reverse.
+void NoteHostLockWait(uint64_t ns) noexcept;
 
 } // namespace Libs::Graphics::FaultCost
 

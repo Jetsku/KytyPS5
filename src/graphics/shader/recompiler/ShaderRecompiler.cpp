@@ -26,6 +26,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <mutex>
@@ -964,6 +966,46 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return result;
 }
 
+// A shader with BVH instructions: its module size on the log (one line per shader) and, with
+// KYTY_RT_DUMP_DIR=<dir>, the module itself (rt_<stage>_<hash>.spv) for spirv-val and spirv-opt.
+static void NoteBvhKernelModule(const IR::Program& ir, const std::vector<uint32_t>& spirv,
+                                const ShaderStageInputInfo& input_info) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> noted;
+	{
+		std::scoped_lock lock(mutex);
+		if (!noted.insert(ir.shader_hash ^ (static_cast<uint64_t>(ir.stage) << 56) ^ spirv.size()).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "KYTY_RT_SOFTWARE: {} shader 0x{:016x} SPIR-V module is {} words (KYTY_RT_FUNCTION={}).\n",
+	    StageName(ir.stage), ir.shader_hash, spirv.size(), GetCodegenOptions().rt_function));
+	const auto* dump_dir = std::getenv("KYTY_RT_DUMP_DIR");
+	if (dump_dir == nullptr || dump_dir[0] == '\0') {
+		return;
+	}
+	const auto path = std::string(dump_dir) +
+	                  fmt::format("/rt_{}_{:016x}_{}.spv", StageName(ir.stage), ir.shader_hash,
+	                              spirv.size());
+	if (std::FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+		std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), file);
+		std::fclose(file);
+	}
+	if (RtFunctionMode() == 0) {
+		return;
+	}
+	// The same module with the node test inlined at each instruction (KYTY_RT_FUNCTION=0), for
+	// comparisons: rt_<stage>_<hash>_<words>.inline.spv.
+	SetThreadRtFunctionOverride(0);
+	auto inlined = Spirv::EmitProgram(ir, input_info);
+	SetThreadRtFunctionOverride(-1);
+	if (std::FILE* file = std::fopen((path + ".inline.spv").c_str(), "wb"); file != nullptr) {
+		std::fwrite(inlined.data(), sizeof(uint32_t), inlined.size(), file);
+		std::fclose(file);
+	}
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
@@ -981,8 +1023,44 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		(void)IR::EliminateExecSelects(ir, per_invocation);
 	}
 
+	// Copy the export at its original control-flow/EXEC site, not an interface placeholder.
+	// Iterate only original instructions: aliases are never recursively copied.
+	if (ir.stage == ShaderType::Vertex && options.input_info.vertex != nullptr) {
+		const auto& vertex = *options.input_info.vertex;
+		if (vertex.param_alias_mask != 0) {
+			for (auto* block: ir.blocks) {
+				for (auto it = block->begin(); it != block->end();) {
+					auto& inst = *it++;
+					if (inst.GetOpcode() != IR::ValueOpcode::SetAttribute) continue;
+					const auto flags = inst.Flags<IR::ExportFlags>();
+					const auto source = ir.export_info[flags.index];
+					if (source.kind != IR::ExportTargetKind::Parameter) continue;
+					for (uint32_t destination = 0; destination < 32u; ++destination) {
+						if ((vertex.param_alias_mask & (1u << destination)) == 0 ||
+						    vertex.param_alias_source[destination] != source.index) continue;
+						auto alias = source;
+						alias.index = destination;
+						alias.target = 0x20u + destination;
+						auto alias_flags = flags;
+						alias_flags.index = static_cast<uint32_t>(ir.export_info.size());
+						ir.export_info.push_back(alias);
+						auto copy = block->PrependNewInst(it, IR::ValueOpcode::SetAttribute,
+						                                 {inst.Arg(0), inst.Arg(1)});
+						copy->SetFlags(alias_flags);
+					}
+					// Spare destinations are not sources of any active PS input.
+					// Unused guest exports must not overwrite the alias.
+					if ((vertex.param_alias_mask & (1u << source.index)) != 0) {
+						inst.Invalidate();
+					}
+				}
+			}
+		}
+	}
 	IR::CollectShaderInfo(ir, options.input_info);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	IR::AllocateBindings(ir, push_data_start_dword,
+	                     ir.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
+	                         options.input_info.compute->lds_storage);
 	IR::AnalyzeBufferWriteRanges(ir, options.input_info);
 	std::string ir_dump;
 	if (options.dump_ir) {
@@ -1002,6 +1080,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	if (ir.info.uses_bvh) {
+		NoteBvhKernelModule(ir, spirv, options.input_info);
+	}
 	CompileResult result;
 	if (options.plain_mip_stats_variant && IR::UsesMipStats(ir)) {
 		result.spirv_plain = Spirv::EmitProgram(ir, options.input_info, false);

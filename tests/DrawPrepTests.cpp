@@ -2,6 +2,7 @@
 // and (S6) the preparation window ring, worker parking and the producer's work stealing.
 // --measure-worker-gate [reps]: the parking/stealing configuration sweep (not a test).
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
@@ -1835,6 +1836,107 @@ void TestRegisterIndirectPairs() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------------------------
+// CpGaps::Ledger (KYTY_CP_GAP_STATS): exclusive time per category
+
+void TestGapLedgerExclusive() {
+	using CpGaps::Cat;
+	CpGaps::Ledger ledger;
+	ledger.Enter(Cat::Slice, 0);
+	ledger.Enter(Cat::Resolver, 10);
+	ledger.Enter(Cat::DrawOp, 20);
+	ledger.Enter(Cat::Commit, 25);
+	ledger.Exit(65); // commit 40
+	ledger.Exit(70); // draw op 50 - 40 = 10
+	ledger.Enter(Cat::DispatchOp, 80);
+	ledger.Exit(100); // 20
+	ledger.Exit(110); // resolver 100 - 50 - 20 = 30
+	ledger.Exit(120); // slice 120 - 100 = 20
+	Check(ledger.Ticks(Cat::Commit) == 40, "gap ledger: commit time");
+	Check(ledger.Ticks(Cat::DrawOp) == 10, "gap ledger: draw op time outside its commit");
+	Check(ledger.Ticks(Cat::DispatchOp) == 20, "gap ledger: dispatch time");
+	Check(ledger.Ticks(Cat::Resolver) == 30, "gap ledger: resolver time without its ops");
+	Check(ledger.Ticks(Cat::Slice) == 20, "gap ledger: slice time without the resolver");
+	uint64_t total = 0;
+	for (size_t i = 0; i < CpGaps::CatCount; i++) {
+		total += ledger.Ticks(static_cast<Cat>(i));
+	}
+	Check(total == 120, "gap ledger: categories add up to the outermost scope");
+	Check(ledger.Calls(Cat::Commit) == 1 && ledger.Calls(Cat::DrawOp) == 1, "gap ledger: calls");
+	Check(ledger.Depth() == 0, "gap ledger: balanced");
+}
+
+void TestGapLedgerPhasesAndNested() {
+	using CpGaps::Cat;
+	CpGaps::Ledger ledger;
+	ledger.Enter(Cat::DispatchOp, 0);
+	ledger.Switch(Cat::DispatchProgram, 5); // 5 dispatch op
+	ledger.Enter(Cat::Protect, 8);
+	ledger.Exit(10);                       // 2 protect
+	ledger.Switch(Cat::DispatchBind, 15);  // program 15 - 5 - 2 = 8
+	ledger.AddNested(Cat::Fault, 3);       // 3 fault (measured elsewhere)
+	ledger.Switch(Cat::DispatchEmit, 30);  // bind 15 - 3 = 12
+	ledger.Exit(40);                       // emit 10
+	Check(ledger.Ticks(Cat::DispatchOp) == 5, "gap ledger: phase before the first switch");
+	Check(ledger.Ticks(Cat::DispatchProgram) == 8, "gap ledger: phase without its nested scope");
+	Check(ledger.Ticks(Cat::Protect) == 2, "gap ledger: nested scope inside a phase");
+	Check(ledger.Ticks(Cat::DispatchBind) == 12, "gap ledger: phase without nested time");
+	Check(ledger.Ticks(Cat::Fault) == 3, "gap ledger: nested time");
+	Check(ledger.Ticks(Cat::DispatchEmit) == 10, "gap ledger: last phase");
+	// A nested scope inside a commit is reported as in-commit time; the commit itself is not.
+	CpGaps::Ledger commit;
+	commit.Enter(Cat::DrawOp, 0);
+	commit.Enter(Cat::HeadWait, 1);
+	commit.Exit(4);
+	commit.Enter(Cat::Commit, 4);
+	commit.Enter(Cat::GpuWaitDrain, 10);
+	commit.Exit(30);
+	commit.AddNested(Cat::Protect, 5);
+	commit.Exit(50);
+	commit.Exit(52);
+	Check(commit.Ticks(Cat::Commit) == 21 && commit.InCommit(Cat::Commit) == 0,
+	      "gap ledger: commit time without nested waits");
+	Check(commit.Ticks(Cat::GpuWaitDrain) == 20 && commit.InCommit(Cat::GpuWaitDrain) == 20,
+	      "gap ledger: GPU wait inside a commit");
+	Check(commit.InCommit(Cat::Protect) == 5, "gap ledger: nested time inside a commit");
+	Check(commit.Ticks(Cat::HeadWait) == 3 && commit.InCommit(Cat::HeadWait) == 0,
+	      "gap ledger: head wait outside the commit");
+	Check(commit.Ticks(Cat::DrawOp) == 1 + 2, "gap ledger: draw op around head and commit");
+}
+
+void TestGapLedgerFlushAndOverflow() {
+	using CpGaps::Cat;
+	CpGaps::Ledger ledger;
+	ledger.Enter(Cat::Slice, 0);
+	ledger.Enter(Cat::Idle, 10);
+	ledger.Flush(100); // a report while idle
+	Check(ledger.Ticks(Cat::Slice) == 10 && ledger.Ticks(Cat::Idle) == 90,
+	      "gap ledger: flush accounts the open scopes up to the report");
+	ledger.ResetTotals();
+	ledger.Exit(150);
+	ledger.Exit(160);
+	Check(ledger.Ticks(Cat::Idle) == 50 && ledger.Ticks(Cat::Slice) == 10,
+	      "gap ledger: open scopes continue after a flush");
+	CpGaps::Ledger deep;
+	for (uint32_t i = 0; i < CpGaps::Ledger::MaxDepth + 3; i++) {
+		deep.Enter(Cat::OtherOp, i);
+	}
+	Check(deep.Overflows() == 3, "gap ledger: overflow counted");
+	for (uint32_t i = 0; i < CpGaps::Ledger::MaxDepth + 3; i++) {
+		deep.Exit(100 + i);
+	}
+	Check(deep.Depth() == 0, "gap ledger: balanced after overflow");
+	deep.Exit(200); // unbalanced exit is ignored
+	Check(deep.Depth() == 0, "gap ledger: extra exit ignored");
+	// Without an attached thread state the scopes do nothing (the diagnostic is off in tests).
+	{
+		const CpGaps::Scope scope(Cat::Commit);
+		CpGaps::Phase(Cat::DispatchEmit);
+		CpGaps::NestedNs(Cat::Fault, 10);
+	}
+	Check(CpGaps::t_state == nullptr, "gap ledger: no state on other threads");
+}
+
 int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "--measure-worker-gate") == 0) {
 		const auto reps = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : 5ul;
@@ -1873,6 +1975,9 @@ int main(int argc, char** argv) {
 	TestColdTokenStranded();
 	TestColdTokenStress();
 	TestStealStress();
+	TestGapLedgerExclusive();
+	TestGapLedgerPhasesAndNested();
+	TestGapLedgerFlushAndOverflow();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "DrawPrepTests: %d failure(s)\n", g_failures);
 		return 1;

@@ -109,9 +109,22 @@ public:
 		const auto offset = static_cast<uint32_t>(m_bytes.size());
 		m_bytes.resize(m_bytes.size() + size);
 		std::memcpy(m_bytes.data() + offset, data, size);
+		// KYTY_DRAW_PREP_DIRECT_READS: a read that starts where the previous one ended (and not at
+		// a page start, where Finish keeps ranges apart) extends it; Finish would merge the two
+		// into the same range, so the certificate is the same.
+		if (m_coalesce && !m_reads.empty()) {
+			auto& last = m_reads.back();
+			if (last.address + last.size == address && last.offset + last.size == offset &&
+			    (address & (PageSize - 1u)) != 0) {
+				last.size += static_cast<uint32_t>(size);
+				return true;
+			}
+		}
 		m_reads.push_back({address, static_cast<uint32_t>(size), offset});
 		return true;
 	}
+	// KYTY_DRAW_PREP_DIRECT_READS: whether Record extends contiguous reads (set per preparation).
+	void SetCoalesce(bool coalesce) noexcept { m_coalesce = coalesce; }
 
 	void Fail(ReadFailure failure) noexcept {
 		if (m_failure == ReadFailure::None) {
@@ -134,10 +147,14 @@ public:
 		}
 		m_order.resize(m_reads.size());
 		std::iota(m_order.begin(), m_order.end(), 0u);
-		std::sort(m_order.begin(), m_order.end(), [this](uint32_t a, uint32_t b) {
+		const auto before = [this](uint32_t a, uint32_t b) {
 			return m_reads[a].address < m_reads[b].address ||
 			       (m_reads[a].address == m_reads[b].address && m_reads[a].size > m_reads[b].size);
-		});
+		};
+		// Reads often come in address order: then the identity order is the sorted one.
+		if (!std::is_sorted(m_order.begin(), m_order.end(), before)) {
+			std::sort(m_order.begin(), m_order.end(), before);
+		}
 		m_ranges.clear();
 		m_range_offsets.clear();
 		m_merged.clear();
@@ -302,6 +319,7 @@ private:
 	std::vector<Coherence::Range> m_digest_ranges;
 	ReadFailure                   m_failure  = ReadFailure::None;
 	bool                          m_finished = false;
+	bool                          m_coalesce = false;
 };
 
 // The read routing of a preparing thread. `exact`: the thread is the GPU thread and uses the
@@ -310,9 +328,19 @@ private:
 struct Recorder {
 	ReadSet* reads = nullptr;
 	bool     exact = false;
+	// KYTY_DRAW_PREP_DIRECT_READS (kernel/memory.cpp): the last guest page this preparation read
+	// whole-page clean by the workers' hint, its host backing bytes and the backing map generation
+	// they were found under. Reads inside it copy from there (and are recorded as usual).
+	uint64_t       direct_page       = UINT64_MAX;
+	const uint8_t* direct_host       = nullptr;
+	uint64_t       direct_generation = 0;
 };
 
 inline thread_local Recorder* t_recorder = nullptr;
+
+// KYTY_DRAW_PREP_DIRECT_READS (drawPrep.cpp, kernel/memory.cpp): 0 off, 1 on, 2 verify, 3 exit.
+[[nodiscard]] int  DirectReadsMode();
+[[nodiscard]] bool DirectReadsEnabled();
 
 // Set on DrawPrep worker threads, which must never reach the scheduler or the caches
 // (CommandScheduler::CheckActive stops the emulator if one does).

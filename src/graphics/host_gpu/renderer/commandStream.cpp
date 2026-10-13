@@ -2,6 +2,7 @@
 #include "common/ramStats.h"
 
 #include "common/hangWatchdog.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
 #include <chrono>
 #include <cinttypes>
@@ -228,6 +229,7 @@ const char* OpName(Op op) noexcept {
 	    "CopyQueryPoolResults",
 	    "WriteTimestamp2",
 	    "UpdateDescriptorSets",
+	    "WriteBufferMarker",
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -645,6 +647,7 @@ bool Ring::EnsureSpace(uint64_t bytes, const WaitPolicy& policy, WaitStats& stat
 		return false;
 	}
 	// The consumer may be parked on packets published without a wake.
+	const CpGaps::Scope gap(CpGaps::Cat::RecorderWait);
 	HangWatchdog::Scope wait("recorder-ring-space", reinterpret_cast<uint64_t>(this),
 	                         m_write + bytes, m_consumed_cache, 0, m_capacity);
 	Kick(stats);
@@ -1340,6 +1343,16 @@ void Encoder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool,
 	w.Put(WriteTimestampPacket {pool, stage_bits, query});
 	Close(w, m_options.verify
 	             ? VerifyHash::Value(Op::WriteTimestamp2, HandleBits(pool), query, stage_bits)
+	             : 0);
+}
+
+void Encoder::writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer,
+                                   vk::DeviceSize offset, uint32_t marker) {
+	const auto stage_bits = static_cast<uint32_t>(static_cast<VkPipelineStageFlagBits>(stage));
+	auto       w          = Open(Op::WriteBufferMarker, Sz<WriteBufferMarkerPacket>(), false);
+	w.Put(WriteBufferMarkerPacket {buffer, offset, stage_bits, marker});
+	Close(w, m_options.verify
+	             ? VerifyHash::Value(Op::WriteBufferMarker, HandleBits(buffer), offset, stage_bits, marker)
 	             : 0);
 }
 

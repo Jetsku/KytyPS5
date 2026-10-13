@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/prepPhases.h"
 #include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
@@ -19,8 +20,10 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/gpuTouchedPages.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
@@ -50,8 +53,11 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <fmt/format.h>
 #include <mutex>
+#include <optional>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -293,13 +299,16 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
-		command();
+		{
+			const CpGaps::Scope gap(CpGaps::Cat::Service);
+			command();
+		}
 		// Service commands (mapping changes, readbacks, deferred label writes) change guest
 		// memory outside the command stream (syncEpoch.h).
 		SyncEpoch::Advance();
 		// KYTY_DRAW_RUN: other command-processor work (drawPrep/drawRun.h).
 		if (DrawRun::Enabled()) {
-			DrawRun::NoteForeignActivity();
+			DrawRun::NoteForeignActivity("service command");
 		}
 	}
 }
@@ -1048,6 +1057,10 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 		        ? cache.TryWriteDataGpu(address, src + (dw_num - 1u), sizeof(uint32_t))
 		        : cache.TryWriteDataGpu(address, src, uint64_t {dw_num} * sizeof(uint32_t));
 		if (written) {
+			// KYTY_DRAW_RUN_QUIET_OPS: GPU-timeline writes still end a run (ExecuteOp).
+			if (DrawRun::Enabled() && DrawRun::QuietOpsEnabled()) {
+				DrawRun::NoteForeignActivity("WriteData gpu");
+			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataGpu);
 			TraceCpLabel("wd-gpu", dst, src[write_one_address ? dw_num - 1u : 0u],
 			             uint64_t {dw_num} * 4u);
@@ -1255,6 +1268,8 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::RaiseCurrentThreadPriority();
 	// KYTY_CPU_RESERVE: its own physical core.
 	Common::PlaceCurrentThread(Common::ThreadRole::Cp);
+	// KYTY_CP_GAP_STATS (drawPrep/cpGaps.h): this thread's time by cause.
+	CpGaps::AttachThread();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	// KYTY_LIVE_FILE (common/liveSwitch.h): live switches, applied at this thread's flips.
@@ -1263,6 +1278,8 @@ void GuestGpu::ThreadRun(void* data) {
 	StartThreadSampler("cp");
 	// KYTY_CP_COMMIT: parsed (and its process-wide switches set) before the first command.
 	(void)CpCommit::Parts();
+	// KYTY_RENDER_LOCK_ASYMMETRIC (RenderMutex): this thread is the renderer lock's owner.
+	gpu->m_renderer.GetMutex().BecomeOwner();
 
 	const bool wakeups       = CpWakeupsEnabled();
 	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
@@ -1277,6 +1294,7 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
+				const CpGaps::Scope gap(CpGaps::Cat::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -1328,6 +1346,7 @@ void GuestGpu::ThreadRun(void* data) {
 					                              reinterpret_cast<uint64_t>(gpu),
 					                              gpu->m_submission_count);
 					gpu->m_processing = false;
+					const CpGaps::Scope gap(CpGaps::Cat::Blocked);
 					if (!wakeups) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					} else {
@@ -1369,6 +1388,7 @@ void GuestGpu::ThreadRun(void* data) {
 			// Deferred label writes still queued on the completion runner write the backing
 			// directly once commands are refused; finish them while this GuestGpu exists.
 			gpu->m_renderer.GetCommandScheduler().DrainPriorityOperations();
+			gpu->m_renderer.GetMutex().ResignOwner();
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
@@ -1377,11 +1397,12 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			HangWatchdog::Scope service("cp-service-execute", reinterpret_cast<uint64_t>(gpu));
+			const CpGaps::Scope gap(CpGaps::Cat::Service);
 			command();
 			SyncEpoch::Advance();
 			// KYTY_DRAW_RUN: a service command is other command-processor work.
 			if (DrawRun::Enabled()) {
-				DrawRun::NoteForeignActivity();
+				DrawRun::NoteForeignActivity("service command");
 			}
 			spin_deadline = 0;
 
@@ -1407,7 +1428,11 @@ void GuestGpu::ThreadRun(void* data) {
 		                        submission.frame_fence);
 		HangWatchdog::DebugDelay("queue", submission.queue_id);
 		Live::CpSliceBegin(); // CP busy time in the "Live:" lines (KYTY_LIVE_FILE only)
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			const CpGaps::Scope gap(CpGaps::Cat::Slice);
+			complete = gpu->Process(submission);
+		}
 		HangWatchdog::NoteQueue(
 		    submission.queue_id, submission.sequence,
 		    complete ? "complete"
@@ -1472,7 +1497,7 @@ bool GuestGpu::Process(Submission& submission) {
 		SyncEpoch::AdvanceSubmission();
 	}
 	if (DrawRun::Enabled()) {
-		DrawRun::NoteForeignActivity();
+		DrawRun::NoteForeignActivity("submission slice");
 	}
 
 	if (first_slice && submission.reset_processor) {
@@ -1480,6 +1505,8 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 	if (first_slice && submission.reset_processor && submission.type != SubmissionType::Compute) {
 		CommitStats::OnFrameBoundary();
+		CpGaps::NoteFrame();
+		Common::PrepPhases::NoteFrame();
 	}
 	if (first_slice && RepeatTrace::Enabled()) {
 		// KYTY_CP_REPEAT_TRACE: a guest frame starts with the processor reset after
@@ -1591,7 +1618,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	// A new submission, or a slice after other queues ran (syncEpoch.h).
 	SyncEpoch::Advance();
 	if (DrawRun::Enabled()) {
-		DrawRun::NoteForeignActivity();
+		DrawRun::NoteForeignActivity("submission slice");
 	}
 	if (first_slice) {
 		SyncEpoch::AdvanceSubmission();
@@ -1604,6 +1631,8 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		// sceAgcSuspendPoint.
 		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
 			CommitStats::OnFrameBoundary();
+			CpGaps::NoteFrame();
+			Common::PrepPhases::NoteFrame();
 		}
 	}
 	cp.BufferInit();
@@ -2222,6 +2251,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
 		MaybeYieldSlice();
+		CommitStats::StepMark(CommitStats::Step::GapRetire);
 		return;
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
@@ -2398,7 +2428,8 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 
 CpSeq::DrawIndirectOp CommandProcessor::IndirectDrawOp(uint32_t data_offset,
                                                       uint32_t draw_initiator, bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	// Indexed records select the DMA index source (0), auto-index records generated indices (2).
+	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	CpSeq::DrawIndirectOp op;
 	op.args_base           = m_draw_indirect_args_base_addr;
@@ -2455,12 +2486,47 @@ static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t ind
 	return draw;
 }
 
-void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	const auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+// `registers` (the SH locations the CP patches with a record's offsets) is not applied: native
+// (GPU-read) records never reach the CPU, and the start instance reaches its SGPR in the shader
+// (KYTY_START_INSTANCE_SGPR, recorded by the PM4 handler).
+void CommandProcessor::DrawIndirect(uint32_t data_offset,
+                                    [[maybe_unused]] IndirectDrawRegisters registers,
+                                    uint32_t draw_initiator, bool indexed) {
+	// KYTY_DRAW_PREP_INDIRECT (drawPrep.h): the draw's programs are prepared in a window slot.
+	auto*      engine  = m_draw_prep.get();
+	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
+	                     engine->Parallel() && DrawPrep::Engine::IndirectEnabled();
+	if (prepare && engine->SpeculativeSlots() != 0) {
+		// The slot must follow the real parse's (a SkipSlots op retires the speculative ones).
+		DropSpeculativeSlots();
+	}
+	auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	if (prepare) {
+		const auto position = engine->PublishIndirect(indexed, m_ctx, m_ucfg, m_sh_ctx,
+		                                              [this] { return WaitForWindowSpace(); });
+		if (position != UINT64_MAX) {
+			op.flags |= CpSeq::IndirectFlagPrepared;
+			op.window = position;
+			m_published_ops.push_back(m_ops->Emitted());
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(CpSeq::OpKind::DrawIndirect, &op, sizeof(op));
 }
 
+// KYTY_CP_OP_STATS: an Exec* body may name its outcome for the op being timed (ExecuteOp).
+static const char* g_cp_op_outcome = nullptr;
+
 void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
+	if ((op.flags & CpSeq::IndirectFlagPrepared) != 0) {
+		// KYTY_DRAW_PREP_INDIRECT: the same execution, with the slot's preparation offered.
+		auto plain = op;
+		plain.flags &= ~CpSeq::IndirectFlagPrepared;
+		m_draw_prep->ExecuteIndirect(op.window, [this, &plain] { ExecDrawIndirect(plain); });
+		return;
+	}
 	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
 		m_num_instances = op.num_instances;
 		m_pending_num_instances.clear();
@@ -2477,7 +2543,13 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	                           .index_base_addr     = op.index_base_addr,
 	                           .index_buffer_size   = op.index_buffer_size,
 	                           .index_type_and_size = op.index_type_and_size})) {
+		g_cp_op_outcome = "DrawIndirect native";
 		return;
+	}
+	g_cp_op_outcome = indexed ? "DrawIndirect cpu indexed" : "DrawIndirect cpu auto";
+	// The CPU path reads the (GPU-written) arguments: other command-processor work for a run.
+	if (DrawRun::Enabled()) {
+		DrawRun::NoteForeignActivity("DrawIndirect cpu");
 	}
 
 	m_pending_num_instances.clear();
@@ -2516,8 +2588,9 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
-                                         uint32_t stride_in_bytes, uint32_t draw_initiator,
-                                         bool indexed) {
+                                         uint32_t                 stride_in_bytes,
+                                         [[maybe_unused]] IndirectDrawRegisters registers,
+                                         uint32_t draw_initiator, bool indexed) {
 	auto op               = IndirectDrawOp(data_offset, draw_initiator, indexed);
 	op.count_addr         = reinterpret_cast<uint64_t>(count_addr);
 	op.max_count_or_count = max_count_or_count;
@@ -2612,6 +2685,14 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint32_t thread_group_z, uint32_t mode) {
 	// The wave size is register state: the front sets it, the op's execution reads it.
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): the dispatch's program is prepared in a window slot.
+	auto*      engine  = m_draw_prep.get();
+	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
+	                     engine->Parallel() && DrawPrep::DispatchPrepEnabled();
+	if (prepare && engine->SpeculativeSlots() != 0) {
+		// The slot must follow the real parse's (a SkipSlots op retires the speculative ones).
+		DropSpeculativeSlots();
+	}
 	CpSeq::DispatchDirectOp op;
 	op.x    = thread_group_x;
 	op.y    = thread_group_y;
@@ -2621,10 +2702,30 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		op.flags |= CpSeq::DispatchFlagSnapshot;
 		op.snapshot = TakeSnapshot();
 	}
+	if (prepare) {
+		const auto position = engine->PublishDispatch(
+		    {thread_group_x, thread_group_y, thread_group_z, mode}, m_ctx, m_ucfg, m_sh_ctx,
+		    [this] { return WaitForWindowSpace(); });
+		if (position != UINT64_MAX) {
+			op.flags |= CpSeq::DispatchFlagPrepared;
+			op.window = position;
+			m_published_ops.push_back(m_ops->Emitted());
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(op);
 }
 
 void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
+	if ((op.flags & CpSeq::DispatchFlagPrepared) != 0) {
+		// KYTY_DRAW_PREP_DISPATCH: the same execution, with the slot's preparation offered.
+		auto plain = op;
+		plain.flags &= ~CpSeq::DispatchFlagPrepared;
+		m_draw_prep->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchDirect(plain); });
+		return;
+	}
 	const auto thread_group_x = op.x;
 	const auto thread_group_y = op.y;
 	const auto thread_group_z = op.z;
@@ -2670,6 +2771,16 @@ void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	// KYTY_DRAW_PREP_DISPATCH: the program of a native indirect dispatch does not depend on its
+	// (GPU-written) arguments. One with thread dimensions reads them on the CPU and runs as a direct
+	// dispatch, unprepared.
+	auto*      engine  = m_draw_prep.get();
+	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
+	                     engine->Parallel() && DrawPrep::DispatchPrepEnabled() &&
+	                     (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0;
+	if (prepare && engine->SpeculativeSlots() != 0) {
+		DropSpeculativeSlots();
+	}
 	CpSeq::DispatchIndirectOp op;
 	op.args_addr = args_addr;
 	op.mode      = mode;
@@ -2677,10 +2788,29 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		op.flags |= CpSeq::DispatchFlagSnapshot;
 		op.snapshot = TakeSnapshot();
 	}
+	if (prepare) {
+		const auto position = engine->PublishDispatch({0, 0, 0, mode, true}, m_ctx, m_ucfg, m_sh_ctx,
+		                                              [this] { return WaitForWindowSpace(); });
+		if (position != UINT64_MAX) {
+			op.flags |= CpSeq::DispatchFlagPrepared;
+			op.window = position;
+			m_published_ops.push_back(m_ops->Emitted());
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(op);
 }
 
 void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op) {
+	if ((op.flags & CpSeq::DispatchFlagPrepared) != 0) {
+		// KYTY_DRAW_PREP_DISPATCH: the same execution, with the slot's preparation offered.
+		auto plain = op;
+		plain.flags &= ~CpSeq::DispatchFlagPrepared;
+		m_draw_prep->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchIndirect(plain); });
+		return;
+	}
 	if ((op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto args = ReadGuestForCp<vk::DispatchIndirectCommand>(op.args_addr);
 		CpSeq::DispatchDirectOp direct;
@@ -2698,7 +2828,7 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 
 void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint32_t control) {
 	(void)CurrentBuffer(); // the report is recorded at this command position
-	Common::LockGuard lock(m_renderer.GetMutex());
+	RenderLockGuard lock(m_renderer.GetMutex());
 	m_renderer.GetLodStats().Report(destination, size, control);
 }
 
@@ -2753,6 +2883,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
 		MaybeYieldSlice();
+		CommitStats::StepMark(CommitStats::Step::GapRetire);
 		return;
 	}
 	if (RepeatTrace::Enabled()) {
@@ -3426,7 +3557,7 @@ void CommandProcessor::ExecEndOfPipe(const CpSeq::EndOfPipeOp& op) {
 void CommandProcessor::EmitGlobalBarrier() {
 	KYTY_GPU_OP_SITE("guest.global_barrier");
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	Common::LockGuard lock(m_renderer.GetMutex());
+	RenderLockGuard lock(m_renderer.GetMutex());
 	// Keep renderer-lock contention in the parent zone's self time.
 	KYTY_PROFILER_DETAIL_BLOCK("CommandProcessor::RecordGlobalBarrier");
 
@@ -3528,9 +3659,20 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			}
 			if (OcclusionCounter::Enabled()) {
 				bool sync = false;
+				bool kept = false;
 				{
-					Common::LockGuard lock(m_renderer.GetMutex());
-					sync = m_renderer.GetOcclusionCounter().Dump(event_address);
+					RenderLockGuard lock(m_renderer.GetMutex());
+					auto&             counter = m_renderer.GetOcclusionCounter();
+					sync = counter.Dump(event_address);
+					kept = counter.LastDumpKeptInstance();
+				}
+				// KYTY_DRAW_RUN: a dump that kept the instance and does not wait recorded only query
+				// commands, which a continuation's skipped work does not depend on (ExecuteOp).
+				const bool waits =
+				    sync && OcclusionCounter::GetProxyMode() == OcclusionCounter::ProxyMode::Sync;
+				if (DrawRun::Enabled() && DrawRun::QuietOpsEnabled() &&
+				    OcclusionCounter::SplitEnabled() && (!kept || waits)) {
+					DrawRun::NoteForeignActivity("EventWrite occlusion dump");
 				}
 				if (sync) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionProxyDumps);
@@ -3579,11 +3721,13 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 // word is read without waiting for the GPU (a diagnostic) and reported when it changes.
 static void NoteLoopGuardHits(RenderContext& renderer) {
 	const auto& options = Libs::Graphics::ShaderRecompiler::GetCodegenOptions();
-	if (options.loop_guard_budget == 0 || options.loop_guard_shaders.empty()) {
+	if (options.loop_guard_budget == 0 ||
+	    (options.loop_guard_shaders.empty() && !options.loop_guard_all)) {
 		return;
 	}
 	const auto mapped = renderer.GetBufferCache().GetGdsBuffer()->Mapped();
-	if (mapped.size() < sizeof(uint32_t)) {
+	constexpr auto hash_from_end = Libs::Graphics::ShaderRecompiler::LoopGuardHashGdsFromEnd;
+	if (mapped.size() < (hash_from_end + 1u) * sizeof(uint32_t)) {
 		return;
 	}
 	static uint32_t reported = 0;
@@ -3591,10 +3735,15 @@ static void NoteLoopGuardHits(RenderContext& renderer) {
 	std::memcpy(&hits, mapped.data() + mapped.size() - sizeof(uint32_t), sizeof(hits));
 	if (hits != reported) {
 		reported = hits;
+		// The last exhausted shader (KYTY_LOOP_GUARD_SHADERS=all names it; written by every one).
+		uint32_t hash_words[2] = {};
+		std::memcpy(hash_words, mapped.data() + mapped.size() - hash_from_end * sizeof(uint32_t),
+		            sizeof(hash_words));
+		const uint64_t hash = hash_words[0] | (uint64_t {hash_words[1]} << 32u);
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "Loop guard: {} invocations of the guarded shaders exhausted the {}-iteration loop "
-		    "budget (KYTY_LOOP_GUARD)\n",
-		    hits, options.loop_guard_budget));
+		    "budget (KYTY_LOOP_GUARD); last one in shader 0x{:016x}\n",
+		    hits, options.loop_guard_budget, hash));
 	}
 }
 
@@ -3709,7 +3858,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, flip.handle, flip.index,
 			                               flip.flip_mode, flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
+			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
 			return;
 		}
 		case CpSeq::FlipVariant::Label: {
@@ -3733,7 +3882,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			                                 flip.handle, flip.index, flip.flip_mode,
 			                                 flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip();
+			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
 			return;
 		}
 		case CpSeq::FlipVariant::LabelInterrupt: {
@@ -3764,7 +3913,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
 			    flip.index, flip.flip_mode, flip.flip_arg, request, m_interrupt_event_id);
 			GetScheduler().Flush();
-			Live::OnCpFlip();
+			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
 			return;
 		}
 	}
@@ -3786,7 +3935,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
-	Live::OnCpFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
+	Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
 }
 
 void CommandProcessor::SynchronizeGpu() {
@@ -3861,15 +4010,153 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
 	return result;
 }
 
+// KYTY_DRAW_RUN's "activity by" attribution of an EVENT_WRITE (ExecEventWrite's groups).
+static const char* EventWriteActivityName(uint32_t event_type) {
+	switch (event_type) {
+		case 0x07:
+		case 0x0f:
+		case 0x10: return "EventWrite partial flush";
+		case 0x16:
+		case 0x31:
+		case 0x2a:
+		case 0x2c:
+		case 0x2e: return "EventWrite cache writeback";
+		case 0x39: return "EventWrite occlusion dump";
+		default: return "EventWrite ignored type";
+	}
+}
+
+// KYTY_CP_OP_STATS=1 (diagnostic, default off): the resolver's time per op kind (EVENT_WRITE by
+// group), one console line every 10 s: "CpOps 10s: <kind> <count> <ms> ...", sorted by time.
+namespace {
+struct CpOpStats {
+	struct Entry {
+		const char* name  = nullptr;
+		uint64_t    count = 0;
+		uint64_t    ns    = 0;
+	};
+	std::array<Entry, 40> entries {};
+	uint64_t              last_print_ns = 0;
+};
+bool CpOpStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_OP_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+uint64_t CpOpStatsNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+class CpOpTimer {
+public:
+	explicit CpOpTimer(const char* name): m_name(name), m_start(CpOpStatsNowNs()) {}
+	~CpOpTimer() {
+		static CpOpStats stats;
+		const auto       now = CpOpStatsNowNs();
+		if (g_cp_op_outcome != nullptr) {
+			m_name          = g_cp_op_outcome;
+			g_cp_op_outcome = nullptr;
+		}
+		for (auto& entry: stats.entries) {
+			if (entry.name == m_name || entry.name == nullptr) {
+				entry.name = m_name;
+				entry.count++;
+				entry.ns += now - m_start;
+				break;
+			}
+		}
+		if (stats.last_print_ns == 0) {
+			stats.last_print_ns = now;
+		} else if (now - stats.last_print_ns >= 10'000'000'000ull) {
+			auto sorted = stats.entries;
+			std::sort(sorted.begin(), sorted.end(),
+			          [](const auto& a, const auto& b) { return a.ns > b.ns; });
+			std::string line = "CpOps 10s:";
+			for (const auto& entry: sorted) {
+				if (entry.name != nullptr && entry.count != 0) {
+					line += fmt::format(" {} {} {:.1f}ms;", entry.name, entry.count,
+					                    static_cast<double>(entry.ns) / 1e6);
+				}
+			}
+			std::printf("%s\n", line.c_str());
+			std::fflush(stdout);
+			stats.entries       = {};
+			stats.last_print_ns = now;
+		}
+	}
+	CpOpTimer(const CpOpTimer&)            = delete;
+	CpOpTimer& operator=(const CpOpTimer&) = delete;
+
+private:
+	const char* m_name;
+	uint64_t    m_start;
+};
+} // namespace
+
+// KYTY_CP_GAP_STATS: an op's category (drawPrep/cpGaps.h).
+static CpGaps::Cat OpGapCat(CpSeq::OpKind kind) {
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::DrawIndex:
+		case OpKind::DrawAuto:
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti: return CpGaps::Cat::DrawOp;
+		case OpKind::DispatchDirect:
+		case OpKind::DispatchIndirect: return CpGaps::Cat::DispatchOp;
+		case OpKind::EndOfPipe:
+		case OpKind::ReleaseMem: return CpGaps::Cat::EndOfPipe;
+		case OpKind::EventWrite: return CpGaps::Cat::EventWrite;
+		case OpKind::WriteData: return CpGaps::Cat::WriteData;
+		case OpKind::DmaData: return CpGaps::Cat::DmaData;
+		case OpKind::WaitRegMem:
+		case OpKind::WaitFlipDone: return CpGaps::Cat::WaitOp;
+		case OpKind::Flip: return CpGaps::Cat::FlipOp;
+		default: return CpGaps::Cat::OtherOp;
+	}
+}
+
 CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
                                           const void* data) {
 	using CpSeq::OpKind;
+	std::optional<CpOpTimer> op_timer;
+	const CpGaps::Scope      gap(OpGapCat(kind));
+	if (CpOpStatsEnabled()) [[unlikely]] {
+		op_timer.emplace(kind == OpKind::EventWrite
+		                     ? EventWriteActivityName(
+		                           static_cast<const CpSeq::EventWriteOp*>(payload)->event_type)
+		                     : CpSeq::OpKindName(kind));
+	}
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): every operation but a direct draw (whose commit keeps its
 	// own run bookkeeping) and pure control flow is other command-processor work, which ends a run.
+	// An occlusion dump that keeps the rendering instance (KYTY_OCCLUSION_SPLIT) records only query
+	// commands: ExecEventWrite notes the activity when it ends the instance or waits instead.
+	// KYTY_DRAW_RUN_QUIET_OPS: so does ExecWriteData for a WRITE_DATA done on the GPU timeline.
+	// KYTY_DRAW_RUN_QUIET_SYNTHETIC: so does a synthetic occlusion dump (KYTY_GPU_OCCLUSION=0), a
+	// CPU write of an always-visible result exactly like a CPU WRITE_DATA.
+	const bool occlusion_dump =
+	    kind == OpKind::EventWrite &&
+	    static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u;
+	const bool quiet =
+	    DrawRun::QuietOpsEnabled() &&
+	    (kind == OpKind::WriteData ||
+	     (occlusion_dump && OcclusionCounter::Enabled() && OcclusionCounter::SplitEnabled()) ||
+	     (occlusion_dump && !OcclusionCounter::Enabled() && DrawRun::QuietSyntheticEnabled()));
+	// KYTY_DRAW_RUN_INDIRECT: so does a prepared single-record indirect draw (an engine commit).
+	const bool indirect_commit =
+	    kind == OpKind::DrawIndirect && DrawRun::IndirectRunsEnabled() &&
+	    (static_cast<const CpSeq::DrawIndirectOp*>(payload)->flags & CpSeq::IndirectFlagPrepared) != 0;
 	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
-	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch) {
-		DrawRun::NoteForeignActivity();
+	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch &&
+	    !quiet && !indirect_commit) {
+		DrawRun::NoteForeignActivity(
+		    kind == OpKind::EventWrite
+		        ? EventWriteActivityName(static_cast<const CpSeq::EventWriteOp*>(payload)->event_type)
+		        : CpSeq::OpKindName(kind));
 	}
+	CommitStats::StepMark(CommitStats::Step::GapOpHead);
 	switch (kind) {
 		case OpKind::DrawIndex: ExecDrawIndex(*static_cast<const CpSeq::DrawIndexOp*>(payload)); break;
 		case OpKind::DrawAuto: ExecDrawAuto(*static_cast<const CpSeq::DrawAutoOp*>(payload)); break;
@@ -4942,6 +5229,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
                                                      std::span<const uint32_t> commands,
                                                      bool&                     handoff) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Resolve");
+	const CpGaps::Scope gap(CpGaps::Cat::Resolver);
 	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
 	handoff                   = false;
 	execution.m_suspended     = false;
@@ -4965,6 +5253,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 	} scope(*this, execution);
 	auto& sequencer = *m_sequencer;
 	for (;;) {
+		CommitStats::StepMark(CommitStats::Step::GapOpExit);
 		// Service commands run between ops: every op before this one has executed and no later
 		// one has, the serial point (P3-SEQUENCER.md 2.4).
 		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
@@ -4975,6 +5264,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			// The sequencer has not produced the next op yet: spin briefly, then let other queues
 			// and services run while it parses.
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
+			const CpGaps::Scope       starved_gap(CpGaps::Cat::Starved);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
 			const auto start    = CpNowNs();
 			bool       produced = false;
@@ -5102,6 +5392,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			                         diagnostic_args[0], diagnostic_args[1], diagnostic_args[2],
 			                         diagnostic_args[3], CpSeq::OpKindName(kind));
 		}
+		CommitStats::StepMark(CommitStats::Step::GapLoop);
 		const auto result = ExecuteOp(kind, view.payload, view.data);
 		m_executing       = false;
 		if (snapshot != nullptr) {

@@ -139,17 +139,14 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	}
 }
 
-static vk::BlendFactor GetBlendFactor(uint32_t factor, bool remap_source_alpha) {
+static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kZero: return vk::BlendFactor::eZero;
 		case Prospero::BlendFactor::kOne: return vk::BlendFactor::eOne;
 		case Prospero::BlendFactor::kSrcColor: return vk::BlendFactor::eSrcColor;
 		case Prospero::BlendFactor::kOneMinusSrcColor: return vk::BlendFactor::eOneMinusSrcColor;
-		case Prospero::BlendFactor::kSrcAlpha:
-			return remap_source_alpha ? vk::BlendFactor::eSrc1Color : vk::BlendFactor::eSrcAlpha;
-		case Prospero::BlendFactor::kOneMinusSrcAlpha:
-			return remap_source_alpha ? vk::BlendFactor::eOneMinusSrc1Color
-			                          : vk::BlendFactor::eOneMinusSrcAlpha;
+		case Prospero::BlendFactor::kSrcAlpha: return vk::BlendFactor::eSrcAlpha;
+		case Prospero::BlendFactor::kOneMinusSrcAlpha: return vk::BlendFactor::eOneMinusSrcAlpha;
 		case Prospero::BlendFactor::kDstAlpha: return vk::BlendFactor::eDstAlpha;
 		case Prospero::BlendFactor::kOneMinusDstAlpha: return vk::BlendFactor::eOneMinusDstAlpha;
 		case Prospero::BlendFactor::kDstColor: return vk::BlendFactor::eDstColor;
@@ -297,7 +294,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			static std::atomic_bool logged {false};
 			if (!logged.exchange(true)) {
 				LOGF("Vulkan subgroup: wave%u %s shader on a %u-wide host subgroup the device "
-				     "cannot narrow; its lane operations mix two waves\n",
+				     "cannot narrow; KYTY_WAVE32_CLUSTERS keeps each wave to its own lanes\n",
 				     wave_size, is_mesh ? "mesh" : "pixel", graphics.subgroup_size);
 			}
 		}
@@ -436,20 +433,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		color_blend_attachment[i].colorWriteMask =
 		    vk::ColorComponentFlags {static_params.color_mask[i]};
 		color_blend_attachment[i].blendEnable = static_params.blend_enable[i] ? VK_TRUE : VK_FALSE;
-		// Only target 0 can use the second blend source carrying logical alpha.
-		const bool remap_source_alpha         = i == 0 && static_params.blend_alpha_source_remap;
 		color_blend_attachment[i].srcColorBlendFactor =
-		    GetBlendFactor(static_params.color_srcblend[i], remap_source_alpha);
+		    GetBlendFactor(static_params.color_srcblend[i]);
 		color_blend_attachment[i].dstColorBlendFactor =
-		    GetBlendFactor(static_params.color_destblend[i], remap_source_alpha);
+		    GetBlendFactor(static_params.color_destblend[i]);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_srcblend[i], remap_source_alpha)
+		         ? GetBlendFactor(static_params.alpha_srcblend[i])
 		         : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_destblend[i], remap_source_alpha)
+		         ? GetBlendFactor(static_params.alpha_destblend[i])
 		         : color_blend_attachment[i].dstColorBlendFactor);
 		color_blend_attachment[i].alphaBlendOp =
 		    (static_params.separate_alpha_blend[i] ? GetBlendOp(static_params.alpha_comb_fcn[i])
@@ -639,7 +634,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
-                            const ComputePipelineCreateHook* create_hook) {
+                            const ComputePipelineCreateHook* create_hook,
+                            vk::Result* result_out) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -690,6 +686,24 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (result_out != nullptr) {
+		// The caller can live without this pipeline (an optional ray-tracing kernel): report the
+		// failure instead of stopping the emulator, and give back what was created for it.
+		*result_out = result;
+		if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+			if (result == vk::Result::eSuccess) {
+				*result_out = vk::Result::eErrorUnknown;
+			}
+			if (pipeline.pipeline != nullptr) {
+				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+				pipeline.pipeline = nullptr;
+			}
+			ReleasePipelineLayout(graphics, pipeline.pipeline_layout, pipeline.descriptor_set_layout);
+			pipeline.pipeline_layout       = nullptr;
+			pipeline.descriptor_set_layout = nullptr;
+		}
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

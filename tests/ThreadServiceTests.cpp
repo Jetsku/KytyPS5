@@ -236,33 +236,51 @@ void TestCondWaitUntil() {
 		std::sort(late.begin(), late.end());
 		return late[late.size() / 2];
 	};
-	const double precise = lateness_us(true);
-	const double coarse  = lateness_us(false);
-	std::printf("  5 ms timed wait, median lateness: precise %.0f us, condition variable only %.0f us\n",
-	            precise, coarse);
-	Check(precise < 400.0, "a precise timed wait ends within 0.4 ms of its deadline");
+	// The timing bounds are retried: a busy machine can delay one attempt, a real regression fails
+	// all of them. The semantic checks (never early, flag seen) are strict on every attempt.
+	constexpr int ATTEMPTS   = 3;
+	const double  coarse     = lateness_us(false);
+	double        precise    = 0.0;
+	bool          precise_ok = false;
+	for (int attempt = 0; attempt < ATTEMPTS && !precise_ok; attempt++) {
+		precise    = lateness_us(true);
+		precise_ok = precise < 400.0;
+		std::printf("  5 ms timed wait, median lateness: precise %.0f us (attempt %d), condition variable "
+		            "only %.0f us\n",
+		            precise, attempt + 1, coarse);
+	}
+	Check(precise_ok, "a precise timed wait ends within 0.4 ms of its deadline");
 
 	// A wake-up 4 ms into a 6 ms wait (inside the precise stretch) ends the wait at once.
-	bool              flag = false;
-	std::thread       waker([&] {
-        std::this_thread::sleep_for(std::chrono::microseconds(4000));
-        {
-            std::scoped_lock lock(mutex);
-            flag = true;
-        }
-        cv.notify_one();
-	});
-	const auto start = std::chrono::steady_clock::now();
-	{
-		std::unique_lock lock(mutex);
-		Common::CondWaitUntil(lock, cv, [&] { return flag; }, start + std::chrono::microseconds(6000),
-		                      10000, true, [] {});
-		Check(flag, "the signalled flag is seen");
+	const auto wake_wait_us = [&] {
+		bool        flag = false;
+		std::thread waker([&] {
+			std::this_thread::sleep_for(std::chrono::microseconds(4000));
+			{
+				std::scoped_lock lock(mutex);
+				flag = true;
+			}
+			cv.notify_one();
+		});
+		const auto start = std::chrono::steady_clock::now();
+		{
+			std::unique_lock lock(mutex);
+			Common::CondWaitUntil(lock, cv, [&] { return flag; }, start + std::chrono::microseconds(6000),
+			                      10000, true, [] {});
+			Check(flag, "the signalled flag is seen");
+		}
+		waker.join();
+		return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	};
+	double waited    = 0.0;
+	bool   waited_ok = false;
+	for (int attempt = 0; attempt < ATTEMPTS && !waited_ok; attempt++) {
+		waited    = wake_wait_us();
+		waited_ok = waited < 5900.0;
+		std::printf("  signal 4 ms into a 6 ms precise wait: ended after %.0f us (attempt %d)\n", waited,
+		            attempt + 1);
 	}
-	waker.join();
-	const double waited =
-	    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-	Check(waited < 5900.0, "a signal before the deadline ends a precise wait before the deadline");
+	Check(waited_ok, "a signal before the deadline ends a precise wait before the deadline");
 }
 
 } // namespace

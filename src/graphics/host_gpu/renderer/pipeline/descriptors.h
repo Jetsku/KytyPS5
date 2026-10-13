@@ -52,6 +52,7 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
+	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
 	// Workgroup count of a direct compute dispatch, for write-range proofs that bound addresses
 	// by workgroup ids. Unknown for draws and indirect dispatches.
@@ -75,6 +76,9 @@ struct PreparedBindings {
 		std::vector<TextureBinding>                         images;
 	};
 	std::array<TextureSet, 3> texture_history {};
+	// KYTY_XFRAME_REUSE=verify: the current set came from the cross-frame store and passed its
+	// revalidation; RebindImages checks the views it acquires (reset by PrepareBindings).
+	bool xframe_verify_views = false;
 	// RebindBuffers: flattened_srt or shader_data_buffer was allocated for this binding (not a
 	// reused upload of the same recording), so no earlier descriptor set refers to it.
 	bool                                  fresh_upload = false;
@@ -104,6 +108,11 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                          std::vector<uint32_t>&                          shader_data);
 
+// Description of the fallback image for a null shader image descriptor.
+[[nodiscard]] TextureCache::ImageDesc
+NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                TextureCache::BindingType binding);
+
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] uint32_t
@@ -129,8 +138,11 @@ template <typename T>
 [[nodiscard]] uint64_t SampledDepthBindingSignature(const ShaderRecompiler::IR::ImageResource& resource,
                                                     const ShaderTextureResource& descriptor,
                                                     vk::Format image_format, vk::Format view_format);
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+// Exits on an unsupported storage view unless `fatal` is false: then it prints the report (once)
+// and returns false.
+bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                            const ShaderTextureResource& descriptor, uint64_t size,
+                            bool fatal = true);
 
 } // namespace Libs::Graphics
 

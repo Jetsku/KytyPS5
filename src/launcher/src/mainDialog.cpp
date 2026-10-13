@@ -1,11 +1,11 @@
 #include "mainDialog.h"
 
+#include "cheatFile.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
 #include "gameContent.h"
-#include "patchesDialog.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -76,6 +76,7 @@ public:
 	void Update();
 	void FindInterpreter();
 	void Run();
+	void SetPresetWarning(const QString& text);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
 
@@ -91,6 +92,9 @@ private:
 	UpdateChecker*  m_update_checker = nullptr;
 	ControllerLightbar m_lightbar;
 	QString         m_interpreter;
+	QString         m_preset_warning;
+	QLabel*         m_preset_label   = nullptr;
+	bool            m_started        = false;
 
 	QProcess m_process;
 
@@ -204,10 +208,35 @@ void MainDialogPrivate::FindInterpreter() {
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
+	m_started = true;
+	if (!m_preset_warning.isEmpty()) {
+		QMessageBox::warning(m_main_dialog, tr("Release settings not applied"), m_preset_warning);
+	}
+
 	Update();
 	if (m_ui->check_updates_on_startup->isChecked()) {
 		m_update_checker->Check(false);
 	}
+}
+
+void MainDialogPrivate::SetPresetWarning(const QString& text) {
+	m_preset_warning = text;
+	if (m_preset_label == nullptr) {
+		m_preset_label = new QLabel(m_main_dialog);
+		m_preset_label->setWordWrap(true);
+		m_preset_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+		m_preset_label->setStyleSheet(QStringLiteral("QLabel { color: #d03030; font-weight: bold; }"));
+		m_ui->verticalLayout_4->insertWidget(0, m_preset_label);
+	}
+	m_preset_label->setText(text);
+	m_preset_label->setVisible(!text.isEmpty());
+	if (m_started && !text.isEmpty()) {
+		QMessageBox::warning(m_main_dialog, tr("Release settings not applied"), text);
+	}
+}
+
+void MainDialog::SetPresetWarning(const QString& text) {
+	m_p->SetPresetWarning(text);
 }
 
 static QString BoolArg(bool value) {
@@ -238,6 +267,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--audio-main-volume" << QString::number(info.audio_mix.main);
 	args << "--audio-music-volume" << QString::number(info.audio_mix.music);
 	args << "--audio-pad-speaker-volume" << QString::number(info.audio_mix.pad_speaker);
+	args << "--audio-objects-volume" << QString::number(info.audio_mix.objects);
+	args << "--audio-objects" << (info.audio_mix.objects_enabled ? "on" : "off");
 	if (info.gpu_occlusion_accurate) {
 		// Overrides the bundled preset's KYTY_GPU_OCCLUSION (performance mode by default).
 		args << "--gpu-occlusion" << "on";
@@ -253,7 +284,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -275,8 +308,11 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--profile";
 	}
 	args << "--spirv-debug-printf" << "false";
-	if (info.amd_cpu_enabled) {
+	// Neither flag: the emulator decides from the CPU vendor.
+	if (info.amd_cpu_mode == QStringLiteral("on")) {
 		args << "--amd-cpu";
+	} else if (info.amd_cpu_mode == QStringLiteral("off")) {
+		args << "--no-amd-cpu";
 	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
@@ -296,7 +332,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--game" << game;
 
-	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
+	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
 	}

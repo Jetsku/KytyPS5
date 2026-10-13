@@ -418,6 +418,7 @@ uint64_t HashUserSgpr(const HW::Shader& shaders) {
 	w.U64(vs.gs_regs.user_data_addr);
 	PutUserSgpr(w, vs.hs_user_sgpr);
 	PutUserSgpr(w, vs.gs_user_sgpr);
+	w.U32(static_cast<uint32_t>(vs.start_instance_user_sgpr));
 	PutUserSgpr(w, shaders.GetPs().ps_user_sgpr);
 	return w.Hash();
 }

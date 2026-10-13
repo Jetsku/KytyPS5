@@ -8,9 +8,11 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -147,18 +149,42 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// The user SGPR (s8 + GS user data index) holding the draw's start instance, which an indirect draw
+	// has the CP write; -1: the user data value.
+	int32_t                 start_instance_sgpr = -1;
+	// PS flat/smooth groups may relocate a shared parameter to a spare location.
+	// Only mask-selected source entries are meaningful (including in cache keys).
+	// Last: journals and pipeline lists store the fields before them (ShaderStoredInputInfoSize).
+	uint32_t                param_alias_mask = 0;
+	std::array<uint32_t, 32> param_alias_source {};
 };
+
+// Bytes of an input info that shader journals and pipeline lists store. A vertex input info is
+// stored without its PS parameter aliases (they follow from the pixel program the draw binds), so
+// journals and lists keep the layout of builds before the aliases.
+template <typename InputInfo>
+constexpr size_t ShaderStoredInputInfoSize() {
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		return offsetof(ShaderVertexInputInfo, param_alias_mask);
+	} else {
+		return sizeof(InputInfo);
+	}
+}
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
 	ShaderStageRuntime stage;
 };
+
+enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -174,6 +200,9 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_linear_center_vgpr        = UINT32_MAX;
 	uint32_t                                       ps_linear_centroid_vgpr      = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	// CB_SHADER_MASK with KYTY_CB_SHADER_MASK_EXPORTS=1 (MRT export i goes to the i-th target
+	// with a non-zero nibble); UINT32_MAX otherwise (export i goes to target i).
+	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
@@ -188,8 +217,8 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha through MRT1 for blending after channel swizzling.
-	bool                                           alpha_blend_source_remap     = false;
+	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
+	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -222,8 +251,19 @@ inline uint32_t ShaderLanesPerInvocation(ShaderType stage, uint32_t wave_size,
 }
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
+// KYTY_CB_SHADER_MASK_EXPORTS=1 (startup, default off; upstream 21a1346e2): colour exports are
+// compact, as on AMD hardware: MRT export i is written to the i-th colour target whose
+// CB_SHADER_MASK nibble is non-zero. Off: export i is written to target i.
+bool     ShaderCbShaderMaskExports();
+// The colour target of MRT export `export_index` under `shader_mask`; UINT32_MAX for none.
+uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
+void ShaderLinkVertexPixelParameters(ShaderVertexInputInfo& vertex,
+                                     const ShaderPixelInputInfo& pixel);
+void ShaderLinkVertexPixelParameters(ShaderVertexInputInfo& vertex,
+                                     const ShaderPixelInputInfo& pixel,
+                                     std::span<const uint32_t> active_inputs);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
 

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterRayTracing.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
@@ -246,6 +247,16 @@ void EmitLoopGuardReport(EmitterState& state) {
 	                          ConstantU32(state, spv::ScopeDevice),
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
 	                          ConstantU32(state, 1));
+	// Which shader: its hash, low dword at LoopGuardHashGdsFromEnd, high dword in the next one.
+	const auto hash = state.program.shader_hash;
+	for (uint32_t word = 0; word < 2; word++) {
+		const auto replaced = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAtomicExchange, TypeU32(state), replaced,
+		    GdsDwordFromEnd(state, LoopGuardHashGdsFromEnd - word), ConstantU32(state, spv::ScopeDevice),
+		    ConstantU32(state, spv::MemorySemanticsMaskNone),
+		    ConstantU32(state, static_cast<uint32_t>(hash >> (32u * word))));
+	}
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 }
@@ -725,6 +736,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
 			                  inst.GetOpcode() != IR::ValueOpcode::SharedMemoryBarrier &&
+			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
 				emit_instruction(lane, inst);
 			}
@@ -920,7 +932,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	                          other_half == nullptr || half == 0 ? Def(predicate)
 	                                                             : other_half->Def(predicate));
 	if (other_half == nullptr) {
-		return low;
+		return EmitWaveBallot(state, low);
 	}
 	const auto high      = state.builder.AllocateId();
 	const auto low_word  = state.builder.AllocateId();
@@ -936,6 +948,15 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	if (state.wave_clusters) {
+		// The wave's own word (EmitWaveBallot); FindILsb of 0 is -1, as FindLSB of an empty ballot.
+		const auto bits   = state.builder.AllocateId();
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits, ballot, 0);
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), result, GlslStd450(state),
+		                          GLSLstd450FindILsb, bits);
+		return result;
+	}
 	if (other_half == nullptr) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
@@ -967,7 +988,7 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
-		                          lane);
+		                          EmitHostLane(state, lane));
 		return low;
 	}
 	const auto physical_lane =
@@ -1136,6 +1157,7 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DefineGetBdaPointer(state);
+	DefineBvhNodeTestFunction(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
@@ -1215,6 +1237,30 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
+	}
+	EmitGeometryOutputDefaults(state);
+	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
+		// The workgroup's LDS region is the one of its index in the dispatch, x + nx * (y + ny * z),
+		// LdsStorageRegionDwords apart. A workgroup the bound range holds no region for (more groups
+		// than the renderer could allocate for, RenderExecutor::BindComputeLds) gets length 0: its
+		// LDS reads return 0 and its writes are dropped, as for any out-of-range LDS address,
+		// instead of landing in another workgroup's region or past the buffer.
+		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
+		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
+		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		const auto region = ConstantU32(state, LdsStorageRegionDwords(LdsDwordCount(state)));
+		const auto dwords = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), dwords, state.lds_variable, 0);
+		const auto held    = EmitBinaryU32(state, spv::OpUDiv, dwords, region);
+		const auto present = Binary(state, spv::OpULessThan, TypeBool(state), index, held);
+		state.lds_base_dwords = EmitSelectValueU32(
+		    state, present, EmitBinaryU32(state, spv::OpIMul, index, region), ConstantU32(state, 0));
+		state.lds_length = EmitSelectValueU32(state, present, ConstantU32(state, LdsDwordCount(state)),
+		                                      ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

@@ -96,8 +96,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 
 	// Buffers with device addresses (every guest buffer) take dedicated memory, a driver allocation
-	// each. KYTY_BDA_SHARED_BLOCKS=1 (default off) lets the ones up to 64 MiB share VMA's memory
-	// blocks instead: nothing needs the allocation's offset to be 0. The BDA page table stores
+	// each (~100 us on Windows; chenxiao07/KytyPS5 af29b93d7: 8400 buffers while a save loads,
+	// 100-400 in a frame that streams a new area). KYTY_BDA_SHARED_BLOCKS (default on; =0 dedicated
+	// memory for every one) lets the ones up to 64 MiB share VMA's memory blocks instead (256 MiB
+	// blocks; a buffer past half a block gets its own memory anyway, so the cap keeps a block at
+	// four or more buffers; VMA frees an empty block, keeping at most one per memory type, or none
+	// over budget): nothing needs the allocation's offset to be 0. The BDA page table stores
 	// BufferDeviceAddress() + page offset per page (BufferCache::ChangeRegister), and
 	// vkGetBufferDeviceAddress already includes the placement; mapped pointers come from VMA's
 	// pMappedData and flushes/invalidates go through vmaFlush/InvalidateAllocation, both
@@ -105,7 +109,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	// so its blocks carry the device-address flag.
 	static const bool shared_blocks = [] {
 		const auto* value = std::getenv("KYTY_BDA_SHARED_BLOCKS");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	static constexpr uint64_t SharedBlockMax = 64ull * 1024 * 1024;
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);

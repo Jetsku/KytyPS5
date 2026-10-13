@@ -11,6 +11,8 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "common/u59Preset.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -49,9 +51,10 @@ static void PrintSystemInfo() {
 	     "Host\n"
 	     "  os:      %s\n"
 	     "  cpu:     %s\n"
-	     "  threads: %u\n\n",
+	     "  threads: %u\n"
+	     "  Intel CPU compatibility (AMD instruction patch): %s\n\n",
 	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
-	     std::thread::hardware_concurrency());
+	     std::thread::hardware_concurrency(), Config::GetAmdCpuDecision().c_str());
 }
 
 static void KytyClose() {
@@ -190,6 +193,9 @@ void Run(const RunOptions& options) {
 	}
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
+	// The renderer, created during Init before /app0 is mounted, reads shader code from it
+	// (KYTY_PIPELINE_LIST).
+	Libs::Graphics::SetPipelineListExecutable(options.app0_dir / options.elf.filename());
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 
@@ -199,6 +205,10 @@ void Run(const RunOptions& options) {
 	std::string title_id;
 	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
+	}
+	// A start without u59-preset.json (direct, or a launcher without the file) says so once.
+	for (const auto& line: Common::U59Preset::StartupWarnings([](const char* name) { return std::getenv(name); })) {
+		Log::WriteToConsoleAndLog(line);
 	}
 
 	int ok = atexit(KytyClose);

@@ -278,6 +278,11 @@ struct LogExecutor {
 		     VerifyHash::Value(Op::WriteTimestamp2, Bits(p), q,
 		                       static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(st))));
 	}
+	void writeBufferMarkerAMD(vk::PipelineStageFlagBits st, vk::Buffer b, vk::DeviceSize o, uint32_t m) {
+		Push(Op::WriteBufferMarker,
+		     VerifyHash::Value(Op::WriteBufferMarker, Bits(b), o,
+		                       static_cast<uint32_t>(static_cast<VkPipelineStageFlagBits>(st)), m));
+	}
 };
 
 // Discards everything (benchmark consumer).
@@ -792,6 +797,18 @@ public:
 				                           static_cast<uint64_t>(
 				                               static_cast<VkPipelineStageFlags2>(
 				                                   vk::PipelineStageFlags2(stage))))});
+				break;
+			}
+			case Op::WriteBufferMarker: {
+				const auto     b      = H<vk::Buffer>();
+				const auto     o      = U64() & 0xffcu;
+				const uint32_t m      = U32();
+				const auto     stage  = (U32() & 1u) != 0 ? vk::PipelineStageFlagBits::eTopOfPipe
+				                                         : vk::PipelineStageFlagBits::eBottomOfPipe;
+				e.writeBufferMarkerAMD(stage, b, o, m);
+				expected.push_back({op, VerifyHash::Value(op, LogExecutor::Bits(b), o,
+				                                          static_cast<uint32_t>(static_cast<VkPipelineStageFlagBits>(stage)),
+				                                          m)});
 				break;
 			}
 			default: break;

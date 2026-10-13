@@ -197,6 +197,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GpuRenderingEnds.Cumulative",
     "FrameEvent.GpuDrawWriteSinks.Cumulative",
     "FrameEvent.OcclusionScopesGated.Cumulative",
+    "FrameEvent.OcclusionUnendedScopes.Cumulative",
+    "FrameEvent.OcclusionCapacityDropped.Cumulative",
     "FrameEvent.DccGpuRecords.Cumulative",
     "FrameEvent.DccGpuReuses.Cumulative",
     "FrameEvent.DccCpuFallbacks.Cumulative",
@@ -214,6 +216,10 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TexturePartialFallbacks.Cumulative",
     "FrameEvent.TextureChunkInvalidations.Cumulative",
     "FrameEvent.TexturePartialVerifyMismatches.Cumulative",
+    "FrameEvent.TextureKeptWrites.Cumulative",
+    "FrameEvent.TextureKeptUnmaps.Cumulative",
+    "FrameEvent.TextureKeptFallbacks.Cumulative",
+    "FrameEvent.ImageWritebackSkippedBytes.Cumulative",
     "FrameEvent.TextureOverlapKeeps.Cumulative",
     "FrameEvent.TilerScratchPoolHits.Cumulative",
     "FrameEvent.TilerScratchPoolMisses.Cumulative",
@@ -706,6 +712,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.BdaAliasedImages.Cumulative",
     "FrameEvent.BdaSettleCpuDirtyPages.Cumulative",
     "FrameEvent.VariantPlanSkips.Cumulative",
+    "FrameEvent.BdaLoggedStores.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

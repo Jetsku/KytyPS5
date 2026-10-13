@@ -9,20 +9,31 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 // Console diagnostics for the audio stack: port opens and closes with their parameters, error
 // results handed to the guest, the DualSense audio route and AvPlayer's guest buffers. They go
 // to stdout because the console text is what users send with a crash report; the log file is
 // often missing. KYTY_AUDIO_DIAG=0 turns them off. A line budget keeps a title that opens ports
 // in a loop from flooding the console, and each (API, error) pair prints once.
+// Once audio.cpp installs the log writer, the console reporter's lines also reach the printf file
+// (_kyty.txt), which is what most players send.
 namespace Libs::Audio::Diag {
+
+// Writes one finished line to the console and the log file (Log::WriteToConsoleAndLog).
+using LogWriter = void (*)(const std::string& text);
+inline std::atomic<LogWriter>& ConsoleLogWriter() {
+	static std::atomic<LogWriter> writer {nullptr};
+	return writer;
+}
 
 class Reporter {
 public:
 	static constexpr int LINE_BUDGET   = 256;
 	static constexpr int ERROR_ENTRIES = 64;
 
-	explicit Reporter(std::FILE* sink, bool enabled = true): m_sink(sink), m_enabled(enabled) {}
+	explicit Reporter(std::FILE* sink, bool enabled = true, bool use_log_writer = false)
+	    : m_sink(sink), m_enabled(enabled), m_use_log_writer(use_log_writer) {}
 
 	[[nodiscard]] bool Enabled() const { return m_enabled && m_sink != nullptr; }
 
@@ -44,15 +55,20 @@ public:
 		if (line > LINE_BUDGET) {
 			return;
 		}
-		std::lock_guard lock(m_mutex);
+		char text[512];
 		if (line == LINE_BUDGET) {
-			std::fprintf(m_sink, "AudioDiag: %d lines printed; further audio diagnostics are off\n",
-			             LINE_BUDGET);
+			std::snprintf(text, sizeof(text), "%d lines printed; further audio diagnostics are off",
+			              LINE_BUDGET);
 		} else {
-			char text[512];
 			std::vsnprintf(text, sizeof(text), format, args);
-			std::fprintf(m_sink, "AudioDiag: %s\n", text);
 		}
+		const LogWriter writer = m_use_log_writer ? ConsoleLogWriter().load() : nullptr;
+		if (writer != nullptr) {
+			writer(std::string("AudioDiag: ") + text + "\n");
+			return;
+		}
+		std::lock_guard lock(m_mutex);
+		std::fprintf(m_sink, "AudioDiag: %s\n", text);
 		std::fflush(m_sink);
 	}
 
@@ -89,6 +105,7 @@ private:
 
 	std::FILE*                           m_sink;
 	bool                                 m_enabled;
+	bool                                 m_use_log_writer;
 	std::atomic<int>                     m_lines {0};
 	std::mutex                           m_mutex;
 	std::array<ErrorKey, ERROR_ENTRIES> m_errors {};
@@ -103,7 +120,7 @@ inline bool EnabledByEnvironment() {
 }
 
 inline Reporter& Console() {
-	static Reporter reporter(stdout, EnabledByEnvironment());
+	static Reporter reporter(stdout, EnabledByEnvironment(), true);
 	return reporter;
 }
 
@@ -117,7 +134,47 @@ inline void Print(const char* format, ...) {
 	va_end(args);
 }
 
+// KYTY_AUDIO_TRACE=1: output timing trace (SDL queue levels, clears, re-primes, device-side
+// shortfalls, AudioOut2 push results) with a summary per port every TRACE_INTERVAL_US. Off by
+// default; the lines go to the console and the log file and have no line budget.
+inline bool TraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_TRACE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+inline constexpr uint64_t TRACE_INTERVAL_US = 10000000;
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 1, 2)))
+#endif
+inline void Trace(const char* format, ...) {
+	char    text[1024];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	if (const LogWriter writer = ConsoleLogWriter().load(); writer != nullptr) {
+		writer(std::string("AudioTrace: ") + text + "\n");
+	} else {
+		std::printf("AudioTrace: %s\n", text);
+		std::fflush(stdout);
+	}
+}
+
+// An error result handed to the guest: one AudioDiag line per (api, code), and with
+// KYTY_AUDIO_TRACE one AudioTrace line per occurrence (the first ERROR_TRACE_BUDGET).
+inline constexpr int ERROR_TRACE_BUDGET = 512;
 inline int Error(const char* api, int code, int64_t detail = 0) {
+	if (TraceEnabled()) {
+		static std::atomic<int> lines {0};
+		if (lines.fetch_add(1, std::memory_order_relaxed) < ERROR_TRACE_BUDGET) {
+			Trace("%s returned 0x%08x to the game (detail %lld)", api, static_cast<unsigned>(code),
+			      static_cast<long long>(detail));
+		}
+	}
 	return Console().Error(api, code, detail);
 }
 

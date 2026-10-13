@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_UPLOADDMA_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -86,9 +87,14 @@ public:
 	// ring and returns the ring offset of the copy, or nullopt (too small, or no ring space that
 	// the current recording's tick may use). `host_copies` (taken only when the copy is queued)
 	// write parts of that range first, on the worker; the rest must be written already.
+	// protects (KYTY_DEFER_PROTECTS, taken only when the copy is queued): deferred write
+	// protections of the pages the host copies read, applied by the worker before it copies them.
+	// llow_small: queue it even below the minimum size.
 	[[nodiscard]] std::optional<uint64_t> Stage(vk::Buffer source, uint64_t source_offset,
 	                                            uint64_t                     size,
-	                                            std::vector<UploadHostCopy>* host_copies = nullptr);
+	                                            std::vector<UploadHostCopy>* host_copies = nullptr,
+	                                            PageManager::PendingProtects* protects = nullptr,
+	                                            bool allow_small = false);
 	// Host-copy totals (tests): bytes queued by Stage and bytes the worker has copied.
 	[[nodiscard]] uint64_t HostCopyBytesQueued() const noexcept { return m_host_bytes_queued; }
 	[[nodiscard]] uint64_t HostCopyBytesDone() const noexcept {
@@ -125,6 +131,7 @@ private:
 		uint64_t              value         = 0;
 		uint64_t              reuse_tick    = 0; // newest completed tick whose ring bytes were released
 		std::vector<UploadHostCopy> host_copies; // performed by the worker before the transfer
+		PageManager::PendingProtects protects;   // applied by the worker before the host copies
 	};
 	struct Span {
 		uint64_t begin = 0;

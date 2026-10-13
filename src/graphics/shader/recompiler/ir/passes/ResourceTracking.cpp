@@ -318,16 +318,20 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image.has_value() != descriptor.indirect_image.has_value()) {
+			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value()) {
 				continue;
 			}
-			if (current.indirect_image.has_value()) {
-				const auto& a = *current.indirect_image;
-				const auto& b = *descriptor.indirect_image;
-				if (a.material_source != b.material_source || a.table_source != b.table_source ||
-				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset ||
+			if (current.indirect_descriptor.has_value()) {
+				const auto& a = *current.indirect_descriptor;
+				const auto& b = *descriptor.indirect_descriptor;
+				if (a.selector != b.selector || a.table_source != b.table_source ||
+				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
+				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
+				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
+				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
+				    (!a.selector_first.IsEmpty() &&
+				     !EquivalentValue(m_program, a.selector_first, b.selector_first)) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
 				     !EquivalentValue(m_program, a.selector_mask, b.selector_mask))) continue;
@@ -774,7 +778,7 @@ private:
 	}
 
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
-	                                DescriptorSource::IndirectImage& indirect,
+	                                DescriptorSource::IndirectDescriptor& indirect,
 	                                DescriptorSource& material_source, uint32_t pc) {
 		const auto guard = PositiveUseGuard(image.Parent());
 		if (guard.IsEmpty()) return false;
@@ -805,9 +809,10 @@ private:
 		        static_cast<uint64_t>(UINT32_MAX) + 1u) return false;
 		const auto mask = BoundedSetBitMask(offset.index, active);
 		if (mask.IsEmpty()) return false;
-		indirect.material_source = InternSource(material_source);
-		indirect.selector_stride = static_cast<uint32_t>(offset.stride);
-		indirect.selector_offset = static_cast<uint32_t>(offset.offset + memory.offset);
+		indirect.selector = DescriptorSource::IndirectDescriptor::SelectorRead {
+		    .source = InternSource(material_source),
+		    .stride = static_cast<uint32_t>(offset.stride),
+		    .offset = static_cast<uint32_t>(offset.offset + memory.offset)};
 		indirect.key_count = Value(32u);
 		indirect.selector_mask = mask;
 		return true;
@@ -923,7 +928,7 @@ private:
 			return false;
 		}
 		DescriptorSource material_source;
-		DescriptorSource::IndirectImage indirect;
+		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
 		if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
@@ -954,12 +959,13 @@ private:
 				return false;
 			}
 			Value selector;
-			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
-			                         indirect.selector_offset) ||
-			    indirect.selector_offset > UINT32_MAX - memory->offset) {
+			DescriptorSource::IndirectDescriptor::SelectorRead selector_read;
+			if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_read.stride,
+			                         selector_read.offset) ||
+			    selector_read.offset > UINT32_MAX - memory->offset) {
 				return false;
 			}
-			indirect.selector_offset += memory->offset;
+			selector_read.offset += memory->offset;
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 			const std::array<const Inst*, 1> material_users {shift};
 			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
@@ -971,7 +977,8 @@ private:
 			    !MakeRuntimeTableSource(*material_handle, pc, material_source)) {
 				return false;
 			}
-			indirect.material_source = InternSource(material_source);
+			selector_read.source = InternSource(material_source);
+			indirect.selector    = selector_read;
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -981,7 +988,7 @@ private:
 		            image_source.dwords.begin());
 		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
 		            image_source.dwords.begin() + 4u);
-		image_source.indirect_image = indirect;
+		image_source.indirect_descriptor = indirect;
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
 		plan.key = key;
@@ -1351,7 +1358,7 @@ private:
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
 				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_image.has_value()) {
+				    image_source->indirect_descriptor.has_value()) {
 					continue;
 				}
 				bool alias = true;

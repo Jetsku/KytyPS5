@@ -60,12 +60,16 @@ struct ConfigOptions {
 	uint32_t               audio_main_volume              = 100;
 	uint32_t               audio_music_volume             = 100;
 	uint32_t               audio_pad_speaker_main_volume  = DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME;
+	// AudioOut2 3D object ports, mixed into the main bed (main and master apply on top).
+	uint32_t               audio_objects_volume           = 100;
+	bool                   audio_objects_enabled          = true;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
+	std::string            amd_cpu_decision; // why amd_cpu_enabled is set as it is, for the log
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -83,9 +87,11 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
+	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -106,12 +112,15 @@ uint32_t GetAudioMasterVolume();
 uint32_t GetAudioMainVolume();
 uint32_t GetAudioMusicVolume();
 uint32_t GetAudioPadSpeakerOnMainVolume();
+uint32_t GetAudioObjectsVolume();
+bool     AudioObjectsEnabled();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
+const std::string& GetAmdCpuDecision();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
@@ -137,9 +146,11 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
 bool PlayGoHackEnabled();
+bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

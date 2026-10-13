@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -12,6 +13,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -169,8 +171,9 @@ std::optional<uint64_t> UploadDma::Allocate(uint64_t size) {
 }
 
 std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offset, uint64_t size,
-                                         std::vector<UploadHostCopy>* host_copies) {
-	if (source == nullptr || size < m_min_bytes) {
+                                         std::vector<UploadHostCopy>* host_copies,
+                                         PageManager::PendingProtects* protects, bool allow_small) {
+	if (source == nullptr || (size < m_min_bytes && !allow_small)) {
 		return std::nullopt;
 	}
 	const auto offset = Allocate(size);
@@ -195,7 +198,8 @@ std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offs
 		std::scoped_lock lock(m_mutex);
 		EXIT_IF(m_stopping);
 		m_jobs.push_back(
-		    {source, source_offset, *offset, size, ++m_enqueued, m_reuse_tick, std::move(copies)});
+		    {source, source_offset, *offset, size, ++m_enqueued, m_reuse_tick, std::move(copies),
+		     protects != nullptr ? std::exchange(*protects, {}) : PageManager::PendingProtects {}});
 	}
 	m_available.notify_one();
 	m_stage_tick  = m_scheduler.CurrentTick();
@@ -256,6 +260,13 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 	vk::CommandBufferBeginInfo begin {};
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	RequireVulkanSuccess(command.begin(&begin), "begin upload DMA command buffer");
+	if (GpuBreadcrumbs::Active()) {
+		GpuBreadcrumbs::Write(command, GpuBreadcrumbs::Queue::Transfer,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Transfer,
+		                                           {.op   = GpuBreadcrumbs::OpUploadDma,
+		                                            .arg0 = static_cast<uint32_t>(jobs.size()),
+		                                            .arg4 = jobs.back().value}));
+	}
 	std::vector<vk::BufferCopy> regions;
 	uint64_t                    reuse_tick = 0;
 	for (size_t first = 0; first < jobs.size();) {
@@ -270,6 +281,11 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 		command.copyBuffer(jobs[first].source, m_ring->Handle(), static_cast<uint32_t>(regions.size()),
 		                   regions.data());
 		first = last;
+	}
+	if (GpuBreadcrumbs::Active()) {
+		GpuBreadcrumbs::Write(command, GpuBreadcrumbs::Queue::Transfer,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Transfer,
+		                                           {.op = GpuBreadcrumbs::OpUploadDmaEnd, .arg4 = jobs.back().value}));
 	}
 	RequireVulkanSuccess(command.end(), "end upload DMA command buffer");
 
@@ -344,6 +360,11 @@ void UploadDma::Worker(std::stop_token stop) {
 		// KYTY_UPLOAD_DMA_HOST_COPY: the staged bytes the command processor left to this worker,
 		// written before the submission below makes them visible to the transfer.
 		uint64_t copied = 0;
+		// KYTY_DEFER_PROTECTS: the pages' write protections first, so a guest write landing before
+		// them is in the copy and every later one faults.
+		for (const auto& job: jobs) {
+			PageManager::ApplyProtects(job.protects, true);
+		}
 		for (const auto& job: jobs) {
 			for (const auto& copy: job.host_copies) {
 				std::memcpy(copy.destination, copy.source, static_cast<size_t>(copy.size));

@@ -10,13 +10,10 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
-// KYTY_LDS_WAITCNT_BARRIER=0 restores the old behavior where S_WAITCNT never orders LDS.
+// KYTY_LDS_WAITCNT_BARRIER=0 restores the old behavior where S_WAITCNT never orders LDS (the
+// scope of the barrier is the emitter's, CodegenOptions::lds_waitcnt_barrier).
 bool LdsWaitcntBarrierEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_LDS_WAITCNT_BARRIER");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+	return GetCodegenOptions().lds_waitcnt_barrier != LdsWaitcntBarrier::Off;
 }
 
 std::atomic_uint32_t g_lds_waitcnt_barriers {0};
@@ -206,12 +203,17 @@ void Translator::EmitControlNop() {
 	ir.Emit(IR::ValueOpcode::ControlNop);
 }
 
-void Translator::EmitWaitcnt() {
-	ir.Emit(IR::ValueOpcode::Waitcnt);
+void Translator::S_WAITCNT_VSCNT(const Decoder::Instruction& inst) {
+	const auto count = inst.src1.value & 63u;
+	// A partial or register-based count (SGPR[SDST] + SIMM16[5:0]) waits for all stores: waiting
+	// longer is always correct, and these forms were accepted (as a no-op) before StoreCompletion.
+	if (inst.src0.kind == Decoder::OperandKind::Null && count == 63u) {
+		return;
+	}
+	ir.Emit(IR::ValueOpcode::StoreCompletion);
 }
 
 void Translator::S_WAITCNT(const Decoder::Instruction& inst) {
-	EmitWaitcnt();
 	if (!lds_write_pending || !LdsWaitcntBarrierEnabled()) {
 		return;
 	}
@@ -227,14 +229,17 @@ void Translator::S_WAITCNT(const Decoder::Instruction& inst) {
 		return;
 	}
 	// On hardware the wave's LDS operations complete in order, so data written by one lane
-	// is visible to every lane after lgkmcnt(0). Host lanes of one guest wave may be separate
-	// invocations or subgroups; a workgroup memory barrier makes the writes visible.
+	// is visible to every lane after lgkmcnt(0). Host lanes of one guest wave are separate
+	// invocations of one subgroup (two lanes per invocation for a split wave64); a memory
+	// barrier makes the writes visible (subgroup scope by default, KYTY_LDS_WAITCNT_BARRIER).
 	ir.Emit(IR::ValueOpcode::SharedMemoryBarrier);
 	lds_write_pending = false;
 	if (g_lds_waitcnt_barriers.fetch_add(1u, std::memory_order_relaxed) == 0u) {
 		LOGF("Shader recompiler: ordering LDS writes at S_WAITCNT lgkmcnt(0) (shader 0x%016" PRIx64
-		     ", pc 0x%08x); KYTY_LDS_WAITCNT_BARRIER=0 disables\n",
-		     program.shader_hash, inst.pc);
+		     ", pc 0x%08x) with a %s-scope memory barrier; KYTY_LDS_WAITCNT_BARRIER=0 disables\n",
+		     program.shader_hash, inst.pc,
+		     GetCodegenOptions().lds_waitcnt_barrier == LdsWaitcntBarrier::Workgroup ? "workgroup"
+		                                                                             : "subgroup");
 	}
 }
 
@@ -250,12 +255,6 @@ void Translator::S_CMOV_B32(const Decoder::Instruction& inst) {
 	}
 	const auto value = ReadU32(inst.src0);
 	WriteOperand(inst.dst, ir.Select(ir.GetScc(), value, ReadU32(inst.dst)));
-}
-
-void Translator::S_SEXT_I32(const Decoder::Instruction& inst, uint32_t bits) {
-	const auto value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
-	                                   {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)}));
-	WriteOperand(inst.dst, value);
 }
 
 void Translator::S_SENDMSG(const Decoder::Instruction& inst) {
@@ -313,6 +312,7 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
                                  const Decoder::Operand& false_source) {
+	// Preserve per-word expressions for descriptor tracking and mask provenance.
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);

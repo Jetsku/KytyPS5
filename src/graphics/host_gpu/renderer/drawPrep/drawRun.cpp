@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
+
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -37,6 +39,35 @@ Live::Switch g_mode("KYTY_DRAW_RUN", ParseMode,
                     [](int64_t, int64_t) { NoteForeignActivity(); });
 Live::Switch g_acquire("KYTY_DRAW_RUN_ACQUIRE", Live::ParseDefaultOff);
 Live::Switch g_push("KYTY_DRAW_RUN_PUSH", Live::ParseDefaultOff);
+// A record made under one value must not be continued under the other.
+Live::Switch g_writes("KYTY_DRAW_RUN_WRITES", Live::ParseDefaultOff,
+                      [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_WRITES change"); });
+
+// A record made with recall on is only recalled while it stays on.
+Live::Switch g_recall("KYTY_DRAW_RUN_RECALL", Live::ParseDefaultOff,
+                      [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_RECALL change"); });
+
+// KYTY_DRAW_RUN_IMAGE_EPOCH: unset, "0": 0; "verify": 2; "exit": 3; anything else: 1.
+Live::Switch g_image_epoch("KYTY_DRAW_RUN_IMAGE_EPOCH", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 2;
+	}
+	return std::strcmp(value, "exit") == 0 ? 3 : 1;
+});
+
+// KYTY_DRAW_RUN_CONT_ELIGIBLE: as KYTY_DRAW_RUN_IMAGE_EPOCH (0, 1, verify 2, exit 3).
+Live::Switch g_cont_eligible("KYTY_DRAW_RUN_CONT_ELIGIBLE", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 2;
+	}
+	return std::strcmp(value, "exit") == 0 ? 3 : 1;
+});
 
 } // namespace Detail
 
@@ -69,8 +100,47 @@ uint64_t HashValues(uint64_t hash, const std::vector<ShaderRecompiler::IR::Descr
 
 } // namespace
 
-void NoteForeignActivity() noexcept {
+namespace {
+
+// What advanced the activity epoch last, and how often each source ended a run (Miss::Activity):
+// the "activity by" part of the 10-second line. The table is the GPU thread's (CountMiss).
+std::atomic<const char*> g_last_activity {"start"};
+struct ActivitySource {
+	const char* what  = nullptr;
+	uint64_t    count = 0;
+	uint64_t    last  = 0;
+};
+std::array<ActivitySource, 24> g_activity_misses {};
+
+} // namespace
+
+void NoteForeignActivity(const char* what) noexcept {
+	g_last_activity.store(what, std::memory_order_relaxed);
 	g_activity.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool QuietOpsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_OPS");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_DRAW_RUN_QUIET_SYNTHETIC (live, default on): a mode change ends the current run.
+Live::Switch g_quiet_synthetic("KYTY_DRAW_RUN_QUIET_SYNTHETIC", Live::ParseDefaultOn,
+                               [](int64_t, int64_t) { NoteForeignActivity(); });
+
+bool QuietSyntheticEnabled() {
+	return g_quiet_synthetic.On();
+}
+
+bool IndirectRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_INDIRECT");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
 }
 
 uint64_t ActivityEpoch() noexcept {
@@ -113,7 +183,17 @@ Totals& GetTotals() {
 }
 
 void CountMiss(Miss miss) noexcept {
-	g_totals.misses[static_cast<uint32_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+	OwnedCounters::Add(g_totals.misses[static_cast<uint32_t>(miss)], 1);
+	if (miss == Miss::Activity) {
+		const char* what = g_last_activity.load(std::memory_order_relaxed);
+		for (auto& source: g_activity_misses) {
+			if (source.what == what || source.what == nullptr) {
+				source.what = what;
+				source.count++;
+				break;
+			}
+		}
+	}
 }
 
 void CountVerifyCheck() noexcept {
@@ -153,8 +233,14 @@ void PrintSummary() {
 		return;
 	}
 	static uint64_t                                          last_ns = 0;
-	static std::array<uint64_t, 13>                          last {};
+	static std::array<uint64_t, 22>                          last {};
 	static std::array<uint64_t, static_cast<size_t>(Miss::Count)> last_misses {};
+	// KYTY_CP_OWNED_COUNTERS (ownedCounters.h): the clock is read every 256th call (the line is
+	// due every 10 s; the commit path calls this once per draw).
+	static uint32_t calls = 0;
+	if (OwnedCounters::g_mode.Get() != 0 && last_ns != 0 && (++calls & 255u) != 0) {
+		return;
+	}
 	const auto                                               now = NowNs();
 	if (last_ns == 0) {
 		last_ns = now;
@@ -163,7 +249,7 @@ void PrintSummary() {
 	if (now - last_ns < 10'000'000'000ull) {
 		return;
 	}
-	const std::array<uint64_t, 13> values {
+	const std::array<uint64_t, 22> values {
 	    g_totals.draws.load(std::memory_order_relaxed),
 	    g_totals.eligible.load(std::memory_order_relaxed),
 	    g_totals.key_matches.load(std::memory_order_relaxed),
@@ -176,13 +262,22 @@ void PrintSummary() {
 	    g_totals.acquire_reused.load(std::memory_order_relaxed),
 	    g_totals.dynamic_emitted.load(std::memory_order_relaxed),
 	    g_totals.partial_pushes.load(std::memory_order_relaxed),
-	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed)};
-	std::array<uint64_t, 13> delta {};
+	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed),
+	    g_totals.depth_promotions_deferred.load(std::memory_order_relaxed),
+	    g_totals.write_records.load(std::memory_order_relaxed),
+	    g_totals.write_continued.load(std::memory_order_relaxed),
+	    g_totals.recall_matches.load(std::memory_order_relaxed),
+	    g_totals.recalled.load(std::memory_order_relaxed),
+	    g_totals.recall_sets_missed.load(std::memory_order_relaxed),
+	    g_totals.epoch_skips.load(std::memory_order_relaxed),
+	    g_totals.epoch_checks.load(std::memory_order_relaxed),
+	    g_totals.epoch_mismatches.load(std::memory_order_relaxed)};
+	std::array<uint64_t, 22> delta {};
 	for (size_t i = 0; i < values.size(); i++) {
 		delta[i] = values[i] - last[i];
 	}
 	static const char* const miss_names[] = {"activity", "command",  "instance", "programs",
-	                                         "validation", "images", "pipeline"};
+	                                         "validation", "images", "pipeline", "writes"};
 	std::string misses;
 	for (size_t i = 0; i < last_misses.size(); i++) {
 		const auto value = g_totals.misses[i].load(std::memory_order_relaxed);
@@ -191,17 +286,31 @@ void PrintSummary() {
 			last_misses[i] = value;
 		}
 	}
+	std::string by;
+	for (auto& source: g_activity_misses) {
+		if (source.what != nullptr && source.count != source.last) {
+			by += " " + std::string(source.what) + "=" + std::to_string(source.count - source.last);
+			source.last = source.count;
+		}
+	}
+	if (!by.empty()) {
+		misses += " (activity by" + by + ")";
+	}
 	std::printf("DrawRun %.0fs (%s): %" PRIu64 " draws, %" PRIu64 " eligible, %" PRIu64
 	            " key matches, %" PRIu64 " continued (%.1f%%), %" PRIu64
 	            " late fallbacks; misses:%s; verify %" PRIu64 " checks, %" PRIu64
 	            " mismatches; %" PRIu64 " alias-excluded, %" PRIu64 " acquisitions reused, %" PRIu64
-	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64 " depth-promotions excluded\n",
+	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64 " depth-promotions excluded, %" PRIu64
+	            " deferred; writes: %" PRIu64 " records, %" PRIu64 " continued; recall: %" PRIu64
+	            " matches, %" PRIu64 " recalled, %" PRIu64 " sets missed; image epoch: %" PRIu64
+	            " skips, verify %" PRIu64 " checks, %" PRIu64 " mismatches\n",
 	            static_cast<double>(now - last_ns) * 1e-9,
 	            GetMode() == Mode::Verify ? "verify" : "on", delta[0], delta[1], delta[2], delta[3],
 	            delta[0] != 0 ? 100.0 * static_cast<double>(delta[3]) / static_cast<double>(delta[0])
 	                          : 0.0,
 	            delta[4], misses.empty() ? " none" : misses.c_str(), delta[6], delta[7], delta[8],
-	            delta[9], delta[10], delta[11], delta[12]);
+	            delta[9], delta[10], delta[11], delta[12], delta[13], delta[14], delta[15], delta[16],
+	            delta[17], delta[18], delta[19], delta[20], delta[21]);
 	std::fflush(stdout);
 	last    = values;
 	last_ns = now;

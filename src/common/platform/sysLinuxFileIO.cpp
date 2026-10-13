@@ -9,16 +9,20 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
 #include <filesystem>
+#include <mutex>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
 #include <utime.h>
+#include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
@@ -81,15 +85,61 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 #endif
 }
 
+static std::atomic<uint64_t> g_read_fallback_count {0};
+
 uint64_t SysFileReadFallbackCount() {
-	return 0;
+	return g_read_fallback_count.load(std::memory_order_relaxed);
+}
+
+// The kernel cannot write into guest pages the emulator has write-protected (GPU write
+// tracking): read() returns EFAULT (fread: a short count with the error flag set) after the
+// bytes before the first such page, and no fault handler runs for a kernel copy. Read the rest
+// through a bounded per-thread host buffer and copy with ordinary user-mode stores, which go
+// through the emulator's fault handling (as the Windows build does for ERROR_NOACCESS).
+static size_t ReadFileViaBounceBuffer(FILE* f, void* data, size_t size) {
+	constexpr size_t                  chunk_size = size_t {1} << 20u;
+	thread_local std::vector<uint8_t> chunk;
+	if (chunk.size() < std::min(chunk_size, size)) {
+		chunk.resize(std::min(chunk_size, size));
+	}
+	size_t total = 0;
+	while (total < size) {
+		const size_t step = std::min(chunk_size, size - total);
+		const size_t got  = fread(chunk.data(), 1, step, f);
+		if (got == 0) {
+			break;
+		}
+		std::memcpy(static_cast<uint8_t*>(data) + total, chunk.data(), got);
+		total += got;
+		if (got < step) {
+			break;
+		}
+	}
+	return total;
+}
+
+static size_t ReadFileIntoMemory(FILE* f, void* data, size_t size) {
+	const size_t w = fread(data, 1, size, f);
+	if (w == size || feof(f) != 0 || ferror(f) == 0) {
+		return w;
+	}
+	const int error = errno;
+	clearerr(f);
+	static std::once_flag once;
+	std::call_once(once, [error] {
+		printf("SysFileRead: read into guest memory failed (errno %d), reading through a host "
+		       "buffer\n",
+		       error);
+	});
+	g_read_fallback_count.fetch_add(1, std::memory_order_relaxed);
+	return w + ReadFileViaBounceBuffer(f, static_cast<uint8_t*>(data) + w, size - w);
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		size_t w = fread(data, 1, size, f.f);
+		const size_t w = ReadFileIntoMemory(f.f, data, size);
 		if (bytes_read != nullptr) {
-			*bytes_read = w;
+			*bytes_read = static_cast<uint32_t>(w);
 		}
 	} else if (f.type == SYS_FILE_MEMORY_STAT) {
 		uint32_t s = size;

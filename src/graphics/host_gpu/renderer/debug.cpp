@@ -4,9 +4,11 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -113,10 +115,11 @@ uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 }
 
 bool SkipInactivePixelShadersEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_SKIP_INACTIVE_PS");
 		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
-	}();
+	}));
 	return enabled;
 }
 
@@ -126,9 +129,15 @@ uint32_t DrawColorOutputFilter(const HW::Context& ctx) {
 	}
 	const auto& sh_regs     = ctx.GetShaderRegisters();
 	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
+	// The export format is per export; KYTY_CB_SHADER_MASK_EXPORTS maps export i to its target.
+	const auto  shader_mask = ShaderCbShaderMaskExports() ? sh_regs.m_cbShaderMask : UINT32_MAX;
 	uint32_t    output_mask = 0;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (sh_regs.target_output_mode[slot] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
+	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
+		const auto slot = ShaderPixelExportTarget(shader_mask, index);
+		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+			break;
+		}
+		if (sh_regs.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
 			output_mask |= 1u << slot;
 		}
 	}

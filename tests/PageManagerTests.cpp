@@ -1,18 +1,23 @@
+#include "common/liveSwitch.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/parkingLock.h"
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -126,9 +131,17 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
+std::mutex g_protection_log_mutex;
+// Runs once, on the calling thread, before the next host protection call (a window inside the
+// page manager's host update: host_lock held, the counts read, the result not yet recorded).
+std::function<void()> g_before_protection;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
+  if (g_before_protection) {
+    const auto hook = std::exchange(g_before_protection, nullptr);
+    hook();
+  }
   uint32_t protection = PAGE_NOACCESS;
   if (mode == Common::VirtualMemory::Mode::Read) {
     protection = PAGE_READONLY;
@@ -136,8 +149,11 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
-  g_protection_calls++;
-  g_protection_ranges.push_back({vaddr, size});
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_protection_calls++;
+    g_protection_ranges.push_back({vaddr, size});
+  }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
@@ -192,6 +208,38 @@ void TestSharedWatcherCounts() {
   manager.UpdatePageWatchers<false>(address + 128, 64);
   Check(IsWritable(memory), "last unwatch did not restore access");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestResyncHostProtection() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(allocation);
+  const auto address = (allocation_base + region_size - 1) & ~(region_size - 1);
+  auto *memory = reinterpret_cast<uint8_t *>(address);
+
+  RegionBits read_mask;
+  read_mask.Set(2);
+  manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<true, true>(address, read_mask);
+  // A view mapped again with its own access: every page writable behind the tracker.
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size * 4, PAGE_READWRITE, &old_protection) != 0,
+        "VirtualProtect failed");
+  // A page the tracker does not watch keeps the protection it was given (a guest's read-only).
+  Check(VirtualProtect(memory + page_size * 3, page_size, PAGE_READONLY, &old_protection) != 0,
+        "VirtualProtect failed");
+  manager.ResyncHostProtection(address, page_size * 4);
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 3) == PAGE_READONLY,
+        "resync did not restore the watched pages' protection only");
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
+  Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
+        "unwatch after a resync did not restore access");
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestCrossRegionRange() {
@@ -711,6 +759,34 @@ void TestDeferredReleaseStress(DeferMode mode) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestConcurrentSharedWatchers() {
+  constexpr size_t worker_count = 8;
+  PageManager manager;
+  auto *memory = Allocate(TRACKER_PAGE_SIZE);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  bool watched = false;
+  std::barrier phase(worker_count, [&]() noexcept {
+    watched = !watched;
+    Check(Protection(memory) == (watched ? PAGE_READONLY : PAGE_READWRITE),
+          "concurrent watchers lost protection or failed to restore writes");
+  });
+  std::vector<std::jthread> workers;
+  for (size_t i = 0; i < worker_count; i++) {
+    workers.emplace_back([&] {
+      for (size_t round = 0; round < 100; round++) {
+        manager.UpdatePageWatchers<true>(address, TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+        manager.UpdatePageWatchers<false>(address, TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 // The spin-then-park lock: mutual exclusion under contention with long holds, and parking.
 void TestParkingLock() {
   Libs::Graphics::ParkingSpinLock lock;
@@ -835,6 +911,117 @@ void TestFatalPaths() {
   }
 }
 
+// KYTY_DEFER_PROTECTS: a deferred write watch leaves the pages writable until its pending list is
+// applied (on another thread here); a synchronous change in between wins; the scope's end applies
+// what nobody took; verify mode checks every applied span.
+void TestDeferredProtects(const char *mode) {
+  Live::Testing::StageText(std::string("KYTY_DEFER_PROTECTS=") + mode + "\n");
+  Live::OnCpFlip();
+  Check(PageManager::DeferProtectsMode() != 0, "KYTY_DEFER_PROTECTS did not switch on");
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto before = PageManager::GetDeferProtectsStats();
+
+  PageManager::PendingProtects list;
+  {
+    const PageManager::DeferProtectsScope scope(true);
+    manager.UpdatePageWatchers<true>(address, page_size * 2);
+    Check(IsWritable(memory) && IsWritable(memory + page_size),
+          "a deferred write watch protected the pages at once");
+    Check(PageManager::HasPendingProtects(), "a deferred write watch left no pending span");
+    list = PageManager::TakePendingProtects();
+    PageManager::DeferProtectsScope::Stop();
+  }
+  Check(list.size() == 1 && IsWritable(memory), "the pending span was applied before it was taken");
+  std::thread([&] { PageManager::ApplyProtects(list, true); }).join();
+  Check(Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_READONLY && IsWritable(memory + page_size * 2),
+        "applying the pending span set the wrong protections");
+
+  // A synchronous release before the deferred protection is applied.
+  {
+    const PageManager::DeferProtectsScope scope(true);
+    manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+    list = PageManager::TakePendingProtects();
+  }
+  manager.UpdatePageWatchers<false>(address + page_size * 2, page_size);
+  PageManager::ApplyProtects(list, false);
+  Check(IsWritable(memory + page_size * 2), "a stale pending span protected a released page");
+
+  // Nobody takes the list: the scope's end applies it.
+  {
+    const PageManager::DeferProtectsScope scope(true);
+    manager.UpdatePageWatchers<true>(address + page_size * 3, page_size);
+    Check(IsWritable(memory + page_size * 3), "a deferred write watch protected the page at once");
+  }
+  Check(Protection(memory + page_size * 3) == PAGE_READONLY, "the scope's end left a page pending");
+
+  manager.UpdatePageWatchers<false>(address, page_size * 2);
+  manager.UpdatePageWatchers<false>(address + page_size * 3, page_size);
+  Check(IsWritable(memory) && IsWritable(memory + page_size * 3), "unwatch did not restore access");
+  const auto after = PageManager::GetDeferProtectsStats();
+  Check(after.pending_pages == 0, "pages stayed pending");
+  Check(after.pages - before.pages == 4 && after.leftover_spans - before.leftover_spans == 1 &&
+            after.worker_spans - before.worker_spans == 1,
+        "deferred protection counters are wrong");
+  Check(after.verify_mismatches == 0, "deferred protection verify found mismatches");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  Live::Testing::StageText("KYTY_DEFER_PROTECTS=\n");
+  Live::OnCpFlip();
+  Check(PageManager::DeferProtectsMode() == 0, "KYTY_DEFER_PROTECTS did not switch off");
+}
+
+// A deferred write watch made while another thread's deferred unprotect of the same page is
+// between reading the counts and recording its host call (a write fault's release applied at its
+// scope end, racing the command processor's next upload of the page). The tighten must not trust
+// the recorded protection the release is about to replace: the page goes on the pending list, and
+// applying it protects the page the release left writable.
+void TestDeferredProtectRacingRelease() {
+  SetDeferMode(DeferMode::On);
+  Live::Testing::StageText("KYTY_DEFER_PROTECTS=1\n");
+  Live::OnCpFlip();
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto before = PageManager::GetDeferProtectsStats();
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "watch did not protect");
+  PageManager::PendingProtects list;
+  std::thread([&] {
+    const PageManager::DeferUnprotectScope scope;
+    manager.UpdatePageWatchers<false>(address, page_size);
+    // The scope's end unprotects the page; just before its host call, another thread watches it
+    // again with its protection deferred.
+    g_before_protection = [&] {
+      std::thread([&] {
+        const PageManager::DeferProtectsScope defer(true);
+        manager.UpdatePageWatchers<true>(address, page_size);
+        list = PageManager::TakePendingProtects();
+        PageManager::DeferProtectsScope::Stop();
+      }).join();
+    };
+  }).join();
+  Check(!g_before_protection, "the release made no host call");
+  Check(IsWritable(memory), "the release did not unprotect");
+  Check(!list.empty(), "a watch racing a release was not deferred: nothing protects the page");
+  PageManager::ApplyProtects(list, true);
+  Check(Protection(memory) == PAGE_READONLY, "applying the raced watch left the page writable");
+  const auto after = PageManager::GetDeferProtectsStats();
+  Check(after.race_pages > before.race_pages, "the race was not counted");
+  Check(after.lost_pages == before.lost_pages, "a raced page was left writable and not pending");
+  Check(after.pending_pages == 0, "pages stayed pending");
+
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(IsWritable(memory), "unwatch did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  Live::Testing::StageText("KYTY_DEFER_PROTECTS=\n");
+  Live::OnCpFlip();
+}
+
 } // namespace
 
 namespace Libs::LibKernel::Memory {
@@ -858,6 +1045,8 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
+  TestResyncHostProtection();
+  TestConcurrentSharedWatchers();
   TestFatalPaths();
 
   // The synchronous paths again, checked by verify mode after every change.
@@ -870,6 +1059,8 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestResyncHostProtection();
+  TestConcurrentSharedWatchers();
   const auto verify_after = PageManager::GetDeferStats();
   Check(verify_after.verify_checks > verify_before.verify_checks &&
             verify_after.verify_mismatches == verify_before.verify_mismatches,
@@ -881,6 +1072,11 @@ int main(int argc, char **argv) {
     TestDeferredReleaseStress(mode);
   }
   TestDeferredBatchOverflow();
+  TestDeferredProtects("1");
+  TestDeferredProtects("verify");
+  TestDeferredProtectRacingRelease();
+  Check(PageManager::GetDeferProtectsStats().verify_checks != 0,
+        "deferred protection verify checked nothing");
   TestParkingLock();
   const auto stats = PageManager::GetDeferStats();
   Check(stats.verify_mismatches == 0, "verify mode found mismatches");

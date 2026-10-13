@@ -1,7 +1,10 @@
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -228,10 +231,10 @@ bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
 	if (prepared.pixel_active) {
 		for (const auto& output: prepared.pixel_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
-				if (output.index >= 32u) {
+				if (output.location >= 32u) {
 					return false;
 				}
-				mrt_mask |= 1u << output.index;
+				mrt_mask |= 1u << output.location; // the colour target (KYTY_CB_SHADER_MASK_EXPORTS)
 			}
 		}
 	}
@@ -485,13 +488,14 @@ uint32_t BindingParts() {
 }
 
 int BindingsVerifyMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_BINDINGS_VERIFY");
 		if (value == nullptr || std::strcmp(value, "0") == 0) {
 			return 0;
 		}
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
-	}();
+	}));
 	return mode;
 }
 
@@ -624,9 +628,9 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
 }
 
 void CountCommittedPlan(bool used) {
-	g_binding_totals.plans.fetch_add(1, std::memory_order_relaxed);
+	OwnedCounters::Add(g_binding_totals.plans, 1);
 	if (used) {
-		g_binding_totals.used.fetch_add(1, std::memory_order_relaxed);
+		OwnedCounters::Add(g_binding_totals.used, 1);
 	}
 	Profiler::CountFrameEvent(used ? Profiler::FrameEvent::DrawPrepBindingPlansUsed
 	                               : Profiler::FrameEvent::DrawPrepBindingPlansDropped);
@@ -649,7 +653,7 @@ const PipelineCache::Pipeline* PlannedPipeline(const PipelineCache& cache, const
 		return nullptr;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingPipelinesUsed);
-	g_binding_totals.pipelines_used.fetch_add(1, std::memory_order_relaxed);
+	OwnedCounters::Add(g_binding_totals.pipelines_used, 1);
 	return plan.pipeline;
 }
 

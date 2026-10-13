@@ -323,6 +323,11 @@ enum class FrameEvent : uint32_t {
 	// Rendering instances with ZPASS counting enabled that began while no occlusion dump pair was
 	// open, so no query was recorded (KYTY_OCCLUSION_GATE).
 	OcclusionScopesGated,
+	// Occlusion query recovery (OcclusionCounter::RecoverBeforePrepare; never expected): a query left
+	// open when the next scope began (ended then), and scopes not counted because the query pool
+	// could not be reduced.
+	OcclusionUnendedScopes,
+	OcclusionCapacityDropped,
 	// DCC clear materialization of GPU-written metadata (TextureCache::MaterializeDccClear):
 	// native GPU inspections recorded (per metadata slice), retained inspections reused, and CPU
 	// readback fallbacks, each fallback also counted once under its first failing reason.
@@ -348,6 +353,13 @@ enum class FrameEvent : uint32_t {
 	TexturePartialFallbacks,
 	TextureChunkInvalidations,
 	TexturePartialVerifyMismatches,
+	// KYTY_IMAGE_GPU_KEEP (TextureCache::KeepGpuBytes): CPU writes and partial unmaps that replaced
+	// only their bytes of a GPU-written image, and kept refreshes that still uploaded it whole.
+	TextureKeptWrites,
+	TextureKeptUnmaps,
+	TextureKeptFallbacks,
+	// KYTY_IMAGE_WRITEBACK_GUARD: image download bytes not written back over newer CPU bytes.
+	ImageWritebackSkippedBytes,
 	// Overlapped texture images kept alive instead of freed (KYTY_TEXTURE_OVERLAP_KEEP_FRAMES).
 	TextureOverlapKeeps,
 	// TileManager scratch buffers reused from its pool or newly allocated (KYTY_TILER_SCRATCH_POOL).
@@ -1235,6 +1247,8 @@ enum class FrameEvent : uint32_t {
 	// Program sources whose dispatches and draws are skipped: a flat SRT read has a loop-carried
 	// address and KYTY_SRT_VARIANT_READS is off (PipelineCache SkipVariantPlan).
 	VariantPlanSkips,
+	// KYTY_BDA_STORE_LOG: stores a BDA-writing dispatch logged for pages without a cache buffer.
+	BdaLoggedStores,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

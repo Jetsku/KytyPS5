@@ -19,6 +19,7 @@
 #include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -119,7 +120,7 @@ static QString GameDirectoryKey(const QString& dir) {
 #endif
 }
 
-// The audio mix sliders (rows 1-4 of the Audio group) are global settings like the controller
+// The audio mix sliders and the 3D objects switch (rows 1-6 of the Audio group) are global settings like the controller
 // group: shown only in the global settings dialog.
 struct AudioMixSlider {
 	QSlider* slider;
@@ -127,16 +128,17 @@ struct AudioMixSlider {
 	int AudioMixSettings::*field;
 };
 
-static std::array<AudioMixSlider, 4> AudioMixSliders(Ui::ConfigurationEditDialog& ui) {
+static std::array<AudioMixSlider, 5> AudioMixSliders(Ui::ConfigurationEditDialog& ui) {
 	return {{{ui.slider_audio_master, ui.label_audio_master_value, &AudioMixSettings::master},
 	         {ui.slider_audio_main, ui.label_audio_main_value, &AudioMixSettings::main},
 	         {ui.slider_audio_music, ui.label_audio_music_value, &AudioMixSettings::music},
 	         {ui.slider_audio_pad_speaker, ui.label_audio_pad_speaker_value,
-	          &AudioMixSettings::pad_speaker}}};
+	          &AudioMixSettings::pad_speaker},
+	         {ui.slider_audio_objects, ui.label_audio_objects_value, &AudioMixSettings::objects}}};
 }
 
 static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
-	for (int row = 1; row <= 4; row++) {
+	for (int row = 1; row <= 6; row++) {
 		ui.audioLayout->setRowVisible(row, visible);
 	}
 	// The occlusion mode is global too (graphics row 9).
@@ -155,9 +157,14 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 			label->setText(ConfigurationEditDialog::tr("%1%").arg(value));
 		});
 	}
+	connect(m_ui->checkBox_audio_objects, &QCheckBox::toggled, this, [this](bool on) {
+		m_ui->slider_audio_objects->setEnabled(on);
+		m_ui->label_audio_objects_value->setEnabled(on);
+	});
 	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
+	m_ui->settings_button->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
@@ -245,6 +252,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	for (const auto& mix: AudioMixSliders(*m_ui)) {
 		mix.slider->setValue(info.audio_mix.*mix.field);
 	}
+	m_ui->checkBox_audio_objects->setChecked(info.audio_mix.objects_enabled);
+	m_ui->slider_audio_objects->setEnabled(info.audio_mix.objects_enabled);
+	m_ui->label_audio_objects_value->setEnabled(info.audio_mix.objects_enabled);
 	m_ui->checkBox_gpu_occlusion->setChecked(info.gpu_occlusion_accurate);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
@@ -309,7 +319,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
+	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
@@ -321,7 +333,11 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
-	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+	// Partly checked: automatic (on unless the CPU is an AMD).
+	m_ui->checkBox_amd_cpu->setTristate(true);
+	m_ui->checkBox_amd_cpu->setCheckState(info.amd_cpu_mode == QStringLiteral("on")    ? Qt::Checked
+	                                      : info.amd_cpu_mode == QStringLiteral("off") ? Qt::Unchecked
+	                                                                                   : Qt::PartiallyChecked);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -390,6 +406,11 @@ void ConfigurationEditDialog::InitGameDirectories() {
 
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_global_settings = true;
+	auto* menu        = new QMenu(m_ui->settings_button);
+	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
+	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
+	m_ui->settings_button->setMenu(menu);
+	m_ui->settings_button->setVisible(true);
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 
@@ -458,6 +479,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		for (const auto& mix: AudioMixSliders(ui)) {
 			info.audio_mix.*mix.field = mix.slider->value();
 		}
+		info.audio_mix.objects_enabled = ui.checkBox_audio_objects->isChecked();
 		info.gpu_occlusion_accurate = ui.checkBox_gpu_occlusion->isChecked();
 	}
 	info.screen_resolution =
@@ -468,14 +490,19 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
+	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
-	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
+	const auto amd_cpu             = ui.checkBox_amd_cpu->checkState();
+	info.amd_cpu_mode              = amd_cpu == Qt::Checked     ? QStringLiteral("on")
+	                                 : amd_cpu == Qt::Unchecked ? QStringLiteral("off")
+	                                                            : QStringLiteral("auto");
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif

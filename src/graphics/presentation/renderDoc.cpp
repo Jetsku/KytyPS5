@@ -178,7 +178,7 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 	}
 
 	// Capture boundaries follow presentation and exclude concurrent queue access.
-	Common::LockGuard render_lock(renderer.GetMutex());
+	RenderLockGuard render_lock(renderer.GetMutex());
 	// KYTY_CP_RECORDER: every recording submitted so far reaches the queue or the broker first
 	// (before queue_mutex, which the recorder may need).
 	auto& scheduler = renderer.GetCommandScheduler();

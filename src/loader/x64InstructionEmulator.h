@@ -2,10 +2,17 @@
 #define KYTY_LOADER_X64_INSTRUCTION_EMULATOR_H_
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 namespace Loader::X64InstructionEmulator {
 
 [[nodiscard]] bool TryEmulate(void* native_context);
+
+// The host CPU's CPUID vendor string ("AuthenticAMD", "GenuineIntel", ...), and whether it names an
+// AMD design. --amd-cpu defaults to on for every other vendor (main.cpp).
+[[nodiscard]] std::string HostCpuVendor();
+[[nodiscard]] bool        IsAmdCpuVendor(std::string_view vendor);
 
 // The "AMD CPU patch" (--amd-cpu, KYTY_AMD_CPU): VRSQRTPS executions emulated so far by the trap
 // fallback (sites without a native trampoline) and, with KYTY_AMD_CPU_TIMING=1, the time spent

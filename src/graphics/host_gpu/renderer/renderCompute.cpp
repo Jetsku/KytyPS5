@@ -11,6 +11,9 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -18,8 +21,10 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
@@ -29,8 +34,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -198,10 +205,93 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// KYTY_LDS_DEVICE_BUFFER_MB (default 1024): the most memory the compute LDS device buffer may
+// take; a direct dispatch with more workgroups than it holds runs its excess workgroups without
+// LDS (their accesses read zero and drop writes), and says so once per shader.
+static uint64_t ComputeLdsMaxBytes(const GraphicContext& graphics) {
+	static const uint64_t configured = [] {
+		const auto* value = std::getenv("KYTY_LDS_DEVICE_BUFFER_MB");
+		const auto  mib   = value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : 1024u;
+		return std::max<uint64_t>(mib, 1u) << 20u;
+	}();
+	return std::min<uint64_t>(configured,
+	                          graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+}
+
+// An indirect dispatch's workgroup count is GPU data: it gets at least this much (1,365 regions
+// of 48 KiB), or the buffer as a direct dispatch grew it.
+static constexpr uint64_t LdsIndirectBytes = 64ull << 20u;
+
+bool RenderExecutor::BindComputeLds(const ShaderComputeInputInfo& input, PreparedBindings& bindings,
+                                    const uint32_t* groups) {
+	const auto& program = *input.stage.program;
+	if (ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory) == nullptr) {
+		return false;
+	}
+	auto&          graphics = m_context.GetGraphics();
+	const uint64_t region =
+	    uint64_t {ShaderRecompiler::LdsStorageRegionDwords(input.lds_size_dwords)} * sizeof(uint32_t);
+	EXIT_IF(region == 0);
+	const uint64_t max_regions = std::max<uint64_t>(ComputeLdsMaxBytes(graphics) / region, 1u);
+	uint64_t       regions     = 0;
+	if (groups != nullptr) {
+		const uint64_t count = uint64_t {groups[0]} * groups[1] * groups[2];
+		regions              = std::min(count, max_regions);
+		if (count > max_regions) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				char text[256];
+				std::snprintf(text, sizeof(text),
+				              "Kyty LDS device buffer: compute shader 0x%016" PRIx64
+				              " dispatches %" PRIu64 " workgroups of %u bytes of LDS; the buffer holds "
+				              "%" PRIu64 " (KYTY_LDS_DEVICE_BUFFER_MB), the others run without LDS\n",
+				              program.shader_hash, count, input.lds_size_dwords * 4u, max_regions);
+				Log::WriteToConsoleAndLog(text);
+			}
+		}
+	} else {
+		const auto current = m_compute_lds != nullptr ? m_compute_lds->Size() / region : 0u;
+		regions = std::min(std::max<uint64_t>(current, LdsIndirectBytes / region), max_regions);
+	}
+	regions            = std::max<uint64_t>(regions, 1u);
+	const auto needed = regions * region;
+	if (m_compute_lds == nullptr || m_compute_lds->Size() < needed) {
+		auto& scheduler = m_context.GetCommandScheduler();
+		const auto old_size = m_compute_lds != nullptr ? m_compute_lds->Size() : 0u;
+		// Grows by at least half, so a growing series of dispatches reallocates a few times only.
+		const auto size =
+		    std::min(std::max(needed, old_size + old_size / 2u), max_regions * region);
+		if (m_compute_lds != nullptr) {
+			// Recorded commands of the current tick may still use the old buffer.
+			scheduler.DeferOperation([old = std::move(m_compute_lds)]() mutable { old.reset(); });
+		}
+		m_compute_lds = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+		                                         vk::BufferUsageFlagBits::eStorageBuffer, size);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			char text[256];
+			std::snprintf(text, sizeof(text),
+			              "Kyty LDS device buffer (KYTY_LDS_DEVICE_BUFFER): %.1f MiB for compute shader "
+			              "0x%016" PRIx64 " (%u bytes of LDS per workgroup, %" PRIu64 " workgroups%s)\n",
+			              static_cast<double>(size) / (1024.0 * 1024.0), program.shader_hash,
+			              input.lds_size_dwords * 4u, regions, groups == nullptr ? ", indirect" : "");
+			Log::WriteToConsoleAndLog(text);
+		}
+	}
+	// A direct dispatch binds its own regions; an indirect one every region the buffer holds.
+	const auto range =
+	    groups != nullptr ? needed : m_compute_lds->Size() / region * region;
+	bindings.shared_memory = {m_compute_lds->Handle(), 0, range};
+	return true;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	KYTY_GPU_OP_SITE("dispatch");
+	// KYTY_CP_GAP_STATS: this scope's phases (drawPrep/cpGaps.h).
+	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopReadyOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -222,7 +312,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	// KYTY_DRAW_RUN: a dispatch ends the run of the draws before it (drawPrep/drawRun.h).
 	BeginDrawRun();
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
@@ -259,10 +349,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info,
-	                                                   m_compute_prep);
+	DrawPrep::MakeComputeInputInfo(cs_regs, {thread_group_x, thread_group_y, thread_group_z, mode},
+	                               input_info);
+	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
+	ShaderProgram compute_program;
+	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): the program a worker prepared from this dispatch's
+	// register snapshot, when its certificate holds; otherwise the serial lookup.
+	auto* const prepared = std::exchange(m_prepared_dispatch, nullptr);
+	if (prepared != nullptr && DrawPrep::ValidateDispatch(*prepared, input_info)) {
+		if (DrawPrep::VerifyMode() != 0) {
+			// The serial lookup on copies; it only reads memory the certificate proved clean.
+			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
+			auto serial_info = input_info;
+			const auto serial_program = m_context.GetPipelineCache().GetComputeProgram(
+			    cs_regs, sh_regs, serial_info, *serial_prep);
+			(void)DrawPrep::VerifyDispatch(*prepared, serial_program, serial_info, *serial_prep);
+		}
+		std::swap(m_compute_prep, prepared->compute_prep);
+		input_info                 = prepared->compute_info;
+		input_info.stage.resources = &m_compute_prep.resources;
+		compute_program            = prepared->compute_program;
+	} else {
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info,
+		                                                                 m_compute_prep);
+	}
+	CpGaps::Phase(CpGaps::Cat::DispatchOp);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -284,22 +395,106 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	const bool large_workgroup =
-	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
-	const bool                   has_sampler = !program.info.samplers.empty();
-	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+
+	if (use_thread_dimensions) {
+		const uint32_t old_x = thread_group_x;
+		const uint32_t old_y = thread_group_y;
+		const uint32_t old_z = thread_group_z;
+		thread_group_x       = input_info.workgroup_counts[0];
+		thread_group_y       = input_info.workgroup_counts[1];
+		thread_group_z       = input_info.workgroup_counts[2];
+
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: use-thread-dimensions %ux%ux%u / %ux%ux%u -> "
+			     "groups %ux%ux%u\n",
+			     old_x, old_y, old_z, std::max(cs_regs.cs_regs.num_thread_x, 1u),
+			     std::max(cs_regs.cs_regs.num_thread_y, 1u),
+			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
+			     thread_group_z);
+		}
+	}
+
+	buffer.EndRendering();
+	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
+	// A software ray-tracing kernel whose pipeline is still being built, or any RT kernel after one
+	// failed to build (rtSession.h), is skipped: the lighting it feeds lags or stays as it was.
+	auto* pipeline_or_null =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_or_null == nullptr) {
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_or_null;
+	auto& bindings = m_compute_bindings;
+	CpGaps::Phase(CpGaps::Cat::DispatchBind);
+	PrepareBindings(input_info.stage, bindings);
+	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		// The requested thread extents initialize EXEC (upstream e4aca7a60).
+		std::copy(std::begin(input_info.dispatch_threads_num),
+		          std::end(input_info.dispatch_threads_num),
+		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
+	}
+	// The native dispatch size bounds workgroup ids for write-range proofs.
+	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
+	bindings.has_dispatch_groups = true;
+	FindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchBda);
+	if (program.info.uses_dma) {
+		m_context.PrepareBda();
+	}
+	if (program.info.uses_bvh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
+	}
+	if (program.info.bda_writes) {
+		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below. The settle relies
+		// on PrepareBda's pass above having uploaded every CPU-dirty page first.
+		EXIT_IF(!program.info.uses_dma);
+		m_context.GetBufferCache().PrepareBdaWrites();
+	}
+	CpGaps::Phase(CpGaps::Cat::DispatchRebind);
+	RebindImages(bindings);
+	BindComputeLds(input_info, bindings, input_info.workgroup_counts);
+	RebindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
+
+	PreparedBindings* descriptor_stage = &bindings;
+	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
+	// is alive. Binding commits and the barrier requests below record state commands only (image
+	// transitions and dependencies are batched); the dispatch goes through Sink(), which records
+	// them first as one barrier, exactly as Handle() did.
+	buffer.BeginEmission();
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	               std::span {&descriptor_stage, 1u});
+	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
+	                          HasShaderBufferWrites(input_info.stage) || program.info.bda_writes;
+	has_storage_writes =
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& image) {
+		                return image.written &&
+		                       image.resource_class ==
+		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
+	                }) ||
+	    has_storage_writes;
+	if (has_storage_writes) {
+		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
+		// while allowing the queue to execute asynchronously.
+		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 		    });
 		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
+		     " hash=0x%016" PRIx64 " tick=%" PRIu64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
-		     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
+		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
+		     m_context.GetCommandScheduler().CurrentTick(),
+		     thread_group_x, thread_group_y, thread_group_z, mode,
+		     input_info.threads_num[0], input_info.threads_num[1],
 		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
 		     sampled_images, program.info.images.size() - sampled_images,
 		     program.info.samplers.size(),
@@ -344,78 +539,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
 			     static_cast<int32_t>(r.LodBias()));
 		}
-	}
-
-	if (use_thread_dimensions) {
-		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
-			return (threads == 0
-			            ? 0u
-			            : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
-		};
-
-		const uint32_t old_x = thread_group_x;
-		const uint32_t old_y = thread_group_y;
-		const uint32_t old_z = thread_group_z;
-		thread_group_x       = groups_from_threads(thread_group_x, cs_regs.cs_regs.num_thread_x);
-		thread_group_y       = groups_from_threads(thread_group_y, cs_regs.cs_regs.num_thread_y);
-		thread_group_z       = groups_from_threads(thread_group_z, cs_regs.cs_regs.num_thread_z);
-
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: use-thread-dimensions %ux%ux%u / %ux%ux%u -> "
-			     "groups %ux%ux%u\n",
-			     old_x, old_y, old_z, std::max(cs_regs.cs_regs.num_thread_x, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_y, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
-			     thread_group_z);
-		}
-	}
-
-	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
-	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	// The native dispatch size bounds workgroup ids for write-range proofs.
-	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
-	bindings.has_dispatch_groups = true;
-	FindBuffers(bindings);
-	if (program.info.uses_dma) {
-		m_context.PrepareBda();
-	}
-	if (program.info.uses_bvh) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
-	}
-	if (program.info.bda_writes) {
-		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below. The settle relies
-		// on PrepareBda's pass above having uploaded every CPU-dirty page first.
-		EXIT_IF(!program.info.uses_dma);
-		m_context.GetBufferCache().PrepareBdaWrites();
-	}
-	RebindImages(bindings);
-	RebindBuffers(bindings);
-
-	PreparedBindings* descriptor_stage = &bindings;
-	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
-	// is alive. Binding commits and the barrier requests below record state commands only (image
-	// transitions and dependencies are batched); the dispatch goes through Sink(), which records
-	// them first as one barrier, exactly as Handle() did.
-	buffer.BeginEmission();
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = HasShaderBufferWrites(input_info.stage) || program.info.bda_writes;
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
@@ -485,13 +608,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode) {
 	KYTY_GPU_OP_SITE("dispatch.indirect");
+	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopReadyOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
+	RenderLockGuard lock(m_context.GetMutex());
 	// KYTY_DRAW_RUN: a dispatch ends the run of the draws before it (drawPrep/drawRun.h).
 	BeginDrawRun();
 	const auto& cs_regs = buffer.GetShaders().GetCs();
@@ -499,19 +623,46 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_compute_prep);
+	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
+	ShaderProgram compute_program;
+	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): as in DispatchDirect, from no workgroup counts.
+	auto* const prepared = std::exchange(m_prepared_dispatch, nullptr);
+	if (prepared != nullptr && DrawPrep::ValidateDispatch(*prepared, input_info)) {
+		if (DrawPrep::VerifyMode() != 0) {
+			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
+			auto serial_info = input_info;
+			const auto serial_program = m_context.GetPipelineCache().GetComputeProgram(
+			    cs_regs, buffer.GetRegisters().GetShaderRegisters(), serial_info, *serial_prep);
+			(void)DrawPrep::VerifyDispatch(*prepared, serial_program, serial_info, *serial_prep);
+		}
+		std::swap(m_compute_prep, prepared->compute_prep);
+		input_info                 = prepared->compute_info;
+		input_info.stage.resources = &m_compute_prep.resources;
+		compute_program            = prepared->compute_program;
+	} else {
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_compute_prep);
+	}
+	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
 	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_or_null =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_or_null == nullptr) {
+		ResetBindings();
+		return;
+	}
+	auto& pipeline = *pipeline_or_null;
 	auto& bindings = m_compute_bindings;
+	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
 	FindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -525,19 +676,22 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		EXIT_IF(!program.info.uses_dma);
 		m_context.GetBufferCache().PrepareBdaWrites();
 	}
+	CpGaps::Phase(CpGaps::Cat::DispatchRebind);
+	BindComputeLds(input_info, bindings, nullptr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
 	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
-	    program.info.bda_writes ||
+	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
+	    HasShaderBufferWrites(input_info.stage) || program.info.bda_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;

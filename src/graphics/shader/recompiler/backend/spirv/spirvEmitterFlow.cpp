@@ -85,7 +85,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
-	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
+	    kind == IR::StageInputKind::BaseInstance || kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
@@ -484,16 +484,16 @@ uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto quad_bits   = state.builder.AllocateId();
 	const auto result      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU64(state), shifted_one, value,
-	                          ConstantU64(state, 0x0000000100000001ull));
+	                          ConstantU32(state, 1));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU64(state), merged_one, value, shifted_one);
 	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU64(state), shifted_two, merged_one,
-	                          ConstantU64(state, 0x0000000200000002ull));
+	                          ConstantU32(state, 2));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU64(state), merged_two, merged_one,
 	                          shifted_two);
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU64(state), quad_bits, merged_two,
 	                          ConstantU64(state, 0x1111111111111111ull));
 	state.builder.AddFunction(spv::OpIMul, TypeU64(state), result, quad_bits,
-	                          ConstantU64(state, 0x0000000f0000000full));
+	                          ConstantU64(state, 15));
 	return result;
 }
 
@@ -513,7 +513,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.
 	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-	    exp.index != 0 && state.input_info.pixel->alpha_blend_source_remap) {
+	    exp.index != 0 && state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 		return;
 	}
 	EmitIfCondition(state, exec, [&]() {
@@ -557,14 +557,36 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
+		    exp.index == 0 && !uint_output &&
+		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
 			    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1});
 			if (blend_output != 0) {
-				const auto alpha = state.builder.AllocateId();
+				auto alpha = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
 				                          3u, 3u, 3u, 3u);
+				uint32_t alpha_factor = 0;
+				switch (state.input_info.pixel->alpha_blend_source) {
+					case ShaderAlphaBlendSource::SourceAlphaOne:
+						alpha_factor = ConstantF32Value(state, 1.0f);
+						break;
+					case ShaderAlphaBlendSource::SourceAlphaZero:
+						alpha_factor = ConstantF32Value(state, 0.0f);
+						break;
+					default: break;
+				}
+				if (alpha_factor != 0) {
+					const auto mapping = state.input_info.pixel->target_export_mapping[0];
+					for (uint32_t component = 0; component < 4; component++) {
+						if (mapping.Map(component) != 3u) continue;
+						const auto factors = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeInsert, vector_type, factors,
+						                          alpha_factor, alpha, component);
+						alpha = factors;
+						break;
+					}
+				}
 				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
 			}
 		}
@@ -633,6 +655,14 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 
 void EmitVoid(ValueEmitContext&) {}
 
+void EmitStoreCompletion(EmitterState& state) {
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	    ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask |
+	                          spv::MemorySemanticsImageMemoryMask));
+}
+
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	if (!tessellation && ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
@@ -640,25 +670,31 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
-	                                       : spv::MemorySemanticsAcquireReleaseMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask;
+	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
+	                                    : spv::MemorySemanticsAcquireReleaseMask |
+	                                          LdsMemorySemantics(state);
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
 
 void EmitSharedMemoryBarrier(EmitterState& state) {
-	// S_WAITCNT lgkmcnt(0) after LDS writes: lanes of one guest wave may live in different
-	// host invocations (and host subgroups for split wave64), so make their LDS writes
-	// visible before the wave reads the exchanged data. Only compute-like stages own
-	// workgroup memory; Vulkan rejects Workgroup memory scope elsewhere.
+	// S_WAITCNT lgkmcnt(0) after LDS writes: lanes of one guest wave live in different host
+	// invocations of one subgroup (two lanes per invocation for a split wave64), so make their
+	// LDS writes visible before the wave reads the exchanged data. Only compute-like stages own
+	// workgroup memory; Vulkan rejects Workgroup memory scope elsewhere. The wait orders only the
+	// wave's own operations, so the barrier stays at subgroup scope (KYTY_LDS_WAITCNT_BARRIER):
+	// it may sit where other waves of the workgroup do not go, and the AMD driver makes a
+	// workgroup-scope fence in a mesh shader a workgroup barrier, which then never completes.
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		return;
 	}
-	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeWorkgroup),
+	const auto scope = GetCodegenOptions().lds_waitcnt_barrier == LdsWaitcntBarrier::Workgroup
+	                       ? spv::ScopeWorkgroup
+	                       : spv::ScopeSubgroup;
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
 	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
-	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
+	                                                 LdsMemorySemantics(state)));
 }
 
 uint32_t EmitLaneId(EmitterState& state) {
@@ -695,7 +731,7 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto indirect = Binary(state, spv::OpIEqual, TypeBool(state), push_dword(3),
 	                             ConstantU32(state, IR::PushData::MeshIndirectSentinel));
 	return EmitValueOrDefaultIfCondition(state, indirect, TypeU32(state), pushed, [&]() {
-		const auto u64 = TypeScalarU64(state);
+		const auto u64 = TypeU64(state);
 		const auto low = Unary(state, spv::OpUConvert, u64, push_dword(0));
 		const auto high =
 		    Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, push_dword(1)),
@@ -726,6 +762,14 @@ uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 
 uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) {
 	return EmitBuiltinU32(ctx.state, static_cast<IR::StageInputKind>(kind.U32()), index.U32());
+}
+
+uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto start = ctx.state.program.bindings.dispatch_thread_dword;
+	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
+		ctx.Fail(inst, "invalid dispatch thread extent");
+	}
+	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
 }
 
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
@@ -794,7 +838,8 @@ uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
 // (addresses, scalar loads, loop exits), as per-lane vector work.
 static uint32_t MarkLaneReadUniform(ValueEmitContext& ctx, const IR::Inst& inst,
                                     uint32_t shuffled) {
-	if (!GetCodegenOptions().uniform_lane_reads) {
+	// KYTY_WAVE32_CLUSTERS: the subgroup's first invocation may belong to the other guest wave.
+	if (!GetCodegenOptions().uniform_lane_reads || ctx.state.wave_clusters) {
 		return shuffled;
 	}
 	auto&      state  = ctx.state;
@@ -862,7 +907,8 @@ static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (GetCodegenOptions().lane_reductions) {
+	// KYTY_WAVE32_CLUSTERS: a subgroup reduction would cover both guest waves; the scan stays.
+	if (GetCodegenOptions().lane_reductions && !ctx.state.wave_clusters) {
 		if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {
 			// One reduction per wave: the second half of a wave64 that one invocation runs
 			// (lane_count 2) takes the first half's result, which covers the same lanes.
@@ -974,7 +1020,7 @@ uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32Vector(state, 2), uniform,
 	                          ConstantU32(state, spv::ScopeSubgroup), read);
 	if (clock.shift == 0) {
-		return uniform;
+		return Unary(state, spv::OpBitcast, TypeU64(state), uniform);
 	}
 	// Scale toward 100 MHz with a shift (no 64-bit arithmetic): right by `shift` bits for a faster
 	// clock (1 GHz: 125 MHz, so guest timeouts expire slightly early rather than 10x late), left
@@ -996,10 +1042,7 @@ uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    Binary(state, carry, TypeU32(state), giving, ConstantU32(state, 32u - amount));
 	const auto received = Binary(state, spv::OpBitwiseOr, TypeU32(state), kept, crossing);
 	const auto given    = Binary(state, shift, TypeU32(state), giving, ConstantU32(state, amount));
-	const auto result   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result,
-	                          right ? received : given, right ? given : received);
-	return result;
+	return PackU64(state, right ? received : given, right ? given : received);
 }
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {

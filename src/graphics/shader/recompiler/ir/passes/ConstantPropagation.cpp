@@ -543,6 +543,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
                       std::unordered_set<Inst*>& lowered_ancillary, ValueSetAnalysis* sets) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::StoreBufferU32: {
+			const auto data = ResolveActiveU32(Arg(inst, 4), Arg(inst, 5));
+			if (!data.IsEmpty() && data != inst.Arg(4)) inst.SetArg(4, data);
+			return;
+		}
 		case ValueOpcode::GetAttributeWithBary: {
 			// The J operand of a V_INTERP_P2: when it is the second component of a hardware I/J
 			// pair, the read gets that pair's interpolation; anything else (a computed J) keeps
@@ -720,6 +725,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
 				Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
 				                    (static_cast<uint64_t>(high.U32()) << 32u)));
+			} else {
+				const auto* low_extract  = low.TryInstruction();
+				const auto* high_extract = high.TryInstruction();
+				if (low_extract != nullptr && high_extract != nullptr &&
+				    low_extract->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+				    high_extract->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+				    Arg(*low_extract, 1) == Value(0u) && Arg(*high_extract, 1) == Value(1u) &&
+				    Arg(*low_extract, 0) == Arg(*high_extract, 0)) {
+					// Guest register pairs need not unpack and repack between wide operations.
+					Replace(inst, Arg(*low_extract, 0));
+				}
 			}
 			return;
 		}

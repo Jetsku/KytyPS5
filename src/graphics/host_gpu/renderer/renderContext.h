@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -28,6 +29,88 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+
+// The renderer's lock (recursive, like Common::Mutex). The GPU thread (the command processor's
+// resolver) takes it around every draw and dispatch, thousands of times a frame; other threads
+// (presentation unless KYTY_PRESENT_UNLOCKED, a capture) rarely. Each Common::Mutex acquisition and
+// release is an interlocked instruction that waits for the GPU thread's store buffer to drain.
+// KYTY_RENDER_LOCK_ASYMMETRIC=1 (startup, default 0; Windows; chenxiao07/KytyPS5 e953c484b): an
+// asymmetric Dekker lock. The GPU thread (the owner, BecomeOwner) marks itself inside with a plain
+// store and proceeds unless a request is up. Another thread takes the mutex, raises `requested`,
+// makes the owner's stores visible and the owner's later loads see the request
+// (FlushProcessWriteBuffers: an interrupt on every processor of the process) and waits until the
+// owner is outside. An owner that finds a request steps out and takes the mutex behind the
+// requester. Off (or without the flush): the owner always takes the mutex, as before.
+class RenderMutex {
+public:
+	RenderMutex()  = default;
+	~RenderMutex() = default;
+	KYTY_CLASS_NO_COPY(RenderMutex);
+
+	// The calling thread (the GPU thread) takes the owner's side from now on, until it resigns
+	// (outside any acquisition).
+	void BecomeOwner();
+	void ResignOwner();
+
+	void Lock() {
+		if (!t_owner) {
+			RequesterLock();
+			return;
+		}
+		if (m_owner_depth++ != 0) {
+			return;
+		}
+		m_busy.store(1, std::memory_order_relaxed);
+		// The store before the load in program order; the requester's flush orders them on the CPU.
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+		if (!m_asymmetric || m_requested.load(std::memory_order_acquire) != 0) {
+			OwnerLockSlow();
+		}
+	}
+	void Unlock() {
+		if (!t_owner) {
+			RequesterUnlock();
+			return;
+		}
+		if (--m_owner_depth != 0) {
+			return;
+		}
+		if (m_owner_locked) {
+			OwnerUnlockSlow();
+			return;
+		}
+		m_busy.store(0, std::memory_order_release);
+	}
+
+private:
+	void OwnerLockSlow();
+	void OwnerUnlockSlow();
+	void RequesterLock();
+	void RequesterUnlock();
+
+	Common::Mutex m_mutex;
+	// The owner's: it is inside (written at each outermost acquisition), and its depth.
+	alignas(64) std::atomic<uint32_t> m_busy {0};
+	uint32_t m_owner_depth  = 0;
+	bool     m_owner_locked = false; // its outermost acquisition took the mutex
+	// The requesters' (under the mutex): one holds the mutex and waits for the owner to leave.
+	alignas(64) std::atomic<uint32_t> m_requested {0};
+	bool m_owner_exists = false;
+	bool m_asymmetric   = false;
+	inline static thread_local bool     t_owner           = false;
+	inline static thread_local uint32_t t_requester_depth = 0;
+};
+
+class RenderLockGuard {
+public:
+	// NOLINTNEXTLINE(google-runtime-references)
+	explicit RenderLockGuard(RenderMutex& mutex): m_mutex(mutex) { m_mutex.Lock(); }
+	~RenderLockGuard() { m_mutex.Unlock(); }
+	KYTY_CLASS_NO_COPY(RenderLockGuard);
+
+private:
+	RenderMutex& m_mutex;
+};
 
 class RenderContext {
 public:
@@ -44,7 +127,7 @@ public:
 	void                                    NotifyGpuProgress();
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
+	RenderMutex&        GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
@@ -62,6 +145,11 @@ public:
 	[[nodiscard]] bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// The host protection of the range was replaced behind the page tracker (PageManager::
+	// ResyncHostProtection): the watched pages get the tracker's protection back.
+	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ResyncHostProtection(vaddr, size);
+	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS (vramStats.h): one GPU memory report (GPU thread).
@@ -100,7 +188,7 @@ private:
 	};
 
 	GraphicContext&           m_graphics;
-	Common::Mutex             m_mutex;
+	RenderMutex               m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;

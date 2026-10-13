@@ -380,6 +380,134 @@ void TestReplayDriver() {
 	Remove(path);
 }
 
+PipelineJournal::Settings MakePipelineSettings(const std::filesystem::path& path,
+                                               const char* identity = "device A", bool sealed = false) {
+	PipelineJournal::Settings settings;
+	settings.path              = path;
+	settings.identity          = Identity(identity);
+	settings.background_writer = false;
+	settings.sealed_writes     = sealed;
+	return settings;
+}
+
+// Pipeline journal: keyed records round-trip in first-recorded order, a key is kept once (also
+// across runs), a damaged tail keeps the intact prefix, another identity starts over, the cap holds.
+void TestPipelineJournal() {
+	const auto path = TestPath("pipelines");
+	Remove(path);
+	{
+		PipelineJournal journal(MakePipelineSettings(path));
+		Expect(journal.Loaded().empty() && !journal.GetStats().file_found, "pipeline journal: missing file loads empty");
+		Expect(journal.Add(0x10, Spec(1, 40)), "pipeline journal: a new key is recorded");
+		Expect(!journal.Add(0x10, Spec(2, 40)), "pipeline journal: a known key is not recorded again");
+		Expect(journal.Add(0x20), "pipeline journal: an empty payload is fine");
+		Expect(journal.Add(0x30, Spec(3, 7)), "pipeline journal: third key");
+		Expect(journal.Contains(0x20) && !journal.Contains(0x40), "pipeline journal: contains");
+		Expect(journal.Flush(), "pipeline journal: flush");
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path));
+		const auto& loaded = journal.Loaded();
+		Expect(loaded.size() == 3 && loaded[0].key == 0x10 && loaded[0].payload == Spec(1, 40) &&
+		           loaded[1].key == 0x20 && loaded[1].payload.empty() && loaded[2].payload == Spec(3, 7),
+		       "pipeline journal: records round-trip in order");
+		Expect(!journal.Add(0x10, Spec(9, 3)), "pipeline journal: loaded keys are known");
+		Expect(journal.Add(0x40, Spec(4, 5)), "pipeline journal: a later run appends");
+		journal.ReleaseLoaded();
+		Expect(journal.Loaded().empty() && journal.Contains(0x10), "pipeline journal: released content stays known");
+	}
+	// Damage: a flipped payload byte in the last record drops it and keeps the rest.
+	auto bytes = ReadAll(path);
+	bytes[bytes.size() - 2] ^= 0xffu;
+	WriteAll(path, bytes);
+	{
+		PipelineJournal journal(MakePipelineSettings(path));
+		Expect(journal.Loaded().size() == 3 && journal.GetStats().damaged_bytes != 0,
+		       "pipeline journal: damaged tail ignored");
+		Expect(journal.Add(0x50, Spec(5, 2)) && journal.Flush(), "pipeline journal: append after damage");
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path));
+		Expect(journal.Loaded().size() == 4 && journal.Loaded()[3].key == 0x50,
+		       "pipeline journal: the damaged tail was cut before appending");
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "device B"));
+		Expect(journal.Loaded().empty() && journal.GetStats().header_rejected,
+		       "pipeline journal: another identity is rejected");
+		journal.Add(0x60);
+		journal.Flush();
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "device B"));
+		Expect(journal.Loaded().size() == 1 && journal.Loaded()[0].key == 0x60,
+		       "pipeline journal: the replaced file holds only the new identity's records");
+	}
+	// Capacity.
+	Remove(path);
+	{
+		auto settings           = MakePipelineSettings(path);
+		settings.max_file_bytes = 400;
+		PipelineJournal journal(std::move(settings));
+		uint64_t accepted = 0;
+		for (uint64_t key = 1; key <= 20; key++) accepted += journal.Add(key, Spec(1, 32)) ? 1 : 0;
+		Expect(accepted > 0 && accepted < 20 && journal.GetStats().over_capacity, "pipeline journal: size cap");
+		Expect(!journal.Contains(20), "pipeline journal: a refused key is not known");
+		journal.Flush();
+	}
+	Expect(std::filesystem::file_size(path) <= 400, "pipeline journal: the file stays under the cap");
+	Remove(path);
+}
+
+// Known-pipeline list mode: Flush writes only what was recorded before Seal (the keys the saved
+// driver cache can hold); Reset empties the file at once.
+void TestPipelineJournalSealed() {
+	const auto path = TestPath("known");
+	Remove(path);
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "driver 1", true));
+		journal.Add(1);
+		journal.Add(2);
+		journal.Seal();
+		journal.Add(3); // created while the driver cache was serialized: not in the saved file
+		Expect(journal.Flush(), "known list: flush");
+		journal.Seal();
+	} // no write at destruction in sealed mode
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "driver 1", true));
+		Expect(journal.Loaded().size() == 2 && journal.Contains(1) && journal.Contains(2) && !journal.Contains(3),
+		       "known list: only sealed keys were written");
+		journal.Add(3);
+		journal.Seal();
+		journal.Flush();
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "driver 1", true));
+		Expect(journal.Loaded().size() == 3, "known list: a later save appends");
+		journal.Reset();
+		Expect(!journal.Contains(1) && journal.KnownCount() == 0, "known list: reset forgets every key");
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "driver 1", true));
+		Expect(journal.Loaded().empty() && !journal.GetStats().header_rejected,
+		       "known list: reset leaves an empty file at once");
+	}
+	{
+		PipelineJournal journal(MakePipelineSettings(path, "driver 2", true));
+		Expect(journal.GetStats().header_rejected, "known list: another driver is rejected");
+	}
+	Remove(path);
+	// In memory only (an empty path): keys are kept, nothing is read or written.
+	{
+		PipelineJournal journal(MakePipelineSettings({}, "driver 1", true));
+		Expect(journal.Add(7) && journal.Contains(7) && !journal.Add(7), "memory list: keys are kept");
+		journal.Seal();
+		Expect(journal.Flush() && journal.GetStats().written_bytes == 0, "memory list: nothing is written");
+		journal.Reset();
+		Expect(!journal.Contains(7), "memory list: reset");
+	}
+}
+
 } // namespace
 
 int main() {
@@ -389,6 +517,8 @@ int main() {
 	TestCapacity();
 	TestBackgroundWriter();
 	TestReplayDriver();
+	TestPipelineJournal();
+	TestPipelineJournalSealed();
 	if (g_failures != 0) {
 		std::printf("ShaderPrecompileTests: %d checks failed\n", g_failures);
 		return 1;

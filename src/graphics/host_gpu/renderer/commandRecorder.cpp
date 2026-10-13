@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
@@ -563,6 +564,10 @@ struct CommandRecorder::NativeExecutor {
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
 		command.writeTimestamp2(stage, pool, query);
 	}
+	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
+	                          uint32_t marker) {
+		command.writeBufferMarkerAMD(stage, buffer, offset, marker);
+	}
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -627,6 +632,7 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 }
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
+	const CpGaps::Scope gap(CpGaps::Cat::RecorderWait);
 	HangWatchdog::Scope wait("recorder-drain", reinterpret_cast<uint64_t>(this),
 	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,
 	                         HangWatchdog::Enabled() ? m_ring.Consumed() : 0);
@@ -669,6 +675,7 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 		return;
 	}
 	EXIT_IF(m_mode != Mode::Thread);
+	const CpGaps::Scope gap(CpGaps::Cat::RecorderWait);
 	HangWatchdog::Scope wait("recorder-recorded-tick", reinterpret_cast<uint64_t>(this), tick,
 	                         HangWatchdog::Enabled() ? m_recorded_tick.load() : 0);
 	if (from_producer) {

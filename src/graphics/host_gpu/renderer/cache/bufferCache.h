@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/writeTickMap.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -56,13 +57,18 @@ public:
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 	// Fault buffer layout: the fault bitmap (1 bit per page). With KYTY_BDA_WRITES it grows by the
-	// written-page bitmap of the same shape and then the dropped-write counter (writes to pages
-	// without a cache buffer), in that order.
+	// written-page bitmap of the same shape, the dropped-write counter (writes to pages without a
+	// cache buffer) and the store log (KYTY_BDA_STORE_LOG: a u32 count, then entries of 4 words
+	// from BDA_STORE_LOG_WORD + 4: guest address low and high, the dword value and its byte mask
+	// as bits), in that order.
 	static constexpr uint64_t FAULT_BITMAP_WORDS      = CACHING_NUMPAGES / 32;
 	static constexpr uint64_t BDA_WRITE_BITMAP_WORD   = FAULT_BITMAP_WORDS;
 	static constexpr uint64_t BDA_DROPPED_WRITES_WORD = 2 * FAULT_BITMAP_WORDS;
+	static constexpr uint64_t BDA_STORE_LOG_WORD      = BDA_DROPPED_WRITES_WORD + 4;
+	static constexpr uint64_t BDA_STORE_LOG_ENTRIES   = 4096;
+	static constexpr uint64_t BDA_STORE_LOG_BYTES     = (4 + 4 * BDA_STORE_LOG_ENTRIES) * sizeof(uint32_t);
 	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE =
-	    (2 * FAULT_BITMAP_WORDS + 4) * sizeof(uint32_t);
+	    BDA_STORE_LOG_WORD * sizeof(uint32_t) + BDA_STORE_LOG_BYTES;
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -93,7 +99,10 @@ public:
 	// Reads use a side copy when every dirty byte they need was written by an already submitted
 	// recording (KYTY_READBACK_SIDE_COPY=0 disables it). GPU-thread reads wait for their copy in
 	// place (KYTY_READBACK_SIDE_GPU_THREAD=0 makes them drain instead).
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// `retried_write`: a write fault whose instruction runs again after the handler returns
+	// (KYTY_READBACK_SIDE_WRITES may then leave the page clean for that second fault).
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                  bool retried_write = false);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
 	// Returns how many of them were eager copies.
@@ -122,6 +131,16 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// KYTY_CP_BINDING_BATCH_PREFETCH (default on, live): a CPU cache hint for the binding memo
+	// slot a later ObtainBuffer(vaddr, size, false, false) on the GPU thread looks up. A stage's
+	// bindings issue all hints first (RenderExecutor::RebindBuffers), so the slots' cache misses
+	// overlap instead of each lookup waiting for its own (the 32,768-slot table is 2 MiB; the
+	// slot load was 4.1% of the command processor at the Sky Garden start view). No state
+	// changes: every key, signature, epoch and guard check of the lookup still runs.
+	// KYTY_CP_BINDING_BATCH_PREFETCH=find: the hints are issued earlier, by RenderExecutor::
+	// FindBuffers for each read binding it discovers (before the stages' image work), instead of a
+	// separate pass in RebindBuffers. `at_find` says which caller asks.
+	void PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find = false) const noexcept;
 	// A writable binding whose shader can only write `written` (sub-ranges of [vaddr, vaddr +
 	// size), e.g. from a write-range proof): the whole range is synchronized as for any binding,
 	// but only `written` becomes GPU-owned (dirty, protected, write-ticked).
@@ -182,6 +201,11 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_READBACK_FLUSH_SIDE (bufferCache.cpp): guest reads served by a side copy after the
+	// command processor submitted the recording that wrote their bytes (process-wide; tests).
+	[[nodiscard]] static uint64_t ReadbackFlushSideCopies() noexcept;
+	// KYTY_READBACK_SIDE_WRITES: guest write faults on GPU-owned pages served by a side copy.
+	[[nodiscard]] static uint64_t ReadbackSideWriteCopies() noexcept;
 	// A native-buffer revision only: callers must separately rule out newer image ownership.
 	// No buffer is created or synchronized. CPU-dirty and pending-publication ranges have no token.
 	[[nodiscard]] std::optional<BufferContentRevision> GetContentRevision(uint64_t vaddr,
@@ -303,6 +327,8 @@ private:
 	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
+	// KYTY_BUFFER_LOOKUP_STATS: the kind of the last SynchronizeBdaBuffersNow (BufferLookupStats::Part).
+	uint8_t m_bda_pass_kind = 0;
 	// KYTY_BDA_SYNC_EPOCH_VERIFY: the full scan a skipped pass replaced.
 	void VerifyBdaEpochSkip(const RangeSet& mapped_ranges);
 	// KYTY_WRITTEN_SYNC_SKIP (default on; =0 off): a written synchronization (not a BDA pass; GPU
@@ -355,9 +381,12 @@ private:
 	// ring to the copy engine (UploadDma) and returns the source the graphics copies then read
 	// (the DMA ring, with the copies' source offsets rebased); otherwise `source` unchanged.
 	// `host_copies` (KYTY_UPLOAD_DMA_HOST_COPY: staging bytes UploadCopies left unwritten) go to
-	// the DMA worker with the copy, or are performed here when the copy is not staged.
+	// the DMA worker with the copy, or are performed here when the copy is not staged. The
+	// calling thread's deferred protections (KYTY_DEFER_PROTECTS) go with them, or are applied
+	// here first. `allow_small`: stage it even below the DMA minimum (KYTY_DEFER_PROTECTS=all).
 	[[nodiscard]] vk::Buffer StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies,
-	                                        std::vector<UploadHostCopy>* host_copies = nullptr);
+	                                        std::vector<UploadHostCopy>* host_copies = nullptr,
+	                                        bool allow_small = false);
 	// A verify-mode difference that only pages turned CPU-dirty since the lookup can cause: a race
 	// when the range's dirtying serials moved since `dirtied_before` (0: unknown, a race), a
 	// mismatch otherwise.
@@ -427,17 +456,27 @@ private:
 	// BindingEpochMemoCrossHits / CrossRejects, and why lookups missed (BindingEpochMemoMiss*).
 	// In verify mode a cross-epoch hit finding CPU-dirty pages with the signature unchanged is a
 	// mismatch, not a race.
+	// KYTY_BINDING_MEMO_TOUCH (default off, live): a cache-buffer hit skips TouchBuffer when this
+	// memo already touched its buffer in the current GC tick (`touched`): the buffer's LRU item then
+	// holds that tick, so the touch would change nothing (LeastRecentlyUsedCache::Touch returns at
+	// once). A hit takes the buffer from `buffer` either way: the slot vector's object (slots live in
+	// a deque, and the structure guard rules out the buffer's deletion).
 	enum class BindingMemoKind : uint8_t { Empty, Stream, Cached };
-	struct BindingMemo {
+	// One 64-byte line per slot (the table is cache-line aligned). Ranges of 4 GiB or more are
+	// never memoized (no storage binding is that large).
+	struct alignas(64) BindingMemo {
 		uint64_t        vaddr     = 0;
-		uint64_t        size      = 0;
+		uint32_t        size      = 0;
+		BindingMemoKind kind      = BindingMemoKind::Empty;
 		uint64_t        epoch     = 0;
 		uint64_t        signature = 0;
 		uint64_t        guard     = 0; // stream: tick; cached: buffer structure epoch
 		uint64_t        offset    = 0;
-		BufferId        id;
-		BindingMemoKind kind = BindingMemoKind::Empty;
+		Buffer*         buffer    = nullptr; // the cache buffer (or the stream buffer)
+		uint64_t        touched   = UINT64_MAX; // cached: the GC tick of the memo's last touch
 	};
+	static_assert(sizeof(BindingMemo) == 64);
+	static constexpr uint64_t BindingMemoMaxSize = uint64_t {1} << 32u;
 	static constexpr size_t BindingMemoSlots = 2048;
 	// KYTY_CP_COMMIT=bindslots: 32,768 slots, indexed by the hash's top 15 bits (11 above).
 	static constexpr size_t BindingMemoSlotsLarge = 32768;
@@ -463,11 +502,28 @@ private:
 	bool     m_binding_hot_enabled = false;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBinding(uint64_t vaddr, uint64_t size,
 	                                                             BufferId id);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBindingMemo(uint64_t vaddr, uint64_t size,
+	                                                                 BufferId id);
+	// KYTY_CP_COMMIT_STATS=steps: the last ObtainReadBindingMemo call was a memo hit.
+	bool m_last_read_hit = false;
 	// The binding without the memo; *obtained receives the cache buffer's id (unchanged for a
 	// stream copy).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferNow(uint64_t vaddr, uint64_t size,
 	                                                           bool is_written, bool is_texel_buffer,
 	                                                           BufferId id, BufferId* obtained);
+	// KYTY_BINDING_LEAN_MISS (default off, live; 1, verify, exit). A read binding that missed its
+	// memo, whose range has no CPU-dirty page (the tracker's lock-free mirror, exact on this thread:
+	// only it clears those bits) while its signature is still the one read before the memo lookup,
+	// and whose buffer from FindBuffers (`id`) is still registered and covers it: the normal path
+	// would decide no stream copy (that needs a CPU-dirty page), keep `id` (FindBuffer would return
+	// it), find nothing to upload, and record the memo under that signature. This takes the same
+	// result and records the same memo from that one query, instead of ObtainBufferNow's and
+	// RecordBinding's several queries and signatures. Anything else takes the normal path.
+	// verify: the normal path runs as well and decides the binding; a different buffer or offset
+	// while the signature is unchanged is a mismatch (BindingLeanMissVerifyMismatches; exit stops).
+	[[nodiscard]] bool TryLeanReadMiss(uint64_t vaddr, uint64_t size, uint64_t epoch,
+	                                   uint64_t before, BufferId id,
+	                                   std::pair<Buffer*, uint64_t>& result);
 	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
 	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
 	// `cross`: the hit came from another epoch (KYTY_BINDING_MEMO_CROSS_EPOCH).
@@ -527,6 +583,13 @@ private:
 	// SettleBdaWrites for the written pages [vaddr, vaddr + size): the parts inside cache buffers.
 	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
 	                           uint64_t& settled_pages);
+	// SettleBdaWrites for the store log (KYTY_BDA_STORE_LOG): the dispatch's stores to pages without
+	// a cache buffer, in log order. Their bytes live in guest memory only: each dword is merged into
+	// the backing after the transition a guest write makes (CPU-dirty, fills forgotten, images over
+	// it invalidated). A dword something on the GPU owns after all (GPU-dirty bytes, a pending
+	// publication, a GPU-modified image) cannot be ordered against that owner here and is dropped as
+	// before. Returns the dropped stores.
+	uint32_t ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> stores, uint64_t shader_hash);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	// `early`: the pages are released before the publication lands (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
@@ -597,6 +660,19 @@ private:
 	std::vector<BackingPublication> m_backing_publications;
 	std::atomic<size_t>              m_backing_publication_count {0};
 	uint64_t                        m_next_backing_publication_token = 0;
+	// KYTY_PUBLICATION_SNAPSHOT: a seqlock copy of every pending range, rewritten under the mutex
+	// at each registration and completion, so HasPendingBackingPublication readers (the draw-prep
+	// workers' read gate, the command processor's clean predicates) never take the mutex.
+	// m_publication_snapshot_count is PublicationSnapshotOverflow when the ranges do not fit.
+	static constexpr uint32_t PublicationSnapshotRanges   = 64;
+	static constexpr uint32_t PublicationSnapshotOverflow = UINT32_MAX;
+	void RewritePublicationSnapshot(); // requires m_backing_publication_mutex
+	[[nodiscard]] bool SnapshotPendingBackingPublication(uint64_t vaddr, uint64_t size,
+	                                                     bool& answer) const;
+	std::atomic<uint64_t>                                        m_publication_seq {0};
+	std::atomic<uint32_t>                                        m_publication_snapshot_count {0};
+	std::array<std::atomic<uint64_t>, PublicationSnapshotRanges> m_publication_begin {};
+	std::array<std::atomic<uint64_t>, PublicationSnapshotRanges> m_publication_end {};
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -695,6 +771,11 @@ private:
 		uint64_t cached_hits       = 0; // cross-epoch hits included
 		uint64_t cross_hits        = 0;
 		uint64_t cross_rejects     = 0;
+		uint64_t touch_skips       = 0; // KYTY_BINDING_MEMO_TOUCH
+		uint64_t lean_misses       = 0; // KYTY_BINDING_LEAN_MISS
+		uint64_t lean_verify_checks     = 0;
+		uint64_t lean_verify_mismatches = 0;
+		uint64_t lean_verify_races      = 0;
 		uint64_t records           = 0;
 		uint64_t verify_checks     = 0;
 		uint64_t verify_mismatches = 0;

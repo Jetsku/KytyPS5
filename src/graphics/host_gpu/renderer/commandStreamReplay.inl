@@ -517,6 +517,16 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			exec.writeTimestamp2(stage, p.pool, p.query);
 			break;
 		}
+		case Op::WriteBufferMarker: {
+			const auto& p           = reader.Get<WriteBufferMarkerPacket>();
+			uint64_t    buffer_bits = 0;
+			const auto  raw         = static_cast<VkBuffer>(p.buffer);
+			std::memcpy(&buffer_bits, &raw, sizeof(buffer_bits));
+			check(VerifyHash::Value(op, buffer_bits, p.offset, p.stage, p.marker));
+			exec.writeBufferMarkerAMD(static_cast<vk::PipelineStageFlagBits>(p.stage), p.buffer, p.offset,
+			                          p.marker);
+			break;
+		}
 	}
 	if (site != nullptr) {
 		exec.LeaveSite();

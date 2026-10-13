@@ -7,8 +7,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/keptRanges.h"
 
 #include <algorithm>
+#include <atomic>
 #include <compare>
 #include <limits>
 #include <memory>
@@ -21,6 +23,7 @@ namespace Libs::Graphics {
 
 class Buffer;
 class CommandScheduler;
+class TileManager;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
@@ -37,6 +40,19 @@ struct ImageUsage {
 	bool depth_target  = false;
 	bool video_out     = false;
 };
+
+// KYTY_DRAW_RUN_IMAGE_EPOCH (RenderExecutor::DrawRunImagesUnchanged): advanced after every change
+// of an image property a draw-run continuation's image check reads (DrawRunImagesChange): an image
+// created or deleted, its registration, rebind request, residency, layout/access/stage, per-
+// subresource states, content serial, CPU dirtiness, buffer modification and tracking range.
+// Changes made on other threads (CPU dirtiness) advance it after the change.
+inline std::atomic<uint64_t> g_image_state_epoch {1};
+inline void NoteImageStateChange() noexcept {
+	g_image_state_epoch.fetch_add(1, std::memory_order_release);
+}
+[[nodiscard]] inline uint64_t ImageStateEpoch() noexcept {
+	return g_image_state_epoch.load(std::memory_order_acquire);
+}
 
 struct ImageBinding {
 	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
@@ -103,7 +119,7 @@ public:
 	void CopyDepthColorImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
-	void CopyImageWithBuffer(Image& source, Buffer& buffer);
+	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	// Native contents identity. Every recorded write to this image gives it a fresh serial
@@ -117,7 +133,10 @@ public:
 	[[nodiscard]] uint64_t DefiniteWrites() const noexcept { return m_definite_writes; }
 	void                   NoteContentWrite() noexcept;
 	void                   NotePossibleWrite() noexcept;
-	void AdoptContentSerial(uint64_t serial) noexcept { m_content_serial = serial; }
+	void AdoptContentSerial(uint64_t serial) noexcept {
+		m_content_serial = serial;
+		NoteImageStateChange();
+	}
 	// A fresh serial from the same sequence, for ordering other writers against image writes
 	// (BufferCache::InvalidateContentRevisions stamps unbounded buffer writers with it).
 	[[nodiscard]] static uint64_t NextContentSerial() noexcept;
@@ -129,10 +148,13 @@ public:
 			m_maybe_hash_valid = false;
 			// Whole-image invalidation carries no chunk information.
 			m_partial_valid = false;
+			kept_dirty.clear();
 			NoteDirtySpan(vaddr, size);
+			NoteImageStateChange();
 		} else if (ImagePageRangesOverlap(live.address, live.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 			NoteDirtySpan(vaddr, size);
+			NoteImageStateChange();
 		}
 	}
 
@@ -149,7 +171,29 @@ public:
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
 		m_partial_valid    = false;
+		NoteImageStateChange();
+		kept_dirty.clear();
 	}
+
+	// KYTY_IMAGE_GPU_KEEP (TextureCache::KeepGpuBytes): a CPU write or a partial unmap replaced the
+	// guest bytes of [begin, end) of this GPU-written image; its other bytes stay the GPU's. The image
+	// is CPU-dirty in kept_dirty only: the next refresh uploads the subresources over those ranges
+	// (TextureCache::UploadKeptRanges). Any whole-image invalidation clears kept_dirty again.
+	// Refused (false) while the whole image is CPU-dirty: that refresh uploads everything anyway.
+	bool NoteKeptCpuWrite(uint64_t begin, uint64_t end) {
+		if (m_maybe_cpu_dirty || (m_cpu_dirty && kept_dirty.empty())) {
+			return false;
+		}
+		m_cpu_dirty        = true;
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+		m_partial_valid    = false;
+		(void)KeptRanges::Add(kept_dirty, std::max(begin, live.address), std::min(end, live.End()));
+		NoteDirtySpan(begin, end - begin);
+		NoteImageStateChange();
+		return true;
+	}
+	[[nodiscard]] bool HasKeptDirty() const noexcept { return m_cpu_dirty && !kept_dirty.empty(); }
 
 	// Chunk-granular CPU write tracking (TextureCache, KYTY_TEXTURE_PARTIAL_UPLOAD). Only for
 	// page-aligned images, so every write to one of their pages overlaps their bytes. While
@@ -189,6 +233,7 @@ public:
 		chunks.whole_cycles    = 0;
 		chunks.whole_released  = false;
 		chunks.hashes.clear();
+		NoteImageStateChange();
 	}
 	[[nodiscard]] static bool ChunkBit(const std::vector<uint64_t>& bits, uint32_t index) noexcept {
 		return (bits[index >> 6] >> (index & 63u)) & 1u;
@@ -215,6 +260,7 @@ public:
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
 		NoteDirtySpan(vaddr, size);
+		NoteImageStateChange();
 	}
 	void ClearChunkDirty() noexcept {
 		if (chunks.dirty_count != 0) {
@@ -275,6 +321,7 @@ public:
 		if (!m_cpu_dirty) {
 			m_maybe_cpu_dirty = true;
 		}
+		NoteImageStateChange();
 	}
 	[[nodiscard]] bool NeedsMaybeCpuHash() const {
 		return m_maybe_cpu_dirty && !m_maybe_hash_valid;
@@ -297,6 +344,7 @@ public:
 		if (!m_cpu_dirty) {
 			ClearDirtySpan();
 		}
+		NoteImageStateChange();
 		return m_cpu_dirty;
 	}
 
@@ -312,8 +360,10 @@ public:
 		// Also reached without an upload (the image is being overwritten on the GPU); a
 		// guest-sourced refresh sets partial validity again afterwards.
 		m_partial_valid = false;
+		kept_dirty.clear();
 		ClearChunkDirty();
 		ClearDirtySpan();
+		NoteImageStateChange();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -421,8 +471,12 @@ public:
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
 		m_partial_valid   = false;
+		NoteImageStateChange();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept {
+		m_buffer_modified = false;
+		NoteImageStateChange();
+	}
 
 	// Against the registered (resident) guest range; see `live`.
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -457,6 +511,8 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// The current stencil plane's mapping into the depth image, also retained by its association.
+	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last  = 0;
 	uint64_t         frame_accessed_last = 0; // presented guest frames, see TextureCache::AdvanceFrame
 	size_t           lru_id              = 0;
@@ -475,6 +531,11 @@ public:
 	vk::Rect2D       claimed_rect {};
 	bool             claimed_rect_valid  = false;
 	ChunkState       chunks;
+	// KYTY_IMAGE_GPU_KEEP: see NoteKeptCpuWrite. kept_holes are the page-aligned ranges inside
+	// [track_addr, track_addr_end) whose watch a kept CPU write released (the faulting pages); the
+	// next TrackImage watches them again, UntrackImage leaves them out.
+	KeptRanges::List kept_dirty;
+	KeptRanges::List kept_holes;
 	// Last download into a cache buffer for texel-buffer reads (SynchronizeBufferFromImage):
 	// the buffer revision it produced and this image's content serial at the time.
 	struct TexelSyncMark {
@@ -497,6 +558,7 @@ public:
 	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
 	                vk::ImageLayout layout) noexcept {
 		backing.state = {stage, access, layout};
+		NoteImageStateChange();
 	}
 
 private:

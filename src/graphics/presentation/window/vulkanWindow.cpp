@@ -11,6 +11,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -62,6 +63,12 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
+	vk::PhysicalDeviceVulkan11Features features {};
+	features.storageBuffer16BitAccess = VK_TRUE;
+	return features;
+}
+
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.samplerMirrorClampToEdge  = VK_TRUE;
@@ -70,6 +77,8 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.storageBuffer8BitAccess   = VK_TRUE;
+	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
 
@@ -223,6 +232,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		depth_clip_control.pNext = &depth_clip_enable;
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
+		vk::PhysicalDeviceVulkan11Features features11 {};
 #if defined(__APPLE__)
 		features12.pNext = &depth_clip_control;
 #else
@@ -230,6 +240,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		fragment_barycentric.pNext = &depth_clip_control;
 		features12.pNext           = &fragment_barycentric;
 #endif
+		features11.pNext       = features12.pNext;
+		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
 
@@ -267,6 +279,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
 		              required_features12.samplerMirrorClampToEdge);
+		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
+		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
+		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
+		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
 		              required_features12.timelineSemaphore);
 		check_feature(features12.shaderOutputLayer, "shaderOutputLayer",
@@ -277,6 +293,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.bufferDeviceAddress);
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
 		              required_features12.shaderBufferInt64Atomics);
+		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
+		              "shaderSampledImageArrayNonUniformIndexing",
+		              required_features12.shaderSampledImageArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
@@ -458,6 +477,175 @@ static void ConfigureShaderFloatControls(const vk::PhysicalDeviceVulkan12Propert
 	     controls.denorm_preserve_f64 ? "true" : "false", enabled ? "" : " (disabled by env)");
 }
 
+static std::string FormatBytes(uint64_t bytes) {
+	if (bytes >= (1ull << 30u)) {
+		return fmt::format("{:.1f} GiB", static_cast<double>(bytes) / static_cast<double>(1ull << 30u));
+	}
+	return fmt::format("{} MiB", bytes >> 20u);
+}
+
+// "Kyty GPU capabilities:" lines on the console, so a player's log answers device questions
+// (driver, architecture, memory, mesh limits, float controls, subgroups, features) without tests.
+// Also resolves KYTY_VS_OUTPUT_GUARD / KYTY_MESH_OUTPUT_GUARD (auto: on for NVIDIA Turing only).
+static void PrintGpuCapabilities(GraphicContext& graphics, const vk::PhysicalDeviceProperties& props,
+                                 const vk::PhysicalDeviceVulkan11Properties&            p11,
+                                 const vk::PhysicalDeviceVulkan12Properties&            p12,
+                                 const vk::PhysicalDeviceSubgroupSizeControlProperties& subgroup,
+                                 const vk::PhysicalDeviceFeatures&                      f10,
+                                 const vk::PhysicalDeviceVulkan12Features&              f12,
+                                 const vk::PhysicalDeviceVulkan13Features&              f13,
+                                 const vk::PhysicalDeviceRobustness2FeaturesEXT*        robustness2,
+                                 bool workgroup_explicit_layout) {
+	namespace Compat        = DeviceCompat;
+	const auto architecture = Compat::GuessNvidiaArchitecture(props.vendorID, props.deviceID);
+	const auto driver       = props.driverVersion;
+	const std::string driver_text =
+	    props.vendorID == Compat::NvidiaVendorId
+	        ? fmt::format("NVIDIA {}.{:02}", (driver >> 22u) & 0x3ffu, (driver >> 14u) & 0xffu)
+	        : fmt::format("{}.{}.{} (0x{:08x})", VK_VERSION_MAJOR(driver), VK_VERSION_MINOR(driver),
+	                      VK_VERSION_PATCH(driver), driver);
+	std::printf("Kyty GPU capabilities: %s, vendor 0x%04x device 0x%04x = %s; driver %s (%s %s); "
+	            "Vulkan %u.%u.%u\n",
+	            props.deviceName.data(), props.vendorID, props.deviceID,
+	            Compat::NvidiaArchitectureName(architecture), driver_text.c_str(),
+	            p12.driverName.data(), p12.driverInfo.data(), VK_VERSION_MAJOR(props.apiVersion),
+	            VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
+
+	// Memory: VRAM, the host-visible part of it (Resizable BAR), and the driver budget.
+	const auto& memory = graphics.physical_device_memory_properties;
+	uint64_t    vram   = 0;
+	uint64_t    bar    = 0;
+	uint64_t    host   = 0;
+	uint32_t    vram_heap = 0;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		const auto size = memory.memoryHeaps[heap].size;
+		if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			if (size > vram) {
+				vram      = size;
+				vram_heap = heap;
+			}
+		} else {
+			host = std::max(host, size);
+		}
+	}
+	for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+		const auto flags = memory.memoryTypes[type].propertyFlags;
+		if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+		    (flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+			bar = std::max(bar, memory.memoryHeaps[memory.memoryTypes[type].heapIndex].size);
+		}
+	}
+	std::string budget = "no VK_EXT_memory_budget";
+	if (graphics.memory_budget_ext_enabled) {
+		vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget_props {};
+		vk::PhysicalDeviceMemoryProperties2         memory2 {};
+		memory2.pNext = &budget_props;
+		graphics.physical_device.getMemoryProperties2(&memory2);
+		budget = fmt::format("budget {} (used by this process {})",
+		                     FormatBytes(budget_props.heapBudget[vram_heap]),
+		                     FormatBytes(budget_props.heapUsage[vram_heap]));
+	}
+	std::printf("Kyty GPU capabilities: VRAM %s, %s; device-local host-visible heap %s (Resizable "
+	            "BAR %s); system heap %s\n",
+	            FormatBytes(vram).c_str(), budget.c_str(), FormatBytes(bar).c_str(),
+	            bar >= (2ull << 30u) ? "on" : "off", FormatBytes(host).c_str());
+
+	if (graphics.mesh_shader_enabled) {
+		const auto& m = graphics.mesh_shader_properties;
+		std::printf("Kyty GPU capabilities: mesh shaders: invocations %u (preferred %u), group size "
+		            "%u, output vertices %u primitives %u components %u, output memory %u, "
+		            "payload+output %u, shared %u; granularity vertex %u primitive %u; prefers "
+		            "local-invocation output vertex %u primitive %u, compact vertex %u primitive %u\n",
+		            m.maxMeshWorkGroupInvocations, m.maxPreferredMeshWorkGroupInvocations,
+		            m.maxMeshWorkGroupSize[0], m.maxMeshOutputVertices, m.maxMeshOutputPrimitives,
+		            m.maxMeshOutputComponents, m.maxMeshOutputMemorySize,
+		            m.maxMeshPayloadAndOutputMemorySize, m.maxMeshSharedMemorySize,
+		            m.meshOutputPerVertexGranularity, m.meshOutputPerPrimitiveGranularity,
+		            static_cast<uint32_t>(m.prefersLocalInvocationVertexOutput),
+		            static_cast<uint32_t>(m.prefersLocalInvocationPrimitiveOutput),
+		            static_cast<uint32_t>(m.prefersCompactVertexOutput),
+		            static_cast<uint32_t>(m.prefersCompactPrimitiveOutput));
+	} else {
+		std::printf("Kyty GPU capabilities: mesh shaders: unavailable\n");
+	}
+
+	const auto independence = [](vk::ShaderFloatControlsIndependence value) {
+		return value == vk::ShaderFloatControlsIndependence::eAll         ? "all"
+		       : value == vk::ShaderFloatControlsIndependence::e32BitOnly ? "32-bit only"
+		                                                                   : "none";
+	};
+	const auto bits3 = [](vk::Bool32 a, vk::Bool32 b, vk::Bool32 c) {
+		return fmt::format("{}{}{}", a ? 1 : 0, b ? 1 : 0, c ? 1 : 0);
+	};
+	const auto declared = ShaderRecompiler::Spirv::GetHostFloatControls();
+	std::printf("Kyty GPU capabilities: float controls (f16 f32 f64 bits): denorm independence %s, "
+	            "rounding independence %s; denorm preserve %s, flush %s; RTE %s, RTZ %s; signed "
+	            "zero/inf/nan %s; Kyty declares ftz32 %u preserve16 %u preserve64 %u\n",
+	            independence(p12.denormBehaviorIndependence),
+	            independence(p12.roundingModeIndependence),
+	            bits3(p12.shaderDenormPreserveFloat16, p12.shaderDenormPreserveFloat32,
+	                  p12.shaderDenormPreserveFloat64)
+	                .c_str(),
+	            bits3(p12.shaderDenormFlushToZeroFloat16, p12.shaderDenormFlushToZeroFloat32,
+	                  p12.shaderDenormFlushToZeroFloat64)
+	                .c_str(),
+	            bits3(p12.shaderRoundingModeRTEFloat16, p12.shaderRoundingModeRTEFloat32,
+	                  p12.shaderRoundingModeRTEFloat64)
+	                .c_str(),
+	            bits3(p12.shaderRoundingModeRTZFloat16, p12.shaderRoundingModeRTZFloat32,
+	                  p12.shaderRoundingModeRTZFloat64)
+	                .c_str(),
+	            bits3(p12.shaderSignedZeroInfNanPreserveFloat16,
+	                  p12.shaderSignedZeroInfNanPreserveFloat32,
+	                  p12.shaderSignedZeroInfNanPreserveFloat64)
+	                .c_str(),
+	            declared.denorm_flush_f32 ? 1u : 0u, declared.denorm_preserve_f16 ? 1u : 0u,
+	            declared.denorm_preserve_f64 ? 1u : 0u);
+
+	std::printf("Kyty GPU capabilities: subgroups: size %u (min %u max %u), required-size stages "
+	            "0x%x, size control %s; supported stages 0x%x operations 0x%x, quad ops in all "
+	            "stages %u\n",
+	            p11.subgroupSize, subgroup.minSubgroupSize, subgroup.maxSubgroupSize,
+	            static_cast<vk::ShaderStageFlags::MaskType>(subgroup.requiredSubgroupSizeStages),
+	            f13.subgroupSizeControl ? "yes" : "no",
+	            static_cast<vk::ShaderStageFlags::MaskType>(p11.subgroupSupportedStages),
+	            static_cast<vk::SubgroupFeatureFlags::MaskType>(p11.subgroupSupportedOperations),
+	            static_cast<uint32_t>(p11.subgroupQuadOperationsInAllStages));
+
+	std::printf("Kyty GPU capabilities: features: int16 %u int64 %u float64 %u float16 %u int8 %u "
+	            "storage8 %u BDA %u memory model %u demote %u maintenance4 %u robustBufferAccess %u "
+	            "robustBufferAccess2 %u robustImageAccess2 %u nullDescriptor %u workgroup layout %u "
+	            "buffer int64 atomics %u\n",
+	            static_cast<uint32_t>(f10.shaderInt16), static_cast<uint32_t>(f10.shaderInt64),
+	            static_cast<uint32_t>(f10.shaderFloat64), static_cast<uint32_t>(f12.shaderFloat16),
+	            static_cast<uint32_t>(f12.shaderInt8),
+	            static_cast<uint32_t>(f12.storageBuffer8BitAccess),
+	            static_cast<uint32_t>(f12.bufferDeviceAddress),
+	            static_cast<uint32_t>(f12.vulkanMemoryModel),
+	            static_cast<uint32_t>(f13.shaderDemoteToHelperInvocation),
+	            static_cast<uint32_t>(f13.maintenance4), static_cast<uint32_t>(f10.robustBufferAccess),
+	            robustness2 != nullptr ? static_cast<uint32_t>(robustness2->robustBufferAccess2) : 0u,
+	            robustness2 != nullptr ? static_cast<uint32_t>(robustness2->robustImageAccess2) : 0u,
+	            robustness2 != nullptr ? static_cast<uint32_t>(robustness2->nullDescriptor) : 0u,
+	            workgroup_explicit_layout ? 1u : 0u,
+	            static_cast<uint32_t>(f12.shaderBufferInt64Atomics));
+
+	// Undefined geometry outputs (SpirvEmitter.h, HostGeometryGuard).
+	const auto vertex_mode = Compat::ParseQuirkMode(std::getenv("KYTY_VS_OUTPUT_GUARD"));
+	const auto mesh_mode   = Compat::ParseQuirkMode(std::getenv("KYTY_MESH_OUTPUT_GUARD"));
+	const bool automatic   = Compat::GeometryOutputGuardAutomatic(architecture);
+	const ShaderRecompiler::Spirv::HostGeometryGuard guard {
+	    .vertex_outputs = Compat::ResolveQuirk(vertex_mode, automatic),
+	    .mesh_outputs   = Compat::ResolveQuirk(mesh_mode, automatic),
+	};
+	ShaderRecompiler::Spirv::SetHostGeometryGuard(guard);
+	std::printf("Kyty GPU capabilities: geometry output guard: vertex %s (KYTY_VS_OUTPUT_GUARD=%s), "
+	            "mesh %s (KYTY_MESH_OUTPUT_GUARD=%s); auto is %s on this GPU\n",
+	            guard.vertex_outputs ? "on" : "off", Compat::QuirkModeName(vertex_mode),
+	            guard.mesh_outputs ? "on" : "off", Compat::QuirkModeName(mesh_mode),
+	            automatic ? "on (NVIDIA Turing)" : "off");
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -540,8 +728,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	depth_clip_control.pNext  = &image_view_min_lod;
 	depth_clip_control.depthClipControl = VK_TRUE;
 
+	// Indirect draws' start instance reaches the shaders as gl_BaseInstance, and byte-aligned
+	// buffers use native 16-bit storage (upstream c3f496271). Both are Vulkan 1.1 features: the
+	// device create info may carry VkPhysicalDeviceVulkan11Features or the older per-feature
+	// structs it supersedes (ShaderDrawParameters), not both.
+	auto features11                 = WindowContext::RequiredVulkan11Features();
+	features11.pNext                = &depth_clip_control;
+	features11.shaderDrawParameters = VK_TRUE;
+
 	auto features12  = WindowContext::RequiredVulkan12Features();
-	features12.pNext = &depth_clip_control;
+	features12.pNext = &features11;
 	// drawIndirectCount is set below, once the supported features are known.
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
@@ -618,6 +814,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = supported_features2.pNext;
 	supported_features2.pNext  = &supported_features12;
+	vk::PhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {};
+	supported_draw_parameters.pNext = supported_features2.pNext;
+	supported_features2.pNext       = &supported_draw_parameters;
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -694,7 +893,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// Only used by the driver-cache probes of the library path and KYTY_PIPELINE_FAST_FIRST; the
 	// default device stays unchanged.
 	graphics.pipeline_creation_cache_control_enabled =
-	    (graphics.pipeline_library_enabled || Libs::Graphics::PipelineFastFirstRequested()) &&
+	    (graphics.pipeline_library_enabled ||
+	     Libs::Graphics::PipelineFastFirstRequested(graphics.GetPhysicalDeviceProperties().vendorID)) &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
 	     pipeline_library_extension ? "true" : "false",
@@ -861,6 +1061,48 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.compute_subgroup_size_control_enabled ||
 	    (supported_features13.subgroupSizeControl == VK_TRUE &&
 	     subgroup_size_control.minSubgroupSize < subgroup_size_control.maxSubgroupSize);
+	// KYTY_COMPUTE_WAVE64=0 (diagnostic, default 1): wave64 compute programs take the two-lanes-per-
+	// invocation path on required 32-wide subgroups, as on NVIDIA, instead of native 64-wide ones.
+	// Only where compute pipelines can require 32 (DeviceCompat::ComputeSubgroupSize then does).
+	if (const auto* wave64 = std::getenv("KYTY_COMPUTE_WAVE64");
+	    wave64 != nullptr && std::strcmp(wave64, "0") == 0) {
+		const bool can_require_32 =
+		    graphics.subgroup_size_control_enabled &&
+		    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
+		    subgroup_size_control.minSubgroupSize <= 32 && subgroup_size_control.maxSubgroupSize >= 32 &&
+		    subgroup_size_control.minSubgroupSize < subgroup_size_control.maxSubgroupSize;
+		if (can_require_32) {
+			graphics.compute_subgroup_size_control_enabled = false;
+			graphics.compute_wave64_split                  = true;
+		}
+		std::printf("Kyty compute wave64 (KYTY_COMPUTE_WAVE64=0): %s\n",
+		            can_require_32 ? "two guest lanes per invocation on required 32-wide subgroups"
+		                           : "unchanged, the device cannot require 32-wide compute subgroups");
+		std::fflush(stdout);
+	}
+	{
+		// KYTY_WAVE32_CLUSTERS: the stages whose wave32 programs can share a host subgroup with a
+		// second guest wave (a default size above 32 the pipeline cannot narrow; vertex-like stages
+		// never require a size).
+		namespace Spirv = ShaderRecompiler::Spirv;
+		const bool wide = graphics.subgroup_size > 32u;
+		const Spirv::HostWaveClusters clusters {
+		    .vertex = wide,
+		    .pixel  = wide && graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eFragment, 32u) == 0u,
+		    .mesh   = wide && graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, 32u) == 0u};
+		Spirv::SetHostWaveClusters(clusters);
+		if (wide) {
+			const auto mode = ShaderRecompiler::GetCodegenOptions().wave32_clusters;
+			std::printf("Kyty wave32 clusters (KYTY_WAVE32_CLUSTERS=%s): %u-wide host subgroups; wave32 "
+			            "vertex/pixel/mesh programs keep their own 32 lanes in %s%s%s\n",
+			            mode == ShaderRecompiler::Wave32Clusters::Off     ? "0, OFF"
+			            : mode == ShaderRecompiler::Wave32Clusters::Force ? "force"
+			                                                              : "auto",
+			            graphics.subgroup_size, clusters.vertex ? "vertex " : "",
+			            clusters.pixel ? "pixel " : "", clusters.mesh ? "mesh" : "");
+			std::fflush(stdout);
+		}
+	}
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -880,11 +1122,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     graphics.mesh_shader_properties.maxMeshOutputPrimitives,
 		     graphics.mesh_shader_properties.maxMeshSharedMemorySize);
 	}
+	PrintGpuCapabilities(graphics, properties2.properties, properties11, properties12,
+	                     subgroup_size_control, supported_features2.features, supported_features12,
+	                     supported_features13, robustness2_ext_enabled ? &supported_robustness2 : nullptr,
+	                     workgroup_layout_extension &&
+	                         supported_workgroup_layout.workgroupMemoryExplicitLayout == VK_TRUE);
 	// VulkanFindPhysicalDevice already checked the required creation features. These
 	// requirements are specific to this creation path and are not part of device selection.
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_draw_parameters.shaderDrawParameters != VK_TRUE);
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
@@ -1068,6 +1316,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.device_fault_enabled = true;
 		}
 	}
+	// KYTY_GPU_BREADCRUMBS: device-uncached marker memory (gpuBreadcrumbs.cpp).
+	vk::PhysicalDeviceCoherentMemoryFeaturesAMD coherent_memory {};
+	if (HasExtension(device_extensions, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceCoherentMemoryFeaturesAMD supported_coherent {};
+		vk::PhysicalDeviceFeatures2                 coherent_query {};
+		coherent_query.pNext = &supported_coherent;
+		physical_device.getFeatures2(&coherent_query);
+		if (supported_coherent.deviceCoherentMemory) {
+			coherent_memory.deviceCoherentMemory  = VK_TRUE;
+			coherent_memory.pNext                 = const_cast<void*>(create_info.pNext);
+			create_info.pNext                     = &coherent_memory;
+			graphics.device_coherent_memory_enabled = true;
+		}
+	}
 	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
 	if (graphics.maintenance8_enabled) {
 		maintenance8.maintenance8 = VK_TRUE;
@@ -1116,6 +1378,77 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		std::fflush(stdout);
 	}
 	return device;
+}
+
+// KYTY_DEVICE_FAULT_DIAGNOSTICS=1: the device facts that decide AMD/NVIDIA code paths, on the
+// console (players send console text, not the log file): driver, queues, memory heaps (a
+// host-visible VRAM heap of 2 GiB or more is resizable BAR / Smart Access Memory), subgroups.
+static void PrintDeviceReport(const GraphicContext& graphics) {
+	const auto&                          physical = graphics.physical_device;
+	vk::PhysicalDeviceDriverProperties   driver {};
+	vk::PhysicalDeviceProperties2        properties {};
+	properties.pNext = &driver;
+	physical.getProperties2(&properties);
+	const auto& p = properties.properties;
+	std::printf("Device report: %s, vendor 0x%04x device 0x%04x, driver %s (%s), driver version 0x%08x, "
+	            "Vulkan %u.%u.%u, timestamp period %.3f ns\n",
+	            p.deviceName.data(), p.vendorID, p.deviceID, driver.driverName.data(),
+	            driver.driverInfo.data(), p.driverVersion, VK_VERSION_MAJOR(p.apiVersion),
+	            VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion),
+	            static_cast<double>(p.limits.timestampPeriod));
+	uint32_t family_count = 0;
+	physical.getQueueFamilyProperties(&family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(family_count);
+	physical.getQueueFamilyProperties(&family_count, families.data());
+	for (uint32_t i = 0; i < family_count; i++) {
+		std::printf("Device report: queue family %u: %u queue(s), flags 0x%x, timestamp bits %u%s%s\n", i,
+		            families[i].queueCount,
+		            static_cast<uint32_t>(static_cast<VkQueueFlags>(families[i].queueFlags)),
+		            families[i].timestampValidBits, i == graphics.queue_family ? " (graphics)" : "",
+		            i == graphics.transfer_queue_family ? " (upload DMA)" : "");
+	}
+	const auto& memory = graphics.GetPhysicalDeviceMemoryProperties();
+	for (uint32_t h = 0; h < memory.memoryHeapCount; h++) {
+		std::string types;
+		for (uint32_t t = 0; t < memory.memoryTypeCount; t++) {
+			if (memory.memoryTypes[t].heapIndex == h) {
+				types += fmt::format(" {}:0x{:x}", t,
+				                     static_cast<uint32_t>(static_cast<VkMemoryPropertyFlags>(
+				                         memory.memoryTypes[t].propertyFlags)));
+			}
+		}
+		std::printf("Device report: heap %u: %.0f MiB, flags 0x%x, types%s\n", h,
+		            static_cast<double>(memory.memoryHeaps[h].size) / (1024.0 * 1024.0),
+		            static_cast<uint32_t>(static_cast<VkMemoryHeapFlags>(memory.memoryHeaps[h].flags)),
+		            types.c_str());
+	}
+	std::printf("Device report: subgroups default %u, min %u, max %u, required-size stages 0x%x, compute "
+	            "wave64 %s%s; side queue %s; sparse buffer %s, sparse image %s; depth feedback loop %s; mesh "
+	            "shaders %s; device-coherent memory %s\n",
+	            graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
+	            static_cast<uint32_t>(static_cast<VkShaderStageFlags>(graphics.required_subgroup_size_stages)),
+	            graphics.SupportsComputeWave64() ? "native" : "two lanes per invocation",
+	            graphics.compute_wave64_split ? " (KYTY_COMPUTE_WAVE64=0)" : "",
+	            graphics.side_queue_index != 0 ? "queue 1" : "shared",
+	            graphics.sparse_residency_buffer_enabled ? "on" : "off",
+	            graphics.sparse_residency_image_enabled ? "on" : "off",
+	            graphics.attachment_feedback_loop_enabled ? "yes" : "no (GENERAL layout)",
+	            graphics.mesh_shader_enabled ? "yes" : "no",
+	            graphics.device_coherent_memory_enabled ? "enabled" : "off");
+	{
+		namespace Recompiler = ShaderRecompiler;
+		const auto mode      = Recompiler::GetCodegenOptions().wave32_clusters;
+		const auto clusters  = Recompiler::Spirv::GetHostWaveClusters();
+		const auto stage     = [mode](bool host) {
+			return mode == Recompiler::Wave32Clusters::Force ? "on (forced)"
+			       : mode == Recompiler::Wave32Clusters::Off ? (host ? "OFF (needed)" : "off")
+			       : host                                    ? "on"
+			                                                 : "not needed";
+		};
+		std::printf("Device report: wave32 clusters (KYTY_WAVE32_CLUSTERS): vertex %s, pixel %s, mesh %s\n",
+		            stage(clusters.vertex), stage(clusters.pixel), stage(clusters.mesh));
+	}
+	std::fflush(stdout);
 }
 
 static void VulkanGetExtensions(VulkanExtensions& r) {
@@ -1582,6 +1915,17 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
 		}
+		// KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h): buffer markers, in device-uncached memory where
+		// VK_AMD_device_coherent_memory offers it (VulkanCreateDevice enables its feature).
+		if (GpuBreadcrumbs::Requested(
+		        HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME),
+		        graphic_ctx.diagnostic_checkpoints_enabled)) {
+			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			graphic_ctx.gpu_breadcrumbs_requested = true;
+			if (HasExtension(available_extensions, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
+			}
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
@@ -1670,6 +2014,12 @@ void WindowContext::CreateVulkan() {
 		                            &graphic_ctx.transfer_queue);
 		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
 	}
+	if (graphic_ctx.gpu_breadcrumbs_requested) {
+		GpuBreadcrumbs::Initialize(graphic_ctx, graphic_ctx.device_coherent_memory_enabled);
+	}
+	if (DeviceFaultDiagnosticsEnabled()) {
+		PrintDeviceReport(graphic_ctx);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1709,6 +2059,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		GpuBreadcrumbs::Shutdown(graphic_ctx);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

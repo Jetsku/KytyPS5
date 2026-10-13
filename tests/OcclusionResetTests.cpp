@@ -32,6 +32,9 @@ int main() {
             window.Reduced();
             const auto used = 1u + epoch % capacity;
             for (uint32_t next = 0; next != used; ++next) {
+                // KYTY_OCCLUSION_SPLIT begins a query at `next` without a reset only when the
+                // window says it was reset and not consumed since.
+                if (window.IsReset(next)) Require(reset[next]);
                 seed = seed * 1664525u + 1013904223u;
                 const auto range = window.Prepare(next, capacity, seed & 1u ? 64u : 1u);
                 Require(range.first == next && range.count <= capacity - next);
@@ -47,8 +50,11 @@ int main() {
     for (uint32_t i = 1; i != 64; ++i) Require(window.Prepare(i, 1024, 64).count == 0);
     Require(window.Prepare(64, 1024, 64).count == 64);
     Require(window.Prepare(1024, 1024, 64).count == 0);
+    Require(window.IsReset(127) && !window.IsReset(128));
     window.Reduced();
+    Require(!window.IsReset(0));
     Require(window.Prepare(0, 1024, 64).count == 64);
+    Require(window.IsReset(1) && window.IsReset(63) && !window.IsReset(64));
     // Legacy mode always resets exactly the next query, even after a wider reset.
     Require(window.Prepare(1, 1024, 1).count == 1);
     std::puts("occlusion reset windows passed");

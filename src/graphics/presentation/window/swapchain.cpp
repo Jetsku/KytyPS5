@@ -20,6 +20,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <limits>
 #include <memory>
 #include <span>
@@ -1183,6 +1184,22 @@ Swapchain::Status Swapchain::Present() {
 
 Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
 
+// KYTY_PRESENT_UNLOCKED (default on; =0 keeps the renderer's lock; chenxiao07/KytyPS5 a30144267): the
+// present thread records and submits the swapchain blit without the renderer's lock. What it uses is
+// the presenter's own: present_scheduler (its pool, timeline and command buffers; only the present
+// thread records on it), the presenter's frames (the flip queue hands a frame over only once the GPU
+// completed its copy, FlipQueue::Complete) and the swapchain images, and the graphics queue, which
+// has its own lock (queue_mutex, also taken by the RenderDoc capture boundaries). Under the
+// renderer's lock the GPU thread waited for that whole recording and submission once a frame. (This
+// tree has no frame generation, which shares the renderer's state and keeps the lock in theirs.)
+static bool PresentUnlocked() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PRESENT_UNLOCKED");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 Presenter::~Presenter() = default;
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
@@ -1195,7 +1212,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	RenderLockGuard   render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
@@ -1211,7 +1228,12 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	// Into the GPU thread's command buffer (its flip) under the renderer's lock; the present
+	// thread's blank frame (no producer) uses only the presenter's scheduler and frame.
+	std::optional<RenderLockGuard> render_lock;
+	if (producer != nullptr || !PresentUnlocked()) {
+		render_lock.emplace(m_impl->renderer.GetMutex());
+	}
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1304,7 +1326,10 @@ void Presenter::Impl::Present() {
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(renderer.GetMutex());
+			std::optional<RenderLockGuard> render_lock;
+			if (!PresentUnlocked()) {
+				render_lock.emplace(renderer.GetMutex());
+			}
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
@@ -1330,7 +1355,7 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

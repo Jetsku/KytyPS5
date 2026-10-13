@@ -288,13 +288,13 @@ void OcclusionCounter::VerifyReduce() {
 	// Adds the queries ended since the last verify reduction to the verify counter (outside
 	// rendering), exactly as FlushPending adds the pending ones without the batch.
 	KYTY_GPU_OP_SITE("occlusion.verify");
-	const uint32_t fresh = m_pending - m_verified;
+	const uint32_t fresh = m_queries.Pending() - m_verified;
 	if (fresh == 0) return;
 	m_context.GetCommandScheduler().Current().Sink().copyQueryPoolResults(
 	    m_pool, m_verified, fresh, m_verify_result->Handle(), 0, 8,
 	    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	VerifyDispatch(0, m_verify_counter->Handle(), 0, m_verify_counter->Size(), fresh);
-	m_verified = m_pending;
+	m_verified = m_queries.Pending();
 }
 
 void OcclusionCounter::PreSubmit(void* context) {
@@ -305,13 +305,13 @@ void OcclusionCounter::FlushBatch() {
 	KYTY_GPU_OP_SITE("occlusion.batch");
 	if (!m_batch_pipeline) return;
 	auto& scheduler = m_context.GetCommandScheduler();
-	if (m_active) {
+	if (m_queries.Active()) {
 		// A counted instance is open (the scheduler is submitting mid-instance): end it so its
 		// query joins this batch. Ending rendering may itself flush (pool full, Accumulate).
 		scheduler.EndRendering();
 	}
-	if (m_batch_count == 0 && m_pending == 0) return;
-	EXIT_IF(m_active || m_prepared);
+	if (m_batch_count == 0 && m_queries.Pending() == 0) return;
+	EXIT_IF(m_queries.Active() || m_prepared);
 	// The batch's dumps took this tick as their completion tick: the reduction must be recorded
 	// into this very command buffer (nothing below may submit it).
 	const auto tick    = scheduler.CurrentTick();
@@ -320,8 +320,8 @@ void OcclusionCounter::FlushBatch() {
 	}
 	auto&      command = scheduler.Current();
 	const auto sink    = command.Sink();
-	if (m_pending != 0) {
-		sink.copyQueryPoolResults(m_pool, 0, m_pending, m_result->Handle(), 0, 8,
+	if (m_queries.Pending() != 0) {
+		sink.copyQueryPoolResults(m_pool, 0, m_queries.Pending(), m_result->Handle(), 0, 8,
 		                          vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	}
 	const vk::DescriptorBufferInfo infos[] {{m_result->Handle(), 0, m_result->Size()},
@@ -343,7 +343,7 @@ void OcclusionCounter::FlushBatch() {
 	command.BindPipeline(vk::PipelineBindPoint::eCompute, m_batch_pipeline);
 	command.PushDescriptors(vk::PipelineBindPoint::eCompute, m_batch_layout, 0,
 	                        static_cast<uint32_t>(writes.size()), writes.data());
-	const uint32_t push[] {m_batch_first_slot, m_batch_count, m_pending, m_slot_count};
+	const uint32_t push[] {m_batch_first_slot, m_batch_count, m_queries.Pending(), m_slot_count};
 	command.PushConstants(m_batch_layout, vk::ShaderStageFlagBits::eCompute, sizeof(push), push);
 	sink.dispatch(1, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -351,7 +351,7 @@ void OcclusionCounter::FlushBatch() {
 	sink.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eAllCommands, {},
 	                     1, &barrier, 0, nullptr, 0, nullptr);
 	EXIT_IF(scheduler.CurrentTick() != tick);
-	m_pending     = 0;
+	m_queries.Reduced();
 	m_reset_window.Reduced();
 	m_verified    = 0;
 	m_batch_count = 0;
@@ -401,9 +401,50 @@ void OcclusionCounter::UpdateGate(OcclusionDumpPairs::Kind kind, uint64_t addres
 	}
 }
 
+bool OcclusionCounter::StrictState() {
+	static const bool strict = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_STRICT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return strict;
+}
+
+void OcclusionCounter::RecoverBeforePrepare() {
+	// Never expected (the split dump's query end no longer flushes batched barriers, which ended
+	// the rendering instance under it); a left-over query or a full pool is repaired instead of
+	// closing the emulator. KYTY_OCCLUSION_STRICT=1 keeps the old exit for development.
+	EXIT_IF(StrictState());
+	const auto recovery = m_queries.BeforePrepare();
+	if (recovery.stale_query != OcclusionQueryState::NoQuery) {
+		m_context.GetCommandScheduler().Current().StateSink().endQuery(m_pool, recovery.stale_query);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionUnendedScopes);
+		static std::once_flag once;
+		std::call_once(once, [&] {
+			std::printf("Occlusion counter: a query scope was still open when the next one began (query %u); "
+			            "ended it\n",
+			            recovery.stale_query);
+			std::fflush(stdout);
+		});
+	}
+	if (recovery.reduce && m_pool) {
+		static std::once_flag once;
+		std::call_once(once, [] {
+			std::printf("Occlusion counter: the query pool was full when a scope began; reduced it first\n");
+			std::fflush(stdout);
+		});
+		if (m_batch_pipeline) {
+			FlushBatch();
+		} else {
+			FlushPending();
+		}
+	}
+}
+
 void OcclusionCounter::Prepare(uint32_t control) {
-	EXIT_IF(m_active || m_pending >= QueryCapacity);
 	m_prepared = false;
+	if (m_queries.Active() || m_queries.Full()) {
+		RecoverBeforePrepare();
+	}
 	if (!Enabled() || !ControlCounts(control)) return;
 	// GFX10 ZPASS enable 1 counts all samples. Other counter selectors and slice
 	// filtering require additional emulation; never report them as invisibility.
@@ -416,33 +457,47 @@ void OcclusionCounter::Prepare(uint32_t control) {
 		return;
 	}
 	Initialize();
-	const auto reset = m_reset_window.Prepare(m_pending, QueryCapacity, g_reset_batch.On() ? 64u : 1u);
+	if (!m_queries.CanBegin()) {
+		// The pool could not be reduced (never expected): this scope is not counted.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionCapacityDropped);
+		return;
+	}
+	const auto reset =
+	    m_reset_window.Prepare(m_queries.Pending(), QueryCapacity, g_reset_batch.On() ? 64u : 1u);
 	if (reset.count != 0) {
 		m_context.GetCommandScheduler().Current().Sink().resetQueryPool(m_pool, reset.first, reset.count);
 	}
 	m_prepared = true;
 }
 
+// Query begins and ends are recorded through StateSink(): they access no memory a draw accesses,
+// so they are never a flush point for batched barriers. Through Sink(), the end recorded by a split
+// dump (called outside the renderer's internal recording) first recorded the pending barriers,
+// which ended the rendering instance; that EndRendering() ended the same query again, so a second,
+// never begun index was ended, the pool count skipped past its reduction point, and the next
+// Prepare exited (m_pending >= QueryCapacity; rocket_hourglass).
 void OcclusionCounter::Begin() {
 	if (!m_prepared) return;
-	m_context.GetCommandScheduler().Current().Sink().beginQuery(m_pool, m_pending, vk::QueryControlFlagBits::ePrecise);
-	m_active = true;
 	m_prepared = false;
+	if (!m_queries.CanBegin()) return;
+	const auto query = m_queries.Begin();
+	m_context.GetCommandScheduler().Current().StateSink().beginQuery(m_pool, query,
+	                                                                 vk::QueryControlFlagBits::ePrecise);
 	++m_scopes_since_dump;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
 }
 
 void OcclusionCounter::End() {
-	if (!m_active) return;
-	m_context.GetCommandScheduler().Current().Sink().endQuery(m_pool, m_pending);
-	m_active = false;
-	++m_pending;
+	// The state changes first: an end reached again while this one is recorded finds none open.
+	const auto query = m_queries.End();
+	if (query == OcclusionQueryState::NoQuery) return;
+	m_context.GetCommandScheduler().Current().StateSink().endQuery(m_pool, query);
 }
 
 void OcclusionCounter::Accumulate() {
 	// Keep ended queries in distinct slots across native rendering boundaries and
 	// submissions. Only a guest snapshot or bounded pool exhaustion needs a sum.
-	if (m_pending == QueryCapacity) {
+	if (m_queries.Full() && !m_queries.Active()) {
 		if (m_batch_pipeline) {
 			FlushBatch();
 		} else {
@@ -453,13 +508,13 @@ void OcclusionCounter::Accumulate() {
 
 void OcclusionCounter::FlushPending() {
 	KYTY_GPU_OP_SITE("occlusion.flush");
-	EXIT_IF(m_active || m_prepared);
-	if (!m_pending) return;
+	EXIT_IF(m_queries.Active() || m_prepared);
+	if (m_queries.Pending() == 0) return;
 	auto native = m_context.GetCommandScheduler().Current().Handle();
-	native.copyQueryPoolResults(m_pool, 0, m_pending, m_result->Handle(), 0, 8,
+	native.copyQueryPoolResults(m_pool, 0, m_queries.Pending(), m_result->Handle(), 0, 8,
 	                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	Dispatch(0, m_counter->Handle(), 0, m_counter->Size());
-	m_pending = 0;
+	m_queries.Reduced();
 	m_reset_window.Reduced();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionReductions);
 }
@@ -488,7 +543,7 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 	command.BindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.PushDescriptors(vk::PipelineBindPoint::eCompute, m_layout, 0,
 	                        static_cast<uint32_t>(writes.size()), writes.data());
-	const uint32_t push[] {mode, static_cast<uint32_t>(offset - aligned), m_pending};
+	const uint32_t push[] {mode, static_cast<uint32_t>(offset - aligned), m_queries.Pending()};
 	native.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
 	native.dispatch(1, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -533,11 +588,41 @@ bool OcclusionCounter::PriorityPublication() {
 	return enabled;
 }
 
+bool OcclusionCounter::SplitEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_SPLIT");
+		const bool  on    = value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+		return on && BatchEnabled();
+	}();
+	return enabled;
+}
+
 bool OcclusionCounter::Dump(uint64_t address) {
 	auto& scheduler = m_context.GetCommandScheduler();
-	scheduler.EndRendering();
+	if (!m_pool) {
+		scheduler.EndRendering(); // Initialize records outside rendering
+	}
 	Initialize();
 	const bool batch = static_cast<bool>(m_batch_pipeline);
+	// KYTY_OCCLUSION_SPLIT: close only the instance's query; the instance stays active.
+	const bool              active = scheduler.Active();
+	const uint64_t          instance = active ? scheduler.Current().ActiveRenderingSerial() : 0;
+	const vk::CommandBuffer command  = active ? scheduler.Current().Identity() : vk::CommandBuffer {};
+	const auto              tick     = scheduler.CurrentTick();
+	const auto              slot_index = static_cast<uint32_t>(m_issued % m_slot_count);
+	// Not with the batch verify (its per-dump reductions record outside rendering), nor when the
+	// slot must be waited for (the wait may submit this command buffer).
+	bool split = batch && SplitEnabled() && instance != 0 && !m_prepared && !m_verify_counter &&
+	             (m_issued < m_slot_count || scheduler.IsFree(m_slot_ticks[slot_index]));
+	if (split) {
+		End();
+		if (m_queries.Full()) {
+			split = false; // the pool must be reduced outside rendering (Accumulate)
+		}
+	}
+	if (!split) {
+		scheduler.EndRendering();
+	}
 	if (!batch) {
 		FlushPending();
 	}
@@ -561,7 +646,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		// KYTY_OCCLUSION_BATCH: the queries ended so far in this batch precede the dump; FlushBatch
 		// reduces them and writes the slot (and this tag) before this command buffer is submitted.
 		auto* entries = reinterpret_cast<uint32_t*>(m_prefix->Mapped().data()) + uint64_t {slot} * 2u;
-		entries[0]    = m_pending;
+		entries[0]    = m_queries.Pending();
 		entries[1]    = tag;
 		if (!m_prefix->IsCoherent()) {
 			m_prefix->Flush(uint64_t {slot} * TableEntrySize, TableEntrySize);
@@ -691,6 +776,24 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	                  m_last_scope.colors == 0 && m_last_scope.has_depth;
 	m_scopes_since_dump = 0;
 	m_last_scope        = {};
+	// A slot wait above may have submitted the command buffer (ending the instance).
+	split = split && scheduler.Active() && scheduler.Current().Identity() == command &&
+	        scheduler.CurrentTick() == tick && scheduler.Current().ActiveRenderingSerial() == instance;
+	if (split && WouldCount(scheduler.Current().OcclusionControl())) {
+		// The instance is counted from here on: its next query begins inside it, or, without a
+		// reset index, the next draw begins a new instance (Prepare resets outside rendering).
+		if (m_queries.CanBegin() && m_reset_window.IsReset(m_queries.Pending())) {
+			const auto query = m_queries.Begin();
+			scheduler.Current().StateSink().beginQuery(m_pool, query, vk::QueryControlFlagBits::ePrecise);
+			++m_scopes_since_dump;
+			m_last_scope = m_instance_scope;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
+		} else {
+			scheduler.EndRendering();
+			split = false;
+		}
+	}
+	m_last_dump_kept = split;
 	return sync;
 }
 }

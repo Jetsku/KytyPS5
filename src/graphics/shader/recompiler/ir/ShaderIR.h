@@ -13,6 +13,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <deque>
 #include <list>
@@ -158,6 +159,7 @@ struct ExportInfo {
 
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
+	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
@@ -171,6 +173,10 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	uint32_t               indirect_root              = NoIndirectBuffer;
+	uint32_t               indirect_mapping_offset    = 0;
+	uint32_t               indirect_search_iterations = 0;
+	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -242,6 +248,7 @@ enum class StageInputKind {
 	PrimitiveId,
 	TessCoord,
 	InstanceIndex,
+	BaseInstance,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,
@@ -251,6 +258,7 @@ enum class StageInputKind {
 	BaryCoordSmoothCentroid,
 	BaryCoordNoPerspective,
 	WorkgroupId,
+	NumWorkgroups,
 	LocalInvocationId,
 	LocalInvocationIndex,
 	GlobalInvocationId,
@@ -371,11 +379,12 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	MipStats,
+	SharedMemory,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -512,6 +521,7 @@ struct DescriptorBinding {
 
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
+	uint32_t                       dispatch_thread_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	// Per-draw GET_LOD_STATS field of each image (one dword each, LodStatsReport::ImageField:
@@ -576,21 +586,32 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
-	struct IndirectImage {
-		uint32_t material_source = UINT32_MAX;
+	struct IndirectDescriptor {
+		struct SelectorRead {
+			uint32_t source = UINT32_MAX;
+			uint32_t stride = 0;
+			uint32_t offset = 0;
+
+			bool operator==(const SelectorRead& other) const = default;
+		};
+		std::optional<SelectorRead> selector;
 		uint32_t table_source    = 0;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		uint32_t table_immediate = 0;
+		uint32_t table_stride    = 0;
+		uint32_t table_record_bytes = 0;
+		bool     table_scalar = false;
+		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
+		Value                 selector_first;
 		Value    selector_mask;
 
-		bool operator==(const IndirectImage& other) const = default;
+		bool operator==(const IndirectDescriptor& other) const = default;
 	};
 
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	std::optional<IndirectDescriptor> indirect_descriptor;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -805,6 +826,14 @@ struct ResourcePlan {
 	// a sealed plan assigned every slot when it was extracted and never writes it again.
 	mutable uint32_t                    evaluation_value_count = 0;
 	bool                                evaluation_sealed      = false;
+	// Unique per sealed plan (AssignTraceIdentity, when sealed, cloned or decoded); keys the
+	// per-thread SRT replay traces (KYTY_SRT_TRACE).
+	uint64_t                            trace_identity         = 0;
+
+	void AssignTraceIdentity() {
+		static std::atomic<uint64_t> next_identity {0};
+		trace_identity = next_identity.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
 };
 
 // Per-thread scratch for nested clean/EXEC memos, activity and material keys. Plans stay
@@ -877,6 +906,7 @@ void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

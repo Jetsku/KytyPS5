@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>840</width>
+    <width>900</width>
     <height>620</height>
    </rect>
   </property>
@@ -190,6 +190,38 @@
           </item>
          </layout>
         </item>
+        <item row="5" column="0">
+         <widget class="QLabel" name="label_audio_objects">
+          <property name="text"><string>3D audio objects:</string></property>
+         </widget>
+        </item>
+        <item row="5" column="1">
+         <layout class="QHBoxLayout" name="audio_objects_layout">
+          <item>
+           <widget class="QSlider" name="slider_audio_objects">
+            <property name="toolTip"><string>Sound effects the game places in 3D (PS5 3D audio object ports), mixed into the game sound on this PC. Game sound and master volume apply on top. 100% is unchanged.</string></property>
+            <property name="maximum"><number>200</number></property>
+            <property name="singleStep"><number>5</number></property>
+            <property name="pageStep"><number>10</number></property>
+            <property name="value"><number>100</number></property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="label_audio_objects_value">
+            <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
+            <property name="text"><string>100%</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item row="6" column="1">
+         <widget class="QCheckBox" name="checkBox_audio_objects">
+          <property name="toolTip"><string>Play the sounds the game places in 3D (PS5 3D audio object ports: ambience, positioned effects). Off drops them, as older Kyty versions did.</string></property>
+          <property name="text"><string>3D audio objects (game's positional sounds)</string></property>
+          <property name="checked"><bool>true</bool></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
@@ -283,6 +315,18 @@
          <widget class="QCheckBox" name="checkBox_gpu_occlusion">
           <property name="toolTip"><string>Off (default): occlusion queries report everything as visible, which is much faster in heavy levels but may draw objects or effects that the game hides behind walls. On: the GPU counts visible samples as on the console (slower; fixes rare visibility issues).</string></property>
           <property name="text"><string>Accurate occlusion queries (slower; fixes rare visibility issues)</string></property>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <widget class="QCheckBox" name="checkBox_skip_notice_screen">
+          <property name="toolTip"><string>Skip startup logos and notices in supported games.</string></property>
+          <property name="text"><string>Skip boot logos</string></property>
+         </widget>
+        </item>
+        <item row="11" column="1">
+         <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
+          <property name="toolTip"><string>Can fix missing textures and incorrect transparency in some games. May reduce performance.</string></property>
+          <property name="text"><string>Accurate texture synchronization</string></property>
          </widget>
         </item>
        </layout>
@@ -407,7 +451,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <layout class="QVBoxLayout" name="compatibilityLayout">
         <item>
          <widget class="QCheckBox" name="checkBox_amd_cpu">
-          <property name="toolTip"><string>For Intel CPUs: emulates the PS5's AMD-only instructions (EXTRQ/INSERTQ) and AMD's VRSQRTPS results. Not needed on AMD CPUs.</string></property>
+          <property name="toolTip"><string>Emulates the PS5's AMD-only instructions (EXTRQ/INSERTQ) and AMD's VRSQRTPS results. Partly checked (default): automatic, on for Intel and other non-AMD CPUs, off for AMD CPUs. Checked: always on. Unchecked: always off.</string></property>
           <property name="text"><string>Intel CPU compatibility (AMD instruction patch)</string></property>
          </widget>
         </item>
@@ -504,6 +548,13 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
        <property name="text"><string>Reset</string></property>
        <property name="toolTip"><string>Restore default settings</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="settings_button">
+       <property name="minimumSize"><size><width>80</width><height>25</height></size></property>
+       <property name="text"><string>Game Configs</string></property>
+       <property name="toolTip"><string>Import or export game configs</string></property>
       </widget>
      </item>
      <item>

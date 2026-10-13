@@ -75,20 +75,20 @@ jobs:
           }
 
       # clang-cl names functions in anonymous namespaces after a hash of the source path on the compile
-      # command line, and PGO finds functions by name. The profile was recorded from C:\kyty-src, a
+      # command line, and PGO finds functions by name. The profile was recorded from C:\kyty-src19, a
       # junction to the checkout, so the release compiles from the same path (CMake keeps the junction).
       - name: Map the source to the PGO path
         shell: cmd
         run: |
-          mklink /J C:\kyty-src "%GITHUB_WORKSPACE%"
-          git config --global --add safe.directory C:/kyty-src
+          mklink /J C:\kyty-src19 "%GITHUB_WORKSPACE%"
+          git config --global --add safe.directory C:/kyty-src19
 
       - name: Configure Release
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
-          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int9-sg-1.profdata
-          cmake -S C:\kyty-src -B _Build/windows ^
+          set PGO_PROFILE=C:/kyty-src19/tools/pgo/u59-int19-sg-1.profdata
+          cmake -S C:\kyty-src19 -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
@@ -105,11 +105,11 @@ jobs:
       - name: Check the PGO source path
         shell: pwsh
         run: |
-          # The training build compiled C:\kyty-src\src\... spelled with backslashes; any other spelling
+          # The training build compiled C:\kyty-src19\src\... spelled with backslashes; any other spelling
           # renames every function in an anonymous namespace and loses its profile.
           $ninja = Get-Content -LiteralPath '_Build/windows/build.ninja' -Raw
-          if (-not $ninja.Contains('C$:\kyty-src\src\emulator.cpp')) {
-            throw 'build.ninja does not compile C:\kyty-src\src\emulator.cpp: the PGO profile would only partly apply.'
+          if (-not $ninja.Contains('C$:\kyty-src19\src\emulator.cpp')) {
+            throw 'build.ninja does not compile C:\kyty-src19\src\emulator.cpp: the PGO profile would only partly apply.'
           }
           Write-Host "MSVC tools $env:VCToolsVersion (the profile's standard-library code: 14.51.36231)"
 
@@ -139,10 +139,9 @@ jobs:
       - name: Report PGO coverage
         shell: pwsh
         run: |
-          # Functions with mismatched or missing profile data are optimized without it (not an error). The int9
-          # profile was recorded before the compatibility merge, which changes a few functions (per-draw
-          # colour-write enables, Image::FindView, pipeline creation): a local build of the release commit from
-          # C:\kyty-src (LLVM 22.1.3) had 10 mismatched and 68 without data. Check the actual counts below.
+          # Functions with mismatched or missing profile data are optimized without it (not an error). The int19
+          # profile was recorded from C:\kyty-src19 at 2420fc66a; a local PGO_USE build of that commit (LLVM 22.1.3)
+          # reported 0 mismatched functions. Later source changes show up as mismatches below.
           $log = Get-Content -LiteralPath 'pgo-build.log'
           $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
           $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'

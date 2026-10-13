@@ -154,6 +154,8 @@ void CheckSourceKeys() {
 
 void CheckFingerprint() {
   constexpr const char *name = "ProgramCacheFingerprint";
+  // Every switch is checked from unset: main sets KYTY_CB_SHADER_MASK_EXPORTS=1 for the export cases.
+  ScopedEnv unset_cb_shader_mask("KYTY_CB_SHADER_MASK_EXPORTS", nullptr);
   const auto version = ShaderRecompiler::CodegenVersion();
   Require(name, "codegen version",
           version.size() == 64 && std::ranges::all_of(version, [](char c) {
@@ -187,6 +189,10 @@ void CheckFingerprint() {
   options_differ("lod_stats_gate", [](CodegenOptions &o) { o.lod_stats_gate = !o.lod_stats_gate; });
   options_differ("robust_buffer_loads",
                  [](CodegenOptions &o) { o.robust_buffer_loads = !o.robust_buffer_loads; });
+  options_differ("readonly_buffers",
+                 [](CodegenOptions &o) { o.readonly_buffers = !o.readonly_buffers; });
+  options_differ("readonly_buffers",
+                 [](CodegenOptions &o) { o.readonly_buffers = !o.readonly_buffers; });
   for (const auto mode : {ShaderRecompiler::MadMode::Exact, ShaderRecompiler::MadMode::Position,
                           ShaderRecompiler::MadMode::Fused}) {
     if (mode != GetCodegenOptions().mad_mode) {
@@ -222,6 +228,10 @@ void CheckFingerprint() {
   options_differ("dispatcher_cap", [](CodegenOptions &o) { o.dispatcher_cap++; });
   options_differ("ir_linear_uses", [](CodegenOptions &o) { o.ir_linear_uses = !o.ir_linear_uses; });
   options_differ("fold_lane_masks", [](CodegenOptions &o) { o.fold_lane_masks = !o.fold_lane_masks; });
+  options_differ("ps_helper_atomics_skip",
+                 [](CodegenOptions &o) { o.ps_helper_atomics_skip = !o.ps_helper_atomics_skip; });
+  options_differ("loop_guard_all", [](CodegenOptions &o) { o.loop_guard_all = !o.loop_guard_all; });
+  options_differ("volatile_loads", [](CodegenOptions &o) { o.volatile_loads = !o.volatile_loads; });
 
   // Host state the emitter reads.
   namespace Spirv = ShaderRecompiler::Spirv;
@@ -278,6 +288,13 @@ void CheckFingerprint() {
   host_differs("shader clock shift", [&] {
     Spirv::SetHostShaderClock({.scope = shader_clock.scope, .shift = shader_clock.shift == 0 ? 3 : 0});
   });
+  const auto wave_clusters = Spirv::GetHostWaveClusters();
+  host_differs("wave32 clusters", [&] {
+    Spirv::SetHostWaveClusters({.vertex = !wave_clusters.vertex,
+                                .pixel = wave_clusters.pixel,
+                                .mesh = wave_clusters.mesh});
+  });
+  Spirv::SetHostWaveClusters(wave_clusters);
   Require(name, "host state restored", ShaderRecompiler::CodegenFingerprint() == base,
           "restoring the host state did not restore the fingerprint");
 
@@ -295,7 +312,8 @@ void CheckFingerprint() {
         "KYTY_NATIVE_INDIRECT_MESH", "KYTY_LDS_WAITCNT_BARRIER", "KYTY_LOD_STATS_MODE",
         "KYTY_SRT_COMPILED_RECIPES", "KYTY_SRT_DECODED_ROOTS", "KYTY_SRT_ARITHMETIC_TAPES",
         "KYTY_REALTIME_CLOCK", "KYTY_DPP_SKIP_INACTIVE", "KYTY_LANE_REDUCTIONS",
-        "KYTY_DISPATCHER_CAP", "KYTY_IR_LINEAR_USES", "KYTY_FOLD_LANE_MASKS"}) {
+        "KYTY_DISPATCHER_CAP", "KYTY_IR_LINEAR_USES", "KYTY_FOLD_LANE_MASKS",
+        "KYTY_WAVE32_CLUSTERS"}) {
     Require(name, "codegen switch list", listed(required),
             std::string("the codegen switch list misses ") + required);
   }

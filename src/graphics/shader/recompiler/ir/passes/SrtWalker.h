@@ -3,7 +3,9 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdint>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -38,6 +40,8 @@ struct SrtRuntime {
 	// address. Without it, only addresses that are never mapped read 0 (the first 64 KiB and
 	// non-canonical addresses), where the in-place read would fault with nothing to resolve it.
 	SrtMappedRange is_guest_mapped = nullptr;
+	// Dispatch workgroup counts (compute). No descriptor this planner tracks reads them yet.
+	std::span<const uint32_t> workgroup_counts;
 };
 
 // Addresses no guest or host mapping can contain: the first 64 KiB (never mapped on Windows, Linux
@@ -84,6 +88,144 @@ bool FindVariantFlatRead(const ResourcePlan& program, uint32_t& pc);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+class SrtWalker;
+struct SrtTrace;
+struct SrtTraceCall;
+
+// KYTY_SRT_TRACE (live, 0 | 1 | verify | exit; default 1): replay traces of a plan's resource
+// refresh. A refresh (MaterializeResources) evaluates the plan's SRT, descriptor and condition
+// values through two memoized, recursive walkers (clean and ordinary). A trace records one successful refresh as
+// a flat list of the evaluations it performed, in order, each with the operands it consumed
+// (earlier entries or immediates), plus the requests the refresh made and the entries that answer
+// each. A request is a whole walker operation (the flat buffer refresh, one descriptor, the active
+// sources) or one value. A later refresh of the same plan on the same thread replays the list in a
+// loop: no memo, no recursion, no recipe or tape dispatch. The values themselves (user data, guest
+// words) may differ from the recording: the replay recomputes every entry with the walker's own
+// operations (EvaluateInstWithOperands for pure instructions, ComputeRawAddress and ReadRawWord /
+// the clean probe for guest reads).
+//
+// Every data-dependent decision of the recording is a guard: every entry must succeed (only
+// refreshes without a failed evaluation are recorded), a select must take the recorded arm, every
+// condition of the active-source walk must have the recorded truth, and the refresh must make the
+// same requests in the same order. A flat read run is replayed as its words, which must lie in the
+// buffer; how the walk batches them (by page ends) does not matter. A guard that does not hold
+// abandons the trace for the rest of the refresh: the walkers' memo was never touched, so
+// evaluation just continues through them from scratch (reads the replay already made are made
+// again, which only adds identical ranges to a read certificate). A plan keeps up to eight traces
+// (variants, most recently served first): when the first request does not match one, the next is
+// tried; a refresh that matches none, or a variant that fails later, makes the next refresh record.
+// A plan whose traces keep failing stops recording for a while.
+//
+// Traces are per thread (nothing shared between the draw-prep workers), keyed by the plan's
+// address and sealing identity and by the runtime's reader configuration. The trace sits above the
+// recipes, tapes and read runs (KYTY_SRT_COMPILED_RECIPES / _ARITHMETIC_TAPES / _READ_RUNS), which
+// remain the evaluator a recording observes (each recipe node is one entry; tapes are bypassed while
+// recording, as they compute the same node values; a flat read run is one entry plus its members)
+// and the path of every refresh not served; a replay uses none of them.
+// verify: every refresh that used a trace is evaluated again without it and compared field by
+// field; differences are counted and logged (exit: stops at the first). KYTY_SRT_TRACE_STATS=1
+// (or verify) prints how refreshes went with the abandon reasons.
+class SrtTraceSession {
+public:
+	// `allowed`: this refresh may use traces (no captured specialization reads).
+	SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, SrtWalker& walker,
+	                const SrtRuntime& runtime, bool allowed);
+	~SrtTraceSession();
+	SrtTraceSession(const SrtTraceSession&)            = delete;
+	SrtTraceSession& operator=(const SrtTraceSession&) = delete;
+
+	// The refresh succeeded: a recording becomes the plan's trace.
+	void Succeeded() { m_succeeded = true; }
+	// At least one request was answered from the trace.
+	[[nodiscard]] bool UsedTrace() const { return m_served != 0; }
+	// Turns traces off on this thread (verification re-runs).
+	static bool& Suppressed();
+	// 0 off, 1 on, 2 verify, 3 verify and stop at the first difference.
+	static int Mode();
+	// verify: one refresh compared; `field` names the first difference (nullptr: equal).
+	static void NoteVerified(const ResourcePlan& program, const char* field);
+	// Refreshes served from a trace from start to end (counted with verify or
+	// KYTY_SRT_TRACE_STATS=1 only), and the statistics line.
+	static uint64_t ServedRefreshes();
+	static void     PrintStats();
+
+private:
+	friend class SrtWalker;
+	enum class State : uint8_t { Off, Record, Serve, Passthrough };
+	// Requests: one value (Wide, Operand), or a whole walker operation (FlatBuffer: every flat
+	// slot; Descriptor: one descriptor's dwords; Active: the active sources). Inside a whole
+	// operation (a coarse request) the values it evaluates are its results, not requests.
+	enum class CallKind : uint8_t { None, Wide, Operand, FlatBuffer, Descriptor, Active };
+	struct Event {
+		int32_t  ref   = 0; // >= 0: an entry; < 0: immediate -1 - ref
+		uint64_t value = 0;
+	};
+	struct Frame {
+		Event    events[6] {};
+		uint32_t count = 0;
+	};
+	struct CallId {
+		CallKind    kind   = CallKind::None;
+		uint8_t     walker = 0;
+		Value       value;          // Wide
+		const void* id     = nullptr; // Operand
+		uint32_t    a      = 0;       // Descriptor: the source
+	};
+
+	// Entry points (SrtWalker's wrappers).
+	bool Wide(SrtWalker& walker, Value value, uint64_t& result);
+	bool Operand(SrtWalker& walker, const ResourcePlan::EvaluationOperand& operand,
+	             uint64_t& result);
+	bool FlatBuffer(SrtWalker& walker, std::vector<uint32_t>& flat);
+	bool Descriptor(SrtWalker& walker, uint32_t source, DescriptorValue& result);
+	std::span<const uint8_t> Active(SrtWalker& walker);
+	// Recording hooks.
+	void PushImmediate(uint64_t bits);
+	void PushMemo(const SrtWalker& walker, uint32_t index);
+	void Open();
+	void CloseInst(const SrtWalker& walker, const Inst& inst, uint32_t index, bool ok,
+	               uint64_t value);
+	void CloseRecipe(const SrtWalker& walker, const ResourcePlan::EvaluationRecipe& recipe,
+	                 uint32_t index, bool ok, uint64_t value);
+	void BeginFlat();
+	void CloseFlat(const SrtWalker& walker, const Inst& inst, uint32_t first, uint32_t end,
+	               uint32_t words, bool probed, bool stop_data, uint32_t consumed);
+	void Abort(const char* reason);
+
+	void Push(const Event& event);
+	void BeginCoarse(const CallId& id);
+	bool EndCoarse(uint32_t expected);
+	const SrtTraceCall* NextCall(const CallId& id);
+	[[nodiscard]] uint64_t Result(int32_t ref) const;
+	bool RunOps(uint32_t end);
+	bool SelectVariant(uint32_t from);
+	bool Retry(const char* reason);
+	void Abandon(const char* reason);
+	void Detach();
+	static std::vector<Frame>& Frames();
+
+	const ResourcePlan& m_program;
+	SrtWalker*          m_walkers[2];
+	void*               m_slot      = nullptr; // the thread's cache entry for the plan
+	State               m_state     = State::Off;
+	bool                m_succeeded = false;
+	uint32_t            m_served    = 0;
+	// Recording.
+	SrtTrace*           m_recording = nullptr;
+	CallId              m_pending;
+	bool                m_coarse = false; // inside a coarse request
+	const char*         m_abort  = nullptr;
+	// Serving.
+	const SrtRuntime*   m_runtime = nullptr;
+	const SrtTrace*     m_trace   = nullptr;
+	uint32_t            m_variant = 0;
+	const char*         m_fail    = nullptr;
+	uint64_t*           m_values  = nullptr;
+	uint32_t*           m_stash   = nullptr;
+	uint32_t            m_cursor  = 0;
+	uint32_t            m_next_op = 0;
+};
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
@@ -106,13 +248,32 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	// KYTY_SRT_TRACE: the public operations above are served or recorded whole by a session.
+	bool EvaluateDescriptorImpl(uint32_t source, DescriptorValue& result);
+	std::span<const uint8_t> FindActiveSourcesImpl();
+	bool RefreshFlatBufferImpl(std::vector<uint32_t>& flat);
+
+private:
 	static ResourcePlan::EvaluationContext& AcquireContext(EvaluationScratch& scratch);
 	static float Float32(uint64_t bits);
 	uint32_t MemoIndex(const Inst& inst) const;
-	bool EvaluateWide(Value value, uint64_t& result);
+	friend class SrtTraceSession;
+	bool EvaluateWide(Value value, uint64_t& result) {
+		if (m_trace != nullptr) [[unlikely]] {
+			return m_trace->Wide(*this, value, result);
+		}
+		return EvaluateWideImpl(value, result);
+	}
+	bool EvaluateWideImpl(Value value, uint64_t& result);
 	bool EvaluateRoot(Value value, const ResourcePlan::EvaluationOperand& root, uint32_t& result);
 	const Inst* FlatReadInstruction(uint32_t slot, uint32_t& memo_index) const;
-	bool EvaluateOperand(const ResourcePlan::EvaluationOperand& operand, uint64_t& result);
+	bool EvaluateOperand(const ResourcePlan::EvaluationOperand& operand, uint64_t& result) {
+		if (m_trace != nullptr) [[unlikely]] {
+			return m_trace->Operand(*this, operand, result);
+		}
+		return EvaluateOperandImpl(operand, result);
+	}
+	bool EvaluateOperandImpl(const ResourcePlan::EvaluationOperand& operand, uint64_t& result);
 	bool EvaluateRecipeNode(uint32_t index, uint64_t& result);
 	bool BorrowCleanValue(uint32_t index, uint64_t& result);
 	bool EvaluateRecipe(const ResourcePlan::EvaluationRecipe& recipe, uint64_t& result);
@@ -152,6 +313,11 @@ private:
 	uint64_t                        m_tape_operations = 0;
 	uint64_t                        m_tape_boundary_calls = 0;
 	bool                            m_share_clean_values = false;
+	// KYTY_SRT_TRACE: the session serving or recording this walker's requests (null: none), and
+	// m_trace_record when it records (the evaluator's hooks report to it).
+	SrtTraceSession*                m_trace        = nullptr;
+	SrtTraceSession*                m_trace_record = nullptr;
+	uint8_t                         m_trace_id     = 0; // 0 the clean walker, 1 the ordinary one
 	uint64_t                        m_shared_clean_hits = 0;
 };
 

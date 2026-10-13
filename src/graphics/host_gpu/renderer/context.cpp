@@ -1,9 +1,11 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/hangTrace.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -44,12 +46,18 @@ static bool EnvSwitch(const char* name, bool default_value) {
 }
 
 bool BarrierBatchEnabled() {
-	static const bool enabled = EnvSwitch("KYTY_BARRIER_BATCH", true);
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [&] {
+		return EnvSwitch("KYTY_BARRIER_BATCH", true);
+	}));
 	return enabled;
 }
 
 bool BarrierSinkEnabled() {
-	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_BARRIER_SINK", true);
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [&] {
+		return BarrierBatchEnabled() && EnvSwitch("KYTY_BARRIER_SINK", true);
+	}));
 	return enabled;
 }
 
@@ -59,13 +67,26 @@ bool UploadBatchEnabled() {
 }
 
 bool DrawWriteSinkEnabled() {
-	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_DRAW_WRITE_SINK", true);
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [&] {
+		return BarrierBatchEnabled() && EnvSwitch("KYTY_DRAW_WRITE_SINK", true);
+	}));
 	return enabled;
 }
 
 bool DepthFeedbackKeepEnabled() {
-	static const bool enabled =
-	    BarrierBatchEnabled() && EnvSwitch("KYTY_DEPTH_FEEDBACK_KEEP", true);
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [&] {
+		return BarrierBatchEnabled() && EnvSwitch("KYTY_DEPTH_FEEDBACK_KEEP", true);
+	}));
+	return enabled;
+}
+
+bool DepthFeedbackLazyEnabled() {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [&] {
+		return DepthFeedbackKeepEnabled() && EnvSwitch("KYTY_DEPTH_FEEDBACK_LAZY", true);
+	}));
 	return enabled;
 }
 
@@ -75,7 +96,10 @@ bool DepthLayoutStableEnabled() {
 }
 
 bool PushConstantShadowEnabled() {
-	static const bool enabled = EnvSwitch("KYTY_PUSH_CONSTANT_SHADOW", true);
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [&] {
+		return EnvSwitch("KYTY_PUSH_CONSTANT_SHADOW", true);
+	}));
 	return enabled;
 }
 
@@ -634,6 +658,13 @@ void CommandBuffer::End() const {
 	EndRendering();
 	FlushBarriers();
 	auto buffer = StateHandle();
+	if (GpuBreadcrumbs::Active()) {
+		// The command buffer's last breadcrumb: at the bottom of the pipe, everything in it completed.
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		GpuBreadcrumbs::Write(buffer, GpuBreadcrumbs::Queue::Graphics,
+		                      GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Graphics,
+		                                           {.op = GpuBreadcrumbs::OpCommandBufferEnd, .tick = tick}));
+	}
 
 	auto result = buffer.end();
 
@@ -801,20 +832,35 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-	if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {
-		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
-		                                                 .submit_id = submit_id,
-		                                                 .arg0      = arg0,
-		                                                 .arg1      = arg1,
-		                                                 .arg2      = arg2,
-		                                                 .arg3      = arg3,
-		                                                 .arg4      = arg4,
-		                                                 .tick = m_context.GetCommandScheduler().CurrentTick(),
-		                                                 .vs = m_shaders != nullptr ? m_shaders->GetVs().es_regs.data_addr : 0,
-		                                                 .ps = m_shaders != nullptr ? m_shaders->GetPs().ps_regs.data_addr : 0,
-		                                                 .cs = m_shaders != nullptr ? m_shaders->GetCs().cs_regs.data_addr : 0});
-		if (marker != nullptr) {
-			Handle().setCheckpointNV(marker);
+	const bool breadcrumbs = GpuBreadcrumbs::Active();
+	if ((m_graphics.diagnostic_checkpoints_enabled || breadcrumbs) && m_buffer) {
+		const DiagnosticCheckpoint checkpoint {
+		    .op        = op,
+		    .submit_id = submit_id,
+		    .arg0      = arg0,
+		    .arg1      = arg1,
+		    .arg2      = arg2,
+		    .arg3      = arg3,
+		    .arg4      = arg4,
+		    .tick      = m_context.GetCommandScheduler().CurrentTick(),
+		    .vs        = m_shaders != nullptr ? m_shaders->GetVs().es_regs.data_addr : 0,
+		    .ps        = m_shaders != nullptr ? m_shaders->GetPs().ps_regs.data_addr : 0,
+		    .cs        = m_shaders != nullptr ? m_shaders->GetCs().cs_regs.data_addr : 0};
+		if (m_graphics.diagnostic_checkpoints_enabled) {
+			const auto* marker = RecordDiagnosticCheckpoint(checkpoint);
+			if (marker != nullptr) {
+				Handle().setCheckpointNV(marker);
+			}
+		}
+		if (breadcrumbs) {
+			// KYTY_GPU_BREADCRUMBS: a state-like command (it orders nothing the batcher tracks), so it
+			// neither flushes pending barriers nor ends the rendering instance.
+			const auto marker = GpuBreadcrumbs::Note(GpuBreadcrumbs::Queue::Graphics, checkpoint);
+			const auto sink   = StateSink();
+			sink.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, GpuBreadcrumbs::Buffer(),
+			                          GpuBreadcrumbs::TopOffset(GpuBreadcrumbs::Queue::Graphics), marker);
+			sink.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, GpuBreadcrumbs::Buffer(),
+			                          GpuBreadcrumbs::BottomOffset(GpuBreadcrumbs::Queue::Graphics), marker);
 		}
 	}
 }
@@ -928,13 +974,19 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	StateSink().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	--m_internal_recording;
-	if (m_context.GetOcclusionCounter().Active() &&
-	    (HangTrace::Enabled() || OcclusionCounter::SyncProxyDumps())) {
-		const auto& db = GetRegisters().GetDepthRenderTarget();
-		m_context.GetOcclusionCounter().NoteScope(db.z_read_base_addr, state.width, state.height,
-		                                          state.num_color_attachments,
-		                                          depth_stencil.has_depth,
-		                                          static_cast<uint32_t>(db.z_info.format));
+	if (HangTrace::Enabled() || OcclusionCounter::SyncProxyDumps()) {
+		const auto& db        = GetRegisters().GetDepthRenderTarget();
+		auto&       occlusion = m_context.GetOcclusionCounter();
+		// A query a split dump begins inside this instance reports the same scope
+		// (KYTY_OCCLUSION_SPLIT).
+		occlusion.NoteInstance(db.z_read_base_addr, state.width, state.height,
+		                       state.num_color_attachments, depth_stencil.has_depth,
+		                       static_cast<uint32_t>(db.z_info.format));
+		if (occlusion.Active()) {
+			occlusion.NoteScope(db.z_read_base_addr, state.width, state.height,
+			                    state.num_color_attachments, depth_stencil.has_depth,
+			                    static_cast<uint32_t>(db.z_info.format));
+		}
 	}
 	m_render_state = state;
 	m_rendering    = true;

@@ -129,6 +129,13 @@ struct Totals {
 	std::atomic<uint64_t> prefetch_published {0};
 	std::atomic<uint64_t> prefetch_adopted {0};
 	std::atomic<uint64_t> prefetch_skipped {0};
+	// KYTY_DRAW_PREP_DISPATCH: dispatch preparations accepted, rejected (serial lookup), published
+	// and not reaching the lookup, and KYTY_DRAW_PREP_VERIFY comparisons and differences.
+	std::atomic<uint64_t> dispatch_committed {0};
+	std::atomic<uint64_t> dispatch_fallbacks {0};
+	std::atomic<uint64_t> dispatch_unused {0};
+	std::atomic<uint64_t> dispatch_verify_checks {0};
+	std::atomic<uint64_t> dispatch_verify_mismatches {0};
 };
 [[nodiscard]] Totals& GetTotals();
 
@@ -153,7 +160,50 @@ struct PreparedDraw {
 	// built by the preparing thread (certificate_built); Validate uses it for the log check.
 	std::vector<Coherence::Range> certificate;
 	bool                          certificate_built = false;
+	// KYTY_DRAW_PREP_DISPATCH: a dispatch slot's preparation (GetComputeProgram's outputs).
+	ShaderComputeInputInfo   compute_info;
+	PipelineCache::StagePrep compute_prep;
+	ShaderProgram            compute_program;
 };
+
+// KYTY_DRAW_PREP_DISPATCH=1 (live, default 0; parallel mode with the CP sequencer, KYTY_CP_SEQ=1): direct
+// dispatches are published to the window like draws, and a worker prepares their compute program
+// (GetComputeProgram: static input info, SRT materialization, permutation lookup) from the
+// register snapshot meanwhile. The resolver executes the dispatch op as before, with the
+// preparation offered where DispatchDirect would call GetComputeProgram, under the same
+// certificate as a draw's (ValidateDispatch: no logged coherence transition touched a read range,
+// every range still clean, the shader map unchanged); otherwise the serial lookup runs. At the Sky
+// Garden the command processor spent about 0.9 ms per frame (about 270 lookups) in it.
+// KYTY_DRAW_PREP_VERIFY also runs the serial lookup on copies after an accepted preparation and
+// compares the program, the stage inputs and the resource snapshot.
+[[nodiscard]] bool DispatchPrepEnabled();
+
+struct DispatchArgs {
+	uint32_t x    = 0;
+	uint32_t y    = 0;
+	uint32_t z    = 0;
+	uint32_t mode = 0; // DISPATCH_INITIATOR
+	// DISPATCH_INDIRECT (without thread dimensions): the counts are GPU data; the lookup starts
+	// from no workgroup counts, as RenderExecutor::DispatchIndirect's does.
+	bool indirect = false;
+};
+
+// The dispatch inputs GetComputeProgram starts from (RenderExecutor::DispatchDirect): the thread
+// dimension mode and the workgroup counts (thread counts rounded up to groups in that mode).
+void MakeComputeInputInfo(const HW::ComputeShaderInfo& cs, const DispatchArgs& args,
+                          ShaderComputeInputInfo& info);
+
+// The pure preparation of one direct dispatch from a register snapshot (Prepare's rules).
+void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& registers,
+                     const DispatchArgs& args, bool eligible, bool exact, PreparedDraw& prepared);
+
+// GPU thread, where DispatchDirect would call GetComputeProgram for `input_info` (MakeComputeInputInfo
+// of the op's arguments): whether the prepared outputs equal what the serial lookup would produce.
+[[nodiscard]] bool ValidateDispatch(PreparedDraw& prepared, const ShaderComputeInputInfo& input_info);
+
+// KYTY_DRAW_PREP_VERIFY for a dispatch: the accepted preparation against a serial lookup's.
+bool VerifyDispatch(const PreparedDraw& prepared, const ShaderProgram& program,
+                    const ShaderComputeInputInfo& info, const PipelineCache::StagePrep& prep);
 
 // Whether the draw path would reach its program preparation for a draw with these registers and
 // counts (renderDraw.cpp: the early returns before PrepareDrawRenderState, with target operations
@@ -187,7 +237,7 @@ bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& p
                      const ShaderPixelInputInfo&             serial_pixel_info,
                      const PipelineCache::GraphicsStagePreps& serial_preps);
 
-enum class DrawKind : uint8_t { Index, Auto };
+enum class DrawKind : uint8_t { Index, Auto, Dispatch };
 
 // Owned by the graphics command processor; its methods run only on the GPU thread.
 //
@@ -251,6 +301,35 @@ public:
 	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
 	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
 
+	// KYTY_DRAW_PREP_INDIRECT (default on; parallel mode with the CP sequencer): a single-record
+	// indirect draw (DRAW_INDIRECT, DRAW_INDEX_INDIRECT) is published like a direct draw, so a
+	// worker prepares its programs from the same register snapshot meanwhile. Its counts are GPU
+	// data: the preparation assumes the draw draws. The resolver executes the draw as before
+	// (native, or the CPU path) with the preparation offered where the serial path would prepare
+	// the programs (RefreshShaders), under the same certificate (Validate); the binding plan is not
+	// used. Astro Bot's clock tower level issues ~2,400 native indirect draws per frame, each
+	// preparing its programs on the command processor (~9 us of its ~15 us).
+	// KYTY_DRAW_PREP_INDIRECT=0: indirect draws prepare serially again.
+	[[nodiscard]] static bool IndirectEnabled();
+	// Sequencer: publishes an indirect draw's preparation; the window position, or UINT64_MAX.
+	[[nodiscard]] uint64_t PublishIndirect(bool indexed, const HW::Context& context,
+	                                       const HW::UserConfig& user_config,
+	                                       const HW::Shader& shaders,
+	                                       const std::function<bool()>& wait_for_space);
+	// Resolver: runs `draw` (the indirect draw's execution) with the head slot (window position
+	// `position`) prepared and offered to it, then retires the slot.
+	void ExecuteIndirect(uint64_t position, const std::function<void()>& draw);
+
+	// KYTY_DRAW_PREP_DISPATCH (DispatchPrepEnabled): the sequencer publishes a direct dispatch's
+	// preparation (window position, or UINT64_MAX), and the resolver runs `dispatch` (the dispatch
+	// op's execution) with the head slot prepared and offered to RenderExecutor::DispatchDirect,
+	// then retires the slot.
+	[[nodiscard]] uint64_t PublishDispatch(const DispatchArgs& args, const HW::Context& context,
+	                                       const HW::UserConfig& user_config,
+	                                       const HW::Shader& shaders,
+	                                       const std::function<bool()>& wait_for_space);
+	void ExecuteDispatch(uint64_t position, const std::function<void()>& dispatch);
+
 	// P3c (KYTY_CP_SEQ_PREFETCH, cpOps.h): the sequencer's speculative parse past a wait publishes
 	// draws without ops. Each such slot carries the number of packets and the hash of every byte
 	// the speculative parse consumed from the wait up to and including the draw packet
@@ -289,6 +368,9 @@ private:
 	void Commit(Slot& slot);
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
 	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
+	// The head slot once prepared (by a worker, or here); the caller commits or uses it, then
+	// retires it.
+	Slot& ReadyHead();
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,

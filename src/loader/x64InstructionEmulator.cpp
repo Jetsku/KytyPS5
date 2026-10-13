@@ -15,6 +15,7 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
+#include <sched.h>
 #include <sys/ucontext.h>
 #else
 #include <sched.h>
@@ -471,6 +472,16 @@ struct Context {
 			default: return nullptr;
 		}
 	}
+	// The kernel hands AVX threads the longer context that carries YMM[255:128]; a plain SSE
+	// context has no such state to clear.
+	void ClearUpperYmm(uint8_t index) const {
+		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) {
+			return;
+		}
+		auto* avx = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
+		auto* ymmh = &avx->__fs.__fpu_ymmh0;
+		ymmh[index] = {};
+	}
 #else
 	ucontext_t* native;
 
@@ -629,12 +640,14 @@ static bool TryEmulateSse4a(Context& context) {
 		index  = rip[offset + 4];
 		instruction_length += 2;
 	}
+	// The manual leaves bits 127:64 undefined for both; AMD CPUs zero them (measured on Zen 4 by
+	// amd_cpu_emulation_tests, as is the clamping of length + index > 64 above).
 	if (prefix == 0x66) {
 		dest[0] = ExtractBitField(dest[0], length, index);
-		dest[1] = 0;
 	} else {
 		dest[0] = InsertBitField(dest[0], source[0], length, index);
 	}
+	dest[1] = 0;
 	std::memcpy(dest_xmm, dest, sizeof(dest));
 	context.Advance(instruction_length);
 	return true;
@@ -705,8 +718,6 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	context.Advance(instruction.length);
 	return true;
 }
-
-#if !defined(__APPLE__)
 
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -823,25 +834,37 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
-#endif
-
 void ConfigureReciprocalSqrtStats() {
-#if !defined(__APPLE__)
 	if (const char* timing = std::getenv("KYTY_AMD_CPU_TIMING"); timing != nullptr) {
 		g_rsqrt_timing.store(std::strcmp(timing, "1") == 0, std::memory_order_relaxed);
 	}
-#endif
 }
 
 ReciprocalSqrtStats GetReciprocalSqrtStats() {
 	ReciprocalSqrtStats stats;
-#if !defined(__APPLE__)
 	for (const auto& slot: g_rsqrt_slots) {
 		stats.traps += slot.traps.load(std::memory_order_relaxed);
 		stats.emulate_ns += slot.ns.load(std::memory_order_relaxed);
 	}
-#endif
 	return stats;
+}
+
+std::string HostCpuVendor() {
+	uint32_t eax = 0;
+	uint32_t ebx = 0;
+	uint32_t ecx = 0;
+	uint32_t edx = 0;
+	__cpuid(0, eax, ebx, ecx, edx);
+	char vendor[12];
+	std::memcpy(vendor, &ebx, 4);
+	std::memcpy(vendor + 4, &edx, 4);
+	std::memcpy(vendor + 8, &ecx, 4);
+	return {vendor, sizeof(vendor)};
+}
+
+bool IsAmdCpuVendor(std::string_view vendor) {
+	// Hygon's Dhyana is a licensed Zen design with AMD's instruction behaviour.
+	return vendor == "AuthenticAMD" || vendor == "HygonGenuine";
 }
 
 bool TryEmulate(void* native_context) {
@@ -859,12 +882,12 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-#if !defined(__APPLE__)
 	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
-#else
-	return TryEmulateSse4a(context) || TryEmulateCpuExtensions(context);
+	       TryEmulateSse4a(context) ||
+#if !defined(__APPLE__)
+	       TryEmulateShaNi(context) ||
 #endif
+	       TryEmulateCpuExtensions(context);
 }
 
 } // namespace Loader::X64InstructionEmulator

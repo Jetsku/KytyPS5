@@ -1,10 +1,12 @@
 #include "kernel/memory.h"
+#include "common/prepPhases.h"
 
 #include "common/assert.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/platform/uffdWriteWatch.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "common/ramStats.h"
 #include "common/rendererBatch.h"
 #include "common/stringUtils.h"
@@ -33,7 +35,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -103,6 +108,27 @@ static void NoteGuestProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 	}
 	const auto bits = static_cast<uint32_t>(mode);
 	GetGpuResources().NoteGuestProtection(vaddr, size, (bits & 1u) != 0, (bits & 2u) != 0);
+}
+
+// KYTY_REMAP_TRACKER_PROTECTION=0 turns it off: after a range's host protection was replaced
+// behind the page tracker (the neighbours of a partly unmapped Windows view mapped again with the
+// view's access, views an unmap rolled back, a guest mprotect that allows writes), its watched
+// pages get the tracker's protection back. Without it CPU writes to still-tracked buffers there
+// stopped faulting and the GPU kept using stale bytes (chenxiao07 3f3825158 / e6dfd8e6b).
+static bool RemapTrackerProtectionEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_REMAP_TRACKER_PROTECTION");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
+static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !RemapTrackerProtectionEnabled()) {
+		return;
+	}
+	GetGpuResources().ResyncHostProtection(vaddr, size);
 }
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -190,7 +216,9 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+static callback_func_t g_test_before_backing_map                   = nullptr;
+static callback_func_t g_test_backing_read                         = nullptr;
 #endif
 
 #include "memoryAddressSpace.inc"
@@ -442,13 +470,6 @@ public:
 		BumpGenerationUnlocked();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
-	}
-
-	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
-		Common::LockGuard lock(m_mutex);
-		BumpGenerationUnlocked();
-
-		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
 
 	bool Query(uint64_t addr, int flags, Range* out) {
@@ -890,7 +911,7 @@ public:
 	bool Release(uint64_t start, size_t len, uint64_t* vaddr, uint64_t* size,
 	             GpuAccessMode* gpu_mode);
 	bool Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int prot, VirtualMemory::Mode mode,
-	         GpuAccessMode gpu_mode);
+	         GpuAccessMode gpu_mode, const char* name, int memory_type);
 	bool Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mode,
 	           uint64_t* host_vaddr_to_release = nullptr);
 	bool Find(uint64_t vaddr, uint64_t* base_addr, size_t* len, int* prot,
@@ -903,7 +924,6 @@ public:
 	void ProtectMapping(uint64_t vaddr, uint64_t size, int prot, VirtualMemory::Mode mode,
 	                    GpuAccessMode gpu_mode);
 	void SetVirtualRangeName(uint64_t vaddr, uint64_t len, const char* name);
-	void SetVirtualRangeMemoryType(uint64_t vaddr, uint64_t len, int memory_type);
 
 	[[nodiscard]] Common::Mutex&                            GetMutex() { return m_mutex; }
 	[[nodiscard]] const std::map<uint64_t, AllocatedBlock>& GetPhysicalBlocks() const {
@@ -1075,6 +1095,19 @@ bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
 const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingAlias(vaddr, size)
 	                                        : nullptr;
+}
+
+bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return false;
+		}
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			buffers.ReadMemory(vaddr, size);
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
 }
 
 // The exact GPU-ownership predicates of a clean backing read. GPU thread only.
@@ -1320,15 +1353,96 @@ static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vad
 	return true;
 }
 
+// KYTY_DRAW_PREP_DIRECT_READS (live, default 1; workers only, the exact predicate path is
+// unchanged): a draw-prep worker's read whose whole 4 KiB page passed the workers' read hint
+// earlier in the same preparation copies straight from the page's host backing bytes, found once
+// per page through the thread's backing mapping records, and checks the backing map generation
+// afterwards (a map change in between redoes the read the usual way). The hint is only a hint:
+// the commit's certificate (logged transitions, then the exact clean predicate or the bytes)
+// decides, as for every worker read, so checking it once per page instead of once per read
+// changes no outcome. The read set also extends a read that continues the previous one
+// (ReadSet::Record). verify: each direct copy is compared with a TryReadBacking of the same bytes;
+// differences that persist on a second read are counted (exit: stop at the first).
+static std::atomic<uint64_t> g_direct_read_checks {0};
+static std::atomic<uint64_t> g_direct_read_mismatches {0};
+
+// The workers' read hint (DrawPrepGate without the exact path and the diagnostics) for a whole
+// page.
+static bool DrawPrepHintClean(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	return !GpuDirtyHint(buffers, vaddr, size) && !buffers.HasPendingBackingPublication(vaddr, size);
+}
+
+static void VerifyDirectRead(uint64_t vaddr, const void* data, uint64_t size) {
+	const auto checks = g_direct_read_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+	std::array<uint8_t, 64> reference {};
+	if (size > reference.size()) {
+		return;
+	}
+	const auto differs = [&] {
+		return TryReadBacking(vaddr, reference.data(), size) &&
+		       std::memcmp(reference.data(), data, static_cast<size_t>(size)) != 0;
+	};
+	if (differs() && differs()) {
+		const auto count = g_direct_read_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 16) {
+			std::printf("DrawPrepDirectReads: a direct read of [0x%" PRIx64 ", +%" PRIu64
+			            ") differs from the backing read\n",
+			            vaddr, size);
+		}
+		if (Graphics::DrawPrep::DirectReadsMode() == 3) {
+			EXIT("DrawPrepDirectReads: a direct read differs from the backing read\n");
+		}
+	}
+	if ((checks & 0xffffffu) == 0) {
+		std::printf("DrawPrepDirectReads verify: %" PRIu64 " checks, %" PRIu64 " mismatches\n",
+		            checks, g_direct_read_mismatches.load(std::memory_order_relaxed));
+	}
+}
+
 static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
                                uint64_t size, uint64_t caller) {
-	return ReadForDrawPrep(recorder, vaddr, data, size, caller) &&
-	       recorder.reads->Record(vaddr, data, size);
+	constexpr uint64_t PageMask = 4095u;
+	const bool direct = !recorder.exact && g_guest_address_space != nullptr && Graphics::DrawPrep::DirectReadsMode() != 0;
+	if (direct && (vaddr >> 12u) == recorder.direct_page && size <= 64u &&
+	    (vaddr & PageMask) + size <= 4096u && !recorder.reads->Failed()) {
+		std::memcpy(data, recorder.direct_host + (vaddr & PageMask), static_cast<size_t>(size));
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (GuestAddressSpace::BackingMapGeneration() == recorder.direct_generation) {
+			if (Graphics::DrawPrep::DirectReadsMode() >= 2) [[unlikely]] {
+				VerifyDirectRead(vaddr, data, size);
+			}
+			return recorder.reads->Record(vaddr, data, size);
+		}
+		recorder.direct_page = UINT64_MAX; // the backing map changed: find the page again
+	}
+	if (!ReadForDrawPrep(recorder, vaddr, data, size, caller)) {
+		return false;
+	}
+	if (direct && (vaddr & PageMask) + size <= 4096u && (vaddr >> 12u) != recorder.direct_page) {
+		const auto page       = vaddr & ~PageMask;
+		uint64_t   generation = 0;
+		const auto* host      = g_guest_address_space->BackingAliasCached(page, 4096u, generation);
+		if (host != nullptr && DrawPrepHintClean(page, 4096u)) {
+			recorder.direct_page       = vaddr >> 12u;
+			recorder.direct_host       = host;
+			recorder.direct_generation = generation;
+		}
+	}
+	return recorder.reads->Record(vaddr, data, size);
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (auto* recorder = Graphics::DrawPrep::ActiveRecorder(); recorder != nullptr) [[unlikely]] {
-		return TryReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER());
+		// KYTY_DRAW_PREP_PHASES: the recorded reads' share of the preparation.
+		const auto start = Common::PrepPhases::SubStart();
+		const bool ok    = TryReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER());
+		Common::PrepPhases::SubAdd(Common::PrepPhases::Sub::Reads, start);
+		Common::PrepPhases::NoteRead(size);
+		return ok;
 	}
 	return TryReadGpuCleanBackingExact(vaddr, data, size);
 }
@@ -1394,6 +1508,50 @@ bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
 }
 
+// DrawPrep::Validate's clean check after a clean coherence-log check over [since, now]
+// (KYTY_DRAW_PREP_CLEAN_SINCE). GPU thread only. The verdict of a whole 4 KiB page that was found
+// clean when the coherence generation was g (loaded before the exact predicates ran) still holds
+// now if g >= since: every transition that can make the page's bytes unclean logs the range it
+// affects before the change is observable, and those transitions run on this thread (GPU-dirty
+// marks, pending publications, GPU-modified images), so one that touched the requested range after
+// g lies in [since, now] and failed the caller's log check. The table keeps verdicts across commits
+// (the per-generation verdict cache drops them at every transition anywhere). Any other page is
+// checked exactly, as IsGpuCleanForRead does.
+bool IsGpuCleanForReadSince(uint64_t vaddr, uint64_t size, uint64_t since) {
+	namespace CleanVerdict = Graphics::CleanVerdict;
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	if (!Graphics::GuestGpu::IsGpuThread() || size == 0) {
+		return IsGpuCleanForRead(vaddr, size);
+	}
+	const auto first = vaddr >> CleanVerdict::PAGE_BITS;
+	const auto last  = (vaddr + size - 1) >> CleanVerdict::PAGE_BITS;
+	if (first == 0 || last - first >= CleanVerdict::MAX_CACHED_PAGES) {
+		return QueryGpuCleanVerdict(vaddr, size);
+	}
+	struct Entry {
+		uint64_t page       = 0;
+		uint64_t generation = 0;
+	};
+	constexpr size_t                         Entries = 4096;
+	static thread_local std::array<Entry, Entries> verdicts {};
+	for (auto page = first; page <= last; page++) {
+		auto& entry = verdicts[static_cast<size_t>((page ^ (page >> 12u)) % Entries)];
+		if (entry.page == page && entry.generation >= since && entry.generation != 0) {
+			continue;
+		}
+		const auto generation = CleanVerdict::Generation();
+		if (IsGpuRangeCleanForBackingRead(page << CleanVerdict::PAGE_BITS, CleanVerdict::PAGE_SIZE)) {
+			entry = {page, generation};
+			continue;
+		}
+		// Not the whole page: the requested bytes decide, exactly.
+		return QueryGpuCleanVerdict(vaddr, size);
+	}
+	return true;
+}
+
 bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
@@ -1435,10 +1593,36 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
-	if (!TryWriteBacking(vaddr, data, size)) {
+	if (TryWriteBacking(vaddr, data, size)) {
+		return;
+	}
+	if (!Common::SkipInvalidEnabled()) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
+	}
+	// KYTY_SKIP_INVALID (chenxiao07/KytyPS5 c680f0545): GPU results (readbacks, downloads) for guest
+	// memory unmapped meanwhile have nowhere to go. The pages still backed are written, the rest
+	// (unmapped, or private memory without a backing view) is dropped.
+	constexpr uint64_t GuestPage = 0x4000;
+	const auto*        source    = static_cast<const uint8_t*>(data);
+	uint64_t           written   = 0;
+	uint64_t           first_dropped = UINT64_MAX;
+	for (uint64_t at = vaddr, end = vaddr + size; at < end;) {
+		const auto next = std::min((at & ~(GuestPage - 1)) + GuestPage, end);
+		if (TryWriteBacking(at, source + (at - vaddr), next - at)) {
+			written += next - at;
+		} else if (first_dropped == UINT64_MAX) {
+			first_dropped = at;
+		}
+		at = next;
+	}
+	static std::atomic_bool logged {false};
+	if (Common::LogOnce(logged)) {
+		LOGF("Memory: GPU data for guest memory without backing dropped, addr=0x%016" PRIx64
+		     " size=0x%" PRIx64 " (0x%" PRIx64 " bytes written, first dropped page 0x%016" PRIx64
+		     "; logged once)\n",
+		     vaddr, size, written, first_dropped);
 	}
 }
 
@@ -1489,10 +1673,10 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	return false;
 }
 
-bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	std::vector<VirtualRanges::Range> ranges;
 	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
-	    !IsInPrtAperture(vaddr, size) || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+	    !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
 		return false;
 	}
 	if (std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {
@@ -1837,7 +2021,8 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 }
 
 bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int prot,
-                         VirtualMemory::Mode mode, GpuAccessMode gpu_mode) {
+                         VirtualMemory::Mode mode, GpuAccessMode gpu_mode, const char* name,
+                         int memory_type) {
 	Common::LockGuard lock(m_mutex);
 
 	if (len == 0 || UINT64_MAX - phys_addr < len) {
@@ -1880,6 +2065,8 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	mapping.prot           = prot;
 	mapping.mode           = mode;
 	mapping.gpu_mode       = gpu_mode;
+	mapping.memory_type    = memory_type;
+	CopyVirtualRangeName(mapping.name, name);
 	m_mappings.push_back(mapping);
 
 	return true;
@@ -2513,16 +2700,6 @@ void FlexibleMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const cha
 	}
 }
 
-void PhysicalMemory::SetVirtualRangeMemoryType(uint64_t vaddr, uint64_t len, int memory_type) {
-	Common::LockGuard lock(m_mutex);
-
-	for (auto& b: m_mappings) {
-		if (VirtualRangesOverlap(vaddr, len, b.map_vaddr, b.map_size)) {
-			b.memory_type = memory_type;
-		}
-	}
-}
-
 uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
@@ -2741,12 +2918,9 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
 	return true;
 }
 
-int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot,
-                                                   int flags, const char* name) {
-	PRINT_NAME();
-
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
+// The ABI entry points and batch operations hold g_memory_operation_mutex.
+static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
+                             const char* name) {
 	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
 
 	constexpr size_t   PAGE_SIZE                = 0x4000;
@@ -2871,8 +3045,17 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	return OK;
 }
 
+int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot,
+                                                   int flags, const char* name) {
+	PRINT_NAME();
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return MapFlexibleMemory(addr_in_out, len, prot, flags, name);
+}
+
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
-	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
+	PRINT_NAME();
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return MapFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
@@ -3083,11 +3266,8 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
-	PRINT_NAME();
-
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
+// The ABI entry point and batch operations hold g_memory_operation_mutex.
+static int UnmapMemory(uint64_t vaddr, size_t len) {
 	LOGF("\t start = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n",
 	     vaddr, len);
@@ -3101,6 +3281,12 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	}
 	UnmapGpuRange(vaddr, len);
 	return UnmapMemoryRange(vaddr, len);
+}
+
+int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
+	PRINT_NAME();
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return UnmapMemory(vaddr, len);
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -3394,7 +3580,8 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 			for (const auto& removed: metadata_unmapped) {
 				EXIT_IF(!g_physical_memory->Map(removed.map_vaddr, removed.start_addr,
 				                                removed.map_size, removed.prot, removed.mode,
-				                                removed.gpu_mode));
+				                                removed.gpu_mode, removed.name,
+				                                removed.memory_type));
 			}
 			restore_owner_aliases(owner_unmapped);
 			restore_gpu_aliases();
@@ -3465,12 +3652,10 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
-int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
-                                        int64_t direct_memory_start, size_t alignment) {
-	PRINT_NAME();
-
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
+// The ABI entry points and batch operations hold g_memory_operation_mutex.
+static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
+                           int64_t direct_memory_start, size_t alignment, const char* name,
+                           int type = -1) {
 	if (addr == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
@@ -3512,6 +3697,20 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		return g_guest_address_space->MapBacking(target_addr, len, direct_memory_start, mode,
 		                                         &shared_failure);
 	};
+	std::vector<PhysicalMemory::AllocatedBlock> replaced_mappings;
+	auto restore_mappings = [&](size_t count, bool restore_views) {
+		for (size_t index = 0; index < count; ++index) {
+			const auto& old = replaced_mappings[index];
+			if (restore_views) {
+				EXIT_IF(!g_guest_address_space->MapBacking(old.map_vaddr, old.map_size,
+				                                           old.start_addr, old.mode));
+			}
+			EXIT_IF(!g_physical_memory->Map(old.map_vaddr, old.start_addr, old.map_size,
+			                               old.prot, old.mode, old.gpu_mode, old.name,
+			                               old.memory_type));
+		}
+		MapGpuRange(in_addr, len);
+	};
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
 		    (alignment != 0 && in_addr % alignment != 0)) {
@@ -3522,22 +3721,68 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		}
 
 		std::vector<VirtualRanges::Range> reserved_ranges;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
-			    return range.type == VirtualRangeType::Reserved;
+			    return range.type == VirtualRangeType::Direct;
 		    })) {
+			uint64_t covered = 0;
+			{
+				Common::LockGuard lock(g_physical_memory->GetMutex());
+				for (const auto& mapping: g_physical_memory->GetMappings()) {
+					const auto start = std::max(in_addr, mapping.map_vaddr);
+					const auto end = std::min(in_addr + len, mapping.map_vaddr + mapping.map_size);
+					if (start >= end) {
+						continue;
+					}
+					auto old = mapping;
+					old.start_addr += start - old.map_vaddr;
+					old.map_vaddr = start;
+					old.size = old.map_size = end - start;
+					covered += old.map_size;
+					replaced_mappings.push_back(old);
+				}
+			}
+			if (covered != len) {
+				return KERNEL_ERROR_EBUSY;
+			}
 			UnmapGpuRange(in_addr, len);
-			reserved_target = true;
-		}
-		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
-			reserved_target = true;
-		}
-		if (!reserved_target) {
-			return KERNEL_ERROR_ENOMEM;
-		}
-		if (map_shared_fixed(in_addr)) {
+			for (size_t index = 0; index < replaced_mappings.size(); ++index) {
+				const auto& old = replaced_mappings[index];
+				GpuAccessMode old_gpu_mode = GpuAccessMode::NoAccess;
+				if (!g_physical_memory->Unmap(old.map_vaddr, old.map_size, &old_gpu_mode)) {
+					restore_mappings(index, false);
+					return KERNEL_ERROR_EBUSY;
+				}
+			}
+			// Keep the old view accessible until mmap atomically replaces it. In particular,
+			// do not publish a temporary reserved/PROT_NONE range between two direct views.
+			if (!map_shared_fixed(in_addr)) {
+				restore_mappings(replaced_mappings.size(), true);
+				return KERNEL_ERROR_ENOMEM;
+			}
 			out_addr       = in_addr;
 			shared_backing = true;
+		} else
+#endif
+		{
+			if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
+			    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
+				    return range.type == VirtualRangeType::Reserved;
+			    })) {
+				UnmapGpuRange(in_addr, len);
+				reserved_target = true;
+			}
+			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
+				reserved_target = true;
+			}
+			if (!reserved_target) {
+				return KERNEL_ERROR_ENOMEM;
+			}
+			if (map_shared_fixed(in_addr)) {
+				out_addr       = in_addr;
+				shared_backing = true;
+			}
 		}
 	} else {
 		constexpr size_t DEFAULT_ALIGNMENT = 0x4000;
@@ -3591,25 +3836,38 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	if (!g_physical_memory->Map(out_addr, direct_memory_start, len, prot, mode, gpu_mode)) {
+	PhysicalMemory::AllocatedBlock mapped_block {};
+	g_physical_memory->Find(direct_memory_start, false, &mapped_block);
+	const int memory_type = type == -1 ? mapped_block.memory_type : type;
+	if (!g_physical_memory->Map(out_addr, direct_memory_start, len, prot, mode, gpu_mode, name,
+	                            memory_type)) {
 		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
-		EXIT_IF(!g_guest_address_space->UnmapBacking(out_addr, len));
+		if (replaced_mappings.empty()) {
+			EXIT_IF(!g_guest_address_space->UnmapBacking(out_addr, len));
+		} else {
+			restore_mappings(replaced_mappings.size(), true);
+		}
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	PhysicalMemory::AllocatedBlock mapped_block {};
-	g_physical_memory->Find(direct_memory_start, false, &mapped_block);
-	const bool published = reserved_target
+	const bool published = !replaced_mappings.empty() || reserved_target
 	                           ? g_virtual_ranges->ReplaceSpan(
-	                                 out_addr, len, VirtualRangeType::Reserved, direct_memory_start,
-	                                 prot, mapped_block.memory_type, VirtualRangeType::Direct, "")
+	                                 out_addr, len, replaced_mappings.empty()
+	                                                    ? VirtualRangeType::Reserved
+	                                                    : VirtualRangeType::Direct,
+	                                 direct_memory_start,
+	                                 prot, memory_type, VirtualRangeType::Direct, name)
 	                           : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot,
-	                                                   mapped_block.memory_type,
-	                                                   VirtualRangeType::Direct, "");
+	                                                   memory_type,
+	                                                   VirtualRangeType::Direct, name);
 	if (!published) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_physical_memory->Unmap(out_addr, len, &rollback_gpu_mode));
-		EXIT_IF(!g_guest_address_space->UnmapBacking(out_addr, len));
+		if (replaced_mappings.empty()) {
+			EXIT_IF(!g_guest_address_space->UnmapBacking(out_addr, len));
+		} else {
+			restore_mappings(replaced_mappings.size(), true);
+		}
 		return KERNEL_ERROR_EBUSY;
 	}
 
@@ -3624,22 +3882,18 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
+                                        int64_t direct_memory_start, size_t alignment) {
+	PRINT_NAME();
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "");
+}
+
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
-
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
-	LOGF("\t type = %d\n", type);
-
-	auto ret = KernelMapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment);
-	if (ret == OK && addr != nullptr && *addr != nullptr) {
-		const auto out_addr = reinterpret_cast<uint64_t>(*addr);
-		g_physical_memory->SetVirtualRangeMemoryType(out_addr, len, type);
-		g_virtual_ranges->SetMemoryType(out_addr, len, type);
-	}
-
-	return ret;
+	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "", type);
 }
 
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
@@ -3659,13 +3913,7 @@ int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, 
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
-	auto ret = KernelMapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment);
-	if (ret == OK && addr != nullptr) {
-		g_physical_memory->SetVirtualRangeName(reinterpret_cast<uint64_t>(*addr), len, name);
-		g_virtual_ranges->Rename(reinterpret_cast<uint64_t>(*addr), len, name);
-	}
-
-	return ret;
+	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, name);
 }
 
 int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled() {
@@ -3771,7 +4019,8 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 				if (chunk.backend_unmapped) {
 					backend_restored = g_physical_memory->Map(
 					    chunk.range.start, chunk.range.offset, chunk.range.size,
-					    chunk.range.protection, chunk.mode, chunk.gpu_mode);
+					    chunk.range.protection, chunk.mode, chunk.gpu_mode, chunk.range.name,
+					    chunk.range.memory_type);
 				}
 			} else if (chunk.range.type == VirtualRangeType::Flexible && chunk.backend_unmapped) {
 				host_restored = backend_restored =
@@ -3968,6 +4217,18 @@ TestClampTotals TestClampRangeMemoTotals() {
 	        totals.verify_races};
 }
 
+void TestBeforeNextBackingMap(callback_func_t callback) {
+	g_test_before_backing_map = callback;
+}
+
+void TestSetBackingReadCallback(callback_func_t callback) {
+	g_test_backing_read = callback;
+}
+
+bool TestTryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
+}
+
 void TestFailNextPhysicalMemoryUnmap() {
 	TestFailPhysicalMemoryUnmapAfter(0);
 }
@@ -4008,6 +4269,36 @@ uint64_t TestGuestBackingSize() {
 uint64_t TestGuestBackingBase() {
 	return g_guest_address_space->GetBackingBase();
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool TestWindowsBackingViewModes() {
+	constexpr uint64_t size = 0x10000;
+	GuestBackingStore backing(size);
+	void* placeholder = VirtualAlloc2(GetCurrentProcess(), nullptr, size,
+	                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+	                                  nullptr, 0);
+	if (placeholder == nullptr) {
+		return false;
+	}
+	const auto address = reinterpret_cast<uint64_t>(placeholder);
+	bool valid = true;
+	for (auto [mode, protection]: std::array {
+	         std::pair {VirtualMemory::Mode::NoAccess, DWORD {PAGE_NOACCESS}},
+	         std::pair {VirtualMemory::Mode::Read, DWORD {PAGE_READONLY}},
+	         std::pair {VirtualMemory::Mode::ReadWrite, DWORD {PAGE_READWRITE}},
+	         std::pair {VirtualMemory::Mode::ExecuteReadWrite, DWORD {PAGE_EXECUTE_READWRITE}}}) {
+		if (!backing.MapFixed(address, size, 0, mode)) {
+			valid = false;
+			break;
+		}
+		MEMORY_BASIC_INFORMATION info {};
+		valid = VirtualQuery(placeholder, &info, sizeof(info)) != 0 &&
+		        info.Type == MEM_MAPPED && info.Protect == protection && valid;
+		EXIT_IF(!backing.Unmap(address, size));
+	}
+	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
+}
+#endif
 
 bool TestGuestFreeRangeBounds() {
 	return GuestFreeRangeContains(0x10000, 0x20000, 0x18000, 0x4000) &&
@@ -4271,11 +4562,8 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	return FreeGuestMemoryOwner(vaddr, mapped_size);
 }
 
-int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
-	PRINT_NAME();
-
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
+// The ABI entry points and batch operations hold g_memory_operation_mutex.
+static int ProtectMemory(const void* addr, size_t len, int prot) {
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
 	LOGF("\t addr = 0x%016" PRIx64 "\n"
@@ -4328,25 +4616,28 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+	// A writable guest protection replaced the tracker's on watched pages: their CPU writes
+	// would stop faulting.
+	if ((prot & PROT_CPU_WRITE) != 0) {
+		ResyncGpuRangeProtection(aligned_addr, aligned_len);
+	}
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
+	PRINT_NAME();
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	return ProtectMemory(addr, len, prot);
+}
+
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
 	PRINT_NAME();
-
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
-	LOGF("\t addr = 0x%016" PRIx64 "\n"
-	     "\t len  = 0x%016" PRIx64 "\n"
-	     "\t type = 0x%08" PRIx32 "\n"
-	     "\t prot = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(len), static_cast<uint32_t>(type),
-	     static_cast<uint32_t>(prot));
-
-	return KernelMprotect(addr, len, prot);
+	LOGF("\t type = %d\n", type);
+	return ProtectMemory(addr, len, prot);
 }
 
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
@@ -4393,23 +4684,19 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		int result = OK;
 		switch (entry->operation) {
 			case MAP_OP_MAP_DIRECT:
-				result = KernelMapNamedDirectMemory(&entry->start, entry->length, entry->protection,
-				                                    flags, static_cast<int64_t>(entry->offset), 0,
-				                                    "anon");
+				result = MapDirectMemory(&entry->start, entry->length, entry->protection, flags,
+				                         static_cast<int64_t>(entry->offset), 0, "anon");
 				break;
 			case MAP_OP_UNMAP:
-				result = KernelMunmap(reinterpret_cast<uint64_t>(entry->start), entry->length);
+				result = UnmapMemory(reinterpret_cast<uint64_t>(entry->start), entry->length);
 				break;
 			case MAP_OP_PROTECT:
-				result = KernelMprotect(entry->start, entry->length, entry->protection);
+			case MAP_OP_TYPE_PROTECT:
+				result = ProtectMemory(entry->start, entry->length, entry->protection);
 				break;
 			case MAP_OP_MAP_FLEXIBLE:
-				result = KernelMapNamedFlexibleMemory(&entry->start, entry->length,
-				                                      entry->protection, flags, "anon");
-				break;
-			case MAP_OP_TYPE_PROTECT:
-				result =
-				    KernelMtypeprotect(entry->start, entry->length, entry->type, entry->protection);
+				result = MapFlexibleMemory(&entry->start, entry->length, entry->protection, flags,
+				                           "anon");
 				break;
 			default: result = KERNEL_ERROR_EINVAL; break;
 		}

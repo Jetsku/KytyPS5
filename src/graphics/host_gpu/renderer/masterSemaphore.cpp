@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
 #include <cinttypes>
 #include <optional>
@@ -67,6 +68,12 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	// KYTY_CP_GAP_STATS (GPU thread only): readback drains, occlusion publication, the rest.
+	const auto      reason = Profiler::CurrentGpuWaitReason();
+	const CpGaps::Scope gap(reason == Profiler::FrameWait::GpuWaitDrain ? CpGaps::Cat::GpuWaitDrain
+	                        : reason == Profiler::FrameWait::GpuWaitOcclusion
+	                            ? CpGaps::Cat::GpuWaitOcclusion
+	                            : CpGaps::Cat::GpuWaitOther);
 	// Attribute CP-thread blocking to its caller (Profiler::ScopedGpuWaitReason). Other threads
 	// (the completion runner, guest threads) wait here by design and are not counted.
 	std::optional<Profiler::ScopedFrameWait> frame_wait;

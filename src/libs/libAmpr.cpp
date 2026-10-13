@@ -288,10 +288,17 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
+				// Allocate once under the cache lock (upstream e43aadf75 adds the exhaustion check).
 				if (!AprShared::UseHashedFileIds()) {
-					info.file_id = it->second.file_id = AprShared::g_next_file_id++;
+					if (AprShared::g_next_file_id == 0xffffffffu) {
+						info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
+					} else {
+						info.file_id = it->second.file_id = AprShared::g_next_file_id++;
+					}
 				}
-				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
+				if (info.result == OK) {
+					RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
+				}
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
@@ -299,7 +306,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		if (log_missing) {
 			LOGF("\tAPR resolve missing path: %s -> %s\n", guest_path, info.host_path.c_str());
 		}
-	} else if (info.result == OK) {
+	} else if (info.result == OK && AprShared::UseHashedFileIds()) {
+		// A hashed id is shared by colliding paths: the last resolved one serves its reads.
 		AprShared::RegisterHostPath(info.file_id, info.host_path, info.file_size, info.is_dir);
 	}
 

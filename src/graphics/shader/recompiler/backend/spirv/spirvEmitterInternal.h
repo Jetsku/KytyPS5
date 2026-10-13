@@ -61,6 +61,7 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct SpirvRequirements {
 	bool subgroup_ballot              = false;
+	bool subgroup_barrier             = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
 	// Native subgroup reductions of DPP row scans (IR::MatchLaneReduction, KYTY_LANE_REDUCTIONS).
@@ -73,8 +74,13 @@ struct SpirvRequirements {
 	// A pixel shader's DS_APPEND/DS_CONSUME elect a non-helper lane (KYTY_PS_APPEND_LIVE_ELECTION).
 	bool helper_invocation            = false;
 	bool buffer_int64_atomics         = false;
+	bool buffer_u8                    = false;
+	bool buffer_u16                   = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	// A buffer store or atomic anywhere in the program; without one (and without coherent loads)
+	// the storage buffers are declared NonWritable (CodegenOptions::readonly_buffers).
+	bool buffer_writes                = false;
 	bool float64                      = false;
 	// S_MEMREALTIME reads the host shader clock (OpReadClockKHR, VK_KHR_shader_clock).
 	bool shader_clock                 = false;
@@ -86,7 +92,14 @@ struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {}
+	      requirements(AnalyzeProgramRequirements(program_)) {
+		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
+			lds_storage_class = spv::StorageClassWorkgroup;
+		}
+		if (IR::FindBinding(program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+			lds_storage_class = spv::StorageClassStorageBuffer;
+		}
+	}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
@@ -94,7 +107,7 @@ struct EmitterState {
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
-	uint32_t                                        native_u64_type = 0;
+	uint32_t                                        u64_type = 0;
 	uint32_t                                        i32_type = 0;
 	uint32_t                                        f32_type = 0;
 	uint32_t                                        f64_type = 0;
@@ -112,12 +125,20 @@ struct EmitterState {
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// KYTY_WAVE32_CLUSTERS (Spirv::WaveClustersActive): a wave32 program on a host subgroup that may
+	// hold two guest waves keeps each to its own 32 lanes (EmitSubgroupLocalInvocationId,
+	// EmitHostLane, EmitWaveBallot).
+	bool                                             wave_clusters           = false;
 	uint32_t                                         storage_buffer_variable = 0;
+	uint32_t                                         storage_buffer_u8_variable = 0;
+	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	// KYTY_RT_FUNCTION: the module's one software BVH node test function (DefineBvhNodeTestFunction).
+	uint32_t                                         bvh_node_test_function  = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -127,6 +148,12 @@ struct EmitterState {
 	// the mip_stats binding stays declared, but no sample records GET_LOD_STATS feedback.
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
+	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds
+	// no region for it).
+	uint32_t                                         lds_base_dwords         = 0;
+	uint32_t                                         lds_length              = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
@@ -182,7 +209,6 @@ uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
-uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -195,10 +221,9 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
-uint32_t TypeStorageBufferPointer(EmitterState& state);
-uint32_t TypeStorageBufferElementPointer(EmitterState& state);
-uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
-uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
+uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
+uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
+uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);
@@ -237,6 +262,12 @@ inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, type, result, value);
 	return result;
+}
+
+inline uint32_t PackU64(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);
+	return Unary(state, spv::OpBitcast, TypeU64(state), pair);
 }
 
 inline uint32_t Binary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t lhs,
@@ -347,14 +378,16 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
+                                uint32_t array_index = 0);
 
-uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
+                             uint32_t array_index = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0);
+                          uint32_t mip = 0, uint32_t array_index = 0);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
@@ -383,6 +416,7 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
+void     EmitGeometryOutputDefaults(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
@@ -399,7 +433,18 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 
+// The invocation's guest lane: SubgroupLocalInvocationId (+32 in the second half of a two-lane
+// invocation; its low 5 bits with KYTY_WAVE32_CLUSTERS).
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+
+// KYTY_WAVE32_CLUSTERS: the host subgroup lane of guest lane `lane` of this invocation's wave (the
+// wave's first host lane plus lane & 31); `lane` unchanged without clusters. Every
+// OpGroupNonUniformShuffle index goes through it.
+uint32_t EmitHostLane(EmitterState& state, uint32_t lane);
+
+// KYTY_WAVE32_CLUSTERS: a subgroup ballot reduced to this invocation's wave, its 32 bits in the
+// first word and zero in the others; `ballot` unchanged without clusters.
+uint32_t EmitWaveBallot(EmitterState& state, uint32_t ballot);
 
 // Loads gl_HelperInvocation (declared when SpirvRequirements::helper_invocation is set).
 uint32_t EmitIsHelperInvocation(EmitterState& state);
@@ -428,30 +473,36 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
+uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
 
+// LDS kept in a device buffer (b0bbaef1e, compute LDS past the device limit) is uniform memory.
+inline spv::MemorySemanticsMask LdsMemorySemantics(const EmitterState& state) {
+	return state.lds_storage_class == spv::StorageClassStorageBuffer
+	           ? spv::MemorySemanticsUniformMemoryMask
+	           : spv::MemorySemanticsWorkgroupMemoryMask;
+}
+
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
 	uint32_t              length           = 0;
-	uint32_t              index_offset     = 0;
 	uint32_t              byte_offset      = 0;
-	bool                  add_index_offset = false;
+	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
+uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
+                                   uint32_t search_iterations, uint32_t default_resource);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
                                                         uint32_t variable, uint32_t pointer_type);
-
-uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
-                                uint32_t raw_index);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
@@ -532,6 +583,7 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);
 
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
+uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
@@ -559,17 +611,17 @@ uint32_t EmitBdaDeviceAddress(ValueEmitContext& ctx, uint32_t guest_address);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
-auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_count,
+auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
                         uint32_t result_type, Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
-	EXIT_IF(mip_count == 0u);
+	EXIT_IF(count == 0u);
 	const auto merge_label = state.builder.AllocateId();
-	std::vector<uint32_t> labels(mip_count);
-	std::vector<uint32_t> words {spv::OpSwitch, mip_lod, merge_label};
-	for (uint32_t mip = 0; mip < mip_count; mip++) {
-		labels[mip] = state.builder.AllocateId();
-		words.push_back(mip);
-		words.push_back(labels[mip]);
+	std::vector<uint32_t> labels(count);
+	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
+	for (uint32_t item = 0; item < count; item++) {
+		labels[item] = state.builder.AllocateId();
+		words.push_back(item);
+		words.push_back(labels[item]);
 	}
 	if constexpr (has_result) {
 		words[2] = labels.front();
@@ -580,13 +632,13 @@ auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_coun
 	if constexpr (has_result) {
 		phi = {spv::OpPhi, result_type, state.builder.AllocateId()};
 	}
-	for (uint32_t mip = 0; mip < mip_count; mip++) {
-		EmitLabel(state, labels[mip]);
+	for (uint32_t item = 0; item < count; item++) {
+		EmitLabel(state, labels[item]);
 		if constexpr (has_result) {
-			phi.push_back(emit(mip));
+			phi.push_back(emit(item));
 			phi.push_back(state.current_label);
 		} else {
-			emit(mip);
+			emit(item);
 		}
 		state.builder.AddFunction(spv::OpBranch, merge_label);
 	}
@@ -652,11 +704,11 @@ inline uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limi
 }
 
 template <typename Fn>
-uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+uint32_t AtomicUpdateLoop(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
-			case IR::ResourceKind::Lds: return spv::MemorySemanticsWorkgroupMemoryMask;
+			case IR::ResourceKind::Lds: return LdsMemorySemantics(state);
 			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
 			default: return spv::MemorySemanticsUniformMemoryMask;
 		}
@@ -694,6 +746,26 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	return observed;
 }
 
+// KYTY_PS_HELPER_ATOMICS_SKIP (CodegenOptions::ps_helper_atomics_skip): whether a pixel shader's CAS
+// loops leave out helper invocations (gl_HelperInvocation declared, SpirvRequirements).
+[[nodiscard]] bool PixelHelperAtomicsSkipped(const EmitterState& state);
+
+// A read-modify-write of one dword as a compare-exchange loop (sub-dword stores, float min/max,
+// INC/DEC). Vulkan does not perform a helper invocation's atomics and leaves their results
+// undefined, so in a helper lane the loop's exit test (exchanged == observed) depends on whatever the
+// driver returns and need never become true: the wave then spins until a device reset (an AMD-only
+// hang where helper lanes stay in the wave for derivatives). Helper lanes skip the loop and read
+// zero, which is what their discarded atomic may return anyway.
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	if (PixelHelperAtomicsSkipped(state)) {
+		const auto live = Unary(state, spv::OpLogicalNot, TypeBool(state), EmitIsHelperInvocation(state));
+		return EmitValueOrZeroIfCondition(state, live, [&]() {
+			return AtomicUpdateLoop(state, pointer, kind, std::forward<Fn>(desired));
+		});
+	}
+	return AtomicUpdateLoop(state, pointer, kind, std::forward<Fn>(desired));
+}
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_ */

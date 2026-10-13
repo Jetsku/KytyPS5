@@ -577,6 +577,11 @@ std::string InstructionToString(const Instruction& inst) {
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),
 			                                               OperandToString(inst.src1).c_str()));
+		case Opcode::S_WAITCNT_VSCNT:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.src0),
+			                                               OperandToString(inst.src1)));
 		case Opcode::S_NOP:
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
@@ -660,10 +665,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
 		case Opcode::BUFFER_STORE_FORMAT_X:
 		case Opcode::BUFFER_STORE_FORMAT_XY:
 		case Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Opcode::BUFFER_LOAD_UBYTE:
 		case Opcode::BUFFER_LOAD_USHORT:
 		case Opcode::BUFFER_LOAD_DWORD:

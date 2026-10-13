@@ -7,6 +7,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -22,6 +24,7 @@ struct Stream {
 	SDL_AudioSpec spec;
 	uint64_t      frames = 0; // Millionths of a frame retain exact simulated consumption.
 	uint64_t      updated;
+	std::vector<uint8_t> pcm;
 };
 
 uint64_t                             now       = 1000000;
@@ -31,6 +34,7 @@ std::vector<std::unique_ptr<Stream>> streams;
 bool                                 fail_open = false, fail_put = false, stalled = false;
 bool                                 pad_connected = false, pad_bluetooth = false;
 uint64_t                             pad_queue_us = 0;
+const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
 float                                last_put_sample = 0.0f; // First sample of the last queued block.
 
@@ -38,9 +42,13 @@ Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
 }
 
+int64_t device_ppm = 0; // How much faster (or slower) than the process clock the device plays.
+
 void Drain(Stream& stream) {
 	if (!stalled) {
-		const auto consumed = (now - stream.updated) * stream.spec.freq;
+		const auto elapsed  = (now - stream.updated) * stream.spec.freq;
+		const auto consumed = static_cast<uint64_t>(static_cast<int64_t>(elapsed) +
+		                                            static_cast<int64_t>(elapsed) * device_ppm / 1000000);
 		stream.frames -= std::min(stream.frames, consumed);
 	}
 	stream.updated = now;
@@ -62,7 +70,7 @@ SDL_AudioStream* OpenAudioDeviceStream(SDL_AudioDeviceID, const SDL_AudioSpec* s
 		return nullptr;
 	}
 
-	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now}));
+	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now, {}}));
 	return reinterpret_cast<SDL_AudioStream*>(streams.back().get());
 }
 
@@ -90,6 +98,8 @@ bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 		last_put_sample = *static_cast<const float*>(data);
 	}
 	auto& state = GetStream(stream);
+	const auto* pcm = static_cast<const uint8_t*>(data);
+	state.pcm.assign(pcm, pcm + bytes);
 	Drain(state);
 	state.frames += static_cast<uint64_t>(bytes) * 1000000 /
 	                (SDL_AUDIO_BYTESIZE(state.spec.format) * state.spec.channels);
@@ -152,7 +162,8 @@ void     Close(Stream*) {}
 bool UsesBluetooth(const Stream* stream) {
 	return stream != nullptr && pad_bluetooth;
 }
-uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float) {
+uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float, const float* gains) {
+	queued_pad_gains = gains;
 	return stream != nullptr ? pad_queue_us : 0;
 }
 } // namespace DualSenseHaptics
@@ -185,6 +196,7 @@ struct Fixture {
 		fail_open = fail_put = stalled = false;
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
+		queued_pad_gains = nullptr;
 		sleeps.clear();
 	}
 
@@ -430,20 +442,193 @@ void TestZeroOutputFrequency() {
 	      "internal output open accepted zero frequency");
 	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
 }
+
+template <typename T>
+void CheckOutputSamples(std::initializer_list<T> expected, const char* message) {
+	const auto& pcm = streams.back()->pcm;
+	Check(pcm.size() == expected.size() * sizeof(T) &&
+	          std::memcmp(pcm.data(), expected.begin(), pcm.size()) == 0, message);
+}
+
+void TestChannelGains() {
+	Fixture f;
+	const std::array pcm {0.25f, -0.5f, 0.75f, -1.0f};
+	const auto stereo = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::FloatStereo);
+	std::array gains {2.0f, 0.5f};
+	Audio::OutputParam output {stereo, pcm.data(), gains.data()};
+	for (int push = 0; push < 2; push++) {
+		f.audio.AudioOutOutputs(&output, 1, false);
+		CheckOutputSamples({0.5f, -0.25f, 1.5f, -0.5f}, "float channel gains were not applied independently");
+	}
+	const int volume[] {16384, 32768};
+	f.audio.AudioOutSetVolume(stereo, 3, volume);
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples({0.25f, -0.25f, 0.75f, -0.5f}, "channel gain did not combine with port volume");
+	gains = {0.0f, 0.0f};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples({0.0f, -0.0f, 0.0f, -0.0f}, "zero channel gains did not mute");
+	output.gains = nullptr;
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples({0.125f, -0.5f, 0.375f, -1.0f}, "channel scaling changed original float PCM");
+
+	const std::array<int16_t, 2> integer_pcm {20000, -20000};
+	const auto integer = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::Signed16bitStereo);
+	output = {integer, integer_pcm.data(), gains.data()};
+	for (const auto gain: {2.0f, std::numeric_limits<float>::max()}) {
+		gains = {gain, gain};
+		f.audio.AudioOutOutputs(&output, 1, false);
+		CheckOutputSamples<int16_t>({32767, -32768}, "integer gain overflowed instead of saturating");
+	}
+	gains = {0.5f, 0.25f};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples<int16_t>({10000, -5000}, "integer channel gains changed original PCM");
+
+	const std::array surround_pcm {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
+	for (const auto format: {Audio::Format::Float8Ch, Audio::Format::Float12Ch}) {
+		const auto surround = f.audio.AudioOutOpen(0, 1, 48000, format);
+		output = {surround, surround_pcm.data(), surround_pcm.data()};
+		f.audio.AudioOutOutputs(&output, 1, false);
+		if (format == Audio::Format::Float8Ch) {
+			CheckOutputSamples({1.0f, 4.0f, 9.0f, 16.0f, 49.0f, 64.0f, 25.0f, 36.0f},
+			                   "channel reordering used destination channel gains");
+		} else {
+			CheckOutputSamples({82.0f, 104.0f, 9.0f, 16.0f, 170.0f, 208.0f, 25.0f, 36.0f},
+			                   "height downmix lost per-channel gains");
+		}
+	}
+	pad_connected = true;
+	const auto speaker = f.Open(2, 4);
+	gains = {0.75f, 0.25f};
+	output = {speaker, pcm.data(), gains.data()};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
+	      "connected controller did not receive channel gains");
+}
+
+// A device that plays faster than the process clock drains the cushion until the queue runs dry
+// (one gap per drain, then a re-prime); with the queue catch-up the device sets the pace instead.
+// Returns how many outputs found less than one block queued after the first priming.
+int RunFastDevice(bool catchup, int64_t ppm, int seconds) {
+	Fixture f;
+	Libs::Audio::g_queue_catchup = catchup ? 1 : 0;
+	device_ppm                   = ppm;
+	const auto port              = f.Open();
+	f.Prime(port);
+	processing = 125;
+	oversleep  = 175;
+	int        low   = 0;
+	const auto start = now;
+	while (now - start < static_cast<uint64_t>(seconds) * 1000000) {
+		Drain(*streams.front());
+		low += streams.front()->frames < uint64_t {256} * 1000000 ? 1 : 0;
+		f.Output(port);
+	}
+	Drain(*streams.front());
+	const auto queued_ms = streams.front()->frames / 1000000 / 48;
+	Check(queued_ms <= 60, "the queue grew past its target");
+	device_ppm                   = 0;
+	Libs::Audio::g_queue_catchup = 0;
+	f.audio.AudioOutClose(port);
+	return low;
+}
+
+// A port that joins a batch the first port already paces starts under one block and stays there;
+// KYTY_AUDIO_PAD_PRIME tops it up with silence once.
+uint64_t LateJoinerQueuedFrames(bool pad_prime) {
+	Fixture f;
+	Libs::Audio::g_pad_prime = pad_prime ? 1 : 0;
+	const auto bed           = f.Open(512);
+	for (int i = 0; i < 8; i++) {
+		f.Output(bed);
+	}
+	const auto         speaker = f.Open(512, 4);
+	Audio::OutputParam batch[] {{bed, f.pcm.data()}, {speaker, f.pcm.data()}};
+	uint64_t           min_frames = ~uint64_t {0};
+	for (int i = 0; i < 400; i++) {
+		f.audio.AudioOutOutputs(batch, 2);
+		if (i >= 10) {
+			Drain(*streams[1]);
+			min_frames = std::min(min_frames, streams[1]->frames / 1000000);
+		}
+	}
+	Libs::Audio::g_pad_prime = 0;
+	f.audio.AudioOutClose(speaker);
+	f.audio.AudioOutClose(bed);
+	return min_frames;
+}
+
+// The AudioOut2 shape on a device faster than the process clock: a bed and a late pad speaker
+// port in one batch. With catch-up and pad prime neither queue may run dry.
+void TestFastDeviceBatch() {
+	Fixture f;
+	Libs::Audio::g_queue_catchup = 1;
+	Libs::Audio::g_pad_prime     = 1;
+	device_ppm                   = 500;
+	processing                   = 125;
+	oversleep                    = 175;
+	const auto bed               = f.Open(512);
+	for (int i = 0; i < 8; i++) {
+		f.Output(bed);
+	}
+	const auto         speaker = f.Open(512, 4);
+	Audio::OutputParam batch[] {{bed, f.pcm.data()}, {speaker, f.pcm.data()}};
+	uint64_t           min_bed = ~uint64_t {0}, min_speaker = ~uint64_t {0}, max_bed = 0;
+	const auto         start = now;
+	for (int i = 0; now - start < 300000000; i++) {
+		if (i >= 10) {
+			Drain(*streams[0]);
+			Drain(*streams[1]);
+			min_bed     = std::min(min_bed, streams[0]->frames / 1000000);
+			max_bed     = std::max(max_bed, streams[0]->frames / 1000000);
+			min_speaker = std::min(min_speaker, streams[1]->frames / 1000000);
+		}
+		f.audio.AudioOutOutputs(batch, 2);
+	}
+	device_ppm                   = 0;
+	Libs::Audio::g_queue_catchup = 0;
+	Libs::Audio::g_pad_prime     = 0;
+	f.audio.AudioOutClose(speaker);
+	f.audio.AudioOutClose(bed);
+	Check(min_bed >= 512, "the bed ran under one block on a fast device");
+	Check(min_speaker >= 512, "the late pad speaker port ran under one block on a fast device");
+	Check(max_bed <= 3 * 1024, "the bed grew past its target");
+}
+
+void TestLateJoinerPadPrime() {
+	Check(LateJoinerQueuedFrames(false) < 512, "a late joiner unexpectedly built its own cushion");
+	Check(LateJoinerQueuedFrames(true) >= 1024, "pad prime did not give the late joiner a cushion");
+}
+
+void TestFastDeviceDrift() {
+	Check(RunFastDevice(false, 500, 300) > 0, "without catch-up a 500 ppm fast device never ran dry");
+	Check(RunFastDevice(true, 500, 300) == 0, "catch-up let a 500 ppm fast device run dry");
+	Check(RunFastDevice(true, 20000, 60) == 0, "catch-up let a 2% fast device run dry");
+	Check(RunFastDevice(true, -500, 300) == 0, "a slow device ran dry with catch-up");
+	Check(RunFastDevice(false, -500, 300) == 0, "a slow device ran dry");
+}
 } // namespace
 
 int main() {
-	TestPrimingAndSteadyCadence();
-	TestUnderrunAndStalledQueueRecovery();
-	TestFallbackClockAndLongGap();
-	TestAsyncDoesNotAccumulateDeadlines();
-	TestSynchronizedBatchAndInactivePorts();
-	TestFallbackUsesEachPortsPeriod();
-	TestFailedQueueUsesFallbackClock();
-	TestControllerSpeakerPacing();
-	TestMixGains();
-	TestInvalidBatchSize();
-	TestZeroOutputFrequency();
+	TestFastDeviceDrift();
+	TestLateJoinerPadPrime();
+	TestFastDeviceBatch();
+	// The scheduling cases hold with the queue catch-up and pad prime off and on (the default).
+	for (const int fixes: {0, 1}) {
+		Libs::Audio::g_queue_catchup = fixes;
+		Libs::Audio::g_pad_prime     = fixes;
+		TestPrimingAndSteadyCadence();
+		TestUnderrunAndStalledQueueRecovery();
+		TestFallbackClockAndLongGap();
+		TestAsyncDoesNotAccumulateDeadlines();
+		TestSynchronizedBatchAndInactivePorts();
+		TestFallbackUsesEachPortsPeriod();
+		TestFailedQueueUsesFallbackClock();
+		TestControllerSpeakerPacing();
+		TestMixGains();
+		TestInvalidBatchSize();
+		TestZeroOutputFrequency();
+		TestChannelGains();
+	}
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

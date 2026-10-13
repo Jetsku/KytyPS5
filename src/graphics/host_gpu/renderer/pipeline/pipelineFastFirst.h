@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <utility>
@@ -23,15 +24,16 @@ namespace Libs::Graphics {
 // fast one for later draws. This header holds the Vulkan-free parts (scheduling, accounting,
 // retirement) so they can be tested without a device.
 //
-// Switches: KYTY_PIPELINE_FAST_FIRST=1 enables it; KYTY_PIPELINE_FAST_FIRST_THREADS (default 2)
+// Switches: KYTY_PIPELINE_FAST_FIRST=1 enables it (=nvidia: only on NVIDIA GPUs); KYTY_PIPELINE_FAST_FIRST_THREADS (default 2)
 // background compile threads; KYTY_PIPELINE_FAST_FIRST_MAX_PENDING (default 1024) cap on queued
 // plus running optimized compiles (beyond it a new pipeline is built optimized, synchronously, as
 // without the switch); KYTY_PIPELINE_FAST_FIRST_RETIRE_S (default 60, 0 = until exit) how long a
 // replaced pipeline handle stays alive for command buffers that may still use it;
-// KYTY_PIPELINE_FAST_FIRST_PROBE (default 0: every eligible new pipeline is built fast and
-// optimized later; 1 first probes the driver cache, which NVIDIA's own on-disk cache can answer for
-// pipelines this process never compiled, and a cold Sky Garden run then waited 1.38 s on pipeline
-// creation instead of 0.31 s);
+// KYTY_PIPELINE_FAST_FIRST_PROBE (default 0: a new pipeline is probed in the driver cache only when
+// its key is known to be there, KYTY_PIPELINE_KNOWN / KYTY_PIPELINE_JOURNAL, and otherwise built
+// fast and optimized later; 1 first probes every pipeline, which NVIDIA's own on-disk cache can
+// answer for pipelines this process never compiled, and a cold Sky Garden run then waited 1.38 s on
+// pipeline creation instead of 0.31 s);
 // KYTY_PIPELINE_FAST_FIRST_DRAIN_S (default 5) how long exit waits for queued optimized compiles
 // so the saved driver cache holds them.
 
@@ -43,10 +45,21 @@ namespace Libs::Graphics {
 	return end != text ? value : default_value;
 }
 
-[[nodiscard]] inline bool PipelineFastFirstRequested() {
-	return FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST", 0) != 0;
+// KYTY_PIPELINE_FAST_FIRST=nvidia: on only for NVIDIA devices (vendor 0x10de), whose unoptimized
+// pipelines run close to optimized speed. Other drivers may run DISABLE_OPTIMIZATION code far
+// slower (a candidate for the device loss on an AMD Radeon RX 6800S at Astro Bot's title scene,
+// whose first frames all use fast builds), and a dispatch past the OS GPU timeout loses the device.
+[[nodiscard]] inline bool FastFirstForVendor(const char* value, uint32_t vendor_id) {
+	if (value == nullptr || *value == '\0') return false;
+	if (std::strcmp(value, "nvidia") == 0) return vendor_id == 0x10deu;
+	char*      end    = nullptr;
+	const auto number = std::strtoull(value, &end, 10);
+	return end != value && number != 0;
 }
 
+[[nodiscard]] inline bool PipelineFastFirstRequested(uint32_t vendor_id) {
+	return FastFirstForVendor(std::getenv("KYTY_PIPELINE_FAST_FIRST"), vendor_id);
+}
 [[nodiscard]] inline uint64_t FastFirstNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
