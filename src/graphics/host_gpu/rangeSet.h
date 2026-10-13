@@ -22,6 +22,17 @@ public:
 		if (it != m_ranges.end() && it->first <= address && it->second >= end) {
 			return;
 		}
+		// A touching/overlapping range whose start is unchanged can grow in place.
+		// Keep its map node and remove only successors absorbed by the new end.
+		if (it != m_ranges.end() && it->first <= address) {
+			it->second = end;
+			auto next  = std::next(it);
+			while (next != m_ranges.end() && next->first <= it->second) {
+				it->second = std::max(it->second, next->second);
+				next       = m_ranges.erase(next);
+			}
+			return;
+		}
 		uint64_t begin = address;
 		uint64_t last  = end;
 		while (it != m_ranges.end() && it->first <= last) {

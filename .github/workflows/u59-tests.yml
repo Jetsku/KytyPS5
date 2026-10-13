@@ -77,7 +77,7 @@ jobs:
         shell: cmd
         run: |
           cmake --build _Build/tests --parallel --target kyty_emulator ^
-            page_manager_tests memory_tracker_tests audio_out2_port_tests pad_haptics_tests controller_settings_tests ^
+            range_set_tests page_manager_tests memory_tracker_tests audio_out2_port_tests pad_haptics_tests controller_settings_tests ^
             ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests resource_tracking_tests ^
             scalar_provenance_tests resource_materialization_tests shader_vertex_metadata_tests archive_file_tests ^
             avplayer_file_tests device_compat_tests shader_cfg_tests
@@ -85,7 +85,7 @@ jobs:
       - name: Test
         shell: pwsh
         run: |
-          ctest --test-dir _Build/tests --output-on-failure -R "^(page_manager|memory_tracker|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|virtual_memory_allocation.*|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|device_compat|shader_cfg)$" 2>&1 | Tee-Object -FilePath ctest.log
+          ctest --test-dir _Build/tests --output-on-failure -R "^(range_set|page_manager|memory_tracker|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|virtual_memory_allocation.*|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|device_compat|shader_cfg)$" 2>&1 | Tee-Object -FilePath ctest.log
           $code = $LASTEXITCODE
           # Job logs need a GitHub sign-in to read; annotations do not. Name each failed test and its error lines.
           foreach ($line in (Get-Content ctest.log | Select-String -Pattern '\((Failed|Timeout|Exception|SEGFAULT|Not Run)\)|\*\*\*(Failed|Exception)')) {
