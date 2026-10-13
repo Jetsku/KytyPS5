@@ -586,6 +586,51 @@ void TestUpgradeVertexLayout() {
 	CHECK(none.upgraded == 0 && file.shaders[2].input_info.size() == 16);
 }
 
+// A list retargeted to another copy of the game: one shader at the same offset, one moved, one absent.
+void TestRetarget() {
+	auto recording = MakeRecording("level_a", vk::PrimitiveTopology::eTriangleList);
+	recording.sources.push_back(SourceOf(Code(3, 150), ShaderJournal::Kind::Pixel, 2, InputSizes[1]));
+	recording.entries.push_back({2, 0, {5}});
+	uint32_t   snapshot_words = 0;
+	const auto words          = PipelineWords(vk::PrimitiveTopology::eTriangleStrip, snapshot_words);
+	const std::vector<std::pair<uint64_t, uint64_t>> identities = {
+	    {PermutationIdentity(recording.sources[0], recording.entries[0]), 0x51},
+	    {PermutationIdentity(recording.sources[2], recording.entries[3]) ^ PlainModuleIdentitySalt, 0x53}};
+	recording.pipelines.push_back({0x2000u, EncodePipelineJournalPayload("level_b", words, snapshot_words, identities)});
+	std::vector<uint64_t> offsets;
+	const auto            image = Image(recording.sources, offsets);
+	PipelineList::Builder     builder(TestInfo());
+	PipelineList::ExportStats export_stats;
+	builder.AddJournals(recording.sources, recording.entries, recording.pipelines, LocatorFor(image), export_stats);
+	const auto file = builder.Finish();
+	CHECK(file.shaders.size() == 3 && file.pipelines.size() == 3 && file.levels.size() == 2);
+
+	// The other copy: shader 0 where it was, shader 1 appended (moved), shader 2 gone.
+	auto other = image;
+	std::fill_n(other.begin() + static_cast<std::ptrdiff_t>(offsets[1]), recording.sources[1].code.size() * 4, uint8_t {0x11});
+	std::fill_n(other.begin() + static_cast<std::ptrdiff_t>(offsets[2]), recording.sources[2].code.size() * 4, uint8_t {0x22});
+	const uint64_t moved_to = other.size();
+	const auto*    pixel    = reinterpret_cast<const uint8_t*>(recording.sources[1].code.data());
+	other.insert(other.end(), pixel, pixel + recording.sources[1].code.size() * 4);
+
+	PipelineList::ResolveStats stats;
+	const auto resolved = PipelineList::Resolve(file, InputSizes, ReaderFor(other), [&](PipelineList::CodeFile) { return other; }, stats);
+	PipelineList::RetargetStats retarget_stats;
+	const auto                  out = PipelineList::Retarget(file, resolved, retarget_stats);
+	CHECK(retarget_stats.shaders == 3 && retarget_stats.same_offset == 1 && retarget_stats.moved == 1 && retarget_stats.missing == 1);
+	CHECK(out.shaders.size() == 2 && out.shaders[0].offset == offsets[0] && out.shaders[1].offset == moved_to);
+	CHECK(out.permutations.size() == 3 && retarget_stats.pipelines == 3 && retarget_stats.pipelines_kept == 2);
+	CHECK(out.pipelines.size() == 2 && out.levels.size() == 2);
+	// The result is a valid list for the other copy: everything in it resolves there at the stamped offsets.
+	PipelineList::ResolveStats again;
+	const auto                 resolved_again = PipelineList::Resolve(out, InputSizes, ReaderFor(other), {}, again);
+	CHECK(again.resolved == 2 && again.relocated == 0 && again.pipelines_kept == 2);
+	// And it survives the file format.
+	PipelineList::File decoded;
+	CHECK(PipelineList::Decode(PipelineList::Encode(out), decoded) && decoded.pipelines.size() == 2);
+	CHECK(resolved_again.sources[1].code == recording.sources[1].code);
+}
+
 } // namespace
 
 int main() {
@@ -597,6 +642,7 @@ int main() {
 	TestMerge();
 	TestReplayInput();
 	TestRewrite();
+	TestRetarget();
 	if (g_failed != 0) {
 		std::printf("PipelineListTests: %d check(s) failed\n", g_failed);
 		return 1;

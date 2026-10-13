@@ -260,6 +260,8 @@ struct Resolved {
 	std::vector<uint32_t>             entry_permutation;
 	// Per list permutation: index into `entries`, or UINT32_MAX when unusable.
 	std::vector<uint32_t> permutation_entry;
+	// Per list shader, where its code (and a merged stage's back half) sits in the file read; usable only.
+	std::vector<uint64_t> offsets, back_offsets;
 };
 
 [[nodiscard]] Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_sizes, const ReadCodeFn& read,
@@ -284,6 +286,15 @@ struct UpgradeStats {
 // Rewrites the vertex input infos of `upgrade.from_size` bytes to `to_size` bytes; nothing when the
 // inserts do not add up to `to_size`.
 void UpgradeVertexInputInfos(File& file, const VertexLayoutUpgrade& upgrade, uint32_t to_size, UpgradeStats& stats);
+
+// Retargeting: the list re-stamped for another copy of the game (another version or SKU) whose shaders
+// `resolved` found. Shaders not found are dropped with their permutations and pipelines; the offsets are the
+// new ones. The caller sets the title and version in `info`.
+struct RetargetStats {
+	uint64_t shaders = 0, same_offset = 0, moved = 0, missing = 0;
+	uint64_t pipelines = 0, pipelines_kept = 0;
+};
+[[nodiscard]] File Retarget(const File& file, const Resolved& resolved, RetargetStats& stats);
 
 // The "no game code" proof: every 64-byte window of known shader code (any byte offset), minus
 // low-entropy windows (fewer than 8 distinct byte values, e.g. zero runs that also occur in plain

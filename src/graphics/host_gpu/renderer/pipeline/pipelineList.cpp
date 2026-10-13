@@ -897,6 +897,8 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 	Resolved out;
 	out.sources.resize(file.shaders.size());
 	out.usable.assign(file.shaders.size(), false);
+	out.offsets.assign(file.shaders.size(), 0);
+	out.back_offsets.assign(file.shaders.size(), 0);
 	stats.shaders += file.shaders.size();
 	// A shader's code pieces: the code and, for a merged stage, its back half. Each is read at its
 	// recorded offset and checked by its hashes; the ones that do not match are searched for in the
@@ -959,6 +961,7 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 	std::vector<uint8_t> moved(file.shaders.size(), 0);
 	std::vector<uint8_t> missing(file.shaders.size(), 0);
 	for (const auto& piece: pieces) {
+		(piece.back ? out.back_offsets : out.offsets)[piece.shader] = piece.offset;
 		missing[piece.shader] |= piece.found ? 0 : 1;
 		moved[piece.shader] |= piece.found && piece.offset != (piece.back ? file.shaders[piece.shader].back_offset
 		                                                                  : file.shaders[piece.shader].offset)
@@ -1048,6 +1051,47 @@ void UpgradeVertexInputInfos(File& file, const VertexLayoutUpgrade& upgrade, uin
 		stats.upgraded++;
 	}
 	if (stats.upgraded != 0 && stats.skipped == 0) file.info.input_info_sizes[0] = to_size;
+}
+
+File Retarget(const File& file, const Resolved& resolved, RetargetStats& stats) {
+	File out;
+	out.info   = file.info;
+	out.levels = file.levels;
+	std::vector<uint32_t> shader_map(file.shaders.size(), UINT32_MAX);
+	for (size_t i = 0; i < file.shaders.size(); i++) {
+		stats.shaders++;
+		if (!resolved.usable[i]) {
+			stats.missing++;
+			continue;
+		}
+		auto shader = file.shaders[i];
+		const bool same = shader.offset == resolved.offsets[i] && (shader.back_code_size == 0 || shader.back_offset == resolved.back_offsets[i]);
+		(same ? stats.same_offset : stats.moved)++;
+		shader.offset = resolved.offsets[i];
+		if (shader.back_code_size != 0) shader.back_offset = resolved.back_offsets[i];
+		shader_map[i] = static_cast<uint32_t>(out.shaders.size());
+		out.shaders.push_back(std::move(shader));
+	}
+	std::vector<uint32_t> permutation_map(file.permutations.size(), UINT32_MAX);
+	for (size_t i = 0; i < file.permutations.size(); i++) {
+		if (shader_map[file.permutations[i].shader] == UINT32_MAX) continue;
+		auto permutation = file.permutations[i];
+		permutation.shader = shader_map[permutation.shader];
+		permutation_map[i] = static_cast<uint32_t>(out.permutations.size());
+		out.permutations.push_back(std::move(permutation));
+	}
+	for (const auto& source: file.pipelines) {
+		stats.pipelines++;
+		if (!std::all_of(source.stages.begin(), source.stages.end(),
+		                 [&](const Stage& stage) { return permutation_map[stage.permutation] != UINT32_MAX; })) {
+			continue;
+		}
+		auto pipeline = source;
+		for (auto& stage: pipeline.stages) stage.permutation = permutation_map[stage.permutation];
+		out.pipelines.push_back(std::move(pipeline));
+		stats.pipelines_kept++;
+	}
+	return out;
 }
 
 // No-code verification ------------------------------------------------------------------------------

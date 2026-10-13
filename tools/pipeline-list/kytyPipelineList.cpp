@@ -16,6 +16,10 @@
 //   info <list>                         Header, counts, levels, section sizes.
 //   check <list> --game <app0 dir> [--exe <executable>]
 //       Resolves the list against a game copy, as the emulator does at start-up.
+//   retarget --list <list> --exe <executable> --title <id> --app-ver <version> --out <list>
+//       Re-stamps a list for another copy of the game (another version or SKU): each shader is looked up in
+//       the other executable (at its recorded offset, then by hash), shaders not found are dropped with
+//       their pipelines, the title and version are replaced. Prints the match counts.
 //   verify <list> --game <app0 dir> [--exe <executable>] [--shaders <shader journal>]...
 //       The no-code proof: no 64-byte window of the listed shaders' code (read from the executable)
 //       or of any journaled shader's code occurs in the file or in any decompressed section.
@@ -53,7 +57,7 @@ namespace {
 
 struct Arguments {
 	std::string                                      command;
-	std::string                                      out, game, exe, producer = "kyty_pipeline_list";
+	std::string                                      out, game, exe, list, title, app_ver, producer = "kyty_pipeline_list";
 	std::vector<std::string>                         shaders, pipelines, inputs, data;
 	bool                                             scan = false;
 };
@@ -516,6 +520,59 @@ int Check(const Arguments& args) {
 	return stats.resolved == stats.shaders ? 0 : 1;
 }
 
+int Retarget(const Arguments& args) {
+	if (args.list.empty() || args.exe.empty() || args.title.empty() || args.app_ver.empty() || args.out.empty()) {
+		std::fprintf(stderr, "retarget needs --list, --exe, --title, --app-ver and --out\n");
+		return 2;
+	}
+	PipelineList::File file;
+	if (!Load(args.list, file)) return 2;
+	std::vector<uint8_t>       image;
+	PipelineList::ResolveStats resolve_stats;
+	const auto                 resolved = ResolveAgainst(args, file, image, resolve_stats);
+	PipelineList::RetargetStats stats;
+	auto                        out = PipelineList::Retarget(file, resolved, stats);
+	const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+	std::printf("list for %s %s -> %s %s\n", file.info.title_id.c_str(), file.info.app_version.c_str(), args.title.c_str(),
+	            args.app_ver.c_str());
+	std::printf("shaders %llu: %llu at the same offset, %llu found moved, %llu not found\n", ull(stats.shaders), ull(stats.same_offset),
+	            ull(stats.moved), ull(stats.missing));
+	const char* names[3]    = {"vertex", "pixel", "compute"};
+	uint64_t    total[3]    = {}, kept[3] = {};
+	for (size_t i = 0; i < file.shaders.size(); i++) {
+		total[static_cast<size_t>(file.shaders[i].kind)]++;
+		kept[static_cast<size_t>(file.shaders[i].kind)] += resolved.usable[i] ? 1 : 0;
+	}
+	for (size_t k = 0; k < 3; k++) {
+		std::printf("  %s shaders: %llu of %llu found\n", names[k], ull(kept[k]), ull(total[k]));
+	}
+	std::printf("permutations %zu of %zu kept; pipelines %llu: %llu kept, %llu dropped\n", out.permutations.size(),
+	            file.permutations.size(), ull(stats.pipelines), ull(stats.pipelines_kept), ull(stats.pipelines - stats.pipelines_kept));
+	// Per level: pipelines kept of those the level had (a pipeline counts in every level it was seen in).
+	std::vector<size_t> level_total(file.levels.size()), level_kept(file.levels.size());
+	for (const auto& pipeline: file.pipelines) {
+		const bool keep = std::all_of(pipeline.stages.begin(), pipeline.stages.end(), [&](const PipelineList::Stage& stage) {
+			return resolved.permutation_entry[stage.permutation] != UINT32_MAX;
+		});
+		for (const auto level: pipeline.levels) {
+			level_total[level]++;
+			level_kept[level] += keep ? 1 : 0;
+		}
+	}
+	for (size_t i = 0; i < file.levels.size(); i++) {
+		std::printf("  level %s: %zu of %zu pipelines kept\n", file.levels[i].c_str(), level_kept[i], level_total[i]);
+	}
+	if (stats.same_offset + stats.moved == 0) {
+		std::fprintf(stderr, "no shader found: nothing written\n");
+		return 1;
+	}
+	out.info.title_id     = args.title;
+	out.info.app_version  = args.app_ver;
+	out.info.producer     = args.producer + " (retargeted from " + file.info.title_id + " " + file.info.app_version + ")";
+	out.info.created_unix = NowUnix();
+	return Write(out, args.out);
+}
+
 int Verify(const Arguments& args) {
 	if (args.inputs.size() != 1 || args.game.empty()) return 2;
 	std::vector<uint8_t> bytes;
@@ -579,7 +636,7 @@ int Verify(const Arguments& args) {
 int main(int argc, char** argv) {
 	Arguments args;
 	if (argc < 2) {
-		std::fprintf(stderr, "usage: kyty_pipeline_list export|merge|info|check|verify ... (see the source header)\n");
+		std::fprintf(stderr, "usage: kyty_pipeline_list export|merge|info|check|retarget|verify ... (see the source header)\n");
 		return 2;
 	}
 	// The arguments as UTF-8 (Windows: from the wide command line; the narrow argv loses characters outside the code page).
@@ -602,6 +659,12 @@ int main(int argc, char** argv) {
 			args.game = value();
 		} else if (arg == "--exe") {
 			args.exe = value();
+		} else if (arg == "--list") {
+			args.list = value();
+		} else if (arg == "--title") {
+			args.title = value();
+		} else if (arg == "--app-ver") {
+			args.app_ver = value();
 		} else if (arg == "--producer") {
 			args.producer = value();
 		} else if (arg == "--shaders") {
@@ -620,6 +683,7 @@ int main(int argc, char** argv) {
 	if (args.command == "merge") return Merge(args);
 	if (args.command == "info") return Info(args);
 	if (args.command == "check") return Check(args);
+	if (args.command == "retarget") return Retarget(args);
 	if (args.command == "verify") return Verify(args);
 	std::fprintf(stderr, "unknown command %s\n", args.command.c_str());
 	return 2;

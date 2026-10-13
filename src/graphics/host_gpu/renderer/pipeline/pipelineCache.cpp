@@ -7767,7 +7767,11 @@ void PipelineCache::InitializePipelineList() {
 	bytes = {};
 	std::string version;
 	(void)Loader::SystemContentParamSfoGetString("APP_VER", &version);
-	if (file.info.title_id != title_id || file.info.app_version != version) {
+	// KYTY_PIPELINE_LIST_CROSS=1: a list of another version or SKU is used best-effort; its shaders still
+	// have to match this game's executable by their hashes.
+	const bool other_game = file.info.title_id != title_id || file.info.app_version != version;
+	const bool cross      = other_game && EnvU64("KYTY_PIPELINE_LIST_CROSS", 0) != 0;
+	if (other_game && !cross) {
 		PipelineCacheLog("Pipeline list: {} is for {} version {}, the game is {} version {}: ignored",
 		                 Common::PathToString(path), file.info.title_id, file.info.app_version, title_id, version);
 		return;
@@ -7874,6 +7878,10 @@ void PipelineCache::InitializePipelineList() {
 	state->levels    = std::move(file.levels);
 	state->pipelines = std::move(file.pipelines);
 	state->prepare   = prepare;
+	if (cross) {
+		PipelineCacheLog("Pipeline list: retargeted list: {} of {} shaders matched (list {} {}, game {} {})",
+		                 stats.resolved - not_here, stats.shaders, file.info.title_id, file.info.app_version, title_id, version);
+	}
 	PipelineCacheLog("Pipeline list: {} ({} {}, by {}): {} of {} shaders match the game ({} found at another offset, "
 	                 "{} differ, {} unreadable, {} with another input layout, {} not usable on this device); {} "
 	                 "permutations, {} of {} pipelines usable, {} levels ({:.0f} ms)",
