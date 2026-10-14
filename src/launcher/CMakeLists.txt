@@ -156,8 +156,14 @@ elseif(LINUX)
 				file(GLOB kyty_qt_plugin_group
 					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so"
 					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so.*")
+				if(kyty_qt_plugin STREQUAL "imageformats")
+					# Distribution plugin directories also contain KDE's kimg_* add-ons.
+					# Ship Qt's own plugins, matching the official Qt SDK layout, rather
+					# than pulling optional KDE codec dependencies into the launcher.
+					list(FILTER kyty_qt_plugin_group INCLUDE REGEX "/libq[^/]+\\.so(\\..*)?$")
+				endif()
 				list(APPEND kyty_qt_plugin_files ${kyty_qt_plugin_group})
-				install(DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}" DESTINATION "plugins")
+				install(FILES ${kyty_qt_plugin_group} DESTINATION "plugins/${kyty_qt_plugin}")
 			endif()
 		endforeach()
 		install(CODE "
