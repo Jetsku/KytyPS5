@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/systemFonts.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -694,6 +695,18 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		// The built-in ImGui font is ASCII only; merge a host CJK font so Chinese/Japanese/Korean
+		// trophy names, dialogs and IME text are not drawn as '?'. The Vulkan backend supports a
+		// dynamic atlas, so glyphs are rasterized on demand and no glyph ranges are required.
+		io.Fonts->AddFontDefault();
+		for (const auto& path: Common::FindCjkFontFiles()) {
+			ImFontConfig config;
+			config.MergeMode = true;
+			if (io.Fonts->AddFontFromFileTTF(path.string().c_str(), 0.0f, &config) != nullptr) {
+				LOGF("[Overlay] CJK font: %s\n", path.string().c_str());
+				break;
+			}
+		}
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;

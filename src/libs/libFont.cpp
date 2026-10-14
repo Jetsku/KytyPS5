@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/systemFonts.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -751,16 +753,30 @@ static bool ttf_data_has_supported_magic(const uint8_t* data, uint32_t size) {
 
 	return (data[0] == 0x00 && data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00) ||
 	       (data[0] == 't' && data[1] == 'r' && data[2] == 'u' && data[3] == 'e') ||
-	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O');
+	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O') ||
+	       (data[0] == 't' && data[1] == 't' && data[2] == 'c' && data[3] == 'f');
+}
+
+static bool init_stb_info(stbtt_fontinfo* info, const uint8_t* data, uint32_t size) {
+	if (info == nullptr || !ttf_data_has_supported_magic(data, size)) {
+		return false;
+	}
+
+	const int offset = stbtt_GetFontOffsetForIndex(data, 0);
+	if (offset < 0 || static_cast<uint32_t>(offset) >= size) {
+		return false;
+	}
+
+	return stbtt_InitFont(info, data, offset) != 0;
 }
 
 static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
-	if (font == nullptr || !ttf_data_has_supported_magic(data, size)) {
+	if (font == nullptr) {
 		return false;
 	}
 
 	stbtt_fontinfo info {};
-	if (stbtt_InitFont(&info, data, 0) == 0) {
+	if (!init_stb_info(&info, data, size)) {
 		return false;
 	}
 
@@ -770,6 +786,43 @@ static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
 	font->has_ttf   = true;
 
 	return true;
+}
+
+struct CjkFallbackFace {
+	std::vector<uint8_t> data;
+	stbtt_fontinfo       info {};
+	bool                 ok = false;
+};
+
+// PS5 system font sets (SC/TC/JP/KR) are not available on the host. The Latin fallback
+// (Roboto) has no CJK glyphs, so missing code points would otherwise become '?'.
+static const CjkFallbackFace& cjk_fallback_face() {
+	static const CjkFallbackFace face = [] {
+		CjkFallbackFace result;
+		for (const auto& path: Common::FindCjkFontFiles()) {
+			auto data = read_file_bytes(path);
+			if (data.empty()) {
+				continue;
+			}
+			stbtt_fontinfo info {};
+			if (!init_stb_info(&info, data.data(), static_cast<uint32_t>(data.size()))) {
+				continue;
+			}
+			result.data = std::move(data);
+			// stbtt_fontinfo keeps a raw pointer into the buffer; rebuild it after the move.
+			(void)init_stb_info(&result.info, result.data.data(),
+			                    static_cast<uint32_t>(result.data.size()));
+			result.ok = true;
+			LOGF("[Font] CJK fallback font: %s\n", path.string().c_str());
+			break;
+		}
+		if (!result.ok) {
+			LOGF("[Font] no CJK fallback font found, CJK text will render as '?' "
+			     "(set KYTY_CJK_FONT to a .ttf/.ttc/.otf file)\n");
+		}
+		return result;
+	}();
+	return face;
 }
 
 static void init_font_face(FontState* font) {
@@ -786,8 +839,12 @@ static void init_font_face(FontState* font) {
 	}
 
 	const auto& data = fallback_font_data(font_is_bold(font), font_is_italic(font));
-	if (!data.empty()) {
-		(void)init_stb_font(font, data.data(), static_cast<uint32_t>(data.size()));
+	if (!data.empty() && init_stb_font(font, data.data(), static_cast<uint32_t>(data.size()))) {
+		return;
+	}
+
+	if (const auto& cjk = cjk_fallback_face(); cjk.ok) {
+		(void)init_stb_font(font, cjk.data.data(), static_cast<uint32_t>(cjk.data.size()));
 	}
 }
 
@@ -810,14 +867,29 @@ static float stb_font_scale(FontState* font) {
 	return stbtt_ScaleForPixelHeight(&font->font_info, stb_font_pixel_height(font));
 }
 
-static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
-	if (font == nullptr || !ensure_stb_font(font)) {
-		return static_cast<uint32_t>('?');
+struct StbGlyphFace {
+	const stbtt_fontinfo* info;
+	uint32_t              code;
+	float                 scale;
+};
+
+// Picks the face that actually contains `code`: the font's own face first, then the host CJK
+// fallback, and finally '?' from the font's own face.
+static StbGlyphFace resolve_stb_glyph(FontState* font, uint32_t code) {
+	const float pixel_height = stb_font_pixel_height(font);
+
+	if (code <= 0x10ffffu && stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code)) != 0) {
+		return {&font->font_info, code, stb_font_scale(font)};
 	}
-	if (code > 0x10ffffu || stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code)) == 0) {
-		return static_cast<uint32_t>('?');
+
+	if (code <= 0x10ffffu && code >= 0x80u) {
+		if (const auto& cjk = cjk_fallback_face();
+		    cjk.ok && stbtt_FindGlyphIndex(&cjk.info, static_cast<int>(code)) != 0) {
+			return {&cjk.info, code, stbtt_ScaleForPixelHeight(&cjk.info, pixel_height)};
+		}
 	}
-	return code;
+
+	return {&font->font_info, static_cast<uint32_t>('?'), stb_font_scale(font)};
 }
 
 static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
@@ -825,8 +897,9 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 		return false;
 	}
 
-	code              = stb_supported_codepoint(font, code);
-	const float scale = stb_font_scale(font);
+	const auto  glyph = resolve_stb_glyph(font, code);
+	const float scale = glyph.scale;
+	code              = glyph.code;
 
 	int advance = 0;
 	int lsb     = 0;
@@ -834,9 +907,9 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 	int y0      = 0;
 	int x1      = 0;
 	int y1      = 0;
-	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, &lsb);
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale, scale, &x0, &y0,
-	                            &x1, &y1);
+	stbtt_GetCodepointHMetrics(glyph.info, static_cast<int>(code), &advance, &lsb);
+	stbtt_GetCodepointBitmapBox(glyph.info, static_cast<int>(code), scale, scale, &x0, &y0, &x1,
+	                            &y1);
 
 	const float width     = static_cast<float>(std::max(x1 - x0, 0));
 	const float height    = static_cast<float>(std::max(y1 - y0, 0));
@@ -860,15 +933,16 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 		return false;
 	}
 
-	code              = stb_supported_codepoint(font, code);
-	const float scale = stb_font_scale(font);
+	const auto  glyph = resolve_stb_glyph(font, code);
+	const float scale = glyph.scale;
+	code              = glyph.code;
 
 	int x0 = 0;
 	int y0 = 0;
 	int x1 = 0;
 	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale, scale, &x0, &y0,
-	                            &x1, &y1);
+	stbtt_GetCodepointBitmapBox(glyph.info, static_cast<int>(code), scale, scale, &x0, &y0, &x1,
+	                            &y1);
 
 	image->fill(0);
 
@@ -883,7 +957,7 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 		return true;
 	}
 
-	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
+	stbtt_MakeCodepointBitmap(glyph.info, image->data(), static_cast<int>(width),
 	                          static_cast<int>(height), FONT_BITMAP_MAX_DIM, scale, scale,
 	                          static_cast<int>(code));
 
