@@ -607,6 +607,98 @@ void CheckShortF32Helpers(VulkanHarness *vulkan) {
               nan_tests(legacy_run.spirv), nan_tests(short_run.spirv));
 }
 
+// KYTY_SHORT_F32_HELPERS with NaN inputs through every path that takes its NaN test: the legacy
+// min3/max3/med3, the emitter's float-to-int layer (KYTY_SINGLE_F2I_SATURATION=0) and buffer float
+// atomics (the compare-and-swap replacement). Every triple of special values (quiet, signaling and
+// negative NaNs included); the min/max results must also equal the CPU model, the atomics their
+// fixed expected memory and return values.
+void CheckShortF32HelpersNanPaths(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenShortF32HelpersNan";
+  using O = ShaderOpcode;
+  const auto &special = SpecialF32();
+  std::vector<std::vector<u32>> inputs(3);
+  for (const auto a : special) {
+    for (const auto b : special) {
+      for (const auto c : special) {
+        inputs[0].push_back(a);
+        inputs[1].push_back(b);
+        inputs[2].push_back(c);
+      }
+    }
+  }
+  const auto bulk = MakeBulkCase(
+      name, 3, 6, inputs,
+      [](std::vector<u32> *code) {
+        AppendVop3(code, 0x151, 10, Vgpr(2), Vgpr(3), Vgpr(4)); // v_min3_f32
+        AppendVop3(code, 0x154, 11, Vgpr(2), Vgpr(3), Vgpr(4)); // v_max3_f32
+        AppendVop3(code, 0x157, 12, Vgpr(2), Vgpr(3), Vgpr(4)); // v_med3_f32
+        AppendVop3(code, 0x157, 13, Vgpr(4), Vgpr(2), Vgpr(3)); // v_med3_f32 (rotated)
+        code->push_back(EncodeVop1(0x08, 14, Vgpr(2)));         // v_cvt_i32_f32
+        code->push_back(EncodeVop1(0x07, 15, Vgpr(3)));         // v_cvt_u32_f32
+      },
+      {O::V_MIN3_F32, O::V_MAX3_F32, O::V_MED3_F32, O::V_CVT_I32_F32, O::V_CVT_U32_F32});
+  CodegenOptions legacy = GetCodegenOptions();
+  legacy.fast_float_min_max = false;
+  legacy.single_f2i_saturation = false;
+  legacy.short_f32_helpers = false;
+  CodegenOptions shorter = legacy;
+  shorter.short_f32_helpers = true;
+  const auto short_run = RunBulk(vulkan, bulk, shorter);
+  const auto legacy_run = RunBulk(vulkan, bulk, legacy);
+  const auto nan = [](u32 bits) { return (bits & 0x7fffffffu) > 0x7f800000u; };
+  const auto cvt = [&](u32 bits, bool is_signed) -> u32 {
+    if (nan(bits)) {
+      return 0u;
+    }
+    const double f = std::bit_cast<float>(bits);
+    if (is_signed) {
+      return f <= -2147483648.0  ? 0x80000000u
+             : f >= 2147483648.0 ? 0x7fffffffu
+                                 : static_cast<u32>(static_cast<int32_t>(std::trunc(f)));
+    }
+    return f <= 0.0 ? 0u : f >= 4294967296.0 ? 0xffffffffu : static_cast<u32>(std::trunc(f));
+  };
+  static const char *const names[] = {"min3", "max3", "med3", "med3(c,a,b)", "cvt_i32",
+                                      "cvt_u32"};
+  CompareBulk(name, bulk, short_run, legacy_run,
+              [&](u32 o, u32 e) -> u32 {
+                const auto a = inputs[0][e], b = inputs[1][e], c = inputs[2][e];
+                switch (o) {
+                case 0: return RefMinMaxF32(RefMinMaxF32(a, b, false), c, false);
+                case 1: return RefMinMaxF32(RefMinMaxF32(a, b, true), c, true);
+                case 2: return RefMedTriF32(a, b, c);
+                case 3: return RefMedTriF32(c, a, b);
+                case 4: return cvt(a, true);
+                default: return cvt(b, false);
+                }
+              },
+              names);
+  const auto nan_tests = [](const std::vector<u32> &spirv) { return CountSpirv(spirv, "OpIsNan"); };
+  Require(name, "OpIsNan count (ALU)", nan_tests(short_run.spirv) > nan_tests(legacy_run.spirv),
+          "KYTY_SHORT_F32_HELPERS did not classify the min/max/med3/cvt NaNs with OpIsNan");
+
+  // Buffer float atomics: old and incoming NaNs (quiet and signaling), infinities, signed zeros.
+  size_t atomic_short_nan = 0;
+  size_t atomic_legacy_nan = 0;
+  for (const auto &test : {BufferAtomicFMinSpecialValues(), BufferAtomicFMaxSpecialValues()}) {
+    for (const bool use_short : {true, false}) {
+      CodegenOptions options = GetCodegenOptions();
+      options.short_f32_helpers = use_short;
+      ScopedCodegenOptions scope(options);
+      std::vector<u32> spirv;
+      const auto words = RunCollect(vulkan, test, test.expected.size(), &spirv);
+      RequireEqualWords(name, use_short ? "atomic readback (short)" : "atomic readback (legacy)",
+                        test.expected, words);
+      (use_short ? atomic_short_nan : atomic_legacy_nan) += nan_tests(spirv);
+    }
+  }
+  Require(name, "OpIsNan count (atomics)", atomic_short_nan > atomic_legacy_nan,
+          "KYTY_SHORT_F32_HELPERS did not classify the atomic NaNs with OpIsNan");
+  std::printf("[codegen] %-32s ok (%u triples, OpIsNan %zu -> %zu; atomics OpIsNan %zu -> %zu)\n",
+              name, bulk.count, nan_tests(legacy_run.spirv), nan_tests(short_run.spirv),
+              atomic_legacy_nan, atomic_short_nan);
+}
+
 // med3/min/max with constant operands (the clamp idiom): x from the special set and random bits.
 void CheckFloatClampConstants(VulkanHarness *vulkan) {
   constexpr const char *name = "CodegenFloatClampConstants";
@@ -2971,6 +3063,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckUniformLaneReads(vulkan);
   CheckFloatMinMax(vulkan);
   CheckShortF32Helpers(vulkan);
+  CheckShortF32HelpersNanPaths(vulkan);
   CheckFloatClampConstants(vulkan);
   CheckPackRtzExhaustive();
   CheckPackRtz(vulkan);
