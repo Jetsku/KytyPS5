@@ -837,6 +837,10 @@ add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(ime_dialog_tests PRIVATE ${inc_headers})
 
+add_executable(range_set_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/RangeSetTests.cpp")
+target_link_libraries(range_set_tests common)
+target_include_directories(range_set_tests PRIVATE ${inc_headers})
+
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryTrackerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
@@ -1208,6 +1212,7 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-pressure-retirement-only)
 	add_test(NAME present_box_downscale
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --present-box-downscale-only)
+	add_test(NAME range_set COMMAND $<TARGET_FILE:range_set_tests>)
 	add_test(NAME image_gpu_keep_device
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-keep-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -2430,6 +2435,7 @@ if(BUILD_TESTING)
 		image_clear_range_tests
 		image_gpu_keep_tests
 		clear_register_decode_tests
+		range_set_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
