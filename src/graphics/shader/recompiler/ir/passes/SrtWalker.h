@@ -49,6 +49,8 @@ struct SrtRuntime {
 	// gpu_fills). Null: every slot is read on the host.
 	bool (*gpu_written)(uint64_t address) = nullptr;
 	std::vector<SrtGpuFill>* gpu_fills    = nullptr;
+	// Also slots only buffer-store address operands use (gpu_fill_slots 2; KYTY_SRT_GPU_FILL=2).
+	bool gpu_fill_store_offsets           = false;
 };
 
 // Addresses no guest or host mapping can contain: the first 64 KiB (never mapped on Windows, Linux

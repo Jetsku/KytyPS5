@@ -2009,6 +2009,47 @@ uint32_t SpecializedPackedStride(const ShaderBufferResource& descriptor) {
 
 } // namespace
 
+// KYTY_SRT_GPU_FILL: whether the write-range program reads a flat dword the refresh left to the
+// GPU (its snapshot word is a placeholder).
+static bool WriteRangesReadGpuFills(const ShaderRecompiler::IR::WriteRangeProgram& ranges,
+                                    std::span<const ShaderRecompiler::IR::SrtGpuFill> fills) {
+	for (const auto& node: ranges.nodes) {
+		if (node.op != ShaderRecompiler::IR::WriteRangeNode::Op::FlatSrt) {
+			continue;
+		}
+		for (const auto& fill: fills) {
+			if (fill.flat_offset == node.a) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Console counts of the write ranges above, every 10 s while they happen.
+static void NoteGpuFillWriteRange(bool whole) {
+	static std::atomic<uint64_t> whole_count {0};
+	static std::atomic<uint64_t> host_count {0};
+	static std::atomic<int64_t>  last_ms {0};
+	(whole ? whole_count : host_count).fetch_add(1, std::memory_order_relaxed);
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	auto last = last_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		last_ms.store(now, std::memory_order_relaxed);
+	} else if (now - last >= 10000 && last_ms.compare_exchange_strong(last, now)) {
+		std::printf("SrtGpuFill write ranges %.0fs: %" PRIu64 " bindings taken whole, %" PRIu64
+		            " evaluations read the filled dwords on the host\n",
+		            static_cast<double>(now - last) / 1000.0, whole_count.exchange(0),
+		            host_count.exchange(0));
+	}
+}
+
+// A binding up to this size whose write range reads a GPU-filled dword is taken as written
+// whole; a larger one reads the dword on the host for an exact range, as without the fill.
+constexpr uint64_t GpuFillWholeBindingLimit = 16ull * 1024 * 1024;
+
 // Guest ranges the shader can write through writable buffer `index`, or nullptr when the whole
 // binding must be treated as written (no proof, proof covers everything, or disabled).
 static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&            context,
@@ -2026,19 +2067,42 @@ static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&       
 	const auto* entry  = program.write_ranges.Find(index);
 	bool        proven = false;
 	const char* result = "unprovable";
+	// KYTY_SRT_GPU_FILL: the program reads a dword the GPU fills (a store offset the GPU wrote).
+	const bool reads_fills = !snapshot.gpu_fills.empty() && PreciseWriteRangesEnabled() &&
+	                         entry != nullptr && entry->bounded &&
+	                         WriteRangesReadGpuFills(program.write_ranges, snapshot.gpu_fills);
 	if (!PreciseWriteRangesEnabled()) {
 		result = "disabled";
 	} else if (entry == nullptr || !entry->bounded) {
 		result = "unprovable";
+	} else if (reads_fills && source.size <= GpuFillWholeBindingLimit) {
+		result = "gpu-fill";
+		NoteGpuFillWriteRange(true);
 	} else if (index >= snapshot.buffers.size() ||
 	           SpecializedPackedStride(DecodeNativeDescriptor<ShaderBufferResource>(
 	               snapshot.buffers[index])) != entry->packed_stride) {
 		result = "stride-mismatch";
 	} else {
 		if (!evaluated) {
+			std::span<const uint32_t> flat = snapshot.flattened_srt;
+			if (reads_fills) {
+				// Exact bounds need the dwords' values: read them on the host (waiting for the
+				// GPU, as without the fill). They are then no longer GPU-written, so the flat
+				// upload reads the same values on the host too.
+				thread_local std::vector<uint32_t> patched;
+				patched.assign(flat.begin(), flat.end());
+				for (const auto& fill: snapshot.gpu_fills) {
+					if (fill.flat_offset < patched.size()) {
+						std::memcpy(&patched[fill.flat_offset],
+						            reinterpret_cast<const void*>(fill.address), sizeof(uint32_t));
+					}
+				}
+				flat = patched;
+				NoteGpuFillWriteRange(false);
+			}
 			const ShaderRecompiler::IR::WriteRangeInputs inputs {
 			    .user_data     = snapshot.user_data,
-			    .flattened_srt = snapshot.flattened_srt,
+			    .flattened_srt = flat,
 			    .groups        = prepared.dispatch_groups,
 			    .has_groups    = prepared.has_dispatch_groups,
 			};

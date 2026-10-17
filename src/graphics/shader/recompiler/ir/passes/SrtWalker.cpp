@@ -2138,7 +2138,9 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		evaluator.m_diag_slot = index;
 		if (!clean && m_runtime.gpu_fills != nullptr &&
 		    read.flat_offset < m_program.gpu_fill_slots.size() &&
-		    m_program.gpu_fill_slots[read.flat_offset] != 0u) [[unlikely]] {
+		    (m_program.gpu_fill_slots[read.flat_offset] == 1u ||
+		     (m_program.gpu_fill_slots[read.flat_offset] == 2u &&
+		      m_runtime.gpu_fill_store_offsets))) [[unlikely]] {
 			// KYTY_SRT_GPU_FILL: this slot alone, outside read runs; its one raw read (ReadRawWord)
 			// leaves GPU-written bytes to the GPU.
 			m_fill_active = true;

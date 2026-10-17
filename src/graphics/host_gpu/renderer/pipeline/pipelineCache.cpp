@@ -96,13 +96,21 @@ namespace {
 
 Live::Switch g_pipeline_prefetch("KYTY_PIPELINE_PREFETCH", Live::ParseDefaultOff);
 Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDefaultOff);
-// KYTY_SRT_GPU_FILL (live, default on; =0 off; port of senaxx 0845beadf): a compute refresh on
+// KYTY_SRT_GPU_FILL (live, default 2; =1 without store offsets; =0 off; port of senaxx 0845beadf): a compute refresh on
 // the command processor leaves a flat SRT slot that only the shader uses (the plan's
 // gpu_fill_slots) to the GPU when its guest dword is GPU-written buffer memory: the walk writes
 // a placeholder instead of faulting and draining the GPU, and RebindBuffers copies the dword
 // from its buffer into the uploaded flat buffer on the GPU, between barriers, before the
 // dispatch (the value the shader's own load would read when it runs).
-Live::Switch g_srt_gpu_fill("KYTY_SRT_GPU_FILL", Live::ParseDefaultOn);
+// =2 also fills slots only buffer-store address operands use; the dispatch then takes a written
+// binding of up to 16 MiB whose write range reads such a slot as written whole (a larger one reads
+// the slot on the host for an exact range).
+Live::Switch g_srt_gpu_fill("KYTY_SRT_GPU_FILL", [](const char* value) -> int64_t {
+	if (value == nullptr) {
+		return 2;
+	}
+	return std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 2);
+});
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -3572,7 +3580,8 @@ struct PipelineCache::ProgramCache {
 			// Image descriptor tables indexed by the workgroup id (upstream 0ee880090).
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			if (!speculative && g_srt_gpu_fill.On() && GuestGpu::IsGpuThread()) {
-				runtime.gpu_written = LibKernel::Memory::IsGpuFillableWord;
+				runtime.gpu_written            = LibKernel::Memory::IsGpuFillableWord;
+				runtime.gpu_fill_store_offsets = g_srt_gpu_fill.Get() >= 2;
 			}
 		}
 		if (source != nullptr) {

@@ -1133,11 +1133,12 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 // processor can leave their bytes to the GPU when GPU work wrote them (KYTY_SRT_GPU_FILL): the
 // slot's value is a raw scalar read (S_LOAD / S_BUFFER_LOAD) whose address comes from user data
 // and immediates alone, and no value the host evaluates refers to it: descriptor dwords and
-// indirect-descriptor keys, branch conditions, uniform fills, other reads' addresses, and the
-// index/offset/soffset operands of buffer stores and atomics (the write-range bounds,
-// WriteRangeAnalysis.cpp, read the flat buffer on the host). Clean (specialization) slots are
-// never filled. Indexed like clean_flat_slots; empty when no slot qualifies or when the plan's
-// flat offsets are not its read indices.
+// indirect-descriptor keys, branch conditions, uniform fills and other reads' addresses. A slot
+// that only the index/offset/soffset operands of buffer stores and atomics use (the write-range
+// bounds, WriteRangeAnalysis.cpp, which read the flat buffer on the host) is marked 2: when it is
+// filled, the renderer takes the whole binding as written for write ranges that read it.
+// Clean (specialization) slots are never filled. Indexed like clean_flat_slots; empty when no
+// slot qualifies or when the plan's flat offsets are not its read indices.
 static std::vector<uint8_t> GpuFillSlots(const Program& program, const ResourcePlan& plan) {
 	const auto count = plan.srt_reads.size();
 	for (size_t slot = 0; slot < count; slot++) {
@@ -1287,7 +1288,7 @@ static std::vector<uint8_t> GpuFillSlots(const Program& program, const ResourceP
 		const char* reason = nullptr;
 		if (inst == nullptr) {
 			reason = "no-inst";
-		} else if (host[slot] != 0u) {
+		} else if (host[slot] != 0u && host[slot] != 5u) {
 			static constexpr const char* kinds[] = {"?", "descriptor", "condition", "uniform-fill",
 			                                        "read-address", "store-address"};
 			reason = kinds[host[slot] < 6u ? host[slot] : 0u];
@@ -1305,7 +1306,9 @@ static std::vector<uint8_t> GpuFillSlots(const Program& program, const ResourceP
 			} else if (!memory_free(*inst)) {
 				reason = "address-from-memory";
 			} else {
-				fill[slot] = 1u;
+				// 2: only buffer store/atomic address operands use it; the renderer then
+				// treats the dispatch's write ranges that read it as the whole binding.
+				fill[slot] = host[slot] == 5u ? 2u : 1u;
 				any        = true;
 			}
 		}
@@ -1315,7 +1318,7 @@ static std::vector<uint8_t> GpuFillSlots(const Program& program, const ResourceP
 	}
 	if (diag) {
 		std::printf("SrtGpuFill plan %016" PRIx64 ": %zu slots, %zu fillable;%s\n", plan.shader_hash,
-		            count, static_cast<size_t>(std::count(fill.begin(), fill.end(), uint8_t {1})),
+		            count, count - static_cast<size_t>(std::count(fill.begin(), fill.end(), uint8_t {0})),
 		            reasons.c_str());
 	}
 	if (!any) {
