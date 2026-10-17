@@ -35,8 +35,8 @@ namespace {
 // the SSA scratch arrays; ResourcePlan 29; Program 14 beyond ResourcePlan.
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update CloneProgram");
 static_assert(sizeof(Block) == 9256, "IR::Block changed: update CloneProgram");
-static_assert(sizeof(ResourcePlan) == 712, "IR::ResourcePlan changed: update CloneProgram");
-static_assert(sizeof(Program) == 1016, "IR::Program changed: update CloneProgram");
+static_assert(sizeof(ResourcePlan) == 736, "IR::ResourcePlan changed: update CloneProgram");
+static_assert(sizeof(Program) == 1040, "IR::Program changed: update CloneProgram");
 static_assert(sizeof(BlockInfo) == 192, "IR::BlockInfo changed: update CloneProgram");
 static_assert(sizeof(DescriptorSource) == 240, "IR::DescriptorSource changed: update CloneProgram");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update CloneProgram");
@@ -266,6 +266,7 @@ bool CloneProgram(const Program& source, Program& target) {
 		copy.instruction = map.Map(instruction.instruction);
 	}
 	target.clean_flat_slots               = source.clean_flat_slots;
+	target.gpu_fill_slots                 = source.gpu_fill_slots;
 	target.requires_specialization_memory = source.requires_specialization_memory;
 	target.has_address_writes             = source.has_address_writes;
 	target.srt_plan_complete              = source.srt_plan_complete;

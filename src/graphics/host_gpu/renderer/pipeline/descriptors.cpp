@@ -51,6 +51,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -1271,6 +1274,89 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// KYTY_SRT_GPU_FILL (port of senaxx 0845beadf): the flat buffer of a refresh that left slots to
+// the GPU (ResourceSnapshot::gpu_fills). Uploaded on its own (never shared through the upload
+// dedup: its placeholders are not its values); each slot's dword is then copied on the GPU from
+// the buffer that holds the GPU-written bytes, behind the writes that produced them and before
+// the command that reads the table. A dword that stopped being GPU-written since the walk (or a
+// rebind off the command processor) is read on the host instead, as the walk would have.
+static vk::DescriptorBufferInfo UploadFlatWithGpuFills(RenderContext&                    context,
+                                                       const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	struct Copy {
+		vk::Buffer source;
+		uint64_t   source_offset;
+		uint32_t   flat_offset;
+	};
+	thread_local std::vector<uint32_t> words;
+	thread_local std::vector<Copy>     copies;
+	words.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+	copies.clear();
+	auto&      cache      = context.GetBufferCache();
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	uint64_t   host_reads = 0;
+	for (const auto& fill: snapshot.gpu_fills) {
+		if (fill.flat_offset >= words.size()) {
+			continue;
+		}
+		vk::Buffer source        = nullptr;
+		uint64_t   source_offset = 0;
+		if (gpu_thread && cache.GpuFillSource(fill.address, &source, &source_offset)) {
+			copies.push_back({source, source_offset, fill.flat_offset});
+			continue;
+		}
+		uint32_t word = 0;
+		std::memcpy(&word, reinterpret_cast<const void*>(fill.address), sizeof(word));
+		words[fill.flat_offset] = word;
+		host_reads++;
+	}
+	const auto flat = NativeUpload(context, words);
+	if (!copies.empty()) {
+		auto& command = context.GetCommandScheduler().Current();
+		command.EndRendering();
+		const auto      native = command.HelperSink();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
+		                       vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                       nullptr);
+		for (const auto& copy: copies) {
+			const vk::BufferCopy region {copy.source_offset,
+			                             flat.offset + uint64_t {copy.flat_offset} * sizeof(uint32_t),
+			                             sizeof(uint32_t)};
+			native.copyBuffer(copy.source, flat.buffer, 1, &region);
+		}
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eUniformRead;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+		                       nullptr);
+	}
+	// One console line every 10 s while fills happen.
+	static std::atomic<uint64_t> tables {0};
+	static std::atomic<uint64_t> filled {0};
+	static std::atomic<uint64_t> read_host {0};
+	static std::atomic<int64_t>  last_ms {0};
+	tables.fetch_add(1, std::memory_order_relaxed);
+	filled.fetch_add(copies.size(), std::memory_order_relaxed);
+	read_host.fetch_add(host_reads, std::memory_order_relaxed);
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	auto last = last_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		last_ms.store(now, std::memory_order_relaxed);
+	} else if (now - last >= 10000 && last_ms.compare_exchange_strong(last, now)) {
+		std::printf("SrtGpuFill %.0fs: %" PRIu64 " flat tables, %" PRIu64
+		            " dwords copied on the GPU, %" PRIu64 " read on the host\n",
+		            static_cast<double>(now - last) / 1000.0, tables.exchange(0), filled.exchange(0),
+		            read_host.exchange(0));
+	}
+	return flat;
+}
+
 // KYTY_UPLOAD_DEDUP=0 restores the previous per-draw upload memo (64 hashed slots, only with
 // KYTY_RENDERER_BATCH=1).
 static bool UploadDedupEnabled() {
@@ -2085,7 +2171,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		bool fresh             = false;
-		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site, &fresh);
+		if (!snapshot.gpu_fills.empty()) [[unlikely]] {
+			prepared.flattened_srt = UploadFlatWithGpuFills(m_context, snapshot);
+			fresh                  = true;
+		} else {
+			prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site, &fresh);
+		}
 		prepared.fresh_upload |= fresh;
 	}
 	if (ShaderRecompiler::IR::FindBinding(

@@ -59,7 +59,7 @@ static_assert(sizeof(ResourcePlan::ArithmeticTape) == 8,
               "IR::ResourcePlan::ArithmeticTape changed: update ProgramCodec");
 static_assert(sizeof(UniformFill) == 28, "IR::UniformFill changed: update ProgramCodec");
 static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: update ProgramCodec");
-static_assert(sizeof(ResourcePlan) == 712, "IR::ResourcePlan changed: update ProgramCodec");
+static_assert(sizeof(ResourcePlan) == 736, "IR::ResourcePlan changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
@@ -803,6 +803,7 @@ public:
 			w.U8(instruction.operand_count);
 		}
 		WriteVector(w, p.clean_flat_slots);
+		WriteVector(w, p.gpu_fill_slots);
 		w.Bool(p.requires_specialization_memory);
 		w.Bool(p.has_address_writes);
 		w.Bool(p.srt_plan_complete);
@@ -1045,6 +1046,7 @@ public:
 			if (r.Failed()) return false;
 		}
 		ReadVector(r, p.clean_flat_slots);
+		ReadVector(r, p.gpu_fill_slots);
 		p.requires_specialization_memory = r.Bool();
 		p.has_address_writes             = r.Bool();
 		p.srt_plan_complete              = r.Bool();

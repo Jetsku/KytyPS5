@@ -1110,6 +1110,14 @@ const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
+bool IsGpuFillableWord(uint64_t vaddr) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, sizeof(uint32_t)) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	return GetGpuResources().GetBufferCache().GpuFillSource(vaddr);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {

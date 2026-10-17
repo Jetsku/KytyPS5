@@ -205,6 +205,13 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_SRT_GPU_FILL (GPU thread): the guest dword at `vaddr` is GPU-written bytes that one
+	// registered buffer holds, with nothing newer elsewhere (no image over it, no pending
+	// publication or early release), so a GPU copy from that buffer reads its current value.
+	// The buffer's handle and the dword's offset in it go to `handle` / `offset` when not null.
+	// No buffer is created or synchronized.
+	[[nodiscard]] bool GpuFillSource(uint64_t vaddr, vk::Buffer* handle = nullptr,
+	                                 uint64_t* offset = nullptr);
 	// KYTY_READBACK_FLUSH_SIDE (bufferCache.cpp): guest reads served by a side copy after the
 	// command processor submitted the recording that wrote their bytes (process-wide; tests).
 	[[nodiscard]] static uint64_t ReadbackFlushSideCopies() noexcept;

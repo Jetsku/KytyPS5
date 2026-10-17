@@ -167,6 +167,10 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // Upstream's descriptor-dependency reader (57cf08688/783d9f8d6): on the GPU thread, GPU-dirty
 // buffer bytes are read back first, then the backing is read.
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread (KYTY_SRT_GPU_FILL): the guest dword at vaddr is GPU-written bytes one registered
+// buffer holds (BufferCache::GpuFillSource), so a GPU copy reads its current value where a host
+// read would wait for the GPU.
+[[nodiscard]] bool     IsGpuFillableWord(uint64_t vaddr);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.

@@ -816,6 +816,10 @@ struct ResourcePlan {
 	std::vector<ArithmeticTape>         arithmetic_tapes;
 	std::vector<ArithmeticTapeInstruction> arithmetic_tape_instructions;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Indexed by flat offset like clean_flat_slots: flat slots only the shader uses
+	// (GpuFillSlots, ResourceMaterialization.cpp), which a compute refresh on the command
+	// processor may leave to the GPU when their bytes are GPU-written (KYTY_SRT_GPU_FILL).
+	std::vector<uint8_t>                gpu_fill_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;
 	bool                                srt_plan_complete          = false;

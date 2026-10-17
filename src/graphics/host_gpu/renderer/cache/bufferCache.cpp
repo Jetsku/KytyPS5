@@ -4619,6 +4619,35 @@ bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.GpuMirrorMatches(vaddr, size);
 }
 
+bool BufferCache::GpuFillSource(uint64_t vaddr, vk::Buffer* handle, uint64_t* offset) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	constexpr uint64_t size = sizeof(uint32_t);
+	if ((vaddr & (size - 1u)) != 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !m_gpu_modified_ranges.Contains(vaddr, size)) {
+		return false;
+	}
+	if ((!m_early_released.empty() && OverlapsUnpublished(vaddr, size)) ||
+	    HasPendingBackingPublication(vaddr, size)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (buffer.is_deleted || !buffer.IsInBounds(vaddr, size) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (handle != nullptr) {
+		*handle = buffer.Handle();
+	}
+	if (offset != nullptr) {
+		*offset = buffer.Offset(vaddr);
+	}
+	return true;
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
 		return true;

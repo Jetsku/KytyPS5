@@ -45,6 +45,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/fileSystem.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -95,6 +96,13 @@ namespace {
 
 Live::Switch g_pipeline_prefetch("KYTY_PIPELINE_PREFETCH", Live::ParseDefaultOff);
 Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDefaultOff);
+// KYTY_SRT_GPU_FILL (live, default on; =0 off; port of senaxx 0845beadf): a compute refresh on
+// the command processor leaves a flat SRT slot that only the shader uses (the plan's
+// gpu_fill_slots) to the GPU when its guest dword is GPU-written buffer memory: the walk writes
+// a placeholder instead of faulting and draining the GPU, and RebindBuffers copies the dword
+// from its buffer into the uploaded flat buffer on the GPU, between barriers, before the
+// dispatch (the value the shader's own load would read when it runs).
+Live::Switch g_srt_gpu_fill("KYTY_SRT_GPU_FILL", Live::ParseDefaultOn);
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -3563,6 +3571,9 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			// Image descriptor tables indexed by the workgroup id (upstream 0ee880090).
 			runtime.workgroup_counts = input_info.workgroup_counts;
+			if (!speculative && g_srt_gpu_fill.On() && GuestGpu::IsGpuThread()) {
+				runtime.gpu_written = LibKernel::Memory::IsGpuFillableWord;
+			}
 		}
 		if (source != nullptr) {
 			bool materialized = false;

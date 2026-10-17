@@ -1129,6 +1129,201 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+// Flat slots the host never needs (port of senaxx 0845beadf), so a compute refresh on the command
+// processor can leave their bytes to the GPU when GPU work wrote them (KYTY_SRT_GPU_FILL): the
+// slot's value is a raw scalar read (S_LOAD / S_BUFFER_LOAD) whose address comes from user data
+// and immediates alone, and no value the host evaluates refers to it: descriptor dwords and
+// indirect-descriptor keys, branch conditions, uniform fills, other reads' addresses, and the
+// index/offset/soffset operands of buffer stores and atomics (the write-range bounds,
+// WriteRangeAnalysis.cpp, read the flat buffer on the host). Clean (specialization) slots are
+// never filled. Indexed like clean_flat_slots; empty when no slot qualifies or when the plan's
+// flat offsets are not its read indices.
+static std::vector<uint8_t> GpuFillSlots(const Program& program, const ResourcePlan& plan) {
+	const auto count = plan.srt_reads.size();
+	for (size_t slot = 0; slot < count; slot++) {
+		if (plan.srt_reads[slot].flat_offset != slot) {
+			return {};
+		}
+	}
+	// A raw read instruction of either form (the plan's clone or the program's own) -> its slot.
+	std::unordered_map<const Inst*, uint32_t> read_slot;
+	for (uint32_t slot = 0; slot < count; slot++) {
+		if (const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction(); inst != nullptr) {
+			read_slot.emplace(inst, slot);
+		}
+		if (slot < program.srt_reads.size()) {
+			if (const auto* inst = program.srt_reads[slot].value.Resolve().TryInstruction();
+			    inst != nullptr) {
+				read_slot.emplace(inst, slot);
+			}
+		}
+	}
+	// Why a slot is a host value (KYTY_SRT_GPU_FILL_DIAG): the first root kind that reached it.
+	std::vector<uint8_t>            host(count, 0u);
+	std::vector<Value>              pending;
+	std::unordered_set<const Inst*> visited;
+	uint8_t                         why = 1;
+	const auto mark = [&](Value root) {
+		if (root.IsEmpty()) {
+			return;
+		}
+		pending.push_back(root);
+		while (!pending.empty()) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			if (value.IsEmpty() || value.IsImmediate()) {
+				continue;
+			}
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			if (const auto found = read_slot.find(inst); found != read_slot.end()) {
+				host[found->second] = host[found->second] != 0u ? host[found->second] : why;
+			}
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= count) {
+					// An unknown slot: any of them may be a host value.
+					for (auto& each: host) {
+						each = each != 0u ? each : why;
+					}
+					continue;
+				}
+				host[slot.U32()] = host[slot.U32()] != 0u ? host[slot.U32()] : why;
+				pending.push_back(plan.srt_reads[slot.U32()].value);
+				continue;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				pending.push_back(inst->Arg(arg));
+			}
+		}
+	};
+	why = 1; // descriptor
+	for (const auto& source: plan.descriptor_sources) {
+		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			mark(source.dwords[dword]);
+		}
+		if (source.indirect_descriptor.has_value()) {
+			mark(source.indirect_descriptor->key_count);
+			mark(source.indirect_descriptor->selector_first);
+			mark(source.indirect_descriptor->selector_mask);
+		}
+	}
+	why = 2; // condition
+	for (const auto& block: plan.control_flow) {
+		mark(block.condition);
+	}
+	why = 3; // uniform fill
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+		mark(plan.uniform_fill.values[i]);
+	}
+	why = 4; // another read's address
+	// Another read's address operands (the read itself is not a host use of its own slot).
+	for (const auto& read: plan.srt_reads) {
+		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				mark(inst->Arg(arg));
+			}
+		}
+	}
+	why = 5; // buffer store address
+	// Buffer stores' and atomics' address operands: the write-range program evaluates them from
+	// the snapshot's flat buffer on the host (AnalyzeBufferWriteRanges visits the same operands).
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = BufferAccessOf(inst.GetOpcode());
+			if (access != BufferAccess::Write && access != BufferAccess::Atomic) {
+				continue;
+			}
+			for (size_t arg = 1; arg < std::min<size_t>(inst.NumArgs(), 4); arg++) {
+				mark(inst.Arg(arg));
+			}
+		}
+	}
+	// The read's own address must not depend on memory: one host read per slot, the slot's own.
+	const auto memory_free = [&](const Inst& read) {
+		std::vector<Value>              stack;
+		std::unordered_set<const Inst*> seen;
+		for (size_t arg = 0; arg < read.NumArgs(); arg++) {
+			stack.push_back(read.Arg(arg));
+		}
+		while (!stack.empty()) {
+			const auto value = stack.back().Resolve();
+			stack.pop_back();
+			if (value.IsEmpty() || value.IsImmediate()) {
+				continue;
+			}
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !seen.insert(inst).second) {
+				continue;
+			}
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::ReadConst:
+				case ValueOpcode::LoadAddressU32:
+				case ValueOpcode::ReadConstBuffer:
+				case ValueOpcode::LoadBufferU32:
+				case ValueOpcode::Phi: return false;
+				default: break;
+			}
+			if (read_slot.contains(inst)) {
+				return false;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				stack.push_back(inst->Arg(arg));
+			}
+		}
+		return true;
+	};
+	static const bool diag = [] {
+		const auto* value = std::getenv("KYTY_SRT_GPU_FILL_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	std::vector<uint8_t> fill(count, 0u);
+	bool                 any = false;
+	std::string          reasons;
+	for (size_t slot = 0; slot < count; slot++) {
+		const auto* inst   = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		const char* reason = nullptr;
+		if (inst == nullptr) {
+			reason = "no-inst";
+		} else if (host[slot] != 0u) {
+			static constexpr const char* kinds[] = {"?", "descriptor", "condition", "uniform-fill",
+			                                        "read-address", "store-address"};
+			reason = kinds[host[slot] < 6u ? host[slot] : 0u];
+		} else if (slot < plan.clean_flat_slots.size() && plan.clean_flat_slots[slot] != 0u) {
+			reason = "clean";
+		}
+		if (reason == nullptr) {
+			const auto op    = inst->GetOpcode();
+			const auto index = inst->Flags<MemoryFlags>().index;
+			const auto kind  = index < plan.memory_info.size() ? plan.memory_info[index].kind
+			                                                  : ResourceKind::None;
+			if (!((op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
+			      (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer))) {
+				reason = "not-raw";
+			} else if (!memory_free(*inst)) {
+				reason = "address-from-memory";
+			} else {
+				fill[slot] = 1u;
+				any        = true;
+			}
+		}
+		if (diag && reason != nullptr && slot < 16) {
+			reasons += fmt::format(" slot{}={}", slot, reason);
+		}
+	}
+	if (diag) {
+		std::printf("SrtGpuFill plan %016" PRIx64 ": %zu slots, %zu fillable;%s\n", plan.shader_hash,
+		            count, static_cast<size_t>(std::count(fill.begin(), fill.end(), uint8_t {1})),
+		            reasons.c_str());
+	}
+	if (!any) {
+		return {};
+	}
+	return fill;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1246,6 +1441,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 		}
 	}
+	if (plan.stage == ShaderType::Compute) {
+		plan.gpu_fill_slots = GpuFillSlots(program, plan);
+	}
 	// Last: the builders above may still assign memo slots. From here the plan is read-only.
 	SealEvaluationIndices(plan);
 	return plan;
@@ -1289,10 +1487,20 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			observed.try_read_specialization_backing = ProbeStrictBacking;
 		}
 	}
+	// KYTY_SRT_GPU_FILL: the slots this refresh leaves to the GPU go to the snapshot. Not with
+	// captured reads (their certificate covers every read), and without trace replays (a replay
+	// reads every slot on the host).
+	snapshot.gpu_fills.clear();
+	observed.gpu_fills = nullptr;
+	const bool gpu_fill = runtime.gpu_written != nullptr && !capture_reads &&
+	                      !program.gpu_fill_slots.empty();
+	if (gpu_fill) {
+		observed.gpu_fills = &snapshot.gpu_fills;
+	}
 	SrtWalker clean(program, scratch, CleanRuntime(observed));
 	SrtWalker walker(program, scratch, observed, program.clean_flat_slots, &clean);
 	// KYTY_SRT_TRACE (SrtWalker.h): replays of this plan's earlier refreshes on this thread.
-	SrtTraceSession trace(program, clean, walker, observed, !capture_reads);
+	SrtTraceSession trace(program, clean, walker, observed, !capture_reads && !gpu_fill);
 	std::span<const uint8_t> active;
 	namespace Phases = Common::PrepPhases; // KYTY_DRAW_PREP_PHASES sub-buckets
 	auto phase_start = Phases::SubStart();

@@ -10,7 +10,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -22,6 +24,66 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// KYTY_SRT_GPU_FILL_DIAG=1 (diagnostic, default off; needs KYTY_SRT_GPU_FILL=1): host reads of
+// GPU-written SRT dwords the fill did not take, by shader and flat slot (or "descriptor/other"
+// outside the flat refresh, "trace" inside a replayed flat refresh), every 10 s on the console.
+bool GpuFillDiagEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SRT_GPU_FILL_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+constexpr uint32_t DiagSlotNone  = UINT32_MAX;
+constexpr uint32_t DiagSlotTrace = UINT32_MAX - 1u;
+
+void NoteGpuFillMiss(const ResourcePlan& program, uint32_t slot) {
+	struct Key {
+		uint64_t hash;
+		uint32_t slot;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const { return key.hash * 31u + key.slot; }
+	};
+	static std::mutex                                mutex;
+	static std::unordered_map<Key, uint64_t, KeyHash> misses;
+	static auto last = std::chrono::steady_clock::now();
+	std::scoped_lock lock(mutex);
+	misses[{program.shader_hash, slot}]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(10)) {
+		return;
+	}
+	last = now;
+	std::vector<std::pair<Key, uint64_t>> sorted(misses.begin(), misses.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::string line = "SrtGpuFill misses 10s:";
+	for (size_t i = 0; i < std::min<size_t>(sorted.size(), 12); i++) {
+		const auto& [key, count] = sorted[i];
+		if (key.slot == DiagSlotNone) {
+			line += fmt::format(" {:016x}/other x{}", key.hash, count);
+		} else if (key.slot == DiagSlotTrace) {
+			line += fmt::format(" {:016x}/trace x{}", key.hash, count);
+		} else {
+			line += fmt::format(" {:016x}/slot{}{} x{}", key.hash, key.slot,
+			                    key.slot < program.gpu_fill_slots.size() && program.gpu_fill_slots[key.slot] != 0u &&
+			                            key.hash == program.shader_hash
+			                        ? "(fillable)"
+			                        : "",
+			                    count);
+		}
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+	misses.clear();
+}
+
+} // namespace
+
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	if (runtime.read_specialization_memory == nullptr) {
 		runtime.try_read_clean_backing = nullptr;
@@ -31,6 +93,9 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	// Strict reads are host values by definition: never left to the GPU.
+	runtime.gpu_written = nullptr;
+	runtime.gpu_fills   = nullptr;
 	return runtime;
 }
 
@@ -1423,6 +1488,18 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 		result = 0;
 		return true;
 	}
+	if (m_runtime.gpu_written != nullptr && !m_fill_active && GpuFillDiagEnabled() &&
+	    address != 0 && m_runtime.gpu_written(address)) [[unlikely]] {
+		NoteGpuFillMiss(m_program, m_diag_slot);
+	}
+	if (m_fill_active && m_runtime.gpu_written(address)) [[unlikely]] {
+		// KYTY_SRT_GPU_FILL: only the shader uses this slot, and the GPU wrote its bytes; the
+		// renderer copies them into the flat buffer on the GPU before the dispatch, where reading
+		// them here would wait for the GPU.
+		m_runtime.gpu_fills->push_back({m_fill_offset, address});
+		result = 0;
+		return true;
+	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
@@ -2058,6 +2135,25 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) return false;
+		evaluator.m_diag_slot = index;
+		if (!clean && m_runtime.gpu_fills != nullptr &&
+		    read.flat_offset < m_program.gpu_fill_slots.size() &&
+		    m_program.gpu_fill_slots[read.flat_offset] != 0u) [[unlikely]] {
+			// KYTY_SRT_GPU_FILL: this slot alone, outside read runs; its one raw read (ReadRawWord)
+			// leaves GPU-written bytes to the GPU.
+			m_fill_active = true;
+			m_fill_offset = read.flat_offset;
+			const bool ok = index < m_program.flat_read_roots.size()
+			    ? EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
+			    : Evaluate(read.value, flat[read.flat_offset]);
+			m_fill_active = false;
+			m_diag_slot   = DiagSlotNone;
+			if (!ok) {
+				return false;
+			}
+			++index;
+			continue;
+		}
 		if (evaluator.m_runtime.try_read_clean_backing != nullptr &&
 		    index < m_program.srt_read_run_ends.size() &&
 		    m_program.srt_read_run_ends[index] > index) {
@@ -2081,6 +2177,7 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		const bool ok = index < m_program.flat_read_roots.size()
 		    ? evaluator.EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
 		    : evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		evaluator.m_diag_slot = DiagSlotNone;
 		if (!ok) {
 			return false;
 		}
@@ -2762,7 +2859,13 @@ bool SrtTraceSession::FlatBuffer(SrtWalker& walker, std::vector<uint32_t>& flat)
 		}
 		return ok;
 	}
+	for (auto* each: m_walkers) {
+		each->m_diag_slot = DiagSlotTrace;
+	}
 	const auto* call = NextCall(id);
+	for (auto* each: m_walkers) {
+		each->m_diag_slot = DiagSlotNone;
+	}
 	if (call == nullptr) {
 		return walker.RefreshFlatBufferImpl(flat);
 	}
