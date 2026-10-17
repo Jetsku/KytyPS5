@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -499,8 +500,9 @@ static int WriteResult(void* result, int32_t execution_result = 0, uint32_t erro
 namespace LibAmpr::Ampr {
 // KYTY_AMPR_ASYNC (default 1): a submitted buffer runs on the submitting thread until a wait
 // record is not yet satisfied; the rest of it then continues on its engine's thread (APR or AMM,
-// in submission order) and the submit call returns, as it does on hardware. Later submissions to
-// that engine queue behind it. Without this the submitting thread blocked for up to a second per
+// in submission order per priority) and the submit call returns, as it does on hardware. Later
+// submissions of that engine and priority queue behind it; the engine thread waits as long as a
+// wait takes. Without this the submitting thread blocked for up to a second per
 // unsatisfied wait (a value it would only produce after the submit returned), and the reads after
 // the wait ran before the AMM maps they depend on.
 enum class AmprEngine : uint8_t { Apr = 0, Amm = 1 };
@@ -508,6 +510,7 @@ struct AsyncSubmit {
 	AmprEngine engine        = AmprEngine::Apr;
 	uint32_t   submission_id = 0; // 0: none (plain submit)
 	uint64_t   result        = 0; // guest result buffer written on completion, 0: none
+	uint32_t   priority      = 0; // the submission's priority queue on its engine
 	bool       deferred      = false;
 };
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
@@ -681,7 +684,8 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffe
 	int32_t  execution_result = OK;
 	uint32_t error_offset     = 0;
 	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr, id,
-	                                  reinterpret_cast<uint64_t>(result)};
+	                                  reinterpret_cast<uint64_t>(result),
+	                                  static_cast<uint32_t>(argument)};
 	auto submit_result = LibAmpr::Ampr::ExecuteAprCommandBuffer(command_buffer_addr,
 	                                                            &execution_result, &error_offset,
 	                                                            diagnostic.Get(), &async);
@@ -716,7 +720,8 @@ static int KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint64_t argu
 
 	int32_t                    execution_result = OK;
 	uint32_t                   error_offset     = 0;
-	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr};
+	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr, 0, 0,
+	                                  static_cast<uint32_t>(argument)};
 	return KernelSyscallResult(diagnostic.Return(LibAmpr::Ampr::ExecuteAprCommandBuffer(
 	    reinterpret_cast<uint64_t>(command_buffer), &execution_result, &error_offset, diagnostic.Get(),
 	    &async)));
@@ -741,7 +746,8 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void*     command_buffer, u
 
 	int32_t  execution_result = OK;
 	uint32_t error_offset     = 0;
-	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr, id};
+	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr, id, 0,
+	                                  static_cast<uint32_t>(argument)};
 	auto submit_result = LibAmpr::Ampr::ExecuteAprCommandBuffer(command_buffer_addr,
 	                                                            &execution_result, &error_offset,
 	                                                            diagnostic.Get(), &async);
@@ -2055,48 +2061,81 @@ struct DeferredBuffer {
 	uint64_t                    result        = 0;
 };
 
+// One engine (APR or AMM) with a FIFO per submission priority, as on hardware (upstream's
+// CommandEngine: 7 APR and 3 AMM priorities). A buffer blocked on a wait holds back only the later
+// buffers of its own priority; the engine thread keeps running the other priorities' fronts. The
+// engine never gives up on a wait: on hardware the queue simply stalls until the value arrives
+// (with a 1 s give-up, Miles Morales' streamer read into an AMM range before its map command ran).
 struct AmprEngineQueue {
-	std::mutex                  mutex;
-	std::condition_variable     cv;
-	std::vector<DeferredBuffer> queue; // FIFO; front() runs, popped when it completes
-	bool                        started = false;
+	std::mutex                               mutex;
+	std::condition_variable                  cv;
+	std::array<std::deque<DeferredBuffer>, 8> queues; // per priority; front() runs, popped when done
+	bool                                     started = false;
 };
 
 static AmprEngineQueue g_engines[2];
 
+static size_t EnginePriorityIndex(uint32_t priority) {
+	return std::min<size_t>(priority, std::tuple_size_v<decltype(AmprEngineQueue::queues)> - 1);
+}
+
 static void EngineThread(AmprEngineQueue* engine, const char* name) {
 	HangWatchdog::SetThreadName(name);
+	std::unique_lock lock(engine->mutex);
 	for (;;) {
-		DeferredBuffer job;
-		{
-			// The front stays queued (moved-from) while it runs, so later submissions see the
-			// engine busy and queue behind it; only this thread pops.
-			std::unique_lock lock(engine->mutex);
-			engine->cv.wait(lock, [&] { return !engine->queue.empty(); });
-			job = std::move(engine->queue.front());
+		bool pending  = false;
+		bool progress = false;
+		for (auto& queue: engine->queues) {
+			if (queue.empty()) {
+				continue;
+			}
+			pending = true;
+			// Only this thread pops, and push_back keeps references to deque elements valid.
+			auto& job = queue.front();
+			lock.unlock();
+			int32_t  execution_result = OK;
+			uint32_t error_offset     = 0;
+			size_t   blocked_at       = SIZE_MAX;
+			const auto start          = job.start;
+			RunOrderedCommands(job.command_buffer, job.state, job.ordered, job.start,
+			                   &execution_result, &error_offset, nullptr, &blocked_at);
+			const bool done = execution_result != OK || blocked_at == SIZE_MAX;
+			if (done) {
+				if (job.result != 0) {
+					AprShared::WriteResult(reinterpret_cast<void*>(job.result), execution_result,
+					                       error_offset);
+				}
+				if (job.submission_id != 0) {
+					AprShared::FinishPendingSubmission(job.submission_id, execution_result,
+					                                   error_offset);
+				}
+			} else {
+				job.start = blocked_at;
+			}
+			progress |= done || blocked_at != start;
+			lock.lock();
+			if (done) {
+				queue.pop_front();
+			}
 		}
-		int32_t  execution_result = OK;
-		uint32_t error_offset     = 0;
-		RunOrderedCommands(job.command_buffer, job.state, job.ordered, job.start, &execution_result,
-		                   &error_offset, nullptr, nullptr);
-		if (job.result != 0) {
-			AprShared::WriteResult(reinterpret_cast<void*>(job.result), execution_result, error_offset);
+		if (progress) {
+			continue;
 		}
-		if (job.submission_id != 0) {
-			AprShared::FinishPendingSubmission(job.submission_id, execution_result, error_offset);
-		}
-		{
-			std::scoped_lock lock(engine->mutex);
-			engine->queue.erase(engine->queue.begin());
+		if (pending) {
+			// Every front waits: CPU stores and GPU writes do not notify, so poll; AMPR counter
+			// and address writes and new submissions wake the thread early.
+			engine->cv.wait_for(lock, std::chrono::microseconds(100));
+		} else {
+			engine->cv.wait(lock);
 		}
 	}
 }
 
-// Whether the engine still runs earlier deferred buffers (later ones must queue behind them).
-static bool EngineBusy(AmprEngine id) {
+// Whether earlier deferred buffers of this priority are still queued (later ones queue behind).
+static bool EngineBusy(AmprEngine id, uint32_t priority) {
 	auto&            engine = g_engines[static_cast<size_t>(id)];
 	std::scoped_lock lock(engine.mutex);
-	return !engine.queue.empty();
+	return !engine.queues[EnginePriorityIndex(priority)].empty();
 }
 
 static void DeferToEngine(AsyncSubmit& async, uint64_t command_buffer, CommandBufferState&& state,
@@ -2114,7 +2153,7 @@ static void DeferToEngine(AsyncSubmit& async, uint64_t command_buffer, CommandBu
 		buffer.start          = start;
 		buffer.submission_id  = async.submission_id;
 		buffer.result         = async.result;
-		engine.queue.push_back(std::move(buffer));
+		engine.queues[EnginePriorityIndex(async.priority)].push_back(std::move(buffer));
 		if (!engine.started) {
 			engine.started = true;
 			std::thread(EngineThread, &engine,
@@ -2212,7 +2251,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	std::sort(ordered.begin(), ordered.end(), [](const OrderedCommand& a, const OrderedCommand& b) {
 		return a.record_offset < b.record_offset;
 	});
-	if (async_enabled && EngineBusy(async->engine)) {
+	if (async_enabled && EngineBusy(async->engine, async->priority)) {
 		DeferToEngine(*async, command_buffer, std::move(state), std::move(ordered), 0);
 		return finish(OK);
 	}
@@ -3475,7 +3514,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBuffer(void* command_buffer_base, uint3
 
 	int32_t     execution_result = OK;
 	uint32_t    error_offset     = 0;
-	AsyncSubmit async {AmprEngine::Amm};
+	AsyncSubmit async {AmprEngine::Amm, 0, 0, argument2};
 	return diagnostic.Return(ExecuteAprCommandBuffer(reinterpret_cast<uint64_t>(command_buffer_base),
 	                                                &execution_result, &error_offset, diagnostic.Get(),
 	                                                &async));
@@ -3500,7 +3539,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_bas
 
 	int32_t     execution_result = OK;
 	uint32_t    error_offset     = 0;
-	AsyncSubmit async {AmprEngine::Amm, id};
+	AsyncSubmit async {AmprEngine::Amm, id, 0, argument2};
 	auto        submit_result = ExecuteAprCommandBuffer(command_buffer_addr, &execution_result,
 	                                                    &error_offset, diagnostic.Get(), &async);
 	if (submit_result != OK) {
@@ -3538,7 +3577,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void* command_buffer
 
 	int32_t     execution_result = OK;
 	uint32_t    error_offset     = 0;
-	AsyncSubmit async {AmprEngine::Amm, id, reinterpret_cast<uint64_t>(result)};
+	AsyncSubmit async {AmprEngine::Amm, id, reinterpret_cast<uint64_t>(result), argument2};
 	auto        submit_result = ExecuteAprCommandBuffer(command_buffer_addr, &execution_result,
 	                                                    &error_offset, diagnostic.Get(), &async);
 	if (submit_result != OK) {
