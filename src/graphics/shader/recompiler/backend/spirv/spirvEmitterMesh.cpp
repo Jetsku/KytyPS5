@@ -250,12 +250,17 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		EmitIfCondition(state, is_primitive, [&] {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, half));
+			// Three 10-bit fields at bits 0, 10 and 20; the top bit of each is that vertex's edge
+			// flag (the GS passthrough VGPR {edge 2, offset 2, edge 1, offset 1, edge 0, offset 0}
+			// is exported as is) and a subgroup has at most 256 vertices, so the index is the low
+			// 9 bits (Mesa, Senaxx 8a1883030). Reading 10 bits turned a set edge flag into an index
+			// past the vertex count: undefined output (spikes) without KYTY_MESH_OUTPUT_GUARD.
 			uint32_t   vertex[3] {};
 			for (uint32_t component = 0; component < 3; component++) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
-				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+				    ConstantU32(state, component * 10u), ConstantU32(state, 9));
 			}
 			uint32_t out_of_range = 0;
 			if (guard) {
