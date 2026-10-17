@@ -2121,8 +2121,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): a continuation keeps the previous draw's targets (the
 	// entries are still in `state`: the fast reset leaves them, DrawRunCandidate requires it).
 	m_run_slice_offset = render_target_slice_offset;
+	// Bindless images (descriptors.cpp): their per-frame feedback copy and image transitions may end
+	// the rendering instance while the bindings are prepared; such draws never continue a run.
+	const auto bindless_stage = [](const ShaderStageRuntime& stage) {
+		return stage.resources != nullptr && !stage.resources->bindless_heaps.empty();
+	};
+	const auto bindless = [&] {
+		return (state.ps_active && bindless_stage(state.ps_input_info.stage)) ||
+		       std::ranges::any_of(state.vertex_info,
+		                           [&](const auto& info) { return bindless_stage(info.stage); });
+	};
 	const bool run_candidate =
-	    DrawRun::Enabled() &&
+	    DrawRun::Enabled() && !bindless() &&
 	    (DrawRunCandidate(buffer, state, render_target_slice_offset) ||
 	     (DrawRun::RecallEnabled() &&
 	      DrawRunRecallCandidate(buffer, state, render_target_slice_offset)));

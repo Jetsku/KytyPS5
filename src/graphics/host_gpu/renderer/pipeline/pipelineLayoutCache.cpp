@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -34,7 +35,7 @@ std::unordered_map<VkDevice, std::unique_ptr<DeviceLayouts>> g_devices;
 PipelineLayoutHandles CreateLayouts(GraphicContext&                                 graphics,
                                     std::span<const vk::DescriptorSetLayoutBinding> bindings,
                                     bool push_descriptors, vk::ShaderStageFlags push_stages,
-                                    uint32_t push_size) {
+                                    uint32_t push_size, vk::DescriptorSetLayout bindless_set) {
 	PipelineLayoutHandles handles;
 	handles.uses_push_descriptors = push_descriptors;
 
@@ -49,8 +50,9 @@ PipelineLayoutHandles CreateLayouts(GraphicContext&                             
 
 	const vk::PushConstantRange  push_constants {push_stages, 0, push_size};
 	vk::PipelineLayoutCreateInfo layout_create {};
-	layout_create.setLayoutCount         = 1;
-	layout_create.pSetLayouts            = &handles.set_layout;
+	const std::array<vk::DescriptorSetLayout, 2> set_layouts {handles.set_layout, bindless_set};
+	layout_create.setLayoutCount         = bindless_set != nullptr ? 2u : 1u;
+	layout_create.pSetLayouts            = set_layouts.data();
 	layout_create.pushConstantRangeCount = 1;
 	layout_create.pPushConstantRanges    = &push_constants;
 	const auto result =
@@ -96,18 +98,22 @@ MakePipelineLayoutSignature(std::span<const vk::DescriptorSetLayoutBinding> bind
 uint64_t HashPipelineLayoutSignature(const PipelineLayoutSignature& signature) {
 	const uint64_t seed = (static_cast<uint64_t>(signature.push_stages) << 32u) ^
 	                      (static_cast<uint64_t>(signature.push_size) << 1u) ^
-	                      (signature.push_descriptors ? 1u : 0u);
+	                      (signature.push_descriptors ? 1u : 0u) ^ (signature.bindless_set * 0x9e3779b97f4a7c15ull);
 	return XXH3_64bits_withSeed(signature.bindings.data(),
 	                            signature.bindings.size() * sizeof(signature.bindings[0]), seed);
 }
 
 PipelineLayoutHandles AcquirePipelineLayout(GraphicContext& graphics,
                                             std::span<const vk::DescriptorSetLayoutBinding> bindings,
-                                            vk::ShaderStageFlags push_stages, uint32_t push_size) {
+                                            vk::ShaderStageFlags push_stages, uint32_t push_size,
+                                            vk::DescriptorSetLayout bindless_set) {
 	auto signature = MakePipelineLayoutSignature(bindings, push_stages, push_size,
 	                                             graphics.max_push_descriptors);
+	signature.bindless_set =
+	    reinterpret_cast<uint64_t>(static_cast<VkDescriptorSetLayout>(bindless_set));
 	if (!PipelineLayoutInterningEnabled()) {
-		return CreateLayouts(graphics, bindings, signature.push_descriptors, push_stages, push_size);
+		return CreateLayouts(graphics, bindings, signature.push_descriptors, push_stages, push_size,
+		                     bindless_set);
 	}
 	std::scoped_lock lock {g_mutex};
 	auto& device = g_devices[static_cast<VkDevice>(graphics.device)];
@@ -120,8 +126,8 @@ PipelineLayoutHandles AcquirePipelineLayout(GraphicContext& graphics,
 	}
 	std::vector<vk::DescriptorSetLayoutBinding> sorted(bindings.begin(), bindings.end());
 	std::ranges::sort(sorted, {}, &vk::DescriptorSetLayoutBinding::binding);
-	const auto handles =
-	    CreateLayouts(graphics, sorted, signature.push_descriptors, push_stages, push_size);
+	const auto handles = CreateLayouts(graphics, sorted, signature.push_descriptors, push_stages,
+	                                   push_size, bindless_set);
 	device->layouts.emplace(std::move(signature), handles);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLayoutsCreated);
 	return handles;

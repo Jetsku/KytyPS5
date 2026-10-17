@@ -35,6 +35,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
@@ -968,6 +969,40 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getProperties2(&properties2);
 	ConfigureShaderFloatControls(properties12);
+	// Bindless images (Senaxx): descriptor indexing with update-after-bind sampled images, enabled
+	// when supported unless KYTY_BINDLESS=0. The recompiler learns it before any shader compiles;
+	// nothing else is created until a program samples bindless images (BindlessTable).
+	{
+		const char* setting   = std::getenv("KYTY_BINDLESS");
+		const bool  requested = setting == nullptr || std::strcmp(setting, "0") != 0;
+		const bool  supported =
+		    supported_features12.runtimeDescriptorArray == VK_TRUE &&
+		    supported_features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
+		    supported_features12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE &&
+		    supported_features12.descriptorBindingPartiallyBound == VK_TRUE &&
+		    supported_features12.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
+		// Set 1 holds four arrays; set 0's own images count against the same per-stage limits.
+		const uint32_t limit = std::min({properties12.maxDescriptorSetUpdateAfterBindSampledImages,
+		                                 properties12.maxPerStageDescriptorUpdateAfterBindSampledImages,
+		                                 properties12.maxPerStageUpdateAfterBindResources});
+		constexpr uint32_t SetZeroMargin = 4096;
+		const uint32_t     usable        = limit > SetZeroMargin ? limit - SetZeroMargin : 0u;
+		graphics.bindless_enabled = requested && supported && usable / 4u > 3u;
+		graphics.bindless_max_sampled_images = graphics.bindless_enabled ? usable : 0u;
+		if (graphics.bindless_enabled) {
+			features12.runtimeDescriptorArray                       = VK_TRUE;
+			features12.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+			features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+			features12.descriptorBindingPartiallyBound              = VK_TRUE;
+			features12.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+		}
+		ShaderRecompiler::IR::SetBindlessImagesEnabled(graphics.bindless_enabled);
+		LOGF("Vulkan bindless images: %s (update-after-bind sampled images %u)\n",
+		     graphics.bindless_enabled ? "enabled"
+		     : !requested             ? "disabled (KYTY_BINDLESS=0)"
+		                              : "unsupported",
+		     limit);
+	}
 	// robustBufferAccess2 (enabled below whenever supported) makes a storage-buffer load return 0
 	// when any byte lies past the descriptor range rounded up to this alignment; at 1 byte that is
 	// exactly the shaders' own dword bounds check, which they can then leave to the device.

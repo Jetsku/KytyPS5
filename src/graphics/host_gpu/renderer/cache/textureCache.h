@@ -21,11 +21,13 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <bitset>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,6 +48,12 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Bindless table hooks (Senaxx; RenderContext sets them). DeleteImage, on the GPU thread, calls
+	// on_bindless_unregister for a bindless-pinned image and then on_image_views_dropped with the
+	// image's views, before it unregisters it; its destruction waits for the current tick.
+	std::function<void(ImageId)>                          on_bindless_unregister;
+	std::function<bool(std::span<const CachedImageView>)> on_image_views_dropped;
+
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
