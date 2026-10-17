@@ -801,6 +801,35 @@ static vk::Pipeline CreateFullscreenPipeline(vk::Device device, vk::PipelineLayo
 	return pipeline;
 }
 
+// KYTY_HDR_TO_SDR (default 1; 0 off): a game that outputs HDR10 (PQ) video-out buffers while the
+// window is SDR (HDR off in the launcher or no HDR display) is converted for display: the PQ code
+// values were shown unchanged, so the picture looked washed out (Miles Morales outputs PQ whatever
+// the reported dynamic range). KYTY_HDR_TO_SDR_WHITE_NITS (default 203, BT.2408 reference white)
+// maps to SDR white; highlights roll off up to KYTY_HDR_TO_SDR_PEAK_NITS (default 1000).
+static bool PqToSdrEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_HDR_TO_SDR");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static float EnvNits(const char* name, float fallback) {
+	const auto* value = std::getenv(name);
+	const float parsed = value != nullptr ? std::strtof(value, nullptr) : 0.0f;
+	return parsed >= 1.0f && parsed <= 10000.0f ? parsed : fallback;
+}
+
+float PqToSdrWhiteNits() {
+	static const float nits = EnvNits("KYTY_HDR_TO_SDR_WHITE_NITS", 203.0f);
+	return nits;
+}
+
+float PqToSdrPeakNits() {
+	static const float nits = EnvNits("KYTY_HDR_TO_SDR_PEAK_NITS", 1000.0f);
+	return nits;
+}
+
 bool PresentNeedsFilter(vk::Extent2D source, vk::Extent2D target) noexcept {
 	const bool shrinks = source.width > target.width || source.height > target.height;
 	const bool halves =
@@ -811,13 +840,16 @@ bool PresentNeedsFilter(vk::Extent2D source, vk::Extent2D target) noexcept {
 
 void PresentFilter::Record(vk::Device device, vk::CommandBuffer command, vk::ImageView source_view,
                            uint32_t level, vk::Extent2D source, vk::ImageView target_view,
-                           vk::Format target_format, vk::Extent2D target) {
+                           vk::Format target_format, vk::Extent2D target, bool pq_to_sdr) {
 	struct Constants {
 		int32_t  size[2];
 		float    scale[2];
 		uint32_t level;
+		uint32_t flags;
+		float    white_nits;
+		float    peak_nits;
 	};
-	static_assert(sizeof(Constants) == 20);
+	static_assert(sizeof(Constants) == 32);
 	if (m_layout == nullptr) {
 		vk::SamplerCreateInfo sampler {};
 		sampler.magFilter    = vk::Filter::eLinear;
@@ -868,7 +900,10 @@ void PresentFilter::Record(vk::Device device, vk::CommandBuffer command, vk::Ima
 	    {static_cast<int32_t>(source.width), static_cast<int32_t>(source.height)},
 	    {static_cast<float>(source.width) / static_cast<float>(target.width),
 	     static_cast<float>(source.height) / static_cast<float>(target.height)},
-	    level};
+	    level,
+	    pq_to_sdr ? 1u : 0u,
+	    PqToSdrWhiteNits(),
+	    PqToSdrPeakNits()};
 	command.pushConstants(m_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),
 	                      &constants);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_pipeline);
@@ -1044,8 +1079,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const vk::Extent2D source_extent =
 	    source != nullptr ? vk::Extent2D {source->image.extent.width, source->image.extent.height}
 	                      : vk::Extent2D {};
-	const bool filtered = source != nullptr && PresentBoxDownscaleEnabled() &&
-	                      PresentNeedsFilter(source_extent, m_extent);
+	// An HDR10 frame on an SDR window is converted by the filter pass (KYTY_HDR_TO_SDR).
+	const bool pq_to_sdr = source != nullptr && source->hdr && !m_hdr_active && PqToSdrEnabled();
+	const bool filtered  = source != nullptr && (pq_to_sdr || (PresentBoxDownscaleEnabled() &&
+	                                                           PresentNeedsFilter(source_extent, m_extent)));
 	if (filtered) {
 		if (source->view == nullptr) {
 			vk::ImageViewCreateInfo view {};
@@ -1091,7 +1128,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 
 	if (filtered) {
 		m_filter.Record(m_window.graphic_ctx.device, vk_command, source->view, 0, source_extent,
-		                m_image_views[m_image_index], m_format, m_extent);
+		                m_image_views[m_image_index], m_format, m_extent, pq_to_sdr);
 	} else if (source != nullptr) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;

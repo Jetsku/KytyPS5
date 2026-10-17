@@ -22469,6 +22469,71 @@ public:
             "the presentation filter aliased a one-texel checkerboard");
   }
 
+  // KYTY_HDR_TO_SDR: PresentFilter converts HDR10 (PQ, BT.2020) to SDR (BT.709, sRGB) with an
+  // extended Reinhard shoulder (white 203 nits -> 1 before the shoulder, 1000 nits -> 1 after).
+  // Neutral PQ codes go through the shader and are compared with this reference of the curve.
+  void CheckPresentPqToSdr() {
+    constexpr const char *name = "PresentPqToSdr";
+    const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const double c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    const auto pq_code = [&](double nits) {
+      const double y = std::pow(nits / 10000.0, m1);
+      return std::pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+    };
+    const auto pq_nits = [&](double code) {
+      const double e = std::pow(code, 1.0 / m2);
+      return 10000.0 * std::pow(std::max(e - c1, 0.0) / (c2 - c3 * e), 1.0 / m1);
+    };
+    const auto reference = [](double nits) {
+      const double white = PqToSdrWhiteNits(), w = PqToSdrPeakNits() / white;
+      const double l = nits / white;
+      const double mapped = std::min(l * (1.0 + l / (w * w)) / (1.0 + l), 1.0);
+      return mapped <= 0.0031308 ? mapped * 12.92
+                                 : 1.055 * std::pow(mapped, 1.0 / 2.4) - 0.055;
+    };
+    constexpr std::array<double, 6> nits{0.0, 1.0, 50.0, 203.0, 1000.0, 10000.0};
+    constexpr u32 width = static_cast<u32>(nits.size());
+    std::vector<u32> codes(width);
+    std::array<double, nits.size()> expected{};
+    for (u32 i = 0; i < width; i++) {
+      const auto code = static_cast<u32>(std::lround(pq_code(nits[i]) * 255.0));
+      codes[i] = 0xff000000u | code | (code << 8u) | (code << 16u);
+      // The reference for the 8-bit code the shader really reads.
+      expected[i] = reference(pq_nits(code / 255.0));
+    }
+    auto source = CreateImage2D(name, width, 1, vk::Format::eR8G8B8A8Unorm,
+                                vk::ImageUsageFlagBits::eSampled, codes, 1,
+                                vk::ImageLayout::eShaderReadOnlyOptimal);
+    auto destination = CreateImage2D(name, width, 1, vk::Format::eR8G8B8A8Unorm,
+                                     vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+                                     vk::ImageLayout::eColorAttachmentOptimal);
+    PresentFilter present_filter;
+    auto cmd = BeginCommands(name, "pq present");
+    present_filter.Record(m_device, cmd, source.view, 0, {width, 1}, destination.view,
+                          vk::Format::eR8G8B8A8Unorm, {width, 1}, true);
+    EndSubmitAndFree(name, "pq present", cmd);
+    present_filter.Release(m_device);
+    const auto pixels = ReadImage(name, &destination);
+    DestroyImage(&destination);
+    DestroyImage(&source);
+    int previous = -1;
+    for (u32 i = 0; i < width; i++) {
+      const int red = static_cast<int>(pixels[i] & 0xffu);
+      const int green = static_cast<int>((pixels[i] >> 8u) & 0xffu);
+      const int blue = static_cast<int>((pixels[i] >> 16u) & 0xffu);
+      const int want = static_cast<int>(std::lround(expected[i] * 255.0));
+      std::printf("[gpu]     %-32s %6.0f nits -> %3d (reference %3d)\n", name, nits[i], red, want);
+      Require(name, "curve", std::abs(red - want) <= 2,
+              "PQ to SDR differs from the reference curve");
+      Require(name, "neutral", std::abs(red - green) <= 1 && std::abs(red - blue) <= 1,
+              "a neutral PQ code changed hue");
+      Require(name, "monotonic", red >= previous, "PQ to SDR is not monotonic");
+      previous = red;
+    }
+    Require(name, "ends", (pixels[0] & 0xffu) == 0 && (pixels[width - 1] & 0xffu) == 255,
+            "black and the PQ maximum do not map to SDR black and white");
+  }
+
   void CheckSamplerBorderColors() {
     constexpr const char *name = "SamplerBorderColors";
     auto &context = RuntimeRenderer();
@@ -59095,6 +59160,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--present-box-downscale-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPresentBoxDownscale();
+    vulkan.CheckPresentPqToSdr();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
