@@ -597,6 +597,8 @@ static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg) {
 		                                    std::pair {std::string_view("DWORDX2"), 2u}}) {
 			if (name.ends_with(suffix)) return dwords;
 		}
+		// A 32-bit result of a 64-bit source (S_FF1_I32_B64, S_BCNT1_I32_B64, S_FLBIT_I32_B64): one.
+		if (name.ends_with("32_B64")) return 1u;
 		return name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64") ||
 		               name.ends_with("_F64") || name.starts_with("V_CMP")
 		           ? 2u

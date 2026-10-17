@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <fmt/format.h>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -28,7 +29,8 @@ bool IsCall(const Instruction& inst) {
 uint32_t DestinationWords(const Instruction& inst, uint32_t wave_size) {
 	const auto name = magic_enum::enum_name(inst.opcode);
 	if (name.starts_with("V_CMP")) return wave_size / 32u;
-	const bool pair = name.find("64") != std::string_view::npos;
+	// A 32-bit result of a 64-bit source (S_FF1_I32_B64, S_BCNT1_I32_B64): one SGPR.
+	const bool pair = name.find("64") != std::string_view::npos && !name.ends_with("32_B64");
 	return std::max(inst.data_dwords, pair ? 2u : 1u);
 }
 
@@ -366,20 +368,38 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
                 EmitMove(result, site.return_reg, static_cast<uint32_t>(return_pc));
                 EmitMove(result, site.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
 			};
-			// Selection: a comparison tree over the target addresses whose every edge leads to its own
-			// block (no block of it is entered twice), so the CFG stays structured: each match runs
-			// its own copy of the body, each miss its own skip path, and all end at the continuation.
-			// The comparisons change SCC and S_SWAPPC_B64 does not: when a callee may see the SCC of
-			// the call (NeedsCallScc), there is one tree per incoming SCC value, each restoring it.
-			std::vector<uint32_t>                   to_continue;
-			std::map<uint32_t, std::vector<size_t>> groups; // high word -> targets
+			// Selection, shaped for the structurizer: every selection of it has its own merge block (an
+			// S_BRANCH to the next instruction) and no block is entered from two places, so the CFG
+			// needs no merge splitting. The targets of a high address word are found by a balanced
+			// search over their low words (s_cmp_lt_u32), each leaf comparing for equality; a match
+			// runs its own copy of the body, a miss its own skip path (the call returns at once), and
+			// every path leaves through the merges to the continuation. The comparisons change SCC and
+			// S_SWAPPC_B64 does not: when a callee may see the SCC of the call (NeedsCallScc), there is
+			// one selection per incoming SCC value, each restoring it.
+			std::map<uint32_t, std::vector<size_t>> groups; // high word -> targets, by low word
 			for (size_t t = 0; t < site.addresses.size(); t++) {
 				groups[static_cast<uint32_t>(site.addresses[t] >> 32u)].push_back(t);
+			}
+			for (auto& [high, targets]: groups) {
+				std::ranges::sort(targets, {}, [&](size_t t) { return static_cast<uint32_t>(site.addresses[t]); });
 			}
 			const bool dual = std::ranges::any_of(site.addresses, [&](uint64_t address) {
 				return NeedsCallScc(functions.at({address, site.return_reg}));
 			});
-			const auto emit_body = [&](const Function& function) {
+			const auto branch = [&] {
+				const auto at = static_cast<uint32_t>(result.size());
+				result.push_back(SBranch);
+				return at;
+			};
+			// The merge block of a selection: an S_BRANCH to the instruction after it.
+			const auto merge = [&](std::vector<uint32_t>& exits) {
+				for (const auto at: exits) {
+					relocations.emplace_back(at, static_cast<uint32_t>(result.size()));
+				}
+				const auto at = branch();
+				relocations.emplace_back(at, at + 1u);
+			};
+			const auto emit_body = [&](const Function& function, std::vector<uint32_t>& exits) {
 				set_return();
 				std::map<uint32_t, uint32_t> local_pc;
 				Branches                     local_branches;
@@ -387,8 +407,7 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 					const auto at     = static_cast<uint32_t>(result.size());
 					local_pc[body.pc] = at;
 					if (body.opcode == Opcode::S_SETPC_B64) {
-						to_continue.push_back(at);
-						result.push_back(SBranch);
+						exits.push_back(branch());
 					} else if (body.opcode == Opcode::S_GETPC_B64) {
 						if (!EmitGetPc(result, body, (function.address & 0x0000ffffffffffffull) + body.pc,
 						               reason)) {
@@ -405,50 +424,72 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 				expansion.inlined++;
 				return result.size() <= MaxExpandedShaderWords;
 			};
-			const auto emit_tree = [&](uint32_t restore) {
-				// A target outside the set: the call returns at once.
-				const auto skip = [&] {
+			// Code that enters with the target pair in s[source_reg:+1] and leaves by falling through.
+			const auto skip = [&](uint32_t restore) {
+				if (restore != 0) result.push_back(restore);
+				set_return();
+			};
+			std::function<bool(const std::vector<size_t>&, size_t, size_t, uint32_t)> emit_range;
+			emit_range = [&](const std::vector<size_t>& targets, size_t first, size_t last,
+			                 uint32_t restore) -> bool {
+				std::vector<uint32_t> exits;
+				if (last - first == 1u) {
+					const auto t = targets[first];
+					result.push_back(0xbf06ff00u | site.source_reg); // s_cmp_eq_u32 lo, lit
+					result.push_back(static_cast<uint32_t>(site.addresses[t]));
+					const auto miss = static_cast<uint32_t>(result.size());
+					result.push_back(SCbranchScc0);
 					if (restore != 0) result.push_back(restore);
-					set_return();
-					to_continue.push_back(static_cast<uint32_t>(result.size()));
-					result.push_back(SBranch);
-				};
+					if (!emit_body(functions.at({site.addresses[t], site.return_reg}), exits)) return false;
+					relocations.emplace_back(miss, static_cast<uint32_t>(result.size()));
+					skip(restore);
+				} else {
+					const auto middle = first + (last - first) / 2u;
+					result.push_back(0xbf0aff00u | site.source_reg); // s_cmp_lt_u32 lo, lit
+					result.push_back(static_cast<uint32_t>(site.addresses[targets[middle]]));
+					const auto lower = static_cast<uint32_t>(result.size());
+					result.push_back(SCbranchScc1);
+					if (!emit_range(targets, middle, last, restore)) return false;
+					exits.push_back(branch());
+					relocations.emplace_back(lower, static_cast<uint32_t>(result.size()));
+					if (!emit_range(targets, first, middle, restore)) return false;
+				}
+				merge(exits);
+				return true;
+			};
+			const auto emit_groups = [&](uint32_t restore) -> bool {
+				std::vector<std::vector<uint32_t>> exits;
 				for (const auto& [high, targets]: groups) {
 					result.push_back(0xbf06ff00u | (site.source_reg + 1u)); // s_cmp_eq_u32 hi, lit
 					result.push_back(high);
-					const auto high_miss = static_cast<uint32_t>(result.size());
+					const auto other = static_cast<uint32_t>(result.size());
 					result.push_back(SCbranchScc0);
-					for (const auto t: targets) {
-						result.push_back(0xbf06ff00u | site.source_reg); // s_cmp_eq_u32 lo, lit
-						result.push_back(static_cast<uint32_t>(site.addresses[t]));
-						const auto low_miss = static_cast<uint32_t>(result.size());
-						result.push_back(SCbranchScc0);
-						if (restore != 0) result.push_back(restore);
-						if (!emit_body(functions.at({site.addresses[t], site.return_reg}))) return false;
-						relocations.emplace_back(low_miss, static_cast<uint32_t>(result.size()));
-					}
-					skip();
-					relocations.emplace_back(high_miss, static_cast<uint32_t>(result.size()));
+					if (!emit_range(targets, 0, targets.size(), restore)) return false;
+					exits.push_back({branch()});
+					relocations.emplace_back(other, static_cast<uint32_t>(result.size()));
 				}
-				skip();
+				skip(restore);
+				for (auto it = exits.rbegin(); it != exits.rend(); ++it) {
+					merge(*it);
+				}
 				return true;
 			};
 			bool emitted = false;
 			if (dual) {
 				const auto select = static_cast<uint32_t>(result.size());
 				result.push_back(SCbranchScc1);
-				emitted = emit_tree(SetScc0);
+				std::vector<uint32_t> exits;
+				emitted = emit_groups(SetScc0);
+				exits.push_back(branch());
 				relocations.emplace_back(select, static_cast<uint32_t>(result.size()));
-				emitted = emitted && emit_tree(SetScc1);
+				emitted = emitted && emit_groups(SetScc1);
+				merge(exits);
 			} else {
-				emitted = emit_tree(0);
+				emitted = emit_groups(0);
 			}
 			if (!emitted) {
 				if (reason.empty()) reason = "the expanded program exceeds the code bound";
 				return false;
-			}
-			for (const auto at: to_continue) {
-				relocations.emplace_back(at, static_cast<uint32_t>(result.size()));
 			}
 		}
 		if (result.size() > MaxExpandedShaderWords) {
