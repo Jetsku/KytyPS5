@@ -5,11 +5,13 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -32,6 +34,7 @@ struct CallTableView {
 
 constexpr uint64_t MaxCallTableBytes   = 16ull << 20u;
 constexpr size_t   MaxCallSiteTargets  = 256;
+constexpr size_t   MaxExpansionsPerProgram = 8;
 
 // Follows the table's load steps from the user data. False with `failure` when a step reads
 // outside the loaded values or unreadable memory, or the table is not a usable buffer.
@@ -47,13 +50,13 @@ bool ReadCallTable(const CallTableView& view, const Decoder::ShaderCodeReader& r
 void CallTableTargets(const CallTableView& view, std::span<const uint32_t> words,
                       std::set<uint64_t>& targets);
 
-// Expands the calls of compute programs, once per program and set of reachable targets: each
-// dispatch evaluates the call targets from user data and the table descriptors (a few small
-// reads); a table's records are read again when its descriptor changes and every
-// `rescan_interval` dispatches (and only parsed when their digest changed), when the callee code
-// is also checked. The targets of a call accumulate (at most MaxCallSiteTargets), so a program
-// is expanded again only when a call can reach a new function. A target that leaves the set
-// between two scans takes the skip path of the expansion.
+// Expands the calls of compute programs for the targets a dispatch can reach: each dispatch
+// evaluates them from user data and the table descriptors (a few small reads). A table is read
+// when its descriptor is new and every `rescan_interval` dispatches (and parsed only when its
+// digest changed). A program keeps one expansion per target set (at most MaxExpansionsPerProgram,
+// least recently used out), so tables that alternate do not expand it again; an expansion is
+// dropped when the callee code it placed changes (checked every `rescan_interval` dispatches). A
+// target that leaves the set between two scans takes the skip path of the expansion.
 class ShaderCallExpander {
 public:
 	struct Expanded {
@@ -68,20 +71,28 @@ public:
 	uint32_t rescan_interval = 64;
 
 private:
+	struct TableState {
+		uint64_t              digest     = 0;
+		uint32_t              scanned_at = 0;
+		std::vector<uint64_t> targets; // ascending
+	};
 	struct Call {
-		ShaderCall         trace;
-		CallTableView      view;
-		bool               view_known = false;
-		uint64_t           table_digest = 0;
-		std::set<uint64_t> targets;
+		ShaderCall trace;
+		std::map<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t>, TableState> tables; // by view
+	};
+	struct Cached {
+		Expanded                     expanded;
+		Decoder::ShaderCallExpansion expansion; // its reads (the callee code)
+		uint32_t                     checked_at = 0;
+		uint32_t                     used_at    = 0;
 	};
 	struct Program {
-		bool                    usable = true;
-		std::vector<Call>       calls;
-		uint32_t                dispatches = 0;
-		Expanded                current;
-		Decoder::ShaderCallExpansion expansion; // of `current` (its reads)
-		std::string             last_failure;
+		bool                       usable = true;
+		std::vector<Call>          calls;
+		uint32_t                   dispatches = 0;
+		Expanded                   current;
+		std::map<uint64_t, Cached> expansions; // by target set
+		std::string                last_failure;
 	};
 
 	bool Refresh(Program& program, std::span<const uint32_t> code, uint64_t base,

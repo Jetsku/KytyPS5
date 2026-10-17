@@ -20073,7 +20073,7 @@ public:
   // callees are guest code: A adds 7 to the data (and clears SCC), B copies it (SCC kept), C
   // branches on it; record 3 is null and record 4 names nothing in the first run: those calls are
   // skipped. The second run names D in record 4; the program is expanded again at the periodic
-  // rescan, and the last of its 64 dispatches stores D's value.
+  // rescan, and the last of its 64 dispatches stores D's value. Each new expansion is translated in\n  // the background first (its dispatches are skipped meanwhile).
   void CheckCallTableDispatch() {
     constexpr const char *name = "CallTableDispatch";
     constexpr uintptr_t base = 0x0000000207000000ull;
@@ -20182,8 +20182,11 @@ public:
         for (uint32_t i = 0; i < user.size(); i++) {
           shaders.SetCsUserSgpr(i, user[i], HW::UserSgprType::Unknown);
         }
+        // A new expansion translates in the background (KYTY_SHADER_CALLS_ASYNC) and its
+        // dispatches are skipped until it is ready: the later dispatches store.
         for (uint32_t dispatch = 0; dispatch < dispatches; dispatch++) {
           context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
       });
       std::array<u32, 10> stored{};
@@ -20208,7 +20211,7 @@ public:
     };
     // v1 and SCC (1 set, 2 clear) per call: A, B (odd: SCC kept set), C, null (skipped), record 4.
     const std::array<u32, 10> first_expected{17, 2, 20, 1, 0x555, 1, 999, 1, 999, 2};
-    const auto first = run(false, 1);
+    const auto first = run(false, 16);
     Require(name, "expanded calls", first == first_expected, "the calls stored" + text(first));
     auto second_expected = first_expected;
     second_expected[8] = 0x777;

@@ -1247,6 +1247,131 @@ static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
 	return true;
 }
 
+// KYTY_SHADER_CALLS_ASYNC (default on): an expanded call program can be large (Miles Morales'
+// ray-tracing kernels: about 160K words) and its translation takes seconds, so it is translated on
+// a background thread and its dispatches are skipped until the translation is ready; the compile
+// path then takes that translation instead of translating (CompileAndPublish). The translation is a
+// function of the code, the static stage state and the user-data count, which the id covers.
+class CallTranslations {
+public:
+	enum class State { Missing, Pending, Ready };
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_SHADER_CALLS_ASYNC");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		return enabled;
+	}
+	static CallTranslations& Instance() {
+		static CallTranslations instance;
+		return instance;
+	}
+	static uint64_t Id(uint64_t hash, uint32_t user_data_count, std::span<const uint32_t> static_state) {
+		return XXH3_64bits_withSeed(static_state.data(), static_state.size_bytes(),
+		                            hash ^ (uint64_t {user_data_count} << 56u));
+	}
+
+	State Query(uint64_t id) {
+		std::scoped_lock lock(m_mutex);
+		const auto entry = m_entries.find(id);
+		if (entry == m_entries.end()) return State::Missing;
+		return entry->second.done ? State::Ready : State::Pending;
+	}
+	void Queue(uint64_t id, const ShaderParams& params, const ShaderComputeInputInfo& info) {
+		auto job        = std::make_unique<Job>();
+		job->id         = id;
+		job->hash       = params.hash;
+		job->code.assign(params.code.begin(), params.code.end());
+		job->user_data.assign(params.user_data.begin(), params.user_data.begin() + params.user_data_count);
+		job->info       = info;
+		job->info.stage = {};
+		{
+			std::scoped_lock lock(m_mutex);
+			if (!m_entries.try_emplace(id).second) return;
+			m_jobs.push_back(std::move(job));
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+		}
+		m_wake.notify_one();
+	}
+	// The ready translation of `id` (once; a later compile of the source translates again).
+	std::optional<ShaderRecompiler::TranslateResult> Take(uint64_t id) {
+		std::scoped_lock lock(m_mutex);
+		const auto entry = m_entries.find(id);
+		if (entry == m_entries.end() || !entry->second.done || !entry->second.result) return {};
+		auto result = std::move(entry->second.result);
+		entry->second.result.reset();
+		return result;
+	}
+	~CallTranslations() {
+		{
+			std::scoped_lock lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_all();
+		if (m_thread.joinable()) m_thread.join();
+	}
+
+private:
+	struct Job {
+		uint64_t               id   = 0;
+		uint64_t               hash = 0;
+		std::vector<uint32_t>  code;
+		std::vector<uint32_t>  user_data;
+		ShaderComputeInputInfo info {};
+	};
+	struct Entry {
+		bool                                             done = false;
+		std::optional<ShaderRecompiler::TranslateResult> result;
+	};
+
+	void Run() {
+		for (;;) {
+			std::unique_ptr<Job> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_wake.wait(lock, [&] { return m_stop || !m_jobs.empty(); });
+				if (m_stop) return;
+				job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+			}
+			ShaderRecompiler::CompileOptions options;
+			ShaderStageInputInfo             stage_input {};
+			stage_input.compute = &job->info;
+			options.stage       = ShaderType::Compute;
+			options.shader_hash = job->hash;
+			options.user_data   = job->user_data;
+			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+			options.early_dump  = options.dump_ir;
+			options.dump_label  = "ShaderRecompiler CS";
+			options.input_info  = stage_input;
+			options.wave_size   = job->info.wave_size;
+			const auto begin    = std::chrono::steady_clock::now();
+			auto       result   = ShaderRecompiler::TranslateProgram(job->code, options);
+			const auto ms       = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - begin)
+			                    .count();
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_SHADER_CALLS: CS shader 0x{:016x}: expansion of {} words translated in the "
+			    "background in {} ms{}.\n",
+			    job->hash, job->code.size(), ms, result.skip_dispatch ? " (its dispatches are skipped)" : ""));
+			std::scoped_lock lock(m_mutex);
+			auto& entry  = m_entries[job->id];
+			entry.done   = true;
+			entry.result = std::move(result);
+		}
+	}
+
+	std::mutex                          m_mutex;
+	std::condition_variable             m_wake;
+	std::deque<std::unique_ptr<Job>>    m_jobs;
+	std::unordered_map<uint64_t, Entry> m_entries;
+	std::thread                         m_thread;
+	bool                                m_stop = false;
+};
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -3010,7 +3135,13 @@ struct PipelineCache::ProgramCache {
 			const auto translate_begin = CompileClockNs();
 			{
 				KYTY_PROFILER_BLOCK("Shader::Translate");
-				translated = ShaderRecompiler::TranslateProgram(translation_code, options);
+				// An expanded call program translated in the background (CallTranslations).
+				auto ready = params.call_expansion != 0
+				                 ? CallTranslations::Instance().Take(CallTranslations::Id(
+				                       key.hash, key.user_data_count, key.static_state))
+				                 : std::nullopt;
+				translated = ready ? std::move(*ready)
+				                   : ShaderRecompiler::TranslateProgram(translation_code, options);
 			}
 			times.translate_ns += CompileClockNs() - translate_begin;
 			translated_now = true;
@@ -6907,6 +7038,20 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	}
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
+	if (params.call_expansion != 0 && CallTranslations::Enabled()) {
+		// A new expanded call program: its dispatches are skipped while it translates.
+		auto& key = scratch.key;
+		ProgramCache::BuildKey(params, input_info, key);
+		if (m_program_cache->FindSource(key) == nullptr) {
+			auto&      translations = CallTranslations::Instance();
+			const auto id = CallTranslations::Id(key.hash, key.user_data_count, key.static_state);
+			switch (translations.Query(id)) {
+				case CallTranslations::State::Missing: translations.Queue(id, params, input_info); return {};
+				case CallTranslations::State::Pending: return {};
+				case CallTranslations::State::Ready: break;
+			}
+		}
+	}
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
 		ShaderReadAttempt read_attempt;
 		uint32_t push_data_cursor = 0;

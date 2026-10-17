@@ -162,86 +162,91 @@ bool ShaderCallExpander::Expand(std::span<const uint32_t> code, uint64_t base,
 bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> code, uint64_t base,
                                  const CompileOptions& options,
                                  const Decoder::ShaderCodeReader& read) {
-	const bool periodic = rescan_interval != 0 && program.dispatches % rescan_interval == 0;
-	program.dispatches++;
-	bool        changed = program.current.code == nullptr;
+	const auto  now = program.dispatches++;
+	const auto  due = [&](uint32_t since) { return rescan_interval != 0 && now - since >= rescan_interval; };
 	std::string failures;
 	const auto  fail = [&](const Call& call, std::string_view why) {
         failures += fmt::format("{}pc 0x{:x}: {}", failures.empty() ? "" : "; ", call.trace.pc, why);
 	};
-	const auto add = [&](Call& call, uint64_t target) {
-		if (call.targets.contains(target)) return;
-		if (call.targets.size() >= MaxCallSiteTargets) {
-			fail(call, "more targets than the bound");
-			return;
-		}
-		call.targets.insert(target);
-		changed = true;
-	};
+	// The targets of each call for this dispatch.
+	std::vector<Decoder::ShaderCallSite> sites;
+	size_t                               targets = 0;
+	uint64_t                             key     = 0x5bd1e995u;
 	for (auto& call: program.calls) {
+		auto& site = sites.emplace_back(Decoder::ShaderCallSite {.pc         = call.trace.pc,
+		                                                         .source_reg = call.trace.source_reg,
+		                                                         .return_reg = call.trace.return_reg});
 		if (call.trace.user_sgpr != UINT32_MAX) {
 			const auto index = call.trace.user_sgpr - options.user_data_base;
 			if (index + 2u > options.user_data.size()) {
 				fail(call, "user data too short");
-				continue;
+			} else {
+				const auto target = static_cast<uint64_t>(options.user_data[index]) |
+				                    (static_cast<uint64_t>(options.user_data[index + 1u]) << 32u);
+				if ((target & AddressMask) != 0) site.addresses.push_back(target);
 			}
-			const auto target = static_cast<uint64_t>(options.user_data[index]) |
-			                    (static_cast<uint64_t>(options.user_data[index + 1u]) << 32u);
-			if ((target & AddressMask) != 0) add(call, target);
-			continue;
-		}
-		CallTableView view;
-		std::string   why;
-		if (!EvaluateCallTable(*call.trace.table, options.user_data, options.user_data_base, read, view,
-		                       why)) {
-			fail(call, why);
-			continue;
-		}
-		const bool moved = !call.view_known || view != call.view;
-		if (moved || periodic) {
-			if (!ReadCallTable(view, read, m_table_words, why)) {
+		} else {
+			CallTableView view;
+			std::string   why;
+			if (!EvaluateCallTable(*call.trace.table, options.user_data, options.user_data_base, read,
+			                       view, why)) {
 				fail(call, why);
-				continue;
-			}
-			const auto digest = XXH3_64bits(m_table_words.data(), m_table_words.size() * sizeof(uint32_t));
-			if (moved || digest != call.table_digest) {
-				std::set<uint64_t> found;
-				CallTableTargets(view, m_table_words, found);
-				for (const auto target: found) {
-					add(call, target);
+			} else {
+				auto [state, fresh] = call.tables.try_emplace(
+				    std::tuple {view.base, view.bytes, view.record_bytes, view.target_offset});
+				if (fresh || due(state->second.scanned_at)) {
+					if (!ReadCallTable(view, read, m_table_words, why)) {
+						fail(call, why);
+					} else {
+						const auto digest =
+						    XXH3_64bits(m_table_words.data(), m_table_words.size() * sizeof(uint32_t));
+						if (fresh || digest != state->second.digest) {
+							std::set<uint64_t> found;
+							CallTableTargets(view, m_table_words, found);
+							if (found.size() > MaxCallSiteTargets) {
+								fail(call, fmt::format("{} targets, more than the bound", found.size()));
+								found.clear();
+							}
+							state->second.targets.assign(found.begin(), found.end());
+						}
+						state->second.digest     = digest;
+						state->second.scanned_at = now;
+					}
 				}
-			}
-			call.view         = view;
-			call.view_known   = true;
-			call.table_digest = digest;
-		}
-	}
-	if (periodic && !changed) {
-		std::vector<uint32_t> words;
-		for (const auto& [address, expected]: program.expansion.reads) {
-			words.resize(expected.size());
-			if (!read(address, words) || words != expected) {
-				changed = true;
-				break;
+				site.addresses = state->second.targets;
 			}
 		}
+		targets += site.addresses.size();
+		key = XXH3_64bits_withSeed(site.addresses.data(), site.addresses.size() * sizeof(uint64_t), key);
 	}
 	if (!failures.empty() && failures != program.last_failure) {
 		program.last_failure = failures;
 		Log::WriteToConsoleAndLog(fmt::format("KYTY_SHADER_CALLS: {} shader 0x{:016x}: {}.\n",
 		                                      StageLabel(options.stage), options.shader_hash, failures));
 	}
-	if (!changed) return true;
-
-	std::vector<Decoder::ShaderCallSite> sites;
-	size_t                               targets = 0;
-	for (const auto& call: program.calls) {
-		sites.push_back({.pc         = call.trace.pc,
-		                 .source_reg = call.trace.source_reg,
-		                 .return_reg = call.trace.return_reg,
-		                 .addresses  = {call.targets.begin(), call.targets.end()}});
-		targets += call.targets.size();
+	// An expansion for these targets, while the callee code it placed reads the same.
+	if (auto cached = program.expansions.find(key); cached != program.expansions.end()) {
+		auto& entry = cached->second;
+		bool  valid = true;
+		if (due(entry.checked_at)) {
+			std::vector<uint32_t> words;
+			for (const auto& [address, expected]: entry.expansion.reads) {
+				words.resize(expected.size());
+				if (!read(address, words) || words != expected) {
+					valid = false;
+					break;
+				}
+			}
+			entry.checked_at = now;
+		}
+		if (valid) {
+			entry.used_at   = now;
+			program.current = entry.expanded;
+			return true;
+		}
+		program.expansions.erase(cached);
 	}
+
 	Decoder::ShaderCallExpansion expansion;
 	std::string                  reason;
 	if (!Decoder::ExpandShaderCalls(code, base, sites, read, options.wave_size, expansion, reason)) {
@@ -251,6 +256,7 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 			    "KYTY_SHADER_CALLS: {} shader 0x{:016x} is not expanded: {}.\n",
 			    StageLabel(options.stage), options.shader_hash, reason));
 		}
+		program.current = {};
 		return false;
 	}
 	const auto digest =
@@ -262,12 +268,22 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 	    expansion.inlined, expansion.inlined == 1 ? "y" : "ies", expansion.code.size(), code.size(),
 	    digest, expansion.dropped.empty() ? "" : fmt::format("; {} left out, first: ", expansion.dropped.size()),
 	    expansion.dropped.empty() ? std::string() : expansion.dropped.front()));
-	program.current = {.code = std::make_shared<const std::vector<uint32_t>>(std::move(expansion.code)),
-	                   .digest = digest};
-	m_retained.push_back(program.current.code);
-	Dump(fmt::format("calls_{:016x}_{:016x}", options.shader_hash, digest), *program.current.code);
+	Expanded result {.code = std::make_shared<const std::vector<uint32_t>>(std::move(expansion.code)),
+	                 .digest = digest};
+	m_retained.push_back(result.code);
+	Dump(fmt::format("calls_{:016x}_{:016x}", options.shader_hash, digest), *result.code);
 	expansion.code.clear();
-	program.expansion = std::move(expansion);
+	if (program.expansions.size() >= MaxExpansionsPerProgram) {
+		const auto oldest = std::ranges::min_element(program.expansions, {}, [](const auto& entry) {
+			return entry.second.used_at;
+		});
+		program.expansions.erase(oldest);
+	}
+	program.expansions[key] = {.expanded   = result,
+	                           .expansion  = std::move(expansion),
+	                           .checked_at = now,
+	                           .used_at    = now};
+	program.current = result;
 	return true;
 }
 
