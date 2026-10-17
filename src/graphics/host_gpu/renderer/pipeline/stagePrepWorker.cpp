@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/gpuReadDelegate.h"
 
@@ -31,12 +32,14 @@ uint64_t NowNs() {
 	                                 .count());
 }
 
+// KYTY_STAGE_PREP_PARALLEL (live, default on; =0 serial): the pixel stage of a draw is prepared on
+// the helper while the vertex stage is prepared on the calling thread. Live so that the stage walks
+// can be A/B'd in one launch (senaxx 816198d2b measured its own version as a loss): off, Get() returns
+// null and callers take the serial path; the helper, once started, stays parked.
+Live::Switch g_stage_prep_parallel("KYTY_STAGE_PREP_PARALLEL", Live::ParseDefaultOn);
+
 bool ParallelEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_STAGE_PREP_PARALLEL");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+	return g_stage_prep_parallel.On();
 }
 
 uint64_t SpinNs() {
