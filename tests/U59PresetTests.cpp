@@ -138,6 +138,10 @@ void TestLoadTitle() {
 	      "the title file one folder up is found");
 	Check(LoadTitle({first, second}, "PPSA21567").status == Status::Missing,
 	      "another title does not take this title's file");
+	// The title presets this repository ships parse.
+	const auto shipped = LoadTitle({std::filesystem::path(KYTY_U59_PRESET_DIR)}, "PPSA01417");
+	Check(shipped.status == Status::Loaded && !shipped.entries.empty(),
+	      "tools/u59-preset.PPSA01417.json loads");
 	for (const char* bad: {"", "PPSA0141", "../PPSA0141", "ppsa01417", "PPSA01417x"}) {
 		Check(LoadTitle({first, second}, bad).status == Status::Missing,
 		      "a malformed title id loads nothing");
