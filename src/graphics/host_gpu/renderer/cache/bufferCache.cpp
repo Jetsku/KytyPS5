@@ -633,6 +633,15 @@ bool RelaxedQueriesEnabled() {
 	return enabled;
 }
 
+// KYTY_TEXEL_RELAXED_SYNC (default on; =0 off): formatted (texel) read bindings use the same
+// lock-free "nothing to upload" test as raw reads, then only the image step (SynchronizeBufferFrom-
+// Image). Before, every texel read walked the tracker under its region locks: Miles Morales binds
+// ~6 texel buffers of ~4 MiB per draw, 15 us each, two thirds of the command processor's time.
+bool TexelRelaxedSyncEnabled() {
+	static const bool enabled = ParseEnvU64("KYTY_TEXEL_RELAXED_SYNC", 1) != 0;
+	return enabled;
+}
+
 // KYTY_BINDING_EPOCH_MEMO (default on; =0 off): read bindings reused within a sync epoch
 // (BufferCache::BindingMemo).
 bool BindingEpochMemoEnabled() {
@@ -3022,9 +3031,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
 	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
 	// GPU-written images; the BDA hot-pass verification scans in full.
-	if (!is_written && !is_texel_buffer && (stats == nullptr || stats->verify_fault_epoch == 0) &&
-	    RelaxedNothingToUpload(vaddr, size)) {
-		return false;
+	if (!is_written && (!is_texel_buffer || TexelRelaxedSyncEnabled()) &&
+	    (stats == nullptr || stats->verify_fault_epoch == 0) && RelaxedNothingToUpload(vaddr, size)) {
+		// A texel read still takes the bytes of GPU-written images that start at its address.
+		return is_texel_buffer ? SynchronizeBufferFromImage(buffer, vaddr, size) : false;
 	}
 	// KYTY_WRITTEN_SYNC_SKIP (bufferCache.h): a range the GPU already owns entirely. (Only texel
 	// READS do more than the tracker work below.)
