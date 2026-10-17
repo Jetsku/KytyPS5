@@ -28,10 +28,14 @@ const char* StageLabel(ShaderType stage) {
 // KYTY_SHADER_CALLS_DUMP=<folder> (diagnostics, default off): each program with calls is written
 // there once as calls_<hash>.bin (its code) and calls_<hash>.txt (its disassembly), and each
 // expansion as calls_<hash>_<digest>.bin/.txt. The files stay on this machine.
+// KYTY_SHADER_CALLS_TOPK=N (default 4; 0: every target): each call table keeps the N targets most
+// of its records name; calls to the others take the skip path. With every callee, an expansion of
+// Miles Morales' ray-tracing kernels is millions of SPIR-V words (2 callees: a 12 s driver
+// compile, 6: 44 s), so only a few compile in seconds.
 size_t MaxTargetsPerTable() {
 	static const size_t cap = [] {
-		const char* value = std::getenv("KYTY_SHADER_CALLS_MAX_TARGETS");
-		return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 0)) : size_t {0};
+		const char* value = std::getenv("KYTY_SHADER_CALLS_TOPK");
+		return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 0)) : size_t {4};
 	}();
 	return cap;
 }
@@ -217,7 +221,7 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 							state->second.targets.assign(found.begin(), found.end());
 							if (const auto cap = MaxTargetsPerTable();
 							    cap != 0 && state->second.targets.size() > cap) {
-								// KYTY_SHADER_CALLS_MAX_TARGETS (diagnostics): the targets most
+								// KYTY_SHADER_CALLS_TOPK: the targets most
 								// records name; the others take the skip path.
 								std::map<uint64_t, uint32_t> records;
 								const uint64_t bytes = m_table_words.size() * sizeof(uint32_t);
