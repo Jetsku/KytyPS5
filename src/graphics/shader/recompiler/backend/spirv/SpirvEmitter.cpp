@@ -96,7 +96,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
+		     return image.indirect_search_iterations != 0u || image.bindless;
 	     });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);

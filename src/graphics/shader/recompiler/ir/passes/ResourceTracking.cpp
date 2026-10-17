@@ -1,15 +1,28 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fmt/format.h>
 #include <span>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+static std::atomic_bool g_bindless_images {false};
+
+void SetBindlessImagesEnabled(bool enabled) {
+	g_bindless_images.store(enabled, std::memory_order_release);
+}
+
+bool BindlessImagesEnabled() {
+	return g_bindless_images.load(std::memory_order_acquire);
+}
+
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -328,6 +341,7 @@ private:
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
 				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
 				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
+				    a.bindless != b.bindless ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -930,55 +944,76 @@ private:
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
-		if (table_source.dword_count == 2u) {
-			const auto* selector = key.Resolve().TryInstruction();
-			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
-			    selector->NumArgs() == 1u && !m_shader_writes &&
-			    NonzeroOnEntry(selector->Arg(0), handle.Parent());
-			if (bitscan) {
-				indirect.key_count = Value(32u);
+		// Enumerate the keys the table can reach (upstream's plan). When that fails and the device
+		// supports bindless images, a sampled-only image over a buffer heap looks its key up at run
+		// time instead (Senaxx's bindless images): a program the enumeration covers translates as
+		// before.
+		const auto enumerable = [&]() -> bool {
+			if (table_source.dword_count == 2u) {
+				const auto* selector = key.Resolve().TryInstruction();
+				const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
+				    selector->NumArgs() == 1u && !m_shader_writes &&
+				    NonzeroOnEntry(selector->Arg(0), handle.Parent());
+				if (bitscan) {
+					indirect.key_count = Value(32u);
+				} else {
+					indirect.key_count = BoundedLoopCount(key, handle.Parent());
+				}
+				if (indirect.key_count.IsEmpty() &&
+				    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, pc)) {
+					return false;
+				}
+				if ((table_offset & 3u) != 0u ||
+				    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 			} else {
-				indirect.key_count = BoundedLoopCount(key, handle.Parent());
+				auto* material_read = key.Resolve().TryInstruction();
+				uint32_t material_memory_index = 0;
+				const auto* memory = material_read != nullptr
+				                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
+				// The record read may carry its own immediate offset (S_BUFFER_LOAD offset=4 reads the
+				// second dword of a per-material record): it adds to the selector offset.
+				if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+				    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+				    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+					return false;
+				}
+				Value selector;
+				DescriptorSource::IndirectDescriptor::SelectorRead selector_read;
+				if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_read.stride,
+				                         selector_read.offset) ||
+				    selector_read.offset > UINT32_MAX - memory->offset) {
+					return false;
+				}
+				selector_read.offset += memory->offset;
+				const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
+				const std::array<const Inst*, 1> material_users {shift};
+				if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
+					return false;
+				}
+				const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+				if (material_handle == nullptr ||
+				    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+				    !MakeRuntimeTableSource(*material_handle, pc, material_source)) {
+					return false;
+				}
+				selector_read.source = InternSource(material_source);
+				indirect.selector    = selector_read;
 			}
-			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, pc)) {
+			return true;
+		};
+		if (!enumerable()) {
+			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
+				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+				       ImageResourceClass::Sampled;
+			});
+			if (!BindlessImagesEnabled() || !sampled_only || table_source.dword_count != 4u) {
 				return false;
 			}
-			if ((table_offset & 3u) != 0u ||
-			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
-		} else {
-			auto* material_read = key.Resolve().TryInstruction();
-			uint32_t material_memory_index = 0;
-			const auto* memory = material_read != nullptr
-			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
-			// The record read may carry its own immediate offset (S_BUFFER_LOAD offset=4 reads the
-			// second dword of a per-material record): it adds to the selector offset.
-			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
-			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-				return false;
-			}
-			Value selector;
-			DescriptorSource::IndirectDescriptor::SelectorRead selector_read;
-			if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_read.stride,
-			                         selector_read.offset) ||
-			    selector_read.offset > UINT32_MAX - memory->offset) {
-				return false;
-			}
-			selector_read.offset += memory->offset;
-			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
-			const std::array<const Inst*, 1> material_users {shift};
-			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
-				return false;
-			}
-			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-			if (material_handle == nullptr ||
-			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_handle, pc, material_source)) {
-				return false;
-			}
-			selector_read.source = InternSource(material_source);
-			indirect.selector    = selector_read;
+			indirect              = {};
+			indirect.table_offset = table_offset;
+			indirect.table_stride = 32u;
+			indirect.bindless     = true;
+			material_source       = {};
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;

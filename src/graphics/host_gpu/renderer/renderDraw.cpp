@@ -1939,8 +1939,10 @@ static void NotePipelineWait(std::chrono::steady_clock::duration elapsed) {
 static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::StagePrep& b) noexcept {
 	auto& [a_resources, a_specialization, a_permutation] = a;
 	auto& [b_resources, b_specialization, b_permutation] = b;
-	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill, a_gpu_fills] = a_resources;
-	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill, b_gpu_fills] = b_resources;
+	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill, a_gpu_fills,
+	       a_bindless_heaps] = a_resources;
+	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill, b_gpu_fills,
+	       b_bindless_heaps] = b_resources;
 	auto& [a_spec_buffers, a_spec_images] = a_specialization;
 	auto& [b_spec_buffers, b_spec_images] = b_specialization;
 	a_buffers.swap(b_buffers);
@@ -1950,6 +1952,7 @@ static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::Sta
 	a_user_data.swap(b_user_data);
 	std::swap(a_fill, b_fill);
 	a_gpu_fills.swap(b_gpu_fills);
+	a_bindless_heaps.swap(b_bindless_heaps);
 	a_spec_buffers.swap(b_spec_buffers);
 	a_spec_images.swap(b_spec_images);
 	std::swap(a_permutation, b_permutation);

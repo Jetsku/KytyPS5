@@ -19,12 +19,12 @@ namespace {
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
 // Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
-// ImageResource 20; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// ImageResource 21; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 7; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
-// 11, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// 12, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
-// ResourceSpecialization 2 (Buffer 3, Image 10).
+// ResourceSpecialization 2 (Buffer 3, Image 11).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
@@ -398,6 +398,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.U32(v.indirect_root);
 	w.U32(v.indirect_mapping_offset);
 	w.U32(v.indirect_search_iterations);
+	w.Bool(v.bindless);
 	w.Words(v.indirect_resources);
 }
 
@@ -421,6 +422,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.indirect_root              = r.U32();
 	v.indirect_mapping_offset    = r.U32();
 	v.indirect_search_iterations = r.U32();
+	v.bindless                   = r.Bool();
 	v.indirect_resources         = r.Words();
 }
 
@@ -555,6 +557,7 @@ void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {
 	w.U32(v.indirect_search_iterations);
 	w.Bool(v.cube);
 	w.Bool(v.fmask);
+	w.Bool(v.bindless);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Image& v) {
@@ -568,6 +571,7 @@ void Read(CodecReader& r, ResourceSpecialization::Image& v) {
 	v.indirect_search_iterations = r.U32();
 	v.cube                       = r.Bool();
 	v.fmask                      = r.Bool();
+	v.bindless                   = r.Bool();
 }
 
 void Write(CodecWriter& w, const ResourcePlan::EvaluationOperand& v) {
@@ -750,6 +754,7 @@ public:
 				w.U32(image.table_record_bytes);
 				w.Bool(image.table_scalar);
 				w.U32(image.workgroup_axis);
+				w.Bool(image.bindless);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
@@ -983,6 +988,7 @@ public:
 				image.table_record_bytes = r.U32();
 				image.table_scalar       = r.Bool();
 				image.workgroup_axis     = r.U32();
+				image.bindless           = r.Bool();
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;

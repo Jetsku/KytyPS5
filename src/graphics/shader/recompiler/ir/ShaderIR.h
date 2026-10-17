@@ -204,6 +204,9 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
+	// table gives for the handle's key; the mapping offset locates the heap's region and size.
+	bool                          bindless          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -601,6 +604,8 @@ struct DescriptorSource {
 		uint32_t table_stride    = 0;
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
+		// No enumeration: the shader looks the key up in the bindless translation table.
+		bool     bindless     = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
 		Value                 selector_first;
