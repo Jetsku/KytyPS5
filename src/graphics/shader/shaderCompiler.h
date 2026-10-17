@@ -20,9 +20,14 @@ struct ShaderParams {
 	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
+	// A compute program whose S_SWAPPC_B64 calls were expanded (ShaderRecompiler::ShaderCallExpander):
+	// `code` holds the expanded words, `guest_base` the guest address of the original program and
+	// `call_expansion` the expansion's digest (part of the program key). Zero otherwise.
+	uint64_t                  guest_base     = 0;
+	uint64_t                  call_expansion = 0;
 
 	[[nodiscard]] uint64_t Base() const {
-		return reinterpret_cast<uint64_t>(code.data());
+		return guest_base != 0 ? guest_base : reinterpret_cast<uint64_t>(code.data());
 	}
 };
 

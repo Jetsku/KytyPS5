@@ -6,7 +6,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -57,9 +59,32 @@ struct CallTable {
 	uint32_t                   return_sgpr  = 0;
 	uint32_t                   record_shift = 0;
 	uint32_t                   target_word  = 0;
+	uint32_t                   record_offset = 0; // the record load's immediate byte offset
 	uint32_t                   table_index  = 0;
 	std::vector<CallTableStep> steps;
 };
+
+// An S_SWAPPC_B64 call of a program and where its target comes from: user SGPRs
+// s[user_sgpr:+1] (user_sgpr != UINT32_MAX), a table (`table`), or neither (not traced).
+struct ShaderCall {
+	uint32_t                 pc         = 0;
+	uint32_t                 source_reg = 0;
+	uint32_t                 return_reg = 0;
+	uint32_t                 user_sgpr  = UINT32_MAX;
+	std::optional<CallTable> table;
+
+	[[nodiscard]] bool Traced() const { return user_sgpr != UINT32_MAX || table.has_value(); }
+};
+
+struct ShaderCallAnalysis {
+	std::vector<ShaderCall> calls;
+	std::string             failures; // the calls that are not traced, empty when all are
+};
+
+// The calls of a program and the origin of their targets (the traces the S_SWAPPC_B64 skip
+// diagnostics log), from the code and the user-data count alone.
+[[nodiscard]] ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code,
+                                                    const CompileOptions& options);
 
 struct TranslateResult {
 	IR::Program program;

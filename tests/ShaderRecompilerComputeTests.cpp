@@ -61,6 +61,7 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/BvhReference.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ShaderCalls.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
@@ -1361,6 +1362,33 @@ void AppendStoreSgprPair(std::vector<u32> *code, u32 value_sgpr,
 }
 
 void AppendEnd(std::vector<u32> *code) { code->push_back(0xbf810000u); }
+
+// Callees for the call tests (Miles Morales' hit callbacks take the record's data dword in s16 and
+// return through s[14:15]): A adds 7 to it (and writes SCC), B copies it (SCC untouched), C branches
+// on it and reads its own PC, D (never in the table the expansion sees) writes 0x777.
+struct TestCallees {
+  static constexpr u32 Stride = 0x100;
+  std::vector<u32> words = std::vector<u32>(4 * Stride / 4, 0xbf810000u);
+  TestCallees() {
+    const auto put = [&](u32 index, std::initializer_list<u32> code) {
+      std::copy(code.begin(), code.end(), words.begin() + index * Stride / 4);
+    };
+    put(0, {EncodeSop2(0x00, 21, 16, InlineU32(7)), // s_add_u32 s21, s16, 7
+            EncodeVop1(0x01, 1, 21),                // v_mov_b32 v1, s21
+            EncodeSop1(0x20, 0, 14)});              // s_setpc_b64 s[14:15]
+    put(1, {EncodeVop1(0x01, 1, 16), EncodeSop1(0x20, 0, 14)});
+    put(2, {EncodeSopc(0x06, 16, InlineU32(5)), // s_cmp_eq_u32 s16, 5
+            EncodeSopp(0x04, 3),                // s_cbranch_scc0 +3
+            EncodeVop1(0x01, 1, 255), 0x555u,   // v_mov_b32 v1, 0x555
+            EncodeSopp(0x02, 2),                // s_branch +2
+            EncodeVop1(0x01, 1, 255), 0x666u,   // v_mov_b32 v1, 0x666
+            EncodeSop1(0x1f, 22, 0),            // s_getpc_b64 s[22:23] (callee + 32)
+            EncodeVop1(0x01, 2, 22),            // v_mov_b32 v2, s22
+            EncodeSop1(0x20, 0, 14)});
+    put(3, {EncodeVop1(0x01, 1, 255), 0x777u, EncodeSop1(0x20, 0, 14)});
+  }
+  static uint64_t Address(uint64_t base, u32 index) { return base + index * Stride; }
+};
 
 std::string Hex(u32 value) {
   char buffer[32] = {};
@@ -20035,6 +20063,164 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
                 0,
             "callee allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_SHADER_CALLS through the real pipeline cache (ExpandComputeCalls): a loop calls through a
+  // table of 16-byte records {function, data} (the table V# loaded through the user-data pointer
+  // s[4:5]), as Miles Morales' ray-tracing kernels do, and stores v1 and SCC after each call. The
+  // callees are guest code: A adds 7 to the data (and clears SCC), B copies it (SCC kept), C
+  // branches on it; record 3 is null and record 4 names nothing in the first run: those calls are
+  // skipped. The second run names D in record 4; the program is expanded again at the periodic
+  // rescan, and the last of its 64 dispatches stores D's value.
+  void CheckCallTableDispatch() {
+    constexpr const char *name = "CallTableDispatch";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t output = base;               // 16 dwords, bound through s[0:3]
+    constexpr uint64_t pointer = base + 0x1000;     // the table V#, at s[4:5]
+    constexpr uint64_t table = base + 0x2000;       // 5 records
+    constexpr uint64_t callees = base + 0x10000;
+    EnsureRuntimeContext();
+
+    static std::vector<u32> code;
+    code.clear();
+    code.push_back(EncodeSmem0(0x02, 72, 2));                // s_load_dwordx4 s[72:75], s[4:5], 0
+    code.push_back(EncodeSmem1(0, 125));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));                // s_waitcnt lgkmcnt(0)
+    AppendSMovLiteral(&code, 40, 0);                         // i
+    AppendSMovLiteral(&code, 41, 0);                         // output byte offset
+    const auto loop = code.size();
+    code.push_back(EncodeSop2(0x1e, 106, 40, InlineU32(4))); // s_lshl_b32 vcc_lo, s40, 4
+    code.push_back(EncodeSmem0(0x0a, 8, 36));                // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
+    code.push_back(EncodeSmem1(0, 106));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));
+    AppendVMovLiteral(&code, 1, 999);
+    code.push_back(EncodeSopc(0x0d, 40, InlineU32(0)));      // s_bitcmp1_b32 s40, 0: SCC = odd i
+    code.push_back(EncodeSMovB32(14, 8));
+    code.push_back(EncodeSMovB32(15, 9));
+    code.push_back(EncodeSMovB32(16, 10));
+    code.push_back(0xbe8e210eu);                             // s_swappc_b64 s[14:15], s[14:15]
+    code.push_back(EncodeSop2(0x0a, 31, InlineU32(1), InlineU32(2))); // s_cselect_b32 s31, 1, 2
+    code.push_back(EncodeVop1(0x01, 2, 41));                 // v_mov_b32 v2, s41
+    code.push_back(EncodeMubuf0(0x1c));                      // buffer_store_dword v1, v2, s[0:3] offen
+    code.push_back(EncodeMubuf1(1, 0, 2));
+    code.push_back(EncodeVop1(0x01, 3, 31));                 // v_mov_b32 v3, s31
+    code.push_back(EncodeMubuf0(0x1c, 4));                   // buffer_store_dword v3, v2, s[0:3] offen offset:4
+    code.push_back(EncodeMubuf1(3, 0, 2));
+    code.push_back(EncodeSop2(0x00, 41, 41, InlineU32(8)));  // s_add_u32 s41, s41, 8
+    code.push_back(EncodeSop2(0x00, 40, 40, InlineU32(1)));  // s_add_u32 s40, s40, 1
+    code.push_back(EncodeSopc(0x0a, 40, InlineU32(5)));      // s_cmp_lt_u32 s40, 5
+    const auto back_branch = code.size();
+    code.push_back(EncodeSopp(0x05, static_cast<u32>(static_cast<int32_t>(loop) -
+                                                     static_cast<int32_t>(back_branch + 1)) &
+                                        0xffffu));           // s_cbranch_scc1 loop
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "call-table direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "call-table direct mapping failed");
+
+    const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+    const auto run = [&](bool with_d, uint32_t dispatches) {
+      std::memset(mapped, 0, allocation_size);
+      TestCallees functions;
+      std::memcpy(reinterpret_cast<void *>(callees), functions.words.data(),
+                  functions.words.size() * sizeof(u32));
+      auto *vsharp = reinterpret_cast<u32 *>(pointer);
+      vsharp[0] = static_cast<u32>(table);
+      vsharp[1] = static_cast<u32>(table >> 32u);
+      vsharp[2] = 5u * 16u;
+      vsharp[3] = 0x5204u;
+      auto *records = reinterpret_cast<u32 *>(table);
+      const auto record = [&](u32 index, uint64_t function, u32 data) {
+        records[index * 4 + 0] = static_cast<u32>(function);
+        records[index * 4 + 1] = static_cast<u32>(function >> 32u);
+        records[index * 4 + 2] = data;
+      };
+      record(0, TestCallees::Address(callees, 0), 10);
+      record(1, TestCallees::Address(callees, 1), 20);
+      record(2, TestCallees::Address(callees, 2), 5);
+      if (with_d) record(4, TestCallees::Address(callees, 3), 0);
+      auto options = saved_options;
+      options.srt_variant_reads = true;
+      options.shader_calls = true;
+      ShaderRecompiler::SetCodegenOptions(options);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        (void)context.GetBufferCache().FindBuffer(table, BufferCache::CACHING_PAGESIZE);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 6, .tgid_x_en = true});
+        const std::array<u32, 6> user{static_cast<u32>(output), static_cast<u32>(output >> 32u),
+                                      64u, (3u << 28u) | (0x16u << 12u) | 0xfacu,
+                                      static_cast<u32>(pointer), static_cast<u32>(pointer >> 32u)};
+        for (uint32_t i = 0; i < user.size(); i++) {
+          shaders.SetCsUserSgpr(i, user[i], HW::UserSgprType::Unknown);
+        }
+        for (uint32_t dispatch = 0; dispatch < dispatches; dispatch++) {
+          context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+        }
+      });
+      std::array<u32, 10> stored{};
+      for (u32 i = 0; i < stored.size(); i++) {
+        stored[i] = reinterpret_cast<volatile u32 *>(output)[i];
+      }
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+      ShaderRecompiler::SetCodegenOptions(saved_options);
+      return stored;
+    };
+    const auto text = [](const std::array<u32, 10> &values) {
+      std::string result;
+      for (const auto value : values) result += " " + Hex(value);
+      return result;
+    };
+    // v1 and SCC (1 set, 2 clear) per call: A, B (odd: SCC kept set), C, null (skipped), record 4.
+    const std::array<u32, 10> first_expected{17, 2, 20, 1, 0x555, 1, 999, 1, 999, 2};
+    const auto first = run(false, 1);
+    Require(name, "expanded calls", first == first_expected, "the calls stored" + text(first));
+    auto second_expected = first_expected;
+    second_expected[8] = 0x777;
+    const auto second = run(true, 64);
+    Require(name, "new target after the rescan", second == second_expected,
+            "after the table named a new callee, the calls stored" + text(second));
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "call-table mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "call-table allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

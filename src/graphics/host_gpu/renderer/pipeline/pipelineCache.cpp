@@ -40,6 +40,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ShaderCalls.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -1204,6 +1205,48 @@ DescribeCallTables(const char* stage_name, const ShaderRecompiler::CompileOption
 	return targets;
 }
 
+// Whether a compute program may call through S_SWAPPC_B64 (any word looks like a call): memoized
+// per thread by program address and hash, so programs without calls pay one lookup per dispatch.
+static bool ComputeProgramMayCall(const ShaderParams& params) {
+	thread_local std::unordered_map<uint64_t, bool> known;
+	const auto key = params.Base() ^ (params.hash * 0x9e3779b97f4a7c15ull) ^ params.code.size();
+	const auto [entry, inserted] = known.try_emplace(key, false);
+	if (inserted) {
+		entry->second = ShaderRecompiler::Decoder::MayCallFunctions(params.code);
+	}
+	return entry->second;
+}
+
+// KYTY_SHADER_CALLS (default on): a compute program that calls functions through S_SWAPPC_B64 is
+// replaced by its expansion (ShaderRecompiler::ShaderCallExpander), which then goes through the
+// program cache like any program: `code` holds the expanded words and the key the expansion's
+// digest. A program that does not expand keeps its code (and is skipped as before).
+static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
+	if (!ShaderRecompiler::GetCodegenOptions().shader_calls || !params.back_code.empty() ||
+	    params.code.empty() || !ComputeProgramMayCall(params)) {
+		return false;
+	}
+	static ShaderRecompiler::ShaderCallExpander expander;
+	ShaderRecompiler::CompileOptions            options;
+	options.stage       = ShaderType::Compute;
+	options.wave_size   = wave_size;
+	options.shader_hash = params.hash;
+	options.user_data   = std::span(params.user_data).first(params.user_data_count);
+	ShaderRecompiler::ShaderCallExpander::Expanded expanded;
+	if (!expander.Expand(
+	        params.code, params.Base(), options,
+	        [](uint64_t address, std::span<uint32_t> words) {
+		        return ReadCallTableMemory(address, words.data(), words.size_bytes());
+	        },
+	        expanded)) {
+		return true;
+	}
+	params.guest_base     = params.Base();
+	params.code           = *expanded.code;
+	params.call_expansion = expanded.digest | 1u; // never 0
+	return true;
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -2071,6 +2114,11 @@ struct PipelineCache::ProgramCache {
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);
+		if (params.call_expansion != 0) [[unlikely]] {
+			// An expanded S_SWAPPC_B64 program (ExpandComputeCalls): its code depends on the callees.
+			key.static_state.push_back(static_cast<uint32_t>(params.call_expansion));
+			key.static_state.push_back(static_cast<uint32_t>(params.call_expansion >> 32u));
+		}
 	}
 
 	static ShaderRecompiler::IR::SrtRuntime MakeRuntime(const ShaderParams& params,
@@ -3025,7 +3073,8 @@ struct PipelineCache::ProgramCache {
 			const auto load_begin = CompileClockNs();
 			auto disk_params = params;
 			disk_params.code = translation_code;
-			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words, speculative);
+			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words,
+			             speculative || params.call_expansion != 0);
 			if (source == nullptr) {
 				disk_source = disk->FindSource(disk_key);
 			}
@@ -3309,7 +3358,8 @@ struct PipelineCache::ProgramCache {
 			disk->AddPermutation(disk_key.digest, push_data_cursor, specialization_bytes, info,
 			                     words.spirv, words.spirv_plain);
 		}
-		if (journal != nullptr && !replay) {
+		// An expanded call program (host-owned code) is not journaled: its key names its callees.
+		if (journal != nullptr && !replay && params.call_expansion == 0) {
 			JournalPermutation(params, translation_code, key, options, input_info,
 			                   push_data_cursor, permutation.specialization, specialization_bytes,
 			                   code_words);
@@ -6822,7 +6872,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	std::optional<CpGaps::Scope> prepare_gap;
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
-	const auto        params      = PrepareProgram(regs, sh, input_info);
+	auto              params      = PrepareProgram(regs, sh, input_info);
+	(void)ExpandComputeCalls(params, input_info.wave_size);
 	prepare_gap.reset();
 	// Use one effective size and placement for the cache key, LDS declaration, and access bounds.
 	// Above the device limit (AMD reports 32 KiB; some Astro Bot compute shaders ask for 48) the
@@ -6892,6 +6943,11 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareComputeProgramSpeculative
 	const auto params             = PrepareProgram(regs, sh, input_info);
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;
+	}
+	// A program with calls is expanded on the serial path only (ExpandComputeCalls).
+	if (ShaderRecompiler::GetCodegenOptions().shader_calls && params.back_code.empty() &&
+	    ComputeProgramMayCall(params)) {
+		return SpeculativeResult::Ineligible;
 	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;

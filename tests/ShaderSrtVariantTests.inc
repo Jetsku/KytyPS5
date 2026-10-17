@@ -607,20 +607,255 @@ void CallTablesTraced() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+// KYTY_SHADER_CALLS: guest memory for the expansion side of the call tests: (guest address, words).
+struct FakeGuestMemory {
+  std::vector<std::pair<uint64_t, std::vector<u32> *>> regions;
+
+  bool Read(uint64_t address, std::span<u32> words) const {
+    for (const auto &[base, data] : regions) {
+      const uint64_t end = base + data->size() * 4u;
+      if (address >= base && address + words.size_bytes() <= end && (address & 3u) == 0) {
+        std::copy_n(data->begin() + static_cast<std::ptrdiff_t>((address - base) / 4u), words.size(),
+                    words.begin());
+        return true;
+      }
+    }
+    return false;
+  }
+  ShaderRecompiler::Decoder::ShaderCodeReader Reader() const {
+    return [this](uint64_t address, std::span<u32> words) { return Read(address, words); };
+  }
+};
+
+// The call shape of Miles Morales' ray-tracing kernels, expanded (ShaderCallExpander) and run: the
+// table V# is loaded through the user-data V#, each call loads a 16-byte record {function, data} at
+// index << 4, copies it into s[14:16] and calls s[14:15]. Records 0-2 name callees A-C; record 3 is
+// null and record 4 names D only in the GPU's copy (the expansion did not see it): both skip the
+// call. Each call stores SCC after the call (s_cselect 1 : 2), v1 (999 before the call) and v2 (0
+// before). Calls alternate the SCC they enter with; B keeps it, A and C set it.
+TestCase CallTableExpanded() {
+  using O = ShaderOpcode;
+  // The harness binds every buffer the program reads to its one test buffer, from its start, and
+  // its user-data V# s[0:3] has base 0: the table is at the start of the buffer (a table V# with
+  // base 0), the stores follow it.
+  constexpr uint64_t GuestBase = 0;
+  constexpr u32 Out = 20;
+  constexpr uint64_t CalleeBase = 0x0000000140000000ull;
+  constexpr u32 TableByte = 0;
+  static TestCallees callees;
+  TestCase test;
+  test.name = "CallTableExpanded";
+  test.initial.resize(2048);
+  const uint64_t table = GuestBase + TableByte;
+  const std::array<u32, 4> table_vsharp{static_cast<u32>(table), static_cast<u32>(table >> 32u),
+                                        5u * 16u, 0x5204u};
+  std::copy(table_vsharp.begin(), table_vsharp.end(), test.initial.begin() + 130);
+  const auto record = [&](std::vector<u32> &words, u32 index, uint64_t function, u32 data) {
+    words[TableByte / 4 + index * 4 + 0] = static_cast<u32>(function);
+    words[TableByte / 4 + index * 4 + 1] = static_cast<u32>(function >> 32u);
+    words[TableByte / 4 + index * 4 + 2] = data;
+  };
+  record(test.initial, 0, TestCallees::Address(CalleeBase, 0), 10);
+  record(test.initial, 1, TestCallees::Address(CalleeBase, 1), 20);
+  record(test.initial, 2, TestCallees::Address(CalleeBase, 2), 5);
+  const std::array<u32, 6> indices{0, 1, 2, 3, 4, 1};
+  for (u32 i = 0; i < indices.size(); ++i) {
+    test.initial[64 + i] = indices[i];
+  }
+  // What the expansion reads: the same buffer without record 4.
+  static std::vector<u32> seen;
+  seen = test.initial;
+  record(test.initial, 4, TestCallees::Address(CalleeBase, 3), 0);
+
+  auto &code = test.code;
+  code.push_back(EncodeSmem0(0x0a, 72, 0)); // s_buffer_load_dwordx4 s[72:75], s[0:3], 520
+  code.push_back(EncodeSmem1(520, 125));
+  for (u32 i = 0; i < indices.size(); ++i) {
+    AppendVMovU32(&code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&code, 0, 30);
+    code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));                       // v_readfirstlane_b32 s20, v0
+    AppendVMovLiteral(&code, 1, 999);
+    code.push_back(EncodeVop1(0x01, 2, InlineU32(0)));                  // v_mov_b32 v2, 0
+    code.push_back(EncodeSop2(0x1e, 106, 20, InlineU32(4)));            // s_lshl_b32 vcc_lo, s20, 4
+    code.push_back(EncodeSmem0(0x0a, 8, 36));                           // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
+    code.push_back(EncodeSmem1(0, 106));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));                           // s_waitcnt lgkmcnt(0)
+    code.push_back(EncodeSopc(0x06, InlineU32(i & 1u), InlineU32(1)));  // SCC = odd call
+    code.push_back(EncodeSMovB32(14, 8));
+    code.push_back(EncodeSMovB32(15, 9));
+    code.push_back(EncodeSMovB32(16, 10));
+    code.push_back(0xbe8e210eu);                                        // s_swappc_b64 s[14:15], s[14:15]
+    code.push_back(EncodeSop2(0x0a, 31, InlineU32(1), InlineU32(2)));   // s_cselect_b32 s31, 1, 2
+    AppendStoreSgpr(&code, 31, Out + i * 3 + 0);
+    code.push_back(EncodeVop1(0x02, 32, Vgpr(1)));                      // v_readfirstlane_b32 s32, v1
+    AppendStoreSgpr(&code, 32, Out + i * 3 + 1);
+    code.push_back(EncodeVop1(0x02, 33, Vgpr(2)));
+    AppendStoreSgpr(&code, 33, Out + i * 3 + 2);
+  }
+  AppendEnd(&code);
+  const auto callee_c_pc = static_cast<u32>(TestCallees::Address(CalleeBase, 2) + 32u);
+  test.expected.assign(test.initial.begin(), test.initial.begin() + Out); // the table
+  test.expected.insert(test.expected.end(), {2, 17, 0,           // A: 10 + 7; its s_add clears SCC
+                   1, 20, 0,           // B: SCC kept (odd call)
+                   1, 0x555, callee_c_pc, // C: s16 == 5; its compare sets SCC
+                   1, 999, 0,          // null record: skipped, SCC kept
+                   2, 999, 0,          // D, outside the expanded set: skipped, SCC kept
+                   1, 20, 0});
+
+  // The expansion, as the pipeline cache does it with this user data and memory.
+  static std::vector<u32> callee_words;
+  callee_words = callees.words;
+  FakeGuestMemory memory;
+  memory.regions = {{GuestBase, &seen}, {CalleeBase, &callee_words}};
+  std::array<u32, 4> user_data{0u, 0u, 8192u, 3u << 28u};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.shader_hash = 0x5ca11ab1e0000001ull;
+  options.user_data = user_data;
+  ShaderRecompiler::ShaderCallExpander expander;
+  ShaderRecompiler::ShaderCallExpander::Expanded expanded;
+  Require(test.name, "expanded",
+          expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), options, memory.Reader(),
+                          expanded) &&
+              expanded.code != nullptr,
+          "the call-table program did not expand");
+  Require(test.name, "no call left",
+          !ShaderRecompiler::Decoder::MayCallFunctions(*expanded.code),
+          "the expansion still holds an S_SWAPPC_B64");
+  code = *expanded.code;
+  test.opcodes = {O::S_BUFFER_LOAD_DWORDX4, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::S_CSELECT_B32,
+                  O::S_ENDPGM};
+  return test;
+}
+
+// ShaderCallExpander: an expansion is kept while the targets stay the same; a target that appears
+// in the table is picked up when the descriptor changes or at the periodic rescan, and a changed
+// callee at the rescan. A program without calls, or with a call whose target is not traced, does
+// not expand. A callee that cannot be placed (here: a nested call) is left out.
+void CallExpanderRefreshes() {
+  constexpr const char *name = "CallExpanderRefreshes";
+  constexpr uint64_t DataBase = 0x0000000150000000ull;
+  constexpr uint64_t CalleeBase = 0x0000000160000000ull;
+  static TestCallees callees;
+  static std::vector<u32> callee_words;
+  callee_words = callees.words;
+  // A fifth callee with a nested call.
+  callee_words.resize(callee_words.size() + TestCallees::Stride / 4, 0xbf810000u);
+  callee_words[4 * TestCallees::Stride / 4] = 0xbe94210au; // s_swappc_b64 s[20:21], s[10:11]
+  callee_words[4 * TestCallees::Stride / 4 + 1] = EncodeSop1(0x20, 0, 14);
+  // Data: the table V# at +0, the table at +0x100 (4 records).
+  static std::vector<u32> data;
+  data.assign(0x200 / 4, 0u);
+  const uint64_t table = DataBase + 0x100;
+  data[0] = static_cast<u32>(table);
+  data[1] = static_cast<u32>(table >> 32u);
+  data[2] = 4u * 16u;
+  const auto record = [&](u32 index, uint64_t function) {
+    data[0x100 / 4 + index * 4 + 0] = static_cast<u32>(function);
+    data[0x100 / 4 + index * 4 + 1] = static_cast<u32>(function >> 32u);
+  };
+  record(0, TestCallees::Address(CalleeBase, 0));
+  record(1, TestCallees::Address(CalleeBase, 4)); // the nested call: left out
+  FakeGuestMemory memory;
+  memory.regions = {{DataBase, &data}, {CalleeBase, &callee_words}};
+
+  std::vector<u32> code;
+  code.push_back(EncodeSmem0(0x02, 72, 2)); // s_load_dwordx4 s[72:75], s[4:5], 0
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 36));
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu);
+  AppendEnd(&code);
+  std::array<u32, 8> user_data{};
+  user_data[4] = static_cast<u32>(DataBase);
+  user_data[5] = static_cast<u32>(DataBase >> 32u);
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.shader_hash = 0x5ca11ab1e0000002ull;
+  options.user_data = user_data;
+  const uint64_t base = 0x0000000170000000ull;
+  ShaderRecompiler::ShaderCallExpander expander;
+  expander.rescan_interval = 4;
+  ShaderRecompiler::ShaderCallExpander::Expanded first, again, grown, patched, moved;
+  const auto expand = [&](ShaderRecompiler::ShaderCallExpander::Expanded &out) {
+    return expander.Expand(code, base, options, memory.Reader(), out) && out.code != nullptr;
+  };
+  Require(name, "first", expand(first), "the program did not expand");
+  Require(name, "kept", expand(again) && again.code == first.code,
+          "an unchanged dispatch expanded the program again");
+  record(2, TestCallees::Address(CalleeBase, 1));
+  // Dispatches 3 and 4: no rescan yet (every 4th dispatch from the first rescans).
+  Require(name, "before the rescan",
+          expand(again) && again.code == first.code && expand(again) && again.code == first.code,
+          "a table change was picked up before the rescan without a descriptor change");
+  Require(name, "rescan", expand(grown) && grown.digest != first.digest,
+          "the periodic rescan missed a new target");
+  callee_words[TestCallees::Stride / 4] = EncodeVop1(0x01, 1, InlineU32(3)); // patch B
+  for (int i = 0; i < 3; ++i) {
+    Require(name, "patched callee", expand(patched) && patched.code == grown.code,
+            "a changed callee was picked up before the rescan");
+  }
+  Require(name, "patched callee", expand(patched) && patched.digest != grown.digest,
+          "a changed callee was not expanded again at the rescan");
+  // A new table (the descriptor changes): read at once.
+  data[0] = static_cast<u32>(table + 0x40);
+  data[2] = 2u * 16u;
+  record(4, TestCallees::Address(CalleeBase, 2));
+  Require(name, "moved table", expand(moved) && moved.digest != patched.digest,
+          "a changed table descriptor was not read at once");
+
+  // The expansion of the nested-call callee is left out, and the program still has no call.
+  Require(name, "nested call left out", !ShaderRecompiler::Decoder::MayCallFunctions(*moved.code),
+          "a callee with a nested call was placed");
+
+  // No calls; an untraced target (s[14:15] computed).
+  std::vector<u32> plain;
+  plain.push_back(EncodeSMovB32(20, 4));
+  AppendEnd(&plain);
+  ShaderRecompiler::ShaderCallExpander::Expanded none;
+  Require(name, "no calls",
+          !expander.Expand(plain, base + 0x1000, options, memory.Reader(), none),
+          "a program without calls expanded");
+  std::vector<u32> computed;
+  computed.push_back(EncodeSMovB32(14, 4));
+  computed.push_back(EncodeSMovB32(15, 5));
+  computed.push_back(EncodeSop2(0x00, 14, 14, InlineU32(4))); // s_add_u32 s14, s14, 4
+  computed.push_back(0xbe8e210eu);
+  AppendEnd(&computed);
+  Require(name, "untraced",
+          !expander.Expand(computed, base + 0x2000, options, memory.Reader(), none),
+          "a call with an untraced target expanded");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
+  {
+    // The skip and dump behaviour of programs with calls (KYTY_SHADER_CALLS=0).
+    auto skipping = options;
+    skipping.shader_calls = false;
+    ScopedCodegenOptions scope(skipping);
+    RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
+    RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
+    RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
+    CallIsSkipped();
+    CallTargetsFromUserData();
+    CallTablesTraced();
+    vulkan->CheckCallTargetDump();
+    NullBasedFlatReadReadsZero();
+    VariantPlanIsFound();
+    vulkan->CheckVariantPlanSkipped();
+  }
+  options.shader_calls = true;
   ScopedCodegenOptions scope(options);
-  RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
-  RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
-  RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
-  CallIsSkipped();
-  CallTargetsFromUserData();
-  CallTablesTraced();
-  vulkan->CheckCallTargetDump();
-  NullBasedFlatReadReadsZero();
-  VariantPlanIsFound();
-  vulkan->CheckVariantPlanSkipped();
+  CallExpanderRefreshes();
+  vulkan->CheckCallTableDispatch();
+  RunCase(vulkan, CallTableExpanded());
 }
 
 } // namespace SrtVariantTests

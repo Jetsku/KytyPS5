@@ -618,8 +618,10 @@ static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg) {
 // never writes, or the user SGPRs themselves when nothing before the call writes them. Anything
 // else (another write, a branch or branch target on the way, an odd or non-user pair) leaves the
 // call `unresolved`: its callee is unknown.
-static std::vector<CallTarget> FindCallTargets(const Decoder::Program& decoded,
-                                               const CompileOptions& options, uint32_t& unresolved) {
+// `per_call`, when given, receives (call pc, user SGPR of the target pair) for every resolved call.
+static std::vector<CallTarget>
+FindCallTargets(const Decoder::Program& decoded, const CompileOptions& options, uint32_t& unresolved,
+                std::vector<std::pair<uint32_t, uint32_t>>* per_call = nullptr) {
 	unresolved             = 0;
 	const auto& insts      = decoded.instructions;
 	const auto  user_sgpr  = [&](uint32_t reg) {
@@ -745,6 +747,9 @@ static std::vector<CallTarget> FindCallTargets(const Decoder::Program& decoded,
 		if (!ok) {
 			unresolved++;
 			continue;
+		}
+		if (per_call != nullptr) {
+			per_call->emplace_back(insts[call].pc, halves[0]);
 		}
 		const auto low  = static_cast<uint64_t>(options.user_data[halves[0] - options.user_data_base]);
 		const auto high = static_cast<uint64_t>(options.user_data[halves[1] - options.user_data_base]);
@@ -1025,7 +1030,8 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 			                 record.pc));
 			continue;
 		}
-		table.target_word = sources[0] - record.dst.reg;
+		table.target_word   = sources[0] - record.dst.reg;
+		table.record_offset = record.offset;
 		// The record index shift: S_LSHL_B32 into the offset register right before.
 		bool shift_found = false;
 		for (size_t i = static_cast<size_t>(load); i-- > 0;) {
@@ -1056,6 +1062,45 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 		tables.push_back(std::move(table));
 	}
 	return tables;
+}
+
+ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code, const CompileOptions& options) {
+	ShaderCallAnalysis analysis;
+	if (code.empty() || !options.back_code.empty() || options.stage == ShaderType::Local) {
+		analysis.failures = "not a single-stage program";
+		return analysis;
+	}
+	Decoder::Program decoded;
+	Decoder::DecodeProgram(code, decoded, true);
+	std::vector<std::pair<uint32_t, uint32_t>> user_calls;
+	uint32_t                                   unresolved = 0;
+	(void)FindCallTargets(decoded, options, unresolved, &user_calls);
+	std::string table_failures;
+	auto        tables = FindCallTables(decoded, options, table_failures);
+	for (const auto& inst: decoded.instructions) {
+		if (!IsUnsupportedCall(inst)) {
+			continue;
+		}
+		ShaderCall call;
+		call.pc         = inst.pc;
+		call.source_reg = inst.raw[0] & 0xffu;
+		call.return_reg = (inst.raw[0] >> 16u) & 0x7fu;
+		if (const auto user = std::ranges::find(user_calls, inst.pc, &std::pair<uint32_t, uint32_t>::first);
+		    user != user_calls.end()) {
+			call.user_sgpr = user->second;
+		} else if (const auto table = std::ranges::find(tables, inst.pc, &CallTable::call_pc);
+		           table != tables.end()) {
+			call.table = *table;
+		} else {
+			analysis.failures += fmt::format("{}pc 0x{:x}: target not traced", analysis.failures.empty() ? "" : "; ",
+			                                 inst.pc);
+		}
+		analysis.calls.push_back(std::move(call));
+	}
+	if (!analysis.failures.empty() && !table_failures.empty()) {
+		analysis.failures += fmt::format(" (table trace: {})", table_failures);
+	}
+	return analysis;
 }
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
