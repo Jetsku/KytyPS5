@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -925,10 +927,14 @@ struct CommandBufferState {
 	uint64_t                         gather_scatter_file_offset = 0;
 };
 
-struct AmmAutoPoolRange {
-	uint64_t start = 0;
-	uint64_t size  = 0;
-	uint64_t used  = 0;
+// Automatic AMM backing (map-auto commands). The pool holds the direct memory given with
+// AMM_USAGE_AUTO; a map-auto takes free pieces of it, and an unmap (or a map over the range)
+// returns them. Before, the pool was a bump allocator that never took memory back, so streaming
+// ran out of direct memory after a few minutes (Miles Morales: map-auto EAGAIN, then an APR read
+// into the unmapped range).
+struct AmmAutoRun {
+	uint64_t dmem = 0;
+	uint64_t size = 0;
 };
 
 struct AmmVirtualAddressRanges {
@@ -952,7 +958,8 @@ static std::mutex                                       g_command_buffer_mutex;
 static std::unordered_map<uint64_t, CommandBufferState> g_command_buffers;
 static std::unordered_map<uint64_t, uint64_t>           g_command_buffer_aliases;
 static std::mutex                                       g_amm_auto_pool_mutex;
-static std::vector<AmmAutoPoolRange>                    g_amm_auto_pool;
+static std::map<uint64_t, uint64_t>                     g_amm_auto_free; // dmem start -> size
+static std::map<uint64_t, AmmAutoRun>                   g_amm_auto_runs; // va start -> backing
 using CommandBufferIterator = std::unordered_map<uint64_t, CommandBufferState>::iterator;
 static std::atomic<uint64_t> g_diagnostic_generation {0};
 
@@ -1691,31 +1698,121 @@ static int NormalizeAmmProtection(int prot) {
 	return normalized;
 }
 
-static bool AllocateAmmAutoDirectMemory(uint64_t size, int memory_type, uint64_t* dmem_offset) {
-	if (dmem_offset == nullptr || size == 0) {
-		return false;
-	}
-
-	std::scoped_lock lock(g_amm_auto_pool_mutex);
-
-	for (auto& range: g_amm_auto_pool) {
-		const auto aligned_used = (range.used + (AMM_PAGE_SIZE - 1u)) & ~(AMM_PAGE_SIZE - 1u);
-		if (aligned_used <= range.size && size <= range.size - aligned_used) {
-			*dmem_offset = range.start + aligned_used;
-			range.used   = aligned_used + size;
-			return true;
+// Callers hold g_amm_auto_pool_mutex.
+static void AmmAutoFreeAdd(uint64_t start, uint64_t size) {
+	auto end  = start + size;
+	auto next = g_amm_auto_free.lower_bound(start);
+	if (next != g_amm_auto_free.begin()) {
+		auto previous = std::prev(next);
+		if (previous->first + previous->second >= start) {
+			start = previous->first;
+			end   = std::max(end, previous->first + previous->second);
+			next  = g_amm_auto_free.erase(previous);
 		}
 	}
+	while (next != g_amm_auto_free.end() && next->first <= end) {
+		end  = std::max(end, next->first + next->second);
+		next = g_amm_auto_free.erase(next);
+	}
+	g_amm_auto_free.emplace(start, end - start);
+}
 
-	int64_t allocated = 0;
-	if (LibKernel::Memory::KernelAllocateDirectMemory(
-	        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, AMM_PAGE_SIZE, memory_type,
-	        &allocated) != OK) {
+// Takes `size` bytes of free automatic backing, possibly in several pieces (first fit).
+static bool AmmAutoTake(uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* pieces) {
+	pieces->clear();
+	uint64_t remaining = size;
+	for (const auto& [start, length]: g_amm_auto_free) {
+		const auto take = std::min(remaining, length);
+		pieces->emplace_back(start, take);
+		remaining -= take;
+		if (remaining == 0) {
+			break;
+		}
+	}
+	if (remaining != 0) {
+		pieces->clear();
 		return false;
 	}
-
-	*dmem_offset = static_cast<uint64_t>(allocated);
+	for (const auto& [start, length]: *pieces) {
+		auto it = g_amm_auto_free.find(start);
+		EXIT_IF(it == g_amm_auto_free.end() || it->second < length);
+		const auto rest = it->second - length;
+		g_amm_auto_free.erase(it);
+		if (rest != 0) {
+			g_amm_auto_free.emplace(start + length, rest);
+		}
+	}
 	return true;
+}
+
+// The automatic backing of [va, va + size) is no longer mapped there: back to the pool.
+static void AmmAutoRelease(uint64_t va, uint64_t size) {
+	const auto end = va + size;
+	auto       run = g_amm_auto_runs.upper_bound(va);
+	if (run != g_amm_auto_runs.begin()) {
+		--run;
+	}
+	while (run != g_amm_auto_runs.end() && run->first < end) {
+		const auto run_va  = run->first;
+		const auto backing = run->second;
+		const auto run_end = run_va + backing.size;
+		if (run_end <= va) {
+			++run;
+			continue;
+		}
+		run              = g_amm_auto_runs.erase(run);
+		const auto first = std::max(va, run_va);
+		const auto last  = std::min(end, run_end);
+		AmmAutoFreeAdd(backing.dmem + (first - run_va), last - first);
+		if (run_va < first) {
+			g_amm_auto_runs.emplace(run_va, AmmAutoRun {backing.dmem, first - run_va});
+		}
+		if (last < run_end) {
+			g_amm_auto_runs.emplace(last, AmmAutoRun {backing.dmem + (last - run_va), run_end - last});
+		}
+	}
+}
+
+static int MapAmmAuto(const CommandBufferState::AmmMapCommand& command) {
+	std::scoped_lock lock(g_amm_auto_pool_mutex);
+	std::vector<std::pair<uint64_t, uint64_t>> pieces;
+	if (!AmmAutoTake(command.size, &pieces)) {
+		// No (or not enough) automatic memory was given: grow the pool from direct memory.
+		int64_t allocated = 0;
+		if (LibKernel::Memory::KernelAllocateDirectMemory(
+		        0, LibKernel::Memory::KernelGetDirectMemorySize(), command.size, AMM_PAGE_SIZE,
+		        command.type, &allocated) != OK) {
+			return LibKernel::KERNEL_ERROR_EAGAIN;
+		}
+		AmmAutoFreeAdd(static_cast<uint64_t>(allocated), command.size);
+		EXIT_IF(!AmmAutoTake(command.size, &pieces));
+	}
+	uint64_t mapped = 0;
+	for (const auto& [dmem, length]: pieces) {
+		void*     addr   = reinterpret_cast<void*>(command.va + mapped);
+		const int result = LibKernel::Memory::KernelMapDirectMemory2(
+		    &addr, length, command.type, NormalizeAmmProtection(command.prot), AMM_MAP_FIXED,
+		    static_cast<int64_t>(dmem), AMM_PAGE_SIZE);
+		if (result != OK) {
+			if (mapped != 0) {
+				LibKernel::Memory::UnmapAmmMemory(command.va, mapped);
+			}
+			for (const auto& [start, piece]: pieces) {
+				AmmAutoFreeAdd(start, piece);
+			}
+			// The pieces mapped before the failure replaced earlier runs there.
+			AmmAutoRelease(command.va, mapped);
+			return result;
+		}
+		mapped += length;
+	}
+	AmmAutoRelease(command.va, command.size);
+	mapped = 0;
+	for (const auto& [dmem, length]: pieces) {
+		g_amm_auto_runs.emplace(command.va + mapped, AmmAutoRun {dmem, length});
+		mapped += length;
+	}
+	return OK;
 }
 
 static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command) {
@@ -1723,16 +1820,29 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	uint64_t dmem_offset = command.dmem_offset;
-	if (command.kind == AmmCommandKind::MapAuto &&
-	    !AllocateAmmAutoDirectMemory(command.size, command.type, &dmem_offset)) {
-		return LibKernel::KERNEL_ERROR_EAGAIN;
+	if (command.kind == AmmCommandKind::MapAuto) {
+		return MapAmmAuto(command);
 	}
 
-	void* addr = reinterpret_cast<void*>(command.va);
-	return LibKernel::Memory::KernelMapDirectMemory2(
+	void*     addr   = reinterpret_cast<void*>(command.va);
+	const int result = LibKernel::Memory::KernelMapDirectMemory2(
 	    &addr, command.size, command.type, NormalizeAmmProtection(command.prot), AMM_MAP_FIXED,
-	    static_cast<int64_t>(dmem_offset), AMM_PAGE_SIZE);
+	    static_cast<int64_t>(command.dmem_offset), AMM_PAGE_SIZE);
+	if (result == OK) {
+		std::scoped_lock lock(g_amm_auto_pool_mutex);
+		AmmAutoRelease(command.va, command.size);
+	}
+	return result;
+}
+
+// An AMM unmap command: the range's automatic backing returns to the pool.
+static int ExecuteAmmUnmapCommand(const CommandBufferState::AmmMapCommand& command) {
+	const int result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
+	if (result == OK) {
+		std::scoped_lock lock(g_amm_auto_pool_mutex);
+		AmmAutoRelease(command.va, command.size);
+	}
+	return result;
 }
 
 static bool AppendAmmMapRecord(uint64_t                                 command_buffer,
@@ -1909,7 +2019,7 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 				if (command.kind == AmmCommandKind::Unmap) {
 					Profiler::ScopedLoadingOperation unmap(Profiler::LoadingOperation::AmmUnmap);
 					// Upstream 259a40abf: an AMM unmap accepts holes (KernelMunmap fails on them).
-					result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
+					result = ExecuteAmmUnmapCommand(command);
 				} else {
 					Profiler::ScopedLoadingOperation map(Profiler::LoadingOperation::AmmMap);
 					result = ExecuteAmmMapCommand(command);
@@ -3296,7 +3406,7 @@ static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t searc
 	*dmem_offset = allocated;
 	if (usage == AMM_USAGE_AUTO) {
 		std::scoped_lock lock(g_amm_auto_pool_mutex);
-		g_amm_auto_pool.push_back(AmmAutoPoolRange {static_cast<uint64_t>(allocated), size, 0});
+		AmmAutoFreeAdd(static_cast<uint64_t>(allocated), size);
 	}
 
 	return OK;
