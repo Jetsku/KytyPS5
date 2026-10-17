@@ -38,6 +38,29 @@ struct CallTarget {
 	uint32_t return_sgpr = 0;
 };
 
+// An S_SWAPPC_B64 call whose target comes from a table in guest memory (Insomniac's ray-tracing
+// hit callbacks): s_buffer_load_dwordxN s[n:...], <table V#>, <index << record_shift>, then the
+// target pair copied from s[n+target_word:+1]. The table V# is reached from user SGPRs through
+// `steps`: each loads `dwords` dwords at `offset` from the 64-bit address (S_LOAD) or the buffer
+// descriptor (S_BUFFER_LOAD) at dword `base_index` of the previous value (of the user SGPRs from
+// `user_sgpr` for the first step). The last step's dwords from `table_index` are the table V#.
+struct CallTableStep {
+	bool     buffer     = false;
+	uint32_t base_index = 0;
+	int32_t  offset     = 0;
+	uint32_t dwords     = 0;
+};
+
+struct CallTable {
+	uint32_t                   call_pc      = 0;
+	uint32_t                   user_sgpr    = 0;
+	uint32_t                   return_sgpr  = 0;
+	uint32_t                   record_shift = 0;
+	uint32_t                   target_word  = 0;
+	uint32_t                   table_index  = 0;
+	std::vector<CallTableStep> steps;
+};
+
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
@@ -45,6 +68,7 @@ struct TranslateResult {
 	bool        skip_dispatch = false;
 	// Only for a program skipped because it calls through S_SWAPPC_B64 (KYTY_SRT_VARIANT_READS).
 	std::vector<CallTarget> call_targets;
+	std::vector<CallTable>  call_tables;
 };
 
 struct CompileResult {

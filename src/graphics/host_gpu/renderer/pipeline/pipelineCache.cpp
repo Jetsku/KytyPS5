@@ -50,6 +50,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -1087,6 +1088,104 @@ void DumpCallTargets(const char* stage_name, uint64_t shader_hash,
 		    target.address, target.user_sgpr, target.user_sgpr + 1u, stage_name, shader_hash,
 		    end * sizeof(uint32_t), returned ? "up to its return" : "no return within the dump"));
 	}
+}
+
+// Reads guest memory for the call-table diagnostics: the clean backing, else in place inside the
+// GPU-mapped ranges (as DumpCallTargets).
+static bool ReadCallTableMemory(uint64_t address, void* data, size_t size) {
+	if (size == 0 || LibKernel::Memory::TryReadGpuCleanBacking(address, data, size)) {
+		return true;
+	}
+	if (ShaderRecompiler::IR::NeverMappedAddress(address, size) ||
+	    !LibKernel::Memory::IsGpuMapped(address, size)) {
+		return false;
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(address), size);
+	return true;
+}
+
+// The functions an S_SWAPPC_B64 program reaches through call tables (ShaderRecompiler CallTable),
+// evaluated with the user data of the dispatch that compiles it: one log line per call with the
+// table's size and its distinct non-null targets. Returns those targets for DumpCallTargets.
+std::vector<ShaderRecompiler::CallTarget>
+DescribeCallTables(const char* stage_name, const ShaderRecompiler::CompileOptions& options,
+                   std::span<const ShaderRecompiler::CallTable> tables) {
+	std::vector<ShaderRecompiler::CallTarget> targets;
+	for (const auto& table: tables) {
+		std::string           failure;
+		std::vector<uint32_t> values;
+		if (table.user_sgpr >= options.user_data_base &&
+		    table.user_sgpr - options.user_data_base < options.user_data.size()) {
+			const auto first = options.user_data.subspan(table.user_sgpr - options.user_data_base);
+			values.assign(first.begin(), first.end());
+		}
+		for (const auto& step: table.steps) {
+			if (step.base_index + 1u >= values.size()) {
+				failure = "a base outside the loaded value";
+				break;
+			}
+			const auto low     = static_cast<uint64_t>(values[step.base_index]);
+			const auto high    = static_cast<uint64_t>(values[step.base_index + 1u]);
+			auto       address = (step.buffer ? low | ((high & 0xffffu) << 32u)
+			                                  : low | (high << 32u)) &
+			                     0x0000ffffffffffffull;
+			address += static_cast<uint64_t>(static_cast<int64_t>(step.offset));
+			values.assign(step.dwords, 0u);
+			if (!ReadCallTableMemory(address, values.data(), values.size() * sizeof(uint32_t))) {
+				failure = fmt::format("unreadable 0x{:x}", address);
+				break;
+			}
+		}
+		if (failure.empty() && table.table_index + 3u >= values.size()) {
+			failure = "no table descriptor";
+		}
+		uint64_t                     base = 0, bytes = 0, records = 0;
+		std::map<uint64_t, uint32_t> callees;
+		if (failure.empty()) {
+			const auto* vsharp = &values[table.table_index];
+			base               = (static_cast<uint64_t>(vsharp[0]) |
+                    (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u)) &
+			       0x0000ffffffffffffull;
+			const auto stride = (vsharp[1] >> 16u) & 0x3fffu;
+			bytes = stride != 0 ? static_cast<uint64_t>(vsharp[2]) * stride : vsharp[2];
+			const uint64_t record_bytes = uint64_t {1} << table.record_shift;
+			const auto     words        = record_bytes / sizeof(uint32_t);
+			records = record_bytes >= 8u ? std::min<uint64_t>(bytes, 16ull << 20u) / record_bytes : 0;
+			std::vector<uint32_t> data(records * words);
+			if (record_bytes < 8u || table.target_word + 1u >= words ||
+			    !ReadCallTableMemory(base, data.data(), data.size() * sizeof(uint32_t))) {
+				failure = fmt::format("unreadable table 0x{:x} (0x{:x} bytes)", base, bytes);
+			} else {
+				for (uint64_t r = 0; r < records; r++) {
+					const auto low  = static_cast<uint64_t>(data[r * words + table.target_word]);
+					const auto high = static_cast<uint64_t>(data[r * words + table.target_word + 1u]);
+					const auto callee = (low | (high << 32u)) & 0x0000ffffffffffffull;
+					if (callee != 0) {
+						callees[callee]++;
+					}
+				}
+			}
+		}
+		std::string list;
+		for (const auto& [callee, count]: callees) {
+			if (targets.size() < 64u) {
+				targets.push_back({callee, 0u, table.return_sgpr});
+			}
+			if (list.size() < 600u) {
+				list += fmt::format("{}0x{:x} x{}", list.empty() ? "" : ", ", callee, count);
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_SRT_VARIANT_READS: call table of {} shader 0x{:016x} at pc 0x{:x} (from s{}, {} "
+		    "load step(s), record {} bytes, target dword {}): {}\n",
+		    stage_name, options.shader_hash, table.call_pc, table.user_sgpr, table.steps.size(),
+		    1u << table.record_shift, table.target_word,
+		    failure.empty()
+		        ? fmt::format("table 0x{:x}, 0x{:x} bytes, {} records, {} distinct callees: {}",
+		                      base, bytes, records, callees.size(), list)
+		        : failure));
+	}
+	return targets;
 }
 
 void DumpMatchedShaderInputs(const ShaderParams& params,
@@ -2973,8 +3072,12 @@ struct PipelineCache::ProgramCache {
 				// Skipped ray-tracing shaders are never compiled; dump their guest code here.
 				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
 				                   params.code, translated.decoded_dump);
-				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash,
-				                translated.call_targets);
+				auto call_targets = translated.call_targets;
+				for (const auto& callee: DescribeCallTables(ProgramStageName(options.stage), options,
+				                                            translated.call_tables)) {
+					call_targets.push_back(callee);
+				}
+				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash, call_targets);
 				if (disk_on) {
 					disk->AddSource(disk_key, true, {});
 				}

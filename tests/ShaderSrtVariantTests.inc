@@ -555,6 +555,58 @@ void CallTargetsFromUserData() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+// S_SWAPPC_B64 calls through a function table (ShaderRecompiler CallTable), as Miles Morales'
+// ray-tracing shaders pick a hit callback per lane: the table V# is loaded through the SRT before a
+// branch, the call block loads a 16-byte record at index << 4 and copies its first pair into the
+// link registers. The table descriptor register is also used as a temporary before its load and
+// after the call; the trace still finds the load that reaches the call.
+void CallTablesTraced() {
+  constexpr const char *name = "CallTablesTraced";
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(72, 4));                        // s_mov_b32 s72, s4 (a temporary)
+  code.push_back(EncodeSmem0(0x02, 8, 2));                     // s_load_dwordx4 s[8:11], s[4:5], 544
+  code.push_back(EncodeSmem1(544, 125));
+  code.push_back(EncodeSmem0(0x0a, 72, 4));                    // s_buffer_load_dwordx4 s[72:75], s[8:11], 64
+  code.push_back(EncodeSmem1(64, 125));
+  code.push_back(EncodeSopp(0x04, 0));                         // s_cbranch_scc0 to the next block
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4)));      // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 36));                    // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu);                                 // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSMovB32(72, 5));                        // a later temporary
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "skipped", result.skip_dispatch, "the calling program was not skipped");
+  const auto &tables = result.call_tables;
+  const auto step = [](const ShaderRecompiler::CallTableStep &s, bool buffer, int32_t offset) {
+    return s.buffer == buffer && s.base_index == 0u && s.offset == offset && s.dwords == 4u;
+  };
+  Require(name, "table",
+          tables.size() == 1u && tables[0].user_sgpr == 4u && tables[0].return_sgpr == 14u &&
+              tables[0].record_shift == 4u && tables[0].target_word == 0u &&
+              tables[0].table_index == 0u && tables[0].steps.size() == 2u &&
+              step(tables[0].steps[0], false, 544) && step(tables[0].steps[1], true, 64),
+          "the call table was not traced (" + std::to_string(tables.size()) + " found)");
+
+  // A second, different load of the descriptor that can reach the call is not a table.
+  std::vector<u32> ambiguous = code;
+  ambiguous.insert(ambiguous.begin() + 5, {EncodeSopp(0x04, 2),       // s_cbranch_scc0 past the reload
+                                           EncodeSmem0(0x0a, 72, 4),  // s_buffer_load_dwordx4 s[72:75], s[8:11], 80
+                                           EncodeSmem1(80, 125)});
+  const auto other = ShaderRecompiler::TranslateProgram(ambiguous, options);
+  Require(name, "two loads", other.skip_dispatch && other.call_tables.empty(),
+          "a descriptor with two reaching loads was traced");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
@@ -564,6 +616,7 @@ void RunAll(VulkanHarness *vulkan) {
   RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
   CallIsSkipped();
   CallTargetsFromUserData();
+  CallTablesTraced();
   vulkan->CheckCallTargetDump();
   NullBasedFlatReadReadsZero();
   VariantPlanIsFound();

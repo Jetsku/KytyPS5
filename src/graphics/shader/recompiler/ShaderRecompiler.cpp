@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -578,6 +579,36 @@ static bool IsUnsupportedCall(const Decoder::Instruction& inst) {
 	       inst.opcode_id == 0x21u;
 }
 
+// The SGPRs an instruction writes: its destination's width follows from the opcode (64-bit
+// scalar ops and lane masks write a pair, SMEM loads their dword count); a second destination
+// (carry-out) counts as a pair. Unsupported instructions other than calls write nothing known;
+// calls write their return address to their SDST pair.
+static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg) {
+	if (inst.opcode == Decoder::Opcode::UNSUPPORTED) {
+		const auto sdst = (inst.raw[0] >> 16u) & 0x7fu;
+		return IsUnsupportedCall(inst) && (sdst == reg || sdst + 1u == reg);
+	}
+	const auto name  = magic_enum::enum_name(inst.opcode);
+	const auto width = [&]() -> uint32_t {
+		for (const auto& [suffix, dwords]: {std::pair {std::string_view("DWORDX16"), 16u},
+		                                    std::pair {std::string_view("DWORDX8"), 8u},
+		                                    std::pair {std::string_view("DWORDX4"), 4u},
+		                                    std::pair {std::string_view("DWORDX3"), 3u},
+		                                    std::pair {std::string_view("DWORDX2"), 2u}}) {
+			if (name.ends_with(suffix)) return dwords;
+		}
+		return name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64") ||
+		               name.ends_with("_F64") || name.starts_with("V_CMP")
+		           ? 2u
+		           : 1u;
+	}();
+	const auto covers = [&](const Decoder::Operand& operand, uint32_t count) {
+		return operand.kind == Decoder::OperandKind::Sgpr && reg >= operand.reg &&
+		       reg < operand.reg + count;
+	};
+	return covers(inst.dst, width) || covers(inst.dst2, 2u);
+}
+
 // Diagnostics for a program skipped for S_SWAPPC_B64: the functions its calls jump to, as the
 // dispatch's user data gives them. Psr's shader-mesh builders copy a callback record from user
 // SGPRs into their link registers before each call (s_mov_b32 s14, s8; s_mov_b32 s15, s9;
@@ -595,35 +626,7 @@ static std::vector<CallTarget> FindCallTargets(const Decoder::Program& decoded,
         return reg >= options.user_data_base &&
                reg - options.user_data_base < options.user_data.size();
 	};
-	// The SGPRs an instruction writes: its destination's width follows from the opcode (64-bit
-	// scalar ops and lane masks write a pair, SMEM loads their dword count); a second destination
-	// (carry-out) counts as a pair. Unsupported instructions other than calls write nothing known;
-	// calls write their return address to their SDST pair.
-	const auto writes_sgpr = [](const Decoder::Instruction& inst, uint32_t reg) {
-		if (inst.opcode == Decoder::Opcode::UNSUPPORTED) {
-			const auto sdst = (inst.raw[0] >> 16u) & 0x7fu;
-			return IsUnsupportedCall(inst) && (sdst == reg || sdst + 1u == reg);
-		}
-		const auto name  = magic_enum::enum_name(inst.opcode);
-		const auto width = [&]() -> uint32_t {
-			for (const auto& [suffix, dwords]: {std::pair {std::string_view("DWORDX16"), 16u},
-			                                    std::pair {std::string_view("DWORDX8"), 8u},
-			                                    std::pair {std::string_view("DWORDX4"), 4u},
-			                                    std::pair {std::string_view("DWORDX3"), 3u},
-			                                    std::pair {std::string_view("DWORDX2"), 2u}}) {
-				if (name.ends_with(suffix)) return dwords;
-			}
-			return name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64") ||
-			               name.ends_with("_F64") || name.starts_with("V_CMP")
-			           ? 2u
-			           : 1u;
-		}();
-		const auto covers = [&](const Decoder::Operand& operand, uint32_t count) {
-			return operand.kind == Decoder::OperandKind::Sgpr && reg >= operand.reg &&
-			       reg < operand.reg + count;
-		};
-		return covers(inst.dst, width) || covers(inst.dst2, 2u);
-	};
+	const auto writes_sgpr = WritesSgpr;
 	std::set<uint32_t> labels;
 	for (const auto& inst: insts) {
 		if (Decoder::IsDirectBranch(inst.opcode)) {
@@ -768,6 +771,293 @@ static std::string DescribeCallTargets(std::span<const CallTarget> targets, uint
 	return text.empty() ? "no callee found" : text;
 }
 
+// Diagnostics for S_SWAPPC_B64 calls whose target pair is read from a table (CallTable): Miles
+// Morales' ray-tracing shaders pick a hit callback per lane in a waterfall loop:
+//   s_lshl_b32 vcc_lo, s8, 4
+//   s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo   ; 16-byte record: function, data pointer
+//   s_mov_b32 s14, s8 ; s_mov_b32 s15, s9 ; ... ; s_swappc_b64 s[14:15], s[14:15]
+// with the table V# s[72:75] loaded blocks earlier through the SRT (user s12 -> +544 -> +64). Each
+// register range is traced to its definition: the last write in the straight-line code before the
+// use, else the only instruction anywhere in the program that writes it (so it reaches every
+// path), else the user SGPRs when nothing writes them. Only scalar loads with an immediate offset
+// are followed; anything else leaves the call out.
+static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
+                                             const CompileOptions& options, std::string& failures) {
+	const auto& insts     = decoded.instructions;
+	const auto  user_sgpr = [&](uint32_t reg) {
+        return reg >= options.user_data_base &&
+               reg - options.user_data_base < options.user_data.size();
+	};
+	std::set<uint32_t> labels;
+	for (const auto& inst: insts) {
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			labels.insert(inst.branch_target);
+		}
+	}
+	constexpr ptrdiff_t Top     = -1; // nothing writes the register: its entry value
+	constexpr ptrdiff_t Unknown = -2;
+	// The straight-line writer of `reg` before instruction `at`, Top at the program start, or
+	// Unknown when a branch or branch target comes first.
+	const auto straight_writer = [&](uint32_t reg, size_t at) -> ptrdiff_t {
+		for (size_t i = at; i-- > 0;) {
+			if (labels.contains(insts[i + 1].pc) || Decoder::IsDirectBranch(insts[i].opcode) ||
+			    insts[i].opcode == Decoder::Opcode::S_SETPC_B64) {
+				return Unknown;
+			}
+			if (WritesSgpr(insts[i], reg)) {
+				return static_cast<ptrdiff_t>(i);
+			}
+		}
+		return Top;
+	};
+	// `also`: further identical writers when the definition crossed control flow.
+	const auto definition = [&](uint32_t reg, uint32_t count, size_t at,
+	                            std::vector<size_t>& also) -> ptrdiff_t {
+		also.clear();
+		ptrdiff_t found   = Unknown;
+		bool      crossed = false;
+		for (uint32_t r = reg; r < reg + count; r++) {
+			const auto writer = straight_writer(r, at);
+			if (writer == Unknown) {
+				crossed = true;
+				break;
+			}
+			if (found != Unknown && found != writer) {
+				return Unknown;
+			}
+			found = writer;
+		}
+		if (!crossed) {
+			return found;
+		}
+		const auto writes_range = [&](size_t i) {
+			for (uint32_t r = reg; r < reg + count; r++) {
+				if (WritesSgpr(insts[i], r)) return true;
+			}
+			return false;
+		};
+		// Across control flow, the reaching definition: the last write before `at` in program
+		// order, one instruction that writes the whole range, provided no branch from before it
+		// lands between it and `at` (it dominates `at`), and no later write can loop back to `at`
+		// (no backward branch at or after such a write targets `at` or earlier).
+		{
+			ptrdiff_t candidate = Unknown;
+			for (size_t i = at; i-- > 0;) {
+				if (writes_range(i)) {
+					candidate = static_cast<ptrdiff_t>(i);
+					break;
+				}
+			}
+			bool ok = candidate >= 0;
+			for (uint32_t r = reg; ok && r < reg + count; r++) {
+				ok = WritesSgpr(insts[static_cast<size_t>(candidate)], r);
+			}
+			const auto cand_pc = ok ? insts[static_cast<size_t>(candidate)].pc : 0u;
+			for (size_t i = 0; ok && i < static_cast<size_t>(candidate); i++) {
+				ok = !Decoder::IsDirectBranch(insts[i].opcode) ||
+				     !(insts[i].branch_target > cand_pc && insts[i].branch_target <= insts[at].pc);
+			}
+			size_t first_later = insts.size();
+			for (size_t i = at; ok && i < insts.size(); i++) {
+				if (first_later == insts.size() && writes_range(i)) {
+					first_later = i;
+				}
+				ok = first_later == insts.size() || !Decoder::IsDirectBranch(insts[i].opcode) ||
+				     insts[i].branch_target > insts[at].pc;
+			}
+			for (const auto& inst: insts) {
+				ok = ok && inst.opcode != Decoder::Opcode::S_SETPC_B64;
+			}
+			if (ok) {
+				return candidate;
+			}
+		}
+		// Else every write of the range anywhere in the program must be the same
+		// load (a compiler reload of one descriptor), at least one of them before `at`.
+		found = Top;
+		for (size_t i = 0; i < insts.size(); i++) {
+			bool writes = false;
+			for (uint32_t r = reg; r < reg + count && !writes; r++) {
+				writes = WritesSgpr(insts[i], r);
+			}
+			if (!writes) {
+				continue;
+			}
+			if (found == Top) {
+				found = static_cast<ptrdiff_t>(i);
+				continue;
+			}
+			const auto& first = insts[static_cast<size_t>(found)];
+			if (first.word_count != insts[i].word_count ||
+			    !std::equal(first.raw, first.raw + first.word_count, insts[i].raw)) {
+				return Unknown;
+			}
+			also.push_back(i);
+		}
+		return found != Top && static_cast<size_t>(found) >= at ? Unknown : found;
+	};
+	const auto smem_load = [](const Decoder::Instruction& inst, bool& buffer) {
+		if (inst.family != Decoder::Family::SMEM || inst.dst.kind != Decoder::OperandKind::Sgpr) {
+			return false;
+		}
+		const auto name = magic_enum::enum_name(inst.opcode);
+		buffer          = name.starts_with("S_BUFFER_LOAD_DWORD");
+		return buffer || name.starts_with("S_LOAD_DWORD");
+	};
+	// Traces s[reg:reg+count-1] before instruction `at`; `origin` is the first SGPR of the value
+	// that holds them (the user SGPRs or the last step's destination).
+	std::string resolve_why;
+	std::function<bool(uint32_t, uint32_t, size_t, uint32_t, CallTable&, uint32_t&)> resolve;
+	resolve = [&](uint32_t reg, uint32_t count, size_t at, uint32_t depth, CallTable& table,
+	              uint32_t& origin) {
+		if (depth > 8) {
+			return false;
+		}
+		std::vector<size_t> also;
+		const auto          def = definition(reg, count, at, also);
+		if (def == Top) {
+			if (!user_sgpr(reg) || !user_sgpr(reg + count - 1u)) {
+				resolve_why = fmt::format("s{}..s{} unwritten but not user data", reg, reg + count - 1u);
+				return false;
+			}
+			table.user_sgpr = reg;
+			origin          = reg;
+			return true;
+		}
+		if (def == Unknown) {
+			std::string writers;
+			for (size_t i = 0; i < insts.size(); i++) {
+				for (uint32_t r = reg; r < reg + count; r++) {
+					if (WritesSgpr(insts[i], r)) {
+						writers += fmt::format(" 0x{:x}:{}:s{}", insts[i].pc,
+						                       magic_enum::enum_name(insts[i].opcode), r);
+						break;
+					}
+				}
+			}
+			resolve_why = fmt::format("s{}..s{} before pc 0x{:x} has no unique definition; writers{}",
+			                          reg, reg + count - 1u, insts[at].pc, writers);
+			return false;
+		}
+		const auto& inst   = insts[static_cast<size_t>(def)];
+		bool        buffer = false;
+		if (!smem_load(inst, buffer) || inst.src1.kind != Decoder::OperandKind::Null ||
+		    reg < inst.dst.reg || reg + count > inst.dst.reg + inst.data_dwords) {
+			resolve_why = fmt::format("s{} defined at pc 0x{:x} by {}", reg, inst.pc,
+			                          magic_enum::enum_name(inst.opcode));
+			return false;
+		}
+		uint32_t base_origin = 0;
+		// Each identical reload must see the same chain.
+		for (const auto other: also) {
+			CallTable copy  = table;
+			uint32_t  other_origin = 0;
+			CallTable first = table;
+			uint32_t  first_origin = 0;
+			if (!resolve(inst.src0.reg, buffer ? 4u : 2u, other, depth + 1u, copy, other_origin) ||
+			    !resolve(inst.src0.reg, buffer ? 4u : 2u, static_cast<size_t>(def), depth + 1u, first,
+			             first_origin) ||
+			    other_origin - inst.src0.reg != first_origin - inst.src0.reg ||
+			    copy.user_sgpr != first.user_sgpr || copy.steps.size() != first.steps.size() ||
+			    !std::equal(copy.steps.begin(), copy.steps.end(), first.steps.begin(),
+			                [](const CallTableStep& a, const CallTableStep& b) {
+				                return a.buffer == b.buffer && a.base_index == b.base_index &&
+				                       a.offset == b.offset && a.dwords == b.dwords;
+			                })) {
+				resolve_why = fmt::format("reloads of s{} at pc 0x{:x} and 0x{:x} differ", reg,
+				                          inst.pc, insts[other].pc);
+				return false;
+			}
+		}
+		if (!resolve(inst.src0.reg, buffer ? 4u : 2u, static_cast<size_t>(def), depth + 1u, table,
+		             base_origin)) {
+			return false;
+		}
+		table.steps.push_back({buffer, inst.src0.reg - base_origin,
+		                       static_cast<int32_t>(inst.offset), inst.data_dwords});
+		origin = inst.dst.reg;
+		return true;
+	};
+	std::vector<CallTable> tables;
+	for (size_t call = 0; call < insts.size(); call++) {
+		if (!IsUnsupportedCall(insts[call])) {
+			continue;
+		}
+		CallTable table;
+		table.call_pc     = insts[call].pc;
+		table.return_sgpr = (insts[call].raw[0] >> 16u) & 0x7fu;
+		const auto target = insts[call].raw[0] & 0xffu;
+		const auto fail = [&](std::string_view why) {
+			failures += fmt::format("{}pc 0x{:x}: {}", failures.empty() ? "" : "; ", table.call_pc, why);
+		};
+		if (target >= 104u || (target & 1u) != 0u) {
+			fail("odd target pair");
+			continue;
+		}
+		// The target pair: two S_MOV_B32 copies of a consecutive pair.
+		uint32_t sources[2] = {};
+		size_t   copies[2]  = {};
+		bool     ok         = true;
+		for (uint32_t half = 0; ok && half < 2; half++) {
+			const auto writer = straight_writer(target + half, call);
+			ok = writer >= 0 && insts[static_cast<size_t>(writer)].opcode == Decoder::Opcode::S_MOV_B32 &&
+			     insts[static_cast<size_t>(writer)].src0.kind == Decoder::OperandKind::Sgpr;
+			if (ok) {
+				copies[half]  = static_cast<size_t>(writer);
+				sources[half] = insts[copies[half]].src0.reg;
+			}
+		}
+		if (!ok || sources[1] != sources[0] + 1u) {
+			fail("target pair not two S_MOV_B32 copies of a pair");
+			continue;
+		}
+		// The record load: both halves from one S_BUFFER_LOAD with a register offset.
+		const auto load = straight_writer(sources[0], std::min(copies[0], copies[1]));
+		bool       buffer = false;
+		if (load < 0 || load != straight_writer(sources[1], std::min(copies[0], copies[1]))) {
+			fail(fmt::format("copied pair s{} has no single straight-line writer", sources[0]));
+			continue;
+		}
+		const auto& record = insts[static_cast<size_t>(load)];
+		if (!smem_load(record, buffer) || !buffer || record.src1.kind == Decoder::OperandKind::Null ||
+		    sources[0] < record.dst.reg || sources[1] >= record.dst.reg + record.data_dwords) {
+			fail(fmt::format("pair writer at pc 0x{:x} is not a register-offset S_BUFFER_LOAD",
+			                 record.pc));
+			continue;
+		}
+		table.target_word = sources[0] - record.dst.reg;
+		// The record index shift: S_LSHL_B32 into the offset register right before.
+		bool shift_found = false;
+		for (size_t i = static_cast<size_t>(load); i-- > 0;) {
+			const auto& inst = insts[i];
+			if (labels.contains(insts[i + 1].pc) || Decoder::IsDirectBranch(inst.opcode)) {
+				break;
+			}
+			if (inst.dst.kind != record.src1.kind ||
+			    (inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg != record.src1.reg)) {
+				continue;
+			}
+			shift_found = inst.opcode == Decoder::Opcode::S_LSHL_B32 &&
+			              inst.src1.kind == Decoder::OperandKind::IntegerInlineConstant;
+			table.record_shift = shift_found ? inst.src1.value : 0u;
+			break;
+		}
+		uint32_t origin = 0;
+		if (!shift_found) {
+			fail("no S_LSHL_B32 record index");
+			continue;
+		}
+		if (!resolve(record.src0.reg, 4u, static_cast<size_t>(load), 0u, table, origin) ||
+		    table.steps.empty()) {
+			fail(fmt::format("table descriptor s{} not traced ({})", record.src0.reg, resolve_why));
+			continue;
+		}
+		table.table_index = record.src0.reg - origin;
+		tables.push_back(std::move(table));
+	}
+	return tables;
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
@@ -849,11 +1139,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			TranslateResult skipped;
 			uint32_t        unresolved = 0;
 			skipped.call_targets       = FindCallTargets(decoded, options, unresolved);
+			std::string table_failures;
+			skipped.call_tables = FindCallTables(decoded, options, table_failures);
 			NoteSkippedProgram(
 			    options, call->pc,
 			    fmt::format("calls a function through S_SWAPPC_B64, which is not supported "
-			                "(callees from user data: {})",
-			                DescribeCallTargets(skipped.call_targets, unresolved)));
+			                "(callees from user data: {}; calls through a traced table: {}{}{})",
+			                DescribeCallTargets(skipped.call_targets, unresolved),
+			                skipped.call_tables.size(), table_failures.empty() ? "" : "; untraced: ",
+			                table_failures));
 			skipped.skip_dispatch = true;
 			skipped.decoded_dump  = std::move(decoded_dump);
 			return skipped;
