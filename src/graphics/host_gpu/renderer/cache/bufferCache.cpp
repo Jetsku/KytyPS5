@@ -4243,6 +4243,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainImageStagingBuffer(uint64_t size
 	return {source, 0};
 }
 
+// An image whose memory is only partly mapped: streaming games (Miles Morales' AMM pool) map the
+// resident part of a texture and leave the rest of its range unmapped. The unmapped bytes read as
+// zeros, as a GPU read of an unmapped page does on the console, instead of ending the emulator.
+bool ReadPartlyUnmappedImageBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (!Libs::LibKernel::Memory::CopySparseMemory(vaddr, data, size)) {
+		return false;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("Image backing 0x%016" PRIx64 "+0x%" PRIx64
+		     " is partly unmapped: its unmapped bytes read as zero\n",
+		     vaddr, size);
+	}
+	return true;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -4264,7 +4280,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (source == nullptr) EXIT("BufferCache: failed to read mapped guest image backing\n");
 	auto* staging = source->Mapped().data() + stage_offset;
 	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	    !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+	    !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size) &&
+	    !ReadPartlyUnmappedImageBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	if (source == &m_staging_buffer) m_staging_buffer.Commit();

@@ -2995,7 +2995,9 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 				if (!LibKernel::Memory::TryReadBacking(base + range.offset, mapped + range.packed,
 				                                       range.size) &&
 				    !LibKernel::Memory::TryReadSparseBacking(base + range.offset,
-				                                          mapped + range.packed, range.size)) {
+				                                          mapped + range.packed, range.size) &&
+				    !ReadPartlyUnmappedImageBacking(base + range.offset, mapped + range.packed,
+				                                    range.size)) {
 					EXIT("TextureCache: failed to read mapped guest image backing\n");
 				}
 			}

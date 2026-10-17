@@ -42,6 +42,10 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 // KYTY_BDA_WRITES=verify: dropped writes and written pages under a GPU-modified image are fatal.
 [[nodiscard]] bool BdaWritesVerify();
 
+// Reads an image's guest range when part of it is not mapped (streamed textures map only their
+// resident part): mapped bytes as they are, unmapped bytes as zero. False when nothing can be read.
+[[nodiscard]] bool ReadPartlyUnmappedImageBacking(uint64_t vaddr, void* data, uint64_t size);
+
 struct BufferContentRevision {
 	BufferId id;
 	uint64_t write_revision;

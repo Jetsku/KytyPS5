@@ -3231,6 +3231,20 @@ void TestOrdinaryMappingsAvoidAmmWindow() {
 	*static_cast<volatile uint64_t*>(fixed) = 0x0123456789abcdefull;
 	Check(test, *static_cast<volatile uint64_t*>(fixed) == 0x0123456789abcdefull,
 	      "fixed map inside the AMM window is not writable");
+	// A streamed texture maps only its resident part: a read across the unmapped rest gets the
+	// mapped bytes and zeros (ReadPartlyUnmappedImageBacking, StagingCopier).
+	{
+		std::vector<uint8_t> bytes(page * 2, 0xcd);
+		Check(test, CopySparseMemory(kAmmWindowBase + page * 4, bytes.data(), bytes.size()),
+		      "a read across a mapped and an unmapped AMM page succeeds");
+		uint64_t first = 0;
+		std::memcpy(&first, bytes.data(), sizeof(first));
+		Check(test,
+		      first == 0x0123456789abcdefull &&
+		          std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(page), bytes.end(),
+		                      [](uint8_t b) { return b == 0; }),
+		      "the mapped page reads its bytes and the unmapped page reads zeros");
+	}
 	CheckOk(test, UnmapAmmMemory(kAmmWindowBase + page * 4, page), "UnmapAmmMemory");
 	CheckOk(test, KernelReleaseDirectMemory(phys, page * 2), "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
