@@ -6488,8 +6488,99 @@ static void NoteBdaSettleStats(size_t logged, uint32_t dropped) {
 	start = now;
 }
 
+// KYTY_BDA_ASYNC_SETTLE (live, default 0): SettleBdaWrites without the wait. The pages a shader's
+// BDA writes reached at its last two settles are taken into GPU ownership right after the dispatch
+// is recorded (as a writable binding over them would: readers order after this dispatch), the
+// written-page list is recorded into a download slot, and the settle is finished once the
+// dispatch completed (ProcessPendingBdaSettles, from later settles and the garbage collector):
+// the logged stores are applied, and pages outside the prediction are settled then ("late",
+// counted: a reader between the dispatch and that settle could have seen them clean).
+Live::Switch g_bda_async_settle("KYTY_BDA_ASYNC_SETTLE", Live::ParseDefaultOff);
+
+void BufferCache::ProcessPendingBdaSettles(bool wait_oldest) {
+	if (wait_oldest && !m_bda_pending.empty()) {
+		Profiler::ScopedFrameWait wait(Profiler::FrameWait::BdaSettle);
+		m_scheduler.Wait(m_bda_pending.front().tick);
+	}
+	while (!m_bda_pending.empty() && m_scheduler.IsFree(m_bda_pending.front().tick)) {
+		auto pending = std::move(m_bda_pending.front());
+		m_bda_pending.pop_front();
+		auto writes = m_fault_manager.ParseBdaWrites(pending.slot);
+		if (!writes.stores.empty()) {
+			writes.dropped += ApplyBdaStoreLog(writes.stores, pending.hash);
+			m_bda_async_totals.stores += writes.stores.size();
+		}
+		m_bda_async_totals.dropped += writes.dropped;
+		RangeSet actual;
+		if (writes.overflow) {
+			for (const auto& [vaddr, id]: m_buffers) {
+				actual.Add(vaddr, m_slot_buffers[id].Size());
+			}
+			m_bda_async_totals.overflows++;
+		} else {
+			for (const auto page: writes.pages) {
+				actual.Add(page, CACHING_PAGESIZE);
+			}
+		}
+		uint64_t late_pages = 0;
+		actual.ForEach([&](uint64_t start, uint64_t end) {
+			for (uint64_t page = start; page < end; page += CACHING_PAGESIZE) {
+				if (!pending.predicted.Contains(page, CACHING_PAGESIZE)) {
+					SettleBdaWrittenRange(page, CACHING_PAGESIZE, pending.hash, late_pages);
+				}
+			}
+		});
+		m_bda_async_totals.late_pages += late_pages;
+		auto& history = m_bda_predict[pending.hash];
+		history.older = std::move(history.newer);
+		history.newer = std::move(actual);
+	}
+}
+
+void BufferCache::SettleBdaWritesAsync(uint64_t shader_hash) {
+	ProcessPendingBdaSettles(false);
+	if (m_bda_pending.size() >= FaultManager::BdaSlots) {
+		ProcessPendingBdaSettles(true);
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
+	PendingBdaSettle pending;
+	pending.hash = shader_hash;
+	if (const auto it = m_bda_predict.find(shader_hash); it != m_bda_predict.end()) {
+		it->second.newer.ForEach([&](uint64_t start, uint64_t end) { pending.predicted.Add(start, end - start); });
+		it->second.older.ForEach([&](uint64_t start, uint64_t end) { pending.predicted.Add(start, end - start); });
+	}
+	uint64_t predicted_pages = 0;
+	pending.predicted.ForEach([&](uint64_t start, uint64_t end) {
+		SettleBdaWrittenRange(start, end - start, shader_hash, predicted_pages);
+	});
+	m_bda_async_totals.predicted_pages += predicted_pages;
+	m_bda_async_totals.settles++;
+	pending.slot = m_fault_manager.RecordBdaWrites();
+	pending.tick = m_scheduler.CurrentTick();
+	m_bda_pending.push_back(std::move(pending));
+	const auto now = std::chrono::steady_clock::now();
+	if (m_bda_async_print.time_since_epoch().count() == 0) {
+		m_bda_async_print = now;
+	} else if (now - m_bda_async_print >= std::chrono::seconds(10)) {
+		m_bda_async_print = now;
+		auto& t = m_bda_async_totals;
+		std::printf("BdaAsyncSettle 10s: %llu settles, %llu predicted pages, %llu late pages, %llu logged "
+		            "stores, %llu dropped, %llu overflows\n",
+		            static_cast<unsigned long long>(t.settles), static_cast<unsigned long long>(t.predicted_pages),
+		            static_cast<unsigned long long>(t.late_pages), static_cast<unsigned long long>(t.stores),
+		            static_cast<unsigned long long>(t.dropped), static_cast<unsigned long long>(t.overflows));
+		std::fflush(stdout);
+		t = {};
+	}
+}
+
 void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 	EXIT_IF(!BdaWritesEnabled());
+	if (g_bda_async_settle.On()) {
+		SettleBdaWritesAsync(shader_hash);
+		return;
+	}
+	ProcessPendingBdaSettles(!m_bda_pending.empty());
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::BdaSettle);
 	// Records the compaction after the dispatch, submits and waits: the pages it wrote.
 	auto writes = m_fault_manager.CollectBdaWrites();

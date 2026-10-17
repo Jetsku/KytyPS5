@@ -50,6 +50,12 @@ public:
 		bool                  overflow     = false;
 	};
 	[[nodiscard]] BdaWrites CollectBdaWrites();
+	// KYTY_BDA_ASYNC_SETTLE: CollectBdaWrites in two halves. RecordBdaWrites records the compaction
+	// into one of BdaSlots download slots (the caller keeps at most BdaSlots unparsed) and returns
+	// it; ParseBdaWrites reads a slot once the recording's tick completed.
+	static constexpr uint32_t BdaSlots = 8;
+	[[nodiscard]] uint32_t  RecordBdaWrites();
+	[[nodiscard]] BdaWrites ParseBdaWrites(uint32_t slot);
 
 private:
 	GraphicContext&                            m_graphics;
@@ -64,7 +70,8 @@ private:
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;
 	// KYTY_BDA_WRITES only (created on first use).
 	vk::Pipeline                               m_bda_pages_pipeline = nullptr;
-	std::unique_ptr<Buffer>                    m_bda_download;
+	std::array<std::unique_ptr<Buffer>, BdaSlots> m_bda_downloads;
+	uint32_t                                   m_bda_next_slot = 0;
 	bool                                       m_bda_region_cleared = false;
 };
 

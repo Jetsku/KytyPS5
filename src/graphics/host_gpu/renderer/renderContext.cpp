@@ -646,6 +646,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	m_buffer_cache.ProcessPendingBdaSettles(false);
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 	m_graphics.TrimRetiredImages();

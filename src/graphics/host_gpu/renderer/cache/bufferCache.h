@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <unordered_map>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -324,8 +325,30 @@ public:
 	// processor continues) and takes every page it wrote into GPU ownership exactly as a writable
 	// binding over the page would, so no later reader sees the page as clean. GPU thread.
 	void SettleBdaWrites(uint64_t shader_hash);
+	// KYTY_BDA_ASYNC_SETTLE (bufferCache.cpp): finishes the settles whose dispatch completed (with
+	// wait_oldest, waits for the oldest first). GPU thread.
+	void ProcessPendingBdaSettles(bool wait_oldest);
 
 private:
+	void SettleBdaWritesAsync(uint64_t shader_hash);
+	struct PendingBdaSettle {
+		uint64_t tick = 0;
+		uint64_t hash = 0;
+		uint32_t slot = 0;
+		RangeSet predicted;
+	};
+	struct BdaPrediction {
+		RangeSet newer;
+		RangeSet older;
+	};
+	struct BdaAsyncTotals {
+		uint64_t settles = 0, predicted_pages = 0, late_pages = 0, stores = 0, dropped = 0, overflows = 0;
+	};
+	std::deque<PendingBdaSettle>                 m_bda_pending;
+	std::unordered_map<uint64_t, BdaPrediction>  m_bda_predict;
+	BdaAsyncTotals                               m_bda_async_totals;
+	std::chrono::steady_clock::time_point        m_bda_async_print {};
+
 	friend struct BufferCacheTestAccess;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainImageStagingBuffer(uint64_t size);
 

@@ -187,6 +187,12 @@ void FaultManager::PrepareBdaWrites() {
 }
 
 FaultManager::BdaWrites FaultManager::CollectBdaWrites() {
+	const auto slot = RecordBdaWrites();
+	m_scheduler.Wait(m_scheduler.CurrentTick());
+	return ParseBdaWrites(slot);
+}
+
+uint32_t FaultManager::RecordBdaWrites() {
 	KYTY_GPU_OP_SITE("fault.bda-writes");
 	EXIT_IF(!m_bda_region_cleared);
 	if (m_bda_pages_pipeline == nullptr) {
@@ -203,6 +209,10 @@ FaultManager::BdaWrites FaultManager::CollectBdaWrites() {
 		m_graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create BDA written-page pipeline");
 		SetVulkanObjectNameF(m_graphics.device, m_bda_pages_pipeline, "BDA Written Page Parser");
+	}
+	const auto slot = m_bda_next_slot++ % BdaSlots;
+	auto&      m_bda_download = m_bda_downloads[slot];
+	if (m_bda_download == nullptr) {
 		m_bda_download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                          AllFlags, BdaDownloadSize);
 	}
@@ -295,8 +305,13 @@ FaultManager::BdaWrites FaultManager::CollectBdaWrites() {
 	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(after.size());
 	dependency.pBufferMemoryBarriers    = after.data();
 	command.pipelineBarrier2(dependency);
+	return slot;
+}
 
-	m_scheduler.Wait(m_scheduler.CurrentTick());
+FaultManager::BdaWrites FaultManager::ParseBdaWrites(uint32_t slot) {
+	auto&       m_bda_download = m_bda_downloads[slot % BdaSlots];
+	const bool  store_log      = StoreLogEnabled();
+	auto*       mapped         = m_bda_download->Mapped().data();
 	// Read back only what was written: the count, then its entries and the counter copy.
 	m_bda_download->Invalidate(0, sizeof(uint64_t));
 	BdaWrites result;
