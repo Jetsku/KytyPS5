@@ -901,7 +901,10 @@ void PresentFilter::Record(vk::Device device, vk::CommandBuffer command, vk::Ima
 	    {static_cast<float>(source.width) / static_cast<float>(target.width),
 	     static_cast<float>(source.height) / static_cast<float>(target.height)},
 	    level,
-	    pq_to_sdr ? 1u : 0u,
+	    // The two-texel box covers at most a 2:1 downscale; beyond that (only an HDR10 frame on an
+	    // SDR window takes this pass then) one linear tap per pixel, as the blit it replaces.
+	    (pq_to_sdr ? 1u : 0u) |
+	        (source.width > 2ull * target.width || source.height > 2ull * target.height ? 2u : 0u),
 	    PqToSdrWhiteNits(),
 	    PqToSdrPeakNits()};
 	command.pushConstants(m_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),

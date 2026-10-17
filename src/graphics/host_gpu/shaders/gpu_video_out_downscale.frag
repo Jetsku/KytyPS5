@@ -12,7 +12,8 @@ layout(push_constant) uniform Downscale {
 	ivec2 size;  // extent of the source level
 	vec2  scale; // source texels per target pixel
 	int   level;
-	uint  flags;      // bit 0: the source is HDR10 (PQ, BT.2020) and the target SDR
+	uint  flags;      // bit 0: the source is HDR10 (PQ, BT.2020) and the target SDR; bit 1: one
+	                  // linear tap per pixel, as a blit (a downscale beyond 2:1, which the box cannot cover)
 	float white_nits; // SDR reference white for the PQ conversion
 	float peak_nits;  // highlight luminance mapped to SDR white (soft shoulder)
 };
@@ -67,12 +68,16 @@ void main() {
 	Taps(c.y, scale.y, ay, way, by, wby);
 	const vec2  texel = 1.0 / vec2(size);
 	const float lod   = float(level);
-	color = (textureLod(source, vec2(ax, ay) * texel, lod) * wax +
-	         textureLod(source, vec2(bx, ay) * texel, lod) * wbx) *
-	            way +
-	        (textureLod(source, vec2(ax, by) * texel, lod) * wax +
-	         textureLod(source, vec2(bx, by) * texel, lod) * wbx) *
-	            wby;
+	if ((flags & 2u) != 0u) {
+		color = textureLod(source, c * texel, lod);
+	} else {
+		color = (textureLod(source, vec2(ax, ay) * texel, lod) * wax +
+		         textureLod(source, vec2(bx, ay) * texel, lod) * wbx) *
+		            way +
+		        (textureLod(source, vec2(ax, by) * texel, lod) * wax +
+		         textureLod(source, vec2(bx, by) * texel, lod) * wbx) *
+		            wby;
+	}
 	if ((flags & 1u) != 0u) {
 		color.rgb = PqToSdr(color.rgb);
 		color.a   = 1.0;
