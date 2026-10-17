@@ -2523,6 +2523,10 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
     compute.lds_size_dwords = 16384;
     compute.host_subgroup_size = 32;
     compute.wave_size = 64;
+    // KYTY_CORPUS_SCRATCH=<dwords per thread>: the dispatch's scratch size (shaders that spill).
+    if (const char *scratch = std::getenv("KYTY_CORPUS_SCRATCH"); scratch != nullptr) {
+      compute.scratch_size_dwords = static_cast<uint32_t>(std::strtoul(scratch, nullptr, 0));
+    }
     // KYTY_CORPUS_CS="threads_x,threads_y,threads_z,thread_ids,lds_dwords,workgroup_reg,group_id_x,
     // group_id_y,group_id_z,user_data_count": the compile-time state of a real dispatch (the words
     // of the program cache's static key), so a shader the game rejects reproduces here.
@@ -58078,7 +58082,112 @@ int main(int argc, char **argv) {
   // reach in a game data file (Insomniac's ray-tracing hit callbacks start with s_mov_b32 vcc_hi,
   // <literal> and return through s[14:15]), reads each as the expansion would and writes its
   // disassembly ("== function <file offset> <words>" or "== rejected <file offset>: <reason>").
-  if (argc == 4 && std::strcmp(argv[1], "--scan-functions") == 0) {
+  // GPU (--pipeline-time <file.bin>): compiles a corpus shader (CompileCorpusShader) and times
+  // vkCreateShaderModule and vkCreateComputePipelines for its SPIR-V. The pipeline layout only has
+  // a push-constant range (the driver's compile time, not a dispatchable pipeline).
+  if (argc == 3 && std::strcmp(argv[1], "--pipeline-time") == 0) {
+    EnsureConfigInitialized();
+    const auto t0 = std::chrono::steady_clock::now();
+    ShaderRecompiler::CompileResult result;
+    const std::string status = CompileCorpusShader(argv[2], &result);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (status != "ok") {
+      std::printf("%s: %s\n", argv[2], status.c_str());
+      return 1;
+    }
+    VulkanHarness vulkan;
+    const auto device = vulkan.Device();
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = result.spirv.size() * sizeof(u32);
+    module_info.pCode = result.spirv.data();
+    vk::ShaderModule module = nullptr;
+    const auto t2 = std::chrono::steady_clock::now();
+    const auto module_result = device.createShaderModule(&module_info, nullptr, &module);
+    const auto t3 = std::chrono::steady_clock::now();
+    // The descriptor set layouts the module declares (DescriptorSet/Binding decorations).
+    std::map<u32, u32> set_of, binding_of, type_of_var, storage_of_var, pointee, array_of;
+    std::map<u32, u32> array_length;
+    std::set<u32> runtime_arrays, images_sampled, images_storage, samplers, sampled_images, blocks, buffer_blocks;
+    std::map<u32, u32> constants;
+    const auto &w = result.spirv;
+    for (size_t i = 5; i < w.size();) {
+      const u32 count = w[i] >> 16u, op = w[i] & 0xffffu;
+      if (count == 0) break;
+      if (op == spv::OpDecorate && w[i + 2] == spv::DecorationDescriptorSet) set_of[w[i + 1]] = w[i + 3];
+      if (op == spv::OpDecorate && w[i + 2] == spv::DecorationBinding) binding_of[w[i + 1]] = w[i + 3];
+      if (op == spv::OpDecorate && w[i + 2] == spv::DecorationBlock) blocks.insert(w[i + 1]);
+      if (op == spv::OpDecorate && w[i + 2] == spv::DecorationBufferBlock) buffer_blocks.insert(w[i + 1]);
+      if (op == spv::OpTypePointer) pointee[w[i + 1]] = w[i + 3];
+      if (op == spv::OpVariable) { type_of_var[w[i + 2]] = w[i + 1]; storage_of_var[w[i + 2]] = w[i + 3]; }
+      if (op == spv::OpTypeImage) (w[i + 7] == 2 ? images_storage : images_sampled).insert(w[i + 1]);
+      if (op == spv::OpTypeSampler) samplers.insert(w[i + 1]);
+      if (op == spv::OpTypeSampledImage) sampled_images.insert(w[i + 1]);
+      if (op == spv::OpTypeRuntimeArray) { array_of[w[i + 1]] = w[i + 2]; runtime_arrays.insert(w[i + 1]); }
+      if (op == spv::OpTypeArray) { array_of[w[i + 1]] = w[i + 2]; array_length[w[i + 1]] = w[i + 3]; }
+      if (op == spv::OpConstant && count == 4) constants[w[i + 2]] = w[i + 3];
+      i += count;
+    }
+    std::map<u32, std::vector<vk::DescriptorSetLayoutBinding>> sets;
+    std::vector<vk::DescriptorBindingFlags> flags_storage;
+    for (const auto &[var, set] : set_of) {
+      if (!binding_of.contains(var) || !type_of_var.contains(var)) continue;
+      u32 type = pointee[type_of_var[var]];
+      u32 descriptors = 1;
+      if (array_of.contains(type)) {
+        descriptors = runtime_arrays.contains(type) ? 4096u : constants[array_length[type]];
+        type = array_of[type];
+      }
+      vk::DescriptorType kind = vk::DescriptorType::eStorageBuffer;
+      if (images_storage.contains(type)) kind = vk::DescriptorType::eStorageImage;
+      else if (images_sampled.contains(type)) kind = vk::DescriptorType::eSampledImage;
+      else if (samplers.contains(type)) kind = vk::DescriptorType::eSampler;
+      else if (sampled_images.contains(type)) kind = vk::DescriptorType::eCombinedImageSampler;
+      else if (storage_of_var[var] == spv::StorageClassUniform && blocks.contains(type))
+        kind = vk::DescriptorType::eUniformBuffer;
+      sets[set].push_back({binding_of[var], kind, std::max(descriptors, 1u), vk::ShaderStageFlagBits::eCompute});
+    }
+    std::vector<vk::DescriptorSetLayout> set_layouts;
+    for (u32 set = 0; !sets.empty() && set <= sets.rbegin()->first; set++) {
+      auto &bindings = sets[set];
+      std::vector<vk::DescriptorBindingFlags> binding_flags(
+          bindings.size(), vk::DescriptorBindingFlagBits::ePartiallyBound);
+      vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info{};
+      flags_info.bindingCount = static_cast<u32>(binding_flags.size());
+      flags_info.pBindingFlags = binding_flags.data();
+      vk::DescriptorSetLayoutCreateInfo set_info{};
+      set_info.pNext = &flags_info;
+      set_info.bindingCount = static_cast<u32>(bindings.size());
+      set_info.pBindings = bindings.data();
+      vk::DescriptorSetLayout set_layout = nullptr;
+      (void)device.createDescriptorSetLayout(&set_info, nullptr, &set_layout);
+      set_layouts.push_back(set_layout);
+    }
+    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, 128};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = static_cast<u32>(set_layouts.size());
+    layout_info.pSetLayouts = set_layouts.data();
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push;
+    vk::PipelineLayout layout = nullptr;
+    (void)device.createPipelineLayout(&layout_info, nullptr, &layout);
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    const auto t4 = std::chrono::steady_clock::now();
+    const auto pipeline_result =
+        module_result == vk::Result::eSuccess
+            ? device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline)
+            : module_result;
+    const auto t5 = std::chrono::steady_clock::now();
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::printf("%s: %zu SPIR-V words; translate+emit %.0f ms, module %.0f ms, pipeline %.0f ms (%s)\n",
+                argv[2], result.spirv.size(), ms(t0, t1), ms(t2, t3), ms(t4, t5),
+                vk::to_string(pipeline_result).c_str());
+    return pipeline_result == vk::Result::eSuccess ? 0 : 1;
+  }  if (argc == 4 && std::strcmp(argv[1], "--scan-functions") == 0) {
     std::vector<u32> words;
     if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
       std::fseek(file, 0, SEEK_END);
