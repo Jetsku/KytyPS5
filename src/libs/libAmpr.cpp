@@ -29,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 
 #ifdef min
@@ -83,6 +84,8 @@ struct SubmissionState {
 	uint64_t result           = 0;
 	int32_t  execution_result = 0;
 	uint32_t error_offset     = 0;
+	// The buffer still runs on an AMPR engine thread (KYTY_AMPR_ASYNC): its wait blocks until then.
+	bool pending = false;
 };
 
 struct ResolvedPathInfo {
@@ -94,6 +97,7 @@ struct ResolvedPathInfo {
 };
 
 static std::mutex                                        g_mutex;
+static std::condition_variable                           g_submission_cv;
 static uint32_t                                          g_next_submission_id = 1;
 static std::unordered_map<uint32_t, SubmissionState>     g_submissions;
 static std::unordered_map<uint32_t, std::filesystem::path> g_files;
@@ -428,11 +432,45 @@ static void SetSubmissionResult(uint32_t submission_id, int32_t execution_result
 	}
 }
 
-static bool CompleteSubmission(uint32_t submission_id, SubmissionState* state) {
+// Marks a submission whose buffer continues on an AMPR engine thread.
+static void SetSubmissionPending(uint32_t submission_id) {
 	std::scoped_lock lock(g_mutex);
+	auto             it = g_submissions.find(submission_id);
+	if (it != g_submissions.end()) {
+		it->second.pending = true;
+	}
+}
+
+// The engine thread finished the buffer: records its result and wakes waiters.
+static void FinishPendingSubmission(uint32_t submission_id, int32_t execution_result,
+                                    uint32_t error_offset) {
+	{
+		std::scoped_lock lock(g_mutex);
+		auto             it = g_submissions.find(submission_id);
+		if (it != g_submissions.end()) {
+			it->second.execution_result = execution_result;
+			it->second.error_offset     = error_offset;
+			it->second.pending          = false;
+		}
+	}
+	g_submission_cv.notify_all();
+}
+
+static bool CompleteSubmission(uint32_t submission_id, SubmissionState* state) {
+	std::unique_lock lock(g_mutex);
 	auto             it = g_submissions.find(submission_id);
 	if (it == g_submissions.end()) {
 		return false;
+	}
+	if (it->second.pending) {
+		HangWatchdog::Scope wait("ampr-submission-wait", submission_id, 0);
+		g_submission_cv.wait(lock, [&] {
+			it = g_submissions.find(submission_id);
+			return it == g_submissions.end() || !it->second.pending;
+		});
+		if (it == g_submissions.end()) {
+			return false;
+		}
 	}
 	if (state != nullptr) {
 		*state = it->second;
@@ -457,9 +495,23 @@ static int WriteResult(void* result, int32_t execution_result = 0, uint32_t erro
 } // namespace AprShared
 
 namespace LibAmpr::Ampr {
+// KYTY_AMPR_ASYNC (default 1): a submitted buffer runs on the submitting thread until a wait
+// record is not yet satisfied; the rest of it then continues on its engine's thread (APR or AMM,
+// in submission order) and the submit call returns, as it does on hardware. Later submissions to
+// that engine queue behind it. Without this the submitting thread blocked for up to a second per
+// unsatisfied wait (a value it would only produce after the submit returned), and the reads after
+// the wait ran before the AMM maps they depend on.
+enum class AmprEngine : uint8_t { Apr = 0, Amm = 1 };
+struct AsyncSubmit {
+	AmprEngine engine        = AmprEngine::Apr;
+	uint32_t   submission_id = 0; // 0: none (plain submit)
+	uint64_t   result        = 0; // guest result buffer written on completion, 0: none
+	bool       deferred      = false;
+};
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset,
-                                   Profiler::LoadingAprSubmission* diagnostic = nullptr);
+                                   Profiler::LoadingAprSubmission* diagnostic = nullptr,
+                                   AsyncSubmit* async = nullptr);
 }
 
 namespace LibKernelApr {
@@ -626,13 +678,17 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffe
 
 	int32_t  execution_result = OK;
 	uint32_t error_offset     = 0;
+	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr, id,
+	                                  reinterpret_cast<uint64_t>(result)};
 	auto submit_result = LibAmpr::Ampr::ExecuteAprCommandBuffer(command_buffer_addr,
 	                                                            &execution_result, &error_offset,
-	                                                            diagnostic.Get());
+	                                                            diagnostic.Get(), &async);
 	if (submit_result != OK) {
 		return KernelSyscallResult(diagnostic.Return(submit_result));
 	}
-	AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	if (!async.deferred) {
+		AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	}
 
 	if (out_submission_id != nullptr) {
 		if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
@@ -640,8 +696,9 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffe
 		}
 	}
 
-	return KernelSyscallResult(
-	    diagnostic.Return(AprShared::WriteResult(result, execution_result, error_offset)));
+	// A deferred buffer's result is written by its engine thread when it completes.
+	return KernelSyscallResult(diagnostic.Return(
+	    async.deferred ? OK : AprShared::WriteResult(result, execution_result, error_offset)));
 }
 
 static int KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint64_t argument) {
@@ -655,10 +712,12 @@ static int KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint64_t argu
 		return KernelSyscallResult(diagnostic.Return(LibKernel::KERNEL_ERROR_EINVAL));
 	}
 
-	int32_t  execution_result = OK;
-	uint32_t error_offset     = 0;
+	int32_t                    execution_result = OK;
+	uint32_t                   error_offset     = 0;
+	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr};
 	return KernelSyscallResult(diagnostic.Return(LibAmpr::Ampr::ExecuteAprCommandBuffer(
-	    reinterpret_cast<uint64_t>(command_buffer), &execution_result, &error_offset, diagnostic.Get())));
+	    reinterpret_cast<uint64_t>(command_buffer), &execution_result, &error_offset, diagnostic.Get(),
+	    &async)));
 }
 
 static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void*     command_buffer, uint64_t argument,
@@ -680,13 +739,16 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void*     command_buffer, u
 
 	int32_t  execution_result = OK;
 	uint32_t error_offset     = 0;
+	LibAmpr::Ampr::AsyncSubmit async {LibAmpr::Ampr::AmprEngine::Apr, id};
 	auto submit_result = LibAmpr::Ampr::ExecuteAprCommandBuffer(command_buffer_addr,
 	                                                            &execution_result, &error_offset,
-	                                                            diagnostic.Get());
+	                                                            diagnostic.Get(), &async);
 	if (submit_result != OK) {
 		return KernelSyscallResult(diagnostic.Return(submit_result));
 	}
-	AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	if (!async.deferred) {
+		AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	}
 
 	if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
 		return KernelSyscallResult(diagnostic.Return(LibKernel::KERNEL_ERROR_EFAULT));
@@ -1697,9 +1759,267 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
+enum class CommandKind {
+	ReadFile,
+	KernelEvent,
+	WriteAddress,
+	AmmMap,
+	Sync,
+};
+
+struct OrderedCommand {
+	uint64_t    record_offset = 0;
+	CommandKind kind          = CommandKind::ReadFile;
+	size_t      index         = 0;
+};
+
+// Whether a wait record would pass now; records that do not wait always pass.
+static bool SyncWaitSatisfiedNow(const CommandBufferState::SyncCommand& command) {
+	using Kind = CommandBufferState::SyncKind;
+	if (command.kind == Kind::WaitOnAddress) {
+		uint64_t observed = 0;
+		if (!ReadGuestWaitValue(command.address, &observed)) {
+			return true; // ExecuteSyncCommand reports the fault
+		}
+		return CounterBank::CompareSatisfied(observed, command.value, command.op, sizeof(uint64_t));
+	}
+	if (command.kind == Kind::WaitOnCounter) {
+		CounterBank::Lane lane {};
+		if (!CounterBank::DecodeLane(command.counter_index, command.access, &lane)) {
+			return true;
+		}
+		uint64_t observed = ReadCounter(lane);
+		if (command.mask_op == CounterBank::MASK_AND) {
+			observed &= command.mask;
+		}
+		return CounterBank::CompareSatisfied(observed, command.value, command.op, lane.bytes);
+	}
+	return true;
+}
+
+static bool AmprAsyncEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AMPR_ASYNC");
+		const bool  on    = value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+		LOGF("Kyty AMPR: %s (KYTY_AMPR_ASYNC)\n",
+		     on ? "a buffer that reaches an unsatisfied wait continues on its engine thread"
+		        : "buffers run to completion on the submitting thread");
+		return on;
+	}();
+	return enabled;
+}
+
+// Runs ordered[start..] of a buffer. With blocked_at, stops before the first wait record that is
+// not yet satisfied and stores its position there (SIZE_MAX when the buffer ran to the end).
+// Errors are reported through execution_result/error_offset; the return value is always OK.
+static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState& state,
+                              const std::vector<OrderedCommand>& ordered, size_t start,
+                              int32_t* execution_result, uint32_t* error_offset,
+                              Profiler::LoadingAprSubmission* diagnostic, size_t* blocked_at) {
+	for (size_t position = start; position < ordered.size(); ++position) {
+		const auto& entry = ordered[position];
+		switch (entry.kind) {
+			case CommandKind::ReadFile: {
+				const auto& command = state.read_file_commands[entry.index];
+				std::filesystem::path host_path;
+				if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n",
+					     command.file_id);
+					*execution_result = LibKernel::KERNEL_ERROR_ENOENT;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return OK;
+				}
+
+				HangWatchdog::Scope read("ampr-file", command.destination, command.size,
+				                         command.file_id, command.file_offset, command_buffer);
+				uint64_t            bytes_read = 0;
+				auto result = ReadHostFileToGuest(host_path, command.file_offset,
+				                                  command.destination, command.size, &bytes_read);
+				if (diagnostic != nullptr) diagnostic->read_bytes += bytes_read;
+				if (HangTrace::Enabled()) {
+					char thread_name[64] = "(host)";
+					if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+						if (LibKernel::PthreadGetname(self, thread_name) != 0) {
+							std::snprintf(thread_name, sizeof(thread_name), "(unnamed)");
+						}
+					}
+					HangTrace::RecordAprRead(command.file_id, Common::PathToString(host_path), command.file_offset,
+					                         command.size, command.destination, bytes_read, result,
+					                         thread_name);
+				}
+				if (result != OK) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
+					     ", path=%s\n",
+					     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
+					*execution_result = result;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return OK;
+				}
+			} break;
+			case CommandKind::KernelEvent: {
+				const auto& command = state.kernel_event_commands[entry.index];
+				const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
+				auto        result  = LibKernel::EventQueue::KernelTriggerEvent(
+				    eq, static_cast<uintptr_t>(command.id),
+				    LibKernel::EventQueue::KERNEL_EVFILT_AMPR,
+				    reinterpret_cast<void*>(command.data));
+				if (result != OK) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
+					     ", result=0x%08" PRIx32 "\n",
+					     command.eq, command.id, static_cast<uint32_t>(result));
+					*execution_result = result;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return OK;
+				}
+			} break;
+			case CommandKind::WriteAddress: {
+				const auto& command = state.write_address_commands[entry.index];
+				if (!AprShared::WriteGuest(command.address, command.value)) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
+					     " value=0x%016" PRIx64 "\n",
+					     command.address, command.value);
+					*execution_result = LibKernel::KERNEL_ERROR_EFAULT;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return OK;
+				}
+				NotifySyncWaiters();
+			} break;
+			case CommandKind::Sync: {
+				const auto& command = state.sync_commands[entry.index];
+				if (blocked_at != nullptr && !SyncWaitSatisfiedNow(command)) {
+					// The rest of the buffer continues on the engine thread (KYTY_AMPR_ASYNC).
+					*blocked_at = position;
+					return OK;
+				}
+				const auto result = ExecuteSyncCommand(command_buffer, command);
+				if (result != OK) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					*execution_result = result;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return OK;
+				}
+			} break;
+			case CommandKind::AmmMap: {
+				const auto& command = state.amm_map_commands[entry.index];
+				int         result  = OK;
+				if (command.kind == AmmCommandKind::Unmap) {
+					Profiler::ScopedLoadingOperation unmap(Profiler::LoadingOperation::AmmUnmap);
+					// Upstream 259a40abf: an AMM unmap accepts holes (KernelMunmap fails on them).
+					result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
+				} else {
+					Profiler::ScopedLoadingOperation map(Profiler::LoadingOperation::AmmMap);
+					result = ExecuteAmmMapCommand(command);
+				}
+
+				if (result != OK) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AmmErrors);
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64
+					     " dmem=0x%016" PRIx64 " size=0x%016" PRIx64 " type=%" PRId32
+					     " prot=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",
+					     static_cast<uint32_t>(command.kind), command.va, command.dmem_offset,
+					     command.size, command.type, static_cast<uint32_t>(command.prot),
+					     static_cast<uint32_t>(result));
+					*execution_result = result;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return OK;
+				}
+			} break;
+		}
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRecordsCompleted);
+	}
+
+	return OK;
+}
+
+struct DeferredBuffer {
+	uint64_t                    command_buffer = 0;
+	CommandBufferState          state;
+	std::vector<OrderedCommand> ordered;
+	size_t                      start         = 0;
+	uint32_t                    submission_id = 0;
+	uint64_t                    result        = 0;
+};
+
+struct AmprEngineQueue {
+	std::mutex                  mutex;
+	std::condition_variable     cv;
+	std::vector<DeferredBuffer> queue; // FIFO; front() runs, popped when it completes
+	bool                        started = false;
+};
+
+static AmprEngineQueue g_engines[2];
+
+static void EngineThread(AmprEngineQueue* engine, const char* name) {
+	HangWatchdog::SetThreadName(name);
+	for (;;) {
+		DeferredBuffer job;
+		{
+			// The front stays queued (moved-from) while it runs, so later submissions see the
+			// engine busy and queue behind it; only this thread pops.
+			std::unique_lock lock(engine->mutex);
+			engine->cv.wait(lock, [&] { return !engine->queue.empty(); });
+			job = std::move(engine->queue.front());
+		}
+		int32_t  execution_result = OK;
+		uint32_t error_offset     = 0;
+		RunOrderedCommands(job.command_buffer, job.state, job.ordered, job.start, &execution_result,
+		                   &error_offset, nullptr, nullptr);
+		if (job.result != 0) {
+			AprShared::WriteResult(reinterpret_cast<void*>(job.result), execution_result, error_offset);
+		}
+		if (job.submission_id != 0) {
+			AprShared::FinishPendingSubmission(job.submission_id, execution_result, error_offset);
+		}
+		{
+			std::scoped_lock lock(engine->mutex);
+			engine->queue.erase(engine->queue.begin());
+		}
+	}
+}
+
+// Whether the engine still runs earlier deferred buffers (later ones must queue behind them).
+static bool EngineBusy(AmprEngine id) {
+	auto&            engine = g_engines[static_cast<size_t>(id)];
+	std::scoped_lock lock(engine.mutex);
+	return !engine.queue.empty();
+}
+
+static void DeferToEngine(AsyncSubmit& async, uint64_t command_buffer, CommandBufferState&& state,
+                          std::vector<OrderedCommand>&& ordered, size_t start) {
+	auto& engine = g_engines[static_cast<size_t>(async.engine)];
+	if (async.submission_id != 0) {
+		AprShared::SetSubmissionPending(async.submission_id);
+	}
+	{
+		std::scoped_lock lock(engine.mutex);
+		DeferredBuffer   buffer;
+		buffer.command_buffer = command_buffer;
+		buffer.state          = std::move(state);
+		buffer.ordered        = std::move(ordered);
+		buffer.start          = start;
+		buffer.submission_id  = async.submission_id;
+		buffer.result         = async.result;
+		engine.queue.push_back(std::move(buffer));
+		if (!engine.started) {
+			engine.started = true;
+			std::thread(EngineThread, &engine,
+			            async.engine == AmprEngine::Apr ? "AMPR APR engine" : "AMPR AMM engine")
+			    .detach();
+		}
+	}
+	engine.cv.notify_one();
+	async.deferred = true;
+}
+
 static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_result,
                                    uint32_t* error_offset,
-                                   Profiler::LoadingAprSubmission* diagnostic) {
+                                   Profiler::LoadingAprSubmission* diagnostic, AsyncSubmit* async) {
+	const bool async_enabled = async != nullptr && AmprAsyncEnabled();
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprSubmit);
 	if (diagnostic != nullptr) diagnostic->execution_observed = 1;
 	const auto finish = [&](int result) {
@@ -1746,20 +2066,6 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		}
 	}
 
-	enum class CommandKind {
-		ReadFile,
-		KernelEvent,
-		WriteAddress,
-		AmmMap,
-		Sync,
-	};
-
-	struct OrderedCommand {
-		uint64_t    record_offset = 0;
-		CommandKind kind          = CommandKind::ReadFile;
-		size_t      index         = 0;
-	};
-
 	std::vector<OrderedCommand> ordered;
 	ordered.reserve(state.read_file_commands.size() + state.kernel_event_commands.size() +
 	                state.write_address_commands.size() + state.amm_map_commands.size() +
@@ -1796,6 +2102,10 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	std::sort(ordered.begin(), ordered.end(), [](const OrderedCommand& a, const OrderedCommand& b) {
 		return a.record_offset < b.record_offset;
 	});
+	if (async_enabled && EngineBusy(async->engine)) {
+		DeferToEngine(*async, command_buffer, std::move(state), std::move(ordered), 0);
+		return finish(OK);
+	}
 	if (diagnostic != nullptr) {
 		uint64_t signature = 14695981039346656037ull;
 		const auto hash = [&](uint64_t value) {
@@ -1857,117 +2167,12 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		diagnostic->commands_signature = signature;
 	}
 
-	for (const auto& entry: ordered) {
-		switch (entry.kind) {
-			case CommandKind::ReadFile: {
-				const auto& command = state.read_file_commands[entry.index];
-				std::filesystem::path host_path;
-				if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
-					LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n",
-					     command.file_id);
-					*execution_result = LibKernel::KERNEL_ERROR_ENOENT;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return finish(OK);
-				}
-
-				HangWatchdog::Scope read("ampr-file", command.destination, command.size,
-				                         command.file_id, command.file_offset, command_buffer);
-				uint64_t            bytes_read = 0;
-				auto result = ReadHostFileToGuest(host_path, command.file_offset,
-				                                  command.destination, command.size, &bytes_read);
-				if (diagnostic != nullptr) diagnostic->read_bytes += bytes_read;
-				if (HangTrace::Enabled()) {
-					char thread_name[64] = "(host)";
-					if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
-						if (LibKernel::PthreadGetname(self, thread_name) != 0) {
-							std::snprintf(thread_name, sizeof(thread_name), "(unnamed)");
-						}
-					}
-					HangTrace::RecordAprRead(command.file_id, Common::PathToString(host_path), command.file_offset,
-					                         command.size, command.destination, bytes_read, result,
-					                         thread_name);
-				}
-				if (result != OK) {
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
-					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
-					     ", path=%s\n",
-					     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return finish(OK);
-				}
-			} break;
-			case CommandKind::KernelEvent: {
-				const auto& command = state.kernel_event_commands[entry.index];
-				const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
-				auto        result  = LibKernel::EventQueue::KernelTriggerEvent(
-				    eq, static_cast<uintptr_t>(command.id),
-				    LibKernel::EventQueue::KERNEL_EVFILT_AMPR,
-				    reinterpret_cast<void*>(command.data));
-				if (result != OK) {
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
-					LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
-					     ", result=0x%08" PRIx32 "\n",
-					     command.eq, command.id, static_cast<uint32_t>(result));
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return finish(OK);
-				}
-			} break;
-			case CommandKind::WriteAddress: {
-				const auto& command = state.write_address_commands[entry.index];
-				if (!AprShared::WriteGuest(command.address, command.value)) {
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
-					LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
-					     " value=0x%016" PRIx64 "\n",
-					     command.address, command.value);
-					*execution_result = LibKernel::KERNEL_ERROR_EFAULT;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return finish(OK);
-				}
-				NotifySyncWaiters();
-			} break;
-			case CommandKind::Sync: {
-				const auto& command = state.sync_commands[entry.index];
-				const auto  result  = ExecuteSyncCommand(command_buffer, command);
-				if (result != OK) {
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return finish(OK);
-				}
-			} break;
-			case CommandKind::AmmMap: {
-				const auto& command = state.amm_map_commands[entry.index];
-				int         result  = OK;
-				if (command.kind == AmmCommandKind::Unmap) {
-					Profiler::ScopedLoadingOperation unmap(Profiler::LoadingOperation::AmmUnmap);
-					// Upstream 259a40abf: an AMM unmap accepts holes (KernelMunmap fails on them).
-					result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
-				} else {
-					Profiler::ScopedLoadingOperation map(Profiler::LoadingOperation::AmmMap);
-					result = ExecuteAmmMapCommand(command);
-				}
-
-				if (result != OK) {
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AmmErrors);
-					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
-					LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64
-					     " dmem=0x%016" PRIx64 " size=0x%016" PRIx64 " type=%" PRId32
-					     " prot=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",
-					     static_cast<uint32_t>(command.kind), command.va, command.dmem_offset,
-					     command.size, command.type, static_cast<uint32_t>(command.prot),
-					     static_cast<uint32_t>(result));
-					*execution_result = result;
-					*error_offset     = static_cast<uint32_t>(command.record_offset);
-					return finish(OK);
-				}
-			} break;
-		}
-		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRecordsCompleted);
+	size_t blocked_at = SIZE_MAX;
+	RunOrderedCommands(command_buffer, state, ordered, 0, execution_result, error_offset, diagnostic,
+	                   async_enabled ? &blocked_at : nullptr);
+	if (blocked_at != SIZE_MAX) {
+		DeferToEngine(*async, command_buffer, std::move(state), std::move(ordered), blocked_at);
 	}
-
 	return finish(OK);
 }
 
@@ -3158,10 +3363,12 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBuffer(void* command_buffer_base, uint3
 		return diagnostic.Return(LibKernel::KERNEL_ERROR_EINVAL);
 	}
 
-	int32_t  execution_result = OK;
-	uint32_t error_offset     = 0;
+	int32_t     execution_result = OK;
+	uint32_t    error_offset     = 0;
+	AsyncSubmit async {AmprEngine::Amm};
 	return diagnostic.Return(ExecuteAprCommandBuffer(reinterpret_cast<uint64_t>(command_buffer_base),
-	                                                &execution_result, &error_offset, diagnostic.Get()));
+	                                                &execution_result, &error_offset, diagnostic.Get(),
+	                                                &async));
 }
 
 static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_base, uint32_t argument1,
@@ -3181,14 +3388,17 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_bas
 	const auto id                  = AprShared::AllocateSubmissionId(command_buffer_addr, 0);
 	diagnostic.SetId(id);
 
-	int32_t  execution_result = OK;
-	uint32_t error_offset     = 0;
-	auto     submit_result =
-	    ExecuteAprCommandBuffer(command_buffer_addr, &execution_result, &error_offset, diagnostic.Get());
+	int32_t     execution_result = OK;
+	uint32_t    error_offset     = 0;
+	AsyncSubmit async {AmprEngine::Amm, id};
+	auto        submit_result = ExecuteAprCommandBuffer(command_buffer_addr, &execution_result,
+	                                                    &error_offset, diagnostic.Get(), &async);
 	if (submit_result != OK) {
 		return diagnostic.Return(submit_result);
 	}
-	AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	if (!async.deferred) {
+		AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	}
 
 	if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
 		return diagnostic.Return(LibKernel::KERNEL_ERROR_EFAULT);
@@ -3216,21 +3426,26 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void* command_buffer
 	    AprShared::AllocateSubmissionId(command_buffer_addr, reinterpret_cast<uint64_t>(result));
 	diagnostic.SetId(id);
 
-	int32_t  execution_result = OK;
-	uint32_t error_offset     = 0;
-	auto     submit_result =
-	    ExecuteAprCommandBuffer(command_buffer_addr, &execution_result, &error_offset, diagnostic.Get());
+	int32_t     execution_result = OK;
+	uint32_t    error_offset     = 0;
+	AsyncSubmit async {AmprEngine::Amm, id, reinterpret_cast<uint64_t>(result)};
+	auto        submit_result = ExecuteAprCommandBuffer(command_buffer_addr, &execution_result,
+	                                                    &error_offset, diagnostic.Get(), &async);
 	if (submit_result != OK) {
 		return diagnostic.Return(submit_result);
 	}
-	AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	if (!async.deferred) {
+		AprShared::SetSubmissionResult(id, execution_result, error_offset);
+	}
 
 	if (out_submission_id != nullptr &&
 	    !AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
 		return diagnostic.Return(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	return diagnostic.Return(AprShared::WriteResult(result, execution_result, error_offset));
+	// A deferred buffer's result is written by its engine thread when it completes.
+	return diagnostic.Return(async.deferred ? OK
+	                                        : AprShared::WriteResult(result, execution_result, error_offset));
 }
 
 static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) {
