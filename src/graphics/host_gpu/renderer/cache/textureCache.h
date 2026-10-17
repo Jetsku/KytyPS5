@@ -430,6 +430,14 @@ private:
 	[[nodiscard]] bool OtherImagesOwnBytes(GuestRange range, ImageId except);
 	// False when no image is registered on the 1 MiB pages of the range (lock-free, any thread).
 	[[nodiscard]] bool MayOverlapImages(uint64_t address, uint64_t size) const;
+	// KYTY_TEXEL_SYNC_MEMO: the image registration epoch (InvalidateCleanImageProofs), or 0 when it
+	// is not maintained (KYTY_TEXTURE_CLEAN_PROOFS off) or saturated.
+	[[nodiscard]] uint64_t RegistrationEpoch() const {
+		const auto epoch = m_clean_image_epoch.load(std::memory_order_acquire);
+		return m_clean_image_proofs && epoch != UINT64_MAX ? epoch : 0;
+	}
+	// Whether a registered image starts at `address` (whatever its state).
+	[[nodiscard]] bool AnyImageStartsAt(uint64_t address);
 	// The 64 KiB blocks of a single-level, single-layer render target (64 KiB render-target
 	// tiling) under `rect` (level-0 texels, clamped to the extent). False: not such a target, or
 	// the rectangle covers the whole image (claim it all).
@@ -595,7 +603,9 @@ private:
 		uint64_t epoch = 0;
 	};
 	std::array<CleanImagePageProof, 256> m_clean_image_pages {};
-	uint64_t m_clean_image_epoch = 1;
+	// Bumped on every image register/unregister and GPU-modified transition (with clean proofs
+	// on); atomic so that BufferCache's texel-sync memo can read it on the GPU thread.
+	std::atomic<uint64_t> m_clean_image_epoch {1};
 	bool m_clean_image_proofs = false;
 	ImageLookupMode  m_image_lookup_mode = ImageLookupMode::FirstPage;
 	uint64_t         m_image_lookup_checks = 0;

@@ -563,6 +563,12 @@ private:
 	void SettleHotPages(uint64_t vaddr, uint64_t size);
 	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// `nothing` (optional): set when the call provably synchronized nothing because no image
+	// starts at or overlaps the range (KYTY_TEXEL_SYNC_MEMO).
+	[[nodiscard]] bool SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                                     bool* nothing);
+	[[nodiscard]] bool SynchronizeBufferFromImageImpl(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                                  bool* nothing);
 	// The texel-read download of one image that owns all of its bytes and starts at the read
 	// (SynchronizeBufferFromImage's image found by TextureCache::FindImageFromRange).
 	[[nodiscard]] bool SynchronizeBufferFromOwner(Buffer& buffer, Common::SlotId image_id);

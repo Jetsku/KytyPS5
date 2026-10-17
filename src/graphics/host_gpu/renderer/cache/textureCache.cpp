@@ -5292,6 +5292,17 @@ void TextureCache::DownloadImageTo(Image& image, vk::Buffer destination,
 	                  texture.LinearSize(), texture.tiles, transform);
 }
 
+bool TextureCache::AnyImageStartsAt(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && image->info.data.address == address) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool TextureCache::MayOverlapImages(uint64_t address, uint64_t size) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
@@ -5561,26 +5572,218 @@ uint64_t TextureCache::MaterializeOwnedBytes(GuestRange range, ImageId only, Ima
 	return moved;
 }
 
+namespace {
+
+// KYTY_TEXEL_IMAGE_SYNC_STATS=1 (diagnostic, default off): BufferCache::SynchronizeBufferFromImage
+// accounting, one console line every 10 s: calls (GPU thread / other), time, the image lookup's
+// share, images found, downloads and their bytes, unchanged skips, alias-byte scans and the
+// bytes they moved.
+struct TexelImageSyncStats {
+	std::atomic<uint64_t> calls {0}, other_thread {0}, ns {0}, lookup_ns {0}, found {0},
+	    downloads {0}, download_bytes {0}, skips {0}, alias_scans {0}, alias_ns {0},
+	    alias_bytes {0}, owner_ns {0};
+	std::atomic<int64_t> last_ms {0};
+};
+TexelImageSyncStats g_texel_image_sync;
+
+bool TexelImageSyncStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TEXEL_IMAGE_SYNC_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+uint64_t TexelSyncNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void ReportTexelImageSync() {
+	auto&      s   = g_texel_image_sync;
+	const auto now = static_cast<int64_t>(TexelSyncNowNs() / 1000000u);
+	auto       last = s.last_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		s.last_ms.store(now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10000 || !s.last_ms.compare_exchange_strong(last, now)) {
+		return;
+	}
+	std::printf("TexelImageSync %.0fs: %" PRIu64 " calls (%" PRIu64 " off the GPU thread), %.1f ms "
+	            "(lookup %.1f, owner sync %.1f, alias %.1f); %" PRIu64 " images found, %" PRIu64
+	            " downloads %.1f MiB, %" PRIu64 " unchanged skips; %" PRIu64 " alias scans moved %.1f MiB\n",
+	            static_cast<double>(now - last) / 1000.0, s.calls.exchange(0), s.other_thread.exchange(0),
+	            static_cast<double>(s.ns.exchange(0)) / 1e6, static_cast<double>(s.lookup_ns.exchange(0)) / 1e6,
+	            static_cast<double>(s.owner_ns.exchange(0)) / 1e6,
+	            static_cast<double>(s.alias_ns.exchange(0)) / 1e6, s.found.exchange(0),
+	            s.downloads.exchange(0), static_cast<double>(s.download_bytes.exchange(0)) / 1048576.0,
+	            s.skips.exchange(0), s.alias_scans.exchange(0),
+	            static_cast<double>(s.alias_bytes.exchange(0)) / 1048576.0);
+	std::fflush(stdout);
+}
+
+} // namespace
+
+namespace {
+
+// KYTY_TEXEL_SYNC_MEMO (live, default on; =0 off; =2 verify): a texel read whose range had no
+// image starting at its address and no image page overlapping it (so it synchronized nothing:
+// no image download, no alias-byte scan) is remembered with the image registration epoch
+// (TextureCache::RegistrationEpoch, bumped on every image register/unregister and GPU-modified
+// transition). The same range, buffer and epoch again returns at once: nothing it looked at can
+// have changed. Miles Morales binds about 190,000 heap-wide (~1 GB) texel buffers a second on the
+// command processor, every one of them finding nothing after a walk of ~1,000 image page counts.
+// =2 runs the full synchronization on a memo hit too and reports a hit that would have synced.
+Live::Switch g_texel_sync_memo("KYTY_TEXEL_SYNC_MEMO", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0') {
+		return 1;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 2;
+	}
+	return std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 2);
+});
+
+struct TexelSyncMemoEntry {
+	uint64_t      vaddr  = 0;
+	uint64_t      size   = 0;
+	uint64_t      epoch  = 0;
+	const Buffer* buffer = nullptr;
+};
+constexpr size_t TexelSyncMemoSlots = 4096;
+std::atomic<uint64_t> g_texel_sync_memo_hits {0}, g_texel_sync_memo_stores {0},
+    g_texel_sync_memo_mismatches {0};
+std::atomic<int64_t> g_texel_sync_memo_last_ms {0};
+
+void ReportTexelSyncMemo() {
+	const auto now  = static_cast<int64_t>(TexelSyncNowNs() / 1000000u);
+	auto       last = g_texel_sync_memo_last_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_texel_sync_memo_last_ms.store(now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10000 || !g_texel_sync_memo_last_ms.compare_exchange_strong(last, now)) {
+		return;
+	}
+	std::printf("TexelSyncMemo %.0fs: %" PRIu64 " hits, %" PRIu64 " stores, %" PRIu64
+	            " verify mismatches\n",
+	            static_cast<double>(now - last) / 1000.0, g_texel_sync_memo_hits.exchange(0),
+	            g_texel_sync_memo_stores.exchange(0), g_texel_sync_memo_mismatches.exchange(0));
+	std::fflush(stdout);
+}
+
+} // namespace
+
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto memo_mode = g_texel_sync_memo.Get();
+	if (memo_mode != 0 && GuestGpu::IsGpuThread()) {
+		const auto epoch = m_texture_cache.RegistrationEpoch();
+		if (epoch != 0) {
+			thread_local std::vector<TexelSyncMemoEntry> memo(TexelSyncMemoSlots);
+			auto& entry = memo[((vaddr >> 6u) ^ (vaddr >> 20u) ^ size) % TexelSyncMemoSlots];
+			const bool hit = entry.vaddr == vaddr && entry.size == size && entry.epoch == epoch &&
+			                 entry.buffer == &buffer;
+			if (hit && memo_mode == 1) {
+				g_texel_sync_memo_hits.fetch_add(1, std::memory_order_relaxed);
+				ReportTexelSyncMemo();
+				return false;
+			}
+			bool       nothing = false;
+			const bool synced  = SynchronizeBufferFromImageCounted(buffer, vaddr, size, &nothing);
+			if (hit) {
+				g_texel_sync_memo_hits.fetch_add(1, std::memory_order_relaxed);
+				if (synced || !nothing) {
+					const auto count = g_texel_sync_memo_mismatches.fetch_add(1, std::memory_order_relaxed);
+					if (count < 16) {
+						std::printf("TexelSyncMemo verify: 0x%" PRIx64 "+0x%" PRIx64
+						            " would have been skipped but %s\n",
+						            vaddr, size, synced ? "synchronized" : "was not provably empty");
+						std::fflush(stdout);
+					}
+				}
+			}
+			// The epoch read before the synchronization: a change during it makes the entry stale.
+			if (nothing && !synced && m_texture_cache.RegistrationEpoch() == epoch &&
+			    !m_texture_cache.AnyImageStartsAt(vaddr)) {
+				entry = {vaddr, size, epoch, &buffer};
+				g_texel_sync_memo_stores.fetch_add(1, std::memory_order_relaxed);
+			} else if (hit) {
+				entry = {};
+			}
+			ReportTexelSyncMemo();
+			return synced;
+		}
+	}
+	return SynchronizeBufferFromImageCounted(buffer, vaddr, size, nullptr);
+}
+
+bool BufferCache::SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                                    bool* nothing) {
+	if (TexelImageSyncStatsEnabled()) [[unlikely]] {
+		auto&      s     = g_texel_image_sync;
+		const auto begin = TexelSyncNowNs();
+		s.calls.fetch_add(1, std::memory_order_relaxed);
+		if (!GuestGpu::IsGpuThread()) {
+			s.other_thread.fetch_add(1, std::memory_order_relaxed);
+		}
+		const bool result = SynchronizeBufferFromImageImpl(buffer, vaddr, size, nothing);
+		s.ns.fetch_add(TexelSyncNowNs() - begin, std::memory_order_relaxed);
+		ReportTexelImageSync();
+		return result;
+	}
+	return SynchronizeBufferFromImageImpl(buffer, vaddr, size, nothing);
+}
+
+bool BufferCache::SynchronizeBufferFromImageImpl(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                                 bool* nothing) {
+	if (nothing != nullptr) {
+		*nothing = false;
+	}
+	const bool stats        = TexelImageSyncStatsEnabled();
+	const auto lookup_begin = stats ? TexelSyncNowNs() : 0;
 	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size, true, true);
+	if (stats) {
+		g_texel_image_sync.lookup_ns.fetch_add(TexelSyncNowNs() - lookup_begin, std::memory_order_relaxed);
+		g_texel_image_sync.found.fetch_add(selected ? 1 : 0, std::memory_order_relaxed);
+	}
+	const auto owner_begin = stats && selected ? TexelSyncNowNs() : 0;
 	const bool synced   = selected && SynchronizeBufferFromOwner(buffer, selected);
+	if (owner_begin != 0) {
+		g_texel_image_sync.owner_ns.fetch_add(TexelSyncNowNs() - owner_begin, std::memory_order_relaxed);
+	}
 	// KYTY_ALIAS_BYTES: every other byte of the range that an image owns (an owner that does not
 	// start at vaddr, owns only part of its bytes, or lies past the image synchronized above) is
 	// read from the buffer too: move it there. Only into the cache buffer that holds the range
 	// (whose GPU-dirty bytes the cache tracks).
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	if (!TextureCache::AliasBytesEnabled() || owner == nullptr || !*owner ||
-	    &m_slot_buffers[*owner] != &buffer) {
+	if (!TextureCache::AliasBytesEnabled()) {
+		if (nothing != nullptr) {
+			*nothing = !selected;
+		}
+		return synced;
+	}
+	if (owner == nullptr || !*owner || &m_slot_buffers[*owner] != &buffer) {
 		return synced;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::AliasBytesTexelReads);
 	if (!m_texture_cache.MayOverlapImages(vaddr, size)) {
+		if (nothing != nullptr) {
+			*nothing = !selected;
+		}
 		return synced;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::AliasBytesTexelScans);
+	const auto alias_begin = stats ? TexelSyncNowNs() : 0;
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	const auto       moved = m_texture_cache.MaterializeOwnedBytes(
         {vaddr, size}, {}, synced ? selected : ImageId {}, "texel-read", &buffer);
+	if (stats) {
+		g_texel_image_sync.alias_scans.fetch_add(1, std::memory_order_relaxed);
+		g_texel_image_sync.alias_bytes.fetch_add(moved, std::memory_order_relaxed);
+		g_texel_image_sync.alias_ns.fetch_add(TexelSyncNowNs() - alias_begin, std::memory_order_relaxed);
+	}
 	return synced || moved != 0;
 }
 
@@ -5608,10 +5811,17 @@ bool BufferCache::SynchronizeBufferFromOwner(Buffer& buffer, Common::SlotId sele
 			// Nothing was written. (A skip needs a content revision for the whole range, which no
 			// CPU-dirty page, so no hot page, has: there is nothing to settle either.)
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncSkips);
+			if (TexelImageSyncStatsEnabled()) {
+				g_texel_image_sync.skips.fetch_add(1, std::memory_order_relaxed);
+			}
 			return true;
 		}
 		image_address = image.info.data.address;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncDownloads);
+		if (TexelImageSyncStatsEnabled()) {
+			g_texel_image_sync.downloads.fetch_add(1, std::memory_order_relaxed);
+			g_texel_image_sync.download_bytes.fetch_add(copied, std::memory_order_relaxed);
+		}
 		if (track_texel_sync) {
 			if (const auto revision = GetContentRevision(image.info.data.address, copied);
 			    revision && &m_slot_buffers[revision->id] == &buffer) {
