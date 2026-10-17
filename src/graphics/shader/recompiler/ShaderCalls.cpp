@@ -28,6 +28,13 @@ const char* StageLabel(ShaderType stage) {
 // KYTY_SHADER_CALLS_DUMP=<folder> (diagnostics, default off): each program with calls is written
 // there once as calls_<hash>.bin (its code) and calls_<hash>.txt (its disassembly), and each
 // expansion as calls_<hash>_<digest>.bin/.txt. The files stay on this machine.
+size_t MaxTargetsPerTable() {
+	static const size_t cap = [] {
+		const char* value = std::getenv("KYTY_SHADER_CALLS_MAX_TARGETS");
+		return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 0)) : size_t {0};
+	}();
+	return cap;
+}
 const char* DumpFolder() {
 	static const char* folder = [] {
 		const char* value = std::getenv("KYTY_SHADER_CALLS_DUMP");
@@ -208,6 +215,26 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 								found.clear();
 							}
 							state->second.targets.assign(found.begin(), found.end());
+							if (const auto cap = MaxTargetsPerTable();
+							    cap != 0 && state->second.targets.size() > cap) {
+								// KYTY_SHADER_CALLS_MAX_TARGETS (diagnostics): the targets most
+								// records name; the others take the skip path.
+								std::map<uint64_t, uint32_t> records;
+								const uint64_t bytes = m_table_words.size() * sizeof(uint32_t);
+								for (uint64_t offset = view.target_offset; offset + 8u <= bytes;
+								     offset += view.record_bytes) {
+									const auto value =
+									    static_cast<uint64_t>(m_table_words[offset / 4u]) |
+									    (static_cast<uint64_t>(m_table_words[offset / 4u + 1u]) << 32u);
+									if ((value & AddressMask) != 0) records[value]++;
+								}
+								auto& kept = state->second.targets;
+								std::ranges::sort(kept, [&](uint64_t x, uint64_t y) {
+									return records[x] != records[y] ? records[x] > records[y] : x < y;
+								});
+								kept.resize(cap);
+								std::ranges::sort(kept);
+							}
 						}
 						state->second.digest     = digest;
 						state->second.scanned_at = now;
