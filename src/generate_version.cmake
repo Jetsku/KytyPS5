@@ -33,7 +33,9 @@ if(GIT_EXECUTABLE)
 			RESULT_VARIABLE GIT_DIRTY_RESULT
 			ERROR_QUIET
 		)
-		if(NOT GIT_DIRTY_RESULT EQUAL 0)
+		# 1: changes; another code is an error (a worktree whose submodule git dir does not
+		# resolve), not a dirty tree.
+		if(GIT_DIRTY_RESULT EQUAL 1)
 			string(APPEND KYTY_GIT_HASH "-dirty")
 		endif()
 	endif()
