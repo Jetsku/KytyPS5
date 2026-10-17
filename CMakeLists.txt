@@ -1237,6 +1237,9 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --codegen-only)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
+	# Bindless images: a T# read from a descriptor heap at a key loaded per lane (Miles' RT kernels).
+	add_test(NAME bindless_codegen
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-codegen-only)
 	add_test(NAME gi_probe_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gi-probe-codegen-only)
 	add_test(NAME gi_probe

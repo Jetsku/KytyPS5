@@ -1318,16 +1318,15 @@ public:
 		}
 		alignment = std::max<uint64_t>(alignment != 0 ? alignment : PageSize(), PageSize());
 		std::lock_guard lock(m_mutex);
-		if (search_addr == 0) {
-			auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN,
-			                                    HOST_SYSTEM_MANAGED_MAX + 1u, size, alignment);
-			return addr != 0 ? addr
-			                 : FindFreeAlignedUnlocked(HOST_USER_MIN, HOST_USER_ALLOC_END, size,
-			                                           alignment);
+		if (search_addr != 0 && search_addr < HOST_USER_ALLOC_END) {
+			return FindFreeAlignedUnlocked(search_addr, HOST_USER_ALLOC_END, size, alignment);
 		}
-		return search_addr < HOST_USER_ALLOC_END
-		           ? FindFreeAlignedUnlocked(search_addr, HOST_USER_ALLOC_END, size, alignment)
-		           : 0;
+		// No hint, or one at or above the AMM window (HOST_USER_ALLOC_END): the default search, as
+		// FindGuestFreeRange falls back for such a hint.
+		auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u,
+		                                    size, alignment);
+		return addr != 0 ? addr
+		                 : FindFreeAlignedUnlocked(HOST_USER_MIN, HOST_USER_ALLOC_END, size, alignment);
 	}
 
 	uint64_t FindFreeAligned(uint64_t search_start, uint64_t search_end, uint64_t size,

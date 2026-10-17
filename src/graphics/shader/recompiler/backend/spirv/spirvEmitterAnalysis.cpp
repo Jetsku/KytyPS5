@@ -154,6 +154,23 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	if (image_resource.bindless) {
+		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+		const auto type     = ImageType(state, image_resource);
+		const auto variable = state.bindless_image_variables.find(type);
+		EXIT_IF(variable == state.bindless_image_variables.end() || state.bindless_slot == 0);
+		const auto pointer_type =
+		    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable->second,
+		                          state.bindless_slot);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		const auto image = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, image, pointer);
+		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+		return image;
+	}
 	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
 	const auto image = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, ImageType(state, state.program.info.images.at(resource)),
@@ -188,6 +205,8 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
+	} else if (image_resource.bindless) {
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;

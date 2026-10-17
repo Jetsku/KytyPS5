@@ -64,6 +64,7 @@
 #include "graphics/shader/recompiler/ShaderCalls.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -2541,6 +2542,10 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
         corpus_user_data_count = v[9];
       }
     }
+    // KYTY_CORPUS_SCRATCH=<dwords>: the dispatch's per-thread scratch size.
+    if (const char *scratch = std::getenv("KYTY_CORPUS_SCRATCH"); scratch != nullptr) {
+      compute.scratch_size_dwords = static_cast<u32>(std::strtoul(scratch, nullptr, 10));
+    }
     options.input_info.compute = &compute;
     options.wave_size = 64;
     // KYTY_CORPUS_DUMP_IR=1: the IR before resource tracking goes to stdout (with KYTY_DUMP_STDOUT=1),
@@ -2579,7 +2584,35 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
                                                  .denorm_preserve_f16 = true,
                                                  .denorm_preserve_f64 = false});
   ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = true});
+  // KYTY_CORPUS_BINDLESS=1: as on a device with bindless images (ir/BindlessBindings.h).
+  if (const char *bindless = std::getenv("KYTY_CORPUS_BINDLESS"); bindless != nullptr) {
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(*bindless == '1');
+  }
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  if (translated.skip_dispatch) {
+    return "skipped";
+  }
+  if (std::getenv("KYTY_CORPUS_BINDLESS") != nullptr) {
+    // The image handles resource tracking turned into bindless heap lookups.
+    u32 bindless_images = 0;
+    for (const auto &image : translated.program.info.images) {
+      const auto &source = translated.program.descriptor_sources.at(image.source);
+      bindless_images += source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless;
+    }
+    u32 bindless_samples = 0;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        const auto info = ShaderRecompiler::IR::ImageOpcodeInfoOf(inst.GetOpcode());
+        if (info.access == ShaderRecompiler::IR::ImageAccess::None) continue;
+        const auto &memory = translated.program.memory_info.at(inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index);
+        if (memory.resource >= translated.program.info.images.size()) continue;
+        const auto &source = translated.program.descriptor_sources.at(
+            translated.program.info.images[memory.resource].source);
+        bindless_samples += source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless;
+      }
+    }
+    std::printf("%s,bindless,%u images,%u instructions\n", path, bindless_images, bindless_samples);
+  }
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   // KYTY_CORPUS_PLAN_STATS=1: "<path>,plan,<blocks>,<conditions>,<inert conditions>" for the
   // resource plan's control flow. A condition is inert when no block reachable from its
@@ -2619,6 +2652,10 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(code.data()),
       .read_memory = [](void *, uint64_t, std::span<u32> values) {
+        std::fill(values.begin(), values.end(), 0u);
+        return true;
+      },
+      .read_specialization_memory = [](void *, uint64_t, std::span<u32> values) {
         std::fill(values.begin(), values.end(), 0u);
         return true;
       },
@@ -57979,6 +58016,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 }
 
 #include "ShaderCodegenTests.inc"
+#include "ShaderBindlessTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderWaveClusterTests.inc"
 #include "ShaderLdsDeviceBufferTests.inc"
@@ -59452,6 +59490,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-writes-only") == 0) {
     VulkanHarness vulkan;
     BdaWriteTests::RunAll(&vulkan);
+    return 0;
+  }
+  // CPU only: heap-indexed T#s through bindless images (ShaderBindlessTests.inc).
+  if (argc == 2 && std::strcmp(argv[1], "--bindless-codegen-only") == 0) {
+    BindlessTests::RunCodegen();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {

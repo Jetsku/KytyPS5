@@ -3269,9 +3269,17 @@ struct PipelineCache::ProgramCache {
 				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
 				                   params.code, translated.decoded_dump);
 				auto call_targets = translated.call_targets;
-				for (const auto& callee: DescribeCallTables(ProgramStageName(options.stage), options,
-				                                            translated.call_tables)) {
-					call_targets.push_back(callee);
+				// The call-table description reads guest memory: only for dumps or
+				// KYTY_CALL_TABLE_LOG=1 (startup, default off).
+				static const bool call_table_log = [] {
+					const char* value = std::getenv("KYTY_CALL_TABLE_LOG");
+					return value != nullptr && value[0] == '1';
+				}();
+				if (call_table_log || Config::GraphicsDebugDumpEnabled()) {
+					for (const auto& callee: DescribeCallTables(ProgramStageName(options.stage), options,
+					                                            translated.call_tables)) {
+						call_targets.push_back(callee);
+					}
 				}
 				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash, call_targets);
 				if (disk_on) {

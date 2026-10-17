@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -20,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1066,8 +1068,39 @@ public:
 	void NotePreparedValidated() noexcept { m_prepared_validated = true; }
 	// KYTY_DRAW_PREP_BINDINGS texturememo: the memo draw-prep threads read hints from (FindHint).
 	[[nodiscard]] const TextureBindingMemo& GetTextureMemo() const noexcept { return m_texture_memo; }
+	// Bindless engine method (Senaxx): at the start of a guest submission, settle the heap entries
+	// the guest wrote since the previous one (GPU thread). Returns at once while no heap is watched.
+	void SyncBindlessHeaps();
 
 private:
+	// Bindless heaps (Senaxx; descriptors.cpp): register the stage's heaps, patch their regions,
+	// and once per frame resolve the keys draws asked for.
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void ResolveBindlessRequests();
+	void SyncWrittenBindlessEntries();
+	bool ResolveBindlessKey(BindlessHeap& heap, uint32_t key);
+	// A settled key whose T# changed: released (its image unpinned when no key refers to it any
+	// more) and resolved again; it keeps its old slot while the new texture cannot be resolved
+	// yet (IDXTRI, KYTY_BINDLESS_KEEP_OLD).
+	bool ResettleBindlessKey(BindlessHeap& heap, uint32_t key);
+	// KYTY_BINDLESS_ENGINE=0: the rolling scan of every heap's entries (budget: keys per frame).
+	uint32_t RevalidateBindlessKeys(uint32_t budget);
+	// Engine method, E5 (CommitBindings): the stage's bindless images in a read-only layout.
+	void MakeBindlessImagesReadable(std::span<BindlessHeap* const> heaps, vk::CommandBuffer target);
+	[[nodiscard]] uint64_t BindlessFrame() const;
+	// IDXTRI's kept old views: keys whose changed T# could not be resolved yet, retried each frame.
+	std::vector<std::pair<BindlessHeap*, uint32_t>> m_bindless_retry;
+	// ResolveBindlessKey's last failure may pass (an image being dropped, a full array).
+	bool m_bindless_transient_failure = false;
+	std::unordered_set<uint64_t>               m_bindless_surveyed; // base ^ table offset << 48
+	uint64_t                                   m_bindless_frame          = UINT64_MAX;
+	uint64_t                                   m_bindless_snapshot_frame = 0;
+	std::vector<uint32_t>                      m_bindless_requests;
+	std::vector<std::array<uint32_t, 8>>       m_bindless_window;
+	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
+	std::vector<ImageId>                       m_bindless_changed;
+	std::vector<uint32_t>                      m_bindless_srt;
+
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	// Records a GPU-sourced indirect draw. Returns false, before recording anything, when the

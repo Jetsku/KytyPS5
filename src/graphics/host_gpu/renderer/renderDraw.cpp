@@ -1889,7 +1889,16 @@ static void CopyPreparedVertexInfo(ShaderVertexInputInfo& dst, const ShaderVerte
 
 // Draws that waited at least 2 ms for their graphics pipeline on the command processor (a new
 // pipeline built there, whichever path builds it: fast-first, libraries, the optimized build): one
-// console line a minute while there are any, "Pipeline waits 60s: ...".
+// console line a minute while there are any, "Pipeline waits 60s: ...". KYTY_PIPELINE_WAIT_STATS=1
+// (startup, default off): the timing and the line cost two clock reads per unplanned draw.
+static bool PipelineWaitStats() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_WAIT_STATS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static void NotePipelineWait(std::chrono::steady_clock::duration elapsed) {
 	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
 	if (us < 2000) {
@@ -1930,8 +1939,10 @@ static void NotePipelineWait(std::chrono::steady_clock::duration elapsed) {
 static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::StagePrep& b) noexcept {
 	auto& [a_resources, a_specialization, a_permutation] = a;
 	auto& [b_resources, b_specialization, b_permutation] = b;
-	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill, a_gpu_fills] = a_resources;
-	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill, b_gpu_fills] = b_resources;
+	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill, a_gpu_fills,
+	       a_bindless_heaps] = a_resources;
+	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill, b_gpu_fills,
+	       b_bindless_heaps] = b_resources;
 	auto& [a_spec_buffers, a_spec_images] = a_specialization;
 	auto& [b_spec_buffers, b_spec_images] = b_specialization;
 	a_buffers.swap(b_buffers);
@@ -1941,6 +1952,7 @@ static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::Sta
 	a_user_data.swap(b_user_data);
 	std::swap(a_fill, b_fill);
 	a_gpu_fills.swap(b_gpu_fills);
+	a_bindless_heaps.swap(b_bindless_heaps);
 	a_spec_buffers.swap(b_spec_buffers);
 	a_spec_images.swap(b_spec_images);
 	std::swap(a_permutation, b_permutation);
@@ -2109,8 +2121,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): a continuation keeps the previous draw's targets (the
 	// entries are still in `state`: the fast reset leaves them, DrawRunCandidate requires it).
 	m_run_slice_offset = render_target_slice_offset;
+	// Bindless images (descriptors.cpp): their per-frame feedback copy and image transitions may end
+	// the rendering instance while the bindings are prepared; such draws never continue a run.
+	const auto bindless_stage = [](const ShaderStageRuntime& stage) {
+		return stage.resources != nullptr && !stage.resources->bindless_heaps.empty();
+	};
+	const auto bindless = [&] {
+		return (state.ps_active && bindless_stage(state.ps_input_info.stage)) ||
+		       std::ranges::any_of(state.vertex_info,
+		                           [&](const auto& info) { return bindless_stage(info.stage); });
+	};
 	const bool run_candidate =
-	    DrawRun::Enabled() &&
+	    DrawRun::Enabled() && !bindless() &&
 	    (DrawRunCandidate(buffer, state, render_target_slice_offset) ||
 	     (DrawRun::RecallEnabled() &&
 	      DrawRunRecallCandidate(buffer, state, render_target_slice_offset)));
@@ -4043,11 +4065,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
-		const auto pipeline_begin = std::chrono::steady_clock::now();
+		const bool wait_stats     = PipelineWaitStats();
+		const auto pipeline_begin = wait_stats ? std::chrono::steady_clock::now()
+		                                       : std::chrono::steady_clock::time_point {};
 		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
 		    primitive_restart_enable, *programs);
-		NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
+		if (wait_stats) {
+			NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
+		}
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.

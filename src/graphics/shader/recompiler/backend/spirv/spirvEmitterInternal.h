@@ -148,6 +148,12 @@ struct EmitterState {
 	// the mip_stats binding stays declared, but no sample records GET_LOD_STATS feedback.
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
+	// the feedback buffer, and the slot of the image instruction being emitted.
+	std::map<uint32_t, uint32_t>                     bindless_image_variables;
+	uint32_t                                         bindless_translation_variable = 0;
+	uint32_t                                         bindless_feedback_variable    = 0;
+	uint32_t                                         bindless_slot                 = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
 	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds

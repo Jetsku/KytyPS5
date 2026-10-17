@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
@@ -339,12 +340,12 @@ void Translator::V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low) {
 	// On a 64-wide one (AMD) invocations 32..63 counted as lanes of a second half, got
 	// v_mbcnt_lo = 32 + base, failed the shader's own `exec = lane < vertex count` test and never
 	// exported a position (exploded strand geometry). Wrapping the lane index at 32 keeps them
-	// active; on a 32-wide subgroup (NVIDIA) it changes nothing. KYTY_VS_LANE_WRAP32=0 turns it
-	// off. From Senaxx's Wolverine fork (d7873b2a4, an AMD tester's RX 9070 XT patch).
-	static const bool wrap_lane32 = [] {
-		const char* value = std::getenv("KYTY_VS_LANE_WRAP32");
-		return value == nullptr || value[0] != '0';
-	}();
+	// active; on a 32-wide subgroup (NVIDIA) it changes nothing. From Senaxx's Wolverine fork
+	// (d7873b2a4, an AMD tester's RX 9070 XT patch). Our KYTY_WAVE32_CLUSTERS (default auto)
+	// already makes the lane id the low 5 bits there, so the wrap is emitted only with clusters
+	// off (CodegenOptions::vs_lane_wrap32, KYTY_VS_LANE_WRAP32=0 turns it off; in the fingerprint).
+	const auto& codegen      = GetCodegenOptions();
+	const bool  wrap_lane32  = codegen.vs_lane_wrap32 && codegen.wave32_clusters == Wave32Clusters::Off;
 	auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	if (wrap_lane32 && program.stage == ShaderType::Vertex && program.wave_size == 32u) {
 		lane = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
