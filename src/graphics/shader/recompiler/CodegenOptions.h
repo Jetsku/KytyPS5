@@ -98,6 +98,11 @@ struct CodegenOptions {
 	// (Bryan's companion change, dropping the sin/cos |x| >= 2^23 select, is not exact on the RTX
 	// 3090 and is not applied.)
 	bool short_f32_helpers = false;
+	// KYTY_VS_LANE_WRAP32=0: V_MBCNT of a wave32 vertex shader no longer wraps the lane index at 32
+	// when KYTY_WAVE32_CLUSTERS=0 (Integer.cpp). With clusters (the default) the lane id is already
+	// the low 5 bits on hosts with wider subgroups, and a 32-wide host has no higher lanes, so the
+	// wrap is emitted only with clusters off.
+	bool vs_lane_wrap32 = true;
 	// KYTY_FAST_FMINMAX=0: emulate f32 min/max/min3/max3/med3 with two bit classifications per
 	// min/max instead of one compare-and-select plus a single two-zeros test.
 	bool fast_float_min_max = true;
