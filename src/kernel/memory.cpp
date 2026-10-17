@@ -1077,11 +1077,15 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	};
 
 	if (search_addr != 0) {
-		return find_in(search_addr, HOST_USER_MAX + 1u);
+		// A hint inside the AMM window is not honoured: that window belongs to AMM map commands.
+		if (search_addr < HOST_USER_ALLOC_END) {
+			return find_in(search_addr, HOST_USER_ALLOC_END);
+		}
+		search_addr = 0;
 	}
 	auto addr = find_in(GUEST_DEFAULT_MAP_BASE, HOST_SYSTEM_MANAGED_MAX + 1u);
 	if (addr == 0) {
-		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
+		addr = find_in(HOST_USER_MIN, HOST_USER_ALLOC_END);
 	}
 	return addr;
 }

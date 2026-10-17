@@ -12,6 +12,10 @@ static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+// End of the user range that ordinary mappings search: the AMM window above it is left to the
+// AMM map commands (kAmmWindowBase).
+static constexpr uint64_t HOST_USER_ALLOC_END = kAmmWindowBase;
+static_assert(kAmmWindowBase > HOST_USER_MIN && kAmmWindowBase + kAmmWindowSize == HOST_USER_MAX + 1u);
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -1318,10 +1322,12 @@ public:
 			auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN,
 			                                    HOST_SYSTEM_MANAGED_MAX + 1u, size, alignment);
 			return addr != 0 ? addr
-			                 : FindFreeAlignedUnlocked(HOST_USER_MIN, HOST_USER_MAX + 1u, size,
+			                 : FindFreeAlignedUnlocked(HOST_USER_MIN, HOST_USER_ALLOC_END, size,
 			                                           alignment);
 		}
-		return FindFreeAlignedUnlocked(search_addr, HOST_USER_MAX + 1u, size, alignment);
+		return search_addr < HOST_USER_ALLOC_END
+		           ? FindFreeAlignedUnlocked(search_addr, HOST_USER_ALLOC_END, size, alignment)
+		           : 0;
 	}
 
 	uint64_t FindFreeAligned(uint64_t search_start, uint64_t search_end, uint64_t size,

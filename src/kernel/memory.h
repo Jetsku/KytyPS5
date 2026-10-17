@@ -25,6 +25,14 @@ using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 
+// The AMM virtual-address window (sceAmprAmmGetVirtualAddressRanges): the top 64 GiB of the guest
+// user range, below the 1 TiB the GPU tables address. Ordinary mappings never take addresses here
+// (FindGuestFreeRange, ReserveAligned), so AMM map commands at fixed addresses cannot replace a
+// mapping the kernel placed there. With the window at 0x1000000000 Miles Morales' streaming
+// pages replaced its own direct-memory heap at that address.
+constexpr uint64_t kAmmWindowBase = 0x00ec00000000ull;
+constexpr uint64_t kAmmWindowSize = 0x001000000000ull;
+
 struct VirtualQueryInfo {
 	uintptr_t start;
 	uintptr_t end;
