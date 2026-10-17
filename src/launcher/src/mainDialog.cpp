@@ -475,6 +475,9 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 // variables go over the bundled preset in this game's process only. The emulator names the file
 // (KYTY_TITLE_PRESET) in its startup log.
 static void ApplyTitlePreset(QProcess* process, const QString& title_id) {
+	// The launcher reuses its QProcess: every launch starts from the system environment, so a
+	// previous title's preset never carries over (also when this title has no valid preset).
+	process->setProcessEnvironment(QProcessEnvironment::systemEnvironment());
 	const QDir                         app_dir(QApplication::applicationDirPath());
 	std::vector<std::filesystem::path> dirs {std::filesystem::path(app_dir.absolutePath().toStdU16String())};
 	if (QDir parent = app_dir; parent.cdUp()) {
