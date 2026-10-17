@@ -58074,6 +58074,54 @@ int main(int argc, char **argv) {
                 ms(t1, t2), ms(t2, t3), structured ? "structured" : "failed", cfg.blocks.size());
     return structured ? 0 : 1;
   }
+  // CPU only (--scan-functions <file> <out.txt>): finds the functions an S_SWAPPC_B64 call table can
+  // reach in a game data file (Insomniac's ray-tracing hit callbacks start with s_mov_b32 vcc_hi,
+  // <literal> and return through s[14:15]), reads each as the expansion would and writes its
+  // disassembly ("== function <file offset> <words>" or "== rejected <file offset>: <reason>").
+  if (argc == 4 && std::strcmp(argv[1], "--scan-functions") == 0) {
+    std::vector<u32> words;
+    if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
+      std::fseek(file, 0, SEEK_END);
+      const auto size = std::ftell(file);
+      std::fseek(file, 0, SEEK_SET);
+      words.resize(static_cast<size_t>(size) / 4u);
+      words.resize(std::fread(words.data(), sizeof(u32), words.size(), file));
+      std::fclose(file);
+    }
+    std::FILE *out = std::fopen(argv[3], "wb");
+    if (words.empty() || out == nullptr) return 2;
+    constexpr uint64_t Base = 0x0000001000000000ull;
+    const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address,
+                                                                 std::span<u32> values) {
+      const uint64_t index = (address - Base) / 4u;
+      if (address < Base || index + values.size() > words.size()) return false;
+      std::copy_n(words.begin() + static_cast<std::ptrdiff_t>(index), values.size(), values.begin());
+      return true;
+    };
+    size_t found = 0, rejected = 0;
+    for (size_t i = 0; i + 3 < words.size(); i++) {
+      if (words[i] != 0xbeeb03ffu || (words[i + 2] != 0xbfa00003u && words[i + 2] != 0xbefc03ffu)) {
+        continue;
+      }
+      std::vector<u32> function;
+      std::string reason;
+      if (!ShaderRecompiler::Decoder::ReadShaderFunction(Base + i * 4u, 14, read, 64, function,
+                                                         reason)) {
+        std::fprintf(out, "== rejected 0x%zx: %s\n", i * 4u, reason.c_str());
+        rejected++;
+        continue;
+      }
+      function.push_back(0xbf810000u); // s_endpgm, for the disassembler
+      ShaderRecompiler::Decoder::Program decoded;
+      ShaderRecompiler::Decoder::DecodeProgram(function, decoded, true);
+      const auto text = ShaderRecompiler::Decoder::ProgramToString(decoded);
+      std::fprintf(out, "== function 0x%zx %zu\n%s", i * 4u, function.size() - 1u, text.c_str());
+      found++;
+    }
+    std::fclose(out);
+    std::printf("%s: %zu functions, %zu rejected candidates\n", argv[2], found, rejected);
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--corpus-program-cache") == 0) {
     EnsureConfigInitialized();
     return ProgramCacheTests::CorpusProgramCache(argv[2]);

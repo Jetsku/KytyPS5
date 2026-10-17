@@ -60,6 +60,11 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
                        std::span<const ShaderCallSite> sites, const ShaderCodeReader& read,
                        uint32_t wave_size, ShaderCallExpansion& expansion, std::string& reason);
 
+// The code of one function as the expansion reads it (from `address` to its last S_SETPC_B64
+// through s[return_reg:+1]); false with `reason` when it is not a function the expansion places.
+bool ReadShaderFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader& read,
+                        uint32_t wave_size, std::vector<uint32_t>& words, std::string& reason);
+
 constexpr uint32_t MaxShaderFunctionWords = 16384;
 constexpr uint32_t MaxExpandedShaderWords = 1u << 20u;
 

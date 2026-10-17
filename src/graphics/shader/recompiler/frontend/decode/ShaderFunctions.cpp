@@ -270,6 +270,13 @@ bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::stri
 
 } // namespace
 
+bool ReadShaderFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader& read,
+                        uint32_t wave_size, std::vector<uint32_t>& words, std::string& reason) {
+	Function function;
+	if (!ReadFunction(address, return_reg, read, wave_size, function, reason)) return false;
+	words = std::move(function.code);
+	return true;
+}
 bool MayCallFunctions(std::span<const uint32_t> code) {
 	return std::ranges::any_of(code, [](uint32_t word) { return IsShaderCallWord(word); });
 }
