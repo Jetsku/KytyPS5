@@ -62,6 +62,7 @@
 #include "graphics/shader/recompiler/BvhReference.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderCalls.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
@@ -58003,6 +58004,34 @@ int main(int argc, char **argv) {
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
     EnsureConfigInitialized();
     return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
+  // CPU only (--cfg-time <file.bin>): decodes a guest program dump and times the CFG build and its
+  // structurization (large S_SWAPPC_B64 expansions, KYTY_SHADER_CALLS_DUMP).
+  if (argc == 3 && std::strcmp(argv[1], "--cfg-time") == 0) {
+    std::vector<u32> code;
+    if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
+      u32 word = 0;
+      while (std::fread(&word, sizeof(word), 1, file) == 1) code.push_back(word);
+      std::fclose(file);
+    }
+    if (code.empty()) return 2;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    const auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto t0 = now();
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(code, decoded, true);
+    const auto t1 = now();
+    auto cfg = ShaderRecompiler::CFG::BuildGraph(decoded);
+    const auto t2 = now();
+    const bool structured = !cfg.irreducible && ShaderRecompiler::CFG::Structurize(cfg);
+    const auto t3 = now();
+    std::printf("%s: %zu words, %zu instructions, %zu blocks; decode %.1f ms, build %.1f ms, "
+                "structurize %.1f ms (%s, %zu blocks)\n",
+                argv[2], code.size(), decoded.instructions.size(), cfg.blocks.size(), ms(t0, t1),
+                ms(t1, t2), ms(t2, t3), structured ? "structured" : "failed", cfg.blocks.size());
+    return structured ? 0 : 1;
   }
   if (argc == 3 && std::strcmp(argv[1], "--corpus-program-cache") == 0) {
     EnsureConfigInitialized();
