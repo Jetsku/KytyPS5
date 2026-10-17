@@ -44,6 +44,17 @@ struct LoadResult {
 // The first directory of `dirs` that holds FileName decides; Missing when none does.
 [[nodiscard]] LoadResult Load(const std::vector<std::filesystem::path>& dirs);
 
+// Per-title overrides: u59-preset.<TITLE_ID>.json (same format) next to u59-preset.json. When the
+// launcher starts that title it sets the file's variables over the bundled preset, in that game's
+// process only (e.g. a switch that breaks one game), and names the file in KYTY_TITLE_PRESET, which
+// the emulator prints at startup.
+[[nodiscard]] std::string TitleFileName(std::string_view title_id);
+
+// The title file in the first directory of `dirs` that holds it; Missing when none does, or when
+// the title id is not nine upper-case letters and digits (e.g. PPSA01417).
+[[nodiscard]] LoadResult LoadTitle(const std::vector<std::filesystem::path>& dirs,
+                                   std::string_view                           title_id);
+
 // One paragraph for the launcher (window and log) about a preset that was not applied, naming the
 // file or the directories searched. Empty for Loaded.
 [[nodiscard]] std::string Describe(const LoadResult& result);

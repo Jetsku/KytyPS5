@@ -223,6 +223,11 @@ void Run(const RunOptions& options) {
 	for (const auto& line: Common::U59Preset::StartupWarnings([](const char* name) { return std::getenv(name); })) {
 		Log::WriteToConsoleAndLog(line);
 	}
+	// The launcher applied u59-preset.<title>.json over the bundled preset for this game.
+	if (const char* title_preset = std::getenv("KYTY_TITLE_PRESET");
+	    title_preset != nullptr && title_preset[0] != '\0') {
+		Log::WriteToConsoleAndLog(fmt::format("Per-title preset applied: {}\n", title_preset));
+	}
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
