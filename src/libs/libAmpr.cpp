@@ -467,10 +467,17 @@ static bool CompleteSubmission(uint32_t submission_id, SubmissionState* state) {
 	}
 	if (it->second.pending) {
 		HangWatchdog::Scope wait("ampr-submission-wait", submission_id, 0);
-		g_submission_cv.wait(lock, [&] {
+		// The engine caps each of its waits (AMPR_ENGINE_WAIT_CAP), so this ends; a warning every
+		// 10 s names a submission that takes that long.
+		const auto pending_done = [&] {
 			it = g_submissions.find(submission_id);
 			return it == g_submissions.end() || !it->second.pending;
-		});
+		};
+		for (uint32_t waited_s = 10; !g_submission_cv.wait_for(lock, std::chrono::seconds(10), pending_done);
+		     waited_s += 10) {
+			LOGF("\tAMPR submission %u still pending after %u s (its engine waits on a record)\n",
+			     submission_id, waited_s);
+		}
 		if (it == g_submissions.end()) {
 			return false;
 		}
@@ -2059,17 +2066,35 @@ struct DeferredBuffer {
 	size_t                      start         = 0;
 	uint32_t                    submission_id = 0;
 	uint64_t                    result        = 0;
+	// When the front record (`start`) was first found blocked (AMPR_ENGINE_WAIT_CAP).
+	std::chrono::steady_clock::time_point blocked_since {};
+	size_t                                blocked_position = SIZE_MAX;
 };
+
+// Safety cap of one engine wait: a record still unsatisfied after this long is logged and run as a
+// bounded synchronous wait (ExecuteSyncCommand: up to AMPR_WAIT_TIMEOUT more, then continues), so a
+// value that never arrives cannot stall its priority queue (and CompleteSubmission) forever. Far
+// above the waits Miles Morales' streamer needs (an AMM map that runs a few frames later).
+constexpr auto AMPR_ENGINE_WAIT_CAP = std::chrono::seconds(10);
+// The engine thread's poll interval while every front waits (CPU stores and GPU writes do not
+// notify): doubles from the first value to the last while nothing progresses.
+constexpr auto AMPR_ENGINE_POLL_FIRST = std::chrono::microseconds(100);
+constexpr auto AMPR_ENGINE_POLL_MAX   = std::chrono::milliseconds(4);
 
 // One engine (APR or AMM) with a FIFO per submission priority, as on hardware (upstream's
 // CommandEngine: 7 APR and 3 AMM priorities). A buffer blocked on a wait holds back only the later
 // buffers of its own priority; the engine thread keeps running the other priorities' fronts. The
-// engine never gives up on a wait: on hardware the queue simply stalls until the value arrives
-// (with a 1 s give-up, Miles Morales' streamer read into an AMM range before its map command ran).
+// engine waits as on hardware, where the queue stalls until the value arrives (with a 1 s give-up,
+// Miles Morales' streamer read into an AMM range before its map command ran), up to
+// AMPR_ENGINE_WAIT_CAP.
+// A submitter runs its buffer inline only when its priority's queue is empty and no other inline
+// run of that priority is in flight (`inline_active`, taken under `mutex`); the remainder of a
+// blocked inline run goes to the front of the queue, so no later buffer overtakes it.
 struct AmprEngineQueue {
 	std::mutex                               mutex;
 	std::condition_variable                  cv;
 	std::array<std::deque<DeferredBuffer>, 8> queues; // per priority; front() runs, popped when done
+	std::array<bool, 8>                      inline_active {};
 	bool                                     started = false;
 };
 
@@ -2082,24 +2107,53 @@ static size_t EnginePriorityIndex(uint32_t priority) {
 static void EngineThread(AmprEngineQueue* engine, const char* name) {
 	HangWatchdog::SetThreadName(name);
 	std::unique_lock lock(engine->mutex);
+	std::chrono::steady_clock::duration poll = AMPR_ENGINE_POLL_FIRST;
 	for (;;) {
 		bool pending  = false;
 		bool progress = false;
-		for (auto& queue: engine->queues) {
-			if (queue.empty()) {
+		for (size_t priority = 0; priority < engine->queues.size(); priority++) {
+			auto& queue = engine->queues[priority];
+			// An inline run of this priority is in flight: its remainder (if any) goes first.
+			if (queue.empty() || engine->inline_active[priority]) {
 				continue;
 			}
 			pending = true;
-			// Only this thread pops, and push_back keeps references to deque elements valid.
+			// Only this thread pops. push_back/push_front keep references to deque elements valid,
+			// and push_front happens only while inline_active (when this thread skips the queue).
 			auto& job = queue.front();
 			lock.unlock();
 			int32_t  execution_result = OK;
 			uint32_t error_offset     = 0;
 			size_t   blocked_at       = SIZE_MAX;
-			const auto start          = job.start;
-			RunOrderedCommands(job.command_buffer, job.state, job.ordered, job.start,
-			                   &execution_result, &error_offset, nullptr, &blocked_at);
+			auto     start            = job.start;
+			const auto now            = std::chrono::steady_clock::now();
+			if (job.blocked_position == job.start && now - job.blocked_since >= AMPR_ENGINE_WAIT_CAP) {
+				// AMPR_ENGINE_WAIT_CAP: run the blocked record as a bounded synchronous wait.
+				const auto& entry = job.ordered[job.start];
+				LOGF("\tAMPR engine wait not satisfied after %lld s, continuing: cb=0x%016" PRIx64
+				     " record=0x%" PRIx64 " priority=%zu\n",
+				     static_cast<long long>(
+				         std::chrono::duration_cast<std::chrono::seconds>(now - job.blocked_since).count()),
+				     job.command_buffer, entry.record_offset, priority);
+				if (entry.kind == CommandKind::Sync) {
+					const auto result = ExecuteSyncCommand(job.command_buffer, job.state.sync_commands[entry.index]);
+					if (result != OK) {
+						execution_result = result;
+						error_offset     = static_cast<uint32_t>(entry.record_offset);
+					}
+				}
+				job.start++;
+				start = SIZE_MAX; // progress
+			}
+			if (execution_result == OK) {
+				RunOrderedCommands(job.command_buffer, job.state, job.ordered, job.start,
+				                   &execution_result, &error_offset, nullptr, &blocked_at);
+			}
 			const bool done = execution_result != OK || blocked_at == SIZE_MAX;
+			if (!done && job.blocked_position != blocked_at) {
+				job.blocked_position = blocked_at;
+				job.blocked_since    = std::chrono::steady_clock::now();
+			}
 			if (done) {
 				if (job.result != 0) {
 					AprShared::WriteResult(reinterpret_cast<void*>(job.result), execution_result,
@@ -2119,27 +2173,49 @@ static void EngineThread(AmprEngineQueue* engine, const char* name) {
 			}
 		}
 		if (progress) {
+			poll = AMPR_ENGINE_POLL_FIRST;
 			continue;
 		}
 		if (pending) {
-			// Every front waits: CPU stores and GPU writes do not notify, so poll; AMPR counter
-			// and address writes and new submissions wake the thread early.
-			engine->cv.wait_for(lock, std::chrono::microseconds(100));
+			// Every front waits: CPU stores and GPU writes do not notify, so poll, backing off while
+			// nothing progresses; AMPR counter and address writes, new submissions and the end of
+			// an inline run wake the thread early.
+			engine->cv.wait_for(lock, poll);
+			poll = std::min<std::chrono::steady_clock::duration>(poll * 2, AMPR_ENGINE_POLL_MAX);
 		} else {
 			engine->cv.wait(lock);
+			poll = AMPR_ENGINE_POLL_FIRST;
 		}
 	}
 }
 
-// Whether earlier deferred buffers of this priority are still queued (later ones queue behind).
-static bool EngineBusy(AmprEngine id, uint32_t priority) {
+// Starts an inline run of a buffer of this priority on the submitting thread: only when no earlier
+// deferred buffer of the priority is queued and no other inline run of it is in flight (checked and
+// marked under the engine lock, so no submission overtakes another). False: queue the buffer.
+static bool TryBeginInline(AmprEngine id, uint32_t priority) {
 	auto&            engine = g_engines[static_cast<size_t>(id)];
+	const auto       index  = EnginePriorityIndex(priority);
 	std::scoped_lock lock(engine.mutex);
-	return !engine.queues[EnginePriorityIndex(priority)].empty();
+	if (!engine.queues[index].empty() || engine.inline_active[index]) {
+		return false;
+	}
+	engine.inline_active[index] = true;
+	return true;
 }
 
+static void EndInline(AmprEngine id, uint32_t priority) {
+	auto& engine = g_engines[static_cast<size_t>(id)];
+	{
+		std::scoped_lock lock(engine.mutex);
+		engine.inline_active[EnginePriorityIndex(priority)] = false;
+	}
+	engine.cv.notify_one();
+}
+
+// `front`: the remainder of this priority's inline run (inline_active is set), queued before the
+// buffers submitted while it ran.
 static void DeferToEngine(AsyncSubmit& async, uint64_t command_buffer, CommandBufferState&& state,
-                          std::vector<OrderedCommand>&& ordered, size_t start) {
+                          std::vector<OrderedCommand>&& ordered, size_t start, bool front = false) {
 	auto& engine = g_engines[static_cast<size_t>(async.engine)];
 	if (async.submission_id != 0) {
 		AprShared::SetSubmissionPending(async.submission_id);
@@ -2153,7 +2229,12 @@ static void DeferToEngine(AsyncSubmit& async, uint64_t command_buffer, CommandBu
 		buffer.start          = start;
 		buffer.submission_id  = async.submission_id;
 		buffer.result         = async.result;
-		engine.queues[EnginePriorityIndex(async.priority)].push_back(std::move(buffer));
+		auto& queue = engine.queues[EnginePriorityIndex(async.priority)];
+		if (front) {
+			queue.push_front(std::move(buffer));
+		} else {
+			queue.push_back(std::move(buffer));
+		}
 		if (!engine.started) {
 			engine.started = true;
 			std::thread(EngineThread, &engine,
@@ -2251,10 +2332,19 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	std::sort(ordered.begin(), ordered.end(), [](const OrderedCommand& a, const OrderedCommand& b) {
 		return a.record_offset < b.record_offset;
 	});
-	if (async_enabled && EngineBusy(async->engine, async->priority)) {
+	if (async_enabled && !TryBeginInline(async->engine, async->priority)) {
 		DeferToEngine(*async, command_buffer, std::move(state), std::move(ordered), 0);
 		return finish(OK);
 	}
+	// Ends the inline run on every path below (after its remainder, if any, was queued first).
+	struct InlineScope {
+		AsyncSubmit* async;
+		~InlineScope() {
+			if (async != nullptr) {
+				EndInline(async->engine, async->priority);
+			}
+		}
+	} inline_scope {async_enabled ? async : nullptr};
 	if (diagnostic != nullptr) {
 		uint64_t signature = 14695981039346656037ull;
 		const auto hash = [&](uint64_t value) {
@@ -2320,7 +2410,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	RunOrderedCommands(command_buffer, state, ordered, 0, execution_result, error_offset, diagnostic,
 	                   async_enabled ? &blocked_at : nullptr);
 	if (blocked_at != SIZE_MAX) {
-		DeferToEngine(*async, command_buffer, std::move(state), std::move(ordered), blocked_at);
+		DeferToEngine(*async, command_buffer, std::move(state), std::move(ordered), blocked_at, true);
 	}
 	return finish(OK);
 }
