@@ -633,6 +633,11 @@ bool RelaxedQueriesEnabled() {
 	return enabled;
 }
 
+// KYTY_WRITE_DATA_GPU_PAGE (default 1; live): BufferCache::TryWriteDataGpu.
+Live::Switch g_write_data_gpu_page("KYTY_WRITE_DATA_GPU_PAGE", [](const char* value) -> int64_t {
+	return value == nullptr || value[0] == '\0' ? 1 : static_cast<int64_t>(std::strtoll(value, nullptr, 10));
+});
+
 // KYTY_TEXEL_RELAXED_SYNC (default 2; 1; 0 off; live): formatted (texel) read bindings use the
 // same lock-free "nothing to upload" test as raw reads (1), and the read-binding memo
 // (ObtainReadBinding, 2), followed by the image step (SynchronizeBufferFromImage) that only texel
@@ -4311,7 +4316,17 @@ bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t
 	}
 	// Only bytes owned by recorded GPU work need ordering on the GPU timeline; everything else
 	// keeps the CPU write (which faults into the usual invalidation when tracked).
-	if (!HasGpuDirtyBytes(vaddr, size) && !HasPendingBackingPublication(vaddr, size)) {
+	// KYTY_WRITE_DATA_GPU_PAGE (default 1; 0 off; live): the 4 KiB pages around the range count
+	// too. A CPU write into a page the GPU owns faults and drains the GPU even when the GPU wrote
+	// other bytes of that page (Miles Morales writes 208-byte constants next to 1448 bytes a
+	// compute shader wrote: ~3 drains and ~12 ms of the command processor per frame).
+	const bool page_granular = g_write_data_gpu_page.Get() != 0;
+	const auto page_begin    = vaddr & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+	const auto page_end      = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+	const auto check_begin   = page_granular ? page_begin : vaddr;
+	const auto check_size    = page_granular ? page_end - page_begin : size;
+	if (!HasGpuDirtyBytes(check_begin, check_size) &&
+	    !HasPendingBackingPublication(check_begin, check_size)) {
 		return false;
 	}
 	KYTY_GPU_OP_SITE("buffercache.write_data");
