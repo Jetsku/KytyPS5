@@ -57,6 +57,11 @@ namespace Libs::Graphics {
 
 namespace {
 
+// KYTY_WIDE_FILL_CLEAR=1 (default off, live): see the fill-to-clear conversion below.
+Live::Switch g_wide_fill_clear("KYTY_WIDE_FILL_CLEAR", [](const char* value) -> int64_t {
+	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
+});
+
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
 // The DccImageState* cause in the DCC CPU fallback's stderr line.
@@ -4944,12 +4949,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		// KYTY_WIDE_FILL_CLEAR (default off): a fill of an image with 64- or 128-bit texels is a clear
+		// KYTY_WIDE_FILL_CLEAR (default off, live): a fill of an image with 64- or 128-bit texels is a clear
 		// too; otherwise only a zero RGBA16F fill and the 32-bit formats are.
-		static const bool wide_fill = [] {
-			const auto* value = std::getenv("KYTY_WIDE_FILL_CLEAR");
-			return value != nullptr && std::strcmp(value, "1") == 0;
-		}();
+		const bool wide_fill = g_wide_fill_clear.Get() != 0;
 		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, packed_clear, clear.color)
 		                : DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color))) {
 			return false;
