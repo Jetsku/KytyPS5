@@ -248,20 +248,41 @@ bool SideReadbackGpuThreadEnabled() {
 	return enabled;
 }
 
-// Aligned side-copy window in bytes: a power of two between 4 KiB and 1 MiB (default 64 KiB).
+// Aligned side-copy window in bytes: a power of two between 4 KiB and 4 MiB (default 4 MiB, was
+// 64 KiB). It is also the staging stride of each side-readback slot (16 slots: 64 MiB of download
+// memory), so the live window below never exceeds it. Miles Morales' game threads poll
+// GPU-written bytes across neighbouring pages: one launch, 5 ABBA quartets at the "Previously on"
+// prompt, 4 MiB vs 64 KiB: +17.8% flips/s (SE 4.2%), CP time per flip unchanged (+2.5 ms, SE 4.6),
+// guest read faults ~690 -> ~510 per frame.
 uint64_t SideReadbackWindow() {
-	constexpr uint64_t Default = 64 * 1024;
+	constexpr uint64_t Default = 4096 * 1024;
 	const auto*        value   = std::getenv("KYTY_READBACK_SIDE_COPY_WINDOW_KB");
 	if (value == nullptr) {
 		return Default;
 	}
 	char*      end = nullptr;
 	const auto kib = std::strtoull(value, &end, 10);
-	if (end == value || *end != '\0' || kib < 4 || kib > 1024 || (kib & (kib - 1)) != 0) {
+	if (end == value || *end != '\0' || kib < 4 || kib > 4096 || (kib & (kib - 1)) != 0) {
 		return Default;
 	}
 	return kib * 1024;
 }
+
+// KYTY_READBACK_SIDE_WINDOW_LIVE_KB (live; unset or 0 = KYTY_READBACK_SIDE_COPY_WINDOW_KB): the
+// aligned window a side readback copies around a fault, a power of two of at least 4 KiB, capped
+// at the startup window (the staging stride). A wider window serves the neighbouring GPU-written
+// bytes of a polled page with the same copy, so fewer guest reads fault and wait (port of senaxx
+// 2559c2737, which widened its drain window from 512 KiB to 4 MiB for the same engine's polling).
+Live::Switch g_side_window_live("KYTY_READBACK_SIDE_WINDOW_LIVE_KB", [](const char* value) -> int64_t {
+	if (value == nullptr) {
+		return 0;
+	}
+	const auto kib = std::strtoull(value, nullptr, 10);
+	if (kib < 4 || kib > 4096 || (kib & (kib - 1)) != 0) {
+		return 0;
+	}
+	return static_cast<int64_t>(kib * 1024);
+});
 
 // KYTY_READBACK_MERGE_GAP_KB=<KiB> (live, default 0 = one region per range; 64 was the fork's): GPU-written ranges
 // of one readback less than this far apart share one vkCmdCopyBuffer region (chenxiao07 9239c5773).
@@ -2279,9 +2300,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	const auto buffer_end   = buffer_begin + buffer.Size();
 	const auto page_begin   = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer_begin);
 	const auto page_end = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE), buffer_end);
-	const auto aligned  = Common::AlignDown(vaddr, side.window);
+	const auto live_window = static_cast<uint64_t>(g_side_window_live.Get());
+	const auto window = live_window != 0 ? std::min(live_window, side.window) : side.window;
+	const auto aligned  = Common::AlignDown(vaddr, window);
 	const auto window_begin = std::max(aligned, buffer_begin);
-	const auto window_end   = std::min(aligned + side.window, buffer_end);
+	const auto window_end   = std::min(aligned + window, buffer_end);
 	if (((page_begin | page_end | window_begin | window_end) % TRACKER_PAGE_SIZE) != 0) {
 		return other(Profiler::FrameEvent::ReadbackSideOtherAlignment);
 	}
