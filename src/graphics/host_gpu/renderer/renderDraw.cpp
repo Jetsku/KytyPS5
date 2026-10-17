@@ -52,6 +52,8 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1882,6 +1884,44 @@ static void CopyPreparedVertexInfo(ShaderVertexInputInfo& dst, const ShaderVerte
 			ReportRenderStateMismatch("a partial vertex input copy");
 			dst = src;
 		}
+	}
+}
+
+// Draws that waited at least 2 ms for their graphics pipeline on the command processor (a new
+// pipeline built there, whichever path builds it: fast-first, libraries, the optimized build): one
+// console line a minute while there are any, "Pipeline waits 60s: ...".
+static void NotePipelineWait(std::chrono::steady_clock::duration elapsed) {
+	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+	if (us < 2000) {
+		return;
+	}
+	struct Totals {
+		uint64_t count = 0;
+		uint64_t us    = 0;
+		uint64_t max   = 0;
+		uint64_t over_50ms = 0;
+		std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+		uint64_t all_count = 0;
+		uint64_t all_us    = 0;
+	};
+	static Totals totals; // command processor thread only
+	totals.count++;
+	totals.us += static_cast<uint64_t>(us);
+	totals.max = std::max<uint64_t>(totals.max, static_cast<uint64_t>(us));
+	totals.over_50ms += us >= 50000 ? 1u : 0u;
+	totals.all_count++;
+	totals.all_us += static_cast<uint64_t>(us);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - totals.last >= std::chrono::seconds(60)) {
+		std::printf("Pipeline waits 60s: %" PRIu64 " draws waited >= 2 ms for their graphics pipeline, "
+		            "%.1f ms in total (max %.1f ms, %" PRIu64 " >= 50 ms); since start %" PRIu64
+		            " draws, %.1f ms\n",
+		            totals.count, static_cast<double>(totals.us) / 1000.0,
+		            static_cast<double>(totals.max) / 1000.0, totals.over_50ms, totals.all_count,
+		            static_cast<double>(totals.all_us) / 1000.0);
+		std::fflush(stdout);
+		totals.count = totals.us = totals.max = totals.over_50ms = 0;
+		totals.last  = now;
 	}
 }
 
@@ -4003,9 +4043,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
+		const auto pipeline_begin = std::chrono::steady_clock::now();
 		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
 		    primitive_restart_enable, *programs);
+		NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.
