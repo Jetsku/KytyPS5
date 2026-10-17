@@ -633,13 +633,27 @@ bool RelaxedQueriesEnabled() {
 	return enabled;
 }
 
-// KYTY_TEXEL_RELAXED_SYNC (default on; =0 off): formatted (texel) read bindings use the same
-// lock-free "nothing to upload" test as raw reads, then only the image step (SynchronizeBufferFrom-
-// Image). Before, every texel read walked the tracker under its region locks: Miles Morales binds
-// ~6 texel buffers of ~4 MiB per draw, 15 us each, two thirds of the command processor's time.
+// KYTY_TEXEL_RELAXED_SYNC (default 2; 1; 0 off; live): formatted (texel) read bindings use the
+// same lock-free "nothing to upload" test as raw reads (1), and the read-binding memo
+// (ObtainReadBinding, 2), followed by the image step (SynchronizeBufferFromImage) that only texel
+// reads do. Before, every texel read walked the tracker under its region locks: Miles Morales binds
+// ~6 texel buffers of ~4 MiB per draw, and each took 15.5 us (1: 3.7 us, 2: 0.6 us), two thirds of
+// the command processor's time. The tracker part of a read synchronization only uploads CPU-dirty
+// page runs and clears their CPU-dirty bits (GPU ownership, image staleness and epochs are the
+// written path's), so with no CPU-dirty page it does nothing. KYTY_TRACKER_RELAXED_VERIFY and
+// KYTY_BINDING_EPOCH_MEMO_VERIFY check both shortcuts (Miles Morales: 0 mismatches); Astro Bot's
+// Sky Garden CP time is unchanged (live A/B 0 vs 2: 34.16 vs 34.20 ms/flip).
+Live::Switch g_texel_relaxed_sync("KYTY_TEXEL_RELAXED_SYNC", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0') {
+		return 2;
+	}
+	return static_cast<int64_t>(std::strtoll(value, nullptr, 10));
+});
 bool TexelRelaxedSyncEnabled() {
-	static const bool enabled = ParseEnvU64("KYTY_TEXEL_RELAXED_SYNC", 1) != 0;
-	return enabled;
+	return g_texel_relaxed_sync.Get() != 0;
+}
+bool TexelBindingMemoEnabled() {
+	return g_texel_relaxed_sync.Get() >= 2;
 }
 
 // KYTY_BINDING_EPOCH_MEMO (default on; =0 off): read bindings reused within a sync epoch
@@ -3613,9 +3627,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-	if (!is_written && !is_texel_buffer && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
+	if (!is_written && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
 	    GuestGpu::IsGpuThread()) {
-		return ObtainReadBinding(vaddr, size, id);
+		if (!is_texel_buffer) {
+			return ObtainReadBinding(vaddr, size, id);
+		}
+		if (TexelBindingMemoEnabled()) {
+			// KYTY_TEXEL_RELAXED_SYNC=2: the memo decides the tracker part; a stream copy is a
+			// guest-byte copy as before (ObtainBufferNow streams small texel reads too).
+			auto result = ObtainReadBinding(vaddr, size, id);
+			if (result.first != &m_stream_buffer) {
+				(void)SynchronizeBufferFromImage(*result.first, vaddr, size);
+			}
+			return result;
+		}
 	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
 }
