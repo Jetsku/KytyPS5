@@ -1274,6 +1274,16 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// KYTY_SRT_GPU_FILL_DIAG=1 (startup, default off): the SRT GPU fill's 10 s console counts (also the
+// recompiler's per-plan lines, ResourceMaterialization.cpp).
+static bool SrtGpuFillDiag() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_GPU_FILL_DIAG");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // KYTY_SRT_GPU_FILL (port of senaxx 0845beadf): the flat buffer of a refresh that left slots to
 // the GPU (ResourceSnapshot::gpu_fills). Uploaded on its own (never shared through the upload
 // dedup: its placeholders are not its values); each slot's dword is then copied on the GPU from
@@ -1334,7 +1344,10 @@ static vk::DescriptorBufferInfo UploadFlatWithGpuFills(RenderContext&           
 		                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
 		                       nullptr);
 	}
-	// One console line every 10 s while fills happen.
+	// KYTY_SRT_GPU_FILL_DIAG=1: one console line every 10 s while fills happen.
+	if (!SrtGpuFillDiag()) {
+		return flat;
+	}
 	static std::atomic<uint64_t> tables {0};
 	static std::atomic<uint64_t> filled {0};
 	static std::atomic<uint64_t> read_host {0};
@@ -2026,8 +2039,11 @@ static bool WriteRangesReadGpuFills(const ShaderRecompiler::IR::WriteRangeProgra
 	return false;
 }
 
-// Console counts of the write ranges above, every 10 s while they happen.
+// KYTY_SRT_GPU_FILL_DIAG=1: console counts of the write ranges above, every 10 s while they happen.
 static void NoteGpuFillWriteRange(bool whole) {
+	if (!SrtGpuFillDiag()) {
+		return;
+	}
 	static std::atomic<uint64_t> whole_count {0};
 	static std::atomic<uint64_t> host_count {0};
 	static std::atomic<int64_t>  last_ms {0};

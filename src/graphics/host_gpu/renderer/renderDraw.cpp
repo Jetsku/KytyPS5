@@ -1889,7 +1889,16 @@ static void CopyPreparedVertexInfo(ShaderVertexInputInfo& dst, const ShaderVerte
 
 // Draws that waited at least 2 ms for their graphics pipeline on the command processor (a new
 // pipeline built there, whichever path builds it: fast-first, libraries, the optimized build): one
-// console line a minute while there are any, "Pipeline waits 60s: ...".
+// console line a minute while there are any, "Pipeline waits 60s: ...". KYTY_PIPELINE_WAIT_STATS=1
+// (startup, default off): the timing and the line cost two clock reads per unplanned draw.
+static bool PipelineWaitStats() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_WAIT_STATS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static void NotePipelineWait(std::chrono::steady_clock::duration elapsed) {
 	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
 	if (us < 2000) {
@@ -4043,11 +4052,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
-		const auto pipeline_begin = std::chrono::steady_clock::now();
+		const bool wait_stats     = PipelineWaitStats();
+		const auto pipeline_begin = wait_stats ? std::chrono::steady_clock::now()
+		                                       : std::chrono::steady_clock::time_point {};
 		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
 		    primitive_restart_enable, *programs);
-		NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
+		if (wait_stats) {
+			NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
+		}
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.
