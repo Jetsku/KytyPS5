@@ -373,6 +373,7 @@ VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 
 VALUE_OPCODE(ControlNop, Void)
 VALUE_OPCODE(StoreCompletion, Void)
+VALUE_OPCODE(DataCacheInvalidate, Void)
 VALUE_OPCODE(Barrier, Void)
 VALUE_OPCODE(SharedMemoryBarrier, Void)
 VALUE_OPCODE(Sendmsg, Void)

@@ -301,6 +301,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
+			// BUFFER_GL0_INV / GL1_INV: loads after the invalidation must not reuse cached data.
+			requirements.coherent_buffers |= inst.GetOpcode() == IR::ValueOpcode::DataCacheInvalidate;
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;

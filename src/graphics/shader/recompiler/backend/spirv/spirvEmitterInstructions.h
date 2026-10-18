@@ -222,6 +222,7 @@ inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void                  EmitSharedMemoryBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
+void                  EmitDataCacheInvalidate(EmitterState& state);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

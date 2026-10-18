@@ -94,6 +94,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::StoreCompletion:
+		case ValueOpcode::DataCacheInvalidate:
 		case ValueOpcode::Barrier:
 		case ValueOpcode::SharedMemoryBarrier: return true;
 		default: return false;

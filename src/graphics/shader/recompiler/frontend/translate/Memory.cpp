@@ -1120,10 +1120,14 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		lds_write_pending = true;
 	}
 	switch (inst.opcode) {
-		case Decoder::Opcode::S_DCACHE_INV:
-		case Decoder::Opcode::S_GL1_INV:
 		case Decoder::Opcode::BUFFER_GL0_INV:
 		case Decoder::Opcode::BUFFER_GL1_INV:
+			// RDNA2 GL0/GL1 invalidation: later vector loads see other workgroups' stores (a
+			// device-scope acquire, and the program's buffers become coherent).
+			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
+			return;
+		case Decoder::Opcode::S_DCACHE_INV:
+		case Decoder::Opcode::S_GL1_INV:
 			// Host shader memory has no guest-visible L0/GL1 cache to invalidate.
 			EmitControlNop();
 			return;
