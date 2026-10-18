@@ -117,8 +117,16 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_occlusion_counter(*this), m_lod_stats(*this) {
+      m_occlusion_counter(*this), m_lod_stats(*this),
+      m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Bindless table (Senaxx): images the texture cache drops leave the table's slots first.
+	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+		m_bindless_table.OnImageUnregistered(id);
+	};
+	m_texture_cache.on_image_views_dropped = [this](std::span<const CachedImageView> views) {
+		return m_bindless_table.ReleaseViews(views);
+	};
 	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
 	// take their first fault.
 	FaultCost::SetThreadDescriber([](char* name, uint64_t size) -> int {
@@ -223,6 +231,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			lap(FaultCost::Part::Buffer);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 			lap(FaultCost::Part::Texture);
+			// Bindless heap pages (engine method): returns without a lock unless a heap is near.
+			m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 			// The faulting page gets the protection its watchers ask even when neither cache
 			// released anything here: another thread may have released it without having applied
 			// the release yet. A fault inside an enclosing scope (an emulator write between that
@@ -261,6 +271,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	const PageManager::DeferUnprotectScope defer_unprotect;
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_bindless_table.OnCpuWrite(vaddr, size);
 	return true;
 }
 
@@ -369,6 +380,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_bindless_table.UnwatchRange(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);

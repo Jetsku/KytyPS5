@@ -130,6 +130,8 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Samples bindless images (Senaxx): descriptor set 1 is the bindless table.
+		bool                    uses_bindless         = false;
 		// Built by the start-up compute prewarm and not used by a dispatch yet (statistics only).
 		bool                    prewarmed             = false;
 	};

@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
@@ -189,14 +190,25 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
+static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless);
+}
+
 // Set 0 plus one push-constant range {push_stages, 0, NativePushConstantSize}; interned by
-// binding signature (pipelineLayoutCache.h, KYTY_LAYOUT_INTERN).
+// binding signature (pipelineLayoutCache.h, KYTY_LAYOUT_INTERN). A pipeline that samples bindless
+// images (pipeline.uses_bindless) also gets set 1, the shared bindless table (Senaxx).
 static void AssignPipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  std::span<const vk::DescriptorSetLayoutBinding> bindings,
                                  vk::ShaderStageFlags                            push_stages) {
 	EXIT_IF(pipeline.pipeline_layout != nullptr || pipeline.descriptor_set_layout != nullptr);
+	vk::DescriptorSetLayout bindless_set = nullptr;
+	if (pipeline.uses_bindless) {
+		bindless_set = BindlessSetLayout(graphics);
+		EXIT_IF(bindless_set == nullptr);
+	}
 	const auto layouts = AcquirePipelineLayout(graphics, bindings, push_stages,
-	                                           ShaderRecompiler::IR::NativePushConstantSize);
+	                                           ShaderRecompiler::IR::NativePushConstantSize,
+	                                           bindless_set);
 	pipeline.descriptor_set_layout = layouts.set_layout;
 	pipeline.pipeline_layout       = layouts.pipeline_layout;
 	pipeline.uses_push_descriptors = layouts.uses_push_descriptors;
@@ -472,15 +484,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
+	pipeline.uses_bindless               = false;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
+		pipeline.uses_bindless |= UsesBindless(*stage.stage.program);
 	}
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
+		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 	}
 	AssignPipelineLayout(graphics, pipeline, descriptor_bindings, graphics_stages);
 	if (graphics_debug_dump_enabled()) {
@@ -605,6 +620,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 				    static_cast<vk::ShaderStageFlags::MaskType>(binding.stageFlags));
 			}
 		}
+		if (pipeline.uses_bindless) {
+			// Set 1 (the bindless table): one word more, so no other layout shares the key and the
+			// journal replay, which reads four words per binding, leaves such pipelines out.
+			layout_signature.push_back(0xb1d1e55u);
+		}
 		result = (*create_hook)(pipeline_info, layout_signature, &pipeline.pipeline);
 	} else {
 		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
@@ -663,6 +683,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
+	pipeline.uses_bindless = UsesBindless(*input_info.stage.program);
 	AssignPipelineLayout(graphics, pipeline, descriptor_bindings,
 	                     vk::ShaderStageFlagBits::eCompute);
 	LOGF("PipelineTrace: pipeline layout CS layout=%p push=%d\n",

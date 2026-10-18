@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/NullTrace.h"
 #include "common/prepPhases.h"
 
 #include "common/assert.h"
@@ -100,6 +101,7 @@ bool NullBufferDescriptor(const ShaderBufferResource& descriptor, bool count = t
 		return true;
 	}
 	const auto nulls = g_unmapped_buffer_nulls.fetch_add(1, std::memory_order_relaxed);
+	NullTraceNote(NullTraceKind::NullBuffer);
 	if (nulls < 8u) {
 		std::fprintf(stderr,
 		             "Kyty spec: buffer V# with unmapped base 0x%012" PRIx64
@@ -438,6 +440,39 @@ private:
 	bool                          m_indexed = false;
 };
 
+// The shader looks the key up in the bindless translation table: nothing to enumerate. Record
+// the heap for the host and reserve the two words it patches (region base, entry count); zeros
+// resolve every key to the placeholder in slot 0.
+bool MaterializeBindlessImage(const DescriptorSource::IndirectDescriptor& indirect,
+                              const DescriptorValue& table_value, uint32_t image_index,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	ShaderBufferResource heap;
+	if (table_value.dword_count != 4u || !DecodeBufferDescriptor(table_value, heap)) {
+		return false;
+	}
+	const auto mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+	snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+	snapshot.images[image_index] = {.dword_count = 8u};
+	snapshot.bindless_heaps.push_back({.base           = heap.Base48(),
+	                                   .size           = heap.GetSize(),
+	                                   .table_offset   = indirect.table_offset,
+	                                   .image          = image_index,
+	                                   .mapping_offset = mapping_offset,
+	                                   .stride         = indirect.record_pointer != UINT32_MAX
+	                                                         ? indirect.table_stride
+	                                                         : 32u,
+	                                   .record_pointer = indirect.record_pointer,
+	                                   .nested_vsharp  = indirect.nested_vsharp,
+	                                   .nested_heap    = indirect.nested_heap,
+	                                   .nested_keys    = indirect.nested_keys});
+	auto& root                      = specialization.images[image_index];
+	root.indirect_root              = image_index;
+	root.indirect_mapping_offset    = mapping_offset;
+	root.indirect_search_iterations = 0;
+	root.bindless                   = true;
+	return true;
+}
+
 template <bool Optimize>
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& indirect,
@@ -702,6 +737,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			if (image.bindless) {
+				// No one descriptor describes a bindless image: keep the dimension the
+				// instruction samples, which picks the set-1 array.
+				image.dimension = base.dimension == Decoder::ImageDimension::Unknown
+				                      ? Decoder::ImageDimension::Dim2D
+				                      : base.dimension;
+				image.cube      = base.cube;
+			}
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -783,7 +826,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
-		if (root.indirect_root != root_index) {
+		if (root.indirect_root != root_index || root.bindless) {
 			continue;
 		}
 		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
@@ -1405,6 +1448,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			continue;
 		}
 		const auto& indirect = *source->indirect_descriptor;
+		if (indirect.bindless) {
+			// The host reads the heap's entries itself; the plan only needs the heap's V#.
+			MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
+			continue;
+		}
 		plan.requires_specialization_memory = true;
 		MarkCleanFlatSlots(plan, indirect.selector ? Source(plan, indirect.selector->source) : nullptr,
 		                   plan.clean_flat_slots, indirect.selector_mask);
@@ -1494,6 +1542,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	// captured reads (their certificate covers every read), and without trace replays (a replay
 	// reads every slot on the host).
 	snapshot.gpu_fills.clear();
+	snapshot.bindless_heaps.clear();
 	observed.gpu_fills = nullptr;
 	const bool gpu_fill = runtime.gpu_written != nullptr && !capture_reads &&
 	                      !program.gpu_fill_slots.empty();
@@ -1585,6 +1634,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			    .indirect_mapping_offset = image.indirect_mapping_offset,
 			    .indirect_search_iterations = image.indirect_search_iterations,
 			    .cube = image.cube,
+			    .bindless = image.bindless,
 			};
 		};
 		if constexpr (Optimize) {
@@ -1611,6 +1661,13 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				const auto& indirect = *source->indirect_descriptor;
 				DescriptorValue material;
 				DescriptorValue table;
+				if (indirect.bindless) {
+					if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+					    !MaterializeBindlessImage(indirect, table, i, snapshot, specialization)) {
+						return false;
+					}
+					continue;
+				}
 				if ((indirect.selector &&
 				     !clean.EvaluateDescriptor(indirect.selector->source, material)) ||
 				    !clean.EvaluateDescriptor(indirect.table_source, table) ||
@@ -1625,6 +1682,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 					if (!NullImageDescriptor(snapshot.images[i])) {
 						ReportInvalidImageDescriptor(program.shader_hash, i, snapshot.images[i]);
+						NullTraceNote(NullTraceKind::NullImage, program.shader_hash);
 					}
 					snapshot.images[i].dwords.fill(0);
 				}
@@ -1673,6 +1731,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSpecialization& specialization) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ResourceMaterialization);
+	NullTraceSetShader(program.shader_hash);
 	static const bool optimized = [] {
 		const auto* setting = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
 		return setting != nullptr && std::strcmp(setting, "optimized") == 0;
@@ -1745,6 +1804,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.bindless                   = source.bindless;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
@@ -1865,7 +1925,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
+			// Enumerated candidates only sample; a bindless image is loaded per instruction and
+			// may take any sampled operation.
+			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}

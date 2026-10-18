@@ -18,6 +18,7 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+struct BindlessHeap;
 
 namespace DrawPrep {
 struct StagePlan;
@@ -88,6 +89,10 @@ struct PreparedBindings {
 	// (user dwords and mip-statistics fields filled in, memory offsets zero).
 	DrawPrep::StagePlan*                  plan             = nullptr;
 	bool                                  plan_shader_data = false;
+	// Bindless images (Senaxx; RenderExecutor::PrepareBindlessHeaps): flattened-SRT words to patch
+	// (offset, region, entries) and the heaps whose images must be readable for this stage.
+	std::vector<std::array<uint32_t, 3>>  bindless_patches;
+	std::vector<BindlessHeap*>            bindless_heaps;
 };
 
 // NoteBufferOutOfBoundsMode's combination of a V# (OOB_SELECT, stride, swizzle, ADD_TID): the bit

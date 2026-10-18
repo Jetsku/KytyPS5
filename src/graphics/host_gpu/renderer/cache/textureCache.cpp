@@ -1158,6 +1158,19 @@ void TextureCache::DeleteImage(ImageId id) {
 			NoteSurfaceMetaChange();
 		}
 	}
+	// Bindless table (Senaxx): a pinned image's keys go back to pending, and no slot may keep a
+	// view of the image once it is destroyed (IDXTRI's stale view guard): such slots are repointed
+	// to the placeholder now, before the destruction below waits for the current tick.
+	if (image->bindless_pinned) {
+		NoteBindlessStateChange(*image);
+		image->bindless_pinned = false;
+		if (on_bindless_unregister) {
+			on_bindless_unregister(id);
+		}
+	}
+	if (on_image_views_dropped && !image->views.empty()) {
+		(void)on_image_views_dropped(image->views);
+	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
 		uint64_t retiring_bytes = 0;
@@ -1190,6 +1203,12 @@ void TextureCache::NoteVramFree(const Image& image, HangTrace::ImageFreeReason r
 void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	HangTrace::SetImageFreeReason(reason);
 	auto& image = m_slot_images[id];
+	// Bindless-pinned images (a heap key samples them through set 1) are never collected.
+	if (image.bindless_pinned && (reason == HangTrace::ImageFreeReason::GarbageCollect ||
+	                              reason == HangTrace::ImageFreeReason::PressureCollect ||
+	                              reason == HangTrace::ImageFreeReason::ResidentIdle)) {
+		return;
+	}
 	if (VramStats::Enabled() && image.registered) {
 		NoteVramFree(image, reason);
 	}
@@ -6727,7 +6746,7 @@ bool TextureCache::IdleRetirable(const Image& image, uint64_t frame, uint64_t mi
 	// move the bytes into a cache buffer of the same size). An age says nothing about a later read:
 	// a probe or impostor rendered once and sampled minutes later would come back as stale guest
 	// bytes. Freeing them needs a download into guest memory first, not an age.
-	return image.registered && !image.depth_id && !image.IsGpuModified() &&
+	return image.registered && !image.depth_id && !image.IsGpuModified() && !image.bindless_pinned &&
 	       !image.binding.is_bound && !image.binding.is_target && !image.usage.video_out &&
 	       frame - std::min(frame, image.frame_accessed_last) > min_age;
 }

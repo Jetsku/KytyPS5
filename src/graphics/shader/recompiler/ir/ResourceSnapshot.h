@@ -40,6 +40,27 @@ struct SrtGpuFill {
 	bool operator==(const SrtGpuFill&) const = default;
 };
 
+// A guest descriptor heap a bindless image indexes: the host owns its key -> slot translation
+// and patches the image's two flattened-SRT words (region base, entry count) before upload.
+struct BindlessHeapUse {
+	uint64_t base           = 0;
+	uint64_t size           = 0;
+	uint32_t table_offset   = 0;
+	uint32_t image          = 0;
+	uint32_t mapping_offset = 0;
+	// Keys select records of `stride` bytes. With a record pointer (not UINT32_MAX), key k's T#
+	// is at the 64-bit address stored at base + k * stride + record_pointer, plus table_offset;
+	// otherwise at base + table_offset + k * 32.
+	uint32_t stride         = 32;
+	uint32_t record_pointer = UINT32_MAX;
+	// Nested heaps (IndirectDescriptor::nested_vsharp): key = record * nested_keys + inner key.
+	uint32_t nested_vsharp  = UINT32_MAX;
+	uint32_t nested_heap    = 0;
+	uint32_t nested_keys    = 0;
+
+	bool operator==(const BindlessHeapUse&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -49,6 +70,7 @@ struct ResourceSnapshot {
 	UniformFill                 uniform_fill;
 	// Compute refreshes on the command processor only (SrtRuntime::gpu_written).
 	std::vector<SrtGpuFill>      gpu_fills;
+	std::vector<BindlessHeapUse> bindless_heaps;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
