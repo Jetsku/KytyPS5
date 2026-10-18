@@ -178,6 +178,7 @@ void CheckMilesHeapSample() {
 // The hit-callback form: the waterfall key selects a 16-byte record of a V# table whose dwords
 // 2-3 point at a material; the T# is S_LOAD_DWORDX8 from the material, the S# S_LOAD_DWORDX4 at
 // +32. The image becomes a record pointer heap; the S# has no plan and takes the default sampler.
+// A BUFFER_LOAD_FORMAT_X through a V# of the material (+48) decodes the V#'s format in the shader.
 std::vector<u32> MilesRecordPointerCode() {
   std::vector<u32> code;
   code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
@@ -201,7 +202,15 @@ std::vector<u32> MilesRecordPointerCode() {
   code.push_back(EncodeSmem1(0, 125));
   code.push_back(EncodeSmem0(0x02u, 40, 7));
   code.push_back(EncodeSmem1(32, 125));
+  // s_load_dwordx4 s[44:47], s[14:15], 48: the material's vertex V#
+  code.push_back(EncodeSmem0(0x02u, 44, 7));
+  code.push_back(EncodeSmem1(48, 125));
   code.push_back(EncodeSopp(0x0cu, 0));
+  // buffer_load_format_x v6, v0, s[44:47] idxen: formatted through the record's V#
+  code.push_back(EncodeMubuf0(0x00u, 0, true, false));
+  code.push_back(EncodeMubuf1(6, 44 / 4, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeVop2(0x03u, 2, Vgpr(6), 2)); // v_add_f32 v2, v6, v2
   code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[40:43]
   code.push_back(EncodeMimg1(2, 3, 32 / 4, 40 / 4));
   code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec

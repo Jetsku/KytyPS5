@@ -76,10 +76,15 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1).
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4 || opcode == ValueOpcode::ReadConstBuffer);
+		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1). A formatted
+		// X load decodes the V#'s format in the shader (upstream a55a28380, LoadIndirectFormattedX):
+		// Miles' hit callbacks read vertex data with BUFFER_LOAD_FORMAT_X through a material's V#.
+		return !typed && data_bits == 32u &&
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32
+		                  : opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4 ||
+		                        opcode == ValueOpcode::ReadConstBuffer);
 	}
 	// KYTY_BDA_WRITES: raw (unformatted) stores and every buffer atomic can write through a V# the
 	// shader computes.
