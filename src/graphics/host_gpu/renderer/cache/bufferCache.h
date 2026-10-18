@@ -337,12 +337,16 @@ private:
 		uint32_t slot = 0;
 		RangeSet predicted;
 	};
+	static constexpr uint32_t BdaWarmSettles    = 16;
+	static constexpr uint32_t BdaRelearnSettles = 4;
 	struct BdaPrediction {
 		RangeSet newer;
 		RangeSet older;
+		uint32_t sync_left = BdaWarmSettles;
 	};
 	struct BdaAsyncTotals {
-		uint64_t settles = 0, predicted_pages = 0, late_pages = 0, stores = 0, dropped = 0, overflows = 0;
+		uint64_t settles = 0, sync_learn = 0, predicted_pages = 0, late_pages = 0, stores = 0, dropped = 0,
+		         overflows = 0;
 	};
 	std::deque<PendingBdaSettle>                 m_bda_pending;
 	std::unordered_map<uint64_t, BdaPrediction>  m_bda_predict;

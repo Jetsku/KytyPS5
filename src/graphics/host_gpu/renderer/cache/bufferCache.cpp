@@ -6536,6 +6536,9 @@ void BufferCache::ProcessPendingBdaSettles(bool wait_oldest) {
 		});
 		m_bda_async_totals.late_pages += late_pages;
 		auto& history = m_bda_predict[pending.hash];
+		if (late_pages != 0) {
+			history.sync_left = std::max(history.sync_left, BdaRelearnSettles);
+		}
 		if (g_bda_async_settle.Get() >= 2) {
 			// =2: the prediction keeps every page the shader ever wrote (over-marking is safe).
 			actual.ForEach([&](uint64_t start, uint64_t end) { history.newer.Add(start, end - start); });
@@ -6590,9 +6593,10 @@ void BufferCache::SettleBdaWritesAsync(uint64_t shader_hash) {
 	} else if (now - m_bda_async_print >= std::chrono::seconds(10)) {
 		m_bda_async_print = now;
 		auto& t = m_bda_async_totals;
-		std::printf("BdaAsyncSettle 10s: %llu settles, %llu predicted pages, %llu late pages, %llu logged "
-		            "stores, %llu dropped, %llu overflows\n",
-		            static_cast<unsigned long long>(t.settles), static_cast<unsigned long long>(t.predicted_pages),
+		std::printf("BdaAsyncSettle 10s: %llu async settles, %llu synchronous to learn, %llu predicted pages, "
+		            "%llu late pages, %llu logged stores, %llu dropped, %llu overflows\n",
+		            static_cast<unsigned long long>(t.settles), static_cast<unsigned long long>(t.sync_learn),
+		            static_cast<unsigned long long>(t.predicted_pages),
 		            static_cast<unsigned long long>(t.late_pages), static_cast<unsigned long long>(t.stores),
 		            static_cast<unsigned long long>(t.dropped), static_cast<unsigned long long>(t.overflows));
 		std::fflush(stdout);
@@ -6602,9 +6606,18 @@ void BufferCache::SettleBdaWritesAsync(uint64_t shader_hash) {
 
 void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 	EXIT_IF(!BdaWritesEnabled());
+	bool learn = false;
 	if (g_bda_async_settle.On()) {
-		SettleBdaWritesAsync(shader_hash);
-		return;
+		// A shader settles synchronously until its prediction is warm (BdaWarmSettles) and again
+		// for a few settles after a late page, so every page it writes then is known before the
+		// command processor continues.
+		auto& prediction = m_bda_predict[shader_hash];
+		if (prediction.sync_left == 0) {
+			SettleBdaWritesAsync(shader_hash);
+			return;
+		}
+		prediction.sync_left--;
+		learn = true;
 	}
 	ProcessPendingBdaSettles(!m_bda_pending.empty());
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::BdaSettle);
@@ -6658,6 +6671,11 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 		SettleBdaWrittenRange(start, end - start, shader_hash, settled_pages);
 	});
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, settled_pages);
+	if (learn) {
+		auto& history = m_bda_predict[shader_hash];
+		written.ForEach([&](uint64_t start, uint64_t end) { history.newer.Add(start, end - start); });
+		m_bda_async_totals.sync_learn++;
+	}
 }
 
 void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
