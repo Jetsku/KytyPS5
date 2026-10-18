@@ -415,6 +415,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.lane_local) {
 		b.Text("lane_local");
 		b.U8(GetHostComputeSubgroups32() ? 1u : 0u);
+		if (const char* nops = std::getenv("KYTY_LANE_LOCAL_NOPS"); nops != nullptr && nops[0] == '0') {
+			b.Text("lane_local_nops_off");
+		}
 	}
 	// Bindless images (ir/BindlessBindings.h): resource tracking may turn an indirect image the
 	// enumeration cannot cover into a bindless one.

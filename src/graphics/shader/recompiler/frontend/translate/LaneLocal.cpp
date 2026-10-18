@@ -236,6 +236,14 @@ bool SaveExec(Opcode opcode) {
 	}
 }
 
+bool NopMessagesLaneLocal() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LANE_LOCAL_NOPS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // Instructions that read or write other lanes, or depend on the wave's layout: never lane-local here.
 const char* RefusedOpcode(const Instruction& inst) {
 	switch (inst.opcode) {
@@ -254,6 +262,10 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::S_SUBVECTOR_LOOP_END: return "program counter";
 		case Opcode::S_SENDMSG:
 		case Opcode::S_SETREG_B32:
+			// A compute program's S_SENDMSG translates to IR Sendmsg and S_SETREG_B32 to a control
+			// no-op; neither emits anything (KYTY_LANE_LOCAL_NOPS=0 refuses them as before).
+			if (NopMessagesLaneLocal()) return nullptr;
+			return "wave message";
 		case Opcode::S_TRAP:
 		case Opcode::S_TTRACEDATA: return "wave message";
 		case Opcode::IMAGE_GET_LOD: return "compute derivatives"; // (their quads: the two-lane layout's)
