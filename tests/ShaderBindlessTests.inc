@@ -198,18 +198,23 @@ std::vector<u32> MilesRecordPointerCode() {
   code.push_back(EncodeSmem0(0x0au, 12, 2));
   code.push_back(EncodeSmem1(0, 106));
   code.push_back(EncodeSopp(0x0cu, 0));
-  // s_load_dwordx8 s[32:39], s[14:15], 0 and s_load_dwordx4 s[40:43], s[14:15], 32
+  // s_load_dwordx8 s[32:39], s[14:15], 64 and s_load_dwordx4 s[40:43], s[14:15], 304: the T# at a
+  // non-zero offset of the material, the S# at an unrelated one
   code.push_back(EncodeSmem0(0x03u, 32, 7));
-  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSmem1(64, 125));
   code.push_back(EncodeSmem0(0x02u, 40, 7));
-  code.push_back(EncodeSmem1(32, 125));
+  code.push_back(EncodeSmem1(304, 125));
   // s_load_dwordx4 s[44:47], s[14:15], 48: the material's vertex V#
   code.push_back(EncodeSmem0(0x02u, 44, 7));
   code.push_back(EncodeSmem1(48, 125));
   code.push_back(EncodeSopp(0x0cu, 0));
   code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[40:43]
   code.push_back(EncodeMimg1(2, 3, 32 / 4, 40 / 4));
+  // A second sample of the same T# (its words have two users)
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v7, v[3:5], s[32:39], s[40:43]
+  code.push_back(EncodeMimg1(7, 3, 32 / 4, 40 / 4));
   code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeVop2(0x03u, 2, Vgpr(7), 2)); // v_add_f32 v2, v7, v2
   // buffer_load_format_x v6, v0, s[44:47] idxen: formatted through the record's V#
   code.push_back(EncodeMubuf0(0x00u, 0, true, false));
   code.push_back(EncodeMubuf1(6, 44 / 4, 0));
@@ -260,7 +265,7 @@ void CheckMilesRecordPointer() {
           source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless &&
               source.indirect_descriptor->record_pointer == 8u &&
               source.indirect_descriptor->table_stride == 16u &&
-              source.indirect_descriptor->table_offset == 0u,
+              source.indirect_descriptor->table_offset == 64u,
           "the image is not a record pointer heap");
   const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   std::vector<u32> memory(0x4000u, 0u);
@@ -280,7 +285,7 @@ void CheckMilesRecordPointer() {
           resources.bindless_heaps.size() == 1u && resources.bindless_heaps[0].base == 0x4000u &&
               resources.bindless_heaps[0].stride == 16u &&
               resources.bindless_heaps[0].record_pointer == 8u &&
-              resources.bindless_heaps[0].table_offset == 0u,
+              resources.bindless_heaps[0].table_offset == 64u,
           "the snapshot does not describe the record pointer heap");
   auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
   ShaderRecompiler::IR::SetBindlessImagesEnabled(false);

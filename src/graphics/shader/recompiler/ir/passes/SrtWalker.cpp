@@ -493,7 +493,11 @@ private:
 		if (inst == nullptr) {
 			Fail(use_pc, "invalid typed planning value");
 		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
+		if (m_visited.contains(inst)) {
+			return;
+		}
+		const auto cycle = m_visiting_set.contains(inst) ? std::ranges::find(m_visiting, inst)
+		                                                 : m_visiting.end();
 		if (cycle != m_visiting.end()) {
 			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
 				return value->GetOpcode() == ValueOpcode::Phi;
@@ -504,39 +508,66 @@ private:
 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
 			                         ValueOpcodeName(inst->GetOpcode())));
 		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return;
-		}
 		m_visiting.push_back(inst);
+		m_visiting_set.insert(inst);
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
 			Collect(inst->Arg(index), use_pc);
 		}
 		m_visiting.pop_back();
-		m_visited.push_back(inst);
+		m_visiting_set.erase(inst);
+		m_visited.insert(inst);
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
 		    (m_variant_reads && !EvaluableBeforeDispatch(inst->Arg(0)))) {
-			if (std::ranges::find(m_program.dynamic_reads, value) ==
-			    m_program.dynamic_reads.end()) {
+			if (m_dynamic_reads.insert(inst).second) {
 				m_program.dynamic_reads.push_back(value);
 			}
 			return;
 		}
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+		// Equivalent reads have the same opcode and memory metadata (EquivalentValue compares
+		// them first): only the slots of that shape are compared.
+		auto& candidates = m_slots_by_shape[ReadShape(*inst)];
+		for (const auto slot: candidates) {
 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
 				m_patches.push_back({inst, slot, false});
 				return;
 			}
 		}
 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+		candidates.push_back(slot);
 		m_program.srt_reads.push_back({value, slot});
 		m_patches.push_back({inst, slot, true});
 	}
 
+	// What EquivalentValue compares first for two runtime reads: the opcode and the memory entry's
+	// fields (offset, kind) that equal entries share.
+	uint64_t ReadShape(const Inst& inst) const {
+		const auto index = inst.Flags<MemoryFlags>().index;
+		uint64_t   shape = static_cast<uint64_t>(inst.GetOpcode()) << 48u;
+		if (index < m_program.memory_info.size()) {
+			const auto& memory = m_program.memory_info[index];
+			shape ^= (static_cast<uint64_t>(memory.offset) << 8u) ^ static_cast<uint64_t>(memory.kind);
+		}
+		return shape;
+	}
+
 	void PatchReads() {
+		// Block conditions and indirect targets by the instruction they name, so a patch does
+		// not scan every block.
+		std::unordered_map<const Inst*, std::vector<size_t>> conditions;
+		std::unordered_map<const Inst*, std::vector<size_t>> targets;
+		for (size_t index = 0; index < m_program.block_info.size(); ++index) {
+			const auto& info = m_program.block_info[index];
+			if (const auto* inst = info.condition.Resolve().TryInstruction(); inst != nullptr) {
+				conditions[inst].push_back(index);
+			}
+			if (const auto* inst = info.indirect_target.Resolve().TryInstruction(); inst != nullptr) {
+				targets[inst].push_back(index);
+			}
+		}
 		for (const auto& patch: m_patches) {
 			auto* block = patch.inst->Parent();
 			auto& list  = block->Instructions();
@@ -550,12 +581,18 @@ private:
 			for (const auto& use: uses) {
 				use.user->SetArg(use.operand, flat);
 			}
-			for (auto& info: m_program.block_info) {
-				if (info.condition.Resolve() == Value(patch.inst)) {
-					info.condition = flat;
+			if (const auto found = conditions.find(patch.inst); found != conditions.end()) {
+				for (const auto index: found->second) {
+					if (m_program.block_info[index].condition.Resolve() == Value(patch.inst)) {
+						m_program.block_info[index].condition = flat;
+					}
 				}
-				if (info.indirect_target.Resolve() == Value(patch.inst)) {
-					info.indirect_target = flat;
+			}
+			if (const auto found = targets.find(patch.inst); found != targets.end()) {
+				for (const auto index: found->second) {
+					if (m_program.block_info[index].indirect_target.Resolve() == Value(patch.inst)) {
+						m_program.block_info[index].indirect_target = flat;
+					}
 				}
 			}
 			if (patch.keep) {
@@ -588,7 +625,10 @@ private:
 
 	Program&           m_program;
 	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
+	std::unordered_set<const Inst*> m_visiting_set;
+	std::unordered_set<const Inst*> m_visited;
+	std::unordered_set<const Inst*> m_dynamic_reads;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_slots_by_shape;
 	std::vector<Patch> m_patches;
 	bool               m_variant_reads = false;
 	std::unordered_map<const Inst*, bool> m_evaluable_memo;
