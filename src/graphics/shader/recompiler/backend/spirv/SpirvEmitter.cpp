@@ -140,11 +140,16 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 	const auto user_data_dwords = program.bindings.user_data_registers.size();
 	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	const bool has_call_state       = program.bindings.call_state_dword != IR::PushData::NoStart;
+	const auto call_state_start     = user_data_dwords + (has_dispatch_threads ? 3u : 0u);
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    (has_call_state && (program.stage != ShaderType::Compute ||
+	                        program.bindings.call_state_dword != call_state_start)) ||
+	    program.bindings.memory_offset_dword !=
+	        call_state_start + (has_call_state ? IR::BindingLayout::CallStateDwords : 0u) ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
 	    program.bindings.mip_stats_count != (mip_stats ? program.info.images.size() : 0u) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||

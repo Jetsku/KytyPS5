@@ -620,6 +620,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                               input_info);
 	// After MakeComputeInputInfo (it resets the info). Part of the program key (GETREG HW_ID2).
 	input_info.async_compute = async_compute;
+	// KYTY_SHADER_CALLS_SPLIT: each program of a split kernel's chain is looked up from this.
+	const auto pristine_info = input_info;
 	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	ShaderProgram compute_program;
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): the program a worker prepared from this dispatch's
@@ -646,6 +648,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CpGaps::Phase(CpGaps::Cat::DispatchOp);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		return;
+	}
+	if (auto split = PipelineCache::TakeCallSplitRun(); split != nullptr) {
+		// A kernel with call loops runs as its chain of dispatches (callSplitDispatch.cpp).
+		ResetBindings();
+		if (!use_thread_dimensions) {
+			buffer.EndRendering();
+			DispatchCallSplit(buffer, pristine_info, split, cs_regs, sh_regs, thread_group_x,
+			                  thread_group_y, thread_group_z);
+		}
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -983,6 +995,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		return;
+	}
+	if (PipelineCache::TakeCallSplitRun() != nullptr) {
+		// KYTY_SHADER_CALLS_SPLIT: an indirect dispatch's wave count is GPU data; not split yet.
+		static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+		if (!logged.test_and_set()) {
+			Log::WriteToConsoleAndLog("KYTY_SHADER_CALLS_SPLIT: indirect dispatches of split kernels are skipped.\n");
+		}
+		ResetBindings();
 		return;
 	}
 	buffer.EndRendering();

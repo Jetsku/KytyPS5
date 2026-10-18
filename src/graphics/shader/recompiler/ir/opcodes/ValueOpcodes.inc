@@ -226,6 +226,15 @@ VALUE_OPCODE(FPFract32, F32, F32)
 VALUE_OPCODE(FPFract64, F64, F64)
 
 VALUE_OPCODE(LaneId, U32)
+// Call-split programs (CallSplit.h, KYTY_SHADER_CALLS_SPLIT): push-data parameter i of the call
+// state, a dword load/store at a device address of the call-state buffer (no page table, no exec
+// mask), a store that skips a value equal to the loaded original, and the probe of a scalar
+// register's value at a call loop (planning translations only, never emitted).
+VALUE_OPCODE(CallStateParam, U32, U32)
+VALUE_OPCODE(CallStateLoad, U32, U64)
+VALUE_OPCODE(CallStateStore, Void, U64, U32)
+VALUE_OPCODE(CallStateStoreChanged, Void, U64, U32, U32)
+VALUE_OPCODE(CallStateProbe, Void, U32, U32)
 VALUE_OPCODE(Ballot, U32x4, U1)
 VALUE_OPCODE(AnyLane, U1, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)

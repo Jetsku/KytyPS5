@@ -41,6 +41,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/CallSplitPlan.h"
 #include "graphics/shader/recompiler/ShaderCalls.h"
 #include "graphics/shader/recompiler/ir/passes/NullTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -1290,10 +1291,50 @@ static std::mutex g_call_bodies_mutex;
 static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>>>
     g_call_bodies;
 
-static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
+// KYTY_SHADER_CALLS_SPLIT: the split program a renderer step selected, and the run a kernel's
+// lookup produced (taken by the renderer).
+thread_local const ShaderRecompiler::CallSplit::Code*          t_split_code = nullptr;
+thread_local std::shared_ptr<ShaderRecompiler::CallSplit::Run> t_split_run;
+
+// False: the dispatch is skipped (a split plan is being built).
+static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInfo& input_info) {
+	const auto wave_size = input_info.wave_size;
+	t_split_run.reset();
+	if (const auto* split = std::exchange(t_split_code, nullptr); split != nullptr) {
+		params.guest_base     = params.Base();
+		params.code           = split->words;
+		params.call_expansion = split->digest;
+		return true;
+	}
 	if (!ShaderRecompiler::GetCodegenOptions().shader_calls || !params.back_code.empty() ||
 	    params.code.empty() || !ComputeProgramMayCall(params)) {
-		return false;
+		return true;
+	}
+	const auto read_memory = [](uint64_t address, std::span<uint32_t> words) {
+		return ReadCallTableMemory(address, words.data(), words.size_bytes());
+	};
+	if (ShaderRecompiler::CallSplit::Planner::Enabled()) {
+		ShaderRecompiler::CompileOptions options;
+		ShaderStageInputInfo             stage_input {};
+		auto                             info = input_info;
+		stage_input.compute = &info;
+		options.stage       = ShaderType::Compute;
+		options.wave_size   = wave_size;
+		options.shader_hash = params.hash;
+		options.user_data   = std::span(params.user_data).first(params.user_data_count);
+		options.input_info  = stage_input;
+		auto run = std::make_shared<ShaderRecompiler::CallSplit::Run>();
+		switch (ShaderRecompiler::CallSplit::Planner::Instance().Plan(params.code, params.Base(), options,
+		                                                              info, read_memory, *run)) {
+			case ShaderRecompiler::CallSplit::Planner::Result::NotSplit: break;
+			case ShaderRecompiler::CallSplit::Planner::Result::Pending: return false;
+			case ShaderRecompiler::CallSplit::Planner::Result::Ready:
+				params.guest_base     = params.Base();
+				params.code           = run->start->words;
+				params.call_expansion = run->start->digest;
+				t_split_run           = std::move(run);
+				return true;
+		}
 	}
 	auto&                            expander = CallExpander();
 	ShaderRecompiler::CompileOptions options;
@@ -1302,12 +1343,7 @@ static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
 	options.shader_hash = params.hash;
 	options.user_data   = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::ShaderCallExpander::Expanded expanded;
-	if (!expander.Expand(
-	        params.code, params.Base(), options,
-	        [](uint64_t address, std::span<uint32_t> words) {
-		        return ReadCallTableMemory(address, words.data(), words.size_bytes());
-	        },
-	        expanded)) {
+	if (!expander.Expand(params.code, params.Base(), options, read_memory, expanded)) {
 		return true;
 	}
 	params.guest_base     = params.Base();
@@ -1369,8 +1405,13 @@ public:
 			std::scoped_lock lock(m_mutex);
 			if (!m_entries.try_emplace(id).second) return;
 			m_jobs.push_back(std::move(job));
-			if (!m_thread.joinable()) {
-				m_thread = std::thread([this] { Run(); });
+			// KYTY_SHADER_CALLS_THREADS (default 3): call-split programs come in hundreds.
+			static const size_t threads = [] {
+				const auto* value = std::getenv("KYTY_SHADER_CALLS_THREADS");
+				return std::clamp<size_t>(value != nullptr ? std::strtoull(value, nullptr, 0) : 3u, 1u, 16u);
+			}();
+			if (m_threads.size() < std::min(threads, m_jobs.size() + m_threads.size())) {
+				m_threads.emplace_back([this] { Run(); });
 			}
 		}
 		m_wake.notify_one();
@@ -1390,7 +1431,9 @@ public:
 			m_stop = true;
 		}
 		m_wake.notify_all();
-		if (m_thread.joinable()) m_thread.join();
+		for (auto& thread: m_threads) {
+			if (thread.joinable()) thread.join();
+		}
 	}
 
 private:
@@ -1459,7 +1502,7 @@ private:
 	std::condition_variable             m_wake;
 	std::deque<std::unique_ptr<Job>>    m_jobs;
 	std::unordered_map<uint64_t, Entry> m_entries;
-	std::thread                         m_thread;
+	std::vector<std::thread>            m_threads;
 	bool                                m_stop = false;
 };
 
@@ -7210,6 +7253,14 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	return result;
 }
 
+void PipelineCache::SelectCallSplitCode(const void* code) {
+	t_split_code = static_cast<const ShaderRecompiler::CallSplit::Code*>(code);
+}
+
+std::shared_ptr<const void> PipelineCache::TakeCallSplitRun() {
+	return std::exchange(t_split_run, nullptr);
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
@@ -7218,7 +7269,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	std::optional<CpGaps::Scope> prepare_gap;
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
 	auto              params      = PrepareProgram(regs, sh, input_info);
-	(void)ExpandComputeCalls(params, input_info.wave_size);
+	if (!ExpandComputeCalls(params, input_info)) {
+		return {};
+	}
 	prepare_gap.reset();
 	// Use one effective size and placement for the cache key, LDS declaration, and access bounds.
 	// Above the device limit (AMD reports 32 KiB; some Astro Bot compute shaders ask for 48) the
@@ -8181,7 +8234,10 @@ void PipelineCache::PrewarmComputePipeline(const ShaderComputeInputInfo& input_i
 PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
                                                               const ShaderProgram& compute_program) {
 	EXIT_IF(!compute_program || !input_info.stage);
-	if (!input_info.stage.program->info.uses_bvh) {
+	// A call-split program (CallSplit.h) builds in the background too, and never waits.
+	const bool call_split =
+	    input_info.stage.program->bindings.call_state_dword != ShaderRecompiler::IR::PushData::NoStart;
+	if (!input_info.stage.program->info.uses_bvh && !call_split) {
 		return &GetComputePipeline(input_info, compute_program);
 	}
 	const auto id = compute_program.id;
@@ -8218,7 +8274,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		ticket      = job->ticket;
 	}
 	bool ready = future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-	switch (RtSession::DecideDispatch(false, ready, first, rt.wait_ms)) {
+	switch (RtSession::DecideDispatch(false, ready, first && !call_split, rt.wait_ms)) {
 		case RtSession::DispatchAction::Run: break;
 		case RtSession::DispatchAction::WaitBounded: {
 			rt.queue.Promote(ticket);

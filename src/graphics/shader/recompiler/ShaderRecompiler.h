@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/CallSplit.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -97,6 +98,9 @@ struct TranslateResult {
 	// Only for a program skipped because it calls through S_SWAPPC_B64 (KYTY_SRT_VARIANT_READS).
 	std::vector<CallTarget> call_targets;
 	std::vector<CallTable>  call_tables;
+	// A call-split planning translation (CallSplit::FlagLiveness or FlagProbe): what it found. Such a
+	// translation is skipped (never compiled).
+	std::shared_ptr<const CallSplit::Report> call_split;
 };
 
 struct CompileResult {

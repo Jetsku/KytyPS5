@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -270,6 +271,11 @@ private:
 	void V_INTERP_MOV_F32(const Decoder::Instruction& inst);
 	void EXP(const Decoder::Instruction& inst);
 
+	void S_KYTY_CALL_STATE(const Decoder::Instruction& inst);
+	IR::Value CallStateAddress(IR::Value base, IR::U32 dword);
+	IR::U32 ReadCallStateCode(uint16_t code);
+	void    WriteCallStateCode(uint16_t code, IR::U32 value);
+	void    EmitCallStateRecipe(const void* recipe, std::vector<IR::Value>& values);
 	void EmitScalar(const Decoder::Instruction& inst);
 	void EmitVector(const Decoder::Instruction& inst);
 	void EmitInterpolation(const Decoder::Instruction& inst);

@@ -20,7 +20,7 @@ namespace {
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
 // Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
 // ImageResource 21; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
-// ShaderInfo 10; DescriptorBinding 2; BindingLayout 7; WriteRangeNode 6; WriteRangeAccess 5;
+// ShaderInfo 10; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
 // 16, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
@@ -683,6 +683,7 @@ void Read(CodecReader& r, ShaderInfo& v) {
 void Write(CodecWriter& w, const BindingLayout& v) {
 	w.U32(v.push_data_start_dword);
 	w.U32(v.dispatch_thread_dword);
+	w.U32(v.call_state_dword);
 	w.U32(v.memory_offset_dword);
 	w.U32(v.memory_offset_count);
 	w.U32(v.mip_stats_count);
@@ -693,6 +694,7 @@ void Write(CodecWriter& w, const BindingLayout& v) {
 void Read(CodecReader& r, BindingLayout& v) {
 	v.push_data_start_dword = r.U32();
 	v.dispatch_thread_dword = r.U32();
+	v.call_state_dword      = r.U32();
 	v.memory_offset_dword   = r.U32();
 	v.memory_offset_count   = r.U32();
 	v.mip_stats_count       = r.U32();

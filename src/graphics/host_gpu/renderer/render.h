@@ -1232,6 +1232,15 @@ private:
 	// LdsIndirectBytes). Returns false when the program has no such binding.
 	bool BindComputeLds(const ShaderComputeInputInfo& input, PreparedBindings& bindings,
 	                    const uint32_t* groups);
+	// KYTY_SHADER_CALLS_SPLIT (callSplitDispatch.cpp, shader/recompiler/CallSplit.h): a dispatch of
+	// a split kernel as its chain of dispatches. `pristine`: the input info before the kernel's
+	// program lookup; `run`: PipelineCache::TakeCallSplitRun.
+	void DispatchCallSplit(CommandBuffer& buffer, const ShaderComputeInputInfo& pristine,
+	                       const std::shared_ptr<const void>& run, const HW::ComputeShaderInfo& cs_regs,
+	                       const HW::ShaderRegisters& sh_regs, uint32_t groups_x, uint32_t groups_y,
+	                       uint32_t groups_z);
+	struct CallSplitState;
+	std::shared_ptr<CallSplitState> m_call_split; // shared_ptr: destroyed where it is complete
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;

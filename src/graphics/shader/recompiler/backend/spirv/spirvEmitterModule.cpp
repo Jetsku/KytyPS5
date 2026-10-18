@@ -37,6 +37,7 @@ bool UsesPhysicalAddresses(const EmitterState& state) {
 	// Guest address accesses (DMA), or a mesh program that may read its draw dwords from a native
 	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params).
 	return state.program.info.uses_dma ||
+	       state.program.bindings.call_state_dword != IR::PushData::NoStart ||
 	       (state.program.stage == ShaderType::Mesh && GetCodegenOptions().mesh_indirect_params);
 }
 

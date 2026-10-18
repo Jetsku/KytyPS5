@@ -773,6 +773,9 @@ enum class Opcode {
 	S_INST_PREFETCH,
 	S_CLAUSE,
 	S_ENDPGM,
+	// Not an RDNA2 instruction: the emulator's call-split marker (SOPP opcode 0x7f, CallSplit.h).
+	// offset = sub-operation, secondary_offset = word index of its payload, word_count = 1 + payload.
+	S_KYTY_CALL_STATE,
 	EXP,
 	COUNT
 };
@@ -826,6 +829,15 @@ enum class ImageDimension : uint32_t {
 };
 
 constexpr uint32_t MaxInstructionRawWords       = 5u;
+
+// S_KYTY_CALL_STATE (CallSplit.h): SOPP opcode 0x7f, which RDNA2 does not define. Its word holds
+// the sub-operation in simm[15:12] and the payload length in simm[11:0]; the payload follows.
+constexpr uint32_t CallStateSoppOpcode = 0x7fu;
+enum class CallStateOp : uint32_t { Header = 1, Save = 2, SaveChanged = 3, Probe = 4 };
+[[nodiscard]] constexpr uint32_t EncodeCallStateWord(CallStateOp op, uint32_t payload_words) {
+	return 0xbf800000u | (CallStateSoppOpcode << 16u) | (static_cast<uint32_t>(op) << 12u) |
+	       (payload_words & 0xfffu);
+}
 constexpr uint32_t MaxImageNsaAddressComponents = 12u;
 
 struct Operand {

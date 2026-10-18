@@ -517,6 +517,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_dispatch_guard_header}")
 
+# Call splitting (shader/recompiler/CallSplit.h, renderer/callSplitDispatch.cpp): the bin pass.
+set(gpu_call_bin_source "${gpu_tiler_shader_dir}/gpu_call_bin.comp")
+set(gpu_call_bin_spv "${gpu_mesh_generated_dir}/gpu_call_bin.spv")
+set(gpu_call_bin_header "${gpu_mesh_generated_dir}/gpu_call_bin_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_call_bin_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_call_bin_spv}" "${gpu_call_bin_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_call_bin_spv} -DOUTPUT=${gpu_call_bin_header}
+	        -DSYMBOL=GPU_CALL_BIN_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_call_bin_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_call_bin_header}")
+
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
 # a program produces. src/codegen_version.cmake fails the build when one of them includes a
@@ -1230,6 +1246,7 @@ if(BUILD_TESTING)
 	add_test(NAME registered_shader_code_off COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
 	set_tests_properties(registered_shader_code_off PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=0")
 	add_test(NAME registered_shader_code_cert COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	add_test(NAME call_split COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --call-split-only)
 	set_tests_properties(registered_shader_code_cert PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME lane_local COMMAND $<TARGET_FILE:lane_local_tests>)

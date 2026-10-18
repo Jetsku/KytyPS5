@@ -21,12 +21,14 @@ namespace {
 void CollectShaderData(const Program& program, BindingLayout& layout) {
 	std::array<bool, NumScalarRegs> registers {};
 	bool uses_dispatch_threads = false;
+	bool uses_call_state       = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (!inst.HasUses()) {
 				continue;
 			}
 			uses_dispatch_threads |= inst.GetOpcode() == ValueOpcode::GetDispatchThreadExtent;
+			uses_call_state |= inst.GetOpcode() == ValueOpcode::CallStateParam;
 			if (inst.GetOpcode() != ValueOpcode::GetUserData) {
 				continue;
 			}
@@ -49,6 +51,10 @@ void CollectShaderData(const Program& program, BindingLayout& layout) {
 	if (uses_dispatch_threads) {
 		layout.dispatch_thread_dword = layout.memory_offset_dword;
 		layout.memory_offset_dword += 3u;
+	}
+	if (uses_call_state) {
+		layout.call_state_dword = layout.memory_offset_dword;
+		layout.memory_offset_dword += BindingLayout::CallStateDwords;
 	}
 }
 
