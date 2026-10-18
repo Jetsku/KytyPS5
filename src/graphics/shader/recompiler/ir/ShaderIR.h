@@ -80,7 +80,10 @@ struct MemoryInfo {
 		// X load decodes the V#'s format in the shader (upstream a55a28380, LoadIndirectFormattedX):
 		// Miles' hit callbacks read vertex data with BUFFER_LOAD_FORMAT_X through a material's V#.
 		return !typed && data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4
 		                  : opcode == ValueOpcode::LoadBufferU32x2 ||
 		                        opcode == ValueOpcode::LoadBufferU32x3 ||
 		                        opcode == ValueOpcode::LoadBufferU32x4 ||
