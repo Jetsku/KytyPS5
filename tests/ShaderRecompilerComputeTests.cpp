@@ -20375,14 +20375,14 @@ public:
     code.push_back(EncodeVopc(0xd5, InlineU32(0), 5));       // v_cmpx_ne_u32 exec, 0, v5
     const auto exit_branch = code.size();
     code.push_back(EncodeSopp(0x08, 0));                     // s_cbranch_execz done
-    code.push_back(EncodeVop1(0x02, 0, Vgpr(72)));           // v_readfirstlane_b32 s0, v72
+    code.push_back(EncodeVop1(0x02, 48, Vgpr(72)));          // v_readfirstlane_b32 s48, v72
     code.push_back(EncodeVop1(0x01, 5, InlineU32(1)));       // v_mov_b32 v5, 1
-    code.push_back(EncodeVopc(0xc2, 0, 72));                 // v_cmp_eq_u32 vcc, s0, v72
+    code.push_back(EncodeVopc(0xc2, 48, 72));                // v_cmp_eq_u32 vcc, s48, v72
     code.push_back(EncodeSop1(0x24, 42, 106));               // s_and_saveexec_b64 s[42:43], vcc
     const auto skip_branch = code.size();
     code.push_back(EncodeSopp(0x08, 0));                     // s_cbranch_execz next
     code.push_back(EncodeVop1(0x01, 5, InlineU32(0)));       // v_mov_b32 v5, 0
-    code.push_back(EncodeSop2(0x1e, 106, 0, InlineU32(4)));  // s_lshl_b32 vcc_lo, s0, 4
+    code.push_back(EncodeSop2(0x1e, 106, 48, InlineU32(4))); // s_lshl_b32 vcc_lo, s48, 4
     code.push_back(EncodeSmem0(0x0a, 8, 36));                // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
     code.push_back(EncodeSmem1(0, 106));
     code.push_back(EncodeSopp(0x0c, 0xc07f));
@@ -20403,7 +20403,8 @@ public:
     code.push_back(EncodeVop2(0x25, 1, 20, 1));              // v_add_nc_u32 v1, s20, v1
     code.push_back(EncodeVop2(0x25, 31, 7, 0));              // v_add_nc_u32 v31, s7, v0
     code.push_back(EncodeVop2(0x1a, 31, InlineU32(2), 31));  // v_lshlrev_b32 v31, 2, v31
-    AppendBufferStoreDword(&code, 1, 31);                    // buffer_store_dword v1, v31, s[0:3] offen
+    code.push_back(EncodeMubuf0(0x1c));                      // buffer_store_dword v1, v31, s[0:3] offen
+    code.push_back(EncodeMubuf1(1, 0, 31));
     AppendEnd(&code);
     ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
                       {.type = Prospero::ShaderBinaryType::kCs,
@@ -20460,7 +20461,10 @@ public:
     options.srt_variant_reads = true;
     options.shader_calls = true;
     ShaderRecompiler::SetCodegenOptions(options);
-    ShaderRecompiler::CallSplit::Planner::SetEnabledOverride(1);
+    // KYTY_TEST_CALL_SPLIT=0: the same dispatch through the call expansion (a check of the test).
+    const char *split_switch = std::getenv("KYTY_TEST_CALL_SPLIT");
+    ShaderRecompiler::CallSplit::Planner::SetEnabledOverride(
+        split_switch != nullptr && split_switch[0] == '0' ? 0 : 1);
     const auto context_owner = MakeRenderContext();
     auto &context = *context_owner;
     HW::Context registers{};
@@ -20492,13 +20496,17 @@ public:
           shaders.SetCsUserSgpr(i, user[i], HW::UserSgprType::Unknown);
         }
         context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 2, 1, 1, 0x41u);
+      });
+      // Read while the dispatch's memory is mapped (the read synchronizes the GPU's writes).
+      for (u32 i = 0; i < stored.size(); i++) {
+        stored[i] = reinterpret_cast<volatile u32 *>(output)[i];
+      }
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
         RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
         context.UnmapMemory(base, allocation_size);
         scheduler.Finish();
       });
-      for (u32 i = 0; i < stored.size(); i++) {
-        stored[i] = reinterpret_cast<volatile u32 *>(output)[i];
-      }
       matched = stored == expected;
       if (!matched) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -58498,6 +58506,148 @@ int main(int argc, char **argv) {
                 argv[2], code.size(), decoded.instructions.size(), cfg.blocks.size(), ms(t0, t1),
                 ms(t1, t2), ms(t2, t3), structured ? "structured" : "failed", cfg.blocks.size());
     return structured ? 0 : 1;
+  }
+  // GPU (--call-split-time <kernel.bin>): plans the call split of a kernel with call loops
+  // (recompiler/CallSplit.h) as the emulator does without its callees (probe, liveness, layouts),
+  // then compiles R_0 and each R_ak and times their driver compiles. KYTY_CORPUS_CS as for
+  // --pipeline-time gives the dispatch's compile-time state.
+  if (argc == 3 && std::strcmp(argv[1], "--call-split-time") == 0) {
+    EnsureConfigInitialized();
+    namespace Split = ShaderRecompiler::CallSplit;
+    std::vector<u32> code;
+    if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
+      u32 word = 0;
+      while (std::fread(&word, sizeof(word), 1, file) == 1) code.push_back(word);
+      std::fclose(file);
+    }
+    if (code.empty()) {
+      std::printf("%s: unreadable\n", argv[2]);
+      return 1;
+    }
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.thread_ids_num = 3;
+    compute.host_subgroup_size = 32;
+    compute.wave_size = 64;
+    size_t user_data_count = 16;
+    if (const char *cs = std::getenv("KYTY_CORPUS_CS"); cs != nullptr) {
+      unsigned v[10] = {};
+      if (std::sscanf(cs, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4],
+                      &v[5], &v[6], &v[7], &v[8], &v[9]) == 10) {
+        compute.threads_num[0] = v[0];
+        compute.threads_num[1] = v[1];
+        compute.threads_num[2] = v[2];
+        compute.thread_ids_num = v[3];
+        compute.lds_size_dwords = v[4];
+        compute.workgroup_register = v[5];
+        compute.group_id[0] = v[6] != 0;
+        compute.group_id[1] = v[7] != 0;
+        compute.group_id[2] = v[8] != 0;
+        user_data_count = v[9];
+      }
+    }
+    ShaderRecompiler::Spirv::SetHostBufferRobustness({.storage_dword_loads_return_zero = true});
+    ShaderRecompiler::Spirv::SetHostFloatControls({.denorm_flush_f32 = false,
+                                                   .denorm_preserve_f16 = true,
+                                                   .denorm_preserve_f64 = false});
+    ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = true});
+    const auto user_data = MakeNativeUserData(nullptr);
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 64;
+    options.dump_ir = false;
+    options.input_info.compute = &compute;
+    options.user_data = std::span<const u32>(user_data).first(user_data_count);
+    Split::Shape shape;
+    std::string failure;
+    if (!Split::AnalyzeShape(code, options, shape, failure)) {
+      std::printf("not split: %s\n", failure.c_str());
+      return 1;
+    }
+    const auto sites = static_cast<u32>(shape.sites.size());
+    std::printf("%u call loop(s), %u VGPR candidates\n", sites, shape.vgprs);
+    const auto translate = [&](const std::vector<u32> &words, Split::Report &report) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const auto result = ShaderRecompiler::TranslateProgram(words, options);
+      const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (result.call_split == nullptr) return -1.0;
+      report = *result.call_split;
+      return ms;
+    };
+    const ShaderRecompiler::Decoder::ShaderCodeReader no_read = [](uint64_t, std::span<u32>) { return false; };
+    Split::Header layouts;
+    layouts.sites.resize(sites);
+    std::vector<u32> words;
+    Split::Report report;
+    Split::BuildCode(shape, layouts, Split::Kind::Probe, 0, false, {}, 0, 0, no_read, words, failure);
+    const auto probe_ms = translate(words, report);
+    if (probe_ms < 0) {
+      std::printf("the probe translation failed\n");
+      return 1;
+    }
+    auto recipe = std::make_shared<Split::Recipe>(report.recipe);
+    Split::RegisterRecipe(shape.digest, recipe);
+    std::printf("probe: %.0f ms\n", probe_ms);
+    for (u32 k = sites; k >= 1; k--) {
+      Split::BuildCode(shape, layouts, Split::Kind::Resume, k, true, {}, 0, 0, no_read, words, failure);
+      const auto ms = translate(words, report);
+      if (ms < 0) {
+        std::printf("the liveness translation of site %u failed\n", k);
+        return 1;
+      }
+      auto &layout = layouts.sites[k - 1u];
+      layout = {};
+      for (const auto value : report.live) {
+        (value >= Split::VectorCode ? layout.vector : layout.uniform).push_back(value);
+      }
+      std::string vectors;
+      for (const auto value : layout.vector) vectors += fmt::format(" v{}", value - Split::VectorCode);
+      std::printf("site %u (pc 0x%x-0x%x, record v%u): liveness %.0f ms, %zu scalars (%zu rebuilt), "
+                  "%zu VGPRs:%s\n",
+                  k, shape.sites[k - 1u].a, shape.sites[k - 1u].b, shape.sites[k - 1u].record_vgpr, ms,
+                  layout.uniform.size(), recipe->sites[k - 1u].roots.size(), layout.vector.size(),
+                  vectors.c_str());
+    }
+    std::printf("%u dwords per wave\n", layouts.WaveDwords());
+    VulkanHarness vulkan;
+    for (u32 k = 0; k <= sites; k++) {
+      Split::BuildCode(shape, layouts, Split::Kind::Resume, k, false, {}, 0, 0, no_read, words, failure);
+      const auto t0 = std::chrono::steady_clock::now();
+      auto translated = ShaderRecompiler::TranslateProgram(words, options);
+      if (translated.skip_dispatch) {
+        std::printf("R_%u: skipped\n", k);
+        continue;
+      }
+      auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+      ShaderRecompiler::IR::ResourceSnapshot resources;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      const ShaderRecompiler::IR::SrtRuntime runtime{
+          .user_data = options.user_data,
+          .shader_base = reinterpret_cast<uint64_t>(words.data()),
+          .read_memory = [](void *, uint64_t, std::span<u32> values) {
+            std::fill(values.begin(), values.end(), 0u);
+            return true;
+          },
+          .read_specialization_memory = [](void *, uint64_t, std::span<u32> values) {
+            std::fill(values.begin(), values.end(), 0u);
+            return true;
+          },
+      };
+      if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
+        std::printf("R_%u: materialize failed\n", k);
+        continue;
+      }
+      auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+      const auto t1 = std::chrono::steady_clock::now();
+      const auto pipeline_ms = vulkan.TimeComputePipeline("call-split", result.spirv,
+                                                          result.program.bindings, k + 1u);
+      std::printf("R_%s%u: %zu guest words, %zu SPIR-V words, translate+emit %.0f ms, pipeline %.0f ms\n",
+                  k == 0 ? "" : "a", k, words.size(), result.spirv.size(),
+                  std::chrono::duration<double, std::milli>(t1 - t0).count(), pipeline_ms);
+    }
+    return 0;
   }
   // CPU only (--scan-functions <file> <out.txt>): finds the functions an S_SWAPPC_B64 call table can
   // reach in a game data file (Insomniac's ray-tracing hit callbacks start with s_mov_b32 vcc_hi,

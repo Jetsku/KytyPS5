@@ -273,12 +273,22 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 	               vk::PipelineStageFlagBits2::eHost,
 	           vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eHostWrite);
 
-	g_totals.dispatches.fetch_add(1, std::memory_order_relaxed);
-	if (!dispatch(*run.start, 0, nullptr, 0)) {
+	const auto ordinal = g_totals.dispatches.fetch_add(1, std::memory_order_relaxed);
+	// KYTY_SHADER_CALLS_SPLIT_LOG=N: the steps of the first N split dispatches.
+	static const uint64_t log_limit = [] {
+		const auto* value = std::getenv("KYTY_SHADER_CALLS_SPLIT_LOG");
+		return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
+	}();
+	std::string steps;
+	const auto note = [&](const char* what, bool ran) {
+		if (ordinal < log_limit) steps += fmt::format(" {}{}", what, ran ? "" : "(skipped)");
+	};
+	const bool started = dispatch(*run.start, 0, nullptr, 0);
+	note("R_0", started);
+	if (!started) {
 		g_totals.skipped.fetch_add(1, std::memory_order_relaxed);
-		return;
 	}
-	for (uint32_t k = 1; k <= run.sites.size(); k++) {
+	for (uint32_t k = 1; started && k <= run.sites.size(); k++) {
 		const auto& site    = run.sites[k - 1u];
 		const auto  targets = static_cast<uint32_t>(site.callees.size());
 		to_compute(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
@@ -310,19 +320,28 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 				g_totals.skipped_callees.fetch_add(1, std::memory_order_relaxed);
 				continue;
 			}
-			if (dispatch(*site.callees[t], address + layout.lists[k - 1u] + uint64_t {t} * waves * 4u, &handle,
-			             layout.args[k - 1u] + uint64_t {t} * 12u)) {
+			const bool ran = dispatch(*site.callees[t], address + layout.lists[k - 1u] + uint64_t {t} * waves * 4u,
+			                          &handle, layout.args[k - 1u] + uint64_t {t} * 12u);
+			note("C", ran);
+			if (ran) {
 				g_totals.callee_dispatches.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				g_totals.skipped_callees.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 		to_compute(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
-		if (site.resume == nullptr ||
-		    !dispatch(*site.resume, address + layout.lists[k - 1u] + uint64_t {targets} * waves * 4u, &handle,
-		              layout.args[k - 1u] + uint64_t {targets} * 12u)) {
+		const bool resumed =
+		    site.resume != nullptr &&
+		    dispatch(*site.resume, address + layout.lists[k - 1u] + uint64_t {targets} * waves * 4u, &handle,
+		             layout.args[k - 1u] + uint64_t {targets} * 12u);
+		note(k == 1 ? "bin1 R_a1" : "bin R_a", resumed);
+		if (!resumed) {
 			g_totals.skipped.fetch_add(1, std::memory_order_relaxed);
 		}
+	}
+	if (ordinal < log_limit) {
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_SHADER_CALLS_SPLIT: dispatch {} of kernel 0x{:016x} ({} waves):{}\n",
+		                                      ordinal, run.kernel, waves, steps));
 	}
 }
 
