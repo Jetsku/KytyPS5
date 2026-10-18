@@ -29,6 +29,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -320,6 +324,55 @@ bool PredictRenderDepthTarget(const GraphicContext& graphics, const HW::Context&
 	return true;
 }
 
+// KYTY_STENCIL_REF_TRACE=<ref> (diagnostic, default off): prints the guest depth/stencil state of
+// draws testing or writing that stencil reference, once per distinct state.
+static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r) {
+	static const int ref = [] {
+		const auto* value = std::getenv("KYTY_STENCIL_REF_TRACE");
+		return value != nullptr && value[0] != '\0' ? std::atoi(value) : -1;
+	}();
+	const auto& sm = hw.GetStencilMask();
+	if (ref < 0 || (sm.stencil_testval != ref && sm.stencil_opval != ref)) {
+		return;
+	}
+	const auto& dc = hw.GetDepthControl();
+	const auto& sc = hw.GetStencilControl();
+	const auto& rc = hw.GetRenderControl();
+	const auto& ro = hw.GetDepthRenderOverride();
+	const auto& z  = hw.GetDepthRenderTarget();
+	const auto& sh = hw.GetShaderRegisters().db_shader_control;
+	char line[640];
+	std::snprintf(line, sizeof(line),
+	              "StencilRefTrace: dc z=%d zw=%d zfunc=%u bounds=%d st=%d sfunc=%u/%u bf=%d | sc "
+	              "fail=%u zpass=%u zfail=%u bf=%u/%u/%u | sm test=%u mask=0x%02x wmask=0x%02x "
+	              "opval=%u bf test=%u mask=0x%02x wmask=0x%02x opval=%u | rc dclr=%d sclr=%d | ro "
+	              "zv=%d zd=%d sv=%d sd=%d | view zro=%d sro=%d | shctl kill=%d zexp=%d mask=%d "
+	              "zbeh=%u other=0x%08x a2m_dis=%d | host dw=%d dfunc=%d sload=%d",
+	              dc.z_enable, dc.z_write_enable, dc.zfunc, dc.depth_bounds_enable, dc.stencil_enable,
+	              dc.stencilfunc, dc.stencilfunc_bf, dc.backface_enable, sc.stencil_fail,
+	              sc.stencil_zpass, sc.stencil_zfail, sc.stencil_fail_bf, sc.stencil_zpass_bf,
+	              sc.stencil_zfail_bf, sm.stencil_testval, sm.stencil_mask, sm.stencil_writemask,
+	              sm.stencil_opval, sm.stencil_testval_bf, sm.stencil_mask_bf, sm.stencil_writemask_bf,
+	              sm.stencil_opval_bf, rc.depth_clear_enable, rc.stencil_clear_enable,
+	              ro.force_z_valid, ro.force_z_dirty, ro.force_stencil_valid, ro.force_stencil_dirty,
+	              z.depth_view.depth_write_disable, z.depth_view.stencil_write_disable,
+	              sh.shader_kill_enable, sh.shader_z_export_enable, sh.shader_mask_export_enable,
+	              sh.shader_z_behavior, sh.other_bits, sh.alpha_to_mask_disable,
+	              r.depth_write_enable, static_cast<int>(r.depth_compare_op),
+	              r.stencil_load_clear_enable);
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> seen;
+	std::scoped_lock                       lock {mutex};
+	if (seen.insert(line).second) {
+		std::printf("%s\n", line);
+		LOGF("%s\n", line);
+		if (auto* file = std::fopen("_StencilRefTrace.txt", "a"); file != nullptr) {
+			std::fprintf(file, "%s\n", line);
+			std::fclose(file);
+		}
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
@@ -427,6 +480,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		r.stencil_front = vk::StencilOpState {};
 		r.stencil_back  = vk::StencilOpState {};
 	}
+	TraceStencilRefState(hw, r);
 	// r.desc is the memo's description (KYTY_DRAW_SEQUENCE_FAST: its last lookup may repeat).
 	r.image_id = FindTargetImage(r.desc, false, TargetDescMemoEnabled() ? &memo.lookup : nullptr);
 	BindRenderTarget(r.image_id);
