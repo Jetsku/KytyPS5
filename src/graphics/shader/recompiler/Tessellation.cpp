@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 
@@ -61,6 +63,11 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
 	const char*           stage_name = local ? "LS" : "HS";
+	// KYTY_TESS_DUMP=1 logs a failing program's disassembly (local diagnosis only).
+	const auto dump = [&] {
+		if (const char* env = std::getenv("KYTY_TESS_DUMP"); env != nullptr && env[0] == '1')
+			LOGF("%s\n", ProgramToString(program).c_str());
+	};
 	TessellationRegisters entry {};
 	entry[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
@@ -141,18 +148,23 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				continue;
 			}
 			const bool local_store =
-			    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+			    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+			    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
+			    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
 			const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
 			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
 			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
 			const bool control_store = !local && buffer_store &&
 			                           inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
-			const bool control_read = !local && (inst.opcode == Opcode::DS_READ_B32 ||
-			                                     inst.opcode == Opcode::DS_READ2_B32);
+			const bool control_read =
+			    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+			               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
+			               inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
 			if (check && ((local && local_store) || control_store || control_read)) {
 				const auto address = read(inst.src0);
 				if (address.kind != Kind::Affine) {
+					dump();
 					EXIT("%s tessellation address is not affine at pc 0x%08x (shader 0x%016" PRIx64
 					     ")\n",
 					     stage_name, inst.pc, hash);
@@ -161,6 +173,7 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					const auto expected = control_read ? input_stride : stride;
 					if ((address.coefficient & 3u) != 0u ||
 					    (expected != 0u && expected != address.coefficient)) {
+						dump();
 						EXIT("%s tessellation stride %u conflicts with %u at pc 0x%08x (shader "
 						     "0x%016" PRIx64 ")\n",
 						     stage_name, address.coefficient, expected, inst.pc, hash);
@@ -183,6 +196,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 							value = {Kind::Affine, 1u, 0u};
 						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 					}
+					break;
+				case Opcode::V_MOV_B32: value = lhs; break;
+				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
+				case Opcode::V_ADD3_U32: value = add(add(lhs, rhs), third); break;
+				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
+				case Opcode::V_ADD_LSHL_U32:
+					if (third.kind == Kind::Affine && third.coefficient == 0u && third.constant < 32u)
+						value = multiply(add(lhs, rhs), constant(1u << third.constant));
 					break;
 				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 				case Opcode::V_MAD_U32_U24:
@@ -220,6 +241,7 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	while (pass(false)) {}
 	pass(true);
 	if (stride == 0u) {
+		dump();
 		EXIT("%s tessellation stride was not found (shader 0x%016" PRIx64 ")\n", stage_name, hash);
 	}
 	return stride;
@@ -263,6 +285,33 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info, uint64_t local_hash,
                                  uint64_t control_hash) {
+	// Every tessellated draw prepares its programs; the interface depends only on
+	// the two programs and the control point counts.
+	struct Key {
+		uint64_t local_hash, control_hash;
+		uint64_t sizes;
+		uint32_t control_points;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const {
+			return std::hash<uint64_t> {}(key.local_hash ^ (key.control_hash * 0x9e3779b97f4a7c15ull) ^
+			                              key.sizes ^ key.control_points);
+		}
+	};
+	static std::mutex                                                      mutex;
+	static std::unordered_map<Key, std::pair<uint32_t, uint32_t>, KeyHash> strides;
+	const bool cacheable = local_hash != 0u && control_hash != 0u;
+	const Key  key {local_hash, control_hash, (uint64_t {local.size()} << 32u) | control.size(),
+	                (info.input_control_points << 8u) | info.output_control_points};
+	if (cacheable) {
+		std::lock_guard lock(mutex);
+		if (const auto found = strides.find(key); found != strides.end()) {
+			info.ls_stride = found->second.first;
+			info.hs_stride = found->second.second;
+			return;
+		}
+	}
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
@@ -272,6 +321,10 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	                                           info.ls_stride, control_hash);
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+	if (cacheable) {
+		std::lock_guard lock(mutex);
+		strides.emplace(key, std::pair {info.ls_stride, info.hs_stride});
+	}
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {

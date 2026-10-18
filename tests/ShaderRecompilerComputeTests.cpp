@@ -52379,8 +52379,14 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
   // The fused LS addresses one control point using its v3 ordinal.
   local.push_back(EncodeVop2(0x0b, local_address, 255u, 3));
   local.push_back(ls_stride);
-  local.push_back(EncodeDs0(0x0e, (3u << 8u) | 1u));
-  local.push_back(EncodeDs1Ex(0, 5, 2, local_address));
+  if (branched) {
+    // Wide records, as in Miles Morales: ds_write_b128 of v2..v5 at offset 16.
+    local.push_back(EncodeDs0(0xdf, 16));
+    local.push_back(EncodeDs1Ex(0, 0, 2, local_address));
+  } else {
+    local.push_back(EncodeDs0(0x0e, (3u << 8u) | 1u));
+    local.push_back(EncodeDs1Ex(0, 5, 2, local_address));
+  }
   local.push_back(EncodeSop1(0x20, 0, 6));
   local.push_back(0xffffffffu); // Shader footer is not executable after LS handoff.
 
@@ -52417,7 +52423,11 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
     control.push_back(EncodeVop2(0x0b, input_address, 255u, control_point));
     control.push_back(ls_stride);
   }
-  control.push_back(EncodeDs0(0x37, (3u << 8u) | 1u));
+  if (branched) {
+    control.push_back(EncodeDs0(0xff, 16)); // ds_read_b128 v10..v13
+  } else {
+    control.push_back(EncodeDs0(0x37, (3u << 8u) | 1u));
+  }
   control.push_back(EncodeDs1Ex(10, 0, 0, input_address));
   u32 joined_address = output_address;
   if (branched) {
@@ -52472,11 +52482,12 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
   evaluation.push_back(EncodeExp1(5, 6, 10, 12));
   AppendEnd(&evaluation);
 
+  // The branched variant also covers the quad domain, fractional-even spacing and ccw output.
   ShaderTessellationInputInfo tess{.input_control_points = 3,
                                   .output_control_points = 3,
-                                  .domain = 1,
-                                  .partitioning = 2,
-                                  .output_topology = 2};
+                                  .domain = branched ? 2u : 1u,
+                                  .partitioning = branched ? 3u : 2u,
+                                  .output_topology = branched ? 3u : 2u};
   AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
           tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
@@ -52520,8 +52531,10 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
         }
       }
     }
-    Require(name, "separate DS offsets", stage != 0 || local_offsets == std::set<u32>{4, 12},
-            "DS_WRITE2 must preserve both independently encoded offsets");
+    Require(name, "separate DS offsets",
+            stage != 0 || local_offsets == (branched ? std::set<u32>{16, 20, 24, 28}
+                                                     : std::set<u32>{4, 12}),
+            "DS writes must preserve every component's offset");
     Require(name, "offchip component addressing",
             stage != 2 ||
                 evaluation_offsets == std::set<u32>{28, 2 * hs_stride + 28},
@@ -52555,10 +52568,13 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
                            assembly.find("TessLevelInner") != std::string::npos),
             "triangle factors require outer[4] and inner[2] Vulkan builtins");
     Require(name, "native domain and winding",
-            stage != 2 || (assembly.find("TessCoord") != std::string::npos &&
-                           assembly.find("Triangles") != std::string::npos &&
-                           assembly.find("SpacingFractionalOdd") != std::string::npos &&
-                           assembly.find("VertexOrderCw") != std::string::npos),
+            stage != 2 ||
+                (assembly.find("TessCoord") != std::string::npos &&
+                 assembly.find(branched ? "Quads" : "Triangles") != std::string::npos &&
+                 assembly.find(branched ? "SpacingFractionalEven" : "SpacingFractionalOdd") !=
+                     std::string::npos &&
+                 assembly.find(branched ? "VertexOrderCcw" : "VertexOrderCw") !=
+                     std::string::npos),
             "TES must preserve guest triangle domain, partitioning, and winding");
   }
   std::printf("[host]    %-32s ok\n", name);
