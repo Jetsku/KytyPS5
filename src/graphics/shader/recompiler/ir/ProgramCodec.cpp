@@ -22,7 +22,7 @@ namespace {
 // ImageResource 21; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 7; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
-// 13, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// 16, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
 // ResourceSpecialization 2 (Buffer 3, Image 11).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
@@ -42,8 +42,8 @@ static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: upd
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
 static_assert(sizeof(CompiledShaderInfo) == 352, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 240, "IR::DescriptorSource changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 96,
+static_assert(sizeof(DescriptorSource) == 256, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 112,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update ProgramCodec");
@@ -756,6 +756,9 @@ public:
 				w.U32(image.workgroup_axis);
 				w.Bool(image.bindless);
 				w.U32(image.record_pointer);
+				w.U32(image.nested_vsharp);
+				w.U32(image.nested_heap);
+				w.U32(image.nested_keys);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
@@ -991,6 +994,9 @@ public:
 				image.workgroup_axis     = r.U32();
 				image.bindless           = r.Bool();
 				image.record_pointer     = r.U32();
+				image.nested_vsharp      = r.U32();
+				image.nested_heap        = r.U32();
+				image.nested_keys        = r.U32();
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;

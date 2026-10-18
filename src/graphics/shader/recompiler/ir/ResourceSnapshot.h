@@ -53,6 +53,10 @@ struct BindlessHeapUse {
 	// otherwise at base + table_offset + k * 32.
 	uint32_t stride         = 32;
 	uint32_t record_pointer = UINT32_MAX;
+	// Nested heaps (IndirectDescriptor::nested_vsharp): key = record * nested_keys + inner key.
+	uint32_t nested_vsharp  = UINT32_MAX;
+	uint32_t nested_heap    = 0;
+	uint32_t nested_keys    = 0;
 
 	bool operator==(const BindlessHeapUse&) const = default;
 };

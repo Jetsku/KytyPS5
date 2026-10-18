@@ -316,9 +316,107 @@ void CheckMilesRecordPointer() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 
+// The nested form (2 of the 218 callees): the material's V# at +48 points at a buffer whose
+// dwords 48-63 are the V# of a T# heap; the T# is S_BUFFER_LOAD_DWORDX8 at an inner key << 5.
+std::vector<u32> MilesNestedHeapCode() {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u);
+  AppendVMovLiteral(&code, 4, 0x3f000000u);
+  AppendVMovLiteral(&code, 5, 0x00000000u);
+  code.push_back(EncodeSop1(0x04u, 20, 126)); // s_mov_b64 s[20:21], exec
+  const auto loop = code.size();
+  code.push_back(EncodeVop1(0x02, 22, Vgpr(1)));  // v_readfirstlane_b32 s22, v1
+  code.push_back(EncodeVopc(0xc2u, 22, 1));       // v_cmp_eq_u32 vcc, s22, v1
+  code.push_back(EncodeSop1(0x24u, 24, 106));     // s_and_saveexec_b64 s[24:25], vcc
+  code.push_back(EncodeSop2(0x1eu, 106, 22, InlineU32(4))); // s_lshl_b32 vcc_lo, s22, 4
+  code.push_back(EncodeSmem0(0x0au, 12, 2));      // s_buffer_load_dwordx4 s[12:15], s[4:7], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeSmem0(0x02u, 44, 7));      // s_load_dwordx4 s[44:47], s[14:15], 48
+  code.push_back(EncodeSmem1(48, 125));
+  code.push_back(EncodeSmem0(0x02u, 40, 7));      // s_load_dwordx4 s[40:43], s[14:15], 304 (S#)
+  code.push_back(EncodeSmem1(304, 125));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeSmem0(0x0au, 60, 22));     // s_buffer_load_dwordx4 s[60:63], s[44:47], 48
+  code.push_back(EncodeSmem1(48, 125));
+  code.push_back(EncodeVop1(0x02, 23, Vgpr(0)));  // v_readfirstlane_b32 s23, v0: the inner key
+  code.push_back(EncodeSop2(0x1eu, 26, 23, InlineU32(5))); // s_lshl_b32 s26, s23, 5
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeSmem0(0x0bu, 64, 30));     // s_buffer_load_dwordx8 s[64:71], s[60:63], s26
+  code.push_back(EncodeSmem1(0, 26));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[64:71], s[40:43]
+  code.push_back(EncodeMimg1(2, 3, 64 / 4, 40 / 4));
+  code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec
+  code.push_back(EncodeSop1(0x04u, 126, 24));     // s_mov_b64 exec, s[24:25]
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(back) & 0xffffu));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckMilesNestedHeap() {
+  constexpr const char *name = "BindlessMilesNestedHeap";
+  const auto code = MilesNestedHeapCode();
+  const auto user_data = MilesHeapUserData();
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  ScopedCodegenOptions scope(codegen);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the nested heap T# was skipped with bindless images");
+  const auto &images = translated.program.info.images;
+  Require(name, "bindless plan", images.size() == 1u, "expected one image");
+  const auto &source = translated.program.descriptor_sources.at(images[0].source);
+  Require(name, "bindless plan",
+          source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless &&
+              source.indirect_descriptor->record_pointer == 8u &&
+              source.indirect_descriptor->nested_vsharp == 48u &&
+              source.indirect_descriptor->nested_heap == 48u &&
+              source.indirect_descriptor->nested_keys != 0u,
+          "the image is not a nested heap");
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  std::vector<u32> memory(0x4000u, 0u);
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.bindless_heaps.size() == 1u &&
+              resources.bindless_heaps[0].nested_vsharp == 48u &&
+              resources.bindless_heaps[0].nested_heap == 48u,
+          "the nested heap did not materialize");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "bindless SPIR-V", CountSpirv(result.spirv, "\"bindless_translation\"") == 1u,
+          "the sample does not go through the bindless arrays");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
 void RunCodegen() {
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
+  CheckMilesNestedHeap();
 }
 
 } // namespace BindlessTests
