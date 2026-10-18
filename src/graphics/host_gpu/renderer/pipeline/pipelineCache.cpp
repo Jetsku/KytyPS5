@@ -1222,6 +1222,51 @@ static bool ComputeProgramMayCall(const ShaderParams& params) {
 // replaced by its expansion (ShaderRecompiler::ShaderCallExpander), which then goes through the
 // program cache like any program: `code` holds the expanded words and the key the expansion's
 // digest. A program that does not expand keeps its code (and is skipped as before).
+// KYTY_DUMP_PROGRAMS=<hash>,...;<folder> (diagnostics): the guest code and disassembly of those
+// programs, once per hash, stage and user-data count, as their compile starts. Local files only.
+static void DumpRequestedProgram(const ShaderParams& params, ShaderType stage) {
+	static const auto request = [] {
+		std::pair<std::set<uint64_t>, std::string> parsed;
+		const char* value = std::getenv("KYTY_DUMP_PROGRAMS");
+		if (value == nullptr) return parsed;
+		std::string_view text(value);
+		const auto       split = text.find(';');
+		if (split == std::string_view::npos) return parsed;
+		parsed.second = std::string(text.substr(split + 1));
+		for (auto list = text.substr(0, split); !list.empty();) {
+			const auto comma = list.find(',');
+			parsed.first.insert(std::strtoull(std::string(list.substr(0, comma)).c_str(), nullptr, 16));
+			if (comma == std::string_view::npos) break;
+			list.remove_prefix(comma + 1);
+		}
+		return parsed;
+	}();
+	if (request.first.empty() || !request.first.contains(params.hash)) return;
+	static std::mutex                 mutex;
+	static std::set<std::string>      done;
+	const auto name = fmt::format("{:016x}_stage{}_ud{}", params.hash, static_cast<uint32_t>(stage),
+	                              params.user_data_count);
+	{
+		std::scoped_lock lock(mutex);
+		if (!done.insert(name).second) return;
+	}
+	std::error_code error;
+	std::filesystem::create_directories(request.second, error);
+	const auto base = std::filesystem::path(request.second) / name;
+	if (std::FILE* file = std::fopen((base.string() + ".bin").c_str(), "wb"); file != nullptr) {
+		std::fwrite(params.code.data(), sizeof(uint32_t), params.code.size(), file);
+		std::fclose(file);
+	}
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::DecodeProgram(params.code, decoded, true);
+	std::string text = fmt::format("user data ({}):", params.user_data_count);
+	for (uint32_t i = 0; i < params.user_data_count; i++) text += fmt::format(" {:08x}", params.user_data[i]);
+	text += "\n" + ShaderRecompiler::Decoder::ProgramToString(decoded);
+	if (std::FILE* file = std::fopen((base.string() + ".txt").c_str(), "wb"); file != nullptr) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
 static ShaderRecompiler::ShaderCallExpander& CallExpander() {
 	static ShaderRecompiler::ShaderCallExpander expander;
 	return expander;
@@ -3037,6 +3082,7 @@ struct PipelineCache::ProgramCache {
 		} stall {.account = !speculative && !replay};
 		std::vector<uint32_t> owned_code;
 		auto translation_code = params.code;
+		DumpRequestedProgram(params, key.stage);
 		if (speculative) {
 			// A certificate checked at draw consumption cannot repair a cache entry published
 			// from changed code. Keep an immutable copy and verify its identity before publication.
