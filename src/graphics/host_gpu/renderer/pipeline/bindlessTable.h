@@ -41,6 +41,10 @@ class PageManager;
 struct BindlessHeap {
 	uint64_t base         = 0;
 	uint32_t table_offset = 0;
+	// Record pointer heaps (BindlessHeapUse::record_pointer): key k's T# is at the 64-bit
+	// pointer stored at base + k * stride + record_pointer, plus table_offset.
+	uint32_t stride         = 32;
+	uint32_t record_pointer = UINT32_MAX;
 	uint32_t binding      = 0;
 	uint32_t region       = 0;
 	// Keys the region holds. The guest appends textures to a heap as it streams them in and
@@ -118,7 +122,8 @@ public:
 	// the translation buffer is full.
 	[[nodiscard]] Heap* FindOrCreateHeap(uint64_t base, uint32_t table_offset, uint32_t binding,
 	                                     uint32_t entries,
-	                                     const ShaderRecompiler::IR::ImageResource& resource);
+	                                     const ShaderRecompiler::IR::ImageResource& resource,
+	                                     uint32_t stride = 32, uint32_t record_pointer = UINT32_MAX);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
 	// 0 when the array is full. A released slot is reused once the GPU has finished the work
 	// recorded before its release.

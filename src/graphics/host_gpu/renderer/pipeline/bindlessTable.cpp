@@ -335,9 +335,13 @@ bool BindlessTable::IsPlaceholder(vk::ImageView view) const noexcept {
 void BindlessTable::WatchHeap(Heap& heap) {
 	heap.watched_entries  = heap.guest_entries;
 	heap.watch_generation = m_watch_generation.load(std::memory_order_acquire);
-	const auto table = heap.base + heap.table_offset;
-	const auto begin = Common::AlignDown(table, TRACKER_PAGE_SIZE);
-	const auto end = Common::AlignUp(table + uint64_t {heap.guest_entries} * 32u, TRACKER_PAGE_SIZE);
+	// A record pointer heap watches its records (the pointers); RevalidateBindlessKeys follows
+	// what they point at.
+	const bool pointers = heap.record_pointer != UINT32_MAX;
+	const auto table    = pointers ? heap.base : heap.base + heap.table_offset;
+	const auto begin    = Common::AlignDown(table, TRACKER_PAGE_SIZE);
+	const auto end      = Common::AlignUp(
+        table + uint64_t {heap.guest_entries} * (pointers ? heap.stride : 32u), TRACKER_PAGE_SIZE);
 	if (end <= begin) {
 		return;
 	}
@@ -479,12 +483,13 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
     uint64_t base, uint32_t table_offset, uint32_t binding, uint32_t entries,
-    const ShaderRecompiler::IR::ImageResource& resource) {
+    const ShaderRecompiler::IR::ImageResource& resource, uint32_t stride, uint32_t record_pointer) {
 	if (entries == 0 || m_set == nullptr) {
 		return nullptr;
 	}
 	for (auto& heap: m_heaps) {
-		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding) {
+		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding &&
+		    heap.stride == stride && heap.record_pointer == record_pointer) {
 			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
 				return nullptr;
 			}
@@ -494,8 +499,10 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	}
 	auto& heap         = m_heaps.emplace_back();
 	heap.base          = base;
-	heap.table_offset  = table_offset;
-	heap.binding       = binding;
+	heap.table_offset   = table_offset;
+	heap.stride         = stride;
+	heap.record_pointer = record_pointer;
+	heap.binding        = binding;
 	heap.resource      = resource;
 	heap.guest_entries = entries;
 	if (!AllocateRegion(heap, std::max(entries, 1u << 14u))) {

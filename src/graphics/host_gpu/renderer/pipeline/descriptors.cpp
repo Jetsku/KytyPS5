@@ -1874,7 +1874,7 @@ void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 	std::vector<std::array<uint32_t, 8>> words;
 	for (const auto& heap: table.Heaps()) {
 		const auto entries = std::min(heap.guest_entries, static_cast<uint32_t>(heap.settled.size()));
-		if (entries == 0) {
+		if (entries == 0 || heap.record_pointer != UINT32_MAX) {
 			continue;
 		}
 		words.resize(entries);
@@ -1946,15 +1946,32 @@ uint64_t RenderExecutor::BindlessFrame() const {
 	return static_cast<uint64_t>(m_context.GetGpu().GetFrameNum());
 }
 
+// Key `key`'s T#: in the heap itself, or behind the key's record pointer.
+static bool ReadBindlessEntry(const BindlessHeap& heap, uint32_t key, uint32_t* words) {
+	if (heap.record_pointer == UINT32_MAX) {
+		return LibKernel::Memory::TryReadBacking(
+		    heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u, words, 32u);
+	}
+	std::array<uint32_t, 2> pointer {};
+	if (!LibKernel::Memory::TryReadBacking(heap.base + static_cast<uint64_t>(key) * heap.stride +
+	                                           heap.record_pointer,
+	                                       pointer.data(), 8u)) {
+		return false;
+	}
+	const auto address =
+	    static_cast<uint64_t>(pointer[0]) | (static_cast<uint64_t>(pointer[1] & 0xffffu) << 32u);
+	return address != 0 &&
+	       LibKernel::Memory::TryReadBacking(address + heap.table_offset, words, 32u);
+}
+
 bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	auto&                                 table = m_context.GetBindlessTable();
 	ShaderRecompiler::IR::DescriptorValue value {};
 	value.dword_count             = 8u;
 	m_bindless_transient_failure  = false;
-	const auto address            = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
 	heap.settled[key]             = 1;
 	heap.descriptors[key]         = {};
-	if (!LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+	if (!ReadBindlessEntry(heap, key, value.dwords.data())) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -2087,6 +2104,9 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	table.TakeWrittenRanges(m_bindless_written);
 	uint32_t view_changes = 0, resource_changes = 0, resettled = 0;
 	for (auto& heap: table.Heaps()) {
+		if (heap.record_pointer != UINT32_MAX) {
+			continue; // compared key by key in RevalidateBindlessKeys
+		}
 		const auto heap_begin = heap.base + heap.table_offset;
 		const auto keys = std::min(heap.guest_entries, static_cast<uint32_t>(heap.settled.size()));
 		const auto heap_end = heap_begin + uint64_t {keys} * 32u;
@@ -2132,7 +2152,13 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 
 uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	KYTY_PROFILER_FUNCTION();
-	if (BindlessEngineEnabled() && !BindlessEngineVerify()) {
+	// With the engine method only record pointer heaps are compared here: the write watch sees
+	// their records, not the T#s they point at.
+	const bool pointers_only = BindlessEngineEnabled() && !BindlessEngineVerify();
+	if (pointers_only &&
+	    std::ranges::none_of(m_context.GetBindlessTable().Heaps(), [](const auto& heap) {
+		    return heap.record_pointer != UINT32_MAX;
+	    })) {
 		return 0; // the write watch reports rewritten entries (SyncBindlessHeaps)
 	}
 	// The guest rewrites heap entries as it streams textures out and others in. A key settled
@@ -2144,16 +2170,28 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	auto&              table    = m_context.GetBindlessTable();
 	uint32_t           resolved = 0;
 	for (auto& heap: table.Heaps()) {
-		const auto keys = static_cast<uint32_t>(heap.settled.size());
-		if (keys == 0) {
+		const auto keys     = static_cast<uint32_t>(heap.settled.size());
+		const bool pointers = heap.record_pointer != UINT32_MAX;
+		if (keys == 0 || (pointers_only && !pointers)) {
 			continue;
 		}
 		const uint32_t begin = heap.revalidate_cursor < keys ? heap.revalidate_cursor : 0u;
-		const uint32_t count = std::min(Window, keys - begin);
+		const uint32_t count = std::min(pointers ? Window / 8u : Window, keys - begin);
 		m_bindless_window.resize(count);
-		const auto address  = heap.base + heap.table_offset + static_cast<uint64_t>(begin) * 32u;
-		const bool readable = LibKernel::Memory::TryReadBacking(address, m_bindless_window.data(),
-		                                                        static_cast<uint64_t>(count) * 32u);
+		bool readable = true;
+		if (pointers) {
+			// Each key's T# lives elsewhere: an unsettled or unreadable key reads as unchanged.
+			for (uint32_t i = 0; i < count; i++) {
+				if (heap.settled[begin + i] == 0 ||
+				    !ReadBindlessEntry(heap, begin + i, m_bindless_window[i].data())) {
+					m_bindless_window[i] = heap.descriptors[begin + i];
+				}
+			}
+		} else {
+			const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(begin) * 32u;
+			readable = LibKernel::Memory::TryReadBacking(address, m_bindless_window.data(),
+			                                             static_cast<uint64_t>(count) * 32u);
+		}
 		uint32_t   next     = begin + count;
 		for (uint32_t i = 0; readable && i < count; i++) {
 			const auto key = begin + i;
@@ -2164,7 +2202,7 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 				next = key; // look at it again next frame
 				break;
 			}
-			if (BindlessEngineEnabled()) {
+			if (BindlessEngineEnabled() && !pointers) {
 				static std::atomic<uint32_t> missed = 0;
 				if (missed.fetch_add(1) < 64) {
 					LOGF("Bindless engine: write not reported, heap=0x%" PRIx64 "+0x%x binding=%u "
@@ -2212,10 +2250,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 				continue;
 			}
 			std::array<uint32_t, 8> words {};
-			if (heap->settled[key] == 0 ||
-			    !LibKernel::Memory::TryReadBacking(heap->base + heap->table_offset +
-			                                           static_cast<uint64_t>(key) * 32u,
-			                                       words.data(), 32u) ||
+			if (heap->settled[key] == 0 || !ReadBindlessEntry(*heap, key, words.data()) ||
 			    words == heap->descriptors[key]) {
 				continue; // settled anew meanwhile, or the guest wrote the old T# back
 			}
@@ -2271,7 +2306,8 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 	const auto& program = *runtime.program;
 	auto&       table   = m_context.GetBindlessTable();
 	for (const auto& use: snapshot.bindless_heaps) {
-		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
+		if (use.record_pointer == UINT32_MAX &&
+		    m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
 		        .second) {
 			SurveyBindlessHeap(use);
 		}
@@ -2285,10 +2321,14 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 			continue;
 		}
 		const auto&    resource = program.info.images[use.image];
-		const uint64_t span     = use.size > use.table_offset ? use.size - use.table_offset : 0;
-		const auto     entries  = static_cast<uint32_t>(std::min<uint64_t>(span / 32u, 1u << 18u));
+		const bool     pointers = use.record_pointer != UINT32_MAX;
+		const uint64_t span     = pointers                    ? use.size
+		                          : use.size > use.table_offset ? use.size - use.table_offset
+		                                                        : 0;
+		const auto     entries  = static_cast<uint32_t>(
+            std::min<uint64_t>(span / std::max(use.stride, 1u), 1u << 18u));
 		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
-		                                    entries, resource);
+		                                    entries, resource, use.stride, use.record_pointer);
 		if (heap == nullptr) {
 			continue; // region 0, count 0: every key samples the placeholder
 		}

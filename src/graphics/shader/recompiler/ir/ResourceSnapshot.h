@@ -48,6 +48,11 @@ struct BindlessHeapUse {
 	uint32_t table_offset   = 0;
 	uint32_t image          = 0;
 	uint32_t mapping_offset = 0;
+	// Keys select records of `stride` bytes. With a record pointer (not UINT32_MAX), key k's T#
+	// is at the 64-bit address stored at base + k * stride + record_pointer, plus table_offset;
+	// otherwise at base + table_offset + k * 32.
+	uint32_t stride         = 32;
+	uint32_t record_pointer = UINT32_MAX;
 
 	bool operator==(const BindlessHeapUse&) const = default;
 };
