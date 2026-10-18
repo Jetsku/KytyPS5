@@ -262,12 +262,12 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::S_SUBVECTOR_LOOP_END: return "program counter";
 		case Opcode::S_SENDMSG:
 		case Opcode::S_SETREG_B32:
-			// A compute program's S_SENDMSG translates to IR Sendmsg and S_SETREG_B32 to a control
-			// no-op; neither emits anything (KYTY_LANE_LOCAL_NOPS=0 refuses them as before).
+		case Opcode::S_TRAP:
+		case Opcode::S_TTRACEDATA:
+			// In a compute program these translate to IR Sendmsg, TtraceData or a control no-op, and
+			// none of them emits anything (KYTY_LANE_LOCAL_NOPS=0 refuses them as before).
 			if (NopMessagesLaneLocal()) return nullptr;
 			return "wave message";
-		case Opcode::S_TRAP:
-		case Opcode::S_TTRACEDATA: return "wave message";
 		case Opcode::IMAGE_GET_LOD: return "compute derivatives"; // (their quads: the two-lane layout's)
 		// Call-split state (CallSplit.h) is addressed by the wave's guest lanes.
 		case Opcode::S_KYTY_CALL_STATE: return "call state";
