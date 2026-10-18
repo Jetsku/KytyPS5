@@ -340,8 +340,10 @@ void BindlessTable::WatchHeap(Heap& heap) {
 	const bool pointers = heap.record_pointer != UINT32_MAX;
 	const auto table    = pointers ? heap.base : heap.base + heap.table_offset;
 	const auto begin    = Common::AlignDown(table, TRACKER_PAGE_SIZE);
+	const auto records  = heap.nested_keys != 0 ? heap.guest_entries / heap.nested_keys
+	                                            : heap.guest_entries;
 	const auto end      = Common::AlignUp(
-        table + uint64_t {heap.guest_entries} * (pointers ? heap.stride : 32u), TRACKER_PAGE_SIZE);
+        table + uint64_t {records} * (pointers ? heap.stride : 32u), TRACKER_PAGE_SIZE);
 	if (end <= begin) {
 		return;
 	}
@@ -483,13 +485,16 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
     uint64_t base, uint32_t table_offset, uint32_t binding, uint32_t entries,
-    const ShaderRecompiler::IR::ImageResource& resource, uint32_t stride, uint32_t record_pointer) {
+    const ShaderRecompiler::IR::ImageResource& resource, uint32_t stride, uint32_t record_pointer,
+    uint32_t nested_vsharp, uint32_t nested_heap, uint32_t nested_keys) {
 	if (entries == 0 || m_set == nullptr) {
 		return nullptr;
 	}
 	for (auto& heap: m_heaps) {
 		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding &&
-		    heap.stride == stride && heap.record_pointer == record_pointer) {
+		    heap.stride == stride && heap.record_pointer == record_pointer &&
+		    heap.nested_vsharp == nested_vsharp && heap.nested_heap == nested_heap &&
+		    heap.nested_keys == nested_keys) {
 			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
 				return nullptr;
 			}
@@ -502,6 +507,9 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	heap.table_offset   = table_offset;
 	heap.stride         = stride;
 	heap.record_pointer = record_pointer;
+	heap.nested_vsharp  = nested_vsharp;
+	heap.nested_heap    = nested_heap;
+	heap.nested_keys    = nested_keys;
 	heap.binding        = binding;
 	heap.resource      = resource;
 	heap.guest_entries = entries;

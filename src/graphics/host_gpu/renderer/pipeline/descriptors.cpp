@@ -1952,16 +1952,42 @@ static bool ReadBindlessEntry(const BindlessHeap& heap, uint32_t key, uint32_t* 
 		return LibKernel::Memory::TryReadBacking(
 		    heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u, words, 32u);
 	}
+	const bool nested = heap.nested_vsharp != UINT32_MAX && heap.nested_keys != 0;
+	const auto record = nested ? key / heap.nested_keys : key;
 	std::array<uint32_t, 2> pointer {};
-	if (!LibKernel::Memory::TryReadBacking(heap.base + static_cast<uint64_t>(key) * heap.stride +
+	if (!LibKernel::Memory::TryReadBacking(heap.base + static_cast<uint64_t>(record) * heap.stride +
 	                                           heap.record_pointer,
 	                                       pointer.data(), 8u)) {
 		return false;
 	}
-	const auto address =
+	auto address =
 	    static_cast<uint64_t>(pointer[0]) | (static_cast<uint64_t>(pointer[1] & 0xffffu) << 32u);
-	return address != 0 &&
-	       LibKernel::Memory::TryReadBacking(address + heap.table_offset, words, 32u);
+	if (address == 0) {
+		return false;
+	}
+	if (nested) {
+		// The V# at nested_vsharp past the pointer, the heap V# at nested_heap of its buffer, and
+		// the inner key's T# in that heap.
+		std::array<uint32_t, 4> vsharp {};
+		if (!LibKernel::Memory::TryReadBacking(address + heap.nested_vsharp, vsharp.data(), 16u)) {
+			return false;
+		}
+		const auto buffer =
+		    static_cast<uint64_t>(vsharp[0]) | (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u);
+		if (buffer == 0 || static_cast<uint64_t>(heap.nested_heap) + 16u > vsharp[2] ||
+		    !LibKernel::Memory::TryReadBacking(buffer + heap.nested_heap, vsharp.data(), 16u)) {
+			return false;
+		}
+		const auto inner = key % heap.nested_keys;
+		const auto heap_base =
+		    static_cast<uint64_t>(vsharp[0]) | (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u);
+		const auto end = static_cast<uint64_t>(heap.table_offset) + uint64_t {inner} * 32u + 32u;
+		return heap_base != 0 && end <= vsharp[2] &&
+		       LibKernel::Memory::TryReadBacking(heap_base + heap.table_offset +
+		                                             uint64_t {inner} * 32u,
+		                                         words, 32u);
+	}
+	return LibKernel::Memory::TryReadBacking(address + heap.table_offset, words, 32u);
 }
 
 bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
@@ -2325,10 +2351,13 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		const uint64_t span     = pointers                    ? use.size
 		                          : use.size > use.table_offset ? use.size - use.table_offset
 		                                                        : 0;
-		const auto     entries  = static_cast<uint32_t>(
-            std::min<uint64_t>(span / std::max(use.stride, 1u), 1u << 18u));
+		const uint64_t keys_per_record =
+		    use.nested_vsharp != UINT32_MAX && use.nested_keys != 0 ? use.nested_keys : 1u;
+		const auto     entries  = static_cast<uint32_t>(std::min<uint64_t>(
+            span / std::max(use.stride, 1u) * keys_per_record, 1u << 18u));
 		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
-		                                    entries, resource, use.stride, use.record_pointer);
+		                                    entries, resource, use.stride, use.record_pointer,
+		                                    use.nested_vsharp, use.nested_heap, use.nested_keys);
 		if (heap == nullptr) {
 			continue; // region 0, count 0: every key samples the placeholder
 		}

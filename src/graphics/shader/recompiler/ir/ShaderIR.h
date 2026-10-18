@@ -619,6 +619,13 @@ struct DescriptorSource {
 		// table, whose 64-bit word at this byte offset points at the T# (table_offset bytes past
 		// it). UINT32_MAX: the T# itself is in the table, 32 bytes per key.
 		uint32_t record_pointer  = UINT32_MAX;
+		// Nested heap (with a record pointer): the T# is in a heap whose V# is read at byte
+		// nested_heap of the buffer whose V# is at byte nested_vsharp past the record pointer; the
+		// shader's key is record * nested_keys + the key into that heap (table_offset and 32-byte
+		// T#s from its base). nested_vsharp UINT32_MAX: no nesting.
+		uint32_t nested_vsharp   = UINT32_MAX;
+		uint32_t nested_heap     = 0;
+		uint32_t nested_keys     = 0;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

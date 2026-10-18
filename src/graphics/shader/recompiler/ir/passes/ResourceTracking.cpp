@@ -349,6 +349,8 @@ private:
 				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
 				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
 				    a.bindless != b.bindless || a.record_pointer != b.record_pointer ||
+				    a.nested_vsharp != b.nested_vsharp || a.nested_heap != b.nested_heap ||
+				    a.nested_keys != b.nested_keys ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1213,6 +1215,186 @@ private:
 		return true;
 	}
 
+	// The pointer of a keyed record: two dwords of one record (key << shift) of a buffer table.
+	bool MatchRecordPointer(const Inst& address, Inst*& table_handle, Value& key, uint32_t& shift,
+	                        uint32_t& record_pointer) const {
+		if (address.GetOpcode() != ValueOpcode::GetAddressResource || address.NumArgs() != 2u) {
+			return false;
+		}
+		for (uint32_t half = 0; half < 2u; ++half) {
+			const auto* read         = address.Arg(half).Resolve().TryInstruction();
+			uint32_t    memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			Value       current_key;
+			uint32_t    current_shift = 0;
+			uint32_t    immediate     = 0;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+			    !MatchRecordOffset(read->Arg(1), current_key, current_shift, immediate)) {
+				return false;
+			}
+			auto*      current = read->Arg(0).Resolve().TryInstruction();
+			const auto offset  = static_cast<uint64_t>(memory->offset) + immediate;
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetBufferResource) {
+				return false;
+			}
+			if (half == 0u) {
+				table_handle   = current;
+				key            = current_key;
+				shift          = current_shift;
+				record_pointer = static_cast<uint32_t>(offset);
+			} else if (!EquivalentValue(m_program, Value(table_handle), Value(current)) ||
+			           !EquivalentValue(m_program, key, current_key) || shift != current_shift ||
+			           static_cast<uint64_t>(record_pointer) + 4u != offset) {
+				return false;
+			}
+		}
+		return record_pointer + 8u <= (1u << shift);
+	}
+
+	// Four dwords that are one scalar read each of `handle_opcode`'s handle at consecutive byte
+	// offsets with no dynamic part: the handle and the first offset.
+	bool MatchConsecutiveWords(const Inst& owner, ValueOpcode handle_opcode, const Inst*& source,
+	                           uint32_t& offset) const {
+		source = nullptr;
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			const auto* read         = owner.Arg(dword).Resolve().TryInstruction();
+			uint32_t    memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			uint32_t    dynamic = 1u;
+			if (memory == nullptr || (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+			    !ImmediateU32(read->Arg(1), dynamic) || dynamic != 0u) {
+				return false;
+			}
+			const auto* handle = read->Arg(0).Resolve().TryInstruction();
+			if (handle == nullptr || handle->GetOpcode() != handle_opcode ||
+			    (source != nullptr && !EquivalentValue(m_program, Value(source), Value(handle)))) {
+				return false;
+			}
+			if (dword == 0u) {
+				offset = memory->offset;
+			} else if (static_cast<uint64_t>(offset) + dword * 4u != memory->offset) {
+				return false;
+			}
+			source = handle;
+		}
+		return true;
+	}
+
+	// The nested heap of Miles' hit callbacks (8 samples in 2 of the 218 callees): the T# is an
+	// S_BUFFER_LOAD_DWORDX8 at a waterfall key << 5 from a heap whose V# is S_BUFFER_LOAD_DWORDX4
+	// at a fixed offset of a buffer whose V# the material holds (S_LOAD_DWORDX4 through the record
+	// pointer). One bindless heap keyed by record * NestedKeys + the inner key; an inner key past
+	// NestedKeys samples the placeholder.
+	static constexpr uint32_t NestedKeys = 64;
+
+	bool TryMakeNestedRecordImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (!BindlessImagesEnabled() || handle.GetOpcode() != ValueOpcode::GetImageResource ||
+		    handle.NumArgs() != 8u ||
+		    !std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			    return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+			           ImageResourceClass::Sampled;
+		    })) {
+			return false;
+		}
+		plan = {};
+		plan.memory.fill(UINT32_MAX);
+		const Inst* heap_handle  = nullptr;
+		Value       inner_key;
+		uint32_t    table_offset = 0;
+		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+			auto*      read         = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t   memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			Value      current_key;
+			uint32_t   offset = 0;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    memory->offset > UINT32_MAX - offset) {
+				return false;
+			}
+			offset += memory->offset;
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    (heap_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(heap_handle), Value(current)))) {
+				return false;
+			}
+			if (dword == 0u) {
+				inner_key    = current_key;
+				table_offset = offset;
+			} else if (!EquivalentValue(m_program, inner_key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * 4u != offset) {
+				return false;
+			}
+			heap_handle = current;
+			const std::array<const Inst*, 1> image_users {&handle};
+			if (UsesOnly(*read, image_users)) {
+				plan.memory[dword] = memory_index;
+				plan.reads[dword]  = read;
+			}
+		}
+		// The heap's V#: S_BUFFER_LOAD_DWORDX4 at a fixed offset of a buffer ...
+		const Inst* outer_handle = nullptr;
+		uint32_t    nested_heap  = 0;
+		if (!MatchConsecutiveWords(*heap_handle, ValueOpcode::GetBufferResource, outer_handle,
+		                           nested_heap)) {
+			return false;
+		}
+		// ... whose V# is S_LOAD_DWORDX4 through the record pointer.
+		const Inst* pointer       = nullptr;
+		uint32_t    nested_vsharp = 0;
+		if (!MatchConsecutiveWords(*outer_handle, ValueOpcode::GetAddressResource, pointer,
+		                           nested_vsharp)) {
+			return false;
+		}
+		Inst*    table_handle   = nullptr;
+		Value    record_key;
+		uint32_t shift          = 0;
+		uint32_t record_pointer = 0;
+		if (!MatchRecordPointer(*pointer, table_handle, record_key, shift, record_pointer)) {
+			return false;
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*table_handle, pc, table_source) ||
+		    table_source.dword_count != 4u) {
+			return false;
+		}
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.table_offset   = table_offset;
+		indirect.table_stride   = 1u << shift;
+		indirect.record_pointer = record_pointer;
+		indirect.nested_vsharp  = nested_vsharp;
+		indirect.nested_heap    = nested_heap;
+		indirect.nested_keys    = NestedKeys;
+		indirect.bindless       = true;
+		indirect.table_source   = InternSource(table_source);
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
+		            image_source.dwords.begin() + 4u);
+		image_source.indirect_descriptor = indirect;
+		// key = record * NestedKeys + inner, or UINT32_MAX (outside every heap) for an inner key
+		// past NestedKeys.
+		auto*      block = handle.Parent();
+		const auto where = std::ranges::find_if(block->Instructions(),
+		                                        [&](const Inst& inst) { return &inst == &handle; });
+		const auto scaled = Value(&*block->PrependNewInst(where, ValueOpcode::IMul32,
+		                                                  {record_key, Value(NestedKeys)}));
+		const auto sum = Value(&*block->PrependNewInst(where, ValueOpcode::IAdd32, {scaled, inner_key}));
+		const auto inside = Value(&*block->PrependNewInst(where, ValueOpcode::ULessThan32,
+		                                                  {inner_key, Value(NestedKeys)}));
+		const auto key = Value(&*block->PrependNewInst(where, ValueOpcode::SelectU32,
+		                                               {inside, sum, Value(UINT32_MAX)}));
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = key;
+		plan.roots  = image_source.dwords;
+		return true;
+	}
+
 	bool IsBindlessPlan(const IndirectImagePlan& plan) const {
 		const auto* source = Source(plan.source);
 		return source != nullptr && source->indirect_descriptor.has_value() &&
@@ -1269,7 +1451,8 @@ private:
 				}
 				IndirectImagePlan plan;
 				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
-				    TryMakeRecordPointerImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				    TryMakeRecordPointerImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeNestedRecordImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					for (const auto index: plan.memory) {
 						if (index != UINT32_MAX) {
 							if (index >= m_planning_memory.size()) m_planning_memory.resize(index + 1u, 0u);

@@ -45,6 +45,10 @@ struct BindlessHeap {
 	// pointer stored at base + k * stride + record_pointer, plus table_offset.
 	uint32_t stride         = 32;
 	uint32_t record_pointer = UINT32_MAX;
+	// Nested heaps (BindlessHeapUse::nested_vsharp): key = record * nested_keys + inner key.
+	uint32_t nested_vsharp  = UINT32_MAX;
+	uint32_t nested_heap    = 0;
+	uint32_t nested_keys    = 0;
 	uint32_t binding      = 0;
 	uint32_t region       = 0;
 	// Keys the region holds. The guest appends textures to a heap as it streams them in and
@@ -123,7 +127,9 @@ public:
 	[[nodiscard]] Heap* FindOrCreateHeap(uint64_t base, uint32_t table_offset, uint32_t binding,
 	                                     uint32_t entries,
 	                                     const ShaderRecompiler::IR::ImageResource& resource,
-	                                     uint32_t stride = 32, uint32_t record_pointer = UINT32_MAX);
+	                                     uint32_t stride = 32, uint32_t record_pointer = UINT32_MAX,
+	                                     uint32_t nested_vsharp = UINT32_MAX, uint32_t nested_heap = 0,
+	                                     uint32_t nested_keys = 0);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
 	// 0 when the array is full. A released slot is reused once the GPU has finished the work
 	// recorded before its release.

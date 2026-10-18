@@ -459,7 +459,10 @@ bool MaterializeBindlessImage(const DescriptorSource::IndirectDescriptor& indire
 	                                   .stride         = indirect.record_pointer != UINT32_MAX
 	                                                         ? indirect.table_stride
 	                                                         : 32u,
-	                                   .record_pointer = indirect.record_pointer});
+	                                   .record_pointer = indirect.record_pointer,
+	                                   .nested_vsharp  = indirect.nested_vsharp,
+	                                   .nested_heap    = indirect.nested_heap,
+	                                   .nested_keys    = indirect.nested_keys});
 	auto& root                      = specialization.images[image_index];
 	root.indirect_root              = image_index;
 	root.indirect_mapping_offset    = mapping_offset;
