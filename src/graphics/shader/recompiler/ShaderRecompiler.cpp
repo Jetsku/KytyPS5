@@ -1165,6 +1165,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 		TranslateResult skipped;
 		skipped.skip_dispatch = true;
+		skipped.skip_pc       = decoded.instructions.back().pc;
+		skipped.skip_reason   = "BVH intersection without a BVH mode";
 		if (options.dump_ir) {
 			skipped.decoded_dump = Decoder::ProgramToString(decoded);
 		}
@@ -1196,6 +1198,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			                skipped.call_tables.size(), table_failures.empty() ? "" : "; untraced: ",
 			                table_failures));
 			skipped.skip_dispatch = true;
+			skipped.skip_pc       = call->pc;
+			skipped.skip_reason   = "S_SWAPPC_B64 call";
 			skipped.decoded_dump  = std::move(decoded_dump);
 			return skipped;
 		}
@@ -1295,6 +1299,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                   "computes a descriptor at runtime that has no BDA path");
 		TranslateResult skipped;
 		skipped.skip_dispatch = true;
+		skipped.skip_pc       = unresolved_pc;
+		skipped.skip_reason   = "descriptor computed at runtime without a BDA path";
 		return skipped;
 	}
 	IR::EliminateDeadCode(ir.blocks);

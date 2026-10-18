@@ -58187,7 +58187,133 @@ int main(int argc, char **argv) {
                 argv[2], result.spirv.size(), ms(t0, t1), ms(t2, t3), ms(t4, t5),
                 vk::to_string(pipeline_result).c_str());
     return pipeline_result == vk::Result::eSuccess ? 0 : 1;
-  }  if (argc == 4 && std::strcmp(argv[1], "--scan-functions") == 0) {
+  }
+  // CPU only (--callee-check <kernel.bin> <data file> <out.csv> <first> <count>): translates the
+  // call-table kernel once per distinct function of the data file (each call of the kernel placing
+  // only that function, as --scan-functions finds them; function index -1: no function, the kernel
+  // alone) and collects EVERY reason the translation skips the program: each skipped instruction is
+  // recorded, replaced by a stand-in (v_mov_b32 of its first destination, s_nop) and the program
+  // translated again, until it translates. Appends "function,iteration,reason,opcode,pc,raw" rows;
+  // prints "start <index>" before each function (a translation that exits names its function).
+  if (argc == 7 && std::strcmp(argv[1], "--callee-check") == 0) {
+    EnsureConfigInitialized();
+    const auto load = [](const char *path) {
+      std::vector<u32> words;
+      if (std::FILE *file = std::fopen(path, "rb"); file != nullptr) {
+        u32 word = 0;
+        while (std::fread(&word, sizeof(word), 1, file) == 1) words.push_back(word);
+        std::fclose(file);
+      }
+      return words;
+    };
+    const auto kernel = load(argv[2]);
+    const auto data = load(argv[3]);
+    std::FILE *out = std::fopen(argv[4], "ab");
+    const long first = std::strtol(argv[5], nullptr, 0);
+    const long count = std::strtol(argv[6], nullptr, 0);
+    if (kernel.empty() || data.empty() || out == nullptr) return 2;
+    constexpr uint64_t DataBase = 0x0000001000000000ull;
+    const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address, std::span<u32> values) {
+      const uint64_t index = (address - DataBase) / 4u;
+      if (address < DataBase || index + values.size() > data.size()) return false;
+      std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(index), values.size(), values.begin());
+      return true;
+    };
+    // The distinct functions (by code), in file order.
+    std::vector<uint64_t> functions;
+    {
+      std::set<std::vector<u32>> seen;
+      for (size_t i = 0; i + 3 < data.size(); i++) {
+        if (data[i] != 0xbeeb03ffu || (data[i + 2] != 0xbfa00003u && data[i + 2] != 0xbefc03ffu)) continue;
+        std::vector<u32> function;
+        std::string reason;
+        if (ShaderRecompiler::Decoder::ReadShaderFunction(DataBase + i * 4u, 14, read, 64, function, reason) &&
+            seen.insert(function).second) {
+          functions.push_back(DataBase + i * 4u);
+        }
+      }
+    }
+    std::vector<ShaderRecompiler::Decoder::ShaderCallSite> sites;
+    {
+      ShaderRecompiler::Decoder::Program decoded;
+      ShaderRecompiler::Decoder::DecodeProgram(kernel, decoded, true);
+      for (const auto &inst : decoded.instructions) {
+        if (inst.family == ShaderRecompiler::Decoder::Family::SOP1 &&
+            ShaderRecompiler::Decoder::IsShaderCallWord(inst.raw[0])) {
+          sites.push_back({.pc = inst.pc, .source_reg = inst.raw[0] & 0xffu,
+                           .return_reg = (inst.raw[0] >> 16u) & 0x7fu});
+        }
+      }
+    }
+    std::printf("%zu distinct functions, %zu calls\n", functions.size(), sites.size());
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.thread_ids_num = 3;
+    compute.lds_size_dwords = 16384;
+    compute.host_subgroup_size = 32;
+    compute.wave_size = 64;
+    compute.scratch_size_dwords = 1024;
+    std::array<u32, 16> user_data{};
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(true); // as on a device with descriptor indexing
+    for (long index = first; index < first + count && index < static_cast<long>(functions.size()); index++) {
+      std::printf("start %ld\n", index);
+      std::fflush(stdout);
+      auto with = sites;
+      for (auto &site : with) {
+        if (index >= 0) site.addresses = {functions[static_cast<size_t>(index)]};
+      }
+      ShaderRecompiler::Decoder::ShaderCallExpansion expansion;
+      std::string reason;
+      if (!ShaderRecompiler::Decoder::ExpandShaderCalls(kernel, 0x0000002000000000ull, with, read, 64,
+                                                        expansion, reason)) {
+        std::fprintf(out, "%ld,0,expansion failed: %s,,,\n", index, reason.c_str());
+        continue;
+      }
+      auto code = expansion.code;
+      for (int iteration = 0; iteration < 64; iteration++) {
+        ShaderRecompiler::CompileOptions options;
+        options.stage = ShaderType::Compute;
+        options.wave_size = 64;
+        options.dump_ir = false;
+        options.shader_hash = 0xc0ffee0000000000ull + static_cast<uint64_t>(index + 1) * 64u + iteration;
+        options.input_info.compute = &compute;
+        options.user_data = user_data;
+        const auto result = ShaderRecompiler::TranslateProgram(code, options);
+        if (!result.skip_dispatch) {
+          std::fprintf(out, "%ld,%d,translated,,,\n", index, iteration);
+          break;
+        }
+        ShaderRecompiler::Decoder::Program decoded;
+        ShaderRecompiler::Decoder::DecodeProgram(code, decoded, true);
+        const auto at = std::ranges::find(decoded.instructions, result.skip_pc,
+                                          &ShaderRecompiler::Decoder::Instruction::pc);
+        if (at == decoded.instructions.end() || result.skip_pc == UINT32_MAX) {
+          std::fprintf(out, "%ld,%d,%s (no pc),,,\n", index, iteration, result.skip_reason.c_str());
+          break;
+        }
+        std::string raw;
+        for (uint32_t w = 0; w < at->word_count; w++) raw += fmt::format("{}{:08x}", w ? " " : "", at->raw[w]);
+        std::fprintf(out, "%ld,%d,%s,%s,0x%x,%s\n", index, iteration, result.skip_reason.c_str(),
+                     std::string(magic_enum::enum_name(at->opcode)).c_str(), at->pc, raw.c_str());
+        std::fflush(out);
+        // Every instruction of this opcode is replaced (the callee repeats its pattern).
+        const auto opcode = at->opcode;
+        for (const auto &inst : decoded.instructions) {
+          if (inst.opcode != opcode) continue;
+          const auto word = inst.pc / 4u;
+          for (uint32_t w = 0; w < inst.word_count; w++) code[word + w] = 0xbf800000u; // s_nop
+          if (inst.dst.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr) {
+            code[word] = (0x3fu << 25u) | ((inst.dst.reg & 0xffu) << 17u) | (0x01u << 9u) | 128u; // v_mov_b32 vN, 0
+          }
+        }
+      }
+    }
+    std::fclose(out);
+    return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--scan-functions") == 0) {
     std::vector<u32> words;
     if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
       std::fseek(file, 0, SEEK_END);

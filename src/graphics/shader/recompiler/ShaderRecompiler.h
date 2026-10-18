@@ -91,6 +91,9 @@ struct TranslateResult {
 	std::string decoded_dump;
 	std::string cfg_dump;
 	bool        skip_dispatch = false;
+	// A skipped program's first unresolved instruction (pc) and why (diagnostics; UINT32_MAX: none).
+	uint32_t    skip_pc = UINT32_MAX;
+	std::string skip_reason;
 	// Only for a program skipped because it calls through S_SWAPPC_B64 (KYTY_SRT_VARIANT_READS).
 	std::vector<CallTarget> call_targets;
 	std::vector<CallTable>  call_tables;
