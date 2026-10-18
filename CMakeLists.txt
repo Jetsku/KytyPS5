@@ -911,6 +911,14 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
+# AJM batch jobs run at sceAjmBatchStart (KYTY_AJM_DEFER; libs/ajm.cpp compiled into the test).
+add_executable(ajm_defer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmDeferTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_defer_tests common fmt::fmt LibAtrac9 FFmpeg::ffmpeg opus)
+target_include_directories(ajm_defer_tests PRIVATE ${inc_headers})
+
 # libSceAudioPropagation HLE state (libs/audioPropagation.h): handles and the direct-sound render.
 add_executable(audio_propagation_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioPropagationTests.cpp"
@@ -1337,6 +1345,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_mix COMMAND $<TARGET_FILE:audio_mix_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME ajm_defer COMMAND $<TARGET_FILE:ajm_defer_tests>)
 	add_test(NAME audio_propagation COMMAND $<TARGET_FILE:audio_propagation_tests>)
 	add_test(NAME unresolved_import_log COMMAND $<TARGET_FILE:unresolved_import_log_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
@@ -2465,6 +2474,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		ajm_defer_tests
 		audio_propagation_tests
 		unresolved_import_log_tests
 		pad_haptics_tests
