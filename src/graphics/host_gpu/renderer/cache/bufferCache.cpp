@@ -6495,7 +6495,10 @@ static void NoteBdaSettleStats(size_t logged, uint32_t dropped) {
 // dispatch completed (ProcessPendingBdaSettles, from later settles and the garbage collector):
 // the logged stores are applied, and pages outside the prediction are settled then ("late",
 // counted: a reader between the dispatch and that settle could have seen them clean).
-Live::Switch g_bda_async_settle("KYTY_BDA_ASYNC_SETTLE", Live::ParseDefaultOff);
+// =2: the prediction is every page the shader's settles ever listed, not the last two settles'.
+Live::Switch g_bda_async_settle("KYTY_BDA_ASYNC_SETTLE", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+});
 
 void BufferCache::ProcessPendingBdaSettles(bool wait_oldest) {
 	if (wait_oldest && !m_bda_pending.empty()) {
@@ -6532,8 +6535,13 @@ void BufferCache::ProcessPendingBdaSettles(bool wait_oldest) {
 		});
 		m_bda_async_totals.late_pages += late_pages;
 		auto& history = m_bda_predict[pending.hash];
-		history.older = std::move(history.newer);
-		history.newer = std::move(actual);
+		if (g_bda_async_settle.Get() >= 2) {
+			// =2: the prediction keeps every page the shader ever wrote (over-marking is safe).
+			actual.ForEach([&](uint64_t start, uint64_t end) { history.newer.Add(start, end - start); });
+		} else {
+			history.older = std::move(history.newer);
+			history.newer = std::move(actual);
+		}
 	}
 }
 
