@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <span>
 #include <unordered_map>
@@ -1641,7 +1643,19 @@ public:
 	// (an image, a sampler, a formatted access, or a write without KYTY_BDA_WRITES). Planning it at runtime removed the flat
 	// slot that would have failed to evaluate and dropped the dispatch, so the program is dropped
 	// here instead of failing: never worse than without the switch.
-	void MarkUnresolved(uint32_t pc) { m_unresolved_pc = std::min(m_unresolved_pc, pc); }
+	// KYTY_SRT_UNRESOLVED_ALL=1 (diagnostics): every unresolved access goes to stderr, not only
+	// the first one the skip line names, so one translation lists all that a program lacks.
+	void MarkUnresolved(uint32_t pc) {
+		static const bool all = [] {
+			const char* value = std::getenv("KYTY_SRT_UNRESOLVED_ALL");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (all) {
+			std::fprintf(stderr, "KYTY_SRT_UNRESOLVED_ALL: shader 0x%016llx pc=0x%08x\n",
+			             static_cast<unsigned long long>(m_program.shader_hash), pc);
+		}
+		m_unresolved_pc = std::min(m_unresolved_pc, pc);
+	}
 	[[nodiscard]] uint32_t UnresolvedPc() const { return m_unresolved_pc; }
 };
 

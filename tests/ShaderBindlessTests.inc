@@ -178,7 +178,8 @@ void CheckMilesHeapSample() {
 // The hit-callback form: the waterfall key selects a 16-byte record of a V# table whose dwords
 // 2-3 point at a material; the T# is S_LOAD_DWORDX8 from the material, the S# S_LOAD_DWORDX4 at
 // +32. The image becomes a record pointer heap; the S# has no plan and takes the default sampler.
-// A BUFFER_LOAD_FORMAT_X through a V# of the material (+48) decodes the V#'s format in the shader.
+// BUFFER_LOAD_FORMAT_X and _XYZW through a V# of the material (+48) decode the V#'s format in
+// the shader.
 std::vector<u32> MilesRecordPointerCode() {
   std::vector<u32> code;
   code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
@@ -206,13 +207,19 @@ std::vector<u32> MilesRecordPointerCode() {
   code.push_back(EncodeSmem0(0x02u, 44, 7));
   code.push_back(EncodeSmem1(48, 125));
   code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[40:43]
+  code.push_back(EncodeMimg1(2, 3, 32 / 4, 40 / 4));
+  code.push_back(EncodeSopp(0x0cu, 0));
   // buffer_load_format_x v6, v0, s[44:47] idxen: formatted through the record's V#
   code.push_back(EncodeMubuf0(0x00u, 0, true, false));
   code.push_back(EncodeMubuf1(6, 44 / 4, 0));
   code.push_back(EncodeSopp(0x0cu, 0));
   code.push_back(EncodeVop2(0x03u, 2, Vgpr(6), 2)); // v_add_f32 v2, v6, v2
-  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[40:43]
-  code.push_back(EncodeMimg1(2, 3, 32 / 4, 40 / 4));
+  // buffer_load_format_xyzw v[8:11], v0, s[44:47] idxen: four channels through the same V#
+  code.push_back(EncodeMubuf0(0x03u, 0, true, false));
+  code.push_back(EncodeMubuf1(8, 44 / 4, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeVop2(0x03u, 2, Vgpr(11), 2)); // v_add_f32 v2, v11, v2
   code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec
   code.push_back(EncodeSop1(0x04u, 126, 24));     // s_mov_b64 exec, s[24:25]
   const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
@@ -233,6 +240,7 @@ void CheckMilesRecordPointer() {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.input_info.compute = &compute_info;
+  options.dump_ir = true;
   options.user_data = user_data;
   auto codegen = GetCodegenOptions();
   codegen.srt_variant_reads = true;
@@ -280,6 +288,26 @@ void CheckMilesRecordPointer() {
   Require(name, "bindless SPIR-V",
           CountSpirv(result.spirv, "\"bindless_translation\"") == 1u,
           "the sample does not go through the bindless arrays");
+  // Both formatted loads call the module's decoder (one function, DefineIndirectFormatFunction).
+  if (const char* path = std::getenv("KYTY_BINDLESS_TEST_SPV"); path != nullptr) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    if (tools.Disassemble(result.spirv, &text) && !text.empty()) {
+      if (std::FILE* out = std::fopen(path, "wb"); out != nullptr) {
+        std::fwrite(text.data(), 1, text.size(), out);
+        std::fclose(out);
+      }
+    }
+    if (std::FILE* out = std::fopen((std::string(path) + ".ir").c_str(), "wb"); out != nullptr) {
+      std::fwrite(result.ir_dump.data(), 1, result.ir_dump.size(), out);
+      std::fclose(out);
+    }
+  }
+  std::printf("[bindless] formatted channel selects: %zu\n", CountSpirv(result.spirv, "OpUMod"));
+  Require(name, "formatted loads", CountSpirv(result.spirv, "OpFunctionCall") >= 2u &&
+              CountSpirv(result.spirv, "OpUMod") >= 1u,
+          "expected the X and XYZW formatted loads to call the decoder (OpUMod " +
+              std::to_string(CountSpirv(result.spirv, "OpUMod")) + ")");
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 

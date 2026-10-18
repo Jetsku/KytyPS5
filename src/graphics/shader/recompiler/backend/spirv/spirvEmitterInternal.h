@@ -154,6 +154,8 @@ struct EmitterState {
 	uint32_t                                         bindless_translation_variable = 0;
 	uint32_t                                         bindless_feedback_variable    = 0;
 	uint32_t                                         bindless_slot                 = 0;
+	// The module's decoder of formatted loads through a computed V# (DefineIndirectFormatFunction).
+	uint32_t                                         indirect_format_function      = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
 	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds
@@ -387,6 +389,7 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                                 uint32_t array_index = 0);
 
+void DefineIndirectFormatFunction(EmitterState& state);
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
