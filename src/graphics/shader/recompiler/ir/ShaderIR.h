@@ -607,6 +607,10 @@ struct DescriptorSource {
 		// No enumeration: the shader looks the key up in the bindless translation table.
 		bool     bindless     = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		// Bindless through a record pointer: the key selects a table_stride-byte record of the
+		// table, whose 64-bit word at this byte offset points at the T# (table_offset bytes past
+		// it). UINT32_MAX: the T# itself is in the table, 32 bytes per key.
+		uint32_t record_pointer  = UINT32_MAX;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;

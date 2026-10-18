@@ -341,7 +341,7 @@ private:
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
 				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
 				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
-				    a.bindless != b.bindless ||
+				    a.bindless != b.bindless || a.record_pointer != b.record_pointer ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1031,6 +1031,167 @@ private:
 		return true;
 	}
 
+	// offset = key << shift (+ immediate): a record of 1 << shift bytes selected by a key.
+	static bool MatchRecordOffset(Value value, Value& key, uint32_t& shift, uint32_t& immediate) {
+		immediate       = 0;
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::IAdd32 && inst->NumArgs() == 2u) {
+			const auto operand = ImmediateU32(inst->Arg(1), immediate) ? 0u
+			                     : ImmediateU32(inst->Arg(0), immediate) ? 1u
+			                                                            : 2u;
+			if (operand == 2u) {
+				return false;
+			}
+			inst = inst->Arg(operand).Resolve().TryInstruction();
+		}
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    inst->NumArgs() != 2u || !ImmediateU32(inst->Arg(1), shift) || shift < 3u ||
+		    shift > 12u) {
+			return false;
+		}
+		key = inst->Arg(0).Resolve();
+		return key.GetType() == Type::U32;
+	}
+
+	// A bindless image whose T# is read through a pointer that a keyed record holds: Spider-Man
+	// Miles Morales' hit callbacks (an S_BUFFER_LOAD_DWORDX4 of record key << 4 from a V#
+	// table, whose dwords 2-3 point at the material; the T# is an S_LOAD_DWORDX8 from there).
+	// Only for a sampled-only handle, when the device has bindless images; the host reads the
+	// pointer and then the T# for each key it resolves.
+	bool TryMakeRecordPointerImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (!BindlessImagesEnabled() || handle.GetOpcode() != ValueOpcode::GetImageResource ||
+		    handle.NumArgs() != 8u ||
+		    !std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			    return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+			           ImageResourceClass::Sampled;
+		    })) {
+			return false;
+		}
+		plan = {};
+		const Inst* pointer      = nullptr;
+		uint32_t    tsharp_offset = 0;
+		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+			auto*      read         = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t   memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			uint32_t   dynamic = 1u;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
+			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+			    !ImmediateU32(read->Arg(1), dynamic) || dynamic != 0u) {
+				return false;
+			}
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    current->NumArgs() != 2u ||
+			    (pointer != nullptr && !EquivalentValue(m_program, Value(pointer), Value(current)))) {
+				return false;
+			}
+			if (dword == 0u) {
+				tsharp_offset = memory->offset;
+			} else if (static_cast<uint64_t>(tsharp_offset) + dword * sizeof(uint32_t) !=
+			           memory->offset) {
+				return false;
+			}
+			const std::array<const Inst*, 1> image_users {&handle};
+			if (!UsesOnly(*read, image_users)) {
+				return false;
+			}
+			pointer            = current;
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = read;
+		}
+		// The pointer: two dwords of one keyed record of a buffer table.
+		Inst*    table_handle   = nullptr;
+		Value    key;
+		uint32_t shift          = 0;
+		uint32_t record_pointer = 0;
+		for (uint32_t half = 0; half < 2u; ++half) {
+			const auto* read         = pointer->Arg(half).Resolve().TryInstruction();
+			uint32_t    memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			Value       current_key;
+			uint32_t    current_shift = 0;
+			uint32_t    immediate     = 0;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+			    !MatchRecordOffset(read->Arg(1), current_key, current_shift, immediate)) {
+				return false;
+			}
+			auto*      current = read->Arg(0).Resolve().TryInstruction();
+			const auto offset  = static_cast<uint64_t>(memory->offset) + immediate;
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetBufferResource) {
+				return false;
+			}
+			if (half == 0u) {
+				table_handle   = current;
+				key            = current_key;
+				shift          = current_shift;
+				record_pointer = static_cast<uint32_t>(offset);
+			} else if (!EquivalentValue(m_program, Value(table_handle), Value(current)) ||
+			           !EquivalentValue(m_program, key, current_key) || shift != current_shift ||
+			           static_cast<uint64_t>(record_pointer) + 4u != offset) {
+				return false;
+			}
+		}
+		if (record_pointer + 8u > (1u << shift)) {
+			return false;
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*table_handle, pc, table_source) ||
+		    table_source.dword_count != 4u) {
+			return false;
+		}
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.table_offset   = tsharp_offset;
+		indirect.table_stride   = 1u << shift;
+		indirect.record_pointer = record_pointer;
+		indirect.bindless       = true;
+		indirect.table_source   = InternSource(table_source);
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
+		            image_source.dwords.begin() + 4u);
+		image_source.indirect_descriptor = indirect;
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = key;
+		plan.roots  = image_source.dwords;
+		return true;
+	}
+
+	bool IsBindlessPlan(const IndirectImagePlan& plan) const {
+		const auto* source = Source(plan.source);
+		return source != nullptr && source->indirect_descriptor.has_value() &&
+		       source->indirect_descriptor->bindless;
+	}
+
+	// Stopgap (Senaxx's default sampler): the S# beside a bindless T# that is read per key too
+	// (from the same material record) has no plan. Sample with one fixed sampler (trilinear,
+	// wrap, full LOD range) rather than skipping the program; only filtering and edge addressing
+	// can differ from the material's own sampler.
+	void UseDefaultSamplerIfUnresolved(Value value, bool sample_adjust, uint32_t pc) {
+		auto* handle = value.Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetSamplerResource ||
+		    handle->NumArgs() != 4u) {
+			return;
+		}
+		DescriptorSource descriptor;
+		MakeSource(*handle, 4u, true, sample_adjust, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) {
+			return;
+		}
+		constexpr std::array<uint32_t, 4> DefaultSampler {
+		    0x00000000u,                             // wrap on every axis
+		    0xfffu << 12u,                           // max_lod 255.9
+		    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
+		    0x00000000u};
+		for (uint32_t dword = 0; dword < 4u; dword++) {
+			handle->SetArg(dword, Value(DefaultSampler[dword]));
+		}
+	}
+
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
@@ -1059,7 +1220,8 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeRecordPointerImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
@@ -1363,6 +1525,9 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
+			if (indirect != nullptr && IsBindlessPlan(*indirect)) {
+				UseDefaultSamplerIfUnresolved(inst.Arg(1), sample_adjust, flags.pc);
+			}
 			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
 			               sampler_handle, sampler_source, true, sample_adjust)) {
 				return; // unresolved (KYTY_SRT_VARIANT_READS): the shader is skipped

@@ -22,7 +22,7 @@ namespace {
 // ImageResource 21; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 7; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
-// 12, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// 13, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
 // ResourceSpecialization 2 (Buffer 3, Image 11).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
@@ -755,6 +755,7 @@ public:
 				w.Bool(image.table_scalar);
 				w.U32(image.workgroup_axis);
 				w.Bool(image.bindless);
+				w.U32(image.record_pointer);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
@@ -989,6 +990,7 @@ public:
 				image.table_scalar       = r.Bool();
 				image.workgroup_axis     = r.U32();
 				image.bindless           = r.Bool();
+				image.record_pointer     = r.U32();
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
