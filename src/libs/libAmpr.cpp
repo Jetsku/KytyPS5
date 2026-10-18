@@ -12,6 +12,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/amprCounterBank.h"
+#include "libs/amprOrder.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -873,6 +874,8 @@ struct CommandBufferState {
 	uint64_t write_offset     = 0;
 	bool     header_validated = false;
 	bool     buffer_validated = false;
+	// AMM submission order (AmmOrder), set when an AMM buffer is submitted.
+	uint64_t submit_seq       = 0;
 	// Diagnostic identity only. Mutated under the existing command-buffer mutex;
 	// these values never participate in command execution or guest-visible state.
 	uint64_t diagnostic_generation = 0;
@@ -1849,6 +1852,7 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 }
 
 // An AMM unmap command: the range's automatic backing returns to the pool.
+
 static int ExecuteAmmUnmapCommand(const CommandBufferState::AmmMapCommand& command) {
 	const int result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
 	if (result == OK) {
@@ -2032,10 +2036,32 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 				if (command.kind == AmmCommandKind::Unmap) {
 					Profiler::ScopedLoadingOperation unmap(Profiler::LoadingOperation::AmmUnmap);
 					// Upstream 259a40abf: an AMM unmap accepts holes (KernelMunmap fails on them).
-					result = ExecuteAmmUnmapCommand(command);
+					// AmmOrder: only the parts no later submission mapped.
+					uint64_t   kept   = 0;
+					const auto pieces = AmmOrder::UnmapPieces(command.va, command.size, state.submit_seq, &kept);
+					for (const auto& [piece_va, piece_size]: pieces) {
+						if (result == OK) {
+							auto piece = command;
+							piece.va   = piece_va;
+							piece.size = piece_size;
+							result     = ExecuteAmmUnmapCommand(piece);
+						}
+					}
+					if (kept != 0) {
+						static std::atomic<uint32_t> reported {0};
+						if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+							std::printf("AMM: unmap of 0x%016" PRIx64 "+0x%" PRIx64
+							            " keeps 0x%" PRIx64 " bytes a later submission mapped\n",
+							            command.va, command.size, kept);
+							std::fflush(stdout);
+						}
+					}
 				} else {
 					Profiler::ScopedLoadingOperation map(Profiler::LoadingOperation::AmmMap);
 					result = ExecuteAmmMapCommand(command);
+					if (result == OK) {
+						AmmOrder::Mapped(command.va, command.size, state.submit_seq);
+					}
 				}
 
 				if (result != OK) {
@@ -2189,6 +2215,31 @@ static void EngineThread(AmprEngineQueue* engine, const char* name) {
 	}
 }
 
+// LibKernel::Memory::PendingAmmMapCovers (the host fault handler): whether a map command of an
+// AMM buffer that is queued on the AMM engine, or running there, still has to map the address.
+// A CPU write into memory such a map will back waits for it instead of faulting fatally (on the
+// hardware the map runs within microseconds; here its queue can sit behind a wait on the GPU).
+static bool EnginePendingMapCovers(uint64_t vaddr) {
+	auto&            engine = g_engines[static_cast<size_t>(AmprEngine::Amm)];
+	std::scoped_lock lock(engine.mutex);
+	for (const auto& queue: engine.queues) {
+		for (const auto& job: queue) {
+			for (size_t position = job.start; position < job.ordered.size(); ++position) {
+				const auto& entry = job.ordered[position];
+				if (entry.kind != CommandKind::AmmMap) {
+					continue;
+				}
+				const auto& command = job.state.amm_map_commands[entry.index];
+				if (command.kind != AmmCommandKind::Unmap && vaddr >= command.va &&
+				    vaddr - command.va < command.size) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
 // Starts an inline run of a buffer of this priority on the submitting thread: only when no earlier
 // deferred buffer of the priority is queued and no other inline run of it is in flight (checked and
 // marked under the engine lock, so no submission overtakes another). False: queue the buffer.
@@ -2237,6 +2288,9 @@ static void DeferToEngine(AsyncSubmit& async, uint64_t command_buffer, CommandBu
 		}
 		if (!engine.started) {
 			engine.started = true;
+			if (async.engine == AmprEngine::Amm) {
+				LibKernel::Memory::SetPendingAmmMapHook(EnginePendingMapCovers);
+			}
 			std::thread(EngineThread, &engine,
 			            async.engine == AmprEngine::Apr ? "AMPR APR engine" : "AMPR AMM engine")
 			    .detach();
@@ -2274,6 +2328,9 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	if (!TryGetCommandBufferState(command_buffer, &state, true, diagnostic)) {
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
 		return finish(LibKernel::KERNEL_ERROR_EFAULT);
+	}
+	if (async != nullptr && async->engine == AmprEngine::Amm) {
+		state.submit_seq = AmmOrder::NextSeq();
 	}
 	if (diagnostic != nullptr) {
 		diagnostic->cached_buffer = state.buffer;

@@ -120,6 +120,10 @@ void                   SetFlexibleMemorySize(uint64_t size);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The AMM engine's pending maps (libAmpr.cpp): whether a queued or running AMM map command still has
+// to map the address (the host fault handler waits for it, KYTY_FAULT_AMM_WAIT_MS).
+void                   SetPendingAmmMapHook(bool (*covers)(uint64_t vaddr));
+[[nodiscard]] bool     PendingAmmMapCovers(uint64_t vaddr);
 // TryReadBacking whose destination may hold partial bytes when it fails (the caller discards it
 // then): any size through a per-thread mapping record, without the mapping lock (see
 // GuestBackingStore::TryReadBackingDirect). Any thread.

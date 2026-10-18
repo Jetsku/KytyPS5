@@ -1068,6 +1068,10 @@ add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# AMM submission order (libs/amprOrder.h).
+add_executable(ampr_order_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AmprOrderTests.cpp")
+target_include_directories(ampr_order_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(occlusion_reset_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionResetTests.cpp")
 target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
 target_link_libraries(occlusion_reset_tests common)
@@ -1203,6 +1207,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_gpu_keep COMMAND $<TARGET_FILE:image_gpu_keep_tests>)
 	add_test(NAME clear_register_decode COMMAND $<TARGET_FILE:clear_register_decode_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
+	add_test(NAME ampr_order COMMAND $<TARGET_FILE:ampr_order_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
 	add_test(NAME host_input_pulse COMMAND $<TARGET_FILE:host_input_pulse_tests>)

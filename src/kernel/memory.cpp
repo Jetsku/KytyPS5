@@ -1110,6 +1110,17 @@ const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
+static std::atomic<bool (*)(uint64_t)> g_pending_amm_map_covers {nullptr};
+
+void SetPendingAmmMapHook(bool (*covers)(uint64_t vaddr)) {
+	g_pending_amm_map_covers.store(covers, std::memory_order_release);
+}
+
+bool PendingAmmMapCovers(uint64_t vaddr) {
+	auto* covers = g_pending_amm_map_covers.load(std::memory_order_acquire);
+	return covers != nullptr && covers(vaddr);
+}
+
 bool IsGpuFillableWord(uint64_t vaddr) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, sizeof(uint32_t)) ||
 	    !Graphics::GuestGpu::IsGpuThread()) {
