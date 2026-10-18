@@ -238,9 +238,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -2025,6 +2027,11 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				return true;
 			}
 			return false;
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
+			if (!binary()) return false;
+			result = inst.GetOpcode() == ValueOpcode::IEqual64 ? a == b : a != b;
+			return true;
 		case ValueOpcode::ULessThan32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);

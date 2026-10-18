@@ -2007,6 +2007,65 @@ void TestSrtFlatteningAndRuntimeMemoization() {
         "flattened typed SRT reads did not receive a binding");
 }
 
+void TestScalarDataReadControlFlow() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (const auto comparison : {ValueOpcode::Void, ValueOpcode::IEqual64,
+                                ValueOpcode::INotEqual64}) {
+    Fixture fixture;
+    const auto low = fixture.UserData(0);
+    const auto high = fixture.UserData(1);
+    const auto address = fixture.Address(low, high);
+    auto* use = fixture.block;
+    if (comparison != ValueOpcode::Void) {
+      const auto pointer = fixture.Emit(ValueOpcode::CompositeConstructU64, {low, high});
+      auto enabled = fixture.Emit(comparison, {pointer, Value(uint64_t{0})});
+      if (comparison == ValueOpcode::IEqual64)
+        enabled = fixture.Emit(ValueOpcode::LogicalNot, {enabled});
+      const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+          {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+      const auto varying = fixture.Emit(ValueOpcode::INotEqual32, {lane, Value(0u)});
+      fixture.block->condition = fixture.Emit(ValueOpcode::LogicalAnd, {varying, enabled});
+      use = fixture.AddBlock();
+      auto* done = fixture.AddBlock();
+      fixture.block->AddBranch(use);
+      fixture.block->AddBranch(done);
+      use->AddBranch(done);
+      fixture.block->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = use, .false_block = done};
+      use->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+      done->terminator.kind = CFG::TerminatorKind::Return;
+    }
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+        {address, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4), use);
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    Check(plan.srt_reads.size() == 1 && !fixture.program.info.uses_dma &&
+              bool(plan.srt_code) == (comparison == ValueOpcode::Void),
+          "scalar data lost flattening or conditional reads entered the unconditional JIT");
+    uint32_t reads = 0;
+    std::array<uint32_t, 2> user_data {};
+    SrtRuntime runtime {.user_data = user_data,
+        .read_memory = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+          ++*static_cast<uint32_t*>(data);
+          if (address == 0) return false;
+          words[0] = 42;
+          return true;
+        }, .userdata = &reads};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const uint64_t pointer : {uint64_t{0}, uint64_t{0x1000}, uint64_t{1} << 32u}) {
+      if (pointer == 0 && comparison == ValueOpcode::Void) continue;
+      user_data = {static_cast<uint32_t>(pointer), static_cast<uint32_t>(pointer >> 32u)};
+      reads = 0;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                reads == (pointer != 0) && snapshot.flattened_srt[0] == (pointer ? 42u : 0u),
+            "scalar data refresh ignored a mixed EXEC/64-bit null-pointer branch");
+    }
+  }
+}
+
 void TestDynamicSrtReadRemainsExplicit() {
   Fixture fixture;
   const auto base =
@@ -3364,6 +3423,7 @@ int main() {
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
+    Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
