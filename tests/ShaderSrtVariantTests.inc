@@ -780,6 +780,7 @@ void CallExpanderRefreshes() {
   const uint64_t base = 0x0000000170000000ull;
   ShaderRecompiler::ShaderCallExpander expander;
   expander.rescan_interval = 4;
+  expander.sticky = false; // every table change is followed
   ShaderRecompiler::ShaderCallExpander::Expanded first, again, grown, patched, moved;
   const auto expand = [&](ShaderRecompiler::ShaderCallExpander::Expanded &out) {
     return expander.Expand(code, base, options, memory.Reader(), out) && out.code != nullptr;

@@ -1221,13 +1221,24 @@ static bool ComputeProgramMayCall(const ShaderParams& params) {
 // replaced by its expansion (ShaderRecompiler::ShaderCallExpander), which then goes through the
 // program cache like any program: `code` holds the expanded words and the key the expansion's
 // digest. A program that does not expand keeps its code (and is skipped as before).
+static ShaderRecompiler::ShaderCallExpander& CallExpander() {
+	static ShaderRecompiler::ShaderCallExpander expander;
+	return expander;
+}
+
+// Where the callee bodies of each expansion handed out are (by its digest), for the background
+// translation to name a callee that keeps an expansion from translating.
+static std::mutex g_call_bodies_mutex;
+static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>>>
+    g_call_bodies;
+
 static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
 	if (!ShaderRecompiler::GetCodegenOptions().shader_calls || !params.back_code.empty() ||
 	    params.code.empty() || !ComputeProgramMayCall(params)) {
 		return false;
 	}
-	static ShaderRecompiler::ShaderCallExpander expander;
-	ShaderRecompiler::CompileOptions            options;
+	auto&                            expander = CallExpander();
+	ShaderRecompiler::CompileOptions options;
 	options.stage       = ShaderType::Compute;
 	options.wave_size   = wave_size;
 	options.shader_hash = params.hash;
@@ -1244,6 +1255,10 @@ static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
 	params.guest_base     = params.Base();
 	params.code           = *expanded.code;
 	params.call_expansion = expanded.digest | 1u; // never 0
+	{
+		std::scoped_lock lock(g_call_bodies_mutex);
+		g_call_bodies.try_emplace(params.call_expansion, expanded.bodies);
+	}
 	return true;
 }
 
@@ -1287,6 +1302,12 @@ public:
 		job->info       = info;
 		job->info.stage = {};
 		{
+			std::scoped_lock lock(g_call_bodies_mutex);
+			if (const auto bodies = g_call_bodies.find(params.call_expansion); bodies != g_call_bodies.end()) {
+				job->bodies = bodies->second;
+			}
+		}
+		{
 			std::scoped_lock lock(m_mutex);
 			if (!m_entries.try_emplace(id).second) return;
 			m_jobs.push_back(std::move(job));
@@ -1321,6 +1342,7 @@ private:
 		std::vector<uint32_t>  code;
 		std::vector<uint32_t>  user_data;
 		ShaderComputeInputInfo info {};
+		std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>> bodies;
 	};
 	struct Entry {
 		bool                                             done = false;
@@ -1357,6 +1379,17 @@ private:
 			    "KYTY_SHADER_CALLS: CS shader 0x{:016x}: expansion of {} words translated in the "
 			    "background in {} ms{}.\n",
 			    job->hash, job->code.size(), ms, result.skip_dispatch ? " (its dispatches are skipped)" : ""));
+			// A callee that keeps it from translating is left out of the next expansions.
+			if (result.skip_dispatch && result.skip_pc != UINT32_MAX && job->bodies != nullptr) {
+				for (const auto& body: *job->bodies) {
+					if (result.skip_pc >= body.begin && result.skip_pc < body.end) {
+						CallExpander().DropTarget(
+						    body.address, fmt::format("{} at +0x{:x} in CS 0x{:016x}", result.skip_reason,
+						                              result.skip_pc - body.begin, job->hash));
+						break;
+					}
+				}
+			}
 			std::scoped_lock lock(m_mutex);
 			auto& entry  = m_entries[job->id];
 			entry.done   = true;
@@ -4884,6 +4917,12 @@ struct PipelineCache::RtState {
 		return empty;
 	}
 
+	// KYTY_RT_PIPELINE_LOG=1 (diagnostics): one line per background pipeline job queued and finished.
+	static bool RtPipelineLogEnabled() {
+		static const bool enabled = EnvU64("KYTY_RT_PIPELINE_LOG", 0) != 0;
+		return enabled;
+	}
+
 	// Under `mutex`. The job of kernel `id`, started when new; null when the queue refused it.
 	Job* Request(uint64_t id, const ShaderComputeInputInfo& input, const ShaderProgram& program) {
 		if (const auto found = jobs.find(id); found != jobs.end()) return &found->second;
@@ -4919,6 +4958,11 @@ struct PipelineCache::RtState {
                 } else if (built->pipeline == nullptr || built->pipeline->pipeline == nullptr) {
                     built->error = "no pipeline was created";
                 }
+                if (RtPipelineLogEnabled()) {
+                    PipelineCacheLog("Software RT: pipeline job {} of compute shader 0x{:016x} finished in {:.0f} ms{}{}",
+                                     id, shader_hash, static_cast<double>(built->ns) / 1.0e6,
+                                     built->error.empty() ? "" : ": ", built->error);
+                }
                 promise->set_value(std::move(built));
             },
             job.ticket);
@@ -4927,6 +4971,10 @@ struct PipelineCache::RtState {
 			return nullptr;
 		}
 		totals.requested.fetch_add(1, std::memory_order_relaxed);
+		if (RtPipelineLogEnabled()) {
+			PipelineCacheLog("Software RT: pipeline job {} of compute shader 0x{:016x} queued ({} requested so far)",
+			                 id, job.shader_hash, totals.requested.load(std::memory_order_relaxed));
+		}
 		return &jobs[id];
 	}
 

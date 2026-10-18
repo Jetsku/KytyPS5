@@ -38,7 +38,15 @@ struct ShaderCallSite {
 	bool operator==(const ShaderCallSite&) const = default;
 };
 
+// Where a placed callee body is in the expanded program (byte offsets, as instruction pcs).
+struct ShaderCallBody {
+	uint32_t begin   = 0;
+	uint32_t end     = 0;
+	uint64_t address = 0;
+};
+
 struct ShaderCallExpansion {
+	std::vector<ShaderCallBody> bodies;
 	std::vector<uint32_t> code;
 	// The callee code as it was read: (guest address, words). The expansion is valid while these
 	// read the same.

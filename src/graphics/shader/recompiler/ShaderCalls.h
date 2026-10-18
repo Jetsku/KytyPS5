@@ -11,6 +11,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -57,18 +58,30 @@ void CallTableTargets(const CallTableView& view, std::span<const uint32_t> words
 // least recently used out), so tables that alternate do not expand it again; an expansion is
 // dropped when the callee code it placed changes (checked every `rescan_interval` dispatches). A
 // target that leaves the set between two scans takes the skip path of the expansion.
+// KYTY_SHADER_CALLS_STICKY (default on): ShaderCallExpander::sticky.
+[[nodiscard]] bool StickyExpansionsDefault();
+
 class ShaderCallExpander {
 public:
 	struct Expanded {
 		std::shared_ptr<const std::vector<uint32_t>> code;
 		uint64_t                                     digest = 0; // XXH3-64 of the code
+		// Where each placed callee body is in `code`.
+		std::shared_ptr<const std::vector<Decoder::ShaderCallBody>> bodies;
 	};
+
+	// A callee whose body keeps an expansion from translating (diagnosed after the translation of
+	// an expansion): it is left out of every later expansion, its calls take the skip path.
+	void DropTarget(uint64_t address, std::string_view why);
 
 	// False (logged once per program) when the program does not expand: it is compiled as is.
 	bool Expand(std::span<const uint32_t> code, uint64_t base, const CompileOptions& options,
 	            const Decoder::ShaderCodeReader& read, Expanded& expanded);
 
 	uint32_t rescan_interval = 64;
+	// Once every call of a program reaches two targets, that expansion is kept for every table
+	// (targets outside it take the skip path): changing tables compile no new pipelines.
+	bool sticky = StickyExpansionsDefault();
 
 private:
 	struct TableState {
@@ -92,6 +105,7 @@ private:
 		uint32_t                   dispatches = 0;
 		Expanded                   current;
 		std::map<uint64_t, Cached> expansions; // by target set
+		uint64_t                   pinned = 0; // KYTY_SHADER_CALLS_STICKY: the expansion kept for every table
 		std::string                last_failure;
 	};
 
@@ -101,6 +115,7 @@ private:
 	std::mutex                            m_mutex;
 	std::unordered_map<uint64_t, Program> m_programs; // by code address ^ hash
 	std::vector<uint32_t>                 m_table_words;
+	std::set<uint64_t>                    m_dropped; // guest addresses (48 bits)
 	// Every expansion handed out stays alive: a compile may still read one that was replaced.
 	std::vector<std::shared_ptr<const std::vector<uint32_t>>> m_retained;
 };

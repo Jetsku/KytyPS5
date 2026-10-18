@@ -20117,6 +20117,8 @@ public:
   // rescan, and the last of its 64 dispatches stores D's value. Each new expansion is translated in\n  // the background first (its dispatches are skipped meanwhile).
   void CheckCallTableDispatch() {
     constexpr const char *name = "CallTableDispatch";
+    // Follow every table change (the pipeline cache's expander reads it once, on its first use).
+    SetEnvironment("KYTY_SHADER_CALLS_STICKY", "0");
     constexpr uintptr_t base = 0x0000000207000000ull;
     constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t allocation_alignment = 0x10000;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fmt/format.h>
 #include <fstream>
@@ -25,9 +26,6 @@ const char* StageLabel(ShaderType stage) {
 	}
 }
 
-// KYTY_SHADER_CALLS_DUMP=<folder> (diagnostics, default off): each program with calls is written
-// there once as calls_<hash>.bin (its code) and calls_<hash>.txt (its disassembly), and each
-// expansion as calls_<hash>_<digest>.bin/.txt. The files stay on this machine.
 // KYTY_SHADER_CALLS_TOPK=N (default 4; 0: every target): each call table keeps the N targets most
 // of its records name; calls to the others take the skip path. With every callee, an expansion of
 // Miles Morales' ray-tracing kernels is millions of SPIR-V words (2 callees: a 12 s driver
@@ -39,6 +37,10 @@ size_t MaxTargetsPerTable() {
 	}();
 	return cap;
 }
+
+// KYTY_SHADER_CALLS_DUMP=<folder> (diagnostics, default off): each program with calls is written
+// there once as calls_<hash>.bin (its code) and calls_<hash>.txt (its disassembly), and each
+// expansion as calls_<hash>_<digest>.bin/.txt. The files stay on this machine.
 const char* DumpFolder() {
 	static const char* folder = [] {
 		const char* value = std::getenv("KYTY_SHADER_CALLS_DUMP");
@@ -65,6 +67,14 @@ void Dump(std::string_view name, std::span<const uint32_t> code) {
 }
 
 } // namespace
+
+bool StickyExpansionsDefault() {
+	static const bool sticky = [] {
+		const char* value = std::getenv("KYTY_SHADER_CALLS_STICKY");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return sticky;
+}
 
 bool EvaluateCallTable(const CallTable& table, std::span<const uint32_t> user_data,
                        uint32_t user_data_base, const Decoder::ShaderCodeReader& read,
@@ -170,6 +180,14 @@ bool ShaderCallExpander::Expand(std::span<const uint32_t> code, uint64_t base,
 	return true;
 }
 
+void ShaderCallExpander::DropTarget(uint64_t address, std::string_view why) {
+	std::scoped_lock lock(m_mutex);
+	if (!m_dropped.insert(address & AddressMask).second) return;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "KYTY_SHADER_CALLS: callee 0x{:x} left out of the expansions ({}); its calls are skipped.\n",
+	    address & AddressMask, why));
+}
+
 bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> code, uint64_t base,
                                  const CompileOptions& options,
                                  const Decoder::ShaderCodeReader& read) {
@@ -247,6 +265,9 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 				site.addresses = state->second.targets;
 			}
 		}
+		std::erase_if(site.addresses, [&](uint64_t address) {
+			return m_dropped.contains(address & AddressMask);
+		});
 		targets += site.addresses.size();
 		key = XXH3_64bits_withSeed(site.addresses.data(), site.addresses.size() * sizeof(uint64_t), key);
 	}
@@ -254,6 +275,27 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 		program.last_failure = failures;
 		Log::WriteToConsoleAndLog(fmt::format("KYTY_SHADER_CALLS: {} shader 0x{:016x}: {}.\n",
 		                                      StageLabel(options.stage), options.shader_hash, failures));
+	}
+	// KYTY_SHADER_CALLS_STICKY (default on): once every call reaches two targets, the program keeps
+	// that expansion for every table (targets outside it take the skip path), so tables that change
+	// do not compile new pipelines (a ray-tracing kernel's takes the driver 10 s and more).
+	if (program.pinned != 0) {
+		const auto pinned = program.expansions.find(program.pinned);
+		const bool usable = pinned != program.expansions.end() &&
+		                    std::ranges::none_of(*pinned->second.expanded.bodies, [&](const auto& body) {
+			                    return m_dropped.contains(body.address & AddressMask);
+		                    });
+		if (usable) {
+			key = program.pinned;
+		} else {
+			program.pinned = 0;
+		}
+	}
+	const bool full = MaxTargetsPerTable() != 0 && std::ranges::all_of(sites, [](const auto& site) {
+		return site.addresses.size() >= std::min<size_t>(MaxTargetsPerTable(), 2);
+	});
+	if (program.pinned == 0 && full && sticky && program.expansions.contains(key)) {
+		program.pinned = key;
 	}
 	// An expansion for these targets, while the callee code it placed reads the same.
 	if (auto cached = program.expansions.find(key); cached != program.expansions.end()) {
@@ -300,7 +342,8 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 	    digest, expansion.dropped.empty() ? "" : fmt::format("; {} left out, first: ", expansion.dropped.size()),
 	    expansion.dropped.empty() ? std::string() : expansion.dropped.front()));
 	Expanded result {.code = std::make_shared<const std::vector<uint32_t>>(std::move(expansion.code)),
-	                 .digest = digest};
+	                 .digest = digest,
+	                 .bodies = std::make_shared<const std::vector<Decoder::ShaderCallBody>>(expansion.bodies)};
 	m_retained.push_back(result.code);
 	Dump(fmt::format("calls_{:016x}_{:016x}", options.shader_hash, digest), *result.code);
 	expansion.code.clear();
@@ -315,6 +358,9 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 	                           .checked_at = now,
 	                           .used_at    = now};
 	program.current = result;
+	if (program.pinned == 0 && full && sticky) {
+		program.pinned = key;
+	}
 	return true;
 }
 

@@ -221,7 +221,8 @@ using Branches = std::vector<std::pair<uint32_t, uint32_t>>; // (branch word, ta
 // Patches the SOPP branches. An edge beyond simm16 goes through an island of two S_BRANCH placed
 // at an instruction boundary between its ends: the first skips the island for code that falls
 // into it, the second continues the long edge. No guest SGPR or SCC is touched.
-bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::string& reason) {
+bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::vector<ShaderCallBody>& bodies,
+                      std::string& reason) {
 	for (size_t index = 0; index < branches.size();) {
 		const auto [at, target] = branches[index];
 		const auto delta        = int64_t(target) - int64_t(at) - 1;
@@ -254,6 +255,10 @@ bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::stri
 		for (auto& [source, destination]: branches) {
 			if (source >= insertion) source += 2;
 			if (destination >= insertion) destination += 2;
+		}
+		for (auto& body: bodies) {
+			if (body.begin >= insertion * 4u) body.begin += 8u;
+			if (body.end > insertion * 4u) body.end += 8u;
 		}
 		const auto onward      = branches[index].second;
 		branches[index].second = insertion + 1u;
@@ -407,6 +412,7 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 				relocations.emplace_back(at, at + 1u);
 			};
 			const auto emit_body = [&](const Function& function, std::vector<uint32_t>& exits) {
+				const auto body_begin = static_cast<uint32_t>(result.size());
 				set_return();
 				std::map<uint32_t, uint32_t> local_pc;
 				Branches                     local_branches;
@@ -429,6 +435,9 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 					relocations.emplace_back(at, local_pc.at(target));
 				}
 				expansion.inlined++;
+				expansion.bodies.push_back({.begin   = body_begin * 4u,
+				                            .end     = static_cast<uint32_t>(result.size()) * 4u,
+				                            .address = function.address});
 				return result.size() <= MaxExpandedShaderWords;
 			};
 			// Code that enters with the target pair in s[source_reg:+1] and leaves by falling through.
@@ -512,7 +521,7 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 		}
 		relocations.emplace_back(at, found->second);
 	}
-	if (!RelocateBranches(result, relocations, reason)) return false;
+	if (!RelocateBranches(result, relocations, expansion.bodies, reason)) return false;
 	expansion.code = std::move(result);
 	return true;
 }
