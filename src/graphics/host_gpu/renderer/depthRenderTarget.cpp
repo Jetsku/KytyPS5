@@ -398,6 +398,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
+	r.stencil_load_clear_enable = r.stencil_clear_enable;
 	r.stencil_clear_value = hw.GetStencilClearValue();
 	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
@@ -499,10 +500,12 @@ bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b) {
 	// Every field, named in declaration order (see ResolveRenderDepthTarget): a new field stops
 	// this compiling until it is compared below.
 	const auto& [a_desc, a_clear, a_load_clear, a_clear_value, a_test, a_write, a_compare,
-	             a_bounds, a_min_bounds, a_max_bounds, a_stencil_clear, a_stencil_clear_value,
+	             a_bounds, a_min_bounds, a_max_bounds, a_stencil_clear, a_stencil_load_clear,
+	             a_stencil_clear_value,
 	             a_stencil_test, a_front, a_back, a_image] = a;
 	const auto& [b_desc, b_clear, b_load_clear, b_clear_value, b_test, b_write, b_compare,
-	             b_bounds, b_min_bounds, b_max_bounds, b_stencil_clear, b_stencil_clear_value,
+	             b_bounds, b_min_bounds, b_max_bounds, b_stencil_clear, b_stencil_load_clear,
+	             b_stencil_clear_value,
 	             b_stencil_test, b_front, b_back, b_image] = b;
 	const auto same_float = [](float x, float y) {
 		return std::bit_cast<uint32_t>(x) == std::bit_cast<uint32_t>(y);
@@ -511,7 +514,8 @@ bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b) {
 	       same_float(a_clear_value, b_clear_value) && a_test == b_test && a_write == b_write &&
 	       a_compare == b_compare && a_bounds == b_bounds &&
 	       same_float(a_min_bounds, b_min_bounds) && same_float(a_max_bounds, b_max_bounds) &&
-	       a_stencil_clear == b_stencil_clear && a_stencil_clear_value == b_stencil_clear_value &&
+	       a_stencil_clear == b_stencil_clear && a_stencil_load_clear == b_stencil_load_clear &&
+	       a_stencil_clear_value == b_stencil_clear_value &&
 	       a_stencil_test == b_stencil_test && a_front == b_front && a_back == b_back &&
 	       a_image == b_image;
 }
@@ -563,7 +567,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
+	if (stencil_clear_enable || stencil_load_clear_enable ||
 	    (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back)))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;
 	}

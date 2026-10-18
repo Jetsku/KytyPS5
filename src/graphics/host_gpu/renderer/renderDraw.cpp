@@ -79,6 +79,16 @@ static bool MeshRestartEnabled() {
 	return enabled;
 }
 
+// KYTY_HTILE_STENCIL_CLEAR (default on): an HTile clear also clears a stencil plane it tracks.
+static bool HtileStencilClearEnabled() {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
+		const auto* value = std::getenv("KYTY_HTILE_STENCIL_CLEAR");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}));
+	return enabled;
+}
+
 struct MeshDrawSegment {
 	uint32_t first;
 	uint32_t count;
@@ -955,6 +965,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		// An HTile that tracks stencil holds the stencil clear state too (SMem), so a fill of it
+		// clears both planes. Clearing only depth kept stale stencil from earlier frames:
+		// Miles Morales' leaf piles then passed their stencil-equal G-buffer pass everywhere
+		// (KYTY_HTILE_STENCIL_CLEAR=0 restores the depth-only clear).
+		depth.stencil_load_clear_enable =
+		    depth.stencil_clear_enable ||
+		    (meta_clear && metadata.stencil_compressed && HtileStencilClearEnabled() &&
+		     (ImageViewOps::DepthAspectMask(depth.desc.view_info.format) &
+		      vk::ImageAspectFlagBits::eStencil));
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -1087,7 +1106,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear  = depth.stencil_load_clear_enable;
 	}
 	depth_scope.Stop();
 	if (color_count == 0 && !depth.image_id) {

@@ -55427,6 +55427,12 @@ void CheckDepthAttachmentWrites() {
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
           "stencil attachment clear did not claim stencil");
 
+  target.stencil_clear_enable = false;
+  target.stencil_load_clear_enable = true;
+  Require("DepthAttachmentWrites", "htile stencil clear",
+          target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
+          "stencil load clear (HTile clear) did not claim stencil");
+
   target.desc.view_info.format = vk::Format::eD32Sfloat;
   Require("DepthAttachmentWrites", "missing stencil aspect",
           !target.AttachmentWriteAspects(),
