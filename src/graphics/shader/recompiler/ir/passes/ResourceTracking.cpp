@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -146,7 +147,9 @@ public:
 				plan.handle->SetArg(dword, plan.key);
 			}
 			for (const auto index: plan.memory) {
-				m_program.memory_info[index].planning_only = true;
+				if (index != UINT32_MAX) {
+					m_program.memory_info[index].planning_only = true;
+				}
 			}
 		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
@@ -1115,6 +1118,7 @@ private:
 			return false;
 		}
 		plan = {};
+		plan.memory.fill(UINT32_MAX);
 		const Inst* pointer      = nullptr;
 		uint32_t    tsharp_offset = 0;
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
@@ -1139,13 +1143,15 @@ private:
 			           memory->offset) {
 				return false;
 			}
+			pointer = current;
+			// T# words the shader also uses otherwise (another sample of the same material, or a
+			// V_WRITELANE spill the callee restores them from) stay real reads through BDA; only
+			// the handle's own words become planning-only.
 			const std::array<const Inst*, 1> image_users {&handle};
-			if (!UsesOnly(*read, image_users)) {
-				return false;
+			if (UsesOnly(*read, image_users)) {
+				plan.memory[dword] = memory_index;
+				plan.reads[dword]  = read;
 			}
-			pointer            = current;
-			plan.memory[dword] = memory_index;
-			plan.reads[dword]  = read;
 		}
 		// The pointer: two dwords of one keyed record of a buffer table.
 		Inst*    table_handle   = nullptr;
@@ -1240,19 +1246,14 @@ private:
 	}
 
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
-		const auto found =
-		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
-		                 [&](const IndirectImagePlan& plan) {
-			    return plan.handle == &handle;
-		    });
-		return found == m_indirect_images.end() ? nullptr : &*found;
+		const auto found = m_indirect_by_handle.find(&handle);
+		return found == m_indirect_by_handle.end() ? nullptr : &m_indirect_images[found->second];
 	}
 
+	// Memory entries the indirect plans read only for planning (a flag per entry: an RT kernel
+	// expansion has thousands of plans and checks every memory operation against them).
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
+		return index < m_planning_memory.size() && m_planning_memory[index] != 0u;
 	}
 
 	void PlanIndirectImages() {
@@ -1269,6 +1270,13 @@ private:
 				IndirectImagePlan plan;
 				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
 				    TryMakeRecordPointerImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+					for (const auto index: plan.memory) {
+						if (index != UINT32_MAX) {
+							if (index >= m_planning_memory.size()) m_planning_memory.resize(index + 1u, 0u);
+							m_planning_memory[index] = 1u;
+						}
+					}
+					m_indirect_by_handle.emplace(plan.handle, m_indirect_images.size());
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
@@ -1626,6 +1634,8 @@ private:
 	mutable bool                               m_block_maps_built = false;
 	mutable std::unordered_map<const Block*, uint32_t> m_block_index;
 	mutable std::unordered_map<uint32_t, const Block*> m_block_by_id;
+	std::vector<uint8_t>                       m_planning_memory;
+	std::unordered_map<const Inst*, size_t>    m_indirect_by_handle;
 	mutable bool                               m_memory_users_built = false;
 	mutable std::vector<uint32_t>              m_memory_users;
 	std::vector<DescriptorSource>              m_sources;
@@ -1643,7 +1653,7 @@ public:
 	// (an image, a sampler, a formatted access, or a write without KYTY_BDA_WRITES). Planning it at runtime removed the flat
 	// slot that would have failed to evaluate and dropped the dispatch, so the program is dropped
 	// here instead of failing: never worse than without the switch.
-	// KYTY_SRT_UNRESOLVED_ALL=1 (diagnostics): every unresolved access goes to stderr, not only
+	// KYTY_SRT_UNRESOLVED_ALL=1 (diagnostics): every unresolved access is logged, not only
 	// the first one the skip line names, so one translation lists all that a program lacks.
 	void MarkUnresolved(uint32_t pc) {
 		static const bool all = [] {
@@ -1651,8 +1661,10 @@ public:
 			return value != nullptr && value[0] == '1';
 		}();
 		if (all) {
-			std::fprintf(stderr, "KYTY_SRT_UNRESOLVED_ALL: shader 0x%016llx pc=0x%08x\n",
-			             static_cast<unsigned long long>(m_program.shader_hash), pc);
+			// Console and log (the emulator's log file), as the skip line itself.
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_SRT_UNRESOLVED_ALL: {} shader 0x{:016x} pc=0x{:08x}\n",
+			    StageName(m_program.stage), m_program.shader_hash, pc));
 		}
 		m_unresolved_pc = std::min(m_unresolved_pc, pc);
 	}
