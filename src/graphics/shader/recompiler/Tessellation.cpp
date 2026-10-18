@@ -59,7 +59,8 @@ bool MergeTessellationJoin(TessellationJoin& join, const TessellationRegisters& 
 }
 
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
-                                   uint32_t control_points, uint32_t input_stride, uint64_t hash) {
+                                   uint32_t control_points, uint32_t input_stride, uint64_t hash,
+                                   std::unordered_map<uint32_t, uint32_t>* constant_stores = nullptr) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
@@ -180,6 +181,8 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 						     stage_name, address.coefficient, expected, inst.pc, hash);
 					}
 					if (!control_read) stride = address.coefficient;
+				} else if (control_store && constant_stores != nullptr) {
+					(*constant_stores)[inst.pc] = address.constant;
 				}
 			}
 			// Store vdata is a source, despite occupying the decoder's dst field.
@@ -360,13 +363,22 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	}
 }
 
-void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
+void LowerTessellationMemory(IR::Program& program, const CompileOptions& options,
+                             const Decoder::Program* decoded) {
 	using namespace IR;
 	if (options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
 	    options.stage != ShaderType::TessellationEvaluation) {
 		return;
 	}
 	const auto& tess = options.input_info.vertex->tess;
+	// The guest-ISA analysis knows which HS ring stores have a constant address: those at or past
+	// the per-vertex area are patch constants, however the IR spells their address.
+	std::unordered_map<uint32_t, uint32_t> constant_stores;
+	if (options.stage == ShaderType::TessellationControl && decoded != nullptr) {
+		(void)ReflectTessellationStride(*decoded, false, tess.output_control_points, tess.ls_stride,
+		                                options.shader_hash, &constant_stores);
+	}
+	uint32_t forced_patch = 0;
 	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
 	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
 	for (auto* block: program.blocks) {
@@ -426,6 +438,14 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					EXIT_NOT_IMPLEMENTED(write
 					                         ? options.stage != ShaderType::TessellationControl
 					                         : options.stage != ShaderType::TessellationEvaluation);
+					if (write && !address.IsImmediate()) {
+						if (const auto found = constant_stores.find(inst.Flags<MemoryFlags>().pc);
+						    found != constant_stores.end() &&
+						    found->second >= tess.hs_stride * tess.output_control_points) {
+							address = Value(found->second);
+							forced_patch++;
+						}
+					}
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
 						EXIT_NOT_IMPLEMENTED(!write);
@@ -480,11 +500,12 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	RemoveIdentities(program.blocks);
 	EliminateDeadCode(program.blocks);
-	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
+	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u isa_patch_addresses=%u (0x%016" PRIx64
+	     ")\n",
 	     options.stage == ShaderType::Local                 ? "LS"
 	     : options.stage == ShaderType::TessellationControl ? "HS"
 	                                                       : "TES",
-	     reads, writes, factors);
+	     reads, writes, factors, forced_patch, options.shader_hash);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler
