@@ -268,13 +268,33 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 		           ? ActiveAddress(block, before, source->Arg(1), predicate, resolved)
 		           : value;
 	}
-	if (source->GetOpcode() != ValueOpcode::IAdd32 && source->GetOpcode() != ValueOpcode::ISub32)
-		return value;
-	const auto lhs = ActiveAddress(block, before, source->Arg(0), predicate, resolved);
-	const auto rhs = ActiveAddress(block, before, source->Arg(1), predicate, resolved);
-	if (lhs != source->Arg(0).Resolve() || rhs != source->Arg(1).Resolve()) {
-		auto copy = block.PrependNewInst(before, source->GetOpcode(), {lhs, rhs},
-		                                 source->Flags<uint64_t>());
+	// Integer address arithmetic. Miles Morales' HS computes its patch-constant address as
+	// 0x8000 - 96 * bfe(v6 = 1 + patch, 0, 24) with v6 written under the CP0 predicate.
+	switch (source->GetOpcode()) {
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitFieldUExtract: break;
+		default: return value;
+	}
+	const auto      args = source->NumArgs();
+	std::array<Value, 3> active {};
+	bool            changed = false;
+	for (size_t index = 0; index < args; index++) {
+		active[index] = ActiveAddress(block, before, source->Arg(index), predicate, resolved);
+		changed |= active[index] != source->Arg(index).Resolve();
+	}
+	if (changed) {
+		auto copy = args == 3u ? block.PrependNewInst(before, source->GetOpcode(),
+		                                              {active[0], active[1], active[2]},
+		                                              source->Flags<uint64_t>())
+		                       : block.PrependNewInst(before, source->GetOpcode(),
+		                                              {active[0], active[1]},
+		                                              source->Flags<uint64_t>());
 		value     = Value(&*copy);
 	}
 	resolved.emplace(source, value);

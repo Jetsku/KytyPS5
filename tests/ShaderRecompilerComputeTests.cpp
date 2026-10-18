@@ -52457,9 +52457,17 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
   AppendVMovLiteral(&control, 5, 0x422c0000u);
   control.push_back(EncodeVopc(0xd4, InlineU32(1), control_point));
   control.push_back(EncodeVop2(0x1a, 4, InlineU32(4), relative_patch));
-  control.push_back(EncodeVop2(0x1a, 6, InlineU32(6), relative_patch));
-  control.push_back(EncodeVop2(0x26, 5, 255u, 6));
-  control.push_back(0x7fc0);
+  if (branched) {
+    // Miles Morales: 0x8000 - 64 * (1 + patch), each step written under the CP0 predicate.
+    control.push_back(EncodeVop2(0x25, 6, InlineU32(1), relative_patch));
+    control.push_back(EncodeVop2(0x0b, 6, InlineU32(64), 6));
+    control.push_back(EncodeVop2(0x26, 5, 255u, 6));
+    control.push_back(0x8000);
+  } else {
+    control.push_back(EncodeVop2(0x1a, 6, InlineU32(6), relative_patch));
+    control.push_back(EncodeVop2(0x26, 5, 255u, 6));
+    control.push_back(0x7fc0);
+  }
   for (u32 i = 0; i < 4; i++) {
     AppendVMovLiteral(&control, i, std::bit_cast<u32>(static_cast<float>(i + 1)));
   }
