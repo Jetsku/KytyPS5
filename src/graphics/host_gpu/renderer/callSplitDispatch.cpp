@@ -128,12 +128,15 @@ struct RenderExecutor::CallSplitState {
 	Buffer& StateBuffer(uint64_t kernel, uint64_t size) {
 		auto& slot = buffers[kernel];
 		if (slot == nullptr || slot->Size() < size) {
+			// Grown by at least a quarter and to a 64 MiB multiple: dispatch sizes vary a little.
+			const auto old_size = slot != nullptr ? slot->Size() : 0u;
+			const auto grown    = (std::max(size, old_size + old_size / 4u) + (uint64_t {64} << 20u) - 1u) &
+			                   ~((uint64_t {64} << 20u) - 1u);
 			if (slot != nullptr) {
 				// Released once the recordings that used it completed.
 				context.GetCommandScheduler().DeferOperation(
 				    [old = std::shared_ptr<Buffer>(std::move(slot))]() mutable { old.reset(); });
 			}
-			const auto grown = std::max(size, slot != nullptr ? slot->Size() + slot->Size() / 2u : size);
 			slot = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(),
 			                                MemoryUsage::DeviceLocal, 0,
 			                                AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, grown);
