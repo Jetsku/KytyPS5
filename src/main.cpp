@@ -11,6 +11,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <charconv>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,16 @@
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #if defined(KYTY_PGO_GENERATE)
 #include <chrono>
@@ -647,7 +658,72 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// NVIDIA Smooth Motion makes its frames with CUDA in the driver's present layer, which initializes
+// CUDA only when the swapchain is created. By then the guest address space owns every free range
+// below HOST_USER_MAX (memoryAddressSpace.inc), CUDA finds no room for its address range there, and
+// cuInit fails with CUDA_ERROR_OUT_OF_MEMORY (2): Smooth Motion stays off (the layer's log is in
+// C:/NvPresent/logs). So CUDA is initialized here, before any reservation. Its range must not land
+// where the guest maps at fixed addresses (the default map base 0x200000000 and up, the AGC driver
+// memory at 0xfe0000000), so the free ranges below a floor are held for the duration of cuInit and
+// released right after it: CUDA's range lands above the floor, and the guest address space later
+// reserves everything around it.
+// KYTY_CUDA_EARLY_INIT=1 (default) | 0. KYTY_CUDA_VA_FLOOR_GB: the floor in GiB (default 512).
+// Without nvcuda.dll (no NVIDIA driver) nothing happens.
+static void InitCudaEarly() {
+	if (const char* value = std::getenv("KYTY_CUDA_EARLY_INIT"); value != nullptr && std::strcmp(value, "0") == 0) {
+		return;
+	}
+	HMODULE cuda = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (cuda == nullptr) {
+		return;
+	}
+	using CuInit    = int(__stdcall*)(unsigned int);
+	const auto init = reinterpret_cast<CuInit>(GetProcAddress(cuda, "cuInit"));
+	if (init == nullptr) {
+		return;
+	}
+	uint64_t floor_gb = 512;
+	if (const char* value = std::getenv("KYTY_CUDA_VA_FLOOR_GB"); value != nullptr && std::atoi(value) > 0) {
+		floor_gb = static_cast<uint64_t>(std::atoi(value));
+	}
+	const uint64_t floor = floor_gb << 30u;
+	// Hold the free ranges below the floor.
+	std::vector<void*> held;
+	uint64_t           next = 0x10000;
+	while (next < floor) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(next), &info, sizeof(info)) == 0) {
+			break;
+		}
+		const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto end  = std::min<uint64_t>(floor, base + static_cast<uint64_t>(info.RegionSize));
+		if (end <= next) {
+			break;
+		}
+		// Reservations start on the 64 KiB allocation granularity.
+		const auto start = (std::max<uint64_t>(base, next) + 0xffffu) & ~uint64_t {0xffff};
+		if (info.State == MEM_FREE && end > start) {
+			void* ptr = VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_RESERVE, PAGE_NOACCESS);
+			if (ptr != nullptr) {
+				held.push_back(ptr);
+			}
+		}
+		next = end;
+	}
+	const int result = init(0);
+	for (void* ptr: held) {
+		VirtualFree(ptr, 0, MEM_RELEASE);
+	}
+	::printf("CUDA: initialized before the guest address space, above %" PRIu64 " GiB (cuInit %d%s)\n", floor_gb,
+	         result, result == 0 ? "" : ", NVIDIA Smooth Motion will not start");
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	InitCudaEarly();
+#endif
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
