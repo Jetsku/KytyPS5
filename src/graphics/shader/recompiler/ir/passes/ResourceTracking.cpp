@@ -9,6 +9,8 @@
 #include <atomic>
 #include <fmt/format.h>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -205,8 +207,8 @@ private:
 		// Match their incoming blocks to exclude only edges that cannot reach this use.
 		if (use != nullptr && use->ImmPredecessors().size() == 1u &&
 		    use->ImmPredecessors()[0] == merge) {
-			const auto merge_it = std::ranges::find(m_program.blocks, merge);
-			const auto use_it   = std::ranges::find(m_program.blocks, use);
+			const auto merge_it = BlockIter(merge);
+			const auto use_it   = BlockIter(use);
 			if (merge_it != m_program.blocks.end() && use_it != m_program.blocks.end()) {
 				const auto& info = m_program.block_info[merge_it - m_program.blocks.begin()];
 				const auto& term = info.terminator;
@@ -263,13 +265,13 @@ private:
 				return value;
 			}
 			const auto* target = incoming == branch ? merge : incoming;
-			const auto  it     = std::ranges::find(m_program.blocks, target);
+			const auto  it     = BlockIter(target);
 			if (it == m_program.blocks.end()) {
 				return value;
 			}
 			target_ids[arm] = m_program.block_info[it - m_program.blocks.begin()].id;
 		}
-		const auto branch_it = std::ranges::find(m_program.blocks, branch);
+		const auto branch_it = BlockIter(branch);
 		if (branch_it == m_program.blocks.end()) {
 			return value;
 		}
@@ -402,22 +404,31 @@ private:
 		           : nullptr;
 	}
 
+	static bool IsMemoryOperation(const Inst& inst) {
+		const auto op = inst.GetOpcode();
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// No memory operation but `owner` uses metadata entry `index`. The uses per entry are
+	// counted once (the program's memory operations do not change while resources are planned).
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_program.blocks) {
-			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+		if (!m_memory_users_built) {
+			m_memory_users_built = true;
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					if (IsMemoryOperation(inst)) {
+						const auto user = inst.Flags<MemoryFlags>().index;
+						if (user >= m_memory_users.size()) m_memory_users.resize(user + 1u, 0u);
+						m_memory_users[user]++;
+					}
 				}
 			}
 		}
-		return true;
+		const uint32_t users = index < m_memory_users.size() ? m_memory_users[index] : 0u;
+		const uint32_t own   = IsMemoryOperation(owner) && owner.Flags<MemoryFlags>().index == index;
+		return users == own;
 	}
 
 	bool MakeRuntimeTableSource(const Inst& handle, uint32_t pc,
@@ -477,8 +488,8 @@ private:
 				return false;
 			}
 			const auto* previous = block->ImmPredecessors()[0];
-			const auto current_it = std::ranges::find(m_program.blocks, block);
-			const auto previous_it = std::ranges::find(m_program.blocks, previous);
+			const auto current_it = BlockIter(block);
+			const auto previous_it = BlockIter(previous);
 			if (current_it == m_program.blocks.end() || previous_it == m_program.blocks.end()) {
 				return false;
 			}
@@ -538,23 +549,57 @@ private:
 		}
 	}
 
+	// Block lookups by pointer and by id, built on first use (the block list does not change
+	// while resources are tracked). Big programs (an S_SWAPPC_B64 expansion of 7,000 blocks)
+	// spent their tracking time in linear searches of the block list.
+	void BuildBlockMaps() const {
+		if (m_block_maps_built) {
+			return;
+		}
+		m_block_maps_built = true;
+		m_block_index.reserve(m_program.blocks.size());
+		for (size_t index = 0; index < m_program.blocks.size(); ++index) {
+			m_block_index.emplace(m_program.blocks[index], static_cast<uint32_t>(index));
+		}
+		m_block_by_id.reserve(m_program.block_info.size());
+		for (size_t index = m_program.block_info.size(); index-- > 0;) {
+			if (index < m_program.blocks.size()) {
+				m_block_by_id[m_program.block_info[index].id] = m_program.blocks[index];
+			}
+		}
+	}
+
+	// std::ranges::find(m_program.blocks, block), in constant time.
+	BlockList::iterator BlockIter(const Block* block) const {
+		BuildBlockMaps();
+		const auto found = m_block_index.find(block);
+		return found == m_block_index.end() ? m_program.blocks.end()
+		                                    : m_program.blocks.begin() + found->second;
+	}
+
 	const Block* FindBlock(uint32_t id) const {
-		const auto info = std::ranges::find(m_program.block_info, id, &BlockInfo::id);
-		return info == m_program.block_info.end()
-		           ? nullptr
-		           : m_program.blocks[info - m_program.block_info.begin()];
+		BuildBlockMaps();
+		const auto found = m_block_by_id.find(id);
+		return found == m_block_by_id.end() ? nullptr : found->second;
 	}
 
 	bool CanReach(const Block* start, const Block* target, const Block* avoid) const {
-		std::vector<const Block*> pending {start};
-		std::vector<const Block*> visited;
+		BuildBlockMaps();
+		std::vector<const Block*>       pending {start};
+		std::vector<uint8_t>            visited(m_program.blocks.size(), 0u);
+		std::unordered_set<const Block*> other; // blocks outside the list, if any
 		while (!pending.empty()) {
 			const auto* block = pending.back();
 			pending.pop_back();
-			if (block == nullptr || block == avoid ||
-			    std::ranges::find(visited, block) != visited.end()) continue;
+			if (block == nullptr || block == avoid) continue;
+			const auto index = m_block_index.find(block);
+			if (index != m_block_index.end()) {
+				if (visited[index->second] != 0u) continue;
+				visited[index->second] = 1u;
+			} else if (!other.insert(block).second) {
+				continue;
+			}
 			if (block == target) return true;
-			visited.push_back(block);
 			for (const auto* next: block->ImmSuccessors()) pending.push_back(next);
 		}
 		return false;
@@ -562,8 +607,8 @@ private:
 
 	bool ConditionalEdge(const Block* from, const Block* to, Value& condition,
 	                     bool& positive) const {
-		const auto position = std::ranges::find(m_program.blocks, from);
-		const auto target = std::ranges::find(m_program.blocks, to);
+		const auto position = BlockIter(from);
+		const auto target = BlockIter(to);
 		if (position == m_program.blocks.end() || target == m_program.blocks.end()) return false;
 		const auto& info = m_program.block_info[position - m_program.blocks.begin()];
 		const auto& term = info.terminator;
@@ -1576,6 +1621,11 @@ private:
 
 	Program&                                   m_program;
 	ShaderInfo                                 m_info;
+	mutable bool                               m_block_maps_built = false;
+	mutable std::unordered_map<const Block*, uint32_t> m_block_index;
+	mutable std::unordered_map<uint32_t, const Block*> m_block_by_id;
+	mutable bool                               m_memory_users_built = false;
+	mutable std::vector<uint32_t>              m_memory_users;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
