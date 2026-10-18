@@ -68,12 +68,10 @@ void Dump(std::string_view name, std::span<const uint32_t> code) {
 
 } // namespace
 
+// Read on each expander construction (one per pipeline cache, and in tests).
 bool StickyExpansionsDefault() {
-	static const bool sticky = [] {
-		const char* value = std::getenv("KYTY_SHADER_CALLS_STICKY");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	return sticky;
+	const char* value = std::getenv("KYTY_SHADER_CALLS_STICKY");
+	return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
 bool EvaluateCallTable(const CallTable& table, std::span<const uint32_t> user_data,

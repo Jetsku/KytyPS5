@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/NullTrace.h"
 #include "common/prepPhases.h"
 
 #include "common/assert.h"
@@ -100,6 +101,7 @@ bool NullBufferDescriptor(const ShaderBufferResource& descriptor, bool count = t
 		return true;
 	}
 	const auto nulls = g_unmapped_buffer_nulls.fetch_add(1, std::memory_order_relaxed);
+	NullTraceNote(NullTraceKind::NullBuffer);
 	if (nulls < 8u) {
 		std::fprintf(stderr,
 		             "Kyty spec: buffer V# with unmapped base 0x%012" PRIx64
@@ -1680,6 +1682,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 					if (!NullImageDescriptor(snapshot.images[i])) {
 						ReportInvalidImageDescriptor(program.shader_hash, i, snapshot.images[i]);
+						NullTraceNote(NullTraceKind::NullImage, program.shader_hash);
 					}
 					snapshot.images[i].dwords.fill(0);
 				}
@@ -1728,6 +1731,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSpecialization& specialization) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ResourceMaterialization);
+	NullTraceSetShader(program.shader_hash);
 	static const bool optimized = [] {
 		const auto* setting = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
 		return setting != nullptr && std::strcmp(setting, "optimized") == 0;

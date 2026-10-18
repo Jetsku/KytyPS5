@@ -41,6 +41,7 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderCalls.h"
+#include "graphics/shader/recompiler/ir/passes/NullTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -3795,6 +3796,7 @@ struct PipelineCache::ProgramCache {
 			source = FindSourceMemo(key, scratch);
 		}
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
+			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
 			return {};
 		}
 		auto runtime = speculative ? MakeSpeculativeRuntime(params) : MakeRuntime(params, read_attempt);
@@ -3812,7 +3814,10 @@ struct PipelineCache::ProgramCache {
 				const CpGaps::Scope gap(CpGaps::Cat::ProgMaterialize);
 				materialized = Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			}
-			if (!materialized) return {};
+			if (!materialized) {
+				ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedResources, params.hash);
+				return {};
+			}
 			if (ResourceReuseEnabled() && ResourceDependencyCacheEnabled() &&
 			    source->reuse.current.prepared_reads.Valid()) {
 				const auto* cached = PermutationAt(*source, source->reuse.current.permutation_index);
@@ -3842,7 +3847,10 @@ struct PipelineCache::ProgramCache {
 		    CompileAndPublish(params, input_info, push_data_cursor, key, runtime, evaluation,
 		                      scratch, prep, read_attempt, source != nullptr, speculative);
 		if (compile_ns != nullptr) *compile_ns += CompileClockNs() - begin;
-		if (permutation == nullptr) return {};
+		if (permutation == nullptr) {
+			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
+			return {};
+		}
 		return Bind(*permutation, input_info, prep, push_data_cursor);
 	}
 
