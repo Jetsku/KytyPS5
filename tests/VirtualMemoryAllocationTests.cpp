@@ -4342,13 +4342,14 @@ void TestPackedBitField(bool insert) {
 						const auto mxcsr = _mm_getcsr();
 						_mm_setcsr(restore.mxcsr);
 						++calls;
+						// Match AMD's zeroed XMM upper quadword, while preserving YMM bits 255:128.
 						Check(test,
 						      output.destination[0] ==
 						              (insert ? insert_bits(input[0],
 						                                    input[source == destination ? 0 : 4],
 						                                    length, index)
 						                      : extract(input[0], length, index)) &&
-						          output.destination[1] == (insert ? input[1] : 0) &&
+						          output.destination[1] == 0 &&
 						          output.destination[2] == input[2] &&
 						          output.destination[3] == input[3],
 						      "SSE4a bitfield result or destination lanes differ");
@@ -4853,9 +4854,10 @@ void TestCpuExtensionPatches() {
 			__rdtscp(&after);
 			Check(test, g_instruction_traps == traps + !host.sse4a + !host.rdpid,
 			      "mixed CPU extension fixture used an unexpected trap path");
+			// The trap emulator matches AMD's zeroed bits 127:64, not the old sentinel.
 			Check(test,
 			      output[1] == 0x123456789abcdef0ull && output[2] == 0x1ab1 &&
-			          (host.sse4a || output[3] == input[1]) &&
+			          (host.sse4a || output[3] == 0) &&
 			          std::equal(output.begin() + 4, output.end(), input.begin() + 2),
 			      "mixed CPU extensions corrupted INSERTQ state or the guest red zone");
 			if (before == after) {
