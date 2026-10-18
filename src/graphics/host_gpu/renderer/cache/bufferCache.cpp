@@ -6495,7 +6495,8 @@ static void NoteBdaSettleStats(size_t logged, uint32_t dropped) {
 // dispatch completed (ProcessPendingBdaSettles, from later settles and the garbage collector):
 // the logged stores are applied, and pages outside the prediction are settled then ("late",
 // counted: a reader between the dispatch and that settle could have seen them clean).
-// =2: the prediction is every page the shader's settles ever listed, not the last two settles'.
+// =2: the prediction is every page the shader's settles ever listed, not the last two settles';
+// =3: also the whole cache buffers those pages lie in.
 Live::Switch g_bda_async_settle("KYTY_BDA_ASYNC_SETTLE", [](const char* value) -> int64_t {
 	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
 });
@@ -6556,6 +6557,23 @@ void BufferCache::SettleBdaWritesAsync(uint64_t shader_hash) {
 	if (const auto it = m_bda_predict.find(shader_hash); it != m_bda_predict.end()) {
 		it->second.newer.ForEach([&](uint64_t start, uint64_t end) { pending.predicted.Add(start, end - start); });
 		it->second.older.ForEach([&](uint64_t start, uint64_t end) { pending.predicted.Add(start, end - start); });
+	}
+	if (g_bda_async_settle.Get() >= 3) {
+		// =3: the whole cache buffers the predicted pages lie in (ring buffers move their writes).
+		RangeSet whole;
+		pending.predicted.ForEach([&](uint64_t start, uint64_t end) {
+			auto it = m_buffers.upper_bound(start);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < end; ++it) {
+				const auto& buffer = m_slot_buffers[it->second];
+				if (buffer.CpuAddress() + buffer.Size() > start) {
+					whole.Add(buffer.CpuAddress(), buffer.Size());
+				}
+			}
+		});
+		whole.ForEach([&](uint64_t start, uint64_t end) { pending.predicted.Add(start, end - start); });
 	}
 	uint64_t predicted_pages = 0;
 	pending.predicted.ForEach([&](uint64_t start, uint64_t end) {
