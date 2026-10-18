@@ -1409,6 +1409,13 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;
+	// An indirect draw's START_INST_LOC names the first stage's user SGPR: for tessellation
+	// the LS, whose user SGPRs start at s0 here. The LS then gets the instance ID from 0 and
+	// the start instance in that SGPR, as the VS path does.
+	if (const auto start_instance = regs.start_instance_user_sgpr - 32;
+	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.hs_regs.rsrc2.user_sgpr) {
+		input_info[0].start_instance_sgpr = start_instance;
+	}
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
@@ -1421,11 +1428,13 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .domain                = sh.m_vgtTfParam & 0x3u,
 	    .partitioning          = (sh.m_vgtTfParam >> 2u) & 0x3u,
 	    .output_topology       = (sh.m_vgtTfParam >> 5u) & 0x3u,
+	    .min_tess_level        = sh.m_vgtHosMinTessLevel,
+	    .max_tess_level        = sh.m_vgtHosMaxTessLevel,
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess,
-	                                              params[0].hash, params[1].hash);
+	                                              params[0].hash, params[1].hash, params[2].code);
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

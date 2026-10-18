@@ -140,6 +140,9 @@ struct ShaderTessellationInputInfo {
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
+	// VGT_HOS_MIN/MAX_TESS_LEVEL as f32 bits: the hardware clamps every factor to them.
+	uint32_t min_tess_level        = 0;
+	uint32_t max_tess_level        = 0;
 };
 
 struct ShaderVertexInputInfo {

@@ -1391,8 +1391,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			// As for VS: the guest instance ID counts from 0 and the start instance comes
+			// from its SGPR, while Vulkan's InstanceIndex already includes the base instance.
+			const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
+			entry_ir.SetVectorReg(
+			    static_cast<IR::VectorReg>(5),
+			    entry_ir.ISub(builtin(IR::StageInputKind::InstanceIndex), base_instance));
+			if (options.input_info.vertex != nullptr &&
+			    options.input_info.vertex->start_instance_sgpr >= 0) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr),
+				    base_instance);
+			}
 		} else if (options.stage == ShaderType::TessellationControl) {
 			const auto& tess = options.input_info.vertex->tess;
 			entry_ir.SetScalarReg(

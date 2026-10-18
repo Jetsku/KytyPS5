@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <bit>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -173,9 +175,45 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&] {
 		auto value = ctx.Arg(inst, 2);
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
-			const auto floating = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
+			auto&      state    = ctx.state;
+			const auto floating = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeF32(state), floating, value);
 			value = floating;
+			const auto& tess = state.input_info.vertex->tess;
+			if (tess.max_tess_level != 0u && std::bit_cast<float>(tess.min_tess_level) <=
+			                                     std::bit_cast<float>(tess.max_tess_level)) {
+				// The tessellator clamps factors to VGT_HOS_MIN/MAX_TESS_LEVEL. Patches with a
+				// factor <= 0 or NaN stay culled.
+				const auto clamped = state.builder.AllocateId();
+				state.builder.AddFunction(std::vector<uint32_t> {
+				    spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FClamp,
+				    value, ConstantF32Value(state, std::bit_cast<float>(tess.min_tess_level)),
+				    ConstantF32Value(state, std::bit_cast<float>(tess.max_tess_level))});
+				const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), value,
+				                             ConstantF32Value(state, 0.0f));
+				value = Select(state, TypeF32(state), positive, clamped, value);
+			}
+			if (tess.partitioning == 1u) {
+				// Power-of-two partitioning rounds each factor up to a power of two; with the
+				// equal spacing it maps to, the generated vertices then match the guest's.
+				// A factor <= 0 (or NaN) still culls the patch.
+				const auto ext = [&](uint32_t opcode, uint32_t arg) {
+					const auto result = state.builder.AllocateId();
+					state.builder.AddFunction(std::vector<uint32_t> {
+					    spv::OpExtInst, TypeF32(state), result, GlslStd450(state), opcode, arg});
+					return result;
+				};
+				const auto one          = ConstantF32Value(state, 1.0f);
+				const auto at_least_one = state.builder.AllocateId();
+				state.builder.AddFunction(std::vector<uint32_t> {spv::OpExtInst, TypeF32(state),
+				                                                 at_least_one, GlslStd450(state),
+				                                                 GLSLstd450FMax, value, one});
+				const auto rounded =
+				    ext(GLSLstd450Exp2, ext(GLSLstd450Ceil, ext(GLSLstd450Log2, at_least_one)));
+				const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), value,
+				                             ConstantF32Value(state, 0.0f));
+				value = Select(state, TypeF32(state), positive, rounded, value);
+			}
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});

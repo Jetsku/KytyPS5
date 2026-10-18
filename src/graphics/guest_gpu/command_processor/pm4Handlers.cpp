@@ -1650,7 +1650,10 @@ static int32_t GsUserSgprAt(uint32_t location) {
 		return -1;
 	}
 	const auto id = location - Pm4::SPI_SHADER_USER_DATA_GS_0;
-	return id < 32u ? static_cast<int32_t>(id) : -1;
+	if (id < 32u) return static_cast<int32_t>(id);
+	// A tessellated draw's first stage is LS-HS: 32 + its HS user SGPR.
+	const auto hs = location - Pm4::SPI_SHADER_USER_DATA_HS_0;
+	return hs < 32u ? static_cast<int32_t>(32u + hs) : -1;
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {

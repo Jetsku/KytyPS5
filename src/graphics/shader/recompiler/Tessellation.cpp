@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cinttypes>
 #include <cstdlib>
 #include <mutex>
@@ -284,7 +285,7 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info, uint64_t local_hash,
-                                 uint64_t control_hash) {
+                                 uint64_t control_hash, std::span<const uint32_t> evaluation) {
 	// Every tessellated draw prepares its programs; the interface depends only on
 	// the two programs and the control point counts.
 	struct Key {
@@ -319,8 +320,20 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	    ReflectTessellationStride(local_program, true, info.input_control_points, 0u, local_hash);
 	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
 	                                           info.ls_stride, control_hash);
-	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
-	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u domain=%u "
+	     "partitioning=%u topology=%u levels=%g..%g (LS 0x%016" PRIx64 ", HS 0x%016" PRIx64 ")\n",
+	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
+	     info.domain, info.partitioning, info.output_topology,
+	     static_cast<double>(std::bit_cast<float>(info.min_tess_level)),
+	     static_cast<double>(std::bit_cast<float>(info.max_tess_level)), local_hash, control_hash);
+	if (const char* env = std::getenv("KYTY_TESS_DUMP"); env != nullptr && env[0] == '2') {
+		// KYTY_TESS_DUMP=2: every new LS/HS/TES set (local diagnosis only).
+		Decoder::Program evaluation_program;
+		if (!evaluation.empty()) Decoder::DecodeProgram(evaluation, evaluation_program);
+		LOGF("Tessellation LS:\n%s\nTessellation HS:\n%s\nTessellation TES:\n%s\n",
+		     ProgramToString(local_program).c_str(), ProgramToString(control_program).c_str(),
+		     evaluation.empty() ? "" : ProgramToString(evaluation_program).c_str());
+	}
 	if (cacheable) {
 		std::lock_guard lock(mutex);
 		strides.emplace(key, std::pair {info.ls_stride, info.hs_stride});

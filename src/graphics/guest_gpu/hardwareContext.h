@@ -605,7 +605,7 @@ struct VertexShaderInfo {
 	UserSgprInfo     hs_user_sgpr;
 	UserSgprInfo     gs_user_sgpr;
 	// The GS user SGPR the CP writes the draw's start instance into: an indirect draw's
-	// START_INST_LOC (-1: none).
+	// START_INST_LOC (-1: none; 32 + n: HS user SGPR n, for a tessellated draw).
 	int32_t start_instance_user_sgpr = -1;
 };
 
