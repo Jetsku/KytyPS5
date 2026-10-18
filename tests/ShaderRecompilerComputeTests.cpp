@@ -52365,7 +52365,8 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
-void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
+void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
+                              bool branched = false) {
   using namespace ShaderRecompiler;
   const bool multiplied_stride = hs_stride == 112;
   const u32 local_address = multiplied_stride ? 18 : 21;
@@ -52418,11 +52419,29 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   }
   control.push_back(EncodeDs0(0x37, (3u << 8u) | 1u));
   control.push_back(EncodeDs1Ex(10, 0, 0, input_address));
-  control.push_back(EncodeMubuf0(0x1d, 28));
-  control.push_back(EncodeMubuf1(10, 2, output_address, 2));
+  u32 joined_address = output_address;
+  if (branched) {
+    // if/else around the control-point store. Both arms recompute v41 from the
+    // same address, so it stays affine at the join; v40 differs per arm and
+    // must not disturb the analysis while no access addresses through it.
+    joined_address = 41;
+    control.push_back(EncodeSopp(0x06, 6)); // s_cbranch_vccz else
+    control.push_back(EncodeVop2(0x1a, joined_address, InlineU32(0), output_address));
+    control.push_back(EncodeMubuf0(0x1d, 28));
+    control.push_back(EncodeMubuf1(10, 2, joined_address, 2));
+    AppendVMovLiteral(&control, 40, 0x3f800000u);
+    control.push_back(EncodeSopp(0x02, 5)); // s_branch end
+    control.push_back(EncodeVop2(0x1a, joined_address, InlineU32(0), output_address));
+    control.push_back(EncodeMubuf0(0x1d, 28));
+    control.push_back(EncodeMubuf1(10, 2, joined_address, 2));
+    AppendVMovLiteral(&control, 40, 0x40000000u);
+  } else {
+    control.push_back(EncodeMubuf0(0x1d, 28));
+    control.push_back(EncodeMubuf1(10, 2, output_address, 2));
+  }
   // Keep the control-point-dependent value and the last written dword live.
   control.push_back(EncodeMubuf0(0x1c, hs_stride - 8));
-  control.push_back(EncodeMubuf1(0, 2, output_address, 2));
+  control.push_back(EncodeMubuf1(0, 2, joined_address, 2));
   // The game reuses previously written data VGPRs for CP0-only ring addresses.
   AppendVMovLiteral(&control, 4, 0x42280000u);
   AppendVMovLiteral(&control, 5, 0x422c0000u);
@@ -52548,6 +52567,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationProgram("TessellationBranchedStore", 124, 128, true);
 }
 
 void CheckEmbeddedFetchVertexOffset() {

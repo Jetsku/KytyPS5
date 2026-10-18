@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <unordered_map>
 #include <utility>
 
@@ -23,14 +24,47 @@ struct TessellationAddress {
 	uint32_t constant    = 0;
 };
 
+bool operator==(const TessellationAddress& lhs, const TessellationAddress& rhs) {
+	return lhs.kind == rhs.kind &&
+	       (lhs.kind != TessellationAddress::Kind::Affine ||
+	        (lhs.coefficient == rhs.coefficient && lhs.constant == rhs.constant));
+}
+
+using TessellationRegisters = std::array<TessellationAddress, IR::NumVectorRegs>;
+
+// The register state on entry to a branch target. Unreached targets do not
+// constrain a join; a reached one keeps a register only if every edge agrees.
+struct TessellationJoin {
+	bool                  reached = false;
+	TessellationRegisters registers {};
+};
+
+bool MergeTessellationJoin(TessellationJoin& join, const TessellationRegisters& registers) {
+	if (!join.reached) {
+		join = {true, registers};
+		return true;
+	}
+	bool changed = false;
+	for (size_t index = 0; index < registers.size(); index++) {
+		if (join.registers[index].kind != TessellationAddress::Kind::Unknown &&
+		    !(join.registers[index] == registers[index])) {
+			join.registers[index] = {};
+			changed               = true;
+		}
+	}
+	return changed;
+}
+
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
-                                   uint32_t control_points, uint32_t input_stride) {
+                                   uint32_t control_points, uint32_t input_stride, uint64_t hash) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
-	std::array<Address, IR::NumVectorRegs> registers {};
-	registers[local ? 3u : 1u] =
+	const char*           stage_name = local ? "LS" : "HS";
+	TessellationRegisters entry {};
+	entry[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
+	TessellationRegisters registers {};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
 	const auto read     = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
@@ -79,77 +113,115 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		           ? value
 		           : Address {};
 	};
-	uint32_t stride = 0;
-	for (const auto& inst: program.instructions) {
-		// Stage exits preserve the active path's definitions. An internal join
-		// would require merging register definitions.
-		EXIT_NOT_IMPLEMENTED(IsDirectBranch(inst.opcode) &&
-		                     inst.branch_target != program.instructions.back().pc);
-		const bool local_store =
-		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
-		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
-		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
-		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
-		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
-		const bool control_store =
-		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
-		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
-		if ((local && local_store) || control_store || control_read) {
-			const auto address = read(inst.src0);
-			if (address.kind != Kind::Affine) {
-				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
-				     inst.pc);
+	// Forward dataflow over the instruction list. Branch targets are joins whose
+	// state merges every incoming edge; back edges are resolved by iterating
+	// until no join changes. Memory accesses are checked only on the final,
+	// stable pass, where every register reflects all paths reaching it.
+	std::unordered_map<uint32_t, TessellationJoin> joins;
+	uint32_t                                       stride = 0;
+	const auto                                     pass   = [&](bool check) {
+		bool changed   = false;
+		bool reachable = true;
+		registers      = entry;
+		stride         = 0;
+		for (const auto& inst: program.instructions) {
+			if (const auto join = joins.find(inst.pc); join != joins.end()) {
+				if (reachable) changed |= MergeTessellationJoin(join->second, registers);
+				reachable = join->second.reached;
+				if (reachable) registers = join->second.registers;
 			}
-			if (address.coefficient != 0u) {
-				const auto expected = control_read ? input_stride : stride;
-				EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
-				                     (expected != 0u && expected != address.coefficient));
-				if (!control_read) stride = address.coefficient;
+			if (!reachable) continue;
+			if (IsDirectBranch(inst.opcode)) {
+				changed |= MergeTessellationJoin(joins[inst.branch_target], registers);
+				if (inst.opcode == Opcode::S_BRANCH) reachable = false;
+				continue;
 			}
-		}
-		// Store vdata is a source, despite occupying the decoder's dst field.
-		if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
-		const auto lhs   = read(inst.src0);
-		const auto rhs   = read(inst.src1);
-		const auto third = read(inst.src2);
-		Address    value;
-		switch (inst.opcode) {
-			case Opcode::V_BFE_U32:
-				if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
-				    rhs.coefficient == 0u && third.kind == Kind::Affine &&
-				    third.coefficient == 0u) {
-					if (rhs.constant == 8u && third.constant == 5u) value = {Kind::Affine, 1u, 0u};
-					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+			if (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SETPC_B64) {
+				reachable = false;
+				continue;
+			}
+			const bool local_store =
+			    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+			const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
+			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
+			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
+			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
+			const bool control_store = !local && buffer_store &&
+			                           inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
+			const bool control_read = !local && (inst.opcode == Opcode::DS_READ_B32 ||
+			                                     inst.opcode == Opcode::DS_READ2_B32);
+			if (check && ((local && local_store) || control_store || control_read)) {
+				const auto address = read(inst.src0);
+				if (address.kind != Kind::Affine) {
+					EXIT("%s tessellation address is not affine at pc 0x%08x (shader 0x%016" PRIx64
+					     ")\n",
+					     stage_name, inst.pc, hash);
 				}
-				break;
-			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
-			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
-			case Opcode::V_LSHL_ADD_U32:
-				if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
-					value = add(multiply(lhs, constant(1u << rhs.constant)), third);
-				break;
-			case Opcode::V_LSHLREV_B32:
-				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
-					value = multiply(rhs, constant(1u << lhs.constant));
-				break;
-			case Opcode::V_SUB_NC_U32:
-				if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-				    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-					value = affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
-				break;
-			default: break;
+				if (address.coefficient != 0u) {
+					const auto expected = control_read ? input_stride : stride;
+					if ((address.coefficient & 3u) != 0u ||
+					    (expected != 0u && expected != address.coefficient)) {
+						EXIT("%s tessellation stride %u conflicts with %u at pc 0x%08x (shader "
+						     "0x%016" PRIx64 ")\n",
+						     stage_name, address.coefficient, expected, inst.pc, hash);
+					}
+					if (!control_read) stride = address.coefficient;
+				}
+			}
+			// Store vdata is a source, despite occupying the decoder's dst field.
+			if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
+			const auto lhs   = read(inst.src0);
+			const auto rhs   = read(inst.src1);
+			const auto third = read(inst.src2);
+			Address    value;
+			switch (inst.opcode) {
+				case Opcode::V_BFE_U32:
+					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
+					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
+					    third.coefficient == 0u) {
+						if (rhs.constant == 8u && third.constant == 5u)
+							value = {Kind::Affine, 1u, 0u};
+						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+					}
+					break;
+				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
+				case Opcode::V_MAD_U32_U24:
+					value = add(multiply(low24(lhs), low24(rhs)), third);
+					break;
+				case Opcode::V_LSHL_ADD_U32:
+					if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
+						value = add(multiply(lhs, constant(1u << rhs.constant)), third);
+					break;
+				case Opcode::V_LSHLREV_B32:
+					if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
+						value = multiply(rhs, constant(1u << lhs.constant));
+					break;
+				case Opcode::V_SUB_NC_U32:
+					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
+					    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
+						value =
+						    affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
+					break;
+				default: break;
+			}
+			if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
+			    inst.dst.dpp)
+				value = {};
+			for (uint32_t index = 0; index < std::max(inst.data_dwords, 1u) &&
+			                         inst.dst.reg + index < registers.size();
+			     index++) {
+				registers[inst.dst.reg + index] = {};
+			}
+			registers.at(inst.dst.reg) = value;
 		}
-		if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
-		    inst.dst.dpp)
-			value = {};
-		for (uint32_t index = 0;
-		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size(); index++) {
-			registers[inst.dst.reg + index] = {};
-		}
-		registers.at(inst.dst.reg) = value;
+		return changed;
+	};
+	// A join register only moves from unreached to known to Unknown, so this ends.
+	while (pass(false)) {}
+	pass(true);
+	if (stride == 0u) {
+		EXIT("%s tessellation stride was not found (shader 0x%016" PRIx64 ")\n", stage_name, hash);
 	}
-	EXIT_NOT_IMPLEMENTED(stride == 0u);
 	return stride;
 }
 
@@ -189,13 +261,15 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 } // namespace
 
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
-                                 ShaderTessellationInputInfo& info) {
+                                 ShaderTessellationInputInfo& info, uint64_t local_hash,
+                                 uint64_t control_hash) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
-	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u);
+	info.ls_stride =
+	    ReflectTessellationStride(local_program, true, info.input_control_points, 0u, local_hash);
 	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
-	                                           info.ls_stride);
+	                                           info.ls_stride, control_hash);
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
 }
