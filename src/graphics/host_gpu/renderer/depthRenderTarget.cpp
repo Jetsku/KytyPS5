@@ -341,7 +341,7 @@ static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r
 	const auto& ro = hw.GetDepthRenderOverride();
 	const auto& z  = hw.GetDepthRenderTarget();
 	const auto& sh = hw.GetShaderRegisters().db_shader_control;
-	char line[640];
+	char line[1024];
 	std::snprintf(line, sizeof(line),
 	              "StencilRefTrace: dc z=%d zw=%d zfunc=%u bounds=%d st=%d sfunc=%u/%u bf=%d | sc "
 	              "fail=%u zpass=%u zfail=%u bf=%u/%u/%u | sm test=%u mask=0x%02x wmask=0x%02x "
@@ -360,7 +360,26 @@ static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r
 	              sh.shader_z_behavior, sh.other_bits, sh.alpha_to_mask_disable,
 	              r.depth_write_enable, static_cast<int>(r.depth_compare_op),
 	              r.stencil_load_clear_enable);
-	static std::mutex                      mutex;
+	// Colour side of the same draw: blend per MRT 0-3, target and shader masks, colour control
+	// and the export formats.
+	const auto& shr = hw.GetShaderRegisters();
+	const auto& cc  = hw.GetColorControl();
+	auto        used = std::strlen(line);
+	used += static_cast<size_t>(std::snprintf(
+	    line + used, sizeof(line) - used, " | cb tmask=0x%08x smask=0x%08x mode=%u rop=0x%02x fmt=%u/%u/%u/%u",
+	    hw.GetRenderTargetMask(), shr.m_cbShaderMask, cc.mode, cc.op, shr.target_output_mode[0],
+	    shr.target_output_mode[1], shr.target_output_mode[2], shr.target_output_mode[3]));
+	for (uint32_t slot = 0; slot < 4 && used < sizeof(line); slot++) {
+		const auto& b = hw.GetBlendControl(slot);
+		used += static_cast<size_t>(std::snprintf(
+		    line + used, sizeof(line) - used, " b%u=%d:%u,%u,%u/%u,%u,%u,%d,byp%d,f%u/%u", slot, b.enable,
+		    b.color_srcblend, b.color_comb_fcn, b.color_destblend, b.alpha_srcblend,
+		    b.alpha_comb_fcn, b.alpha_destblend, b.separate_alpha_blend,
+		    hw.GetRenderTarget(slot).info.blend_bypass,
+		    static_cast<uint32_t>(hw.GetRenderTarget(slot).info.format),
+		    static_cast<uint32_t>(hw.GetRenderTarget(slot).info.channel_type)));
+	}
+	static std::mutex                     mutex;
 	static std::unordered_set<std::string> seen;
 	std::scoped_lock                       lock {mutex};
 	if (seen.insert(line).second) {
