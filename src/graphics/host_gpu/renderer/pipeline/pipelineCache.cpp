@@ -7583,10 +7583,19 @@ void PipelineCache::InitializeShaderPrecompile() {
 		// and mesh limits are part of the stage input infos) and the sizes of the input structs. The
 		// translator is not part of it: the journal holds inputs, not outputs.
 		const auto& properties = m_graphics.GetPhysicalDeviceProperties();
-		const auto  identity   = fmt::format(
+		auto        identity   = fmt::format(
 	        "kyty shader journal; device {:08x}:{:08x}; input infos {} {} {}", properties.vendorID,
 	        properties.deviceID, ShaderStoredInputInfoSize<ShaderVertexInputInfo>(),
 	        ShaderStoredInputInfoSize<ShaderPixelInputInfo>(), ShaderStoredInputInfoSize<ShaderComputeInputInfo>());
+		// KYTY_BDA_FORCE_SHADERS changes those programs' bound buffers, which the stored
+		// specializations list: a journal recorded with another list is not replayed.
+		std::string forced;
+		for (const auto hash: ShaderRecompiler::GetCodegenOptions().bda_force_shaders) {
+			forced += fmt::format(" {:016x}", hash);
+		}
+		if (!forced.empty()) {
+			identity += "; bda force" + forced;
+		}
 		ShaderJournal::Settings settings;
 		settings.path     = path;
 		settings.identity = std::vector<uint8_t>(identity.begin(), identity.end());
