@@ -58266,8 +58266,10 @@ int main(int argc, char **argv) {
       }
       ShaderRecompiler::Decoder::ShaderCallExpansion expansion;
       std::string reason;
-      if (!ShaderRecompiler::Decoder::ExpandShaderCalls(kernel, 0x0000002000000000ull, with, read, 64,
-                                                        expansion, reason)) {
+      if (sites.empty()) {
+        expansion.code = kernel; // an expansion dump (KYTY_SHADER_CALLS_DUMP): translated as is
+      } else if (!ShaderRecompiler::Decoder::ExpandShaderCalls(kernel, 0x0000002000000000ull, with, read, 64,
+                                                               expansion, reason)) {
         std::fprintf(out, "%ld,0,expansion failed: %s,,,\n", index, reason.c_str());
         continue;
       }
