@@ -211,6 +211,11 @@ struct CodegenOptions {
 	// the region of the outer selection externally entered (Wolverine's 0x09161b28ae4039bb). The
 	// copies run the same instructions; nothing after them can tell them apart.
 	bool cfg_clone_exits = false;
+	// KYTY_STORAGE_LENGTH_ZERO=1 (default 0): a storage-buffer OpArrayLength of 0 counts as unbounded
+	// (0xffffffff), leaving the bounds check to the device. NVIDIA returns 0 for a binding of 2 GiB or
+	// more (Insomniac binds its whole vertex pool, 3 GiB, through one V#); with this switch the
+	// descriptor range is no longer capped (KYTY_STORAGE_RANGE_CAP auto), so data past 2 GiB reads.
+	bool storage_length_zero = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has

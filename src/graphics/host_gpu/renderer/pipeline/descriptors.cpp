@@ -59,6 +59,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_set>
@@ -196,7 +197,10 @@ static uint64_t StorageRangeCap(const GraphicContext& graphics) {
 	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const auto* value = std::getenv("KYTY_STORAGE_RANGE_CAP");
 		if (value == nullptr || *value == '\0' || std::strcmp(value, "auto") == 0) {
-			return int64_t {2};
+			// KYTY_STORAGE_LENGTH_ZERO=1 makes shaders survive the zero length: bind the whole range.
+			const auto* length_zero = std::getenv("KYTY_STORAGE_LENGTH_ZERO");
+			return length_zero != nullptr && std::strcmp(length_zero, "0") != 0 ? int64_t {0}
+			                                                                    : int64_t {2};
 		}
 		return int64_t {std::strcmp(value, "0") != 0 ? 1 : 0};
 	}));
@@ -262,6 +266,20 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	                                     : size + adjustment,
 	             StorageRangeCap(graphics));
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
+	if (size > 0x7ffffffcu) {
+		// Bindings of 2 GiB or more (KYTY_STORAGE_RANGE_CAP / KYTY_STORAGE_LENGTH_ZERO): each guest
+		// range once, at most 64 lines.
+		static std::mutex                             logged_mutex;
+		static std::set<std::pair<uint64_t, uint64_t>> logged;
+		std::scoped_lock                              lock {logged_mutex};
+		if (logged.size() < 64 && logged.emplace(address, size).second) {
+			std::printf("Storage binding over 2 GiB: %s slot=%u guest=0x%016" PRIx64 " size=0x%" PRIx64
+			            " host range=0x%" PRIx64 " read=%d written=%d formatted=%d\n",
+			            ShaderStageResourceName(stage), slot, address, size,
+			            static_cast<uint64_t>(range), resource.read ? 1 : 0, resource.written ? 1 : 0,
+			            resource.formatted ? 1 : 0);
+		}
+	}
 	descriptor_scope.Stop();
 	const auto invalidate_start = resource.written ? BufferLookupStats::Now() : 0;
 	if (narrowed) {

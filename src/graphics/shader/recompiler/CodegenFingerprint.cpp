@@ -123,6 +123,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.branchless_lds) {
 		b.Text("branchless_lds");
 	}
+	if (options.storage_length_zero) {
+		b.Text("storage_length_zero");
+	}
 	if (options.vs_lane_wrap32 && options.wave32_clusters == Wave32Clusters::Off) {
 		b.Text("vs_lane_wrap32");
 	}

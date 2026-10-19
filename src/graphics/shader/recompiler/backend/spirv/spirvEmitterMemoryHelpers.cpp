@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -180,6 +182,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
+	if (GetCodegenOptions().storage_length_zero) {
+		// KYTY_STORAGE_LENGTH_ZERO: NVIDIA's OpArrayLength is 0 for a range of 2 GiB or more.
+		const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, access.length, 0);
+		const auto length = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), length, zero,
+		                          ConstantU32(state, 0xffffffffu), access.length);
+		access.length = length;
+	}
 	return access;
 }
 
