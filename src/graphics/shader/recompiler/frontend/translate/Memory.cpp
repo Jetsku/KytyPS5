@@ -180,6 +180,12 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	    (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer)) {
 		memory.coherent = true;
 	}
+	// KYTY_INDIRECT_COHERENT: a GLC/DLC scalar load is coherent too (S_LOAD through a computed
+	// address and S_BUFFER_LOAD through a computed V# read through BDA).
+	if (GetCodegenOptions().indirect_coherent && (decoded.glc || decoded.dlc) &&
+	    (memory.kind == ResourceKind::ScalarBuffer || memory.kind == ResourceKind::ScalarAddress)) {
+		memory.coherent = true;
+	}
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {

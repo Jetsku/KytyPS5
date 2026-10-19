@@ -1375,7 +1375,29 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 				    const auto pointer = state.builder.AllocateId();
 				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
 				                              pointer, host);
-				    if (bits == 32u) {
+				    if (bits == 32u && IndirectLoadCoherent(ctx, inst)) {
+					    // KYTY_INDIRECT_COHERENT: a GLC/DLC store is Coherent and Volatile, so a
+					    // polling workgroup of the same dispatch sees it.
+					    const auto block = state.builder.DecoratedType(
+					        spv::OpTypeStruct,
+					        {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+					         {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+					         {spv::OpDecorate, {spv::DecorationBlock}}},
+					        TypeU32(state));
+					    const auto base = state.builder.AllocateId();
+					    state.builder.AddFunction(
+					        spv::OpConvertUToPtr,
+					        TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block), base,
+					        host);
+					    const auto member = state.builder.AllocateId();
+					    state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state),
+					                              member, base, ConstantU32(state, 0));
+					    constexpr uint32_t alignment = sizeof(uint32_t);
+					    state.builder.AddFunction(spv::OpStore, member, value,
+					                              spv::MemoryAccessAlignedMask |
+					                                  spv::MemoryAccessVolatileMask,
+					                              alignment);
+				    } else if (bits == 32u) {
 					    constexpr uint32_t alignment = sizeof(uint32_t);
 					    state.builder.AddFunction(spv::OpStore, pointer, value,
 					                              spv::MemoryAccessAlignedMask, alignment);
@@ -2110,7 +2132,8 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto guest = Binary(state, spv::OpBitwiseAnd, TypeU64(state),
 	                          Binary(state, spv::OpIAdd, TypeU64(state), base, u64(offset)),
 	                          ConstantDeviceAddress(state, ~uint64_t {3}));
-	return LoadBda(ctx, guest, in_bounds, 32u);
+	return LoadBda(ctx, guest, in_bounds, 32u,
+	               GetCodegenOptions().indirect_coherent && mem.coherent);
 }
 
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -2164,7 +2187,8 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
-		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem),
+		                     GetCodegenOptions().indirect_coherent && mem.coherent);
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
