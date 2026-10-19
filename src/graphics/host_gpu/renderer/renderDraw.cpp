@@ -3806,6 +3806,49 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			     ps_addr, state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0);
 		}
 	}
+	// KYTY_DRAW_TRACE_PS=<hash>[:<sgpr>:<offset>] (diagnostic): logs the first 16 draws with this
+	// pixel program: counts and user SGPRs; with <sgpr>:<offset> also the V# at that byte offset of
+	// the pointer in user SGPRs <sgpr>/<sgpr>+1 and the first 64 dwords of its buffer, from guest
+	// memory (with whether a GPU write of them is pending).
+	static const auto trace_ps = [] {
+		std::array<uint64_t, 3> parsed {0, UINT64_MAX, 0};
+		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_PS"); value != nullptr) {
+			char* end = nullptr;
+			parsed[0] = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') {
+				parsed[1] = std::strtoull(end + 1, &end, 10);
+				if (end != nullptr && *end == ':') parsed[2] = std::strtoull(end + 1, &end, 0);
+			}
+		}
+		return parsed;
+	}();
+	if (trace_ps[0] != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	    state.ps_input_info.stage.program->shader_hash == trace_ps[0]) {
+		static std::atomic<uint32_t> traced {0};
+		if (traced.fetch_add(1, std::memory_order_relaxed) < 16) {
+			const auto& user_data = state.ps_input_info.stage.resources->user_data;
+			std::string text = fmt::format("DrawTracePs: hash=0x{:016x} index_count={} instances={} ud:",
+			                               trace_ps[0], draw.index_count, draw.instance_count);
+			for (const auto word: user_data) text += fmt::format(" {:08x}", word);
+			if (trace_ps[1] != UINT64_MAX && trace_ps[1] + 1 < user_data.size()) {
+				const uint64_t pointer = user_data[trace_ps[1]] |
+				                         (static_cast<uint64_t>(user_data[trace_ps[1] + 1] & 0xffffu) << 32u);
+				uint32_t vsharp[4] {};
+				const bool read = LibKernel::Memory::TryReadBacking(pointer + trace_ps[2], vsharp, sizeof(vsharp));
+				const uint64_t base = vsharp[0] | (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u);
+				text += fmt::format(" | V#@0x{:x}{}: {:08x} {:08x} {:08x} {:08x} base=0x{:x} stride={} records={}",
+				                    pointer + trace_ps[2], read ? "" : "?", vsharp[0], vsharp[1], vsharp[2],
+				                    vsharp[3], base, (vsharp[1] >> 16u) & 0x3fffu, vsharp[2]);
+				uint32_t words[64] {};
+				if (base != 0 && LibKernel::Memory::TryReadBacking(base, words, sizeof(words))) {
+					text += fmt::format(" gpu_dirty={} data:",
+					                    m_context.GetBufferCache().HasGpuDirtyBytes(base, sizeof(words)) ? 1 : 0);
+					for (const auto word: words) text += fmt::format(" {:08x}", word);
+				}
+			}
+			LOGF("%s\n", text.c_str());
+		}
+	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run
 		return;
