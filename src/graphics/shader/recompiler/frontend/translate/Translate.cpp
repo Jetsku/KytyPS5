@@ -1531,6 +1531,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
 	bool lds_write_pending = false;
+	bool flat_aperture     = false;
+	for (const auto& instruction: decoded.instructions) {
+		for (const auto* operand: {&instruction.src0, &instruction.src1, &instruction.src2,
+		                           &instruction.src3}) {
+			flat_aperture |= operand->kind >= Decoder::OperandKind::SharedBase &&
+			                 operand->kind <= Decoder::OperandKind::PrivateLimit;
+		}
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs,
@@ -1538,6 +1546,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		// Blocks are visited in address order; keep unordered LDS writes pending across
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);
+		translator.SetFlatAperture(flat_aperture);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

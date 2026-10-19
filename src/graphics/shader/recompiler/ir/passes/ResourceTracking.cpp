@@ -57,15 +57,59 @@ uint32_t PossibleU32Bits(Value value) {
 	}
 }
 
+// Whether `active` being true proves `condition` is true (same value, or an AND of such parts).
+bool MaskImplies(Value active, Value condition, uint32_t depth = 0) {
+	active    = active.Resolve();
+	condition = condition.Resolve();
+	if (active == condition) return true;
+	if (depth > 6) return false;
+	const auto* wanted = condition.TryInstruction();
+	if (wanted != nullptr && wanted->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return MaskImplies(active, wanted->Arg(0), depth + 1) &&
+		       MaskImplies(active, wanted->Arg(1), depth + 1);
+	}
+	const auto* have = active.TryInstruction();
+	if (have != nullptr && have->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return MaskImplies(have->Arg(0), condition, depth + 1) ||
+		       MaskImplies(have->Arg(1), condition, depth + 1);
+	}
+	return false;
+}
+
 // Whether the high dword of a FLAT address is provably outside the canonical user address range
 // (a PS5 shared/private aperture tag), so that access can only be local stack memory.
 bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	high   = high.Resolve();
 	active = active.Resolve();
+	// The aperture-routed access adds the carry of its low-dword offset to the high dword.
+	if (const auto* add = high.TryInstruction();
+	    add != nullptr && add->GetOpcode() == ValueOpcode::IAdd32) {
+		const auto is_carry = [](Value value) {
+			const auto* select = value.Resolve().TryInstruction();
+			return select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32 &&
+			       select->Arg(1).Resolve().IsImmediate() && select->Arg(2).Resolve().IsImmediate() &&
+			       select->Arg(1).Resolve().GetType() == Type::U32 &&
+			       select->Arg(2).Resolve().GetType() == Type::U32 &&
+			       select->Arg(1).Resolve().U32() <= 1u && select->Arg(2).Resolve().U32() <= 1u;
+		};
+		if (is_carry(add->Arg(1))) {
+			high = add->Arg(0).Resolve();
+		} else if (is_carry(add->Arg(0))) {
+			high = add->Arg(1).Resolve();
+		}
+	}
 	// A predicated VGPR write supplies its new value on exactly the lanes which execute this
 	// access. Do not discard a selection under a different mask.
 	while (const auto* select = high.TryInstruction()) {
-		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) {
+		if (select->GetOpcode() != ValueOpcode::SelectU32) {
+			break;
+		}
+		// The select must be this access's own predicated write. Instrumented copies of the mask
+		// (the loop guard duplicates it) are not the same value, so a select whose other side is the
+		// register's previous value (a phi) is accepted too.
+		const auto* other = select->Arg(2).Resolve().TryInstruction();
+		if (!MaskImplies(active, select->Arg(0)) &&
+		    (other == nullptr || other->GetOpcode() != ValueOpcode::Phi)) {
 			break;
 		}
 		high = select->Arg(1).Resolve();
@@ -164,6 +208,20 @@ public:
 				Collect(inst);
 			}
 		}
+		if (!m_dead_stores.empty()) {
+			// Global legs of aperture-routed stores that can never run: erase them.
+			for (auto* block: m_program.blocks) {
+				auto& instructions = block->Instructions();
+				for (auto inst = instructions.begin(); inst != instructions.end();) {
+					if (std::ranges::find(m_dead_stores, &*inst) != m_dead_stores.end()) {
+						inst->Invalidate();
+						inst = instructions.erase(inst);
+					} else {
+						++inst;
+					}
+				}
+			}
+		}
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
@@ -202,6 +260,8 @@ public:
 	}
 
 private:
+	std::vector<Inst*> m_dead_stores;
+
 	struct HandlePatch {
 		Inst*    handle   = nullptr;
 		uint32_t resource = 0;
@@ -1791,8 +1851,7 @@ private:
 				const auto* source   = predicate.TryInstruction();
 				if (source != nullptr && source->GetOpcode() == ValueOpcode::LogicalAnd &&
 				    IsNoncanonicalFlatAddress(inst.Arg(2), source->Arg(0))) {
-					inst.SetArg(last, Value(false));
-					m_info.uses_dma = true;
+					m_dead_stores.push_back(&inst);
 					return;
 				}
 			}
