@@ -1112,6 +1112,12 @@ uint32_t IndirectBufferInBounds(EmitterState& state, const IndirectBufferAccess&
 	return in_bounds;
 }
 
+// KYTY_INDIRECT_COHERENT (CodegenOptions::indirect_coherent): a GLC/DLC load through a computed V#
+// is Coherent and Volatile, as through a bound V#.
+bool IndirectLoadCoherent(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return GetCodegenOptions().indirect_coherent && ctx.Memory(inst).coherent;
+}
+
 uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto buffer = PrepareIndirectBuffer(ctx, inst);
@@ -1127,7 +1133,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		values[component] = EmitValueOrZeroIfCondition(
 		    state, AndCondition(state, valid_format,
 		                        IndirectBufferInBounds(state, buffer, component * 4u, 4u, false)),
-		    [&]() { return LoadBdaDword(ctx, address); });
+		    [&]() { return LoadBdaDword(ctx, address, IndirectLoadCoherent(ctx, inst)); });
 	}
 	return ConstructU32Composite(state, components, values);
 }
@@ -1211,7 +1217,7 @@ IndirectBufferElement IndirectBufferElementAccess(ValueEmitContext& ctx, const I
 // ResourceKind::IndirectBuffer), read through BDA; an out-of-range element reads 0.
 uint32_t LoadIndirectBufferElement(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t bits) {
 	const auto access = IndirectBufferElementAccess(ctx, inst, 0u, bits / 8u);
-	return LoadBda(ctx, access.guest, access.in_bounds, bits);
+	return LoadBda(ctx, access.guest, access.in_bounds, bits, IndirectLoadCoherent(ctx, inst));
 }
 
 // KYTY_BDA_WRITES: sets the written-page bit of the page a BDA write lands in (the fault buffer's

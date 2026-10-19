@@ -108,6 +108,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.ps_helper_atomics_skip ? 1u : 0u);
 	b.U8(options.loop_guard_all ? 1u : 0u);
 	b.U8(options.volatile_loads ? 1u : 0u);
+	b.U8(options.indirect_coherent ? 1u : 0u);
 	b.U8(static_cast<uint8_t>(options.wave32_clusters));
 	b.U8(static_cast<uint8_t>(options.lds_waitcnt_barrier));
 	b.U8(static_cast<uint8_t>(options.lds_device_buffer));

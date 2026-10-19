@@ -198,6 +198,12 @@ struct CodegenOptions {
 	// indirect V#) access is Volatile, not only MUBUF accesses with GLC/DLC. A guest loop that polls
 	// memory written by another workgroup or queue then rereads it instead of a cached or hoisted value.
 	bool volatile_loads = false;
+	// KYTY_INDIRECT_COHERENT=1 (default 0): a GLC/DLC load through a V# the shader computed
+	// (ResourceKind::IndirectBuffer, read through BDA) is Coherent and Volatile, as the same load
+	// through a bound V# already is. Without it the load is a plain one the driver may hoist out of
+	// a polling loop or serve from a non-coherent cache: a decoupled look-back scan (Ratchet &
+	// Clank's 0xba61d861c2b03285) spins forever on a partition flag another workgroup published.
+	bool indirect_coherent = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
