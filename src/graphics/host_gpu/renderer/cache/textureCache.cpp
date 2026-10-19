@@ -1892,14 +1892,20 @@ ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
+	// One placeholder per format and image dimensionality: a 1D or 3D view cannot use a 2D image.
+	const auto type = desc.info.type == Prospero::ImageType::kColor1D ||
+	                          desc.info.type == Prospero::ImageType::kColor3D
+	                      ? desc.info.type
+	                      : Prospero::ImageType::kColor2D;
+	const auto format = (static_cast<uint64_t>(type) << 32u) |
+	                    static_cast<uint64_t>(desc.info.pixel_format);
 	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
