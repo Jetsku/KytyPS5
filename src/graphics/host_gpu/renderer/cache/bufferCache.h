@@ -131,6 +131,10 @@ public:
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_HEAPS: a BDA access faulted at [vaddr, vaddr + size): the GPU-mapped allocation holding it
+	// becomes resident now and before every later BDA-writing dispatch (its other pages are the
+	// destinations of that and the next dispatches, which would drop their stores and atomics).
+	void NoteBdaFault(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -708,6 +712,10 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	// KYTY_BDA_HEAPS: allocations made resident by NoteBdaFault, re-ensured before BDA writers.
+	std::mutex                                        m_bda_heaps_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_heaps;
+	bool                                              m_bda_heaps_loaded = false;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	struct KnownFillRange {

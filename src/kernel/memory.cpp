@@ -1540,6 +1540,26 @@ bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
 }
 
+static bool IsInPrtAperture(uint64_t address, uint64_t size);
+
+// The committed, non-private, GPU-mapped allocation containing vaddr (not sparse/PRT).
+bool GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr) return false;
+	const auto generation = g_virtual_ranges->Generation();
+	if (!g_virtual_ranges->Query(vaddr, 0, &range) || !IsCommittedRangeType(range.type) ||
+	    IsPrivateCommittedRangeType(range.type) || range.start > vaddr ||
+	    range.size <= vaddr - range.start || IsInPrtAperture(vaddr, 1)) {
+		return false;
+	}
+	if (!IsGpuMapped(range.start, range.size) || generation != g_virtual_ranges->Generation()) {
+		return false;
+	}
+	*start = range.start;
+	*size  = range.size;
+	return true;
+}
+
 // DrawPrep::Validate's clean check after a clean coherence-log check over [since, now]
 // (KYTY_DRAW_PREP_CLEAN_SINCE). GPU thread only. The verdict of a whole 4 KiB page that was found
 // clean when the coherence generation was g (loaded before the exact predicates ran) still holds

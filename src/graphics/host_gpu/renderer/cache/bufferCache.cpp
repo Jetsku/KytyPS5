@@ -1,3 +1,4 @@
+#include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
@@ -40,6 +41,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -5583,8 +5585,116 @@ bool BdaWritesVerify() {
 	return GetBdaWritesMode() == BdaWritesMode::Verify;
 }
 
+namespace {
+
+// KYTY_BDA_HEAPS (default off): see BufferCache::NoteBdaFault. KYTY_BDA_HEAP_MB (default 64) is the
+// window around a fault (inside its allocation) that it makes resident.
+bool BdaHeapsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BDA_HEAPS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// The windows learned so far persist in _PipelineCache/<title>.bdaheaps ("start size" in hex per line):
+// the first dispatch that stores to a cold page drops those stores, so the next start makes them resident
+// before it.
+std::filesystem::path BdaHeapsPath() {
+	std::string title_id;
+	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
+	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
+		return {};
+	}
+	return std::filesystem::path("_PipelineCache") / (title_id + ".bdaheaps");
+}
+
+uint64_t BdaHeapLimit() {
+	static const uint64_t limit = [] {
+		const auto* value = std::getenv("KYTY_BDA_HEAP_MB");
+		const auto  mb    = value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : 64u;
+		return mb << 20u;
+	}();
+	return limit;
+}
+
+} // namespace
+
+void BufferCache::NoteBdaFault(uint64_t vaddr, uint64_t size) {
+	if (!BdaHeapsEnabled() || size == 0) {
+		return;
+	}
+	uint64_t alloc_start = 0;
+	uint64_t alloc_bytes = 0;
+	if (!Libs::LibKernel::Memory::GetGpuBufferMapping(vaddr, &alloc_start, &alloc_bytes)) {
+		return;
+	}
+	// The window is a multiple of its size, clipped to the allocation: neighbouring faults share it.
+	const auto window = std::max<uint64_t>(BdaHeapLimit(), CACHING_PAGESIZE);
+	const auto start  = std::max(alloc_start, vaddr & ~(window - 1u));
+	const auto end    = std::min(alloc_start + alloc_bytes, (vaddr & ~(window - 1u)) + window);
+	if (end <= start || end - start <= size) {
+		return;
+	}
+	const auto bytes = end - start;
+	{
+		std::scoped_lock lock {m_bda_heaps_mutex};
+		for (const auto& [heap_start, heap_size]: m_bda_heaps) {
+			if (heap_start == start && heap_size == bytes) {
+				return;
+			}
+		}
+		m_bda_heaps.emplace_back(start, bytes);
+		if (const auto path = BdaHeapsPath(); !path.empty()) {
+			std::error_code error;
+			std::filesystem::create_directories(path.parent_path(), error);
+			if (auto* file = std::fopen(path.string().c_str(), "w"); file != nullptr) {
+				for (const auto& [heap_start, heap_size]: m_bda_heaps) {
+					std::fprintf(file, "%" PRIx64 " %" PRIx64 "\n", heap_start, heap_size);
+				}
+				std::fclose(file);
+			}
+		}
+	}
+	(void)FindBuffer(start, bytes);
+	LOGF("KYTY_BDA_HEAPS: BDA fault at 0x%016" PRIx64 ": 0x%016" PRIx64 "+0x%" PRIx64
+	            " is resident now\n",
+	            vaddr, start, bytes);
+	
+}
+
 void BufferCache::PrepareBdaWrites() {
 	EXIT_IF(!BdaWritesEnabled());
+	if (BdaHeapsEnabled()) {
+		std::vector<std::pair<uint64_t, uint64_t>> heaps;
+		{
+			std::scoped_lock lock {m_bda_heaps_mutex};
+			if (!m_bda_heaps_loaded) {
+				m_bda_heaps_loaded = true;
+				if (const auto path = BdaHeapsPath(); !path.empty()) {
+					if (auto* file = std::fopen(path.string().c_str(), "r"); file != nullptr) {
+						unsigned long long heap_start = 0;
+						unsigned long long heap_size  = 0;
+						while (std::fscanf(file, "%llx %llx", &heap_start, &heap_size) == 2) {
+							m_bda_heaps.emplace_back(heap_start, heap_size);
+						}
+						std::fclose(file);
+						LOGF("KYTY_BDA_HEAPS: %zu window(s) loaded from %s\n", m_bda_heaps.size(),
+						     path.string().c_str());
+					}
+				}
+			}
+			heaps = m_bda_heaps;
+		}
+		for (const auto& [start, bytes]: heaps) {
+			uint64_t mapped_start = 0;
+			uint64_t mapped_size  = 0;
+			if (Libs::LibKernel::Memory::GetGpuBufferMapping(start, &mapped_start, &mapped_size) &&
+			    mapped_start <= start && start + bytes <= mapped_start + mapped_size) {
+				(void)FindBuffer(start, bytes);
+			}
+		}
+	}
 	m_fault_manager.PrepareBdaWrites();
 	// The dispatch may overwrite any known fill.
 	ForgetKnownFills(0, uint64_t {1} << 40u);
