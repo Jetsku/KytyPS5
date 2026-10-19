@@ -185,6 +185,27 @@ static bool WriteRangeImageStatsEnabled() {
 	return enabled;
 }
 
+// KYTY_STORAGE_RANGE_CAP (default auto: on for NVIDIA, 1 = always, 0 = never) limits a storage
+// buffer descriptor's range to just under 2 GiB. NVIDIA reports maxStorageBufferRange 4 GiB - 1,
+// but OpArrayLength of a binding with a larger range returns 0 there (seen with a 3 GiB range), so
+// every bounds-checked load reads 0. Ratchet & Clank binds its whole vertex pool with one 3 GiB V#:
+// all world vertices collapsed to one point and the G-buffer stayed empty. Data past the cap reads
+// 0 under the cap, as all of it did before.
+static uint64_t StorageRangeCap(const GraphicContext& graphics) {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
+		const auto* value = std::getenv("KYTY_STORAGE_RANGE_CAP");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "auto") == 0) {
+			return int64_t {2};
+		}
+		return int64_t {std::strcmp(value, "0") != 0 ? 1 : 0};
+	}));
+	constexpr uint64_t NvidiaVendor = 0x10de;
+	const bool on =
+	    mode == 1 || (mode == 2 && graphics.GetPhysicalDeviceProperties().vendorID == NvidiaVendor);
+	return on ? uint64_t {0x7ffffffc} : std::numeric_limits<uint64_t>::max();
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
@@ -236,8 +257,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
 	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
 	// no-op for every shader-side check, and it makes the device check match them.
-	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
-	                                           : size + adjustment;
+	const auto range =
+	    std::min(size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
+	                                     : size + adjustment,
+	             StorageRangeCap(graphics));
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	descriptor_scope.Stop();
 	const auto invalidate_start = resource.written ? BufferLookupStats::Now() : 0;
