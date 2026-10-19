@@ -1953,6 +1953,11 @@ static bool AmprAsyncEnabled() {
 	return enabled;
 }
 
+// Counts every record any AMPR buffer executed (not a blocked wait polled again): the engine's wait cap
+// restarts while other buffers still make progress, because a wait on a value an AMM map or another
+// buffer produces is slow, not lost, when the engines are busy (Ratchet & Clank's streamer).
+static std::atomic<uint64_t> g_ampr_progress {0};
+
 // Runs ordered[start..] of a buffer. With blocked_at, stops before the first wait record that is
 // not yet satisfied and stores its position there (SIZE_MAX when the buffer ran to the end).
 // Errors are reported through execution_result/error_offset; the return value is always OK.
@@ -1964,6 +1969,7 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 		const auto& entry = ordered[position];
 		switch (entry.kind) {
 			case CommandKind::ReadFile: {
+				g_ampr_progress.fetch_add(1, std::memory_order_relaxed);
 				const auto& command = state.read_file_commands[entry.index];
 				std::filesystem::path host_path;
 				if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
@@ -2003,6 +2009,7 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 				}
 			} break;
 			case CommandKind::KernelEvent: {
+				g_ampr_progress.fetch_add(1, std::memory_order_relaxed);
 				const auto& command = state.kernel_event_commands[entry.index];
 				const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
 				auto        result  = LibKernel::EventQueue::KernelTriggerEvent(
@@ -2020,6 +2027,7 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 				}
 			} break;
 			case CommandKind::WriteAddress: {
+				g_ampr_progress.fetch_add(1, std::memory_order_relaxed);
 				const auto& command = state.write_address_commands[entry.index];
 				if (!AprShared::WriteGuest(command.address, command.value)) {
 					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
@@ -2039,6 +2047,7 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 					*blocked_at = position;
 					return OK;
 				}
+				g_ampr_progress.fetch_add(1, std::memory_order_relaxed);
 				const auto result = ExecuteSyncCommand(command_buffer, command);
 				if (result != OK) {
 					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
@@ -2048,6 +2057,7 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 				}
 			} break;
 			case CommandKind::AmmMap: {
+				g_ampr_progress.fetch_add(1, std::memory_order_relaxed);
 				const auto& command = state.amm_map_commands[entry.index];
 				int         result  = OK;
 				if (command.kind == AmmCommandKind::Unmap) {
@@ -2112,6 +2122,8 @@ struct DeferredBuffer {
 	// When the front record (`start`) was first found blocked (AMPR_ENGINE_WAIT_CAP).
 	std::chrono::steady_clock::time_point blocked_since {};
 	size_t                                blocked_position = SIZE_MAX;
+	uint64_t                              progress_seen    = 0; // g_ampr_progress when blocked_since was set
+	std::chrono::steady_clock::time_point first_blocked {};      // blocked_since without progress restarts
 };
 
 // Safety cap of one engine wait: a record still unsatisfied after this long is logged and run as a
@@ -2119,6 +2131,8 @@ struct DeferredBuffer {
 // value that never arrives cannot stall its priority queue (and CompleteSubmission) forever. Far
 // above the waits Miles Morales' streamer needs (an AMM map that runs a few frames later).
 constexpr auto AMPR_ENGINE_WAIT_CAP = std::chrono::seconds(10);
+// ... restarted while other AMPR buffers keep executing records, up to this long in all.
+constexpr auto AMPR_ENGINE_WAIT_HARD_CAP = std::chrono::seconds(120);
 // The engine thread's poll interval while every front waits (CPU stores and GPU writes do not
 // notify): doubles from the first value to the last while nothing progresses.
 constexpr auto AMPR_ENGINE_POLL_FIRST = std::chrono::microseconds(100);
@@ -2171,6 +2185,13 @@ static void EngineThread(AmprEngineQueue* engine, const char* name) {
 			auto     start            = job.start;
 			const auto now            = std::chrono::steady_clock::now();
 			if (job.blocked_position == job.start && now - job.blocked_since >= AMPR_ENGINE_WAIT_CAP) {
+				const auto progress_now = g_ampr_progress.load(std::memory_order_relaxed);
+				if (progress_now != job.progress_seen && now - job.first_blocked < AMPR_ENGINE_WAIT_HARD_CAP) {
+					job.progress_seen  = progress_now;
+					job.blocked_since  = now;
+					lock.lock();
+					continue;
+				}
 				// AMPR_ENGINE_WAIT_CAP: run the blocked record as a bounded synchronous wait.
 				const auto& entry = job.ordered[job.start];
 				LOGF("\tAMPR engine wait not satisfied after %lld s, continuing: cb=0x%016" PRIx64
@@ -2196,6 +2217,8 @@ static void EngineThread(AmprEngineQueue* engine, const char* name) {
 			if (!done && job.blocked_position != blocked_at) {
 				job.blocked_position = blocked_at;
 				job.blocked_since    = std::chrono::steady_clock::now();
+				job.first_blocked    = job.blocked_since;
+				job.progress_seen    = g_ampr_progress.load(std::memory_order_relaxed);
 			}
 			if (done) {
 				if (job.result != 0) {
