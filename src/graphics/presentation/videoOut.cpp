@@ -843,39 +843,83 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
-	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
+	// A configurable-frequency timer loop that blocks between vblanks; it presents and fires the
+	// flip events the guest waits for. Its only spin is the last <= 50 us of a vblank wait.
 	Common::RaiseServiceThreadPriority();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
-	int64_t  total_wait      = 0;
+	// Keep the virtual display on an absolute QPC timeline. Carrying a negative relative wait
+	// forward makes an over-budget frame trigger the next vblank immediately, producing a burst
+	// of guest flips and visible frametime spikes at refresh rates above 60 Hz.
+	const auto start_time   = Common::Timer::QueryPerformanceCounter();
+	uint64_t   vblank_index = 0;
 	uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 8th vblank
 	while (!token.stop_requested()) {
 		if ((++placement_count & 7u) == 0u) {
 			Common::SamplePlacement(Common::ThreadRole::Host);
 		}
-		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
-			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		const auto now     = Common::Timer::QueryPerformanceCounter();
+		// Calculate deadlines from the origin instead of repeatedly adding a truncated period;
+		// this preserves the fractional QPC ticks at rates such as 120 Hz.
+		const auto deadline_for = [start_time, frequency, refresh](uint64_t index) {
+			const auto whole     = frequency / refresh;
+			const auto remainder = frequency % refresh;
+			return start_time + whole * index + (remainder * index) / refresh;
+		};
+		auto deadline = deadline_for(vblank_index);
+		bool missed_deadline = now > deadline;
+		if (now > deadline) {
+			// If work missed one or more deadlines, move to the next scheduled tick. Never
+			// manufacture back-to-back vblanks to repay the timing debt.
+			const auto elapsed = now - start_time;
+			vblank_index = std::max(vblank_index, (elapsed * refresh) / frequency);
+			deadline = deadline_for(vblank_index);
+			while (deadline < now) {
+				deadline = deadline_for(++vblank_index);
+			}
+		}
+		// Immediate mode should follow completed guest flips, not quantize them to the
+		// virtual vblank cadence. Keep the guest's vblank events on their configured clock,
+		// while allowing the host swapchain to present each ready frame as soon as it arrives.
+		if (Config::GetPresentMode() == Config::PresentMode::Immediate &&
+		    !m_presenter.IsGuestPaused()) {
+			for (;;) {
+				const auto current = Common::Timer::QueryPerformanceCounter();
+				if (current >= deadline || token.stop_requested()) {
+					break;
+				}
+				if (m_flip_queue.Flip(0)) {
+					continue;
+				}
+				const auto remaining = deadline - current;
+				const auto remaining_us = (remaining * 1000000u + frequency - 1) / frequency;
+				Common::Thread::SleepMicro(static_cast<uint32_t>(
+				    std::clamp<uint64_t>(std::min<uint64_t>(remaining_us, 500), 1,
+				                         std::numeric_limits<uint32_t>::max())));
+			}
+		}
+		for (;;) {
+			const auto current = Common::Timer::QueryPerformanceCounter();
+			if (current >= deadline) {
+				break;
+			}
+			const auto remaining = deadline - current;
+			const auto remaining_us = (remaining * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
 			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			if (token.stop_requested()) {
+				break;
+			}
 		}
 		if (token.stop_requested()) {
 			break;
 		}
-		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
-
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		vblank_index++;
 
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
-			const auto frame_end = Common::Timer::QueryPerformanceCounter();
-			total_wait +=
-			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
 			continue;
 		}
 
@@ -897,7 +941,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				presented = true;
 			}
 		}
-		if (!presented && total_wait < 0) {
+		if (!presented && missed_deadline) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
@@ -915,9 +959,6 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 		}
 		VblankEnd();
-
-		const auto frame_end = Common::Timer::QueryPerformanceCounter();
-		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
 	}
 }
 
