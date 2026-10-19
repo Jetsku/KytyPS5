@@ -981,7 +981,21 @@ private:
 				return false;
 			}
 			table_handle = current_handle;
-			const std::array<const Inst*, 1> image_users {&handle};
+			// Several image instructions may sample the same T# (each has its own handle over
+			// the same reads): every user must be an image handle with equivalent dwords.
+			std::vector<const Inst*> image_users {&handle};
+			for (const auto& use: read->Uses()) {
+				const Inst* other = use.user;
+				if (other == &handle || other->GetOpcode() != ValueOpcode::GetImageResource ||
+				    other->NumArgs() != 8u) {
+					continue;
+				}
+				bool same = true;
+				for (uint32_t i = 0; same && i < 8u; i++) {
+					same = EquivalentValue(m_program, handle.Arg(i), other->Arg(i));
+				}
+				if (same) image_users.push_back(other);
+			}
 			if (!UsesOnly(*read, image_users)) {
 				return false;
 			}
