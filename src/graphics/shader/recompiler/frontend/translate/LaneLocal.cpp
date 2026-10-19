@@ -236,10 +236,14 @@ bool SaveExec(Opcode opcode) {
 	}
 }
 
+// KYTY_LANE_LOCAL_NOPS=1: the proof accepts S_SENDMSG, S_SETREG_B32, S_TRAP and S_TTRACEDATA
+// (RefusedOpcode). Off by default: in Miles Morales it made 95 of 168 wave64
+// compute programs lane-local but saved no GPU time, and with KYTY_WAVE64_WARPS those programs ran
+// slightly faster split than lane-local.
 bool NopMessagesLaneLocal() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_LANE_LOCAL_NOPS");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
 }
@@ -265,7 +269,7 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::S_TRAP:
 		case Opcode::S_TTRACEDATA:
 			// In a compute program these translate to IR Sendmsg, TtraceData or a control no-op, and
-			// none of them emits anything (KYTY_LANE_LOCAL_NOPS=0 refuses them as before).
+			// none of them emits anything (KYTY_LANE_LOCAL_NOPS=1; off by default, see NopMessagesLaneLocal).
 			if (NopMessagesLaneLocal()) return nullptr;
 			return "wave message";
 		case Opcode::IMAGE_GET_LOD: return "compute derivatives"; // (their quads: the two-lane layout's)
