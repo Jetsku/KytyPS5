@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -2403,6 +2404,43 @@ bool StructurizeImpl(Graph& graph) {
 	return StructureBreakRegions(graph);
 }
 
+// KYTY_CFG_CLONE_EXITS (CodegenOptions::cfg_clone_exits): gives every extra block entering a
+// small shared terminal block its own copy of it. Returns whether anything was copied.
+bool CloneSharedExitBlocks(Graph& graph) {
+	constexpr uint32_t MaxInstructions = 8;
+	bool               cloned          = false;
+	const auto         count           = graph.blocks.size();
+	for (size_t index = 0; index < count; index++) {
+		const auto exit = graph.blocks[index];
+		if (exit.terminator.kind != TerminatorKind::Return || !exit.successors.empty() ||
+		    exit.predecessors.size() < 2 || exit.inst_end - exit.inst_begin > MaxInstructions ||
+		    exit.id == graph.entry_block) {
+			continue;
+		}
+		for (size_t p = 1; p < exit.predecessors.size(); p++) {
+			auto* predecessor = graph.FindBlock(exit.predecessors[p]);
+			if (predecessor == nullptr || predecessor->terminator.kind == TerminatorKind::IndirectBranch) {
+				continue;
+			}
+			BasicBlock copy   = exit;
+			copy.id           = static_cast<uint32_t>(graph.blocks.size());
+			copy.predecessors = {predecessor->id};
+			copy.dominators.clear();
+			copy.post_dominators.clear();
+			const auto copy_id = copy.id;
+			ReplaceValue(predecessor->successors, exit.id, copy_id);
+			ReplaceTerminatorTarget(predecessor->terminator, exit.id, copy_id);
+			graph.blocks.push_back(std::move(copy));
+			cloned = true;
+		}
+	}
+	if (cloned) {
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
+	return cloned;
+}
+
 } // namespace
 
 bool Structurize(Graph& graph) {
@@ -2435,6 +2473,16 @@ bool Structurize(Graph& graph) {
 		if (StructurizeImpl(structured)) {
 			graph = std::move(structured);
 			return true;
+		}
+	}
+	if (GetCodegenOptions().cfg_clone_exits && !graph.irreducible && !graph.unsupported) {
+		Graph cloned = graph;
+		if (CloneSharedExitBlocks(cloned)) {
+			structured = cloned;
+			if (StructurizeImpl(structured)) {
+				graph = std::move(structured);
+				return true;
+			}
 		}
 	}
 	SetFailure(graph, failure_kind, failure_block, failure_reason);

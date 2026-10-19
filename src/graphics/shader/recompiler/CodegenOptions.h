@@ -204,6 +204,13 @@ struct CodegenOptions {
 	// a polling loop or serve from a non-coherent cache: a decoupled look-back scan (Ratchet &
 	// Clank's 0xba61d861c2b03285) spins forever on a partition flag another workgroup published.
 	bool indirect_coherent = false;
+	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
+	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
+	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared
+	// "every lane discarded: null export, s_endpgm" tail from inside nested selections, which made
+	// the region of the outer selection externally entered (Wolverine's 0x09161b28ae4039bb). The
+	// copies run the same instructions; nothing after them can tell them apart.
+	bool cfg_clone_exits = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
