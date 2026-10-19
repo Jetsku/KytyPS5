@@ -108,6 +108,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	// IR::PushData::MeshFirstGroupDword, to WorkgroupId.x. 0 (NVIDIA: X equals the total) keeps
 	// the six draw dwords and the program as before.
 	uint32_t split_groups         = 0;
+	bool     fast_launch          = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {

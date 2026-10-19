@@ -1303,11 +1303,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (mesh.split_groups != 0) {
 				group = entry_ir.IAdd(group, draw(IR::PushData::MeshFirstGroupDword));
 			}
-			const auto primitive_chunk = entry_ir.IMul(group, u32(mesh.primitives_per_group));
+			const auto primitive_chunk = mesh.fast_launch ? group :
+			    entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
-			const auto chunk = entry_ir.IMul(primitive_chunk, step);
-			const auto vertices =
+			const auto chunk = mesh.fast_launch ? group : entry_ir.IMul(primitive_chunk, step);
+			const auto vertices = mesh.fast_launch ? u32(mesh.vertices_per_group) :
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
 			    entry_ir.ULessThan(vertices, size), u32(0),
@@ -1332,6 +1333,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
+			if (mesh.fast_launch) {
+				// Fast launch broadcasts the subgroup's base vertex and instance to every lane:
+				// ES VGPR count 1 -> v5 is the vertex index, v6 the instance index.
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
+				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+			} else {
 			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 			// center in every subgroup; strip winding follows the global primitive.
 			const auto vertex = entry_ir.IMul(local, step);
@@ -1382,6 +1390,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			// The instance ID counts from 0; the start instance is the draw's.
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
 			                      builtin(IR::StageInputKind::WorkgroupId, 1));
+			}
 			if (options.input_info.vertex != nullptr && options.input_info.vertex->start_instance_sgpr >= 0) {
 				entry_ir.SetScalarReg(
 				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr), draw(2));
