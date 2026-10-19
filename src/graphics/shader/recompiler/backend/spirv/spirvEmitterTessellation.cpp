@@ -14,7 +14,8 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& tess     = state.input_info.vertex->tess;
 	const auto  variable = state.tess_variables.at(static_cast<uint32_t>(kind));
 	EXIT_IF(variable == 0);
-	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput ||
+	                   (kind == Attribute::PatchOutput && state.program.stage == ShaderType::TessellationEvaluation);
 	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
@@ -91,7 +92,9 @@ void DefineTessellationInterfaces(EmitterState& state) {
 	for (uint32_t index = 0; index < used.size(); index++) {
 		if (!used[index]) continue;
 		const auto kind    = static_cast<Attribute>(index);
-		const bool input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+		const bool input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput ||
+		                   (kind == Attribute::PatchOutput &&
+		                    state.program.stage == ShaderType::TessellationEvaluation);
 		const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 		uint32_t   type;
 		if (kind == Attribute::Factor) {

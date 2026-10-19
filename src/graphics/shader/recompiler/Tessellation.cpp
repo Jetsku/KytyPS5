@@ -163,6 +163,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
 			               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
 			               inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
+			// Any other HS buffer store (the tessellation-factor ring): a constant address is
+			// recorded for the lowering, whatever IR spelled it (Ratchet & Clank:
+			// (v1 & 0xff) << 4 addresses patch 0's factors).
+			if (check && !local && buffer_store && !control_store && constant_stores != nullptr) {
+				const auto address = read(inst.src0);
+				if (address.kind == Kind::Affine && address.coefficient == 0u)
+					(*constant_stores)[inst.pc] = address.constant;
+			}
 			if (check && ((local && local_store) || control_store || control_read)) {
 				const auto address = read(inst.src0);
 				if (address.kind != Kind::Affine) {
@@ -200,6 +208,15 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 							value = {Kind::Affine, 1u, 0u};
 						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 					}
+					break;
+				case Opcode::V_AND_B32:
+					// The packed HS ID's low byte is the patch ordinal (Ratchet & Clank:
+					// v23 = v1 & 0xff addresses the patch block, 0x114 * patch + 0x5c * cp).
+					if ((lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant == 0xffu &&
+					     rhs.kind == Kind::PackedControlPoint) ||
+					    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0xffu &&
+					     lhs.kind == Kind::PackedControlPoint))
+						value = constant(0u);
 					break;
 				case Opcode::V_MOV_B32: value = lhs; break;
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
@@ -432,6 +449,11 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					                     options.stage != ShaderType::TessellationControl);
 					kind = TessellationAttribute::Factor;
 					factors += components;
+					if (!address.IsImmediate()) {
+						if (const auto found = constant_stores.find(inst.Flags<MemoryFlags>().pc);
+						    found != constant_stores.end())
+							address = Value(found->second);
+					}
 				} else {
 					kind = write ? TessellationAttribute::ControlOutput
 					             : TessellationAttribute::EvaluationInput;
@@ -448,7 +470,8 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					}
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
-						EXIT_NOT_IMPLEMENTED(!write);
+						// A TES reads the patch constants the HS stored (PatchOutput, as an input).
+						EXIT_NOT_IMPLEMENTED(!write && options.stage != ShaderType::TessellationEvaluation);
 						kind = TessellationAttribute::PatchOutput;
 					}
 				}
