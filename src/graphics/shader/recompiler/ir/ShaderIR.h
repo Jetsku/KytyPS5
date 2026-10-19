@@ -24,6 +24,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Emulated 64-bit FLAT apertures. Each contains 4 GiB of byte offsets and is outside guest global
+// VA space. Keep queries and FLAT routing consistent.
+inline constexpr uint32_t SharedApertureHigh  = 0x70000000u;
+inline constexpr uint32_t PrivateApertureHigh = 0x80000000u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
