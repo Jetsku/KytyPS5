@@ -1241,7 +1241,18 @@ static void DumpRequestedProgram(const ShaderParams& params, ShaderType stage) {
 		}
 		return parsed;
 	}();
-	if (request.first.empty() || !request.first.contains(params.hash)) return;
+	// A listed 1 logs the guest address and hash of every program translated.
+	if (request.first.contains(1)) {
+		const auto line = fmt::format("ProgramAddr: stage={} base=0x{:016x} hash=0x{:016x} words={}\n",
+		                               static_cast<uint32_t>(stage), params.Base(), params.hash,
+		                               params.code.size());
+		LOGF("%s", line.c_str());
+	}
+	// A listed value also matches the guest address of the program (as diagnostics print it).
+	if (request.first.empty() ||
+	    (!request.first.contains(params.hash) && !request.first.contains(params.Base()))) {
+		return;
+	}
 	static std::mutex                 mutex;
 	static std::set<std::string>      done;
 	const auto name = fmt::format("{:016x}_stage{}_ud{}", params.hash, static_cast<uint32_t>(stage),

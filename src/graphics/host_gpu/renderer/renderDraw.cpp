@@ -61,6 +61,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -3785,6 +3786,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (m_context.GetOcclusionCounter().DebugLogActive()) {
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
 		                           buffer.GetShaders().GetVs().es_regs.data_addr);
+	}
+	// KYTY_DRAW_SHADER_MAP=1 (diagnostic): logs once per guest VS/PS address pair the program hashes
+	// (device-loss checkpoints name the guest addresses only).
+	static const bool shader_map = [] {
+		const auto* value = std::getenv("KYTY_DRAW_SHADER_MAP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	if (shader_map) {
+		static std::mutex                                 map_mutex;
+		static std::set<std::pair<uint64_t, uint64_t>>    seen;
+		const auto vs_addr = buffer.GetShaders().GetVs().es_regs.data_addr;
+		const auto ps_addr = state.ps_active ? buffer.GetShaders().GetPs().ps_regs.data_addr : 0;
+		std::scoped_lock map_lock(map_mutex);
+		if (seen.emplace(vs_addr, ps_addr).second) {
+			LOGF("DrawShaderMap: VS=0x%016" PRIx64 " hash=0x%016" PRIx64 " PS=0x%016" PRIx64
+			     " hash=0x%016" PRIx64 "\n",
+			     vs_addr, state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+			     ps_addr, state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0);
+		}
 	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run
