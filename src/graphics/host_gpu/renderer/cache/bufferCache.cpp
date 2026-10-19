@@ -2526,6 +2526,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		NoteWatchdogSubmit(m_graphics.queue, submit);
 		submit_result = m_graphics.queue.submit(1, &submit, nullptr);
 	}
+	if (submit_result == vk::Result::eErrorDeviceLost) {
+		// The fatal exit below has no breadcrumbs of its own: report the device fault and NV
+		// checkpoints first (KYTY_DEVICE_FAULT_DIAGNOSTICS=1).
+		DumpDeviceLossDiagnostics(m_graphics, value);
+	}
 	RequireVulkanSuccess(submit_result, "submit side readback");
 
 	{
