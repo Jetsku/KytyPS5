@@ -1142,12 +1142,8 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 }
 
 int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
-	PRINT_NAME();
-
-	LOGF("\t event_param = 0x%016" PRIx64 "\n"
-	     "\t event       = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
-
+	// Games poll this in a tight loop (Wolverine: tens of GB of log per hour), so only a call that
+	// returns an event logs.
 	if (event == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
@@ -1156,6 +1152,11 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 	if (g_save_data_events.empty()) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
+
+	PRINT_NAME();
+	LOGF("\t event_param = 0x%016" PRIx64 "\n"
+	     "\t event       = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
 
 	*event = g_save_data_events.front();
 	g_save_data_events.pop_front();
