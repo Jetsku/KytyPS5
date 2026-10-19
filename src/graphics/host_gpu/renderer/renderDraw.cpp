@@ -2341,6 +2341,8 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 	}
 	color_scope.Stop();
 	const CommitStats::SubScope depth_scope(CommitStats::Sub::DepthTarget);
+	SetStencilTraceDraw(draw.index_count, buffer.GetShaders().GetPs().ps_regs.data_addr,
+	                    state.color_count, mrt_mask);
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	if (verify_entries) {
 		RenderDepthInfo reference {};

@@ -326,6 +326,21 @@ bool PredictRenderDepthTarget(const GraphicContext& graphics, const HW::Context&
 
 // KYTY_STENCIL_REF_TRACE=<ref> (diagnostic, default off): prints the guest depth/stencil state of
 // draws testing or writing that stencil reference, once per distinct state.
+namespace {
+struct StencilTraceDraw {
+	uint32_t index_count = 0;
+	uint64_t ps_addr     = 0;
+	uint32_t color_count = 0;
+	uint32_t mrt_mask    = 0;
+};
+thread_local StencilTraceDraw g_stencil_trace_draw;
+} // namespace
+
+void SetStencilTraceDraw(uint32_t index_count, uint64_t ps_addr, uint32_t color_count,
+                         uint32_t mrt_mask) {
+	g_stencil_trace_draw = {index_count, ps_addr, color_count, mrt_mask};
+}
+
 static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r) {
 	static const int ref = [] {
 		const auto* value = std::getenv("KYTY_STENCIL_REF_TRACE");
@@ -369,6 +384,11 @@ static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r
 	    line + used, sizeof(line) - used, " | cb tmask=0x%08x smask=0x%08x mode=%u rop=0x%02x fmt=%u/%u/%u/%u",
 	    hw.GetRenderTargetMask(), shr.m_cbShaderMask, cc.mode, cc.op, shr.target_output_mode[0],
 	    shr.target_output_mode[1], shr.target_output_mode[2], shr.target_output_mode[3]));
+	used += static_cast<size_t>(std::snprintf(
+	    line + used, sizeof(line) - used, " | draw idx=%u ps=0x%010llx colors=%u mrt=0x%x",
+	    g_stencil_trace_draw.index_count,
+	    static_cast<unsigned long long>(g_stencil_trace_draw.ps_addr),
+	    g_stencil_trace_draw.color_count, g_stencil_trace_draw.mrt_mask));
 	for (uint32_t slot = 0; slot < 4 && used < sizeof(line); slot++) {
 		const auto& b = hw.GetBlendControl(slot);
 		used += static_cast<size_t>(std::snprintf(
