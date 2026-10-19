@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -1022,6 +1023,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	DispatchGuard::Slot guard_slot {};
+	if (DispatchGuard::Enabled()) {
+		if (m_dispatch_guard == nullptr) {
+			m_dispatch_guard = std::make_unique<DispatchGuard>(m_context);
+		}
+		guard_slot = m_dispatch_guard->Reserve();
+	}
 	RebindBuffers(bindings);
 	// KYTY_REBIND_AFTER_JOIN: the bindings' lookups joined the argument buffer (or one another's).
 	if (RebindAfterJoinEnabled()) {
@@ -1039,6 +1047,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
 	buffer.BeginEmission();
+	vk::Buffer dispatch_buffer = args_buffer->Handle();
+	uint64_t   dispatch_offset = args_offset;
+	if (guard_slot.buffer) {
+		m_dispatch_guard->Record(buffer, guard_slot, args_buffer->Handle(), args_offset,
+		                         program.shader_hash);
+		dispatch_buffer = guard_slot.buffer;
+		dispatch_offset = guard_slot.offset;
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -1072,7 +1088,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	TraceDispatch(m_context, input_info, nullptr, args_addr);
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
+	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (program.info.bda_writes) {

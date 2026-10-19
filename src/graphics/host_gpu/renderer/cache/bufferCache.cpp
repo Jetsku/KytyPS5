@@ -6094,6 +6094,10 @@ uint32_t BufferCache::ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> s
 	// The guest-write transition once per dword run, before any byte lands.
 	RangeSet dwords;
 	for (const auto& store: stores) {
+		// A shader storing through a garbage pointer logs an address outside the guest space.
+		if (!GuestRange {store.Address() & ~uint64_t {3}, sizeof(uint32_t)}.Valid()) {
+			continue;
+		}
 		dwords.Add(store.Address() & ~uint64_t {3}, sizeof(uint32_t));
 	}
 	RangeSet refused;
@@ -6111,6 +6115,10 @@ uint32_t BufferCache::ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> s
 	for (const auto& store: stores) {
 		const auto address = store.Address() & ~uint64_t {3};
 		uint32_t   word    = 0;
+		if (!GuestRange {address, sizeof(word)}.Valid()) {
+			dropped++;
+			continue;
+		}
 		if (refused.Intersects(address, sizeof(word)) ||
 		    !Libs::LibKernel::Memory::TryReadBacking(address, &word, sizeof(word))) {
 			dropped++;

@@ -501,6 +501,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
+# KYTY_INDIRECT_GUARD (renderer/dispatchGuard.h): sanitises GPU-produced DispatchIndirect counts.
+set(gpu_dispatch_guard_source "${gpu_tiler_shader_dir}/gpu_dispatch_guard.comp")
+set(gpu_dispatch_guard_spv "${gpu_mesh_generated_dir}/gpu_dispatch_guard.spv")
+set(gpu_dispatch_guard_header "${gpu_mesh_generated_dir}/gpu_dispatch_guard_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_dispatch_guard_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_dispatch_guard_spv}" "${gpu_dispatch_guard_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_dispatch_guard_spv} -DOUTPUT=${gpu_dispatch_guard_header}
+	        -DSYMBOL=GPU_DISPATCH_GUARD_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_dispatch_guard_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_dispatch_guard_header}")
 
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
