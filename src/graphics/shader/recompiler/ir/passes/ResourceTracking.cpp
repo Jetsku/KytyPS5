@@ -57,6 +57,43 @@ uint32_t PossibleU32Bits(Value value) {
 	}
 }
 
+// Whether the high dword of a FLAT address is provably outside the canonical user address range
+// (a PS5 shared/private aperture tag), so that access can only be local stack memory.
+bool IsNoncanonicalFlatAddress(Value high, Value active) {
+	high   = high.Resolve();
+	active = active.Resolve();
+	// A predicated VGPR write supplies its new value on exactly the lanes which execute this
+	// access. Do not discard a selection under a different mask.
+	while (const auto* select = high.TryInstruction()) {
+		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) {
+			break;
+		}
+		high = select->Arg(1).Resolve();
+	}
+	uint32_t lower = 0;
+	uint32_t upper = UINT32_MAX;
+	if (high.IsImmediate() && high.GetType() == Type::U32) {
+		lower = upper = high.U32();
+	} else if (const auto* inst = high.TryInstruction();
+	           inst != nullptr && inst->GetOpcode() == ValueOpcode::UMedTri32) {
+		// The median lies between any two constant inputs, regardless of the third.
+		uint32_t count = 0;
+		for (size_t index = 0; index < inst->NumArgs(); ++index) {
+			const auto value = inst->Arg(index).Resolve();
+			if (!value.IsImmediate() || value.GetType() != Type::U32) continue;
+			if (count++ == 0) {
+				lower = upper = value.U32();
+			} else {
+				lower = std::min(lower, value.U32());
+				upper = std::max(upper, value.U32());
+			}
+		}
+		if (count < 2) return false;
+	}
+	// Leave one high DWORD on each side for the signed instruction offset/carry.
+	return lower > 0x00008000u && upper < 0xffff7fffu;
+}
+
 Value CanonicalizeSampleAdjustDword3(Value value) {
 	for (;;) {
 		value            = value.Resolve();
@@ -1744,6 +1781,21 @@ private:
 				return;
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
+			if (address_info.access == AddressAccess::Write && memory.kind == ResourceKind::Global &&
+			    inst.NumArgs() >= 5) {
+				// The global leg of an aperture-routed FLAT store: the predicate is exec AND NOT
+				// (shared OR private). When the address is provably an aperture tag the leg never
+				// runs, so it is switched off rather than requiring ownership tracking.
+				const auto last      = inst.NumArgs() - 1;
+				const auto predicate = inst.Arg(last).Resolve();
+				const auto* source   = predicate.TryInstruction();
+				if (source != nullptr && source->GetOpcode() == ValueOpcode::LogicalAnd &&
+				    IsNoncanonicalFlatAddress(inst.Arg(2), source->Arg(0))) {
+					inst.SetArg(last, Value(false));
+					m_info.uses_dma = true;
+					return;
+				}
+			}
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 			}

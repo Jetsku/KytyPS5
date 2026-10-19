@@ -325,6 +325,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						Fail(program, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
+				} else if (address_access == IR::AddressAccess::Write &&
+				           inst.Arg(inst.NumArgs() - 1).Resolve().IsImmediate() &&
+				           !inst.Arg(inst.NumArgs() - 1).Resolve().U1()) {
+					// Switched off by resource tracking (a provably local aperture address).
 				} else if (address_access == IR::AddressAccess::Write) {
 					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
 				} else {
