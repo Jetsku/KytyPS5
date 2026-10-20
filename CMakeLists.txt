@@ -2284,6 +2284,11 @@ if(BUILD_TESTING)
 	# stay in the build directory, so later runs start warm).
 	add_test(NAME program_cache
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-only)
+	# The compute cases compiled on several threads at once, from fresh and from shared copied
+	# translations (the precompile replay's pattern), against single-threaded compiles; no
+	# compiled program may name an instruction specialization made dead (CPU only).
+	add_test(NAME shader_parallel_compile
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --parallel-compile-only)
 	add_test(NAME program_cache_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
 	add_test(NAME program_cache_gpu_verify

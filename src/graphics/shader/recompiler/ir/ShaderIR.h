@@ -939,6 +939,14 @@ void  ValidateProgram(const Program& program, bool require_ssa);
 // (first-encounter hitches, precompile time; chenxiao07 a28de66fe).
 [[nodiscard]] bool ValidationEnabled();
 void  ResolveControlFlowIdentities(Program& program);
+// References from the resource-plan tables (descriptor sources, resource control flow, SRT reads,
+// evaluation recipes and tapes, uniform fill, dynamic reads) to instructions the program no longer
+// has. Specialization can leave such references: a zero-stride buffer read or an FMASK read it
+// replaces takes its descriptor's last uses, and dead-code elimination then erases instructions
+// the descriptor source still names. Drop clears them (an empty value, a null instruction) and
+// returns how many it cleared; Count only counts them. Neither dereferences such a reference.
+size_t CountDeadPlanReferences(const Program& program);
+size_t DropDeadPlanReferences(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
 Value ResolveActiveU32(Value value, Value active);

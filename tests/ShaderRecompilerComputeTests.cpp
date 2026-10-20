@@ -49,6 +49,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -72,6 +73,7 @@
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -2381,8 +2383,16 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(translated.program) == 0,
+          "the translation's plan tables name instructions it does not have");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  // Specialization can make instructions the plan tables name dead (a zero-stride buffer read's
+  // descriptor); CompileProgram must clear those references before a pass reads them.
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(result.program) == 0,
+          "the compiled program's plan tables name instructions it does not have");
   copy_check.Verify(test.name, options, specialization, result);
   cache_check.Verify(options, runtime, resources, specialization, result);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -2859,8 +2869,16 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(translated.program) == 0,
+          "the translation's plan tables name instructions it does not have");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  // Specialization can make instructions the plan tables name dead (a zero-stride buffer read's
+  // descriptor); CompileProgram must clear those references before a pass reads them.
+  Require(test.name, "plan references",
+          ShaderRecompiler::IR::CountDeadPlanReferences(result.program) == 0,
+          "the compiled program's plan tables name instructions it does not have");
   copy_check.Verify(test.name, options, specialization, result);
   cache_check.Verify(options, runtime, resources, specialization, result);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
@@ -58210,6 +58228,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderBvhTests.inc"
 #include "ShaderBdaWriteTests.inc"
 #include "ShaderIsaAuditTests.inc"
+#include "ShaderParallelCompileTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -58562,8 +58581,19 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized();
     return ProgramCacheTests::CorpusProgramCache(argv[2]);
   }
+  // CPU only (--journal-compile <shaders.journal> [threads]): every permutation of a shader
+  // journal compiled once, then on several threads (ShaderParallelCompileTests.inc).
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--journal-compile") == 0) {
+    EnsureConfigInitialized();
+    const auto threads = argc == 4 ? static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 0)) : 8u;
+    return ParallelCompileTests::JournalCompile(argv[2], std::clamp(threads, 1u, 64u));
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--parallel-compile-only") == 0) {
+    ParallelCompileTests::CheckParallelCompile();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gi-probe-codegen-only") == 0) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();
