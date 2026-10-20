@@ -3,6 +3,7 @@
 #include "common/cpuPlacement.h"
 #include "common/hostException.h"
 #include "common/liveSwitch.h"
+#include "common/logging/log.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -423,13 +424,20 @@ void WriteStacks(FILE* file) {
 #else
 void WriteStacks(FILE*) {}
 #endif
-bool WriteSnapshot(const std::string& directory, bool stacks) {
+bool WriteSnapshot(const std::string& directory, bool stacks, uint32_t report = 1,
+                   std::string* written = nullptr) {
 	try {
 		std::error_code error;
 		const auto      directory_path = std::filesystem::u8path(directory);
 		std::filesystem::create_directories(directory_path, error);
 		if (error) return false;
-		const auto path = directory_path / "watchdog.txt";
+		// The first report keeps its old name; KYTY_HANG_WATCHDOG_REPORTS adds numbered ones.
+		const auto path = directory_path / (report <= 1 ? std::string("watchdog.txt")
+		                                                : fmt::format("watchdog-{}.txt", report));
+		if (written != nullptr) {
+			const auto text = path.u8string();
+			written->assign(reinterpret_cast<const char*>(text.data()), text.size());
+		}
 #ifdef _WIN32
 		FILE* file = _wfopen(path.c_str(), L"wb");
 #else
@@ -451,7 +459,19 @@ bool WriteSnapshot(const std::string& directory, bool stacks) {
 } // namespace
 
 bool StallDetector::Poll(uint64_t now, uint64_t f, uint64_t s, uint64_t timeout) {
-	if (fired) return false;
+	// flips_only: host submissions do not count as progress (a CP that keeps submitting while
+	// the guest never flips again still fires).
+	if (flips_only) s = submissions == 0 ? s : submissions;
+	if (fired) {
+		// Re-armed only after progress, so one stall gives one report.
+		if (rearm && (f != flips || s != submissions)) {
+			fired         = false;
+			flips         = f;
+			submissions   = s;
+			idle_since_ms = now;
+		}
+		return false;
+	}
 	if (!armed) {
 		armed         = f != 0 && s != 0;
 		flips         = f;
@@ -497,10 +517,26 @@ void StartMonitor(std::string_view trace_directory) {
 	const auto* value = std::getenv("KYTY_HANG_WATCHDOG_MS");
 	const auto  timeout =
 	    value ? std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 1000, 600000) : 5000;
-	g_watchdog = std::jthread([timeout](std::stop_token stop) {
+	// KYTY_HANG_WATCHDOG_REPORTS=<n> (default 1, at most 16): after a report the watchdog waits
+	// for progress and reports the next stall too, so a long loading pause cannot use up the one
+	// report before the real freeze. KYTY_HANG_WATCHDOG_TRIGGER=flips: a stall is "no flip" only
+	// (default: no flip and no host submission).
+	const auto* reports_value = std::getenv("KYTY_HANG_WATCHDOG_REPORTS");
+	const auto  max_reports   = static_cast<uint32_t>(
+        reports_value ? std::clamp<uint64_t>(std::strtoull(reports_value, nullptr, 10), 1, 16) : 1);
+	const auto* trigger    = std::getenv("KYTY_HANG_WATCHDOG_TRIGGER");
+	const bool  flips_only = trigger != nullptr && std::strcmp(trigger, "flips") == 0;
+	g_watchdog = std::jthread([timeout, max_reports, flips_only](std::stop_token stop) {
 		Common::PlaceCurrentThreadCold();
 		try {
-			StallDetector    detector;
+			const auto fresh = [&] {
+				StallDetector d;
+				d.flips_only = flips_only;
+				d.rearm      = max_reports > 1;
+				return d;
+			};
+			StallDetector    detector = fresh();
+			uint32_t         reports  = 0;
 			std::unique_lock lock(g_sleep_mutex);
 			for (;;) {
 				const bool terminal = g_terminal_requested.exchange(false);
@@ -508,17 +544,26 @@ void StartMonitor(std::string_view trace_directory) {
 				const auto now = NowMs();
 				g_time_ms.store(now, std::memory_order_relaxed);
 				if (!Enabled() && !terminal)
-					detector = {};
+					detector = fresh();
 				else if (terminal ||
 				         detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
 					g_report_reason.store(terminal ? 2 : 1);
+					reports++;
 					lock.unlock();
-					if (!WriteSnapshot(g_directory, true)) {
+					std::string path;
+					if (!WriteSnapshot(g_directory, true, reports, &path)) {
 						// An explicit unwritable trace path must not silently discard the
 						// report.
-						(void)WriteSnapshot(DefaultDirectory(), true);
+						(void)WriteSnapshot(DefaultDirectory(), true, reports, &path);
 					}
-					return;
+					// One line per stall report, after every thread was resumed (not during a fatal
+					// shutdown, which may be tearing the log down).
+					if (!terminal) Log::WriteToConsoleAndLog(fmt::format(
+					    "Hang watchdog: no {} for {} ms (flips={}); report {}/{} written to {}\n",
+					    flips_only ? "flip" : "flip or submission", timeout, g_flips.load(),
+					    reports, max_reports, path));
+					if (terminal || reports >= max_reports) return;
+					lock.lock();
 				}
 				g_sleep.wait_for(lock, stop, std::chrono::seconds(1),
 				                 [] { return g_terminal_requested.load(); });
