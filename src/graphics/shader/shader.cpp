@@ -1379,16 +1379,31 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
-	mesh.max_primitives       = mesh.fast_launch ? mesh.max_vertices :
-	                            native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices)
-	                                       : group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	// Fast launch (mesh shader mode): a meshlet usually has more triangles than vertices, and
+	// GE_NGG_SUBGRP_CNTL.PRIM_AMP_FACTOR is the subgroup's primitive capacity. The guest exports
+	// one primitive per lane, so the subgroup needs a lane per primitive as well (upstream
+	// ae2555832, Senaxx e6f33fdb). With the vertex count only, Wolverine's meshlets lost every
+	// primitive past the 32nd: holes in the terrain, rocks and shadow casters.
+	// KYTY_MESH_PRIM_AMP=0 restores the old sizing.
+	static const bool prim_amp = [] {
+		const char* value = std::getenv("KYTY_MESH_PRIM_AMP");
+		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	const auto amplification  = sh.m_geNggSubgrpCntl & 0x1ffu;
+	mesh.max_primitives       = mesh.fast_launch
+	                                ? (prim_amp ? std::max(mesh.max_vertices, amplification)
+	                                            : mesh.max_vertices)
+	                                : native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices)
+	                                             : group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      native_ngg ? mesh.max_primitives :
 	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	const auto threads  = native_ngg && !mesh.fast_launch ? mesh.vertices_per_group : mesh.max_vertices;
+	const auto threads  = native_ngg && !mesh.fast_launch ? mesh.vertices_per_group
+	                      : mesh.fast_launch ? std::max(mesh.max_vertices, mesh.max_primitives)
+	                                         : mesh.max_vertices;
 	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
