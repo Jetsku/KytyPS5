@@ -503,6 +503,9 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// KYTY_STORAGE_LENGTH_ZERO: a length of 0 means unbounded (NVIDIA's OpArrayLength of a binding
+	// of 2 GiB or more).
+	bool                  zero_length_unbounded = false;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,

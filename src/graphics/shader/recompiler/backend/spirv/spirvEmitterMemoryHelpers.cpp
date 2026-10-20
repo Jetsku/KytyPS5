@@ -182,14 +182,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
-	if (GetCodegenOptions().storage_length_zero) {
-		// KYTY_STORAGE_LENGTH_ZERO: NVIDIA's OpArrayLength is 0 for a range of 2 GiB or more.
-		const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, access.length, 0);
-		const auto length = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), length, zero,
-		                          ConstantU32(state, 0xffffffffu), access.length);
-		access.length = length;
-	}
+	// KYTY_STORAGE_LENGTH_ZERO: NVIDIA's OpArrayLength is 0 for a range of 2 GiB or more. The check
+	// becomes "index < length || length == 0" (EmitMemoryElementInBounds); selecting 0xffffffff
+	// as the length crashed NVIDIA's shader compiler.
+	access.zero_length_unbounded = GetCodegenOptions().storage_length_zero;
 	return access;
 }
 
@@ -247,6 +243,10 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
                                    uint32_t index) {
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
+	if (access.zero_length_unbounded) {
+		const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, access.length, 0);
+		return Binary(state, spv::OpLogicalOr, TypeBool(state), in_bounds, zero);
+	}
 	return in_bounds;
 }
 
