@@ -2127,14 +2127,23 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	CommitStats::Mark(CommitStats::Phase::Programs);
 	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
-	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw.
-	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw. A tessellated draw needs
+	// all three vertex stages (one without a runtime made PrepareBindings exit: Wolverine
+	// HS 0x3ff475220c3b4e7b + TES 0xb39fc591165dbc5f).
+	const bool tess_missing =
+	    state.vertex_stages_written == 3u &&
+	    (!state.programs.vertex[1] || !state.programs.vertex[2] || !state.vertex_info[0].stage ||
+	     !state.vertex_info[1].stage || !state.vertex_info[2].stage);
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel) || tess_missing) {
 		// Counted and reported (the first few, then every 2048th) so a dropped draw is never silent.
 		static std::atomic_uint64_t dropped {0};
 		const auto                  count = dropped.fetch_add(1, std::memory_order_relaxed) + 1u;
 		if (count <= 4u || (count & 2047u) == 0u) {
 			std::printf("Warning: draw #%" PRIu64 " dropped, %s program missing (%s)\n", count,
-			            !state.programs.vertex[0] ? "vertex" : "pixel", draw.Name());
+			            !state.programs.vertex[0] ? "vertex"
+			            : tess_missing           ? "tessellation"
+			                                     : "pixel",
+			            draw.Name());
 		}
 		return false;
 	}
