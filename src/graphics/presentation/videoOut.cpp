@@ -24,6 +24,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/eventQueueFilters.h"
 #include "kernel/pthread.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
@@ -1296,6 +1297,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_presenter.Renderer().NotifyGpuProgress();
 
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+		Controller::OnGuestFlip();
 		// A completed guest flip (one per presented layer group), not the polling iterations of
 		// FlipQueue::Flip. This is a CPU presentation marker; it does not measure GPU execution
 		// time.

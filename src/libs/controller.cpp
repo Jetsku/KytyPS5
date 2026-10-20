@@ -198,13 +198,160 @@ static int TriggerTravel(const ControllerState& state, Axis axis) {
 	return (state.buttons & button) != 0 && value == 0 ? 255 : value;
 }
 
+// KYTY_PAD_SCRIPT="20:cross,24:cross,f1200:options" (default unset): unattended button presses
+// inside the emulated pad, OR-ed into the real input. "<s>:<button>" fires at <s> seconds (may be
+// fractional) after pad initialization, "f<n>:<button>" at guest flip <n>. Buttons: cross, circle,
+// square, triangle, options, up, down, left, right, l1, r1.
+// KYTY_PAD_TRIGGER_FILE=<path> (default unset): while the game reads the pad, the file is polled
+// every 250 ms; when it exists, the buttons it names (separated by commas or spaces) are pressed
+// at once and the file is deleted, so a test runner can press when it sees a prompt.
+// Each press is held for 300 ms. Host input and window focus are never touched.
+namespace {
+
+struct PadScriptEvent {
+	bool     by_flip  = false;
+	double   at       = 0.0;
+	uint32_t button   = 0;
+	bool     fired    = false;
+	uint64_t fired_us = 0;
+};
+
+std::vector<PadScriptEvent> g_pad_script;
+Common::Mutex               g_pad_script_mutex;
+std::atomic<uint64_t>       g_pad_flips {0};
+uint64_t                    g_pad_start_us = 0;
+const char*                 g_pad_trigger  = nullptr;
+
+uint64_t PadScriptNowUs() {
+	return static_cast<uint64_t>(SDL_GetTicksNS() / 1000);
+}
+
+uint32_t PadScriptButton(const char* name, size_t len) {
+	static constexpr struct {
+		const char* name;
+		uint32_t    button;
+	} BUTTONS[] = {{"cross", PAD_BUTTON_CROSS}, {"circle", PAD_BUTTON_CIRCLE},
+	               {"square", PAD_BUTTON_SQUARE}, {"triangle", PAD_BUTTON_TRIANGLE},
+	               {"options", PAD_BUTTON_OPTIONS}, {"up", PAD_BUTTON_UP},
+	               {"down", PAD_BUTTON_DOWN}, {"left", PAD_BUTTON_LEFT},
+	               {"right", PAD_BUTTON_RIGHT}, {"l1", PAD_BUTTON_L1}, {"r1", PAD_BUTTON_R1}};
+	for (const auto& b: BUTTONS) {
+		if (std::strlen(b.name) == len && std::strncmp(b.name, name, len) == 0) {
+			return b.button;
+		}
+	}
+	return 0;
+}
+
+void PadScriptInit() {
+	g_pad_start_us    = PadScriptNowUs();
+	const char* value = std::getenv("KYTY_PAD_SCRIPT");
+	for (const char* p = value; p != nullptr && *p != '\0';) {
+		const char* end   = std::strchr(p, ',');
+		const char* next  = end != nullptr ? end + 1 : p + std::strlen(p);
+		const char* colon = std::strchr(p, ':');
+		if (end == nullptr) {
+			end = next;
+		}
+		PadScriptEvent event;
+		if (colon != nullptr && colon < end) {
+			event.by_flip = *p == 'f' || *p == 'F';
+			event.at      = std::strtod(event.by_flip ? p + 1 : p, nullptr);
+			event.button  = PadScriptButton(colon + 1, static_cast<size_t>(end - colon - 1));
+		}
+		if (event.button != 0) {
+			g_pad_script.push_back(event);
+		} else {
+			LOGF("Kyty: KYTY_PAD_SCRIPT: ignored entry '%.*s'\n", static_cast<int>(end - p), p);
+		}
+		p = next;
+	}
+	if (const char* trigger = std::getenv("KYTY_PAD_TRIGGER_FILE");
+	    trigger != nullptr && *trigger != '\0') {
+		g_pad_trigger = trigger;
+	}
+	if (!g_pad_script.empty() || g_pad_trigger != nullptr) {
+		LOGF("Kyty: KYTY_PAD_SCRIPT: %zu scripted presses, trigger file %s\n", g_pad_script.size(),
+		     g_pad_trigger != nullptr ? g_pad_trigger : "off");
+	}
+}
+
+// KYTY_PAD_TRIGGER_FILE: queues the file's buttons for now and deletes it.
+void PadScriptPollTrigger(uint64_t now) {
+	static uint64_t last_poll = 0;
+	if (now - last_poll < 250000) {
+		return;
+	}
+	last_poll = now;
+	FILE* file = std::fopen(g_pad_trigger, "rb");
+	if (file == nullptr) {
+		return;
+	}
+	char       text[256] = {};
+	const auto size      = std::fread(text, 1, sizeof(text) - 1, file);
+	std::fclose(file);
+	text[size] = '\0';
+	(void)std::remove(g_pad_trigger);
+	const double at = static_cast<double>(now - g_pad_start_us) / 1e6;
+	for (const char* p = text; *p != '\0';) {
+		const auto len = std::strcspn(p, ", \t\r\n");
+		if (len != 0) {
+			PadScriptEvent event;
+			event.at     = at;
+			event.button = PadScriptButton(p, len);
+			if (event.button != 0) {
+				g_pad_script.push_back(event);
+			}
+		}
+		p += len + (p[len] != '\0' ? 1 : 0);
+	}
+}
+
+uint32_t PadScriptButtons() {
+	if (g_pad_script.empty() && g_pad_trigger == nullptr) {
+		return 0;
+	}
+	constexpr uint64_t HOLD_US = 300000;
+	Common::LockGuard  lock(g_pad_script_mutex);
+	const uint64_t     now  = PadScriptNowUs();
+	const uint64_t     flip = g_pad_flips.load(std::memory_order_relaxed);
+	if (g_pad_trigger != nullptr) {
+		PadScriptPollTrigger(now);
+	}
+	uint32_t held = 0;
+	for (auto& event: g_pad_script) {
+		if (!event.fired) {
+			const bool due = event.by_flip
+			                     ? static_cast<double>(flip) >= event.at
+			                     : static_cast<double>(now - g_pad_start_us) >= event.at * 1e6;
+			if (!due) {
+				continue;
+			}
+			event.fired    = true;
+			event.fired_us = now;
+			LOGF("Kyty: KYTY_PAD_SCRIPT press 0x%05x at %.2f s, guest flip %llu\n", event.button,
+			     static_cast<double>(now - g_pad_start_us) / 1e6, static_cast<unsigned long long>(flip));
+		}
+		if (now - event.fired_us < HOLD_US) {
+			held |= event.button;
+		}
+	}
+	return held;
+}
+
+} // namespace
+
+void OnGuestFlip() {
+	g_pad_flips.fetch_add(1, std::memory_order_relaxed);
+}
+
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
+	data->buttons           = state.buttons | PadScriptButtons();
 	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
 	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
 	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
@@ -436,6 +583,7 @@ void Initialize() {
 
 	g_controller = new GameController;
 	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
+	PadScriptInit();
 }
 
 void Shutdown() {
