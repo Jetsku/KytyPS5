@@ -1094,17 +1094,23 @@ private:
 				if (same) image_users.push_back(other);
 			}
 			if (!UsesOnly(*read, image_users)) {
-				// An explicit-LOD gather also passes T# words 1 and 3 by value (its mip selection
-				// reads them on the GPU, Translator::IMAGE_GATHER): such a word stays a real read
-				// through the table (Wolverine's HiZ CS 0x37ab7d3ab9bff0b9 gathers a heap T#);
-				// only the handle's own uses are planned.
+				// A T# word the shader also uses as a value stays a real read through the table;
+				// only the handle's own uses are planned. An explicit-LOD gather passes words 1 and
+				// 3 by value (its mip selection reads them on the GPU, Translator::IMAGE_GATHER:
+				// Wolverine's HiZ CS 0x37ab7d3ab9bff0b9), and Wolverine's material pixel shaders
+				// (0x487054eeb2d7f3e7 and five more) take their sampler key from T# word 4.
+				// KYTY_TSHARP_DATA_WORDS=0: only the gather words (the first fix).
+				static const bool data_words = [] {
+					const char* value = std::getenv("KYTY_TSHARP_DATA_WORDS");
+					return value == nullptr || std::strcmp(value, "0") != 0;
+				}();
 				const bool lod_words_only = std::ranges::all_of(read->Uses(), [&](const Use& use) {
 					if (std::ranges::find(image_users, use.user) != image_users.end()) return true;
 					return use.user->GetOpcode() == ValueOpcode::ImageGatherRaw && use.operand >= 3u &&
 					       std::ranges::find(image_users, use.user->Arg(0).Resolve().TryInstruction()) !=
 					           image_users.end();
 				});
-				if (!lod_words_only || dword == 0u) {
+				if ((!lod_words_only && !data_words) || dword == 0u) {
 					return false;
 				}
 				plan.memory[dword] = UINT32_MAX;
