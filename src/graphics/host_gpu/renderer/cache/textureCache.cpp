@@ -4736,13 +4736,34 @@ bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
 	       image.info.HasStencil() || image.backing.image == nullptr;
 }
 
+// Whether two images at the same guest range are interpretations of the same texel grid. Same
+// extent, or (KYTY_ALIAS_BLOCK_VIEWS, default on; =0 off) a block-compressed image and an
+// uncompressed one whose texels are its blocks: same block grid, block size, depth and
+// subresources. Ratchet & Clank writes its BC6 reflection-probe array (256x256x384) through a
+// R32G32B32A32_UINT 64x64x384 view of the same memory; with extents compared as texels the
+// written view never synced into the BC6 image, every probe but the first stayed black and areas
+// lit only by probes were pitch black.
+static bool SameAliasGrid(const ImageInfo& a, const ImageInfo& b) {
+	if (a.extent == b.extent) {
+		return true;
+	}
+	static const bool block_views = [] {
+		const auto* value = std::getenv("KYTY_ALIAS_BLOCK_VIEWS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return block_views && a.IsBlock() != b.IsBlock() && a.BlockExtent() == b.BlockExtent() &&
+	       a.extent.depth == b.extent.depth && a.bytes_per_block == b.bytes_per_block &&
+	       a.resources == b.resources && a.tile_mode == b.tile_mode && !a.IsVolume() &&
+	       !b.IsVolume();
+}
+
 bool TextureCache::HasAliasPartner(uint64_t page, ImageId found, const Image& image) const {
 	bool partner = false;
 	if (const auto* owners = m_image_page_table.Find(page); owners != nullptr) {
 		owners->ForEach([&](ImageId id) {
 			const auto* other = m_slot_images.try_get(id);
 			if (id != found && other != nullptr && other->registered &&
-			    other->info.data == image.info.data && other->info.extent == image.info.extent &&
+			    other->info.data == image.info.data && SameAliasGrid(other->info, image.info) &&
 			    other->backing.samples == image.backing.samples) {
 				partner = true;
 			}
@@ -4765,7 +4786,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
 		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
 		    other->info.HasStencil() || other->info.data != image.info.data ||
-		    other->info.extent != image.info.extent ||
+		    !SameAliasGrid(other->info, image.info) ||
 		    other->backing.samples != image.backing.samples) {
 			continue;
 		}
