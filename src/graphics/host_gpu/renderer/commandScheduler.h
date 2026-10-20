@@ -112,6 +112,9 @@ public:
 		m_command.m_user_config = binding.user_config;
 		m_command.m_shaders     = binding.shaders;
 	}
+	// The bound shader registers, writable: the command processor's own SH register writes during
+	// an op (an indirect multi-draw's per-record draw index).
+	[[nodiscard]] HW::Shader* BoundShaders() const noexcept { return m_command.m_shaders; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;

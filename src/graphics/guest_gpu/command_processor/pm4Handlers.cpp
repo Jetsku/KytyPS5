@@ -1638,6 +1638,15 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	return 6;
 }
 
+// The first stage's user SGPR at an SH register location: the GS user SGPR, 32 + the HS user SGPR
+// for a tessellated draw (LS-HS), -1 for another register.
+static int32_t FirstStageUserSgprAt(uint32_t location) {
+	const auto id = location - Pm4::SPI_SHADER_USER_DATA_GS_0;
+	if (id < 32u) return static_cast<int32_t>(id);
+	const auto hs = location - Pm4::SPI_SHADER_USER_DATA_HS_0;
+	return hs < 32u ? static_cast<int32_t>(32u + hs) : -1;
+}
+
 // The GS user SGPR at an SH register location, -1 for another register.
 // KYTY_START_INSTANCE_SGPR=0: indirect draws name no start-instance SGPR (the shaders still count
 // the instance ID from 0, as the GPU does).
@@ -1741,12 +1750,17 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
+	// DRAW_INDEX_ENABLE (word 3 bit 31): the CP writes each record's index into the user SGPR at
+	// DRAW_INDEX_LOC (bits 0..15) before drawing it (Insomniac mesh draws index a per-draw table).
+	const int32_t draw_index_sgpr =
+	    (buffer[3] >> 31u) != 0u ? FirstStageUserSgprAt(buffer[3] & 0xffffu) : -1;
+
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     registers, draw_initiator, indexed);
+	                     registers, draw_initiator, indexed, draw_index_sgpr);
 
 	return 9;
 }

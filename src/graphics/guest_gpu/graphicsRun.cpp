@@ -120,6 +120,21 @@ static bool NativeIndirectEnabled() {
 	return enabled;
 }
 
+// KYTY_INDIRECT_DRAW_INDEX (default on; =0 off): DRAW_(INDEX_)INDIRECT_MULTI with DRAW_INDEX_ENABLE
+// has the CP write each record's index into the user SGPR at DRAW_INDEX_LOC before that record
+// draws. Kyty ignored it, so every record saw the SGPR's previous value: Wolverine's title mesh
+// draws (one record per object, the shader indexes a per-draw table with that SGPR) all drew the
+// first table entry with the other records' meshlet counts, i.e. garbage triangles in front of
+// the camera. The host indirect path has no per-record SGPR, so such multi-draws of more than one
+// record take the CPU path (which reads the records).
+static bool IndirectDrawIndexEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_INDIRECT_DRAW_INDEX");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // KYTY_INDIRECT_VALIDATE=1 (diagnostic): also read native arguments on the CPU, which drains
 // the GPU, and log where the native and CPU-read draws would differ.
 static bool IndirectValidateEnabled() {
@@ -2624,12 +2639,30 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t                 stride_in_bytes,
                                          [[maybe_unused]] IndirectDrawRegisters registers,
-                                         uint32_t draw_initiator, bool indexed) {
+                                         uint32_t draw_initiator, bool indexed,
+                                         int32_t draw_index_sgpr) {
 	auto op               = IndirectDrawOp(data_offset, draw_initiator, indexed);
 	op.count_addr         = reinterpret_cast<uint64_t>(count_addr);
 	op.max_count_or_count = max_count_or_count;
 	op.stride             = stride_in_bytes;
+	if (draw_index_sgpr >= 0 && IndirectDrawIndexEnabled()) {
+		op.draw_index_sgpr = static_cast<uint32_t>(draw_index_sgpr) + 1u;
+	}
 	(void)Submit(CpSeq::OpKind::DrawIndirectMulti, &op, sizeof(op));
+}
+
+// The CP's DRAW_INDEX_LOC write: `index` into the bound first stage's user SGPR (1 + GS user SGPR,
+// or 1 + 32 + HS user SGPR). The register keeps the value, as on the GPU.
+static void WriteDrawIndexSgpr(HW::Shader* shaders, uint32_t encoded_sgpr, uint32_t index) {
+	if (shaders == nullptr || encoded_sgpr == 0) {
+		return;
+	}
+	const auto sgpr = encoded_sgpr - 1u;
+	if (sgpr < 32u) {
+		shaders->SetGsUserSgpr(sgpr, index, shaders->GetVs().gs_user_sgpr.type[sgpr]);
+	} else if (sgpr - 32u < 32u) {
+		shaders->SetHsUserSgpr(sgpr - 32u, index, shaders->GetVs().hs_user_sgpr.type[sgpr - 32u]);
+	}
 }
 
 void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
@@ -2647,9 +2680,24 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		return;
 	}
 
+	// DRAW_INDEX_ENABLE: each record gets its index in that SGPR. The host path draws every record
+	// with the registers as they are, so it is right for a single record only.
+	HW::Shader* const draw_index_shaders =
+	    op.draw_index_sgpr != 0 ? GetScheduler().BoundShaders() : nullptr;
+	if (draw_index_shaders != nullptr) {
+		WriteDrawIndexSgpr(draw_index_shaders, op.draw_index_sgpr, 0);
+		static std::atomic<bool> reported {false};
+		if (!reported.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Kyty: indirect multi-draw writes the draw index to user SGPR %u "
+			     "(KYTY_INDIRECT_DRAW_INDEX=0 turns it off)\n",
+			     op.draw_index_sgpr - 1u);
+		}
+	}
+
 	// The renderer rejects strides shorter than a record; the CPU path below reports them.
 	const auto args_base = op.args_base + op.data_offset;
-	if (TryDrawIndirectNative({.args_addr           = args_base,
+	if ((draw_index_shaders == nullptr || max_count_or_count == 1) &&
+	    TryDrawIndirectNative({.args_addr           = args_base,
 	                           .stride              = stride_in_bytes,
 	                           .max_count           = max_count_or_count,
 	                           .count_addr          = count_addr,
@@ -2680,6 +2728,7 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = args_base + static_cast<uint64_t>(i) * stride_in_bytes;
+		WriteDrawIndexSgpr(draw_index_shaders, op.draw_index_sgpr, i);
 
 		if (!indexed) {
 			const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);

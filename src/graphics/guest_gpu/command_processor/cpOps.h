@@ -226,7 +226,7 @@ struct DrawIndirectOp {
 	uint32_t flags               = 0;
 	uint32_t num_instances       = 0; // IndirectFlagSetInstances
 	uint32_t snapshot            = 0; // IndirectFlagSnapshot
-	uint32_t reserved            = 0;
+	uint32_t draw_index_sgpr     = 0; // multi: 1 + the user SGPR given each record's index (0: none)
 	uint64_t window              = 0; // IndirectFlagPrepared
 };
 
