@@ -4614,8 +4614,58 @@ ImageId TextureCache::FindImageFromRangeLocked(uint64_t address, uint64_t size, 
 	return selected;
 }
 
+// KYTY_IMAGE_LAYER_DIAG=<layers> (diagnostic, default off): every 5 s, for each sampled image with
+// that many array layers, log its guest range and how many 64 KiB chunks of the guest memory behind
+// it are nonzero, to tell an image that missed guest writes from guest memory that never got them.
+static void ImageLayerDiag(const ImageInfo& info) {
+	static const uint32_t layers = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_LAYER_DIAG");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+	}();
+	if (layers == 0 || info.resources.layers != layers || info.data.Empty()) {
+		return;
+	}
+	static std::mutex                                                     mutex;
+	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> last;
+	const auto                                                            now = std::chrono::steady_clock::now();
+	{
+		std::scoped_lock lock {mutex};
+		auto [it, inserted] = last.try_emplace(info.data.address, now);
+		if (!inserted && now - it->second < std::chrono::seconds(5)) {
+			return;
+		}
+		it->second = now;
+	}
+	constexpr uint64_t   Chunk = 64 * 1024;
+	std::vector<uint8_t> bytes(Chunk);
+	uint64_t             chunks = 0, nonzero = 0, unreadable = 0, first = UINT64_MAX;
+	std::string          map;
+	for (uint64_t at = info.data.address; at < info.data.End(); at += Chunk, chunks++) {
+		const auto size = std::min(Chunk, info.data.End() - at);
+		if (!LibKernel::Memory::TryReadBacking(at, bytes.data(), size)) {
+			unreadable++;
+			map += 'u';
+			continue;
+		}
+		const bool any = std::any_of(bytes.begin(), bytes.begin() + static_cast<int64_t>(size),
+		                             [](uint8_t b) { return b != 0; });
+		if (any) {
+			nonzero++;
+			first = std::min(first, at - info.data.address);
+		}
+		map += any ? '#' : '.';
+	}
+	LOGF("Image layer diag: 0x%016" PRIx64 " size=0x%" PRIx64 " %ux%u layers=%u levels=%u fmt=%u: "
+	     "%" PRIu64 "/%" PRIu64 " chunks nonzero, %" PRIu64 " unreadable, first nonzero +0x%" PRIx64
+	     " map %s\n",
+	     info.data.address, info.data.size, info.extent.width, info.extent.height,
+	     info.resources.layers, info.resources.levels, static_cast<uint32_t>(info.guest_format),
+	     nonzero, chunks, unreadable, first == UINT64_MAX ? 0 : first, map.c_str());
+}
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
+	ImageLayerDiag(m_slot_images[id].info);
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
