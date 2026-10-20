@@ -1535,7 +1535,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
 	bool lds_write_pending = false;
 	bool flat_aperture     = false;
+	const bool flat_aperture_bvh = GetCodegenOptions().flat_aperture_bvh;
 	for (const auto& instruction: decoded.instructions) {
+		flat_aperture |= flat_aperture_bvh &&
+		                 (instruction.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY ||
+		                  instruction.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY);
 		for (const auto* operand: {&instruction.src0, &instruction.src1, &instruction.src2,
 		                           &instruction.src3}) {
 			flat_aperture |= operand->kind >= Decoder::OperandKind::SharedBase &&

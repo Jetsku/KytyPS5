@@ -132,6 +132,12 @@ struct CodegenOptions {
 	// slower on the RTX 3090 for Astro Bot's heaviest LDS kernel (cs 0x6856320a9c6f89fd: 1.42 -> 2.33 ms).
 	// Device-buffer LDS and GDS keep their branches.
 	bool branchless_lds = false;
+	// KYTY_FLAT_APERTURE_BVH=1 (default off; Wolverine preset): a program with an
+	// IMAGE_BVH*_INTERSECT_RAY routes its FLAT accesses by aperture even when it never reads an
+	// aperture register. The PS5 ray-traversal stack addresses LDS/scratch through FLAT with
+	// hard-coded aperture high words (V_MED3_U32 hi, 0x80000000, 0x70000000), so its pushes were
+	// global stores, which cannot compile (Wolverine cs 0x2ea3957af2daf690).
+	bool flat_aperture_bvh = false;
 	// KYTY_LANE_LOCAL=1 (default off; chenxiao07/KytyPS5 9907780e1, 9bb47e15d): a wave64 compute program
 	// proven lane-local (Frontend::IsWaveLaneLocal: its lanes' results depend on no lane outside their
 	// 32-lane half) runs one guest lane per host invocation on a host whose compute subgroups are fixed at
