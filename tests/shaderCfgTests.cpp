@@ -11313,7 +11313,7 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   Check(jump->terminator.indirect_selector_values.size() == 2,
         "S_SETPC_B64 jump table did not retain selector mapping");
   Check(
-      (result.ir_dump.find("SLoadDword") == std::string::npos),
+      (result.ir_dump.find("LoadAddressU32") == std::string::npos),
       "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "dispatcher SPIR-V lacks OpSwitch");
@@ -11374,7 +11374,9 @@ void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
         "unreachable S_SETPC metadata suppressed a reachable scalar load component");
 }
 
-void TestNewShaderRecompilerSetpcDwordJumpTable() {
+// offset_sgpr 106 aliases the vcc_lo selector, like PPSA34015's
+// s_load_dword s17, s[22:23], s17.
+void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),             // skip one unreachable block
       EncodeSMovB32(100, 129),         // unreachable
@@ -11384,20 +11386,20 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
       EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
       0x00000034u,
       EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
-      EncodeSmem0(0x00, 6, 2),
-      (106u << 25u) | 4u,          // s_load_dword s6, s[4:5], vcc_lo offset:4
-      EncodeSopp(0x0c, 0),         // s_waitcnt 0
-      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
-      EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
-      EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
-      EncodeSMovB32(1, 129),       // case 0
+      EncodeSmem0(0x00, offset_sgpr, 2),
+      (106u << 25u) | 4u,  // s_load_dword offset, s[4:5], vcc_lo offset:4
+      EncodeSopp(0x0c, 0), // s_waitcnt 0
+      EncodeSop2(0x01, 4, 4, offset_sgpr), // s_sub_u32 s4, s4, offset
+      EncodeSop2(0x05, 5, 5, 128),         // s_subb_u32 s5, s5, 0
+      EncodeSop1(0x20, 0, 4),              // s_setpc_b64 s[4:5]
+      EncodeSMovB32(1, 129),               // case 0
       EncodeSopp(0x02, 1),
       EncodeSMovB32(2, 129), // case 1
       EncodeSopp(0x01, 0),
       0u,
       0x00000010u,
       0x00000008u,
-      0x00000010u, // table at pc 0x44, targets relative backward from pc 0x40
+      0x00000010u, // table at pc 0x4c, targets relative backward from pc 0x48
   };
 
   auto options = MakeCompileOptions(ShaderType::Compute);
@@ -11433,7 +11435,7 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
                 result.program.block_info,
                 [](const auto &info) { return info.start_pc == 0x04u; }),
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
-  Check((result.ir_dump.find("SLoadDword") == std::string::npos),
+  Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
@@ -16070,7 +16072,8 @@ int main(int argc, char **argv) {
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTable(6);
+  TestNewShaderRecompilerSetpcDwordJumpTable(106);
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();
