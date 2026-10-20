@@ -58367,6 +58367,24 @@ int main(int argc, char **argv) {
     std::fclose(out);
     return 0;
   }
+  // --disasm <program.bin> <out.txt>: the RDNA2 disassembly of a guest program dump (the .bin of
+  // KYTY_DUMP_PROGRAMS, or the code of a program-cache source record).
+  if (argc == 4 && std::strcmp(argv[1], "--disasm") == 0) {
+    std::vector<u32> words;
+    if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
+      u32 word = 0;
+      while (std::fread(&word, sizeof(word), 1, file) == 1) words.push_back(word);
+      std::fclose(file);
+    }
+    std::FILE *out = std::fopen(argv[3], "wb");
+    if (words.empty() || out == nullptr) return 2;
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(words, decoded, true);
+    const auto text = ShaderRecompiler::Decoder::ProgramToString(decoded);
+    std::fwrite(text.data(), 1, text.size(), out);
+    std::fclose(out);
+    return 0;
+  }
   if (argc == 4 && std::strcmp(argv[1], "--scan-functions") == 0) {
     std::vector<u32> words;
     if (std::FILE *file = std::fopen(argv[2], "rb"); file != nullptr) {
