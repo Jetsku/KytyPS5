@@ -1389,19 +1389,26 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		const char* value = std::getenv("KYTY_MESH_PRIM_AMP");
 		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
 	}();
+	// Outside fast launch the amplification bounds the exported primitives too (upstream
+	// ae2555832 for native NGG: primitives per group times PRIM_AMP_FACTOR, with a lane per
+	// primitive; Senaxx 896831309 for the legacy GS path: meshlet shaders export more primitives
+	// than vertices - 2).
 	const auto amplification  = sh.m_geNggSubgrpCntl & 0x1ffu;
-	mesh.max_primitives       = mesh.fast_launch
-	                                ? (prim_amp ? std::max(mesh.max_vertices, amplification)
-	                                            : mesh.max_vertices)
-	                                : native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices)
-	                                             : group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	const auto amp            = prim_amp ? amplification : 0u;
+	const auto native_bound   = mesh.InputPrimitiveCount(mesh.max_vertices);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
-	                                      native_ngg ? mesh.max_primitives :
-	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	                                      native_ngg ? (mesh.fast_launch ? std::max(mesh.max_vertices, amp)
+	                                                                     : native_bound)
+	                                                 : mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
+	mesh.max_primitives = mesh.fast_launch ? std::max(mesh.max_vertices, amp)
+	                      : native_ngg ? std::max(native_bound, mesh.primitives_per_group * amp)
+	                                   : group.primitive_group_size *
+	                                         std::max(sh.m_vgtGsMaxVertOut - 2u, amp);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	const auto threads  = native_ngg && !mesh.fast_launch ? mesh.vertices_per_group
+	const auto threads  = native_ngg && !mesh.fast_launch
+	                          ? std::max(mesh.vertices_per_group, mesh.primitives_per_group * amp)
 	                      : mesh.fast_launch ? std::max(mesh.max_vertices, mesh.max_primitives)
 	                                         : mesh.max_vertices;
 	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
