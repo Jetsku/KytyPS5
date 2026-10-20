@@ -414,6 +414,9 @@ struct PthreadMutexPrivate {
 	uint32_t                count     = 0;
 	int                     type      = 1;
 	int                     pprotocol = PTHREAD_PRIO_NONE;
+	// Waiters that have waited longer than the hand-off limit, oldest first. While it is not
+	// empty only its front thread may take the mutex (see NativeMutexLock).
+	std::vector<Pthread> starving;
 };
 
 struct PthreadMutexattrPrivate {
@@ -1417,6 +1420,67 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
+// Guest mutex starvation guard. The mutex below is not fair: unlock wakes a waiter, but the
+// unlocking thread can take the mutex again before the woken host thread runs. A guest thread
+// that unlocks and re-locks in a loop (Wwise's audio thread does this with its global lock
+// when audio runs behind) then keeps the mutex for seconds and every other locker starves:
+// Ratchet & Clank froze with its main thread stuck in PthreadMutexLock. A waiter that has
+// waited longer than KYTY_MUTEX_HANDOFF_US (default 2000 us, 0 = off) joins the starving
+// queue; while that queue is not empty the mutex goes to its front thread only (direct
+// hand-off, like Go's sync.Mutex starvation mode). Short waits behave as before.
+static int64_t MutexHandoffMicros() {
+	static const int64_t value = [] {
+		const auto* env = std::getenv("KYTY_MUTEX_HANDOFF_US");
+		if (env == nullptr || env[0] == '\0') {
+			return static_cast<int64_t>(2000);
+		}
+		return std::max<int64_t>(0, std::strtoll(env, nullptr, 10));
+	}();
+	return value;
+}
+
+static bool MutexMayTake(const PthreadMutexPrivate* mutex, Pthread self) {
+	return mutex->owner == nullptr && (mutex->starving.empty() || mutex->starving.front() == self);
+}
+
+static void MutexLeaveStarving(PthreadMutexPrivate* mutex, Pthread self) {
+	auto it = std::find(mutex->starving.begin(), mutex->starving.end(), self);
+	if (it != mutex->starving.end()) {
+		mutex->starving.erase(it);
+	}
+}
+
+// Called with mutex->m held after each wait step: joins the starving queue once the wait is
+// longer than the hand-off limit (again if a signal handler on this thread took and released
+// the mutex in between, which removed this thread from the queue).
+static void MutexUpdateStarving(PthreadMutexPrivate* mutex, Pthread self,
+                                std::chrono::steady_clock::time_point wait_start,
+                                bool* starving) {
+	const auto limit = MutexHandoffMicros();
+	if (limit <= 0) {
+		return;
+	}
+	if (*starving) {
+		if (std::find(mutex->starving.begin(), mutex->starving.end(), self) ==
+		    mutex->starving.end()) {
+			mutex->starving.push_back(self);
+		}
+		return;
+	}
+	if (std::chrono::steady_clock::now() - wait_start >= std::chrono::microseconds(limit)) {
+		*starving = true;
+		mutex->starving.push_back(self);
+	}
+}
+
+static std::chrono::steady_clock::duration MutexWaitStep(bool starving) {
+	const auto limit = MutexHandoffMicros();
+	if (!starving && limit > 0 && limit < SIGNAL_APC_POLL_MICROS) {
+		return std::chrono::microseconds(limit);
+	}
+	return std::chrono::microseconds(SIGNAL_APC_POLL_MICROS);
+}
+
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
 	EXIT_IF(mutex == nullptr);
 
@@ -1443,39 +1507,45 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	}
 
 	std::optional<HangWatchdog::Scope> blocked;
-	if (mutex->owner != nullptr)
+	if (!MutexMayTake(mutex, self))
 		blocked.emplace("guest-mutex", reinterpret_cast<uint64_t>(mutex),
 		                reinterpret_cast<uint64_t>(self), reinterpret_cast<uint64_t>(mutex->owner));
+	const auto wait_start = std::chrono::steady_clock::now();
+	bool       starving   = false;
 	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
+		while (!MutexMayTake(mutex, self)) {
 			if (blocked) blocked->Observed(reinterpret_cast<uint64_t>(mutex->owner));
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
+			mutex->cv.wait_for(lock, MutexWaitStep(starving));
+			if (!MutexMayTake(mutex, self)) {
+				MutexUpdateStarving(mutex, self, wait_start, &starving);
 				lock.unlock();
 				KernelDispatchPendingSignalForCurrentThread();
 				lock.lock();
 			}
 		}
 	} else if (*timeout_us == 0) {
-		if (mutex->owner != nullptr) {
+		if (!MutexMayTake(mutex, self)) {
 			return ETIMEDOUT;
 		}
 	} else {
-		const auto deadline =
-		    std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us);
-		while (mutex->owner != nullptr) {
+		const auto deadline = wait_start + std::chrono::microseconds(*timeout_us);
+		while (!MutexMayTake(mutex, self)) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
+				if (starving) {
+					MutexLeaveStarving(mutex, self);
+					lock.unlock();
+					// The next starving waiter may be the one allowed to take the mutex now.
+					mutex->cv.notify_all();
+				}
 				return ETIMEDOUT;
 			}
 
 			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			mutex->cv.wait_for(lock, poll);
-			if (mutex->owner != nullptr) {
+			const auto step      = MutexWaitStep(starving);
+			mutex->cv.wait_for(lock, (remaining < step ? remaining : step));
+			if (!MutexMayTake(mutex, self)) {
+				MutexUpdateStarving(mutex, self, wait_start, &starving);
 				lock.unlock();
 				KernelDispatchPendingSignalForCurrentThread();
 				lock.lock();
@@ -1483,6 +1553,9 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		}
 	}
 
+	if (!mutex->starving.empty()) {
+		MutexLeaveStarving(mutex, self);
+	}
 	mutex->owner = self;
 	mutex->count = 1;
 	return OK;
@@ -1507,7 +1580,8 @@ static int NativeMutexTrylock(PthreadMutexPrivate* mutex) {
 		return EBUSY;
 	}
 
-	if (mutex->owner != nullptr) {
+	// A starving waiter has priority (see MutexHandoffMicros).
+	if (mutex->owner != nullptr || !mutex->starving.empty()) {
 		return EBUSY;
 	}
 
@@ -1540,8 +1614,14 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 
 	mutex->owner = nullptr;
 	mutex->count = 0;
+	// With starving waiters only the queue's front may take the mutex: wake all so it runs now.
+	const bool hand_off = !mutex->starving.empty();
 	lock.unlock();
-	mutex->cv.notify_one();
+	if (hand_off) {
+		mutex->cv.notify_all();
+	} else {
+		mutex->cv.notify_one();
+	}
 
 	return OK;
 }
