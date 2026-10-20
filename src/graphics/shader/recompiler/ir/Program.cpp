@@ -821,6 +821,30 @@ size_t DropDeadPlanReferences(Program& program) {
 	return dropped;
 }
 
+size_t ResolvePlanIdentities(Program& program) {
+	size_t resolved = 0;
+	ForEachPlanReference(
+	    program,
+	    [&](Value& value) {
+		    if (value.IsIdentity()) {
+			    value = value.Resolve();
+			    resolved++;
+		    }
+	    },
+	    [&](const Inst*& inst) {
+		    if (inst == nullptr || inst->GetOpcode() != ValueOpcode::Identity) {
+			    return;
+		    }
+		    // An identity of an immediate names no instruction: DropDeadPlanReferences clears it.
+		    if (auto* target = Value(const_cast<Inst*>(inst)).Resolve().TryInstruction();
+		        target != nullptr) {
+			    inst = target;
+			    resolved++;
+		    }
+	    });
+	return resolved;
+}
+
 std::string ProgramToString(const Program& program) {
 	std::map<const Inst*, size_t> ids;
 	size_t                        next_id = 1;

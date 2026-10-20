@@ -947,6 +947,12 @@ void  ResolveControlFlowIdentities(Program& program);
 // returns how many it cleared; Count only counts them. Neither dereferences such a reference.
 size_t CountDeadPlanReferences(const Program& program);
 size_t DropDeadPlanReferences(Program& program);
+// Points plan-table references to Identity instructions at what the identities resolve to.
+// RemoveIdentities rewires only IR uses and erases the identities, so such a reference would be
+// dead (DropDeadPlanReferences clears it) although its value is still live: Astro Bot's Sky Garden
+// lost its sky and lighting that way. Before DropDeadPlanReferences, these references were read
+// through the freed identity, which still held its argument. Returns how many it redirected.
+size_t ResolvePlanIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
 Value ResolveActiveU32(Value value, Value active);
