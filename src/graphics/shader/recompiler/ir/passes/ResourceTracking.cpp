@@ -1094,7 +1094,21 @@ private:
 				if (same) image_users.push_back(other);
 			}
 			if (!UsesOnly(*read, image_users)) {
-				return false;
+				// An explicit-LOD gather also passes T# words 1 and 3 by value (its mip selection
+				// reads them on the GPU, Translator::IMAGE_GATHER): such a word stays a real read
+				// through the table (Wolverine's HiZ CS 0x37ab7d3ab9bff0b9 gathers a heap T#);
+				// only the handle's own uses are planned.
+				const bool lod_words_only = std::ranges::all_of(read->Uses(), [&](const Use& use) {
+					if (std::ranges::find(image_users, use.user) != image_users.end()) return true;
+					return use.user->GetOpcode() == ValueOpcode::ImageGatherRaw && use.operand >= 3u &&
+					       std::ranges::find(image_users, use.user->Arg(0).Resolve().TryInstruction()) !=
+					           image_users.end();
+				});
+				if (!lod_words_only || dword == 0u) {
+					return false;
+				}
+				plan.memory[dword] = UINT32_MAX;
+				continue;
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
