@@ -1296,6 +1296,69 @@ bool CanReachBefore(const Graph& graph, uint32_t start, uint32_t target, uint32_
 	return false;
 }
 
+// KYTY_CFG_CLONE_EXITS: the merge of a selection whose arms leave only through early returns
+// (edges to a linear chain ending in a return, e.g. a cloned discard tail) besides one common
+// continuation. Post-dominance sees the returns and finds no merge; with those edges ignored the
+// continuation is the merge. Every other path from the arms must reach it before any block that
+// follows it. Outside loops only; a merge the header does not dominate gets its own gateway
+// (SplitSharedMergeBlock).
+uint32_t MergeIgnoringReturnArms(const Graph& graph, const BasicBlock& header) {
+	const auto count = graph.blocks.size();
+	std::vector<int8_t> terminal(count, -1);
+	const auto is_terminal = [&](uint32_t id) {
+		if (id >= count) return true;
+		if (terminal[id] < 0) terminal[id] = HasLinearPathToTerminal(graph, id) ? 1 : 0;
+		return terminal[id] == 1;
+	};
+	// Blocks reachable from the starts over non-return edges, never entering `blocked`.
+	const auto reach = [&](std::initializer_list<uint32_t> starts, uint32_t blocked) {
+		std::vector<bool>     seen(count, false);
+		std::vector<uint32_t> pending;
+		for (const auto start: starts) {
+			if (start < count && start != blocked && !is_terminal(start)) pending.push_back(start);
+		}
+		while (!pending.empty()) {
+			const auto id = pending.back();
+			pending.pop_back();
+			if (id >= count || seen[id]) continue;
+			seen[id] = true;
+			const auto* block = graph.FindBlock(id);
+			if (block == nullptr) continue;
+			for (const auto next: block->successors) {
+				if (next != blocked && next != header.id && !is_terminal(next)) pending.push_back(next);
+			}
+		}
+		return seen;
+	};
+	const auto true_target  = header.terminator.true_block;
+	const auto false_target = header.terminator.false_block;
+	if (true_target >= count || false_target >= count) return UINT32_MAX;
+	const auto from_true  = reach({true_target}, UINT32_MAX);
+	const auto from_false = reach({false_target}, UINT32_MAX);
+	std::vector<uint32_t> valid;
+	for (uint32_t m = 0; m < count; m++) {
+		if (m == header.id || !from_true[m] || !from_false[m]) {
+			continue;
+		}
+		// Paths from the arms that avoid m must not reach anything m leads to.
+		const auto avoiding = reach({true_target, false_target}, m);
+		const auto after    = reach({m}, UINT32_MAX);
+		bool       joins    = false;
+		for (uint32_t id = 0; id < count && !joins; id++) {
+			joins = id != m && avoiding[id] && after[id];
+		}
+		if (!joins) valid.push_back(m);
+	}
+	// The nearest merge: every other candidate follows it.
+	for (const auto m: valid) {
+		const auto after = reach({m}, UINT32_MAX);
+		if (std::ranges::all_of(valid, [&](uint32_t other) { return other == m || after[other]; })) {
+			return m;
+		}
+	}
+	return UINT32_MAX;
+}
+
 uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 	const auto  global_merge = graph.FindNearestCommonPostDominator(block.terminator.true_block,
 	                                                                block.terminator.false_block);
@@ -1329,6 +1392,11 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 				}
 				if (HasLinearPathToTerminal(graph, false_target)) {
 					return true_target;
+				}
+				if (GetCodegenOptions().cfg_clone_exits) {
+					if (const auto merge = MergeIgnoringReturnArms(graph, block); merge != UINT32_MAX) {
+						return merge;
+					}
 				}
 			}
 		}
