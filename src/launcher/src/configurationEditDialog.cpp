@@ -162,6 +162,13 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		m_ui->slider_audio_objects->setEnabled(on);
 		m_ui->label_audio_objects_value->setEnabled(on);
 	});
+	connect(m_ui->comboBox_present_mode, &QComboBox::currentTextChanged, this,
+	        [this](const QString& text) {
+		        const bool immediate =
+		            TextToEnum<Configuration::PresentMode>(text) ==
+		            Configuration::PresentMode::Immediate;
+		        m_ui->graphicsLayout->setRowVisible(m_ui->checkBox_smooth_frametime_fix, immediate);
+	        });
 	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
@@ -285,6 +292,10 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	m_ui->checkBox_smooth_frametime_fix->setChecked(info.smooth_frametime_fix);
+	m_ui->graphicsLayout->setRowVisible(
+	    m_ui->checkBox_smooth_frametime_fix,
+	    info.present_mode == Configuration::PresentMode::Immediate);
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
 	// Keep Auto when Qt is built without Vulkan support.
@@ -517,6 +528,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.smooth_frametime_fix = ui.checkBox_smooth_frametime_fix->isChecked();
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
