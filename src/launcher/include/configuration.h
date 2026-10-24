@@ -174,6 +174,7 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	bool                   smooth_frametime_fix        = false;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -214,6 +215,7 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		smooth_frametime_fix        = other.smooth_frametime_fix;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
