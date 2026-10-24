@@ -533,14 +533,14 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
-	// The bundled preset contains this switch as off so other games and present modes keep
-	// the default behavior. The per-game Immediate-mode checkbox explicitly overrides it.
-	auto environment = QProcessEnvironment::systemEnvironment();
-	const bool smooth_frametime_fix =
-	    info.present_mode == Configuration::PresentMode::Immediate && info.smooth_frametime_fix;
-	environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"),
-	                   smooth_frametime_fix ? QStringLiteral("1") : QStringLiteral("0"));
-	process->setProcessEnvironment(environment);
+	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
+	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
+	// or the user's environment still applies (the emulator default is off).
+	if (info.present_mode == Configuration::PresentMode::Immediate && info.smooth_frametime_fix) {
+		auto environment = QProcessEnvironment::systemEnvironment();
+		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"), QStringLiteral("1"));
+		process->setProcessEnvironment(environment);
+	}
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
