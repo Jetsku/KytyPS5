@@ -56,7 +56,20 @@ void TestInitializeDropsUnstartedJobs() {
 
 } // namespace
 
+// This line keeps the switch default off (int21 behaviour); the test turns it on unless set.
+static void DefaultEnv(const char* name, const char* value) {
+	if (std::getenv(name) != nullptr) {
+		return;
+	}
+#ifdef _WIN32
+	_putenv_s(name, value);
+#else
+	setenv(name, value, 0);
+#endif
+}
+
 int main() {
+	DefaultEnv("KYTY_AJM_DEFER", "1");
 	if (const char* defer = std::getenv("KYTY_AJM_DEFER"); defer != nullptr && defer[0] == '0') {
 		std::printf("AjmDeferTests: skipped (KYTY_AJM_DEFER=0)\n");
 		return 0;

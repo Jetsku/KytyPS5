@@ -1884,6 +1884,15 @@ void TestNativeDataCacheInvalidation() {
   ShaderComputeInputInfo compute{};
   compute.threads_num[1] = compute.threads_num[2] = 1;
   options.input_info.compute = &compute;
+  // KYTY_DCACHE_INV is opt-in in this line (int21); the barrier shape is tested with it on.
+  const auto saved_codegen = ShaderRecompiler::GetCodegenOptions();
+  auto       dcache_codegen = saved_codegen;
+  dcache_codegen.dcache_invalidate = true;
+  ShaderRecompiler::SetCodegenOptions(dcache_codegen);
+  struct RestoreCodegen {
+    ShaderRecompiler::CodegenOptions saved;
+    ~RestoreCodegen() { ShaderRecompiler::SetCodegenOptions(saved); }
+  } restore_codegen{saved_codegen};
   for (const uint32_t wave_size : {32u, 64u}) {
     compute.threads_num[0] = compute.wave_size = options.wave_size = wave_size;
     const auto minimal = RecompileForTest(cache_ops, options);
@@ -15984,8 +15993,22 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
 } // namespace
 } // namespace Libs::Graphics
 
+
+// This line keeps the switch default off (int21 behaviour); the test turns it on unless set.
+static void DefaultEnv(const char* name, const char* value) {
+  if (std::getenv(name) != nullptr) {
+    return;
+  }
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 0);
+#endif
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
+  DefaultEnv("KYTY_MESH_CULL", "full");
 
   EnsureConfigInitialized();
   if (argc == 2 && std::strcmp(argv[1], "--unused-pixel-inputs-only") == 0) {

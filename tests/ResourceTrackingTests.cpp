@@ -1563,7 +1563,7 @@ void TestIndependentImageSamplerPairs() {
     const auto sampler = fixture.Sampler(
         {Value(pair % 8), Value(0u), Value(0u), Value(0u)}, pc);
     fixture.Emit(ValueOpcode::ImageSampleRaw,
-                 {image, sampler, address, Value(true)},
+                 {image, sampler, address},
                  fixture.AddMemory(memory, pc));
   }
   fixture.PlanAndTrack();

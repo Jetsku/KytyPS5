@@ -2412,7 +2412,21 @@ void CheckSocketWakeup() {
 
 } // namespace
 
+
+// This line keeps the switch default off (int21 behaviour); the test turns it on unless set.
+static void DefaultEnv(const char* name, const char* value) {
+  if (std::getenv(name) != nullptr) {
+    return;
+  }
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 0);
+#endif
+}
+
 int main(int argc, char** argv) {
+  DefaultEnv("KYTY_MUTEX_HANDOFF_US", "2000");
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
