@@ -42,6 +42,12 @@ using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 
+// End (exclusive) of the guest address space that Initialize() reserves on the host
+// (memoryAddressSpace.inc: HOST_USER_MAX + 1). Code that must place a host reservation outside the
+// guest range before it is reserved (main.cpp's early CUDA initialization) derives its bound from
+// this, so the two cannot drift apart.
+constexpr uint64_t GUEST_ADDRESS_SPACE_END = 0xfc00000000ull;
+
 struct VirtualQueryInfo {
 	uintptr_t start;
 	uintptr_t end;

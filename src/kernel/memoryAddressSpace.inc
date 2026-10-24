@@ -11,7 +11,7 @@ static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
-static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+static constexpr uint64_t HOST_USER_MAX = GUEST_ADDRESS_SPACE_END - 1u;
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
