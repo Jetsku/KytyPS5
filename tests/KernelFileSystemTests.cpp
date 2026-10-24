@@ -2427,6 +2427,7 @@ static void DefaultEnv(const char* name, const char* value) {
 
 int main(int argc, char** argv) {
   DefaultEnv("KYTY_MUTEX_HANDOFF_US", "2000");
+  DefaultEnv("KYTY_AMPR_ASYNC", "1");
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
