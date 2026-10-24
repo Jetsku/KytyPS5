@@ -80,6 +80,11 @@ constexpr int SCE_FONT_TEXT_PARSER_RESULT_TERMINATE = 0;
 constexpr int SCE_FONT_TEXT_PARSER_RESULT_ERROR     = -1;
 constexpr int SCE_FONT_WRITING_FORM_HORIZONTAL      = 0x10;
 constexpr int FONT_BITMAP_MAX_DIM                   = 128;
+// TrueType glyphs are rasterized at the requested size; the limit only rejects absurd scales.
+constexpr int FONT_GLYPH_MAX_DIM                    = 4096;
+constexpr int FONT_ERROR_INVALID_PARAMETER          = static_cast<int>(0x80460002u);
+constexpr int FONT_ERROR_INVALID_FONT_HANDLE        = static_cast<int>(0x80460005u);
+constexpr int FONT_ERROR_NO_SUPPORT_CODE            = static_cast<int>(0x80460041u);
 
 struct FontMemory {
 	uint16_t                   type;
@@ -119,6 +124,14 @@ struct FontGlyphMetrics {
 		float advance;
 	} vertical;
 };
+
+struct FontKerning {
+	float offset_x;
+	float offset_y;
+	float position_x;
+	float position_y;
+};
+static_assert(sizeof(FontKerning) == 16);
 
 struct FontRenderSurface {
 	void*   buffer;
@@ -197,7 +210,7 @@ struct FontState {
 	const uint8_t*                                                 ttf_data;
 	uint32_t                                                       ttf_size;
 	bool                                                           has_ttf;
-	std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM> fallback_image;
+	std::vector<uint8_t>                                           fallback_image;
 	FontTransImage                                                 trans_image;
 };
 
@@ -218,7 +231,7 @@ struct GlyphState {
 	uint32_t                                                       code;
 	int                                                            attribute;
 	FontGlyphMetrics                                               metrics;
-	std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM> image;
+	std::vector<uint8_t>                                           image;
 	FontTransImage                                                 trans_image;
 };
 
@@ -859,38 +872,36 @@ static bool ensure_stb_font(FontState* font) {
 	return font->has_ttf;
 }
 
-static float stb_font_pixel_height(const FontState* font) {
-	const float scale = (font != nullptr && font->scale_h > 1.0f ? font->scale_h : 16.0f);
-	return static_cast<float>(std::clamp(static_cast<int>(scale + 0.5f), 8, FONT_BITMAP_MAX_DIM));
-}
-
-static float stb_font_scale(FontState* font) {
-	return stbtt_ScaleForPixelHeight(&font->font_info, stb_font_pixel_height(font));
-}
-
 struct StbGlyphFace {
 	const stbtt_fontinfo* info;
 	uint32_t              code;
-	float                 scale;
+	float                 scale_x;
+	float                 scale_y;
 };
+
+// The scale pixel values set by FontSetScalePixel map the em square (not ascent - descent) to
+// pixels, matching the PS5 font library.
+static StbGlyphFace make_stb_glyph_face(const stbtt_fontinfo* info, uint32_t code,
+                                        const FontState* font) {
+	return {info, code, stbtt_ScaleForMappingEmToPixels(info, font->scale_w),
+	        stbtt_ScaleForMappingEmToPixels(info, font->scale_h)};
+}
 
 // Picks the face that actually contains `code`: the font's own face first, then the host CJK
 // fallback, and finally '?' from the font's own face.
 static StbGlyphFace resolve_stb_glyph(FontState* font, uint32_t code) {
-	const float pixel_height = stb_font_pixel_height(font);
-
 	if (code <= 0x10ffffu && stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code)) != 0) {
-		return {&font->font_info, code, stb_font_scale(font)};
+		return make_stb_glyph_face(&font->font_info, code, font);
 	}
 
 	if (code <= 0x10ffffu && code >= 0x80u) {
 		if (const auto& cjk = cjk_fallback_face();
 		    cjk.ok && stbtt_FindGlyphIndex(&cjk.info, static_cast<int>(code)) != 0) {
-			return {&cjk.info, code, stbtt_ScaleForPixelHeight(&cjk.info, pixel_height)};
+			return make_stb_glyph_face(&cjk.info, code, font);
 		}
 	}
 
-	return {&font->font_info, static_cast<uint32_t>('?'), stb_font_scale(font)};
+	return make_stb_glyph_face(&font->font_info, static_cast<uint32_t>('?'), font);
 }
 
 static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
@@ -898,59 +909,51 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 		return false;
 	}
 
-	const auto  glyph = resolve_stb_glyph(font, code);
-	const float scale = glyph.scale;
-	code              = glyph.code;
+	const auto glyph = resolve_stb_glyph(font, code);
+	code             = glyph.code;
 
 	int advance = 0;
-	int lsb     = 0;
 	int x0      = 0;
 	int y0      = 0;
 	int x1      = 0;
 	int y1      = 0;
-	stbtt_GetCodepointHMetrics(glyph.info, static_cast<int>(code), &advance, &lsb);
-	stbtt_GetCodepointBitmapBox(glyph.info, static_cast<int>(code), scale, scale, &x0, &y0, &x1,
-	                            &y1);
+	stbtt_GetCodepointHMetrics(glyph.info, static_cast<int>(code), &advance, nullptr);
+	stbtt_GetCodepointBox(glyph.info, static_cast<int>(code), &x0, &y0, &x1, &y1);
 
-	const float width     = static_cast<float>(std::max(x1 - x0, 0));
-	const float height    = static_cast<float>(std::max(y1 - y0, 0));
-	const float advance_f = std::max(static_cast<float>(advance) * scale, width);
-
-	metrics->width                = width;
-	metrics->height               = height;
-	metrics->horizontal.bearing_x = static_cast<float>(x0);
-	metrics->horizontal.bearing_y = static_cast<float>(-y0);
-	metrics->horizontal.advance   = advance_f;
+	metrics->width                = static_cast<float>(x1 - x0) * glyph.scale_x;
+	metrics->height               = static_cast<float>(y1 - y0) * glyph.scale_y;
+	metrics->horizontal.bearing_x = static_cast<float>(x0) * glyph.scale_x;
+	metrics->horizontal.bearing_y = static_cast<float>(y1) * glyph.scale_y;
+	metrics->horizontal.advance   = static_cast<float>(advance) * glyph.scale_x;
 	metrics->vertical.bearing_x   = 0.0f;
 	metrics->vertical.bearing_y   = 0.0f;
-	metrics->vertical.advance     = stb_font_pixel_height(font);
+	metrics->vertical.advance     = font->scale_h;
 
 	return true;
 }
 
-static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM>* image,
-                           FontTransImage* trans_image, uint32_t code, FontState* font) {
+static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_image, uint32_t code,
+                           FontState* font) {
 	if (image == nullptr || trans_image == nullptr || !ensure_stb_font(font)) {
 		return false;
 	}
 
-	const auto  glyph = resolve_stb_glyph(font, code);
-	const float scale = glyph.scale;
-	code              = glyph.code;
+	const auto glyph = resolve_stb_glyph(font, code);
+	code             = glyph.code;
 
 	int x0 = 0;
 	int y0 = 0;
 	int x1 = 0;
 	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(glyph.info, static_cast<int>(code), scale, scale, &x0, &y0, &x1,
-	                            &y1);
+	stbtt_GetCodepointBitmapBox(glyph.info, static_cast<int>(code), glyph.scale_x, glyph.scale_y,
+	                            &x0, &y0, &x1, &y1);
 
-	image->fill(0);
-
-	const auto width          = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_BITMAP_MAX_DIM));
-	const auto height         = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_BITMAP_MAX_DIM));
+	const auto width  = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_GLYPH_MAX_DIM));
+	const auto height = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_GLYPH_MAX_DIM));
+	// Keep at least one byte so that blank glyphs still get a valid address.
+	image->assign(std::max<size_t>(static_cast<size_t>(width) * height, 1), 0);
 	trans_image->address      = image->data();
-	trans_image->width_byte   = FONT_BITMAP_MAX_DIM;
+	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
 
@@ -959,8 +962,8 @@ static bool init_stb_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP
 	}
 
 	stbtt_MakeCodepointBitmap(glyph.info, image->data(), static_cast<int>(width),
-	                          static_cast<int>(height), FONT_BITMAP_MAX_DIM, scale, scale,
-	                          static_cast<int>(code));
+	                          static_cast<int>(height), static_cast<int>(width), glyph.scale_x,
+	                          glyph.scale_y, static_cast<int>(code));
 
 	return true;
 }
@@ -1016,8 +1019,8 @@ static uint32_t normalize_bitmap_font_code(uint32_t code) {
 	return static_cast<uint32_t>('?');
 }
 
-static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX_DIM>* image,
-                       FontTransImage* trans_image, uint32_t code, const FontState* font) {
+static void init_image(std::vector<uint8_t>* image, FontTransImage* trans_image, uint32_t code,
+                       const FontState* font) {
 	EXIT_NOT_IMPLEMENTED(image == nullptr);
 	EXIT_NOT_IMPLEMENTED(trans_image == nullptr);
 
@@ -1025,11 +1028,12 @@ static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX
 		return;
 	}
 
-	image->fill(0);
 	code = normalize_bitmap_font_code(code);
 
+	// The VGA fallback font keeps its 128-pixel limit (scaled_font_height clamps).
 	const auto width  = static_cast<uint32_t>(scaled_font_width(font));
 	const auto height = static_cast<uint32_t>(scaled_font_height(font));
+	image->assign(static_cast<size_t>(width) * height, 0);
 #if LIBAVUTIL_VERSION_MAJOR < 61
 	const auto* vga_font = avpriv_vga16_font;
 #else
@@ -1042,13 +1046,13 @@ static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX
 		for (uint32_t x = 0; x < width; x++) {
 			const uint32_t src_x = std::min<uint32_t>((x * 8u) / width, 7u);
 			if ((row & (0x80u >> src_x)) != 0) {
-				(*image)[y * FONT_BITMAP_MAX_DIM + x] = 0xff;
+				(*image)[y * width + x] = 0xff;
 			}
 		}
 	}
 
 	trans_image->address      = image->data();
-	trans_image->width_byte   = FONT_BITMAP_MAX_DIM;
+	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
 }
@@ -1500,7 +1504,7 @@ int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontal
 
 	auto* font = static_cast<FontState*>(font_handle);
 	if (ensure_stb_font(font)) {
-		const float scale    = stb_font_scale(font);
+		const float scale    = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
 		int         ascent   = 0;
 		int         descent  = 0;
 		int         line_gap = 0;
@@ -2156,6 +2160,53 @@ int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t
 	return OK;
 }
 
+int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint32_t code,
+                                 FontKerning* kerning) {
+	PRINT_NAME();
+	if (kerning == nullptr) {
+		return FONT_ERROR_INVALID_PARAMETER;
+	}
+	*kerning   = {};
+	auto* font = static_cast<FontState*>(font_handle);
+	if (font == nullptr) {
+		return FONT_ERROR_INVALID_FONT_HANDLE;
+	}
+	if (pre_code == 0 || !ensure_stb_font(font)) {
+		return OK;
+	}
+	const auto glyph_index = [&](uint32_t value) {
+		if ((value & 0x80000000u) != 0) {
+			return static_cast<int>(value & 0xffffu);
+		}
+		return stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(value));
+	};
+	const auto valid_index = [&](int index) {
+		return index > 0 && index < font->font_info.numGlyphs;
+	};
+	const int  left        = glyph_index(pre_code);
+	const int  right       = glyph_index(code);
+	if (!valid_index(left) || !valid_index(right)) {
+		// Code points drawn from the host CJK fallback face have no kerning with the font's own
+		// face, but they are supported: report zero kerning instead of an error.
+		const auto from_fallback = [&](uint32_t value) {
+			return (value & 0x80000000u) == 0 &&
+			       resolve_stb_glyph(font, value).info != &font->font_info;
+		};
+		if ((valid_index(left) || from_fallback(pre_code)) &&
+		    (valid_index(right) || from_fallback(code))) {
+			return OK;
+		}
+		return FONT_ERROR_NO_SUPPORT_CODE;
+	}
+	kerning->offset_x = static_cast<float>(stbtt_GetGlyphKernAdvance(&font->font_info, left, right)) *
+	                    stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	LOGF("\t handle = 0x%016" PRIx64 ", pre_code = 0x%08" PRIx32 ", code = 0x%08" PRIx32
+	     ", offset_x = %f\n",
+	     reinterpret_cast<uint64_t>(font_handle), pre_code, code,
+	     static_cast<double>(kerning->offset_x));
+	return OK;
+}
+
 int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                           FontGlyphMetrics* metrics) {
 	PRINT_NAME();
@@ -2328,6 +2379,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("FXP359ygujs", Font::FontDestroyLibrary);
 	LIB_FUNC("C-4Qw5Srlyw", Font::FontGenerateCharGlyph);
 	LIB_FUNC("L97d+3OgMlE", Font::FontGetCharGlyphMetrics);
+	LIB_FUNC("sDuhHGNhHvE", Font::FontGetKerning);
 	LIB_FUNC("IQtleGLL5pQ", Font::FontGetRenderCharGlyphMetrics);
 	LIB_FUNC("8-zmgsxkBek", Font::FontGlyphDefineAttribute);
 	LIB_FUNC("whrS4oksXc4", Font::FontMemoryInit);
