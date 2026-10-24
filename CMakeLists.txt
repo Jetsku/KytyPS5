@@ -648,6 +648,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(scalar_provenance_tests common fmt::fmt xbyak::xbyak)
@@ -889,6 +890,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	# The IR it includes (Program.cpp, Value.cpp) reads KYTY_IR_LINEAR_USES from the codegen options.
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
@@ -908,6 +910,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.cpp"
