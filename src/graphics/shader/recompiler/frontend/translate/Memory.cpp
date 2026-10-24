@@ -1125,6 +1125,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		lds_write_pending = true;
 	}
 	switch (inst.opcode) {
+		case Decoder::Opcode::S_DCACHE_INV:
+		case Decoder::Opcode::S_GL1_INV:
 		case Decoder::Opcode::BUFFER_GL0_INV:
 		case Decoder::Opcode::BUFFER_GL1_INV:
 			// KYTY_DCACHE_INV=1 (default off; upstream 22ef16a04): a device-scope acquire barrier,
