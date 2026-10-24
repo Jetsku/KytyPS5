@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <intrin.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -58,6 +57,12 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <x86intrin.h>
+#endif
 
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #include <xmmintrin.h>
