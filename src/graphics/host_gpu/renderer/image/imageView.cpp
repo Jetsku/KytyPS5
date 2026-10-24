@@ -362,13 +362,21 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u "
+		     "detail: image=%d image_type=%d fmt_ok=%d ranges_ok=%d map_ok=%d type_ok=%d aspect_ok=%d "
+		     "extent=%ux%ux%u flags=0x%x\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
 		     static_cast<int>(normalized.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		     image.layers, static_cast<int>(image.image != nullptr),
+		     static_cast<int>(image.image_type), static_cast<int>(format_compatible),
+		     static_cast<int>(ranges_valid), static_cast<int>(mapping_valid),
+		     static_cast<int>(IsValidViewType(image, normalized)),
+		     static_cast<int>(IsValidAspect(image, normalized.aspect)), image.extent.width,
+		     image.extent.height, image.extent.depth,
+		     static_cast<uint32_t>(static_cast<vk::ImageCreateFlags::MaskType>(image.flags)));
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};

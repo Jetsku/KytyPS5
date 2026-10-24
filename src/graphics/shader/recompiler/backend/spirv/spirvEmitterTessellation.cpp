@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <bit>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -29,12 +31,17 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
 		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-		const auto index = inst.Arg(1).U32() / 4u;
-		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		// Guest factor dwords: triangles outer[3] inner[1], quads outer[4] inner[2], isolines
+		// outer[2] in reverse order of the Vulkan builtin (as AMD drivers write them).
+		const auto index   = inst.Arg(1).U32() / 4u;
+		const auto outers  = tess.domain == 0u ? 2u : tess.domain == 1u ? 3u : 4u;
+		const auto factors = tess.domain == 0u ? 2u : tess.domain == 1u ? 4u : 6u;
+		const auto outer   = index < outers;
+		EXIT_NOT_IMPLEMENTED(index >= factors);
+		const auto element = !outer ? index - outers : tess.domain == 0u ? 1u - index : index;
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
-		                          ConstantU32(state, outer ? index : index - 3u));
+		                          ConstantU32(state, element));
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
@@ -128,20 +135,35 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	// CxVgtTfParam: triangles, integer or fractional-odd partitioning, clockwise output.
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u ||
-	                     (tess.partitioning != 0u && tess.partitioning != 2u) ||
-	                     tess.output_topology != 2u);
+	// VGT_TF_PARAM: TYPE 0 isoline, 1 triangle, 2 quad; PARTITIONING 0 integer, 1 pow2,
+	// 2 fractional odd, 3 fractional even; TOPOLOGY 0 point, 1 line, 2 triangle cw, 3 ccw.
+	EXIT_NOT_IMPLEMENTED(tess.domain > 2u);
+	// Lines only come from isolines and triangles only from the triangle and quad domains.
+	EXIT_NOT_IMPLEMENTED(tess.output_topology != 0u &&
+	                     (tess.output_topology == 1u) != (tess.domain == 0u));
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
 	} else {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-		state.builder.AddExecutionMode(
-		    state.main_func, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
-		                                             : spv::ExecutionModeSpacingFractionalOdd);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
+		state.builder.AddExecutionMode(state.main_func, tess.domain == 0u ? spv::ExecutionModeIsolines
+		                                                : tess.domain == 1u
+		                                                    ? spv::ExecutionModeTriangles
+		                                                    : spv::ExecutionModeQuads);
+		// Vulkan has no power-of-two spacing; equal spacing is its nearest integer mode (the
+		// factors are rounded up to a power of two where the HS stores them).
+		state.builder.AddExecutionMode(state.main_func,
+		                               tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd
+		                               : tess.partitioning == 3u
+		                                   ? spv::ExecutionModeSpacingFractionalEven
+		                                   : spv::ExecutionModeSpacingEqual);
+		if (tess.output_topology == 0u) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePointMode);
+		} else if (tess.output_topology >= 2u) {
+			state.builder.AddExecutionMode(state.main_func, tess.output_topology == 2u
+			                                                    ? spv::ExecutionModeVertexOrderCw
+			                                                    : spv::ExecutionModeVertexOrderCcw);
+		}
 	}
 }
 
@@ -158,9 +180,45 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&] {
 		auto value = ctx.Arg(inst, 2);
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
-			const auto floating = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
+			auto&      state    = ctx.state;
+			const auto floating = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeF32(state), floating, value);
 			value = floating;
+			const auto& tess = state.input_info.vertex->tess;
+			if (tess.max_tess_level != 0u && std::bit_cast<float>(tess.min_tess_level) <=
+			                                     std::bit_cast<float>(tess.max_tess_level)) {
+				// The tessellator clamps factors to VGT_HOS_MIN/MAX_TESS_LEVEL. Patches with a
+				// factor <= 0 or NaN stay culled.
+				const auto clamped = state.builder.AllocateId();
+				state.builder.AddFunction(std::vector<uint32_t> {
+				    spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FClamp,
+				    value, ConstantF32Value(state, std::bit_cast<float>(tess.min_tess_level)),
+				    ConstantF32Value(state, std::bit_cast<float>(tess.max_tess_level))});
+				const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), value,
+				                             ConstantF32Value(state, 0.0f));
+				value = Select(state, TypeF32(state), positive, clamped, value);
+			}
+			if (tess.partitioning == 1u) {
+				// Power-of-two partitioning rounds each factor up to a power of two; with the
+				// equal spacing it maps to, the generated vertices then match the guest's.
+				// A factor <= 0 (or NaN) still culls the patch.
+				const auto ext = [&](uint32_t opcode, uint32_t arg) {
+					const auto result = state.builder.AllocateId();
+					state.builder.AddFunction(std::vector<uint32_t> {
+					    spv::OpExtInst, TypeF32(state), result, GlslStd450(state), opcode, arg});
+					return result;
+				};
+				const auto one          = ConstantF32Value(state, 1.0f);
+				const auto at_least_one = state.builder.AllocateId();
+				state.builder.AddFunction(std::vector<uint32_t> {spv::OpExtInst, TypeF32(state),
+				                                                 at_least_one, GlslStd450(state),
+				                                                 GLSLstd450FMax, value, one});
+				const auto rounded =
+				    ext(GLSLstd450Exp2, ext(GLSLstd450Ceil, ext(GLSLstd450Log2, at_least_one)));
+				const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), value,
+				                             ConstantF32Value(state, 0.0f));
+				value = Select(state, TypeF32(state), positive, rounded, value);
+			}
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});

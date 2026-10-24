@@ -52,6 +52,8 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +61,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -73,6 +76,16 @@ static bool MeshRestartEnabled() {
 	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const auto* value = std::getenv("KYTY_MESH_RESTART");
 		return value != nullptr && std::strcmp(value, "1") == 0;
+	}));
+	return enabled;
+}
+
+// KYTY_HTILE_STENCIL_CLEAR (default on): an HTile clear also clears a stencil plane it tracks.
+static bool HtileStencilClearEnabled() {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
+		const auto* value = std::getenv("KYTY_HTILE_STENCIL_CLEAR");
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}));
 	return enabled;
 }
@@ -956,7 +969,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (depth.depth_clear_enable || meta_clear)
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
 		// Apply pending clears to compressed stencil as well as depth (upstream 5bf37f52a).
-		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+		// KYTY_HTILE_STENCIL_CLEAR=0 restores the depth-only clear of a compressed stencil.
+		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed && HtileStencilClearEnabled()))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
@@ -1894,13 +1908,62 @@ static void CopyPreparedVertexInfo(ShaderVertexInputInfo& dst, const ShaderVerte
 	}
 }
 
+// Draws that waited at least 2 ms for their graphics pipeline on the command processor (a new
+// pipeline built there, whichever path builds it: fast-first, libraries, the optimized build): one
+// console line a minute while there are any, "Pipeline waits 60s: ...". KYTY_PIPELINE_WAIT_STATS=1
+// (startup, default off): the timing and the line cost two clock reads per unplanned draw.
+static bool PipelineWaitStats() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_WAIT_STATS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static void NotePipelineWait(std::chrono::steady_clock::duration elapsed) {
+	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+	if (us < 2000) {
+		return;
+	}
+	struct Totals {
+		uint64_t count = 0;
+		uint64_t us    = 0;
+		uint64_t max   = 0;
+		uint64_t over_50ms = 0;
+		std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+		uint64_t all_count = 0;
+		uint64_t all_us    = 0;
+	};
+	static Totals totals; // command processor thread only
+	totals.count++;
+	totals.us += static_cast<uint64_t>(us);
+	totals.max = std::max<uint64_t>(totals.max, static_cast<uint64_t>(us));
+	totals.over_50ms += us >= 50000 ? 1u : 0u;
+	totals.all_count++;
+	totals.all_us += static_cast<uint64_t>(us);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - totals.last >= std::chrono::seconds(60)) {
+		std::printf("Pipeline waits 60s: %" PRIu64 " draws waited >= 2 ms for their graphics pipeline, "
+		            "%.1f ms in total (max %.1f ms, %" PRIu64 " >= 50 ms); since start %" PRIu64
+		            " draws, %.1f ms\n",
+		            totals.count, static_cast<double>(totals.us) / 1000.0,
+		            static_cast<double>(totals.max) / 1000.0, totals.over_50ms, totals.all_count,
+		            static_cast<double>(totals.all_us) / 1000.0);
+		std::fflush(stdout);
+		totals.count = totals.us = totals.max = totals.over_50ms = 0;
+		totals.last  = now;
+	}
+}
+
 // KYTY_RENDER_STATE_FAST swap: exchanges two stage preparations member by member. The bindings name
 // every member in declaration order, so a new member stops this compiling until it is swapped.
 static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::StagePrep& b) noexcept {
 	auto& [a_resources, a_specialization, a_permutation] = a;
 	auto& [b_resources, b_specialization, b_permutation] = b;
-	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill] = a_resources;
-	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill] = b_resources;
+	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill, a_gpu_fills,
+	       a_bindless_heaps] = a_resources;
+	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill, b_gpu_fills,
+	       b_bindless_heaps] = b_resources;
 	auto& [a_spec_buffers, a_spec_images] = a_specialization;
 	auto& [b_spec_buffers, b_spec_images] = b_specialization;
 	a_buffers.swap(b_buffers);
@@ -1909,6 +1972,8 @@ static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::Sta
 	a_srt.swap(b_srt);
 	a_user_data.swap(b_user_data);
 	std::swap(a_fill, b_fill);
+	a_gpu_fills.swap(b_gpu_fills);
+	a_bindless_heaps.swap(b_bindless_heaps);
 	a_spec_buffers.swap(b_spec_buffers);
 	a_spec_images.swap(b_spec_images);
 	std::swap(a_permutation, b_permutation);
@@ -2086,8 +2151,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): a continuation keeps the previous draw's targets (the
 	// entries are still in `state`: the fast reset leaves them, DrawRunCandidate requires it).
 	m_run_slice_offset = render_target_slice_offset;
+	// Bindless images (descriptors.cpp): their per-frame feedback copy and image transitions may end
+	// the rendering instance while the bindings are prepared; such draws never continue a run.
+	const auto bindless_stage = [](const ShaderStageRuntime& stage) {
+		return stage.resources != nullptr && !stage.resources->bindless_heaps.empty();
+	};
+	const auto bindless = [&] {
+		return (state.ps_active && bindless_stage(state.ps_input_info.stage)) ||
+		       std::ranges::any_of(state.vertex_info,
+		                           [&](const auto& info) { return bindless_stage(info.stage); });
+	};
 	const bool run_candidate =
-	    DrawRun::Enabled() &&
+	    DrawRun::Enabled() && !bindless() &&
 	    (DrawRunCandidate(buffer, state, render_target_slice_offset) ||
 	     (DrawRun::RecallEnabled() &&
 	      DrawRunRecallCandidate(buffer, state, render_target_slice_offset)));
@@ -3838,6 +3913,68 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
 		                           buffer.GetShaders().GetVs().es_regs.data_addr);
 	}
+	// KYTY_DRAW_SHADER_MAP=1 (diagnostic): logs once per guest VS/PS address pair the program hashes
+	// (device-loss checkpoints name the guest addresses only).
+	static const bool shader_map = [] {
+		const auto* value = std::getenv("KYTY_DRAW_SHADER_MAP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	if (shader_map) {
+		static std::mutex                                 map_mutex;
+		static std::set<std::pair<uint64_t, uint64_t>>    seen;
+		const auto vs_addr = buffer.GetShaders().GetVs().es_regs.data_addr;
+		const auto ps_addr = state.ps_active ? buffer.GetShaders().GetPs().ps_regs.data_addr : 0;
+		std::scoped_lock map_lock(map_mutex);
+		if (seen.emplace(vs_addr, ps_addr).second) {
+			LOGF("DrawShaderMap: VS=0x%016" PRIx64 " hash=0x%016" PRIx64 " PS=0x%016" PRIx64
+			     " hash=0x%016" PRIx64 "\n",
+			     vs_addr, state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+			     ps_addr, state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0);
+		}
+	}
+	// KYTY_DRAW_TRACE_PS=<hash>[:<sgpr>:<offset>] (diagnostic): logs the first 16 draws with this
+	// pixel program: counts and user SGPRs; with <sgpr>:<offset> also the V# at that byte offset of
+	// the pointer in user SGPRs <sgpr>/<sgpr>+1 and the first 64 dwords of its buffer, from guest
+	// memory (with whether a GPU write of them is pending).
+	static const auto trace_ps = [] {
+		std::array<uint64_t, 3> parsed {0, UINT64_MAX, 0};
+		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_PS"); value != nullptr) {
+			char* end = nullptr;
+			parsed[0] = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') {
+				parsed[1] = std::strtoull(end + 1, &end, 10);
+				if (end != nullptr && *end == ':') parsed[2] = std::strtoull(end + 1, &end, 0);
+			}
+		}
+		return parsed;
+	}();
+	if (trace_ps[0] != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	    state.ps_input_info.stage.program->shader_hash == trace_ps[0]) {
+		static std::atomic<uint32_t> traced {0};
+		if (traced.fetch_add(1, std::memory_order_relaxed) < 16) {
+			const auto& user_data = state.ps_input_info.stage.resources->user_data;
+			std::string text = fmt::format("DrawTracePs: hash=0x{:016x} index_count={} instances={} ud:",
+			                               trace_ps[0], draw.index_count, draw.instance_count);
+			for (const auto word: user_data) text += fmt::format(" {:08x}", word);
+			if (trace_ps[1] != UINT64_MAX && trace_ps[1] + 1 < user_data.size()) {
+				const uint64_t pointer = user_data[trace_ps[1]] |
+				                         (static_cast<uint64_t>(user_data[trace_ps[1] + 1] & 0xffffu) << 32u);
+				uint32_t vsharp[4] {};
+				const bool read = LibKernel::Memory::TryReadBacking(pointer + trace_ps[2], vsharp, sizeof(vsharp));
+				const uint64_t base = vsharp[0] | (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u);
+				text += fmt::format(" | V#@0x{:x}{}: {:08x} {:08x} {:08x} {:08x} base=0x{:x} stride={} records={}",
+				                    pointer + trace_ps[2], read ? "" : "?", vsharp[0], vsharp[1], vsharp[2],
+				                    vsharp[3], base, (vsharp[1] >> 16u) & 0x3fffu, vsharp[2]);
+				uint32_t words[64] {};
+				if (base != 0 && LibKernel::Memory::TryReadBacking(base, words, sizeof(words))) {
+					text += fmt::format(" gpu_dirty={} data:",
+					                    m_context.GetBufferCache().HasGpuDirtyBytes(base, sizeof(words)) ? 1 : 0);
+					for (const auto word: words) text += fmt::format(" {:08x}", word);
+				}
+			}
+			LOGF("%s\n", text.c_str());
+		}
+	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run
 		return;
@@ -4169,11 +4306,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
+		const bool wait_stats     = PipelineWaitStats();
+		const auto pipeline_begin = wait_stats ? std::chrono::steady_clock::now()
+		                                       : std::chrono::steady_clock::time_point {};
 		const bool skippable = planned_pipeline == nullptr && pipeline_cache.PipelineSkipEnabled() &&
 		                       DrawOnlyChangesPicture(m_context, state, vertex_stages, mesh_active);
 		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
 		    primitive_restart_enable, *programs, skippable);
+		if (wait_stats) {
+			NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
+		}
 		if (pipeline_object == nullptr) {
 			// KYTY_PIPELINE_SKIP: skipped until its pipeline is built. Nothing was recorded; no
 			// draw-run record may be continued or recalled across it (its bindings replaced the

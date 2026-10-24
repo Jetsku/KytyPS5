@@ -6,7 +6,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -38,13 +40,63 @@ struct CallTarget {
 	uint32_t return_sgpr = 0;
 };
 
+// An S_SWAPPC_B64 call whose target comes from a table in guest memory (Insomniac's ray-tracing
+// hit callbacks): s_buffer_load_dwordxN s[n:...], <table V#>, <index << record_shift>, then the
+// target pair copied from s[n+target_word:+1]. The table V# is reached from user SGPRs through
+// `steps`: each loads `dwords` dwords at `offset` from the 64-bit address (S_LOAD) or the buffer
+// descriptor (S_BUFFER_LOAD) at dword `base_index` of the previous value (of the user SGPRs from
+// `user_sgpr` for the first step). The last step's dwords from `table_index` are the table V#.
+struct CallTableStep {
+	bool     buffer     = false;
+	uint32_t base_index = 0;
+	int32_t  offset     = 0;
+	uint32_t dwords     = 0;
+};
+
+struct CallTable {
+	uint32_t                   call_pc      = 0;
+	uint32_t                   user_sgpr    = 0;
+	uint32_t                   return_sgpr  = 0;
+	uint32_t                   record_shift = 0;
+	uint32_t                   target_word  = 0;
+	uint32_t                   record_offset = 0; // the record load's immediate byte offset
+	uint32_t                   table_index  = 0;
+	std::vector<CallTableStep> steps;
+};
+
+// An S_SWAPPC_B64 call of a program and where its target comes from: user SGPRs
+// s[user_sgpr:+1] (user_sgpr != UINT32_MAX), a table (`table`), or neither (not traced).
+struct ShaderCall {
+	uint32_t                 pc         = 0;
+	uint32_t                 source_reg = 0;
+	uint32_t                 return_reg = 0;
+	uint32_t                 user_sgpr  = UINT32_MAX;
+	std::optional<CallTable> table;
+
+	[[nodiscard]] bool Traced() const { return user_sgpr != UINT32_MAX || table.has_value(); }
+};
+
+struct ShaderCallAnalysis {
+	std::vector<ShaderCall> calls;
+	std::string             failures; // the calls that are not traced, empty when all are
+};
+
+// The calls of a program and the origin of their targets (the traces the S_SWAPPC_B64 skip
+// diagnostics log), from the code and the user-data count alone.
+[[nodiscard]] ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code,
+                                                    const CompileOptions& options);
+
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
 	bool        skip_dispatch = false;
+	// A skipped program's first unresolved instruction (pc) and why (diagnostics; UINT32_MAX: none).
+	uint32_t    skip_pc = UINT32_MAX;
+	std::string skip_reason;
 	// Only for a program skipped because it calls through S_SWAPPC_B64 (KYTY_SRT_VARIANT_READS).
 	std::vector<CallTarget> call_targets;
+	std::vector<CallTable>  call_tables;
 };
 
 struct CompileResult {

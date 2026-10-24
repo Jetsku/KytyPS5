@@ -38,6 +38,8 @@ struct RenderDepthInfo {
 	float                       depth_min_bounds         = 0.0f;
 	float                       depth_max_bounds         = 0.0f;
 	bool                        stencil_clear_enable     = false;
+	// stencil_clear_enable, or a stencil-tracking HTile cleared by a fill (see renderDraw.cpp).
+	bool                        stencil_load_clear_enable = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;
 	vk::StencilOpState          stencil_front;

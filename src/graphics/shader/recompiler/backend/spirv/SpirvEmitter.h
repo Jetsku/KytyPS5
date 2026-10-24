@@ -115,6 +115,9 @@ HostWaveClusters GetHostWaveClusters();
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records = true);
 
+// Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
+[[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */

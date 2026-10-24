@@ -42,6 +42,15 @@ struct SrtRuntime {
 	SrtMappedRange is_guest_mapped = nullptr;
 	// Dispatch workgroup counts (compute). No descriptor this planner tracks reads them yet.
 	std::span<const uint32_t> workgroup_counts;
+	// KYTY_SRT_GPU_FILL (compute on the command processor): whether the guest dword at the
+	// address is GPU-written buffer memory the renderer can copy on the GPU. With it, a flat slot
+	// of the plan's gpu_fill_slots whose dword it reports is left to the GPU: the refresh writes
+	// a placeholder and lists the slot in the snapshot's gpu_fills (MaterializeResources sets
+	// gpu_fills). Null: every slot is read on the host.
+	bool (*gpu_written)(uint64_t address) = nullptr;
+	std::vector<SrtGpuFill>* gpu_fills    = nullptr;
+	// Also slots only buffer-store address operands use (gpu_fill_slots 2; KYTY_SRT_GPU_FILL=2).
+	bool gpu_fill_store_offsets           = false;
 };
 
 // Addresses no guest or host mapping can contain: the first 64 KiB (never mapped on Windows, Linux
@@ -305,6 +314,12 @@ private:
 	// The last 4 KiB page is_guest_mapped confirmed: mappings do not change during one walk
 	// (unmaps run on the GPU thread, which is walking), and flat reads cluster in a few tables.
 	uint64_t                        m_mapped_page = UINT64_MAX;
+	// KYTY_SRT_GPU_FILL: while a GPU-fillable flat slot is refreshed, its flat offset (its own
+	// read is the only raw read of its evaluation).
+	bool                            m_fill_active = false;
+	uint32_t                        m_fill_offset = 0;
+	// KYTY_SRT_GPU_FILL_DIAG: the flat slot being refreshed (UINT32_MAX: none).
+	uint32_t                        m_diag_slot   = UINT32_MAX;
 	bool                            m_count_recipes = false;
 	uint64_t                        m_compiled_nodes = 0;
 	uint64_t                        m_fallback_nodes = 0;

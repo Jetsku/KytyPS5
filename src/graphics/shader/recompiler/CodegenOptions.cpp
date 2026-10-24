@@ -26,6 +26,7 @@ CodegenOptions FromEnvironment() {
 	options.movrel_switch      = EnvFlag("KYTY_MOVREL_SWITCH", options.movrel_switch);
 	options.uniform_lane_reads = EnvFlag("KYTY_UNIFORM_LANE_READS", options.uniform_lane_reads);
 	options.short_f32_helpers  = EnvFlag("KYTY_SHORT_F32_HELPERS", options.short_f32_helpers);
+	options.vs_lane_wrap32     = EnvFlag("KYTY_VS_LANE_WRAP32", options.vs_lane_wrap32);
 	options.fast_float_min_max = EnvFlag("KYTY_FAST_FMINMAX", options.fast_float_min_max);
 	options.native_float_min_max = EnvFlag("KYTY_NATIVE_FMINMAX", options.native_float_min_max);
 	options.dcache_invalidate = EnvFlag("KYTY_DCACHE_INV", options.dcache_invalidate);
@@ -40,6 +41,7 @@ CodegenOptions FromEnvironment() {
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
 	options.branchless_loads    = EnvFlag("KYTY_BRANCHLESS_LOADS", options.branchless_loads);
 	options.branchless_lds      = EnvFlag("KYTY_BRANCHLESS_LDS", options.branchless_lds);
+	options.flat_aperture_bvh   = EnvFlag("KYTY_FLAT_APERTURE_BVH", options.flat_aperture_bvh);
 	options.lane_local          = EnvFlag("KYTY_LANE_LOCAL", options.lane_local);
 	options.readonly_buffers    = EnvFlag("KYTY_READONLY_BUFFERS", options.readonly_buffers);
 	options.interp_modes = EnvFlag("KYTY_INTERP_MODES", options.interp_modes);
@@ -60,7 +62,10 @@ CodegenOptions FromEnvironment() {
 	options.ps_helper_atomics_skip =
 	    EnvFlag("KYTY_PS_HELPER_ATOMICS_SKIP", options.ps_helper_atomics_skip);
 	options.volatile_loads         = EnvFlag("KYTY_VOLATILE_LOADS", options.volatile_loads);
-	options.cfg_clone_exits = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
+	options.indirect_coherent = EnvFlag("KYTY_INDIRECT_COHERENT", options.indirect_coherent);
+	options.cfg_clone_exits   = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
+	options.storage_length_zero =
+	    EnvFlag("KYTY_STORAGE_LENGTH_ZERO", options.storage_length_zero);
 	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {
 		options.loop_guard_all = std::strcmp(list, "all") == 0 || std::strcmp(list, "*") == 0;
 		std::string_view text(options.loop_guard_all ? "" : list);
@@ -77,7 +82,8 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
-	options.realtime_clock    = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
+	options.shader_calls      = EnvFlag("KYTY_SHADER_CALLS", options.shader_calls);
+	options.realtime_clock   = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
 	options.dpp_skip_inactive = EnvFlag("KYTY_DPP_SKIP_INACTIVE", options.dpp_skip_inactive);
 	options.lane_reductions   = EnvFlag("KYTY_LANE_REDUCTIONS", options.lane_reductions);
 	options.ir_linear_uses    = EnvFlag("KYTY_IR_LINEAR_USES", options.ir_linear_uses);

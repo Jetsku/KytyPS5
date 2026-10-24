@@ -24,6 +24,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Emulated 64-bit FLAT apertures. Each contains 4 GiB of byte offsets and is outside guest global
+// VA space. Keep queries and FLAT routing consistent.
+inline constexpr uint32_t SharedApertureHigh  = 0x70000000u;
+inline constexpr uint32_t PrivateApertureHigh = 0x80000000u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
@@ -81,10 +86,18 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1).
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4 || opcode == ValueOpcode::ReadConstBuffer);
+		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1). A formatted
+		// X load decodes the V#'s format in the shader (upstream a55a28380, LoadIndirectFormattedX):
+		// Miles' hit callbacks read vertex data with BUFFER_LOAD_FORMAT_X through a material's V#.
+		return !typed && data_bits == 32u &&
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4
+		                  : opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4 ||
+		                        opcode == ValueOpcode::ReadConstBuffer);
 	}
 	// KYTY_BDA_WRITES: raw (unformatted) stores and every buffer atomic can write through a V# the
 	// shader computes.
@@ -209,6 +222,9 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
+	// table gives for the handle's key; the mapping offset locates the heap's region and size.
+	bool                          bindless          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -583,7 +599,6 @@ struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 64;
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
-	static constexpr uint32_t MaxSampledPairs = 64;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;
@@ -631,7 +646,20 @@ struct DescriptorSource {
 		uint32_t table_stride    = 0;
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
+		// No enumeration: the shader looks the key up in the bindless translation table.
+		bool     bindless     = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		// Bindless through a record pointer: the key selects a table_stride-byte record of the
+		// table, whose 64-bit word at this byte offset points at the T# (table_offset bytes past
+		// it). UINT32_MAX: the T# itself is in the table, 32 bytes per key.
+		uint32_t record_pointer  = UINT32_MAX;
+		// Nested heap (with a record pointer): the T# is in a heap whose V# is read at byte
+		// nested_heap of the buffer whose V# is at byte nested_vsharp past the record pointer; the
+		// shader's key is record * nested_keys + the key into that heap (table_offset and 32-byte
+		// T#s from its base). nested_vsharp UINT32_MAX: no nesting.
+		uint32_t nested_vsharp   = UINT32_MAX;
+		uint32_t nested_heap     = 0;
+		uint32_t nested_keys     = 0;
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
@@ -846,6 +874,10 @@ struct ResourcePlan {
 	std::vector<ArithmeticTape>         arithmetic_tapes;
 	std::vector<ArithmeticTapeInstruction> arithmetic_tape_instructions;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Indexed by flat offset like clean_flat_slots: flat slots only the shader uses
+	// (GpuFillSlots, ResourceMaterialization.cpp), which a compute refresh on the command
+	// processor may leave to the GPU when their bytes are GPU-written (KYTY_SRT_GPU_FILL).
+	std::vector<uint8_t>                gpu_fill_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;
 	bool                                srt_plan_complete          = false;

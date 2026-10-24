@@ -161,8 +161,15 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					    (rhs.kind == Kind::PackedControlPoint && lhs == constant(0xffu)))
 						value = constant(0u);
 					break;
+				// V_MOV_B32, V_ADD3_U32 and V_ADD_LSHL_U32 address Miles Morales' patches.
+				case Opcode::V_MOV_B32: value = lhs; break;
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
+				case Opcode::V_ADD3_U32: value = add(add(lhs, rhs), third); break;
 				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
+				case Opcode::V_ADD_LSHL_U32:
+					if (third.kind == Kind::Affine && third.coefficient == 0u && third.constant < 32u)
+						value = multiply(add(lhs, rhs), constant(1u << third.constant));
+					break;
 				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 				case Opcode::V_MAD_U32_U24:
 					value = add(multiply(low24(lhs), low24(rhs)), third);

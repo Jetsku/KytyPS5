@@ -1118,11 +1118,15 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	};
 
 	if (search_addr != 0) {
-		return find_in(search_addr, HOST_USER_MAX + 1u);
+		// A hint inside the AMM window is not honoured: that window belongs to AMM map commands.
+		if (search_addr < HOST_USER_ALLOC_END) {
+			return find_in(search_addr, HOST_USER_ALLOC_END);
+		}
+		search_addr = 0;
 	}
 	auto addr = find_in(GUEST_DEFAULT_MAP_BASE, HOST_SYSTEM_MANAGED_MAX + 1u);
 	if (addr == 0) {
-		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
+		addr = find_in(HOST_USER_MIN, HOST_USER_ALLOC_END);
 	}
 	return addr;
 }
@@ -1147,6 +1151,25 @@ bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
 const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingAlias(vaddr, size)
 	                                        : nullptr;
+}
+
+static std::atomic<bool (*)(uint64_t)> g_pending_amm_map_covers {nullptr};
+
+void SetPendingAmmMapHook(bool (*covers)(uint64_t vaddr)) {
+	g_pending_amm_map_covers.store(covers, std::memory_order_release);
+}
+
+bool PendingAmmMapCovers(uint64_t vaddr) {
+	auto* covers = g_pending_amm_map_covers.load(std::memory_order_acquire);
+	return covers != nullptr && covers(vaddr);
+}
+
+bool IsGpuFillableWord(uint64_t vaddr) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, sizeof(uint32_t)) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	return GetGpuResources().GetBufferCache().GpuFillSource(vaddr);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1604,6 +1627,26 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest, InPlac
 
 bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
+}
+
+static bool IsInPrtAperture(uint64_t address, uint64_t size);
+
+// The committed, non-private, GPU-mapped allocation containing vaddr (not sparse/PRT).
+bool GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr) return false;
+	const auto generation = g_virtual_ranges->Generation();
+	if (!g_virtual_ranges->Query(vaddr, 0, &range) || !IsCommittedRangeType(range.type) ||
+	    IsPrivateCommittedRangeType(range.type) || range.start > vaddr ||
+	    range.size <= vaddr - range.start || IsInPrtAperture(vaddr, 1)) {
+		return false;
+	}
+	if (!IsGpuMapped(range.start, range.size) || generation != g_virtual_ranges->Generation()) {
+		return false;
+	}
+	*start = range.start;
+	*size  = range.size;
+	return true;
 }
 
 // DrawPrep::Validate's clean check after a clean coherence-log check over [since, now]

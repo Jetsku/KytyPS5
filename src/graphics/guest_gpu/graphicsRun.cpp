@@ -1765,6 +1765,11 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	if (!submission.started) {
+		// Texture-heap entries the guest wrote before submitting are visible to all of this
+		// submission's draws, as on the console (bindless engine method, Senaxx).
+		m_renderer.GetRenderExecutor().SyncBindlessHeaps();
+	}
 	if (m_sequencer != nullptr && submission.queue_id == 0) {
 		return ProcessSequenced(submission);
 	}

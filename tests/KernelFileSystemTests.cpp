@@ -1579,6 +1579,89 @@ void CheckAmprWriteAddressRecordSizes(Loader::SymbolDatabase &symbols, uint32_t 
   destroy(batch);
 }
 
+// KYTY_AMPR_ASYNC (the ordering part of upstream's CheckAmprOrdering, on this line's executor): a
+// buffer whose wait is not satisfied returns from submit, holds back the later buffers of its
+// priority (a read behind it must not land early), lets other priorities complete, and waits as
+// long as the value takes (well past the old 1 s give-up), then runs the read and completes.
+void CheckAmprAsyncOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
+  Libs::LibAmpr::InitAmpr_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AMPR command and submission exports resolve");
+    return symbol->vaddr;
+  };
+  using Unary = int (KYTY_SYSV_ABI *)(void *);
+  using AprConstructor = int (KYTY_SYSV_ABI *)(void *, void *, void *);
+  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
+  using WaitAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t, uint8_t,
+                                          uint8_t);
+  using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
+  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
+                                       void *, uint64_t, uint64_t);
+  struct Result { int32_t result; uint32_t error_offset; };
+  using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
+  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
+  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
+  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
+  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
+  const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
+  const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
+  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
+  const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
+  struct Buffer {
+    std::array<uint64_t, 5> header {};
+    std::array<uint32_t, 256> data {};
+  };
+  std::array<Buffer, 3> buffers;
+  for (auto &buffer : buffers) {
+    construct(buffer.header.data());
+    construct_apr(buffer.header.data(), &buffer.header[3], &buffer.header[4]);
+    Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(Buffer::data)) == OK,
+          "initialize APR command buffer");
+  }
+  // The ticket the guest's streamer waits for (compare 1: greater than), stored by a CPU thread.
+  volatile uint64_t ticket = 0x4000000000002d4dull;
+  constexpr uint64_t Reference = 0x4000000000002e9full;
+  uint64_t blocked_done = 0, read_done = 0, lower_done = 0;
+  std::array<char, 3> output {};
+  std::array<Result, 3> results {{{1234, 5678}, {1234, 5678}, {1234, 5678}}};
+  std::array<uint32_t, 3> ids {};
+  auto *blocked = buffers[0].header.data();
+  auto *reader = buffers[1].header.data();
+  auto *lower = buffers[2].header.data();
+  Check(wait_address(blocked, &ticket, Reference, 1, 0) == OK &&
+            write_address(blocked, &blocked_done, 1) == OK &&
+            read_file(reader, reinterpret_cast<uint64_t>(&buffers[1].header[3]),
+                      reinterpret_cast<uint64_t>(&buffers[1].header[4]), file_id,
+                      output.data(), output.size(), 0) == OK &&
+            write_address(reader, &read_done, 2) == OK &&
+            write_address(lower, &lower_done, 3) == OK,
+        "build a blocked buffer, a read behind it and another priority's buffer");
+  Check(submit_apr(blocked, 3, &results[0], &ids[0]) == OK &&
+            submit_apr(reader, 3, &results[1], &ids[1]) == OK &&
+            submit_apr(lower, 4, &results[2], &ids[2]) == OK && wait_apr(ids[2]) == OK,
+        "submits return while a wait is unsatisfied; another priority completes");
+  Check(lower_done == 3 && blocked_done == 0 && read_done == 0 &&
+            output == std::array<char, 3>{} && results[0].result == 1234 &&
+            results[1].result == 1234,
+        "the unsatisfied wait holds back the later buffer of its priority");
+  // Longer than the old 1 s give-up: the buffers must still be waiting.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  Check(blocked_done == 0 && read_done == 0 && output == std::array<char, 3>{},
+        "the engine keeps waiting past one second instead of running the read early");
+  ticket = Reference + 1;
+  Check(wait_apr(ids[0]) == OK && wait_apr(ids[1]) == OK,
+        "the CPU store releases the waiting buffers");
+  Check(blocked_done == 1 && read_done == 2 && std::memcmp(output.data(), "APR", 3) == 0 &&
+            results[0].result == OK && results[1].result == OK,
+        "the read lands only after the wait, and both results complete");
+  for (auto &buffer : buffers) {
+    destroy(buffer.header.data());
+  }
+}
+
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -1676,6 +1759,7 @@ void CheckAprPaths(const std::filesystem::path &root) {
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
   CheckAmprWriteAddressRecordSizes(symbols, collision_ids[0]);
+  CheckAmprAsyncOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");
 }
 

@@ -21,11 +21,13 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <bitset>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,6 +48,12 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Bindless table hooks (Senaxx; RenderContext sets them). DeleteImage, on the GPU thread, calls
+	// on_bindless_unregister for a bindless-pinned image and then on_image_views_dropped with the
+	// image's views, before it unregisters it; its destruction waits for the current tick.
+	std::function<void(ImageId)>                          on_bindless_unregister;
+	std::function<bool(std::span<const CachedImageView>)> on_image_views_dropped;
+
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
@@ -433,6 +441,14 @@ private:
 	[[nodiscard]] bool OtherImagesOwnBytes(GuestRange range, ImageId except);
 	// False when no image is registered on the 1 MiB pages of the range (lock-free, any thread).
 	[[nodiscard]] bool MayOverlapImages(uint64_t address, uint64_t size) const;
+	// KYTY_TEXEL_SYNC_MEMO: the image registration epoch (InvalidateCleanImageProofs), or 0 when it
+	// is not maintained (KYTY_TEXTURE_CLEAN_PROOFS off) or saturated.
+	[[nodiscard]] uint64_t RegistrationEpoch() const {
+		const auto epoch = m_clean_image_epoch.load(std::memory_order_acquire);
+		return m_clean_image_proofs && epoch != UINT64_MAX ? epoch : 0;
+	}
+	// Whether a registered image starts at `address` (whatever its state).
+	[[nodiscard]] bool AnyImageStartsAt(uint64_t address);
 	// The 64 KiB blocks of a single-level, single-layer render target (64 KiB render-target
 	// tiling) under `rect` (level-0 texels, clamped to the extent). False: not such a target, or
 	// the rectangle covers the whole image (claim it all).
@@ -555,7 +571,7 @@ private:
 	uint64_t m_gpu_dcc_fallbacks = 0;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::unordered_map<uint64_t, ImageId>             m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::atomic<uint64_t>                             m_frame {0};
@@ -603,7 +619,9 @@ private:
 		uint64_t epoch = 0;
 	};
 	std::array<CleanImagePageProof, 256> m_clean_image_pages {};
-	uint64_t m_clean_image_epoch = 1;
+	// Bumped on every image register/unregister and GPU-modified transition (with clean proofs
+	// on); atomic so that BufferCache's texel-sync memo can read it on the GPU thread.
+	std::atomic<uint64_t> m_clean_image_epoch {1};
 	bool m_clean_image_proofs = false;
 	ImageLookupMode  m_image_lookup_mode = ImageLookupMode::FirstPage;
 	uint64_t         m_image_lookup_checks = 0;

@@ -41,16 +41,20 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ShaderCalls.h"
+#include "graphics/shader/recompiler/ir/passes/NullTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/fileSystem.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -95,6 +99,21 @@ namespace {
 
 Live::Switch g_pipeline_prefetch("KYTY_PIPELINE_PREFETCH", Live::ParseDefaultOff);
 Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDefaultOff);
+// KYTY_SRT_GPU_FILL (live, default 2; =1 without store offsets; =0 off; port of senaxx 0845beadf): a compute refresh on
+// the command processor leaves a flat SRT slot that only the shader uses (the plan's
+// gpu_fill_slots) to the GPU when its guest dword is GPU-written buffer memory: the walk writes
+// a placeholder instead of faulting and draining the GPU, and RebindBuffers copies the dword
+// from its buffer into the uploaded flat buffer on the GPU, between barriers, before the
+// dispatch (the value the shader's own load would read when it runs).
+// =2 also fills slots only buffer-store address operands use; the dispatch then takes a written
+// binding of up to 16 MiB whose write range reads such a slot as written whole (a larger one reads
+// the slot on the host for an exact range).
+Live::Switch g_srt_gpu_fill("KYTY_SRT_GPU_FILL", [](const char* value) -> int64_t {
+	if (value == nullptr) {
+		return 2;
+	}
+	return std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 2);
+});
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -1090,6 +1109,360 @@ void DumpCallTargets(const char* stage_name, uint64_t shader_hash,
 	}
 }
 
+// Reads guest memory for the call-table diagnostics: the clean backing, else in place inside the
+// GPU-mapped ranges (as DumpCallTargets).
+static bool ReadCallTableMemory(uint64_t address, void* data, size_t size) {
+	if (size == 0 || LibKernel::Memory::TryReadGpuCleanBacking(address, data, size)) {
+		return true;
+	}
+	if (ShaderRecompiler::IR::NeverMappedAddress(address, size) ||
+	    !LibKernel::Memory::IsGpuMapped(address, size)) {
+		return false;
+	}
+	std::memcpy(data, reinterpret_cast<const void*>(address), size);
+	return true;
+}
+
+// The functions an S_SWAPPC_B64 program reaches through call tables (ShaderRecompiler CallTable),
+// evaluated with the user data of the dispatch that compiles it: one log line per call with the
+// table's size and its distinct non-null targets. Returns those targets for DumpCallTargets.
+std::vector<ShaderRecompiler::CallTarget>
+DescribeCallTables(const char* stage_name, const ShaderRecompiler::CompileOptions& options,
+                   std::span<const ShaderRecompiler::CallTable> tables) {
+	std::vector<ShaderRecompiler::CallTarget> targets;
+	for (const auto& table: tables) {
+		std::string           failure;
+		std::vector<uint32_t> values;
+		if (table.user_sgpr >= options.user_data_base &&
+		    table.user_sgpr - options.user_data_base < options.user_data.size()) {
+			const auto first = options.user_data.subspan(table.user_sgpr - options.user_data_base);
+			values.assign(first.begin(), first.end());
+		}
+		for (const auto& step: table.steps) {
+			if (step.base_index + 1u >= values.size()) {
+				failure = "a base outside the loaded value";
+				break;
+			}
+			const auto low     = static_cast<uint64_t>(values[step.base_index]);
+			const auto high    = static_cast<uint64_t>(values[step.base_index + 1u]);
+			auto       address = (step.buffer ? low | ((high & 0xffffu) << 32u)
+			                                  : low | (high << 32u)) &
+			                     0x0000ffffffffffffull;
+			address += static_cast<uint64_t>(static_cast<int64_t>(step.offset));
+			values.assign(step.dwords, 0u);
+			if (!ReadCallTableMemory(address, values.data(), values.size() * sizeof(uint32_t))) {
+				failure = fmt::format("unreadable 0x{:x}", address);
+				break;
+			}
+		}
+		if (failure.empty() && table.table_index + 3u >= values.size()) {
+			failure = "no table descriptor";
+		}
+		uint64_t                     base = 0, bytes = 0, records = 0;
+		std::map<uint64_t, uint32_t> callees;
+		if (failure.empty()) {
+			const auto* vsharp = &values[table.table_index];
+			base               = (static_cast<uint64_t>(vsharp[0]) |
+                    (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u)) &
+			       0x0000ffffffffffffull;
+			const auto stride = (vsharp[1] >> 16u) & 0x3fffu;
+			bytes = stride != 0 ? static_cast<uint64_t>(vsharp[2]) * stride : vsharp[2];
+			const uint64_t record_bytes = uint64_t {1} << table.record_shift;
+			const auto     words        = record_bytes / sizeof(uint32_t);
+			records = record_bytes >= 8u ? std::min<uint64_t>(bytes, 16ull << 20u) / record_bytes : 0;
+			std::vector<uint32_t> data(records * words);
+			if (record_bytes < 8u || table.target_word + 1u >= words ||
+			    !ReadCallTableMemory(base, data.data(), data.size() * sizeof(uint32_t))) {
+				failure = fmt::format("unreadable table 0x{:x} (0x{:x} bytes)", base, bytes);
+			} else {
+				for (uint64_t r = 0; r < records; r++) {
+					const auto low  = static_cast<uint64_t>(data[r * words + table.target_word]);
+					const auto high = static_cast<uint64_t>(data[r * words + table.target_word + 1u]);
+					const auto callee = (low | (high << 32u)) & 0x0000ffffffffffffull;
+					if (callee != 0) {
+						callees[callee]++;
+					}
+				}
+			}
+		}
+		std::string list;
+		for (const auto& [callee, count]: callees) {
+			if (targets.size() < 64u) {
+				targets.push_back({callee, 0u, table.return_sgpr});
+			}
+			if (list.size() < 600u) {
+				list += fmt::format("{}0x{:x} x{}", list.empty() ? "" : ", ", callee, count);
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_SRT_VARIANT_READS: call table of {} shader 0x{:016x} at pc 0x{:x} (from s{}, {} "
+		    "load step(s), record {} bytes, target dword {}): {}\n",
+		    stage_name, options.shader_hash, table.call_pc, table.user_sgpr, table.steps.size(),
+		    1u << table.record_shift, table.target_word,
+		    failure.empty()
+		        ? fmt::format("table 0x{:x}, 0x{:x} bytes, {} records, {} distinct callees: {}",
+		                      base, bytes, records, callees.size(), list)
+		        : failure));
+	}
+	return targets;
+}
+
+// Whether a compute program may call through S_SWAPPC_B64 (any word looks like a call): memoized
+// per thread by program address and hash, so programs without calls pay one lookup per dispatch.
+static bool ComputeProgramMayCall(const ShaderParams& params) {
+	thread_local std::unordered_map<uint64_t, bool> known;
+	const auto key = params.Base() ^ (params.hash * 0x9e3779b97f4a7c15ull) ^ params.code.size();
+	const auto [entry, inserted] = known.try_emplace(key, false);
+	if (inserted) {
+		entry->second = ShaderRecompiler::Decoder::MayCallFunctions(params.code);
+	}
+	return entry->second;
+}
+
+// KYTY_SHADER_CALLS (default on): a compute program that calls functions through S_SWAPPC_B64 is
+// replaced by its expansion (ShaderRecompiler::ShaderCallExpander), which then goes through the
+// program cache like any program: `code` holds the expanded words and the key the expansion's
+// digest. A program that does not expand keeps its code (and is skipped as before).
+// KYTY_DUMP_PROGRAMS=<hash>,...;<folder> (diagnostics): the guest code and disassembly of those
+// programs, once per hash, stage and user-data count, as their compile starts. Local files only.
+static void DumpRequestedProgram(const ShaderParams& params, ShaderType stage) {
+	static const auto request = [] {
+		std::pair<std::set<uint64_t>, std::string> parsed;
+		const char* value = std::getenv("KYTY_DUMP_PROGRAMS");
+		if (value == nullptr) return parsed;
+		std::string_view text(value);
+		const auto       split = text.find(';');
+		if (split == std::string_view::npos) return parsed;
+		parsed.second = std::string(text.substr(split + 1));
+		for (auto list = text.substr(0, split); !list.empty();) {
+			const auto comma = list.find(',');
+			parsed.first.insert(std::strtoull(std::string(list.substr(0, comma)).c_str(), nullptr, 16));
+			if (comma == std::string_view::npos) break;
+			list.remove_prefix(comma + 1);
+		}
+		return parsed;
+	}();
+	// A listed 1 logs the guest address and hash of every program translated.
+	if (request.first.contains(1)) {
+		const auto line = fmt::format("ProgramAddr: stage={} base=0x{:016x} hash=0x{:016x} words={}\n",
+		                               static_cast<uint32_t>(stage), params.Base(), params.hash,
+		                               params.code.size());
+		LOGF("%s", line.c_str());
+	}
+	// A listed value also matches the guest address of the program (as diagnostics print it).
+	if (request.first.empty() ||
+	    (!request.first.contains(params.hash) && !request.first.contains(params.Base()))) {
+		return;
+	}
+	static std::mutex                 mutex;
+	static std::set<std::string>      done;
+	const auto name = fmt::format("{:016x}_stage{}_ud{}", params.hash, static_cast<uint32_t>(stage),
+	                              params.user_data_count);
+	{
+		std::scoped_lock lock(mutex);
+		if (!done.insert(name).second) return;
+	}
+	std::error_code error;
+	std::filesystem::create_directories(request.second, error);
+	const auto base = std::filesystem::path(request.second) / name;
+	if (std::FILE* file = std::fopen((base.string() + ".bin").c_str(), "wb"); file != nullptr) {
+		std::fwrite(params.code.data(), sizeof(uint32_t), params.code.size(), file);
+		std::fclose(file);
+	}
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::DecodeProgram(params.code, decoded, true);
+	std::string text = fmt::format("user data ({}):", params.user_data_count);
+	for (uint32_t i = 0; i < params.user_data_count; i++) text += fmt::format(" {:08x}", params.user_data[i]);
+	text += "\n" + ShaderRecompiler::Decoder::ProgramToString(decoded);
+	if (std::FILE* file = std::fopen((base.string() + ".txt").c_str(), "wb"); file != nullptr) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
+static ShaderRecompiler::ShaderCallExpander& CallExpander() {
+	static ShaderRecompiler::ShaderCallExpander expander;
+	return expander;
+}
+
+// Where the callee bodies of each expansion handed out are (by its digest), for the background
+// translation to name a callee that keeps an expansion from translating.
+static std::mutex g_call_bodies_mutex;
+static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>>>
+    g_call_bodies;
+
+static bool ExpandComputeCalls(ShaderParams& params, uint32_t wave_size) {
+	if (!ShaderRecompiler::GetCodegenOptions().shader_calls || !params.back_code.empty() ||
+	    params.code.empty() || !ComputeProgramMayCall(params)) {
+		return false;
+	}
+	auto&                            expander = CallExpander();
+	ShaderRecompiler::CompileOptions options;
+	options.stage       = ShaderType::Compute;
+	options.wave_size   = wave_size;
+	options.shader_hash = params.hash;
+	options.user_data   = std::span(params.user_data).first(params.user_data_count);
+	ShaderRecompiler::ShaderCallExpander::Expanded expanded;
+	if (!expander.Expand(
+	        params.code, params.Base(), options,
+	        [](uint64_t address, std::span<uint32_t> words) {
+		        return ReadCallTableMemory(address, words.data(), words.size_bytes());
+	        },
+	        expanded)) {
+		return true;
+	}
+	params.guest_base     = params.Base();
+	params.code           = *expanded.code;
+	params.call_expansion = expanded.digest | 1u; // never 0
+	{
+		std::scoped_lock lock(g_call_bodies_mutex);
+		g_call_bodies.try_emplace(params.call_expansion, expanded.bodies);
+	}
+	return true;
+}
+
+// KYTY_SHADER_CALLS_ASYNC (default on): an expanded call program can be large (Miles Morales'
+// ray-tracing kernels: about 160K words) and its translation takes seconds, so it is translated on
+// a background thread and its dispatches are skipped until the translation is ready; the compile
+// path then takes that translation instead of translating (CompileAndPublish). The translation is a
+// function of the code, the static stage state and the user-data count, which the id covers.
+class CallTranslations {
+public:
+	enum class State { Missing, Pending, Ready };
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_SHADER_CALLS_ASYNC");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		return enabled;
+	}
+	static CallTranslations& Instance() {
+		static CallTranslations instance;
+		return instance;
+	}
+	static uint64_t Id(uint64_t hash, uint32_t user_data_count, std::span<const uint32_t> static_state) {
+		return XXH3_64bits_withSeed(static_state.data(), static_state.size_bytes(),
+		                            hash ^ (uint64_t {user_data_count} << 56u));
+	}
+
+	State Query(uint64_t id) {
+		std::scoped_lock lock(m_mutex);
+		const auto entry = m_entries.find(id);
+		if (entry == m_entries.end()) return State::Missing;
+		return entry->second.done ? State::Ready : State::Pending;
+	}
+	void Queue(uint64_t id, const ShaderParams& params, const ShaderComputeInputInfo& info) {
+		auto job        = std::make_unique<Job>();
+		job->id         = id;
+		job->hash       = params.hash;
+		job->code.assign(params.code.begin(), params.code.end());
+		job->user_data.assign(params.user_data.begin(), params.user_data.begin() + params.user_data_count);
+		job->info       = info;
+		job->info.stage = {};
+		{
+			std::scoped_lock lock(g_call_bodies_mutex);
+			if (const auto bodies = g_call_bodies.find(params.call_expansion); bodies != g_call_bodies.end()) {
+				job->bodies = bodies->second;
+			}
+		}
+		{
+			std::scoped_lock lock(m_mutex);
+			if (!m_entries.try_emplace(id).second) return;
+			m_jobs.push_back(std::move(job));
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+		}
+		m_wake.notify_one();
+	}
+	// The ready translation of `id` (once; a later compile of the source translates again).
+	std::optional<ShaderRecompiler::TranslateResult> Take(uint64_t id) {
+		std::scoped_lock lock(m_mutex);
+		const auto entry = m_entries.find(id);
+		if (entry == m_entries.end() || !entry->second.done || !entry->second.result) return {};
+		auto result = std::move(entry->second.result);
+		entry->second.result.reset();
+		return result;
+	}
+	~CallTranslations() {
+		{
+			std::scoped_lock lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_all();
+		if (m_thread.joinable()) m_thread.join();
+	}
+
+private:
+	struct Job {
+		uint64_t               id   = 0;
+		uint64_t               hash = 0;
+		std::vector<uint32_t>  code;
+		std::vector<uint32_t>  user_data;
+		ShaderComputeInputInfo info {};
+		std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>> bodies;
+	};
+	struct Entry {
+		bool                                             done = false;
+		std::optional<ShaderRecompiler::TranslateResult> result;
+	};
+
+	void Run() {
+		for (;;) {
+			std::unique_ptr<Job> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_wake.wait(lock, [&] { return m_stop || !m_jobs.empty(); });
+				if (m_stop) return;
+				job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+			}
+			ShaderRecompiler::CompileOptions options;
+			ShaderStageInputInfo             stage_input {};
+			stage_input.compute = &job->info;
+			options.stage       = ShaderType::Compute;
+			options.shader_hash = job->hash;
+			options.user_data   = job->user_data;
+			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+			options.early_dump  = options.dump_ir;
+			options.dump_label  = "ShaderRecompiler CS";
+			options.input_info  = stage_input;
+			options.wave_size   = job->info.wave_size;
+			const auto begin    = std::chrono::steady_clock::now();
+			auto       result   = ShaderRecompiler::TranslateProgram(job->code, options);
+			const auto ms       = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - begin)
+			                    .count();
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_SHADER_CALLS: CS shader 0x{:016x}: expansion of {} words translated in the "
+			    "background in {} ms{}.\n",
+			    job->hash, job->code.size(), ms, result.skip_dispatch ? " (its dispatches are skipped)" : ""));
+			// A callee that keeps it from translating is left out of the next expansions.
+			if (result.skip_dispatch && result.skip_pc != UINT32_MAX && job->bodies != nullptr) {
+				for (const auto& body: *job->bodies) {
+					if (result.skip_pc >= body.begin && result.skip_pc < body.end) {
+						CallExpander().DropTarget(
+						    body.address, fmt::format("{} at +0x{:x} in CS 0x{:016x}", result.skip_reason,
+						                              result.skip_pc - body.begin, job->hash));
+						break;
+					}
+				}
+			}
+			std::scoped_lock lock(m_mutex);
+			auto& entry  = m_entries[job->id];
+			entry.done   = true;
+			entry.result = std::move(result);
+		}
+	}
+
+	std::mutex                          m_mutex;
+	std::condition_variable             m_wake;
+	std::deque<std::unique_ptr<Job>>    m_jobs;
+	std::unordered_map<uint64_t, Entry> m_entries;
+	std::thread                         m_thread;
+	bool                                m_stop = false;
+};
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -1957,6 +2330,11 @@ struct PipelineCache::ProgramCache {
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);
+		if (params.call_expansion != 0) [[unlikely]] {
+			// An expanded S_SWAPPC_B64 program (ExpandComputeCalls): its code depends on the callees.
+			key.static_state.push_back(static_cast<uint32_t>(params.call_expansion));
+			key.static_state.push_back(static_cast<uint32_t>(params.call_expansion >> 32u));
+		}
 	}
 
 	static ShaderRecompiler::IR::SrtRuntime MakeRuntime(const ShaderParams& params,
@@ -2716,6 +3094,7 @@ struct PipelineCache::ProgramCache {
 		} stall {.account = !speculative && !replay};
 		std::vector<uint32_t> owned_code;
 		auto translation_code = params.code;
+		DumpRequestedProgram(params, key.stage);
 		if (speculative) {
 			// A certificate checked at draw consumption cannot repair a cache entry published
 			// from changed code. Keep an immutable copy and verify its identity before publication.
@@ -2848,7 +3227,13 @@ struct PipelineCache::ProgramCache {
 			const auto translate_begin = CompileClockNs();
 			{
 				KYTY_PROFILER_BLOCK("Shader::Translate");
-				translated = ShaderRecompiler::TranslateProgram(translation_code, options);
+				// An expanded call program translated in the background (CallTranslations).
+				auto ready = params.call_expansion != 0
+				                 ? CallTranslations::Instance().Take(CallTranslations::Id(
+				                       key.hash, key.user_data_count, key.static_state))
+				                 : std::nullopt;
+				translated = ready ? std::move(*ready)
+				                   : ShaderRecompiler::TranslateProgram(translation_code, options);
 			}
 			times.translate_ns += CompileClockNs() - translate_begin;
 			translated_now = true;
@@ -2911,7 +3296,8 @@ struct PipelineCache::ProgramCache {
 			const auto load_begin = CompileClockNs();
 			auto disk_params = params;
 			disk_params.code = translation_code;
-			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words, speculative);
+			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words,
+			             speculative || params.call_expansion != 0);
 			if (source == nullptr) {
 				disk_source = disk->FindSource(disk_key);
 			}
@@ -2974,8 +3360,20 @@ struct PipelineCache::ProgramCache {
 				// Skipped ray-tracing shaders are never compiled; dump their guest code here.
 				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
 				                   params.code, translated.decoded_dump);
-				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash,
-				                translated.call_targets);
+				auto call_targets = translated.call_targets;
+				// The call-table description reads guest memory: only for dumps or
+				// KYTY_CALL_TABLE_LOG=1 (startup, default off).
+				static const bool call_table_log = [] {
+					const char* value = std::getenv("KYTY_CALL_TABLE_LOG");
+					return value != nullptr && value[0] == '1';
+				}();
+				if (call_table_log || Config::GraphicsDebugDumpEnabled()) {
+					for (const auto& callee: DescribeCallTables(ProgramStageName(options.stage), options,
+					                                            translated.call_tables)) {
+						call_targets.push_back(callee);
+					}
+				}
+				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash, call_targets);
 				if (disk_on) {
 					disk->AddSource(disk_key, true, {});
 				}
@@ -3191,7 +3589,8 @@ struct PipelineCache::ProgramCache {
 			disk->AddPermutation(disk_key.digest, push_data_cursor, specialization_bytes, info,
 			                     words.spirv, words.spirv_plain);
 		}
-		if (journal != nullptr && !replay) {
+		// An expanded call program (host-owned code) is not journaled: its key names its callees.
+		if (journal != nullptr && !replay && params.call_expansion == 0) {
 			JournalPermutation(params, translation_code, key, options, input_info,
 			                   push_data_cursor, permutation.specialization, specialization_bytes,
 			                   code_words);
@@ -3455,12 +3854,17 @@ struct PipelineCache::ProgramCache {
 			source = FindSourceMemo(key, scratch);
 		}
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
+			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
 			return {};
 		}
 		auto runtime = speculative ? MakeSpeculativeRuntime(params) : MakeRuntime(params, read_attempt);
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			// Image descriptor tables indexed by the workgroup id (upstream 0ee880090).
 			runtime.workgroup_counts = input_info.workgroup_counts;
+			if (!speculative && g_srt_gpu_fill.On() && GuestGpu::IsGpuThread()) {
+				runtime.gpu_written            = LibKernel::Memory::IsGpuFillableWord;
+				runtime.gpu_fill_store_offsets = g_srt_gpu_fill.Get() >= 2;
+			}
 		}
 		if (source != nullptr) {
 			bool materialized = false;
@@ -3468,7 +3872,10 @@ struct PipelineCache::ProgramCache {
 				const CpGaps::Scope gap(CpGaps::Cat::ProgMaterialize);
 				materialized = Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			}
-			if (!materialized) return {};
+			if (!materialized) {
+				ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedResources, params.hash);
+				return {};
+			}
 			if (ResourceReuseEnabled() && ResourceDependencyCacheEnabled() &&
 			    source->reuse.current.prepared_reads.Valid()) {
 				const auto* cached = PermutationAt(*source, source->reuse.current.permutation_index);
@@ -3498,7 +3905,10 @@ struct PipelineCache::ProgramCache {
 		    CompileAndPublish(params, input_info, push_data_cursor, key, runtime, evaluation,
 		                      scratch, prep, read_attempt, source != nullptr, speculative);
 		if (compile_ns != nullptr) *compile_ns += CompileClockNs() - begin;
-		if (permutation == nullptr) return {};
+		if (permutation == nullptr) {
+			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
+			return {};
+		}
 		return Bind(*permutation, input_info, prep, push_data_cursor);
 	}
 
@@ -4631,6 +5041,12 @@ struct PipelineCache::RtState {
 		return empty;
 	}
 
+	// KYTY_RT_PIPELINE_LOG=1 (diagnostics): one line per background pipeline job queued and finished.
+	static bool RtPipelineLogEnabled() {
+		static const bool enabled = EnvU64("KYTY_RT_PIPELINE_LOG", 0) != 0;
+		return enabled;
+	}
+
 	// Under `mutex`. The job of kernel `id`, started when new; null when the queue refused it.
 	Job* Request(uint64_t id, const ShaderComputeInputInfo& input, const ShaderProgram& program) {
 		if (const auto found = jobs.find(id); found != jobs.end()) return &found->second;
@@ -4666,6 +5082,11 @@ struct PipelineCache::RtState {
                 } else if (built->pipeline == nullptr || built->pipeline->pipeline == nullptr) {
                     built->error = "no pipeline was created";
                 }
+                if (RtPipelineLogEnabled()) {
+                    PipelineCacheLog("Software RT: pipeline job {} of compute shader 0x{:016x} finished in {:.0f} ms{}{}",
+                                     id, shader_hash, static_cast<double>(built->ns) / 1.0e6,
+                                     built->error.empty() ? "" : ": ", built->error);
+                }
                 promise->set_value(std::move(built));
             },
             job.ticket);
@@ -4674,6 +5095,10 @@ struct PipelineCache::RtState {
 			return nullptr;
 		}
 		totals.requested.fetch_add(1, std::memory_order_relaxed);
+		if (RtPipelineLogEnabled()) {
+			PipelineCacheLog("Software RT: pipeline job {} of compute shader 0x{:016x} queued ({} requested so far)",
+			                 id, job.shader_hash, totals.requested.load(std::memory_order_relaxed));
+		}
 		return &jobs[id];
 	}
 
@@ -6524,16 +6949,15 @@ void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vert
 	// group offset, so ExecutePreparedDraw can split a draw with more groups along X.
 	mesh.split_groups =
 	    limits.maxMeshWorkGroupCount[0] < limits.maxMeshWorkGroupTotalCount ? 1u : 0u;
-	const auto  logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-	const auto  host_threads    = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-	                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-	if (host_threads > limits.maxMeshWorkGroupInvocations ||
-	    host_threads > limits.maxMeshWorkGroupSize[0] ||
-	    mesh.max_vertices > limits.maxMeshOutputVertices ||
+	// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its waves in
+	// passes (Senaxx a1c2a88a9; EmitMeshEntryPoint).
+	mesh.passes = mesh.PassesFor(
+	    std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
+	if (mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
 	    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 	    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
 		EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-		     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+		     mesh.HostThreads(), mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
 	}
 }
 
@@ -6793,7 +7217,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	std::optional<CpGaps::Scope> prepare_gap;
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
-	const auto        params      = PrepareProgram(regs, sh, input_info);
+	auto              params      = PrepareProgram(regs, sh, input_info);
+	(void)ExpandComputeCalls(params, input_info.wave_size);
 	prepare_gap.reset();
 	// Use one effective size and placement for the cache key, LDS declaration, and access bounds.
 	// Above the device limit (AMD reports 32 KiB; some Astro Bot compute shaders ask for 48) the
@@ -6827,6 +7252,20 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	}
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
+	if (params.call_expansion != 0 && CallTranslations::Enabled()) {
+		// A new expanded call program: its dispatches are skipped while it translates.
+		auto& key = scratch.key;
+		ProgramCache::BuildKey(params, input_info, key);
+		if (m_program_cache->FindSource(key) == nullptr) {
+			auto&      translations = CallTranslations::Instance();
+			const auto id = CallTranslations::Id(key.hash, key.user_data_count, key.static_state);
+			switch (translations.Query(id)) {
+				case CallTranslations::State::Missing: translations.Queue(id, params, input_info); return {};
+				case CallTranslations::State::Pending: return {};
+				case CallTranslations::State::Ready: break;
+			}
+		}
+	}
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
 		ShaderReadAttempt read_attempt;
 		uint32_t push_data_cursor = 0;
@@ -6863,6 +7302,11 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareComputeProgramSpeculative
 	const auto params             = PrepareProgram(regs, sh, input_info);
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;
+	}
+	// A program with calls is expanded on the serial path only (ExpandComputeCalls).
+	if (ShaderRecompiler::GetCodegenOptions().shader_calls && params.back_code.empty() &&
+	    ComputeProgramMayCall(params)) {
+		return SpeculativeResult::Ineligible;
 	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;

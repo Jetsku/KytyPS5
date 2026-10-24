@@ -14,6 +14,7 @@
 #include <compare>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -559,6 +560,11 @@ public:
 	uint64_t         feedback_instance = 0;
 	uint64_t         feedback_serial   = 0;
 	uint64_t         feedback_attached = 0;
+	// Referenced by a bindless table slot (Senaxx): the collector keeps it, and dropping it tells
+	// the table (TextureCache::on_bindless_unregister) to repoint the slot. bindless_self_id is the
+	// image's own id, set when it is pinned (NoteBindlessStateChange).
+	bool             bindless_pinned  = false;
+	Common::SlotId   bindless_self_id {};
 	// Replaces the tracked state without recording a barrier. Only for callers that proved no
 	// access pair of the old and new scopes can conflict (see KYTY_DEPTH_FEEDBACK_KEEP).
 	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
@@ -600,6 +606,25 @@ private:
 	vk::ImageUsageFlags  m_dropped_usage {};
 	vk::ImageCreateFlags m_dropped_flags {};
 };
+
+// Changes of a bindless-pinned image's state that the per-draw bindless pass checks
+// (RenderExecutor::CommitBindings): its layout and render-target use. A heap is rechecked only
+// when this changed since it was last checked, or for the images resolved since (Senaxx).
+inline std::atomic<uint64_t> g_bindless_state_generation {1};
+// The pinned images whose state changed, for the engine method's per-draw pass (E5), which looks
+// at these and at newly settled images only, instead of every image of a heap.
+struct BindlessStateChanges {
+	std::mutex           mutex;
+	std::vector<ImageId> ids;
+};
+inline BindlessStateChanges g_bindless_state_changes;
+inline void NoteBindlessStateChange(const Image& image) noexcept {
+	if (image.bindless_pinned) {
+		g_bindless_state_generation.fetch_add(1, std::memory_order_relaxed);
+		std::scoped_lock lock {g_bindless_state_changes.mutex};
+		g_bindless_state_changes.ids.push_back(image.bindless_self_id);
+	}
+}
 
 namespace ImageOps {
 

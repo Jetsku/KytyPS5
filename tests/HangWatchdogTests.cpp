@@ -29,6 +29,22 @@ void Decisions() {
   Check(!d.Poll(40000, 2, 2, 5000), "flip progress cancels stall");
   Check(d.Poll(45000, 2, 2, 5000), "exactly five seconds fires");
   Check(!d.Poll(99999, 2, 2, 5000), "only once");
+
+  // KYTY_HANG_WATCHDOG_REPORTS > 1: the next stall fires after progress resumed.
+  HangWatchdog::StallDetector r;
+  r.rearm = true;
+  Check(!r.Poll(0, 1, 1, 5000), "rearm: arms");
+  Check(r.Poll(5000, 1, 1, 5000), "rearm: first stall fires");
+  Check(!r.Poll(20000, 1, 1, 5000), "rearm: same stall reported once");
+  Check(!r.Poll(21000, 2, 1, 5000), "rearm: progress re-arms");
+  Check(!r.Poll(25999, 2, 1, 5000), "rearm: below threshold");
+  Check(r.Poll(26000, 2, 1, 5000), "rearm: second stall fires");
+  // KYTY_HANG_WATCHDOG_TRIGGER=flips: submissions alone are no progress.
+  HangWatchdog::StallDetector f;
+  f.flips_only = true;
+  Check(!f.Poll(0, 1, 1, 5000), "flips: arms");
+  Check(!f.Poll(3000, 1, 50, 5000), "flips: submissions do not fire early");
+  Check(f.Poll(5000, 1, 99, 5000), "flips: submissions are no progress");
 }
 void ConcurrentSnapshot() {
   std::atomic<bool> ready{false}, release{false};

@@ -167,6 +167,14 @@ struct EmitterState {
 	// the mip_stats binding stays declared, but no sample records GET_LOD_STATS feedback.
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
+	// the feedback buffer, and the slot of the image instruction being emitted.
+	std::map<uint32_t, uint32_t>                     bindless_image_variables;
+	uint32_t                                         bindless_translation_variable = 0;
+	uint32_t                                         bindless_feedback_variable    = 0;
+	uint32_t                                         bindless_slot                 = 0;
+	// The module's decoder of formatted loads through a computed V# (DefineIndirectFormatFunction).
+	uint32_t                                         indirect_format_function      = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
 	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds
@@ -184,6 +192,14 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_zero_position_mask               = 0;
+	uint32_t                   mesh_zero_position_words              = 0;
+	// A subgroup larger than the host workgroup runs in mesh_passes passes (ShaderMeshInputInfo):
+	// mesh_pass_variable holds the current pass, and the guest program is cut at its barriers
+	// into mesh_segment_funcs, each called once per pass.
+	uint32_t                   mesh_passes                           = 1;
+	uint32_t                   mesh_pass_variable                    = 0;
+	std::vector<uint32_t>      mesh_segment_funcs;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -400,6 +416,7 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                                 uint32_t array_index = 0);
 
+void DefineIndirectFormatFunction(EmitterState& state);
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
@@ -440,6 +457,7 @@ void     EmitGeometryOutputDefaults(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
+uint32_t MeshLaneSlot(EmitterState& state);
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits);
@@ -543,6 +561,9 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// KYTY_STORAGE_LENGTH_ZERO: a length of 0 means unbounded (NVIDIA's OpArrayLength of a binding
+	// of 2 GiB or more).
+	bool                  zero_length_unbounded = false;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,

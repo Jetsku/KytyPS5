@@ -158,6 +158,8 @@ jobs:
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
+          # Per-title overrides (u59-preset.<TITLE_ID>.json, common/u59Preset.h) ship next to it.
+          Get-ChildItem -Path 'tools' -Filter 'u59-preset.*.json' | Copy-Item -Destination $release
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
             throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
           }

@@ -1151,12 +1151,8 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 }
 
 int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
-	PRINT_NAME();
-
-	LOGF("\t event_param = 0x%016" PRIx64 "\n"
-	     "\t event       = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
-
+	// Games poll this in a tight loop (Wolverine: tens of GB of log per hour), so only a call that
+	// returns an event logs.
 	if (event == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
@@ -1165,6 +1161,11 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 	if (g_save_data_events.empty()) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
+
+	PRINT_NAME();
+	LOGF("\t event_param = 0x%016" PRIx64 "\n"
+	     "\t event       = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
 
 	*event = g_save_data_events.front();
 	g_save_data_events.pop_front();
@@ -1293,6 +1294,48 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
+struct SaveDataConvertParam {
+	int32_t                   user_id;
+	int32_t                   reserved0;
+	const SceSaveDataDirName* src_dir_name;
+	const SceSaveDataDirName* dst_dir_name; // may be null
+	uint64_t                  dst_blocks;   // 0 keeps the source size
+	uint8_t                   reserved[24];
+};
+
+static_assert(sizeof(SaveDataConvertParam) == 56);
+
+// sceSaveDataConvert (Senaxx 511447c79): converts save data to the current format. A result >= 0
+// starts an asynchronous conversion the caller polls; NOT_FOUND and NO_NEED_CONVERT mean "nothing to
+// convert", and the caller goes on to mount or create its save. Kyty only writes the current
+// format. Unresolved, the stub's 0 made Wolverine wait for a conversion forever after New Game
+// (the picture froze in the opening cinematic while its loader polled).
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
+	PRINT_NAME();
+
+	if (convert == nullptr || convert->src_dir_name == nullptr ||
+	    !valid_path_component(convert->src_dir_name->data)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	if (convert->user_id < 0) {
+		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+	}
+
+	LOGF("\t user_id    = %" PRId32 "\n"
+	     "\t src        = %.32s\n"
+	     "\t dst        = %.32s\n"
+	     "\t dst_blocks = %" PRIu64 "\n",
+	     convert->user_id, convert->src_dir_name->data,
+	     convert->dst_dir_name != nullptr ? convert->dst_dir_name->data : "<null>",
+	     convert->dst_blocks);
+
+	std::error_code error;
+	const auto      dir =
+	    save_directory(get_title_id(), convert->src_dir_name->data, convert->user_id);
+	return std::filesystem::exists(dir, error) ? SAVE_DATA_ERROR_NO_NEED_CONVERT
+	                                           : SAVE_DATA_ERROR_NOT_FOUND;
+}
+
 } // namespace SaveData
 
 namespace LibSaveDataNative {
@@ -1313,6 +1356,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cduy9v4YmT4", ::Libs::SaveData::SaveDataSetSaveDataMemory2);
 	LIB_FUNC("wiT9jeC7xPw", ::Libs::SaveData::SaveDataSyncSaveDataMemory);
 	LIB_FUNC("j8xKtiFj0SY", ::Libs::SaveData::SaveDataGetEventResult);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
 	LIB_FUNC("WAzWTZm1H+I", ::Libs::SaveData::SaveDataTransferringMount);
 	LIB_FUNC("RjMlsR8EXrw", ::Libs::SaveData::SaveDataTransferringMount);
 	LIB_FUNC("z1JA8-iJt3k", ::Libs::SaveData::SaveDataBackup);

@@ -284,6 +284,7 @@ int JournalCompile(const char *path, uint32_t threads) {
   settings.identity = identity;
   settings.background_writer = false;
   ShaderJournal journal(std::move(settings));
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true); // as on a device with descriptor indexing
   const auto begin = std::chrono::steady_clock::now();
   std::vector<std::unique_ptr<Job>> jobs;
   size_t skipped = 0;

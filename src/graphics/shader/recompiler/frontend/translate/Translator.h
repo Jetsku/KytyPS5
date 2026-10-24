@@ -92,6 +92,15 @@ private:
 	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
+	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
+	// A shared/private aperture register was read: FLAT accesses then route by aperture.
+	bool flat_aperture_seen = false;
+
+public:
+	// Every block of a program routes FLAT accesses by aperture once any block reads a base/limit.
+	void SetFlatAperture(bool seen) { flat_aperture_seen = seen; }
+
+private:
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
 	void IMAGE_GET_LOD(const Decoder::Instruction& inst);

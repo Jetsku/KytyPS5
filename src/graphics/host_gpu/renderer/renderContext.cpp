@@ -117,8 +117,16 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_occlusion_counter(*this), m_lod_stats(*this) {
+      m_occlusion_counter(*this), m_lod_stats(*this),
+      m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Bindless table (Senaxx): images the texture cache drops leave the table's slots first.
+	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+		m_bindless_table.OnImageUnregistered(id);
+	};
+	m_texture_cache.on_image_views_dropped = [this](std::span<const CachedImageView> views) {
+		return m_bindless_table.ReleaseViews(views);
+	};
 	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
 	// take their first fault.
 	FaultCost::SetThreadDescriber([](char* name, uint64_t size) -> int {
@@ -223,6 +231,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			lap(FaultCost::Part::Buffer);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 			lap(FaultCost::Part::Texture);
+			// Bindless heap pages (engine method): returns without a lock unless a heap is near.
+			m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 			// The faulting page gets the protection its watchers ask even when neither cache
 			// released anything here: another thread may have released it without having applied
 			// the release yet. A fault inside an enclosing scope (an emulator write between that
@@ -261,6 +271,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	const PageManager::DeferUnprotectScope defer_unprotect;
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_bindless_table.OnCpuWrite(vaddr, size);
 	return true;
 }
 
@@ -314,14 +325,46 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
 }
 
+// KYTY_MAP_INVALIDATE=0 turns it off: a new mapping is treated as a write of its whole range.
+// Streaming games map the resident part of a texture and leave the rest of its range unmapped
+// (Miles Morales' AMM pool); an image created then read zeros there, and its page watch could not
+// protect pages that had no mapping. When the game maps the rest and loads the finer mips into it
+// (AMPR file reads), no write faulted and the image kept the zeros: shared detail textures whose
+// two finest mips stayed black made car paint black near the camera.
+static bool MapInvalidateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_MAP_INVALIDATE");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	// GPU mapping changes retire clean-read verdicts (the backing translation has its own
-	// generation in the guest address space).
-	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
-	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.InvalidateBdaSynchronization();
-	SyncEpoch::Advance();
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		// GPU mapping changes retire clean-read verdicts (the backing translation has its own
+		// generation in the guest address space).
+		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
+		m_mapped_ranges.Add(vaddr, size);
+		m_buffer_cache.InvalidateBdaSynchronization();
+		SyncEpoch::Advance();
+	}
+	if (!MapInvalidateEnabled() || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// Images and buffers over the new mapping hold the zeros read before it: invalidate them as a
+	// file read into the range does. Untracked images watch the pages again at their refresh, now
+	// that the pages can be protected.
+	const bool images = m_texture_cache.IsRegionRegistered(vaddr, size);
+	if (images) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("MapMemory: 0x%016" PRIx64 "+0x%" PRIx64
+			     " maps into registered images: they are refreshed (KYTY_MAP_INVALIDATE)\n",
+			     vaddr, size);
+		}
+	}
+	(void)InvalidateMemory(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -348,6 +391,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_bindless_table.UnwatchRange(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);

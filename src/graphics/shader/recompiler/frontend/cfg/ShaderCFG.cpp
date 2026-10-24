@@ -722,8 +722,104 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
+// Dominator sets through immediate dominators (Cooper, Harvey and Kennedy, "A Simple, Fast Dominance
+// Algorithm"): on large programs (an S_SWAPPC_B64 expansion has thousands of blocks) the iterative
+// set intersection below costs time and memory quadratic in the block count. `edges(block)` lists
+// the edges into a block in the direction of the analysis (predecessors for dominators, successors
+// for post-dominators), `roots` the blocks the analysis starts from. The sets equal the iterative
+// fixed point for every block a root reaches; false (nothing written) when some block is not
+// reached, so the caller keeps the iterative algorithm for those graphs.
+template <typename Edges, typename Forward, typename Store>
+bool ComputeDominatorSetsFast(const Graph& graph, const std::vector<uint32_t>& roots, Edges&& edges,
+                              Forward&& forward, Store&& store) {
+	const auto count   = static_cast<uint32_t>(graph.blocks.size());
+	const auto virtual_root = count; // joins several roots
+	// Reverse postorder of the forward walk from the roots.
+	std::vector<uint32_t> order_index(count + 1u, UINT32_MAX);
+	std::vector<uint32_t> postorder;
+	postorder.reserve(count + 1u);
+	{
+		std::vector<std::pair<uint32_t, uint32_t>> stack; // (block, next successor index)
+		std::vector<bool>                          visited(count + 1u, false);
+		visited[virtual_root] = true;
+		stack.emplace_back(virtual_root, 0u);
+		while (!stack.empty()) {
+			auto& [block, next] = stack.back();
+			const auto& successors = block == virtual_root ? roots : forward(block);
+			if (next < successors.size()) {
+				const auto successor = successors[next++];
+				if (successor < count && !visited[successor]) {
+					visited[successor] = true;
+					stack.emplace_back(successor, 0u);
+				}
+				continue;
+			}
+			postorder.push_back(block);
+			stack.pop_back();
+		}
+	}
+	if (postorder.size() != count + 1u) {
+		return false;
+	}
+	for (uint32_t i = 0; i < postorder.size(); i++) {
+		order_index[postorder[i]] = static_cast<uint32_t>(postorder.size()) - 1u - i;
+	}
+	std::vector<uint32_t> idom(count + 1u, UINT32_MAX);
+	idom[virtual_root] = virtual_root;
+	const auto intersect = [&](uint32_t a, uint32_t b) {
+		while (a != b) {
+			while (order_index[a] > order_index[b]) a = idom[a];
+			while (order_index[b] > order_index[a]) b = idom[b];
+		}
+		return a;
+	};
+	const auto is_root = [&](uint32_t block) { return Contains(roots, block); };
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+			const auto block = *it;
+			if (block == virtual_root) continue;
+			uint32_t next = is_root(block) ? virtual_root : UINT32_MAX;
+			for (const auto pred: edges(block)) {
+				if (pred >= count || idom[pred] == UINT32_MAX) continue;
+				next = next == UINT32_MAX ? pred : intersect(pred, next);
+			}
+			if (next != UINT32_MAX && idom[block] != next) {
+				idom[block] = next;
+				changed     = true;
+			}
+		}
+	}
+	std::vector<uint32_t> chain;
+	for (uint32_t block = 0; block < count; block++) {
+		chain.clear();
+		for (uint32_t at = block; at != virtual_root; at = idom[at]) {
+			chain.push_back(at);
+		}
+		std::sort(chain.begin(), chain.end());
+		store(block, chain);
+	}
+	return true;
+}
+
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
+	// The walk follows the edges the iterative algorithm reads (the predecessor lists), reversed.
+	std::vector<std::vector<uint32_t>> forward(count);
+	for (const auto& block: graph.blocks) {
+		for (const auto pred: block.predecessors) {
+			if (pred < count) forward[pred].push_back(block.id);
+		}
+	}
+	if (graph.entry_block < count &&
+	    ComputeDominatorSetsFast(
+	        graph, {graph.entry_block},
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return graph.blocks[block].predecessors; },
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return forward[block]; },
+	        [&](uint32_t block, const std::vector<uint32_t>& set) { graph.blocks[block].dominators = set; })) {
+		return;
+	}
 	const auto all   = AllBlockIds(count);
 
 	for (auto& block: graph.blocks) {
@@ -758,6 +854,25 @@ void ComputeDominators(Graph& graph) {
 
 void ComputePostDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
+	std::vector<uint32_t> exits;
+	for (const auto& block: graph.blocks) {
+		if (block.successors.empty()) exits.push_back(block.id);
+	}
+	// The walk follows the successor lists (the edges the iterative algorithm reads), reversed.
+	std::vector<std::vector<uint32_t>> backward(count);
+	for (const auto& block: graph.blocks) {
+		for (const auto succ: block.successors) {
+			if (succ < count) backward[succ].push_back(block.id);
+		}
+	}
+	if (!exits.empty() &&
+	    ComputeDominatorSetsFast(
+	        graph, exits,
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return graph.blocks[block].successors; },
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return backward[block]; },
+	        [&](uint32_t block, const std::vector<uint32_t>& set) { graph.blocks[block].post_dominators = set; })) {
+		return;
+	}
 	const auto all   = AllBlockIds(count);
 
 	for (auto& block: graph.blocks) {

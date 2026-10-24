@@ -1330,6 +1330,10 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 	mesh.scratch_size_dwords = data.scratch_size_dwords;
+	// VGT_SHADER_STAGES_EN fast-launch field (bits 19..20).
+	const auto fast_launch = (context.GetShaderStages() >> 19u) & 3u;
+	EXIT_NOT_IMPLEMENTED(fast_launch > 1u);
+	mesh.fast_launch = fast_launch != 0;
 	if (data.type == Prospero::ShaderBinaryType::kGsFront) {
 		EXIT_IF(regs.gs_regs.data_addr == 0);
 		const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
@@ -1346,11 +1350,27 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		params.hash = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
-	if (merged) {
+	const auto& group = user_config.GetGeControl();
+	if (mesh.fast_launch) {
+		const auto& user_vgpr = user_config.GetGeUserVgprEn();
+		if (data.type != Prospero::ShaderBinaryType::kGs ||
+		    regs.gs_regs.rsrc1.gs_vgpr_component_count != 0u ||
+		    regs.gs_regs.rsrc2.es_vgpr_component_count != 1u ||
+		    user_config.GetPrimType() != Prospero::PrimitiveType::kPointList ||
+		    group.primitive_group_size != 1u || group.vertex_group_size != 1u || user_vgpr.vgpr1 ||
+		    user_vgpr.vgpr2 || user_vgpr.vgpr3 || mesh.max_vertices != sh.m_vgtGsMaxVertOut) {
+			EXIT("unsupported GS fast launch: type=%u gs_vgprs=%u es_vgprs=%u prim=%u GE=%u/%u "
+			     "user_vgpr=%u/%u/%u max_vertices=%u max_out=%u\n",
+			     static_cast<uint32_t>(data.type), regs.gs_regs.rsrc1.gs_vgpr_component_count,
+			     regs.gs_regs.rsrc2.es_vgpr_component_count,
+			     static_cast<uint32_t>(user_config.GetPrimType()), group.primitive_group_size,
+			     group.vertex_group_size, user_vgpr.vgpr1, user_vgpr.vgpr2, user_vgpr.vgpr3,
+			     mesh.max_vertices, sh.m_vgtGsMaxVertOut);
+		}
+	} else if (merged) {
 		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
 		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
-	const auto& group = user_config.GetGeControl();
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
@@ -1363,26 +1383,46 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
-	mesh.max_primitives       = native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices)
-	                                       : group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	// Fast launch (mesh shader mode): a meshlet usually has more triangles than vertices, and
+	// GE_NGG_SUBGRP_CNTL.PRIM_AMP_FACTOR is the subgroup's primitive capacity. The guest exports
+	// one primitive per lane, so the subgroup needs a lane per primitive as well (upstream
+	// ae2555832, Senaxx e6f33fdb). With the vertex count only, PPSA03671's meshlets lost every
+	// primitive past the 32nd: holes in the terrain, rocks and shadow casters.
+	// Outside fast launch the amplification can bound the exported primitives too (upstream
+	// ae2555832 for native NGG: primitives per group times PRIM_AMP_FACTOR, with a lane per
+	// primitive; Senaxx 896831309 for the legacy GS path: meshlet shaders export more primitives
+	// than vertices - 2).
+	// KYTY_MESH_PRIM_AMP: unset = fast launch only (the other paths keep the release sizing),
+	// 1 = every path (also KYTY_NGG_PRIM_AMP=1), 0 = never.
+	static const int prim_amp_mode = [] {
+		const char* value = std::getenv("KYTY_MESH_PRIM_AMP");
+		const char* ngg   = std::getenv("KYTY_NGG_PRIM_AMP");
+		if (value != nullptr && std::strcmp(value, "0") == 0) return 0;
+		if ((value != nullptr && std::strcmp(value, "1") == 0) ||
+		    (ngg != nullptr && std::strcmp(ngg, "1") == 0))
+			return 2;
+		return 1;
+	}();
+	const auto amplification  = sh.m_geNggSubgrpCntl & 0x1ffu;
+	const auto amp            = prim_amp_mode == 2 || (prim_amp_mode == 1 && mesh.fast_launch)
+	                                ? amplification
+	                                : 0u;
+	const auto native_bound   = mesh.InputPrimitiveCount(mesh.max_vertices);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
-	                                      native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices) :
-	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	                                      native_ngg ? (mesh.fast_launch ? std::max(mesh.max_vertices, amp)
+	                                                                     : native_bound)
+	                                                 : mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
+	mesh.max_primitives = mesh.fast_launch ? std::max(mesh.max_vertices, amp)
+	                      : native_ngg ? std::max(native_bound, mesh.primitives_per_group * amp)
+	                                   : group.primitive_group_size *
+	                                         std::max(sh.m_vgtGsMaxVertOut - 2u, amp);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	auto threads = native_ngg ? mesh.vertices_per_group : mesh.max_vertices;
-	// KYTY_NGG_PRIM_AMP=1 (default off; upstream ae2555832): the primitive outputs are sized from
-	// GE_NGG_SUBGRP_CNTL.PRIM_AMP_FACTOR (primitives per input primitive), and the workgroup is
-	// large enough to export each of them.
-	static const bool prim_amp = [] {
-		const char* value = std::getenv("KYTY_NGG_PRIM_AMP");
-		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
-	if (prim_amp && (sh.m_geNggSubgrpCntl & 0x1ffu) != 0u) {
-		mesh.max_primitives = mesh.primitives_per_group * (sh.m_geNggSubgrpCntl & 0x1ffu);
-		threads             = std::max(threads, mesh.max_primitives);
-	}
+	const auto threads  = native_ngg && !mesh.fast_launch
+	                          ? std::max(mesh.vertices_per_group, mesh.primitives_per_group * amp)
+	                      : mesh.fast_launch ? std::max(mesh.max_vertices, mesh.max_primitives)
+	                                         : mesh.max_vertices;
 	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
@@ -1424,6 +1464,13 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;
+	// An indirect draw's START_INST_LOC names the first stage's user SGPR: for tessellation
+	// the LS, whose user SGPRs start at s0 here. The LS then gets the instance ID from 0 and
+	// the start instance in that SGPR, as the VS path does.
+	if (const auto start_instance = regs.start_instance_user_sgpr - 32;
+	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.hs_regs.rsrc2.user_sgpr) {
+		input_info[0].start_instance_sgpr = start_instance;
+	}
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
@@ -1436,6 +1483,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .domain                = sh.m_vgtTfParam & 0x3u,
 	    .partitioning          = (sh.m_vgtTfParam >> 2u) & 0x3u,
 	    .output_topology       = (sh.m_vgtTfParam >> 5u) & 0x3u,
+	    .min_tess_level        = sh.m_vgtHosMinTessLevel,
+	    .max_tess_level        = sh.m_vgtHosMaxTessLevel,
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
