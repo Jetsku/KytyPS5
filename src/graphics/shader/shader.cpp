@@ -1488,22 +1488,10 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	// Upstream c71589124: reflection decodes both programs, so it runs once per LS/HS pair and VGT
-	// configuration (the key also covers the VGT fields cached in tess).
-	const uint64_t layout_key[] = {RegisteredOrDeclaredShaderHash(regs.ls_regs.data_addr, local),
-	                              RegisteredOrDeclaredShaderHash(regs.hs_regs.data_addr, control),
-	                              uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u | sh.m_vgtTfParam};
-	{
-		static std::unordered_map<uint64_t, ShaderTessellationInputInfo> layouts;
-		static std::mutex                                                layouts_mutex;
-		std::scoped_lock lock(layouts_mutex);
-		auto [entry, inserted] = layouts.try_emplace(XXH3_64bits(layout_key, sizeof(layout_key)), tess);
-		if (inserted) {
-			ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, entry->second,
-			                                              params[0].hash, params[1].hash, params[2].code);
-		}
-		tess = entry->second;
-	}
+	// The analysis caches the LS/HS strides per program pair and control point counts itself
+	// (the tess line's cache; int21's per-pair layout cache of upstream c71589124 is not used with it).
+	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess, params[0].hash,
+	                                              params[1].hash, params[2].code);
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}

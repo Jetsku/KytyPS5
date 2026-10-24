@@ -68,7 +68,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 void DefineTessellationInterfaces(EmitterState& state) {
 	using Attribute = IR::TessellationAttribute;
-	std::array<bool, 6> used {};
+	std::array<bool, IR::NumTessellationAttributes> used {};
 	uint32_t            patch_begin = UINT32_MAX, patch_end = 0;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
