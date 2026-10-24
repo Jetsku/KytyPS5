@@ -1429,14 +1429,14 @@ static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, 
 // that unlocks and re-locks in a loop (Wwise's audio thread does this with its global lock
 // when audio runs behind) then keeps the mutex for seconds and every other locker starves:
 // Ratchet & Clank froze with its main thread stuck in PthreadMutexLock. A waiter that has
-// waited longer than KYTY_MUTEX_HANDOFF_US (default 2000 us, 0 = off) joins the starving
+// waited longer than KYTY_MUTEX_HANDOFF_US (default 0 = off in this line; 2000 us in the PPSA01474/PPSA03671 title presets) joins the starving
 // queue; while that queue is not empty the mutex goes to its front thread only (direct
 // hand-off, like Go's sync.Mutex starvation mode). Short waits behave as before.
 static int64_t MutexHandoffMicros() {
 	static const int64_t value = [] {
 		const auto* env = std::getenv("KYTY_MUTEX_HANDOFF_US");
 		if (env == nullptr || env[0] == '\0') {
-			return static_cast<int64_t>(2000);
+			return static_cast<int64_t>(0);
 		}
 		return std::max<int64_t>(0, std::strtoll(env, nullptr, 10));
 	}();

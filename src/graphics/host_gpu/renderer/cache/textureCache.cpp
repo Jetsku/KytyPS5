@@ -4830,7 +4830,8 @@ bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
 }
 
 // Whether two images at the same guest range are interpretations of the same texel grid. Same
-// extent, or (KYTY_ALIAS_BLOCK_VIEWS, default on; =0 off) a block-compressed image and an
+// extent, or (KYTY_ALIAS_BLOCK_VIEWS=1; default off in this line, on in the PPSA01474 and
+// PPSA03671 title presets) a block-compressed image and an
 // uncompressed one whose texels are its blocks: same block grid, block size, depth and
 // subresources. Ratchet & Clank writes its BC6 reflection-probe array (256x256x384) through a
 // R32G32B32A32_UINT 64x64x384 view of the same memory; with extents compared as texels the
@@ -4842,7 +4843,7 @@ static bool SameAliasGrid(const ImageInfo& a, const ImageInfo& b) {
 	}
 	static const bool block_views = [] {
 		const auto* value = std::getenv("KYTY_ALIAS_BLOCK_VIEWS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 	}();
 	return block_views && a.IsBlock() != b.IsBlock() && a.BlockExtent() == b.BlockExtent() &&
 	       a.extent.depth == b.extent.depth && a.bytes_per_block == b.bytes_per_block &&
