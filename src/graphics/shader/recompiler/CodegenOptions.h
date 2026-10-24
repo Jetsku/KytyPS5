@@ -267,11 +267,12 @@ struct CodegenOptions {
 	// deferred-lighting and GI kernels are dropped, and with the game's lighting patches off lit
 	// geometry renders black. KYTY_SRT_VARIANT_READS=0 restores the old planning.
 	bool srt_variant_reads = true;
-	// KYTY_SHADER_CALLS=0: compute programs that call functions through S_SWAPPC_B64 are skipped (as
-	// before) instead of having their callees expanded into them (ShaderCalls.h). Programs without
+	// KYTY_SHADER_CALLS=1 (default off in this line; on in the Insomniac title presets): compute
+	// programs that call functions through S_SWAPPC_B64 have their callees expanded into them
+	// (ShaderCalls.h) instead of being skipped. Programs without
 	// calls are not affected either way, so it is not part of the codegen fingerprint: an expanded
 	// program is a different input (its code and key carry the callees).
-	bool shader_calls = true;
+	bool shader_calls = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,

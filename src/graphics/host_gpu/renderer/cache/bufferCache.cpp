@@ -260,8 +260,9 @@ bool SideReadbackGpuThreadEnabled() {
 // GPU-written bytes across neighbouring pages: one launch, 5 ABBA quartets at the "Previously on"
 // prompt, 4 MiB vs 64 KiB: +17.8% flips/s (SE 4.2%), CP time per flip unchanged (+2.5 ms, SE 4.6),
 // guest read faults ~690 -> ~510 per frame.
+// Default 64 KiB in this line (as int21); the Insomniac title presets set 4096.
 uint64_t SideReadbackWindow() {
-	constexpr uint64_t Default = 4096 * 1024;
+	constexpr uint64_t Default = 64 * 1024;
 	const auto*        value   = std::getenv("KYTY_READBACK_SIDE_COPY_WINDOW_KB");
 	if (value == nullptr) {
 		return Default;
@@ -709,12 +710,12 @@ bool RelaxedQueriesEnabled() {
 	return enabled;
 }
 
-// KYTY_WRITE_DATA_GPU_PAGE (default 1; live): BufferCache::TryWriteDataGpu.
+// KYTY_WRITE_DATA_GPU_PAGE (default 0 in this line, 1 in the Insomniac title presets; live): BufferCache::TryWriteDataGpu.
 Live::Switch g_write_data_gpu_page("KYTY_WRITE_DATA_GPU_PAGE", [](const char* value) -> int64_t {
-	return value == nullptr || value[0] == '\0' ? 1 : static_cast<int64_t>(std::strtoll(value, nullptr, 10));
+	return value == nullptr || value[0] == '\0' ? 0 : static_cast<int64_t>(std::strtoll(value, nullptr, 10));
 });
 
-// KYTY_TEXEL_RELAXED_SYNC (default 2; 1; 0 off; live): formatted (texel) read bindings use the
+// KYTY_TEXEL_RELAXED_SYNC (default 0 in this line, 2 in the Insomniac title presets; 1; 0 off; live): formatted (texel) read bindings use the
 // same lock-free "nothing to upload" test as raw reads (1), and the read-binding memo
 // (ObtainReadBinding, 2), followed by the image step (SynchronizeBufferFromImage) that only texel
 // reads do. Before, every texel read walked the tracker under its region locks: Miles Morales binds
@@ -726,7 +727,7 @@ Live::Switch g_write_data_gpu_page("KYTY_WRITE_DATA_GPU_PAGE", [](const char* va
 // Sky Garden CP time is unchanged (live A/B 0 vs 2: 34.16 vs 34.20 ms/flip).
 Live::Switch g_texel_relaxed_sync("KYTY_TEXEL_RELAXED_SYNC", [](const char* value) -> int64_t {
 	if (value == nullptr || value[0] == '\0') {
-		return 2;
+		return 0;
 	}
 	return static_cast<int64_t>(std::strtoll(value, nullptr, 10));
 });

@@ -99,7 +99,7 @@ namespace {
 
 Live::Switch g_pipeline_prefetch("KYTY_PIPELINE_PREFETCH", Live::ParseDefaultOff);
 Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDefaultOff);
-// KYTY_SRT_GPU_FILL (live, default 2; =1 without store offsets; =0 off; port of senaxx 0845beadf): a compute refresh on
+// KYTY_SRT_GPU_FILL (live, default 0 in this line, 2 in the Insomniac title presets; =1 without store offsets; =0 off; port of senaxx 0845beadf): a compute refresh on
 // the command processor leaves a flat SRT slot that only the shader uses (the plan's
 // gpu_fill_slots) to the GPU when its guest dword is GPU-written buffer memory: the walk writes
 // a placeholder instead of faulting and draining the GPU, and RebindBuffers copies the dword
@@ -109,8 +109,8 @@ Live::Switch g_program_prefetch("KYTY_PIPELINE_PREFETCH_PROGRAMS", Live::ParseDe
 // binding of up to 16 MiB whose write range reads such a slot as written whole (a larger one reads
 // the slot on the host for an exact range).
 Live::Switch g_srt_gpu_fill("KYTY_SRT_GPU_FILL", [](const char* value) -> int64_t {
-	if (value == nullptr) {
-		return 2;
+	if (value == nullptr || value[0] == '\0') {
+		return 0;
 	}
 	return std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 2);
 });

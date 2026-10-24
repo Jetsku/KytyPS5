@@ -1000,11 +1000,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	physical_device.getProperties2(&properties2);
 	ConfigureShaderFloatControls(properties12);
 	// Bindless images (Senaxx): descriptor indexing with update-after-bind sampled images, enabled
-	// when supported unless KYTY_BINDLESS=0. The recompiler learns it before any shader compiles;
+	// when supported and KYTY_BINDLESS=1 (default off in this line; the Insomniac title presets turn it on). The recompiler learns it before any shader compiles;
 	// nothing else is created until a program samples bindless images (BindlessTable).
 	{
 		const char* setting   = std::getenv("KYTY_BINDLESS");
-		const bool  requested = setting == nullptr || std::strcmp(setting, "0") != 0;
+		const bool  requested = setting != nullptr && setting[0] != '\0' && std::strcmp(setting, "0") != 0;
 		const bool  supported =
 		    supported_features12.runtimeDescriptorArray == VK_TRUE &&
 		    supported_features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&

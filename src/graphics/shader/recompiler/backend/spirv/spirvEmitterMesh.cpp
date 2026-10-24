@@ -12,13 +12,15 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 // KYTY_MESH_CULL selects how much of the primitive guard below is emitted, for A/B runs:
-// "off" emits none of it, "zero" only the zero-position test, anything else everything.
+// "off" (or unset: default off in this line, "full" in the Insomniac title presets) emits none of
+// it, "zero" only the zero-position test, anything else everything.
 enum class MeshCull { Off, Zero, Full };
 
 MeshCull MeshCullMode() {
 	static const MeshCull mode = [] {
 		const char* value = std::getenv("KYTY_MESH_CULL");
-		if (value != nullptr && std::strcmp(value, "off") == 0) {
+		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "off") == 0 ||
+		    std::strcmp(value, "0") == 0) {
 			return MeshCull::Off;
 		}
 		if (value != nullptr && std::strcmp(value, "zero") == 0) {

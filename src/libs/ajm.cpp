@@ -119,11 +119,12 @@ static std::atomic_uint32_t g_ajm_next_batch {1};
 
 // Jobs run when their batch starts (sceAjmBatchStart), as on the console, not when they are added: a game may add a
 // decode job before the input it names is filled (a streamed file read that completes before the batch starts) -
-// decoded at once, that input was silence or stale data. KYTY_AJM_DEFER=0: run them as they are added (as before).
+// decoded at once, that input was silence or stale data. KYTY_AJM_DEFER=1 turns it on (default off in this line, on in the Insomniac title
+// presets); unset or 0 runs them as they are added (as before).
 static bool AjmDeferJobs() {
 	static const bool defer = [] {
 		const char* value = std::getenv("KYTY_AJM_DEFER");
-		return value == nullptr || *value == '\0' || *value != '0';
+		return value != nullptr && *value != '\0' && *value != '0';
 	}();
 	return defer;
 }

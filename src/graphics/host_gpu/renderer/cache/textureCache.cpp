@@ -5767,7 +5767,7 @@ void ReportTexelImageSync() {
 
 namespace {
 
-// KYTY_TEXEL_SYNC_MEMO (live, default on; =0 off; =2 verify): a texel read whose range had no
+// KYTY_TEXEL_SYNC_MEMO (live, default off in this line, on in the Insomniac title presets; =0 off; =2 verify): a texel read whose range had no
 // image starting at its address and no image page overlapping it (so it synchronized nothing:
 // no image download, no alias-byte scan) is remembered with the image registration epoch
 // (TextureCache::RegistrationEpoch, bumped on every image register/unregister and GPU-modified
@@ -5777,7 +5777,7 @@ namespace {
 // =2 runs the full synchronization on a memo hit too and reports a hit that would have synced.
 Live::Switch g_texel_sync_memo("KYTY_TEXEL_SYNC_MEMO", [](const char* value) -> int64_t {
 	if (value == nullptr || value[0] == '\0') {
-		return 1;
+		return 0;
 	}
 	if (std::strcmp(value, "verify") == 0) {
 		return 2;

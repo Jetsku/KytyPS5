@@ -325,7 +325,8 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
 }
 
-// KYTY_MAP_INVALIDATE=0 turns it off: a new mapping is treated as a write of its whole range.
+// KYTY_MAP_INVALIDATE=1 (default off in this line; on in the Insomniac title presets): a new
+// mapping is treated as a write of its whole range.
 // Streaming games map the resident part of a texture and leave the rest of its range unmapped
 // (Miles Morales' AMM pool); an image created then read zeros there, and its page watch could not
 // protect pages that had no mapping. When the game maps the rest and loads the finer mips into it
@@ -334,7 +335,7 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 static bool MapInvalidateEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_MAP_INVALIDATE");
-		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
 	}();
 	return enabled;
 }

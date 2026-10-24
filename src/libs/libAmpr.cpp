@@ -1943,8 +1943,9 @@ static bool SyncWaitSatisfiedNow(const CommandBufferState::SyncCommand& command)
 
 static bool AmprAsyncEnabled() {
 	static const bool enabled = [] {
+		// Default off in this line; the Insomniac title presets turn it on.
 		const char* value = std::getenv("KYTY_AMPR_ASYNC");
-		const bool  on    = value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+		const bool  on    = value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 		LOGF("Kyty AMPR: %s (KYTY_AMPR_ASYNC)\n",
 		     on ? "a buffer that reaches an unsatisfied wait continues on its engine thread"
 		        : "buffers run to completion on the submitting thread");
