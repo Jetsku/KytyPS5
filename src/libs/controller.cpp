@@ -317,6 +317,25 @@ static uint8_t Scale(uint8_t value, float scale) {
 	return static_cast<uint8_t>(std::max(1L, std::lround(value * scale)));
 }
 
+// KYTY_TRIGGER_EFFECT_INTENSITY=<0..100> (default 100: the game's strengths unchanged): a fixed
+// percentage of every adaptive-trigger strength and vibration amplitude the game sets, applied on
+// top of the in-game cycle (key 3). Players found Astro Bot's and Astro's Playroom's trigger
+// effects much stronger than on a PS5 (issue #54); the conversion to the DualSense report matches
+// the known effect formats, so this lets them choose the strength.
+static float TriggerEffectIntensityPercent() {
+	static const float scale = [] {
+		const auto* value = std::getenv("KYTY_TRIGGER_EFFECT_INTENSITY");
+		if (value == nullptr || value[0] == '\0') {
+			return 1.0f;
+		}
+		const auto percent = std::clamp(std::strtol(value, nullptr, 10), 0L, 100L);
+		std::printf("Pad: trigger effects at %ld%% of the game's strength (KYTY_TRIGGER_EFFECT_INTENSITY)\n",
+		            percent);
+		return static_cast<float>(percent) / 100.0f;
+	}();
+	return scale;
+}
+
 static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, float scale,
                                  uint8_t type, uint8_t frequency = 0) {
 	uint16_t active = 0;
@@ -1027,7 +1046,7 @@ bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 
 	DualSenseEffects effect {};
-	const auto       scale = GetSettingScale(Setting::TriggerEffectIntensity);
+	const auto scale = GetSettingScale(Setting::TriggerEffectIntensity) * TriggerEffectIntensityPercent();
 	if ((param.trigger_mask & 0x01u) != 0) {
 		effect.enable_bits |= 0x08;
 		if (!trigger_effect_to_dualsense(param.command[0], effect.left_trigger, scale)) {

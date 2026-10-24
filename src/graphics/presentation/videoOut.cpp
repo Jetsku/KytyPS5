@@ -872,6 +872,8 @@ static Live::Switch g_present_abs_vblank("KYTY_PRESENT_ABS_VBLANK", Live::ParseD
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
 	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
+	// Named, so hang reports show which thread made the present submissions (it was '').
+	Profiler::SetThreadName("VideoOut present");
 	Common::RaiseServiceThreadPriority();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);

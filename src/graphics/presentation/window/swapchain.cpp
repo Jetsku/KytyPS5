@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/hangWatchdog.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -707,10 +708,17 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		scheduler.Wait(m_frame_ticks[m_frame_index]);
 		m_frame_ticks[m_frame_index] = 0;
 	}
-	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	m_image_index = static_cast<uint32_t>(-1);
+	vk::Result result;
+	{
+		// Hang reports (issue #62, Linux): shows a present thread blocked in the driver's acquire.
+		HangWatchdog::Scope acquire("vkAcquireNextImageKHR",
+		                            reinterpret_cast<uint64_t>(static_cast<VkSwapchainKHR>(m_handle)),
+		                            m_frame_index);
+		result = m_window.graphic_ctx.device.acquireNextImageKHR(
+		    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
+		    &m_image_index);
+	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1200,8 +1208,13 @@ Swapchain::Status Swapchain::Present() {
 	{
 		// The blit this present waits for goes ahead of game batches still waiting for their
 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		// Hang reports (issue #62, Linux): a present blocked in the driver holds the graphics queue
+		// lock, so these scopes tell a stuck vkQueuePresentKHR from a stuck GPU.
+		const auto        queue = reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_window.graphic_ctx.queue));
+		HangWatchdog::Scope lock_scope("present-queue-lock", queue, m_image_index);
+		Common::LockGuard   lock(m_window.graphic_ctx.queue_mutex);
 		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
+		HangWatchdog::Scope present_scope("vkQueuePresentKHR", queue, m_image_index);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {

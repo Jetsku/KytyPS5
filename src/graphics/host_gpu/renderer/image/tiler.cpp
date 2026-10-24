@@ -218,6 +218,47 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		if (freed != 0) {
 			result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
 		}
+		if (result != VK_SUCCESS) {
+			// Issue #57 (RX 6900 XT, about 6.5 GB of 16 GB in use): the stderr line above is not in
+			// the log, so the fatal message carries the size and the device limits that can refuse a
+			// single buffer whatever the free VRAM (VMA has tried every memory type by now).
+			vk::PhysicalDeviceMaintenance4Properties maintenance4 {};
+			vk::PhysicalDeviceMaintenance3Properties maintenance3 {};
+			maintenance3.pNext = &maintenance4;
+			vk::PhysicalDeviceProperties2 properties {};
+			properties.pNext = &maintenance3;
+			m_graphics.physical_device.getProperties2(&properties);
+			// Device-memory objects (a driver limit, maxMemoryAllocationCount) and the VRAM heaps' use.
+			const auto&  memory_properties = m_graphics.physical_device_memory_properties;
+			VmaBudget    budgets[VK_MAX_MEMORY_HEAPS] {};
+			vmaGetHeapBudgets(m_graphics.allocator, budgets);
+			uint64_t blocks = 0;
+			uint64_t vram_usage = 0;
+			uint64_t vram_budget = 0;
+			for (uint32_t heap = 0; heap < memory_properties.memoryHeapCount; heap++) {
+				blocks += budgets[heap].statistics.blockCount;
+				if (memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+					vram_usage += budgets[heap].usage;
+					vram_budget += budgets[heap].budget;
+				}
+			}
+			static char operation[512];
+			std::snprintf(operation, sizeof(operation),
+			              "allocate TileManager scratch buffer (%llu bytes for a %llu-byte detile; %llu idle "
+			              "pooled bytes freed; device maxMemoryAllocationSize %llu, maxBufferSize %llu, "
+			              "maxStorageBufferRange %u; %llu device-memory objects, maxMemoryAllocationCount %u; "
+			              "VRAM heaps %llu MiB used of a %llu MiB budget)",
+			              static_cast<unsigned long long>(capacity), static_cast<unsigned long long>(size),
+			              static_cast<unsigned long long>(freed),
+			              static_cast<unsigned long long>(maintenance3.maxMemoryAllocationSize),
+			              static_cast<unsigned long long>(maintenance4.maxBufferSize),
+			              properties.properties.limits.maxStorageBufferRange,
+			              static_cast<unsigned long long>(blocks),
+			              properties.properties.limits.maxMemoryAllocationCount,
+			              static_cast<unsigned long long>(vram_usage >> 20u),
+			              static_cast<unsigned long long>(vram_budget >> 20u));
+			RequireVulkanSuccess(static_cast<vk::Result>(result), operation);
+		}
 	}
 	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
 	VramStats::Note(VramStats::Kind::TilerScratch, true, static_cast<int64_t>(capacity));
