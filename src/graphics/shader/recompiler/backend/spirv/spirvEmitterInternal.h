@@ -122,6 +122,7 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          i32_vector_types {};
 	std::array<uint32_t, 3>                          f32_vector_types {};
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
+	uint32_t                                         tess_patch_base     = 0;
 	uint32_t                                         tess_inner_variable = 0;
 
 	const SpirvRequirements                          requirements;

@@ -1499,7 +1499,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		std::scoped_lock lock(layouts_mutex);
 		auto [entry, inserted] = layouts.try_emplace(XXH3_64bits(layout_key, sizeof(layout_key)), tess);
 		if (inserted) {
-			ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, entry->second);
+			ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, entry->second,
+			                                              params[0].hash, params[1].hash, params[2].code);
 		}
 		tess = entry->second;
 	}
