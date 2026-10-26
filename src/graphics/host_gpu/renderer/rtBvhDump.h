@@ -7,7 +7,7 @@
 
 namespace Libs::Graphics {
 
-// KYTY_RT_DUMP_BVH=<n>[,<n>...] (off by default; diagnostic only). At the n-th compute dispatch
+// KYTY_RT_DUMP_BVH=<n>[,<n>...] (or / between the numbers; off by default; diagnostic only). At the n-th compute dispatch
 // of a program with BVH instructions (1-based over the run, whether KYTY_RT_STUB translated the
 // program or it was skipped), dump the Psr TLAS the dispatch's SRT names (s[0:1]: +0 in the
 // lighting shaders, +40 in the GI shaders, other offsets as a fallback) and every BLAS its

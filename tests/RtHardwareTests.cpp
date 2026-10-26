@@ -1052,19 +1052,33 @@ struct DeviceGuest {
 };
 
 DeviceGuest UploadGuest(Gpu& gpu, const GuestMemory& memory) {
-	constexpr uint64_t   page  = 1ull << 14u;
-	const uint64_t       begin = memory.Begin() & ~(page - 1);
-	const uint64_t       end   = (memory.End() + page - 1) & ~(page - 1);
-	std::vector<uint8_t> bytes(end - begin);
+	// Only the 16 KiB pages that hold blob bytes go to the device (a BVH dump's pages lie far
+	// apart in the guest address space); the pages in between map to one zero page.
+	constexpr uint64_t           page  = 1ull << 14u;
+	const uint64_t               begin = memory.Begin() & ~(page - 1);
+	const uint64_t               end   = (memory.End() + page - 1) & ~(page - 1);
+	std::map<uint64_t, uint64_t> slot; // page number -> arena page (arena page 0: the zero page)
 	for (const auto& [address, blob]: memory.Blobs()) {
-		std::memcpy(bytes.data() + (address - begin), blob.data(), blob.size());
+		if (blob.empty()) continue;
+		for (uint64_t p = address / page; p <= (address + blob.size() - 1u) / page; p++) {
+			slot.try_emplace(p, slot.size() + 1u);
+		}
+	}
+	std::vector<uint8_t> bytes((slot.size() + 1u) * page);
+	for (const auto& [address, blob]: memory.Blobs()) {
+		for (uint64_t at = 0; at < blob.size();) {
+			const uint64_t a = address + at;
+			const uint64_t n = std::min<uint64_t>(blob.size() - at, page - (a % page));
+			std::memcpy(bytes.data() + slot.at(a / page) * page + (a % page), blob.data() + at, n);
+			at += n;
+		}
 	}
 	DeviceGuest guest {};
 	guest.arena      = gpu.Upload(bytes.data(), bytes.size());
 	guest.page_first = begin >> 14u;
-	std::vector<uint64_t> table((end - begin) / page);
-	for (size_t i = 0; i < table.size(); i++) {
-		table[i] = guest.arena.address + i * page;
+	std::vector<uint64_t> table((end - begin) / page, guest.arena.address);
+	for (const auto& [p, s]: slot) {
+		table[p - begin / page] = guest.arena.address + s * page;
 	}
 	guest.page_table = gpu.Upload(table.data(), table.size() * sizeof(uint64_t));
 	return guest;
@@ -2245,11 +2259,129 @@ bool WriteTestDump(const char* path) {
 	return snapshot.Save(path);
 }
 
+// --bvh-bench <file.kbvh> [--rays N]: the hardware path on a game's own BVHs. The dump's pages
+// become the scene memory; the GPU converts every BLAS (one AABB per leaf) and the TLAS, builds
+// the acceleration structures, then traces the same random rays inside the TLAS bounds with the
+// GLSL software traversal (a lower bound on the guest routine's cost) and the hybrid ray query
+// (RT cores for the boxes, the instruction's exact triangle test per leaf candidate). Reports
+// times, Mrays/s, AS memory and how often the two disagree.
+int BenchDump(const char* path, uint32_t ray_count) {
+	GuestSnapshot snapshot;
+	if (!snapshot.Load(path)) {
+		std::printf("cannot load %s\n", path);
+		return 2;
+	}
+	Scene scene;
+	{
+		uint64_t             run_begin = 0;
+		std::vector<uint8_t> run;
+		uint64_t             last_page = ~0ull;
+		const auto           flush     = [&] {
+            if (!run.empty()) scene.memory.Insert(run_begin, std::move(run));
+            run.clear();
+		};
+		for (const auto& [number, page]: snapshot.Pages()) {
+			if (number != last_page + 1u) {
+				flush();
+				run_begin = number * GuestSnapshot::PageBytes;
+			}
+			run.insert(run.end(), page.bytes.begin(), page.bytes.end());
+			last_page = number;
+		}
+		flush();
+	}
+	scene.tlas.base = std::strtoull(snapshot.MetaValue("capture.tlas", "0").c_str(), nullptr, 0);
+	const auto read = scene.memory.Reader();
+	TlasWalk   tlas_walk;
+	if (WalkTlas(read, scene.tlas.base, tlas_walk) != WalkStatus::Ok) {
+		std::printf("TLAS walk failed\n");
+		return 1;
+	}
+	for (const auto& inst: tlas_walk.instances) {
+		RtTest::PsrBvhWriter::InstanceDesc desc {};
+		desc.blas_address = inst.blas_address;
+		desc.blas_root    = inst.root;
+		scene.instances.push_back(desc);
+	}
+	BoxNode    root {};
+	WalkStatus status = WalkStatus::Ok;
+	if (!ReadBox(read, scene.tlas.base, Psr::RootPointer, root, status)) {
+		std::printf("TLAS root unreadable\n");
+		return 1;
+	}
+	Aabb world = Aabb::Empty();
+	for (uint32_t c = 0; c < 4; c++) {
+		if (root.children[c] != Psr::InvalidNode) world.Grow(root.bounds[c]);
+	}
+	float diagonal = 0.0f;
+	for (int a = 0; a < 3; a++) diagonal += (world.max[a] - world.min[a]) * (world.max[a] - world.min[a]);
+	diagonal = std::sqrt(diagonal);
+	// Random rays from inside the TLAS bounds (reflection- and GI-like: any direction, full length).
+	std::mt19937                          rng(1234);
+	std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+	std::normal_distribution<float>       normal(0.0f, 1.0f);
+	std::vector<GpuRay>                   rays(ray_count);
+	for (auto& g: rays) {
+		std::array<float, 3> origin {};
+		std::array<float, 3> dir {};
+		float                length = 0.0f;
+		for (int a = 0; a < 3; a++) {
+			origin[a] = world.min[a] + (0.05f + 0.9f * unit(rng)) * (world.max[a] - world.min[a]);
+			dir[a]    = normal(rng);
+			length += dir[a] * dir[a];
+		}
+		for (auto& d: dir) d /= std::sqrt(std::max(length, 1e-12f));
+		const Ray r = MakeRay(origin, dir, diagonal);
+		for (int a = 0; a < 3; a++) {
+			g.o[a]   = r.origin[a];
+			g.d[a]   = r.dir[a];
+			g.inv[a] = r.inv_dir[a];
+		}
+		g.extent = r.extent;
+	}
+	Gpu gpu;
+	if (!gpu.Init()) {
+		std::printf("no device with acceleration structures and ray query\n");
+		return 1;
+	}
+	std::printf("%s on %s: %zu instances, %zu guest pages\n", path, gpu.Name(), scene.instances.size(),
+	            snapshot.Pages().size());
+	PrintSupport(gpu);
+	(void)BuildHostScene(gpu, scene, false, false);
+	HostScene host = BuildHostScene(gpu, scene, false, true);
+	std::printf("  hybrid conversion: BLAS walk+convert %.3f ms, BLAS builds %.3f ms (%zu BLAS, %" PRIu64
+	            " leaves), TLAS convert %.3f ms + build %.3f ms, AS %.1f MiB, inputs %.1f MiB, status 0x%x\n",
+	            host.convert_ms, host.blas_build_ms, host.blas.size(), host.primitives, host.tlas_convert_ms,
+	            host.tlas_ms - host.tlas_convert_ms, host.accel_bytes / 1048576.0, host.input_bytes / 1048576.0,
+	            host.status_bits);
+	Buffer     ray_buf = gpu.Upload(rays.data(), rays.size() * sizeof(GpuRay));
+	const auto sw      = Trace(gpu, host, scene, ray_buf, ray_count, TraceKind::Software, 3);
+	const auto hw      = Trace(gpu, host, scene, ray_buf, ray_count, TraceKind::Hybrid, 3);
+	uint64_t   hits = 0, nodes = 0, cand = 0, differ = 0, statuses = 0;
+	for (uint32_t i = 0; i < ray_count; i++) {
+		const auto& a = sw.results[i];
+		const auto& b = hw.results[i];
+		hits += a.hit;
+		nodes += a.nodes;
+		cand += b.candidates;
+		statuses += (a.status | b.status) != 0u ? 1u : 0u;
+		differ += (a.hit != b.hit || (a.hit != 0u && a.t != b.t)) ? 1u : 0u;
+	}
+	std::printf("  %u rays: software %.3f ms (%.0f Mrays/s, %.1f nodes/ray) | hybrid %.3f ms (%.0f Mrays/s, "
+	            "%.1f leaf candidates/ray) | speed-up %.1fx | %" PRIu64 "%% hit, %" PRIu64
+	            " rays differ, %" PRIu64 " with status\n",
+	            ray_count, sw.ms, ray_count / sw.ms / 1e3, static_cast<double>(nodes) / ray_count, hw.ms,
+	            ray_count / hw.ms / 1e3, static_cast<double>(cand) / ray_count, sw.ms / std::max(hw.ms, 1e-6),
+	            hits * 100 / std::max<uint64_t>(ray_count, 1u), differ, statuses);
+	return 0;
+}
+
 int main(int argc, char** argv) {
 	bool        cpu_only = false;
 	bool        bench    = false;
-	const char* dump     = nullptr;
-	uint32_t    rays     = 2000;
+	const char* dump       = nullptr;
+	const char* dump_bench = nullptr;
+	uint32_t    rays       = 2000;
 	for (int i = 1; i < argc; i++) {
 		if (std::strcmp(argv[i], "--cpu-only") == 0) {
 			cpu_only = true;
@@ -2261,12 +2393,17 @@ int main(int argc, char** argv) {
 			return WriteTestDump(argv[i + 1]) ? 0 : 1;
 		} else if (std::strcmp(argv[i], "--bvh-dump") == 0 && i + 1 < argc) {
 			dump = argv[++i];
+		} else if (std::strcmp(argv[i], "--bvh-bench") == 0 && i + 1 < argc) {
+			dump_bench = argv[++i];
 		} else if (std::strcmp(argv[i], "--rays") == 0 && i + 1 < argc) {
 			rays = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
 		}
 	}
 	if (dump != nullptr) {
 		return AnalyzeDump(dump, rays);
+	}
+	if (dump_bench != nullptr) {
+		return BenchDump(dump_bench, rays);
 	}
 	if (!bench) {
 		RunCpuTests();

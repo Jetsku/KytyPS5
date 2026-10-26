@@ -50,13 +50,20 @@ public:
 		return
 		    [this](uint64_t address, void* dst, size_t size) { return Read(address, dst, size); };
 	}
-	[[nodiscard]] uint64_t Begin() const { return Base; }
+	// A blob at a fixed address (a loaded BVH dump's pages); blobs must not overlap.
+	void Insert(uint64_t address, std::vector<uint8_t> bytes) {
+		m_begin          = std::min(m_begin, address);
+		m_next           = std::max<uint64_t>(m_next, address + bytes.size());
+		m_blobs[address] = std::move(bytes);
+	}
+	[[nodiscard]] uint64_t Begin() const { return m_begin; }
 	[[nodiscard]] uint64_t End() const { return m_next; }
 
 	static constexpr uint64_t Base = 0x0000000140000000ull;
 
 private:
-	uint64_t                                 m_next = Base;
+	uint64_t                                 m_begin = Base;
+	uint64_t                                 m_next  = Base;
 	std::map<uint64_t, std::vector<uint8_t>> m_blobs;
 };
 

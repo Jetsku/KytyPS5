@@ -30,7 +30,7 @@ const std::vector<uint64_t>& DumpOrdinals() {
 		}
 		const std::string text(value);
 		for (size_t at = 0; at < text.size();) {
-			const size_t end   = std::min(text.find_first_of(",; ", at), text.size());
+			const size_t end   = std::min(text.find_first_of(",;/ ", at), text.size());
 			const auto   token = text.substr(at, end - at);
 			char*        rest  = nullptr;
 			const auto   n     = std::strtoull(token.c_str(), &rest, 10);

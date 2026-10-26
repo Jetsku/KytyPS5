@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rtBvhDump.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -646,6 +647,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                                                 m_compute_prep);
 	}
 	CpGaps::Phase(CpGaps::Cat::DispatchOp);
+	// KYTY_RT_DUMP_BVH (diagnostic): before any binding is prepared (its readbacks may flush the
+	// recording). Programs with BVH instructions only.
+	if (RtBvhDumpEnabled() && compute_program && input_info.stage.program->info.uses_bvh) {
+		RtBvhDispatch dump {};
+		dump.shader_hash    = input_info.stage.program->shader_hash;
+		dump.shader_address = cs_regs.cs_regs.data_addr;
+		dump.user_sgpr      = std::span<const uint32_t>(
+            cs_regs.cs_user_sgpr.value,
+            std::min<uint32_t>(cs_regs.cs_user_sgpr.count, HW::UserSgprInfo::SGPRS_MAX));
+		dump.groups = {thread_group_x, thread_group_y, thread_group_z};
+		dump.frame  = static_cast<int>(m_context.GetGpu().GetFrameNum());
+		RtBvhDumpOnDispatch(dump);
+	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
