@@ -128,6 +128,58 @@ void TestLogHullMatchesSearch() {
 	}
 }
 
+// KYTY_CERT_LOG_SUMMARY: whenever the summary calls an interval clean, the walk agrees; and it
+// does vouch for intervals far from every entry.
+void TestLogSummaryMatchesCheck() {
+	auto     log     = std::make_unique<Coherence::Log>();
+	auto     summary = std::make_unique<Coherence::Summary>(*log);
+	uint64_t state   = 0x243f6a8885a308d3ull;
+	auto     random  = [&] {
+		state ^= state << 13u;
+		state ^= state >> 7u;
+		state ^= state << 17u;
+		return state;
+	};
+	// Starting point: intervals beginning before the first query are never vouched for.
+	log->Append(Coherence::MakeRange(0x200000000ull, 0x100), Coherence::Source::BufferDirtyAdd);
+	std::vector<uint64_t> starts;
+	bool                  agree = true;
+	uint64_t              vouched = 0;
+	for (int round = 0; round < 4000; round++) {
+		starts.push_back(log->Generation());
+		const int entries = static_cast<int>(random() % 4u);
+		for (int i = 0; i < entries; i++) {
+			const auto kind  = random() % 64u;
+			const auto begin = 0x200000000ull + (random() % 256u) * 0x4000u;
+			const auto size  = kind == 0 ? UINT64_MAX : (random() % 8u) * 0x1000u;
+			log->Append(kind == 0 ? Coherence::Universe : Coherence::MakeRange(begin, size),
+			            Coherence::Source::BufferDirtyAdd);
+		}
+		std::vector<Coherence::Range> ranges;
+		uint64_t cursor = 0x200000000ull + (random() % 256u) * 0x4000u;
+		for (int i = 0, n = static_cast<int>(random() % 3u); i < n; i++) {
+			const auto size = 0x100u + (random() % 4u) * 0x800u;
+			ranges.push_back({cursor, cursor + size});
+			cursor += size + (random() % 16u) * 0x10000u;
+		}
+		const auto from  = starts[static_cast<size_t>(random() % starts.size())];
+		const auto to    = log->Generation();
+		const bool clean = summary->Clean(from, to, ranges);
+		const auto exact = log->Check(from, to, ranges);
+		if (clean) {
+			vouched++;
+			agree = agree && exact.result == Coherence::CheckResult::Clean;
+		}
+		if (starts.size() > 64) {
+			starts.erase(starts.begin());
+		}
+	}
+	Check(agree, "a summary-clean interval is clean for the walk");
+	Check(vouched > 100, "the summary vouches for intervals away from the entries");
+	Check(!summary->Clean(0, log->Generation(), std::array<Coherence::Range, 1> {{{0x200000000ull, 0x200001000ull}}}),
+	      "an interval from before the summary started is never vouched for");
+}
+
 void TestLogBumpWithoutReaders() {
 	// A log nobody reads only counts generations (Bump); its entries are never readable, and a
 	// Check over such an interval is conservative (Unknown), never Clean.
@@ -1984,6 +2036,7 @@ int main(int argc, char** argv) {
 	TestLogEmptyRangeNeverIntersects();
 	TestLogBumpWithoutReaders();
 	TestLogHullMatchesSearch();
+	TestLogSummaryMatchesCheck();
 	TestGlobalLogAlwaysRecords();
 	TestLogOverflow();
 	TestLogConcurrentAppends();

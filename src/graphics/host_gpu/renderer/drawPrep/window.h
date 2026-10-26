@@ -72,6 +72,17 @@ public:
 		    expected, Encode(head, State::Claimed), std::memory_order_acq_rel);
 	}
 
+	// Position `seq` was claimed by a worker that has finished (a hint for seq != Head(); the
+	// acquire load still makes its payload visible).
+	[[nodiscard]] bool DoneAt(uint64_t seq) const noexcept {
+		return m_slots[seq & m_mask].state.load(std::memory_order_acquire) == Encode(seq, State::Done);
+	}
+
+	// The address of position `seq`'s state word (cache prefetch hints only).
+	[[nodiscard]] const void* StateAddress(uint64_t seq) const noexcept {
+		return &m_slots[seq & m_mask].state;
+	}
+
 	// The head was claimed by a worker that has finished.
 	[[nodiscard]] bool HeadDone() const noexcept {
 		const auto head = Head();

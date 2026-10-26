@@ -105,11 +105,13 @@ public:
 	uint64_t Append(Range range, Source source) noexcept {
 		// KYTY_CP_SEQ=1: the sticky GPU-touched pages (gpuTouchedPages.h), set before the
 		// transition becomes observable, for the transitions that can make a range unclean.
+		using GpuTouched::DiagSource;
 		GpuTouched::NoteTransition(range.begin, range.end,
-		                           source == Source::BufferDirtyAdd ||
-		                               source == Source::TrackerGpuMark ||
-		                               source == Source::ImageGpuModified ||
-		                               source == Source::PublicationBegin);
+		                           source == Source::BufferDirtyAdd     ? DiagSource::BufferDirtyAdd
+		                           : source == Source::TrackerGpuMark   ? DiagSource::TrackerGpuMark
+		                           : source == Source::ImageGpuModified ? DiagSource::ImageGpuModified
+		                           : source == Source::PublicationBegin ? DiagSource::PublicationBegin
+		                                                                : DiagSource::Count);
 		const auto generation = m_generation.fetch_add(1, std::memory_order_seq_cst) + 1u;
 		auto&      entry      = m_entries[generation & (Capacity - 1u)];
 		// Slots are written in turn: the writer of this lap waits until the previous lap's writer
@@ -219,6 +221,120 @@ private:
 
 	alignas(64) std::atomic<uint64_t> m_generation {1};
 	std::array<Entry, Capacity> m_entries {};
+};
+
+// KYTY_CERT_LOG_SUMMARY (drawPrep.cpp): a single-thread summary of a log, for a reader that asks
+// many Checks whose intervals overlap (the draw-prep commits: every commit walks the transitions
+// since its preparation began, so with a deep preparation window each entry was read by dozens of
+// commits). The reader ingests every entry once, in generation order, into a sparse table holding,
+// per 64 KiB block of guest address space, the newest generation of an entry touching it (entries
+// wider than WideBlocks blocks, and universe entries, raise one "wide" generation instead). Then
+// "no entry in (from, to] intersects these ranges" holds when every entry up to `to` was ingested
+// without a gap since before `from`, the wide generation is <= from and every block the ranges
+// touch holds a generation <= from: an entry in the interval intersecting a range would have raised
+// one of them above `from`. Otherwise (a block or the wide generation is newer, an entry not yet
+// readable, a gap) Clean() answers false and the caller runs the exact Check.
+class Summary {
+public:
+	static constexpr uint32_t BlockShift    = 16u;
+	static constexpr uint32_t LeafShift     = 36u; // 64 GiB per leaf
+	static constexpr uint64_t BlocksPerLeaf = uint64_t {1} << (LeafShift - BlockShift);
+	static constexpr uint64_t WideBlocks    = 4096; // 256 MiB
+
+	explicit Summary(const Log& log) noexcept: m_log(log) {}
+	~Summary() {
+		for (auto* leaf: m_leaves) {
+			std::free(leaf);
+		}
+	}
+	Summary(const Summary&)            = delete;
+	Summary& operator=(const Summary&) = delete;
+
+	// True: no entry with a generation in (from, to] intersects `ranges` (sorted, non-overlapping).
+	// False: unknown (the caller decides with Log::Check).
+	[[nodiscard]] bool Clean(uint64_t from, uint64_t to, std::span<const Range> ranges) noexcept {
+		if (to <= from) {
+			return true;
+		}
+		if (!m_started) {
+			// Entries before this point were never ingested: only later intervals qualify.
+			m_started    = true;
+			m_ingested   = m_log.Generation();
+			m_valid_from = m_ingested;
+		}
+		if (from < m_valid_from || !Ingest(to) || m_wide > from) {
+			return false;
+		}
+		for (const auto& range: ranges) {
+			if (range.begin >= range.end) {
+				continue;
+			}
+			if (range.end > (uint64_t {1} << 48u)) {
+				return false;
+			}
+			for (auto block = range.begin >> BlockShift; block <= (range.end - 1u) >> BlockShift; block++) {
+				const auto* leaf = m_leaves[block >> (LeafShift - BlockShift)];
+				if (leaf != nullptr && leaf[block & (BlocksPerLeaf - 1u)] > from) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	[[nodiscard]] uint64_t Ingested() const noexcept { return m_ingested; }
+
+private:
+	// Ingests the entries up to `to`; false when one is not readable yet (or no longer: then the
+	// summary restarts after the gap).
+	bool Ingest(uint64_t to) noexcept {
+		while (m_ingested < to) {
+			const auto generation = m_ingested + 1u;
+			Range      range;
+			Source     source = Source::Universe;
+			if (!m_log.Read(generation, range, source)) {
+				if (m_log.Generation() - generation >= Log::Capacity) {
+					// Recycled before it was ingested: nothing before the current end can be
+					// vouched for any more.
+					m_ingested   = m_log.Generation();
+					m_valid_from = m_ingested;
+				}
+				return false;
+			}
+			Note(range, generation);
+			m_ingested = generation;
+		}
+		return true;
+	}
+
+	void Note(Range range, uint64_t generation) noexcept {
+		if (range.begin >= range.end) {
+			return;
+		}
+		const auto first = range.begin >> BlockShift;
+		if (range.end > (uint64_t {1} << 48u) || ((range.end - 1u) >> BlockShift) - first >= WideBlocks) {
+			m_wide = generation;
+			return;
+		}
+		for (auto block = first; block <= (range.end - 1u) >> BlockShift; block++) {
+			auto*& leaf = m_leaves[block >> (LeafShift - BlockShift)];
+			if (leaf == nullptr) {
+				leaf = static_cast<uint64_t*>(std::calloc(BlocksPerLeaf, sizeof(uint64_t)));
+				if (leaf == nullptr) {
+					m_wide = generation; // no table: treat as touching everything
+					return;
+				}
+			}
+			leaf[block & (BlocksPerLeaf - 1u)] = generation; // generations only grow
+		}
+	}
+
+	const Log&                                         m_log;
+	bool                                               m_started    = false;
+	uint64_t                                           m_ingested   = 0;
+	uint64_t                                           m_valid_from = 0;
+	uint64_t                                           m_wide       = 0;
+	std::array<uint64_t*, 1u << (48u - LeafShift)>    m_leaves {};
 };
 
 // The process-wide log (one per coherence domain: the guest GPU).

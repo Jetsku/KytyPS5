@@ -97,6 +97,8 @@ public:
 	[[nodiscard]] uint64_t FaultMutationEpoch() const noexcept {
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
+	// Whether CPU-mutation transitions advance FaultMutationEpoch() at all (constructor flag).
+	[[nodiscard]] bool TracksCpuMutations() const noexcept { return m_track_cpu_mutations; }
 	// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow). Once enabled, every transition
 	// FaultMutationEpoch() covers also records the range it can make CPU-dirty (a write fault's
 	// whole fault-ahead window, a whole new region, a demoted or swept region's hot pages, ...),
