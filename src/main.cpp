@@ -807,6 +807,17 @@ static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	InitCudaEarly();
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// KYTY_RADV_TRANSFER_QUEUE=1 (default off; chenxiao07/KytyPS5 1bfdf6ded): asks RADV for its
+	// transfer-only queue family, which it shows only when asked, before the driver loads (Mesa 26
+	// reads RADV_EXPERIMENTAL, older Mesa RADV_PERFTEST; other drivers neither), unless the variable
+	// is set already. The upload DMA (KYTY_UPLOAD_DMA) then has a copy queue of its own on AMD;
+	// chenxiao's readbacks gained 19-27% on an RX 9060 XT / 9070 XT with it.
+	if (const char* ask = std::getenv("KYTY_RADV_TRANSFER_QUEUE"); ask != nullptr && ask[0] == '1') {
+		setenv("RADV_EXPERIMENTAL", "transfer_queue", 0);
+		setenv("RADV_PERFTEST", "transfer_queue", 0);
+	}
+#endif
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
