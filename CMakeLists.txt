@@ -641,6 +641,10 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_kyty_full_emulator_test(null_texture_desc_tests "${KYTY_TESTS_DIR}/NullTextureDescTests.cpp")
 add_kyty_full_emulator_test(sparse_residency_stress_tests "${KYTY_TESTS_DIR}/SparseResidencyStressTests.cpp")
 
+# Times the driver's compile of SPIR-V modules (KYTY_DUMP_SPIRV_MIN_WORDS dumps), offline; a tool, not a test.
+add_executable(pipeline_build_timer EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineBuildTimer.cpp")
+target_link_libraries(pipeline_build_timer Vulkan::Headers)
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"

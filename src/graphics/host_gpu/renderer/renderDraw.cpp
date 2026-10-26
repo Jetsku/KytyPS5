@@ -4296,8 +4296,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// built for and no pipeline was replaced since (DrawPrep::PlannedPipeline).
 	auto&       pipeline_cache = m_context.GetPipelineCache();
 	const auto  colors_span    = std::span<const RenderColorInfo> {state.color_info, state.color_count};
-	if (pipeline_cache.PipelineSkipEnabled() && SkipRecurrentTargetsOnly()) {
-		NoteSkipTargets(m_context, state);
+	if (pipeline_cache.PipelineSkipEnabled()) {
+		pipeline_cache.NoteSkipFrame(m_context.GetTextureCache().Frame());
+		if (SkipRecurrentTargetsOnly()) NoteSkipTargets(m_context, state);
 	}
 	const auto* ps_input       = state.ps_active ? &state.ps_input_info : nullptr;
 	const auto* planned_pipeline =

@@ -226,6 +226,13 @@ public:
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                                 const GraphicsPrograms& programs, bool skippable);
 	[[nodiscard]] bool PipelineSkipEnabled() const noexcept { return m_skip != nullptr; }
+	// KYTY_PIPELINE_SKIP_FRAME_BUDGET_US: the frame the next skippable draws belong to (CP thread).
+	void NoteSkipFrame(uint64_t frame) noexcept {
+		if (frame != m_skip_frame) {
+			m_skip_frame      = frame;
+			m_skip_frame_used = 0;
+		}
+	}
 	struct SkipTotals {
 		uint64_t requested = 0, published = 0, skipped_draws = 0, ready_in_wait = 0, not_queued = 0;
 		uint64_t compile_ns = 0;
@@ -433,6 +440,7 @@ private:
 	// Background builds of every replayed compute program's pipeline (KYTY_PIPELINE_PREWARM_COMPUTE).
 	struct ComputePrewarm;
 	std::unique_ptr<ComputePrewarm> m_compute_prewarm;
+	bool                            m_compute_ahead = false; // KYTY_PIPELINE_COMPUTE_AHEAD
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -454,6 +462,10 @@ private:
 	std::unique_ptr<PrefetchState> m_skip;
 	uint64_t                       m_skip_wait_ns = 0;
 	std::atomic<uint64_t>          m_skip_draws {0}, m_skip_ready_in_wait {0}, m_skip_not_queued {0};
+	// KYTY_PIPELINE_SKIP_FRAME_BUDGET_US (0: off): the skippable draws of one frame wait at most this
+	// long in all for their new pipelines (each still at most KYTY_PIPELINE_SKIP_WAIT_US).
+	uint64_t                       m_skip_frame_budget_ns = 0;
+	uint64_t                       m_skip_frame = 0, m_skip_frame_used = 0;
 	Pipeline* GetGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                  std::span<const ShaderVertexInputInfo> vertex_info,
 	                                  CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,

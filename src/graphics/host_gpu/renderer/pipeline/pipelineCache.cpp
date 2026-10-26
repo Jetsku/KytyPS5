@@ -428,6 +428,10 @@ public:
 		info.pins++;
 		return found->second;
 	}
+	[[nodiscard]] bool Contains(uint64_t hash) const {
+		std::scoped_lock lock(m_mutex);
+		return m_by_hash.contains(hash);
+	}
 	[[nodiscard]] uint64_t HashOf(vk::ShaderModule module) const {
 		std::scoped_lock lock(m_mutex);
 		const auto       found = m_modules.find(static_cast<VkShaderModule>(module));
@@ -1464,6 +1468,32 @@ private:
 	bool                                m_stop = false;
 };
 
+// KYTY_DUMP_SPIRV_MIN_WORDS=<words>;<folder> (diagnostics, local files only): the emitted SPIR-V of
+// every permutation of at least <words> words, as <folder>/<stage>_<hash>_<words>.spv (what makes the
+// slow driver compiles large).
+void DumpLargeSpirv(const char* stage_name, uint64_t hash, const std::vector<uint32_t>& spirv) {
+	static const auto request = [] {
+		std::pair<uint64_t, std::string> parsed {0, {}};
+		const char* value = std::getenv("KYTY_DUMP_SPIRV_MIN_WORDS");
+		if (value == nullptr) return parsed;
+		const std::string_view text(value);
+		const auto             split = text.find(';');
+		if (split == std::string_view::npos) return parsed;
+		parsed.first  = std::strtoull(std::string(text.substr(0, split)).c_str(), nullptr, 10);
+		parsed.second = std::string(text.substr(split + 1));
+		return parsed;
+	}();
+	if (request.first == 0 || spirv.size() < request.first) return;
+	std::error_code error;
+	std::filesystem::create_directories(request.second, error);
+	const auto path = std::filesystem::path(request.second) /
+	                  fmt::format("{}_{:016x}_{}.spv", stage_name, hash, spirv.size());
+	if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+		std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), file);
+		std::fclose(file);
+	}
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -2227,6 +2257,7 @@ struct PipelineCache::ProgramCache {
 		}
 		times.emit_ns     = CompileClockNs() - emit_begin;
 		times.spirv_words = result.spirv.size();
+		DumpLargeSpirv(stage_name, options.shader_hash, result.spirv);
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
@@ -4748,6 +4779,7 @@ struct PipelineCache::FastFirstState {
 	const uint64_t     drain_ms;
 	const bool         probe_supported; // VK_EXT_pipeline_creation_cache_control
 	const bool         probe_all;       // KYTY_PIPELINE_FAST_FIRST_PROBE=1
+	bool               compute_only = false; // KYTY_PIPELINE_FAST_FIRST_COMPUTE=1 without KYTY_PIPELINE_FAST_FIRST
 	std::mutex                  report_mutex;
 	std::condition_variable_any report_cv;
 	std::jthread               reporter;
@@ -4825,11 +4857,14 @@ struct PipelineCache::PrefetchState {
 		// and its future only holds a broken promise (no exceptions on Linux, so check first).
 		std::shared_ptr<std::atomic<bool>> started;
 	};
-	// keyed: builds describe their content and note it in the known-pipeline list (the skip
-	// builder, KYTY_PIPELINE_SKIP: its pipelines are published like the CP's own builds).
+	// keyed: builds describe their content and note it in the known-pipeline list and the pipeline
+	// journal when they are published, like the CP's own builds (the skip builder, KYTY_PIPELINE_SKIP,
+	// and the prefetch pool: with prefetch on nearly every pipeline is built here, and without the
+	// key the journal stayed empty, so a cold start replayed nothing). drop_on_stop: Stop drops the
+	// queued builds no draw waits for (the skip builder).
 	explicit PrefetchState(PipelineCache& owner, size_t threads, size_t limit = 128, bool keyed_builds = false,
-	                       const char* name = "Pipeline prefetch")
-	    : cache(owner), max_pending(limit), keyed(keyed_builds), log_name(name),
+	                       const char* name = "Pipeline prefetch", bool drop_queued_on_stop = false)
+	    : cache(owner), max_pending(limit), keyed(keyed_builds), drop_on_stop(drop_queued_on_stop), log_name(name),
 	      queue(threads, limit, Common::PlaceCurrentThreadCold) {}
 	~PrefetchState() {
 		Stop();
@@ -4853,7 +4888,7 @@ struct PipelineCache::PrefetchState {
 			stopped = true;
 		}
 		// The skip builder's queue can hold hundreds of builds no draw waits for: drop them.
-		if (keyed) (void)queue.DropPending();
+		if (drop_on_stop) (void)queue.DropPending();
 		queue.Stop();
 	}
 	// True when this call queued the build.
@@ -4939,6 +4974,13 @@ struct PipelineCache::PrefetchState {
 	}
 	// Builds queued or running, not yet completed (a cheap check before Take).
 	std::atomic<uint64_t> pending_count {0};
+	// Whether a build of the key is queued or running (and not yet taken).
+	bool Has(const GraphicsPipelineKey& key) {
+		if (pending_count.load(std::memory_order_relaxed) == 0) return false;
+		std::lock_guard lock(mutex);
+		const auto it = pending.find(key);
+		return it != pending.end() && it->second.future.valid();
+	}
 	// The skip builder's lookup: Absent (not queued: the queue was full or stopped), Pending (still
 	// building after waiting up to wait_ns), or Ready (out holds the pipeline; the key stays
 	// reserved until Complete).
@@ -4963,6 +5005,7 @@ struct PipelineCache::PrefetchState {
 	PipelineCache& cache;
 	const size_t max_pending;
 	const bool keyed;
+	const bool drop_on_stop;
 	const char* const log_name;
 	std::mutex mutex;
 	bool stopped = false;
@@ -5267,8 +5310,55 @@ struct PipelineCache::ComputePrewarm {
 	void Stop() {
 		if (stopped.exchange(true)) return;
 		queue.DropPending();
+		ReleaseWaiters();
 		queue.Stop();
 		LogTotals();
+	}
+
+	// KYTY_PIPELINE_COMPUTE_AHEAD: a dropped build is never waited for.
+	void ReleaseWaiters() {
+		{
+			std::scoped_lock lock(inflight_mutex);
+			inflight.clear();
+		}
+		inflight_cv.notify_all();
+	}
+
+	// KYTY_PIPELINE_COMPUTE_AHEAD=1: a compute program prepared ahead of its dispatch (draw preparation,
+	// KYTY_PIPELINE_PREFETCH_PROGRAMS) gets its pipeline built here at once, each id once.
+	void RequestAhead(uint64_t id, const ShaderComputeInputInfo& input, vk::ShaderModule module) {
+		if (stopped.load(std::memory_order_acquire)) return;
+		{
+			std::scoped_lock lock(inflight_mutex);
+			if (!asked.insert(id).second) return;
+			inflight.insert(id);
+		}
+		auto info             = std::make_shared<ShaderComputeInputInfo>(input);
+		info->stage.resources = &NoPrewarmResources();
+		if (queue.Submit([this, id, info, module] { Build(id, *info, module); }, id)) {
+			requested.fetch_add(1, std::memory_order_relaxed);
+			ahead.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			Finished(id);
+		}
+	}
+
+	// The command processor needs the pipeline of `id`: when a build of it is queued or running, it
+	// moves to the front and this waits for it (true). False when none is.
+	bool WaitFor(uint64_t id) {
+		std::unique_lock lock(inflight_mutex);
+		if (!inflight.contains(id)) return false;
+		queue.Promote(id);
+		inflight_cv.wait(lock, [&] { return !inflight.contains(id); });
+		return true;
+	}
+
+	void Finished(uint64_t id) {
+		{
+			std::scoped_lock lock(inflight_mutex);
+			if (inflight.erase(id) == 0) return;
+		}
+		inflight_cv.notify_all();
 	}
 
 	// Builds everything requested so far, then stops (KYTY_PIPELINE_LIST_PREPARE).
@@ -5281,10 +5371,11 @@ struct PipelineCache::ComputePrewarm {
 	void LogTotals() const {
 		if (requested.load() != 0) {
 			PipelineCacheLog("Compute prewarm: {} requested, {} built and published ({:.1f} ms), {} dropped (a "
-			                 "dispatch built it first), {} failed",
+			                 "dispatch built it first), {} failed; {} requested ahead of their dispatch, {} "
+			                 "dispatches waited for one ({:.1f} ms)",
 			                 requested.load(), g_compile_totals.prewarm_built.load(),
 			                 static_cast<double>(g_compile_totals.prewarm_ns.load()) / 1e6, dropped.load(),
-			                 failed.load());
+			                 failed.load(), ahead.load(), waits.load(), static_cast<double>(wait_ns.load()) / 1e6);
 		}
 	}
 
@@ -5298,6 +5389,11 @@ struct PipelineCache::ComputePrewarm {
 	}
 
 	void Build(uint64_t id, const ShaderComputeInputInfo& info, vk::ShaderModule module) {
+		BuildOnce(id, info, module);
+		Finished(id);
+	}
+
+	void BuildOnce(uint64_t id, const ShaderComputeInputInfo& info, vk::ShaderModule module) {
 		static thread_local bool named = false;
 		if (!named) {
 			named = true;
@@ -5342,10 +5438,14 @@ struct PipelineCache::ComputePrewarm {
 		g_compile_totals.prewarm_built.fetch_add(1, std::memory_order_relaxed);
 	}
 
-	PipelineCache&        cache;
-	std::atomic<bool>     stopped {false};
-	std::atomic<uint64_t> requested {0}, dropped {0}, failed {0};
-	PipelineCompileQueue  queue; // last: joined before the rest goes
+	PipelineCache&               cache;
+	std::atomic<bool>            stopped {false};
+	std::atomic<uint64_t>        requested {0}, dropped {0}, failed {0}, ahead {0}, waits {0}, wait_ns {0};
+	std::mutex                   inflight_mutex;
+	std::condition_variable      inflight_cv;
+	std::unordered_set<uint64_t> inflight; // ids requested ahead, not built yet
+	std::unordered_set<uint64_t> asked;    // every id requested ahead (each is built once)
+	PipelineCompileQueue         queue;    // last: joined before the rest goes
 };
 
 // KYTY_PIPELINE_LIST (default off): a KYPLST1 pipeline list (pipelineList.h) made from recorded runs,
@@ -5489,8 +5589,11 @@ struct PipelineCache::JournalReplay {
 		if (low_priority) LowerCurrentThreadPriority();
 		Profiler::SetThreadName("PipelineJournal");
 		Common::PlaceCurrentThreadCold();
-		// The pipelines need the programs' modules: wait for the shader precompile replay.
-		if (cache.m_shader_precompiler != nullptr) cache.m_shader_precompiler->Wait();
+		// The pipelines need the programs' modules: wait for the shader precompile replay. Early
+		// (KYTY_PIPELINE_JOURNAL_EARLY=1): start at once; a record whose modules the replay has not
+		// published yet is set aside and tried again once the replay is done.
+		auto* precompiler = cache.m_shader_precompiler.get();
+		if (precompiler != nullptr && !early) precompiler->Wait();
 		std::call_once(order_once, [this] {
 			BuildOrder();
 			last_report_ns = CompileClockNs();
@@ -5498,9 +5601,43 @@ struct PipelineCache::JournalReplay {
 		while (!stop.load(std::memory_order_acquire)) {
 			const auto index = next.fetch_add(1, std::memory_order_relaxed);
 			if (index >= order.size()) break;
-			Replay(items[order[index]]);
+			const bool can_defer = early && precompiler != nullptr && !precompiler->GetProgress().finished;
+			if (!Replay(items[order[index]], can_defer)) {
+				// The replay publishes in about the order the pipelines were first needed: wait up to
+				// 2 s for this record's modules, then set it aside.
+				bool       replayed = false;
+				const auto waited   = CompileClockNs();
+				while (!stop.load(std::memory_order_acquire) && CompileClockNs() - waited < 2'000'000'000ull) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(20));
+					const bool finished = precompiler->GetProgress().finished;
+					if (Replay(items[order[index]], !finished)) {
+						replayed = true;
+						break;
+					}
+				}
+				if (!replayed) {
+					std::scoped_lock lock(deferred_mutex);
+					deferred.push_back(order[index]);
+					continue;
+				}
+			}
 			done.fetch_add(1, std::memory_order_relaxed);
 			MaybeReport();
+		}
+		if (early && precompiler != nullptr && !stop.load(std::memory_order_acquire)) {
+			precompiler->Wait();
+			while (!stop.load(std::memory_order_acquire)) {
+				uint32_t item = 0;
+				{
+					std::scoped_lock lock(deferred_mutex);
+					if (deferred.empty()) break;
+					item = deferred.back();
+					deferred.pop_back();
+				}
+				(void)Replay(items[item], false);
+				done.fetch_add(1, std::memory_order_relaxed);
+				MaybeReport();
+			}
 		}
 		if (running.fetch_sub(1, std::memory_order_acq_rel) == 1) {
 			size_t cache_bytes = 0;
@@ -5547,18 +5684,24 @@ struct PipelineCache::JournalReplay {
 		return cache_full.load(std::memory_order_relaxed);
 	}
 
-	void Replay(const Item& item) {
+	// False (nothing counted) when can_defer and a module is not published yet: the caller tries
+	// the record again after the shader precompile replay.
+	bool Replay(const Item& item, bool can_defer) {
 		const auto&    record = item.record;
 		JournalPayload payload;
 		if (!DecodeJournalPayload(record.payload, payload)) {
 			failed.fetch_add(1, std::memory_order_relaxed);
-			return;
+			return true;
 		}
-		if (!force && !item.from_list && cache.IsKnownPipeline(record.key)) {
+		// Known to the driver cache: nothing to build, but only while the record's own modules are the
+		// ones this run uses (after a translator or preset change the record's key is still known
+		// although the game now needs the retargeted pipeline: checked below with its new key).
+		const auto known_record = !force && !item.from_list && cache.IsKnownPipeline(record.key);
+		if (known_record && (!retarget || RecordModulesPublished(payload))) {
 			skipped_known.fetch_add(1, std::memory_order_relaxed);
 			g_compile_totals.journal_skipped.fetch_add(1, std::memory_order_relaxed);
 			NoteReplayKey(record.key);
-			return;
+			return true;
 		}
 		const std::span<const uint32_t> words(payload.words);
 		const auto                      snapshot_words = words.first(payload.snapshot_words);
@@ -5591,10 +5734,14 @@ struct PipelineCache::JournalReplay {
 		};
 		// The layout from its signature (pipeline/shaders.cpp: interned flag, push descriptors, push
 		// stages, push size, then binding, type, count and stages per binding).
+		if (!found && can_defer) {
+			unpin();
+			return false;
+		}
 		if (!found || modules.empty() || signature.size() < 4 || (signature.size() - 4) % 4 != 0) {
 			unpin();
 			missing.fetch_add(1, std::memory_order_relaxed);
-			return;
+			return true;
 		}
 		std::vector<vk::DescriptorSetLayoutBinding> bindings;
 		for (size_t i = 4; i < signature.size(); i += 4) {
@@ -5655,6 +5802,16 @@ struct PipelineCache::JournalReplay {
 		ReleasePipelineLayout(cache.m_graphics, layouts.pipeline_layout, layouts.set_layout);
 		unpin();
 		if (!ok) failed.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+
+	// Whether every module the record names by content hash is published in this run.
+	static bool RecordModulesPublished(const JournalPayload& payload) {
+		const std::span<const uint32_t> words(payload.words);
+		for (const auto hash: GraphicsPipelineSnapshot::SerializedModules(words.first(payload.snapshot_words))) {
+			if (hash == 0 || !g_shader_modules.Contains(hash)) return false;
+		}
+		return true;
 	}
 
 	struct BuildContext {
@@ -5716,6 +5873,9 @@ struct PipelineCache::JournalReplay {
 	std::atomic<uint64_t> built {0}, built_list {0}, skipped_known {0}, missing {0}, failed {0}, mismatched {0},
 	    retargets {0}, skipped_full {0};
 	const bool            retarget = EnvU64("KYTY_PIPELINE_JOURNAL_RETARGET", 1) != 0;
+	const bool            early    = EnvU64("KYTY_PIPELINE_JOURNAL_EARLY", 0) != 0;
+	std::mutex            deferred_mutex;
+	std::vector<uint32_t> deferred; // indices into items: modules not published at the first try
 	std::atomic<uint64_t> created {0}, unpredicted {0}, logged_misses {0};
 	std::mutex                   keys_mutex;
 	std::unordered_set<uint64_t> replay_keys;
@@ -6182,17 +6342,31 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			                 : m_known != nullptr           ? "pipelines known to be cached"
 			                                                : "off");
 		}
+	} else if (EnvU64("KYTY_PIPELINE_FAST_FIRST_COMPUTE", 0) != 0) {
+		// KYTY_PIPELINE_FAST_FIRST_COMPUTE=1 (default off): fast-first for compute pipelines only;
+		// graphics pipelines keep the prefetch pool. On NVIDIA Miles' unoptimized graphics builds were
+		// the full compile (91ff6ece4), compute ones may not be.
+		m_fast_first               = std::make_unique<FastFirstState>(*this);
+		m_fast_first->compute_only = true;
+		PipelineCacheLog("Pipeline fast-first: compute pipelines only (KYTY_PIPELINE_FAST_FIRST_COMPUTE)");
 	}
+	const bool graphics_fast_first = m_fast_first != nullptr && !m_fast_first->compute_only;
 	if ((g_pipeline_prefetch.On() || EnvU64("KYTY_PIPELINE_PREFETCH_POOL", 0) != 0) && m_library == nullptr &&
-	    m_fast_first == nullptr) {
-		const auto threads = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_PREFETCH_THREADS", 2), 1, 4);
-		m_prefetch = std::make_unique<PrefetchState>(*this, threads);
+	    !graphics_fast_first) {
+		// Up to 16: a cold Miles start compiles hundreds of ~130 ms pipelines, and the old cap of 4
+		// silently turned 8 or 12 into 4.
+		const auto threads = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_PREFETCH_THREADS", 2), 1, 16);
+		// KYTY_PIPELINE_PREFETCH_JOURNAL=0: prefetched pipelines are not keyed (neither journaled nor known).
+		const bool keyed = EnvU64("KYTY_PIPELINE_PREFETCH_JOURNAL", 1) != 0;
+		m_prefetch = std::make_unique<PrefetchState>(*this, threads, 128, keyed);
 		PipelineCacheLog("Pipeline prefetch: {} compile workers; draws always wait for their exact pipeline", threads);
 	}
 	if (EnvU64("KYTY_PIPELINE_SKIP", 0) != 0 && m_library == nullptr) {
-		const auto threads = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_THREADS", 3), 1, 8);
+		const auto threads = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_THREADS", 3), 1, 16);
 		m_skip_wait_ns     = std::min<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_WAIT_US", 2000), 1000000) * 1000ull;
-		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip");
+		m_skip_frame_budget_ns =
+		    std::min<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_FRAME_BUDGET_US", 0), 1000000) * 1000ull;
+		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip", true);
 		PipelineCacheLog("Pipeline skip: {} background builders; draws that only change the picture wait "
 		                 "{} us for a new pipeline, then are skipped until it is built "
 		                 "(KYTY_PIPELINE_SKIP_THREADS, KYTY_PIPELINE_SKIP_WAIT_US)",
@@ -6686,10 +6860,23 @@ void PipelineCache::InitializeShaderPrecompile() {
 		PipelineCacheLog("Shader precompile: the pipeline list adds {} sources and {} permutations to the replay",
 		                 added.sources, added.entries);
 	}
+	const bool prepare = m_list != nullptr && m_list->prepare;
+	// KYTY_PIPELINE_COMPUTE_AHEAD=1 (default off; needs KYTY_PIPELINE_PREWARM_COMPUTE and
+	// KYTY_PIPELINE_PREFETCH_PROGRAMS): a compute program prepared ahead of its dispatch gets its
+	// pipeline built on the prewarm threads at once, and the dispatch waits for that build instead of
+	// compiling it on the command processor (a cold Miles start spent 20 s there). Created before the
+	// replay check: a first start has an empty journal.
+	m_compute_ahead = EnvU64("KYTY_PIPELINE_COMPUTE_AHEAD", 0) != 0;
+	if (EnvU64("KYTY_PIPELINE_PREWARM_COMPUTE", m_list != nullptr ? 1 : 0) != 0) {
+		const auto threads = static_cast<size_t>(
+		    std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_PREWARM_THREADS", prepare ? 4 : 1), 1, 16));
+		m_compute_prewarm  = std::make_unique<ComputePrewarm>(*this, threads);
+		PipelineCacheLog("Compute prewarm: the pipelines of replayed compute programs{} are built on {} background "
+		                 "thread(s)", m_compute_ahead ? " and of programs prepared ahead" : "", threads);
+	}
 	if (EnvU64("KYTY_SHADER_PRECOMPILE_REPLAY", 1) == 0 || m_shader_journal->Entries().empty()) {
 		return;
 	}
-	const bool prepare = m_list != nullptr && m_list->prepare;
 	ShaderPrecompiler::Settings replay;
 	replay.threads     = static_cast<uint32_t>(
 	    std::clamp<uint64_t>(EnvU64("KYTY_SHADER_PRECOMPILE_THREADS", prepare ? 8 : 2), 1, 16));
@@ -6704,14 +6891,7 @@ void PipelineCache::InitializeShaderPrecompile() {
 	replay.priority_source = [](const ShaderJournal::Source& source) {
 		return source.kind == ShaderJournal::Kind::Compute && MayContainBvhIntersect(source.code);
 	};
-	if (EnvU64("KYTY_PIPELINE_PREWARM_COMPUTE", m_list != nullptr ? 1 : 0) != 0) {
-		const auto threads = static_cast<size_t>(
-		    std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_PREWARM_THREADS", prepare ? 4 : 1), 1, 8));
-		m_compute_prewarm  = std::make_unique<ComputePrewarm>(*this, threads);
-		m_program_cache->prewarm_all_compute = true;
-		PipelineCacheLog("Compute prewarm: the pipelines of replayed compute programs are built on {} background "
-		                 "thread(s)", threads);
-	}
+	if (m_compute_prewarm != nullptr) m_program_cache->prewarm_all_compute = true;
 	m_program_cache->rt_prewarm = [this](const ShaderComputeInputInfo& info, const ShaderProgram& program) {
 		PrewarmComputePipeline(info, program);
 	};
@@ -7321,6 +7501,11 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareComputeProgramSpeculative
 	if (result == SpeculativeResult::Ok && read_failed()) {
 		return SpeculativeResult::ReadFailed;
 	}
+	if (result == SpeculativeResult::Ok && m_compute_ahead && m_compute_prewarm != nullptr && program &&
+	    input_info.stage.program != nullptr && !input_info.stage.program->info.uses_bvh) {
+		// Each id once; a build finds a pipeline the command processor made first and drops itself.
+		m_compute_prewarm->RequestAhead(program.id, input_info, program.module);
+	}
 	return result;
 }
 
@@ -7854,15 +8039,29 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	// (a driver-cache hit is usually done by then). A full queue falls back to building it here.
 	if (skippable && vertex_info.size() == 1 && topology != vk::PrimitiveTopology::ePatchList &&
 	    !graphics_debug_dump_enabled()) {
-		bool queued = false;
+		bool           queued = false;
+		PrefetchState* source = m_skip.get();
 		{
 			Common::LockGuard lock(m_mutex);
 			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 				return remember(*iter->second);
 			}
-			queued = m_skip->Request(key, vs_input_info, ps_input_info, programs);
+			// A build the prefetch pool already has for the key (draw preparation asked ahead) is
+			// polled there instead of building the same pipeline a second time on the skip builder.
+			if (m_prefetch != nullptr && m_prefetch->Has(key)) {
+				source = m_prefetch.get();
+				queued = true;
+			} else {
+				queued = m_skip->Request(key, vs_input_info, ps_input_info, programs);
+			}
 		}
-		const auto poll = m_skip->TryTake(key, queued ? m_skip_wait_ns : 0, ready);
+		uint64_t wait_ns = queued ? m_skip_wait_ns : 0;
+		if (m_skip_frame_budget_ns != 0) {
+			wait_ns = std::min(wait_ns, m_skip_frame_budget_ns - std::min(m_skip_frame_budget_ns, m_skip_frame_used));
+		}
+		const auto poll_begin = wait_ns != 0 ? CompileClockNs() : 0;
+		const auto poll       = source->TryTake(key, wait_ns, ready);
+		if (wait_ns != 0) m_skip_frame_used += CompileClockNs() - poll_begin;
 		// Totals at most every 2 s while skips or skip builds happen (the exit report may not run).
 		const auto report = [this] {
 			static uint64_t last_ns = 0;
@@ -7886,7 +8085,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			return nullptr;
 		}
 		if (poll == PrefetchState::Poll::Ready) {
-			ready_from = m_skip.get();
+			ready_from = source;
 			wait_begin = CompileClockNs();
 			if (queued) m_skip_ready_in_wait.fetch_add(1, std::memory_order_relaxed);
 			report();
@@ -7963,7 +8162,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	FastFirstState::GraphicsFast    fast_result;
 	GraphicsContent                 content;
 	const bool                      keyed = m_known != nullptr || m_journal != nullptr;
-	if (m_fast_first != nullptr && !prefetched && !m_fast_first->scheduler.Stopped()) {
+	if (m_fast_first != nullptr && !m_fast_first->compute_only && !prefetched && !m_fast_first->scheduler.Stopped()) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
 			if (keyed) content = DescribeGraphicsPipeline(info, layout_signature);
@@ -8084,6 +8283,23 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// KYTY_PIPELINE_COMPUTE_AHEAD: wait for a build already under way (outside m_mutex, which the
+	// build takes to publish) instead of building the pipeline a second time here.
+	uint64_t ahead_wait_ns = 0;
+	if (m_compute_ahead && m_compute_prewarm != nullptr) {
+		bool present = false;
+		{
+			Common::LockGuard lock(m_mutex);
+			present = m_compute_pipelines.contains(compute_program.id);
+		}
+		const auto begin = CompileClockNs();
+		if (!present && m_compute_prewarm->WaitFor(compute_program.id)) {
+			ahead_wait_ns = CompileClockNs() - begin;
+			m_compute_prewarm->waits.fetch_add(1, std::memory_order_relaxed);
+			m_compute_prewarm->wait_ns.fetch_add(ahead_wait_ns, std::memory_order_relaxed);
+		}
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
@@ -8092,6 +8308,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 			// Built by the start-up prewarm (KYTY_PIPELINE_PREWARM_COMPUTE) before any dispatch asked.
 			iter->second->prewarmed = false;
 			g_compile_totals.cs_prewarmed.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (ahead_wait_ns != 0) {
+			g_compile_totals.cs_cp_ns.fetch_add(ahead_wait_ns, std::memory_order_relaxed);
+			AddCompileStall(ahead_wait_ns);
 		}
 		FlushCompileStall();
 		return *iter->second;
