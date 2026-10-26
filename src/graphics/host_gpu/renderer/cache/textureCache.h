@@ -339,6 +339,15 @@ private:
 	// Uploads the subresources over image.kept_dirty from guest memory; false: nothing recorded,
 	// the caller uploads the whole image.
 	[[nodiscard]] PartialUploadResult UploadKeptRanges(Image& image);
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE (see UploadGpuWrittenRanges).
+	[[nodiscard]] bool GpuWriteTrackEligible(const Image& image) const;
+	[[nodiscard]] bool GpuWritePartialCandidate(const Image& image);
+	void               MaterializeForRebuild(ImageId id, RefreshIntent intent);
+	[[nodiscard]] PartialUploadResult UploadGpuWrittenRanges(ImageId id, RefreshIntent intent);
+	[[nodiscard]] std::optional<ImageInfo> GpuWriteDepthInfo(const Image& image) const;
+	void VerifyGpuWrittenRanges(ImageId id, RefreshIntent intent);
+	void NoteRefreshSync(ImageId id, bool gpu_partial);
+	void PrintPartialGpuWriteSummary();
 	[[nodiscard]] bool        UploadKeptDepthLayers(Image& image, PartialUploadResult& result);
 	// Whole-image refresh of a tiled sampled texture whose guest bytes are copied to staging
 	// by m_staging_copier. False when the ordinary refresh path must be used.
@@ -672,6 +681,30 @@ private:
 	ExactRangeTotals m_exact_range_printed;
 	uint64_t         m_exact_range_print_ns = 0;
 	uint32_t         m_exact_range_logged   = 0;
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE=1|verify, KYTY_IMAGE_PARTIAL_GPU_WRITE_STENCIL=keep.
+	int  m_partial_gpu_write              = 0;
+	bool m_partial_gpu_write_verify       = false;
+	bool m_partial_gpu_write_stencil_keep = false;
+	bool m_stencil_draw_suppressed        = false;
+	bool m_bind_mark                      = false; // a binding's mark right before its refresh
+	struct PartialGpuWriteTotals {
+		uint64_t refreshes       = 0; // refreshes of buffer-modified images
+		uint64_t untracked       = 0; // written ranges not tracked
+		uint64_t stale           = 0; // tracked, but other changes since:
+		uint64_t stale_foreign   = 0; //   another image wrote its bytes / not in sync
+		uint64_t stale_serial    = 0; //   its native contents were written
+		uint64_t stale_cpu       = 0; //   CPU writes
+		uint64_t partial         = 0; // partial rebuilds
+		uint64_t partial_bytes   = 0; // tiled bytes they rebuilt
+		uint64_t whole_bytes     = 0; // bytes the whole rebuilds would have read
+		uint64_t fallback_layout = 0;
+		uint64_t fallback_most   = 0;
+		uint64_t fallback_others = 0;
+		uint64_t overflows       = 0;
+	};
+	PartialGpuWriteTotals m_pgw_totals;
+	PartialGpuWriteTotals m_pgw_printed;
+	uint64_t              m_pgw_print_ns = 0;
 	bool m_gpu_write_skip        = true;
 	int  m_gpu_write_skip_verify = 0;
 	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).

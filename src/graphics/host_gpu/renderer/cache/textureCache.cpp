@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
+#include "graphics/host_gpu/renderer/image/gpuWriteRanges.h"
 #include "graphics/host_gpu/renderer/image/imageClearRange.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/stagingCopier.h"
@@ -417,6 +418,19 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		                ? "a buffer write over exactly one image's range rebuilds only the images "
 		                  "inside it"
 		                : "count only (every overlapped image is rebuilt as before)");
+		std::fflush(stdout);
+	}
+	if (const auto* partial = std::getenv("KYTY_IMAGE_PARTIAL_GPU_WRITE");
+	    partial != nullptr && *partial != '\0' && std::strcmp(partial, "0") != 0) {
+		m_partial_gpu_write        = 1;
+		m_partial_gpu_write_verify = std::strcmp(partial, "verify") == 0;
+		const auto* stencil        = std::getenv("KYTY_IMAGE_PARTIAL_GPU_WRITE_STENCIL");
+		m_partial_gpu_write_stencil_keep = stencil != nullptr && std::strcmp(stencil, "keep") == 0;
+		std::printf("Image partial GPU-write (KYTY_IMAGE_PARTIAL_GPU_WRITE=%s): a buffer write over "
+		            "part of an image rebuilds only the subresources / block rows over it%s%s%s\n",
+		            partial, m_partial_gpu_write_verify ? ", each checked against a whole rebuild" : "",
+		            m_partial_gpu_write_stencil_keep ? "; stencil records trust depth-target draws" : "",
+		            AliasBytesEnabled() ? "" : " (colour/depth images need KYTY_ALIAS_BYTES: stencil records only)");
 		std::fflush(stdout);
 	}
 	m_gpu_write_skip  = EnvNotZero("KYTY_GPU_WRITE_IMAGE_SKIP");
@@ -1729,6 +1743,415 @@ bool TextureCache::UploadKeptDepthLayers(Image& image, PartialUploadResult& resu
 	return true;
 }
 
+// KYTY_IMAGE_PARTIAL_GPU_WRITE (default off). A GPU buffer write over part of an image used to make
+// its next use rebuild all of it from the buffer: Beyond Good & Evil writes single layers of a
+// 4096x4096 layered depth/stencil target (a 256 MiB stencil plane rebuilt per write, Jetsku/KytyPS5
+// issue #82), Astro Bot's compute passes write 64 KiB of 1080p targets that were rebuilt whole.
+// InvalidateMemoryFromGPU records the written ranges while the image's other native contents are
+// known to equal what the rebuild would produce there (GpuWriteTrackEligible, foreign_since_sync,
+// the content serial); the refresh then rebuilds only the subresources, or the runs of block rows
+// of 2D tiled subresources, over those ranges, moving owned bytes through the buffer for those
+// ranges only. KYTY_IMAGE_PARTIAL_GPU_WRITE=verify also rebuilds whole afterwards and compares.
+namespace {
+std::atomic<uint64_t> g_pgw_verify_checks {0};
+std::atomic<uint64_t> g_pgw_verify_mismatches {0};
+} // namespace
+
+void TextureCache::MaterializeForRebuild(ImageId id, RefreshIntent intent) {
+	auto& image = m_slot_images[id];
+	if (!AliasBytesEnabled() || image.depth_id) {
+		return;
+	}
+	// The rebuild reads buffer (or guest) bytes over the whole image. Bytes it still owns itself (a
+	// bounded buffer write took the others) reach the buffer first; a read also takes the bytes
+	// other images own there (a write binding usually overwrites them).
+	if (image.IsBufferModified() && !image.IsDefinitelyCpuDirty() && image.OwnedSet() != nullptr &&
+	    !image.OwnsNoBytes()) {
+		(void)MaterializeOwnedBytes(image.live, id, {}, "rebuild-own");
+	}
+	if (intent == RefreshIntent::Read) {
+		(void)MaterializeOwnedBytes(image.live, {}, id, "rebuild");
+	}
+}
+
+bool TextureCache::GpuWritePartialCandidate(const Image& image) {
+	if (m_partial_gpu_write == 0 || !image.IsBufferModified()) {
+		return false;
+	}
+	PrintPartialGpuWriteSummary();
+	m_pgw_totals.refreshes++;
+	if (!image.gpu_write.active || image.gpu_write.ranges.empty()) {
+		m_pgw_totals.untracked++;
+		return false;
+	}
+	const bool cpu     = image.IsCpuDirty() || image.HasKeptDirty();
+	const bool serial  = !image.depth_id && image.ContentSerial() != image.gpu_write.serial;
+	const bool foreign = image.foreign_since_sync;
+	if (cpu || serial || foreign || !image.FullyResident() || image.info.samples != 1 ||
+	    image.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		m_pgw_totals.stale++;
+		m_pgw_totals.stale_cpu += cpu ? 1u : 0u;
+		m_pgw_totals.stale_serial += serial ? 1u : 0u;
+		m_pgw_totals.stale_foreign += foreign ? 1u : 0u;
+		return false;
+	}
+	return true;
+}
+
+void TextureCache::NoteRefreshSync(ImageId id, bool gpu_partial) {
+	auto& image = m_slot_images[id];
+	if (gpu_partial) {
+		m_pgw_totals.partial++;
+	}
+	if (image.depth_id) {
+		image.foreign_since_sync = false;
+		// The upload wrote the depth image's stencil aspect, also behind its other records.
+		if (const auto* depth = m_slot_images.try_get(image.depth_id); depth != nullptr) {
+			for (const auto record: depth->stencil_ids) {
+				if (record != id) {
+					if (auto* other = m_slot_images.try_get(record); other != nullptr) {
+						other->foreign_since_sync = true;
+					}
+				}
+			}
+		}
+		return;
+	}
+	// Bytes other images still own (a write-intent refresh does not take them) may hold other
+	// contents than this image's native ones.
+	image.foreign_since_sync = AliasBytesEnabled() && OtherImagesOwnBytes(image.live, id);
+}
+
+TextureCache::PartialUploadResult TextureCache::UploadGpuWrittenRanges(ImageId id, RefreshIntent intent) {
+	// Scratch buffers from the tiler stay alive until this operation's last tick (tiler.h).
+	const TileManager::ScratchHold scratch_hold(m_tiler);
+	PartialUploadResult result;
+	auto&               image       = m_slot_images[id];
+	const auto          live        = image.live;
+	const auto          base        = image.info.data.address;
+	const auto&         written     = image.gpu_write.ranges;
+	auto&               destination = image.depth_id ? m_slot_images[image.depth_id] : image;
+	const auto          binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+	result.dirty_bytes              = KeptRanges::Bytes(written);
+
+	// Selection: every subresource (tile) whose tiled bytes intersect a written range; for 2D
+	// tiles outside the mip tail only the runs of block rows that do (see TryPartialUpload).
+	std::vector<GpuTileInfo>         tiles;
+	std::vector<vk::BufferImageCopy> regions;
+	KeptRanges::List                 refreshed;
+	uint64_t                         linear_total = 0;
+	uint64_t                         tiled_bytes  = 0;
+	const auto add = [&](GpuTileInfo tile, vk::BufferImageCopy region, uint64_t linear_size) {
+		linear_total        = Common::AlignUp(linear_total, 256);
+		tile.linear_offset  = linear_total;
+		tile.linear_size    = linear_size;
+		region.bufferOffset = linear_total;
+		linear_total += linear_size;
+		tiled_bytes += tile.tiled_size;
+		(void)KeptRanges::Add(refreshed, base + tile.tiled_offset,
+		                      base + tile.tiled_offset + tile.tiled_size);
+		tiles.push_back(tile);
+		regions.push_back(region);
+	};
+	const auto select = [&](const std::vector<GpuTileInfo>&         all_tiles,
+	                        const std::vector<vk::BufferImageCopy>& all_regions, uint32_t texel_height) {
+		for (size_t index = 0; index < all_tiles.size(); index++) {
+			const auto& tile   = all_tiles[index];
+			const auto& region = all_regions[index];
+			const auto  begin  = base + tile.tiled_offset;
+			if (tile.tiled_size == 0 || !KeptRanges::Intersects(written, begin, begin + tile.tiled_size)) {
+				continue;
+			}
+			TileBlockLayout block {};
+			const bool      family_bands = tile.family != TileBlockFamily::Standard4KB3D &&
+			                          tile.family != TileBlockFamily::Standard64KB3D &&
+			                          tile.family != TileBlockFamily::Prt64KB3D;
+			const bool bands = family_bands && !tile.tail && tile.depth == 1 &&
+			                   region.imageOffset.y == 0 && region.imageExtent.depth == 1 &&
+			                   region.imageSubresource.layerCount == 1 &&
+			                   TileGetBlockLayout(tile.family, tile.bytes_per_element, block) &&
+			                   block.block_depth == 1 && block.block_width != 0 &&
+			                   block.block_height != 0 && block.block_size != 0;
+			const uint32_t tiled_width = tile.tiled_width != 0 ? tile.tiled_width : tile.pitch;
+			const uint64_t row_bytes =
+			    bands ? static_cast<uint64_t>((tiled_width + block.block_width - 1) / block.block_width) *
+			                block.block_size
+			          : 0;
+			const uint32_t rows = bands ? (tile.height + block.block_height - 1) / block.block_height : 0;
+			if (!bands || row_bytes == 0 || rows <= 1 || rows * row_bytes > tile.tiled_size) {
+				add(tile, region, tile.linear_size);
+				continue;
+			}
+			const uint64_t pitch_bytes = static_cast<uint64_t>(tile.pitch) * tile.bytes_per_element;
+			for (const auto& [row, end_row]: GpuWriteRanges::DirtyRowRuns(written, begin, row_bytes, rows)) {
+				const uint32_t y0   = row * block.block_height;
+				const uint32_t y1   = std::min(end_row * block.block_height, tile.height);
+				GpuTileInfo    band = tile;
+				band.tiled_offset   = tile.tiled_offset + row * row_bytes;
+				band.tiled_size     = (end_row - row) * row_bytes;
+				band.height         = y1 - y0;
+				band.tiled_height   = (end_row - row) * block.block_height;
+				auto           band_region = region;
+				const uint32_t texel_y0    = y0 * texel_height;
+				const uint32_t texel_y1    = std::min(y1 * texel_height, region.imageExtent.height);
+				band_region.imageOffset.y      = static_cast<int32_t>(texel_y0);
+				band_region.imageExtent.height = texel_y1 - texel_y0;
+				add(band, band_region, static_cast<uint64_t>(band.height) * pitch_bytes);
+			}
+		}
+	};
+
+	bool linear_depth = false; // copies read the source directly (untiled depth/stencil)
+	if (binding != BindingType::DepthTarget) {
+		const auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+		if (!transfer.valid || transfer.color_transform != ColorTransform::None ||
+		    transfer.tiles.empty() || transfer.tiles.size() != transfer.regions.size()) {
+			m_pgw_totals.fallback_layout++;
+			return result;
+		}
+		select(transfer.tiles, transfer.regions,
+		       std::max(transfer.layout.surface.texture.texel_height, 1u));
+	} else {
+		const auto info = GpuWriteDepthInfo(image);
+		if (!info.has_value()) {
+			m_pgw_totals.fallback_layout++;
+			return result;
+		}
+		const auto layers = info->resources.layers;
+		const auto slice  = info->data.size / layers;
+		auto       copies = BuildDepthCopies(*info, slice,
+		                                     image.depth_id ? vk::ImageAspectFlagBits::eStencil
+		                                                    : vk::ImageAspectFlagBits::eDepth);
+		if (image.depth_id) {
+			for (auto& copy: copies) {
+				copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
+			}
+		}
+		if (info->IsTiled()) {
+			select(BuildDepthTiles(*info), copies, 1);
+		} else {
+			linear_depth = true;
+			for (const auto layer: KeptRanges::DirtyLayers(written, base, slice, layers)) {
+				regions.push_back(copies[layer]);
+				tiled_bytes += slice;
+				(void)KeptRanges::Add(refreshed, base + slice * layer, base + slice * (layer + 1));
+			}
+		}
+	}
+	if (regions.empty()) {
+		// The writes touched only bytes no texel is decoded from (gaps between levels).
+		result.done = true;
+		return result;
+	}
+	if (tiled_bytes >= live.size - live.size / 8) {
+		// Nearly all of it: the whole rebuild needs fewer dispatches for the same bytes.
+		m_pgw_totals.fallback_most++;
+		return result;
+	}
+	if (!image.depth_id && AliasBytesEnabled()) {
+		// Bytes outside the rebuilt parts that another image owns would come from it in the whole
+		// rebuild (a read takes them, a write leaves the buffer's older bytes there).
+		if (OtherImagesOwnBytes(live, id)) {
+			for (const auto& [begin, end]: GpuWriteRanges::Complement(refreshed, live.address, live.End())) {
+				if (OtherImagesOwnBytes({begin, end - begin}, id)) {
+					m_pgw_totals.fallback_others++;
+					return result;
+				}
+			}
+		}
+		// MaterializeForRebuild for the rebuilt parts only.
+		const bool own = image.IsBufferModified() && !image.IsDefinitelyCpuDirty() &&
+		                 image.OwnedSet() != nullptr && !image.OwnsNoBytes();
+		for (const auto& [begin, end]: refreshed) {
+			if (own && image.OwnsBytesIn(begin, end - begin)) {
+				(void)MaterializeOwnedBytes({begin, end - begin}, id, {}, "partial-own");
+			}
+			if (intent == RefreshIntent::Read) {
+				(void)MaterializeOwnedBytes({begin, end - begin}, {}, id, "partial");
+			}
+		}
+	}
+
+	const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(live.address, live.size);
+	if (source == nullptr) {
+		EXIT("TextureCache: failed to obtain image upload source\n");
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesBuffer, tiled_bytes);
+	if (linear_depth) {
+		for (auto& region: regions) {
+			region.bufferOffset += source_offset;
+		}
+		destination.Upload(regions, source->Handle(), source_offset, source->Size() - source_offset);
+	} else if (binding == BindingType::DepthTarget ||
+	           !m_tiler.DetileToImage(destination, source->Handle(), source_offset, live.size,
+	                                  linear_total, tiles, regions)) {
+		const auto linear =
+		    m_tiler.Detile(source->Handle(), source_offset, live.size, linear_total, tiles);
+		for (auto& region: regions) {
+			region.bufferOffset += linear.offset;
+		}
+		destination.Upload(regions, linear.buffer, linear.offset, linear.size);
+	}
+	result.done  = true;
+	result.bytes = tiled_bytes;
+	m_pgw_totals.partial_bytes += tiled_bytes;
+	m_pgw_totals.whole_bytes += live.size;
+	if (m_partial_gpu_write_verify) {
+		VerifyGpuWrittenRanges(id, intent);
+	}
+	return result;
+}
+
+std::optional<ImageInfo> TextureCache::GpuWriteDepthInfo(const Image& image) const {
+	// As UploadImage's depth path: the stencil plane has its own row pitch and shares the native
+	// image with the depth plane.
+	const Image* depth = image.depth_id ? m_slot_images.try_get(image.depth_id) : &image;
+	if (depth == nullptr) {
+		return std::nullopt;
+	}
+	const auto& destination = *depth;
+	auto        info        = destination.info;
+	if (image.depth_id) {
+		info.data            = image.info.data;
+		info.resources       = {image.stencil_subresources.level_count,
+		                        image.stencil_subresources.layer_count};
+		info.guest_format    = Prospero::BufferFormat::k8UInt;
+		info.bytes_per_block = 1;
+		if (info.IsTiled()) {
+			info.pitch = TileGetDepthPitch(info.extent.width, 1, 0);
+		}
+	}
+	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
+	if (info.samples != 1 || destination.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0 ||
+	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block ||
+	    transfer_bytes != info.bytes_per_block) {
+		return std::nullopt;
+	}
+	return info;
+}
+
+void TextureCache::VerifyGpuWrittenRanges(ImageId id, RefreshIntent intent) {
+	auto&      image       = m_slot_images[id];
+	auto&      destination = image.depth_id ? m_slot_images[image.depth_id] : image;
+	const auto binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+	// Every texel the whole rebuild writes, in its linear layout.
+	std::vector<vk::BufferImageCopy> copies;
+	uint64_t                         size = 0;
+	if (binding != BindingType::DepthTarget) {
+		const auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+		copies              = transfer.regions;
+		size                = transfer.LinearSize();
+	} else if (const auto info = GpuWriteDepthInfo(image); info.has_value()) {
+		const auto slice = info->data.size / info->resources.layers;
+		copies           = BuildDepthCopies(*info, slice,
+		                                    image.depth_id ? vk::ImageAspectFlagBits::eStencil
+		                                                   : vk::ImageAspectFlagBits::eDepth);
+		if (image.depth_id) {
+			for (auto& copy: copies) {
+				copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
+			}
+		}
+		size = info->data.size;
+	}
+	if (copies.empty() || size == 0) {
+		return;
+	}
+	const auto readback = [&]() {
+		const auto capacity = Common::AlignUp(size, uint64_t {4});
+		auto buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                       vk::BufferUsageFlagBits::eTransferDst, capacity);
+		buffer->Fill(0, capacity, 0);
+		destination.Download(copies, buffer->Handle(), 0, size);
+		return buffer;
+	};
+	auto partial = readback();
+	// The whole rebuild, exactly as InitializeImage does it without the switch.
+	MaterializeForRebuild(id, intent);
+	const auto [source, source_offset] =
+	    m_buffer_cache.ObtainBufferForImage(image.live.address, image.live.size);
+	if (source == nullptr) {
+		EXIT("TextureCache: failed to obtain image upload source\n");
+	}
+	UploadImage(image, *source, source_offset);
+	auto whole = readback();
+	vk::MemoryBarrier2 to_host {};
+	to_host.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &to_host;
+	m_scheduler.Current().HelperSink().pipelineBarrier2(dependency);
+	const auto address = image.info.data.address;
+	const auto width   = image.info.extent.width;
+	const auto height  = image.info.extent.height;
+	const auto format  = static_cast<uint32_t>(destination.backing.format);
+	const bool stencil = static_cast<bool>(image.depth_id);
+	const auto ranges  = image.gpu_write.ranges.size();
+	m_scheduler.DeferOperation([partial, whole, size, address, width, height, format, stencil, ranges] {
+		partial->Invalidate(0, size);
+		whole->Invalidate(0, size);
+		g_pgw_verify_checks.fetch_add(1, std::memory_order_relaxed);
+		const auto* a = partial->Mapped().data();
+		const auto* b = whole->Mapped().data();
+		if (std::memcmp(a, b, size) == 0) {
+			return;
+		}
+		uint64_t first = 0;
+		while (first < size && a[first] == b[first]) {
+			first++;
+		}
+		uint64_t differing = 0;
+		for (uint64_t i = first; i < size; i++) {
+			differing += a[i] != b[i] ? 1u : 0u;
+		}
+		const auto count = g_pgw_verify_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 32) {
+			std::printf("Image partial GPU-write verify: MISMATCH image 0x%016" PRIx64
+			            " %ux%u format %u%s, %zu written range(s): %" PRIu64 " of %" PRIu64
+			            " linear bytes differ, first at %" PRIu64 "\n",
+			            address, width, height, format, stencil ? " (stencil plane)" : "", ranges,
+			            differing, size, first);
+			std::fflush(stdout);
+		}
+	});
+}
+
+void TextureCache::PrintPartialGpuWriteSummary() {
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (m_pgw_print_ns == 0) {
+		m_pgw_print_ns = now;
+		return;
+	}
+	if (now - m_pgw_print_ns < 10'000'000'000ull) {
+		return;
+	}
+	const auto& t = m_pgw_totals;
+	const auto& p = m_pgw_printed;
+	const auto  saved =
+	    (t.whole_bytes - p.whole_bytes) - std::min(t.whole_bytes - p.whole_bytes, t.partial_bytes - p.partial_bytes);
+	std::printf("Image partial GPU-write %.0fs: %" PRIu64 " buffer-write refreshes, %" PRIu64
+	            " partial (%.1f MiB rebuilt, %.1f MiB saved), not tracked %" PRIu64 ", stale %" PRIu64
+	            " (foreign %" PRIu64 " serial %" PRIu64 " cpu %" PRIu64 "), whole because: layout %" PRIu64 " most %" PRIu64 " other owners %" PRIu64
+	            " ranges %" PRIu64 "; verify %" PRIu64 " checks %" PRIu64 " mismatches\n",
+	            static_cast<double>(now - m_pgw_print_ns) * 1e-9, t.refreshes - p.refreshes,
+	            t.partial - p.partial,
+	            static_cast<double>(t.partial_bytes - p.partial_bytes) / 1048576.0,
+	            static_cast<double>(saved) / 1048576.0, t.untracked - p.untracked, t.stale - p.stale,
+	            t.stale_foreign - p.stale_foreign, t.stale_serial - p.stale_serial, t.stale_cpu - p.stale_cpu,
+	            t.fallback_layout - p.fallback_layout, t.fallback_most - p.fallback_most,
+	            t.fallback_others - p.fallback_others, t.overflows - p.overflows,
+	            g_pgw_verify_checks.load(std::memory_order_relaxed),
+	            g_pgw_verify_mismatches.load(std::memory_order_relaxed));
+	std::fflush(stdout);
+	m_pgw_printed  = t;
+	m_pgw_print_ns = now;
+}
+
 void TextureCache::UntrackImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (!image.IsTracked()) {
@@ -2706,17 +3129,11 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	bool       guest_refresh = false;
-	if (upload && AliasBytesEnabled() && !image.depth_id) {
-		// The rebuild reads buffer (or guest) bytes over the whole image. Bytes it still owns
-		// itself (a bounded buffer write took the others) reach the buffer first; a read also
-		// takes the bytes other images own there (a write binding usually overwrites them).
-		if (image.IsBufferModified() && !image.IsDefinitelyCpuDirty() &&
-		    image.OwnedSet() != nullptr && !image.OwnsNoBytes()) {
-			(void)MaterializeOwnedBytes(image.live, id, {}, "rebuild-own");
-		}
-		if (intent == RefreshIntent::Read) {
-			(void)MaterializeOwnedBytes(image.live, {}, id, "rebuild");
-		}
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE: only GPU buffer writes over known ranges changed the image's
+	// bytes; it moves bytes through the buffer for those ranges only (UploadGpuWrittenRanges).
+	const bool gpu_partial_candidate = upload && GpuWritePartialCandidate(image);
+	if (upload && !gpu_partial_candidate) {
+		MaterializeForRebuild(id, intent);
 	}
 	if (upload) {
 		Profiler::ScopedFrameWait upload_time(Profiler::FrameWait::TextureUpload);
@@ -2742,7 +3159,15 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		guest_refresh = image.ChunkTracked() && !image.IsBufferModified() &&
 		                !image.IsGpuModified() && !image.depth_id && binding == BindingType::Texture;
 		PartialUploadResult partial {};
-		if (image.HasKeptDirty()) {
+		bool                gpu_partial = false;
+		if (gpu_partial_candidate) {
+			partial     = UploadGpuWrittenRanges(id, intent);
+			gpu_partial = partial.done;
+			if (!partial.done) {
+				// Nothing was recorded or moved: the whole rebuild as without the switch.
+				MaterializeForRebuild(id, intent);
+			}
+		} else if (image.HasKeptDirty()) {
 			// KYTY_IMAGE_GPU_KEEP: only the subresources over the replaced bytes.
 			partial = UploadKeptRanges(image);
 			if (!partial.done) {
@@ -2786,6 +3211,9 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 			}
 		}
 		image.ClearBufferModified();
+		if (m_partial_gpu_write != 0) {
+			NoteRefreshSync(id, gpu_partial);
+		}
 		if (m_exact_range_mode == 1) {
 			// KYTY_IMAGE_EXACT_RANGE_INVALIDATE: a refresh from memory also covers kept bytes.
 			NoteExactRangeRewrite(image);
@@ -2805,7 +3233,9 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 			// chunk bytes that caused the refresh.
 			// Partially resident textures: detail "texture-resident", bytes = resident bytes.
 			HangTrace::RecordTransfer(HangTrace::TransferKind::ImageUpload,
-			                          partial.done ? "cpu-write-partial" : reason,
+			                          gpu_partial    ? "gpu-buffer-partial"
+			                          : partial.done ? "cpu-write-partial"
+			                                         : reason,
 			                          writer != nullptr          ? writer
 			                          : image.depth_id           ? "stencil-plane"
 			                          : !image.FullyResident()   ? "texture-resident"
@@ -4109,6 +4539,11 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		}
 		depth.stencil_ids.push_back(association);
 	}
+	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+		// KYTY_IMAGE_PARTIAL_GPU_WRITE: other native stencil contents behind this record.
+		record.foreign_since_sync = true;
+		record.gpu_write.active   = false;
+	}
 	record.depth_id             = depth_id;
 	record.stencil_subresources = depth.stencil_subresources;
 	NoteImageStateChange();
@@ -4596,7 +5031,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		                desc.type == BindingType::Texture);
 	}
 	if (desc.type == BindingType::Storage) {
+		m_bind_mark = true;
 		MarkImageGpuModified(image);
+		m_bind_mark = false;
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id, desc.type == BindingType::Storage ? RefreshIntent::Write
@@ -4640,7 +5077,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc,
 	}
 	RequireFullResidency(id);
 	TouchImage(image);
+	m_bind_mark = true;
 	MarkImageGpuModified(image);
+	m_bind_mark = false;
 	image.usage.render_target = true;
 	RefreshImage(id, RefreshIntent::Write);
 	// KYTY_ALIAS_BYTES: the draw can write only inside its scissor. The target owns the 64 KiB
@@ -4683,7 +5122,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	RequireFullResidency(id);
 	TouchImage(image);
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE: this binding's draws mark its stencil records below, after their
+	// refresh (the draws come after it).
+	m_stencil_draw_suppressed = true;
+	m_bind_mark               = true;
 	MarkImageGpuModified(image);
+	m_bind_mark               = false;
+	m_stencil_draw_suppressed = false;
 	image.usage.depth_target = true;
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
@@ -4718,9 +5163,19 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	RefreshImage(id, RefreshIntent::Write);
+	m_stencil_draw_suppressed = true;
 	CommitGpuWrite(image);
+	m_stencil_draw_suppressed = false;
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil), RefreshIntent::Write);
+	}
+	if (m_partial_gpu_write != 0 && !m_partial_gpu_write_stencil_keep) {
+		// The draws of this binding come after the stencil record's refresh above.
+		for (const auto record: image.stencil_ids) {
+			if (auto* stencil = m_slot_images.try_get(record); stencil != nullptr) {
+				stencil->foreign_since_sync = true;
+			}
+		}
 	}
 	return image.FindView(desc.view_info);
 }
@@ -4890,6 +5345,8 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 					continue;
 				}
 				other->alias_owner = false;
+				// KYTY_IMAGE_PARTIAL_GPU_WRITE: this write replaces bytes of the other image.
+				other->foreign_since_sync = true;
 				if (!other->IsGpuModified()) {
 					continue;
 				}
@@ -4913,6 +5370,8 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 		MarkImageGpuModified(image);
 		if (whole) {
 			image.OwnAllBytes();
+			// Its native contents are now the contents of every byte of its range.
+			image.foreign_since_sync = false;
 			image.claimed_rect       = {{0, 0}, {image.info.extent.width, image.info.extent.height}};
 			image.claimed_rect_valid = true;
 		} else {
@@ -4944,6 +5403,7 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 				continue;
 			}
 			other->alias_owner = false;
+			other->foreign_since_sync = true;
 			if (other->IsGpuModified()) {
 				other->ClearGpuModified();
 				InvalidateCleanImageProofs(other->live.address, other->live.size,
@@ -6144,6 +6604,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		if (!image.Overlaps(address, size)) {
 			continue;
 		}
+		// KYTY_IMAGE_PARTIAL_GPU_WRITE: decided before the write takes the bytes.
+		const bool first_write  = !image.IsBufferModified();
+		const bool track_ranges = m_partial_gpu_write != 0 &&
+		                          (first_write ? GpuWriteTrackEligible(image) : image.gpu_write.active);
 		if (image.IsGpuModified()) {
 			// The buffer cache takes ownership of these bytes; its Add bumps as well.
 			// KYTY_ALIAS_BYTES: only of these bytes; the image keeps its others (rebuilds and
@@ -6169,12 +6633,45 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 				continue;
 			}
 		}
+		const auto serial = image.ContentSerial();
 		image.MarkBufferModified();
+		if (track_ranges) {
+			if (first_write) {
+				image.BeginGpuWriteTrack(serial);
+			} else {
+				image.gpu_write.active = true; // MarkBufferModified ended it
+			}
+			if (!GpuWriteRanges::Record(image.gpu_write.ranges, address, size, image.live.address,
+			                            image.live.End())) {
+				image.gpu_write.active = false;
+				m_pgw_totals.overflows++;
+			}
+		}
 		image.NoteDirtySpan(address, size);
 	}
 	if (m_exact_range_mode != 0) {
 		PrintExactRangeSummary();
 	}
+}
+
+bool TextureCache::GpuWriteTrackEligible(const Image& image) const {
+	const auto& info = image.info;
+	if (!image.registered || info.data.Empty() || !image.FullyResident() || info.samples != 1 ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed || image.IsCpuDirty() ||
+	    image.foreign_since_sync || image.exact_range_stale || info.IsVolume()) {
+		return false;
+	}
+	if (image.depth_id) {
+		// A stencil plane record: its contents are the depth image's stencil aspect. A record the
+		// GPU wrote through itself is refreshed whole (the full path never moves its bytes).
+		const auto* depth = m_slot_images.try_get(image.depth_id);
+		return depth != nullptr && !image.IsGpuModified() && depth->info.samples == 1 &&
+		       depth->backing.samples == 1 && !depth->info.metadata.stencil_compressed;
+	}
+	// The whole rebuild moves owned bytes through the buffer (KYTY_ALIAS_BYTES); without per-byte
+	// ownership it would not keep the image's own bytes either. Colour transforms do not round-trip.
+	return AliasBytesEnabled() && image.backing.image != nullptr && image.backing.samples == 1 &&
+	       info.GetColorTransform() == ColorTransform::None;
 }
 
 void TextureCache::NoteExactRangeStaleUseSlow(Image& image, bool storage) {
@@ -6289,9 +6786,25 @@ void TextureCache::MarkImageGpuModified(Image& image) {
 		}
 	}
 	image.MarkGpuModified();
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE: a write to a depth image may write its stencil aspect, the
+	// native contents of its stencil plane records (FindDepthTarget marks them itself, unless
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE_STENCIL=keep trusts depth-target draws not to write stencil).
+	if (m_partial_gpu_write != 0 && !image.stencil_ids.empty() && !m_stencil_draw_suppressed) {
+		for (const auto record: image.stencil_ids) {
+			if (auto* stencil = m_slot_images.try_get(record); stencil != nullptr) {
+				stencil->foreign_since_sync = true;
+			}
+		}
+	}
 	// Every GPU writer (draw targets, storage bindings, clears, helper passes, copies) passes
 	// here before or right after recording its write: the native contents get a new identity.
+	const auto serial_before = image.ContentSerial();
 	image.NotePossibleWrite();
+	if (m_bind_mark && image.gpu_write.active && image.gpu_write.serial == serial_before) {
+		// KYTY_IMAGE_PARTIAL_GPU_WRITE: a binding marks its image before refreshing it (RefreshImage
+		// right after); nothing has written the native contents in between.
+		image.gpu_write.serial = image.ContentSerial();
+	}
 }
 
 TextureCache::ContentMark TextureCache::MarkContent(ImageId id) {

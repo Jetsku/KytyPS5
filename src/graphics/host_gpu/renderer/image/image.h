@@ -468,15 +468,42 @@ public:
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
+	// Any cause but a recorded GPU buffer write (NoteGpuWriteRange) makes the next refresh whole.
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
 		m_partial_valid   = false;
+		gpu_write.active  = false;
 		NoteImageStateChange();
 	}
 	void ClearBufferModified() noexcept {
 		m_buffer_modified = false;
+		gpu_write.active  = false;
+		gpu_write.ranges.clear();
 		NoteImageStateChange();
 	}
+
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE (TextureCache::InvalidateMemoryFromGPU, UploadGpuWrittenRanges).
+	// While `active`, the image is buffer-modified only by GPU buffer writes over `ranges`, its
+	// native contents elsewhere equal what a whole rebuild would produce there, and the next
+	// refresh rebuilds only the subresources / block rows over those ranges. `serial` is the content
+	// serial at the first write (a native write since makes the refresh whole).
+	struct GpuWriteTrack {
+		KeptRanges::List ranges;
+		uint64_t         serial = 0;
+		bool             active = false;
+	};
+	GpuWriteTrack gpu_write;
+	// Starts the record of a GPU buffer write (after MarkBufferModified, which ends any previous one).
+	void BeginGpuWriteTrack(uint64_t serial) {
+		gpu_write.ranges.clear();
+		gpu_write.serial = serial;
+		gpu_write.active = true;
+	}
+	// The native contents may differ from the guest/buffer/other owners' contents of bytes this
+	// image does not own: true until a refresh or a whole-image GPU write, and again when another
+	// image's GPU write takes some of its bytes (TextureCache::CommitGpuWrite). Partial rebuilds
+	// need it false.
+	bool foreign_since_sync = true;
 
 	// Against the registered (resident) guest range; see `live`.
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
