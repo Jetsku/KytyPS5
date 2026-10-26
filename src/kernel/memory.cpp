@@ -1629,6 +1629,46 @@ bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
 }
 
+bool IsCommittedSpan(uint64_t vaddr, uint64_t size) {
+	if (g_virtual_ranges == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	const auto end     = vaddr + size;
+	auto       current = vaddr;
+	while (current < end) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 0, &range) || !IsCommittedRangeType(range.type) ||
+		    range.start + range.size <= current) {
+			return false;
+		}
+		current = range.start + range.size;
+	}
+	return true;
+}
+
+std::string DescribeAddressForCrash(uint64_t vaddr) {
+	std::string out;
+	char        line[256];
+	if (g_virtual_ranges != nullptr) {
+		VirtualRanges::Range range {};
+		if (g_virtual_ranges->Query(vaddr, 0, &range)) {
+			std::snprintf(line, sizeof(line),
+			              "guest range: 0x%016" PRIx64 "+0x%" PRIx64 " type=%s prot=0x%x dmem=0x%" PRIx64 "\n",
+			              range.start, range.size, magic_enum::enum_name(range.type).data(),
+			              static_cast<unsigned>(range.protection), range.offset);
+		} else {
+			std::snprintf(line, sizeof(line), "guest range: none (not reserved or mapped)\n");
+		}
+		out += line;
+	}
+	std::snprintf(line, sizeof(line), "gpu mapped: %s, backing: %s, queued AMM map covers it: %s\n",
+	              IsGpuMapped(vaddr, 1) ? "yes" : "no",
+	              g_guest_address_space != nullptr && g_guest_address_space->BackingContains(vaddr, 1) ? "yes" : "no",
+	              PendingAmmMapCovers(vaddr) ? "yes" : "no");
+	out += line;
+	return out;
+}
+
 static bool IsInPrtAperture(uint64_t address, uint64_t size);
 
 // The committed, non-private, GPU-mapped allocation containing vaddr (not sparse/PRT).

@@ -1959,6 +1959,30 @@ static bool AmprAsyncEnabled() {
 // buffer produces is slow, not lost, when the engines are busy (Ratchet & Clank's streamer).
 static std::atomic<uint64_t> g_ampr_progress {0};
 
+// KYTY_AMM_TRACE=1: one log line per AMM map/unmap record and per APR file read as it executes
+// (thread, buffer, submission sequence, range, result), to order reads against the maps that back
+// their destinations.
+static bool AmmTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AMM_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static void AmmTrace(const char* what, uint64_t command_buffer, uint64_t seq, uint64_t va, uint64_t size,
+                     uint64_t extra, int result) {
+	char thread_name[64] = "(host)";
+	if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		if (LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed)");
+		}
+	}
+	LOGF("AMM trace: %s thread='%s' cb=0x%016" PRIx64 " seq=%" PRIu64 " va=0x%016" PRIx64 " size=0x%" PRIx64
+	     " extra=0x%" PRIx64 " result=0x%08" PRIx32 "\n",
+	     what, thread_name, command_buffer, seq, va, size, extra, static_cast<uint32_t>(result));
+}
+
 // Runs ordered[start..] of a buffer. With blocked_at, stops before the first wait record that is
 // not yet satisfied and stores its position there (SIZE_MAX when the buffer ran to the end).
 // Errors are reported through execution_result/error_offset; the return value is always OK.
@@ -1984,6 +2008,10 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 
 				HangWatchdog::Scope read("ampr-file", command.destination, command.size,
 				                         command.file_id, command.file_offset, command_buffer);
+				if (AmmTraceEnabled()) {
+					AmmTrace("read", command_buffer, state.submit_seq, command.destination, command.size,
+					         command.file_offset, 0);
+				}
 				uint64_t            bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
@@ -2092,6 +2120,10 @@ static int RunOrderedCommands(uint64_t command_buffer, const CommandBufferState&
 					}
 				}
 
+				if (AmmTraceEnabled()) {
+					AmmTrace(command.kind == AmmCommandKind::Unmap ? "unmap" : "map", command_buffer,
+					         state.submit_seq, command.va, command.size, command.dmem_offset, result);
+				}
 				if (result != OK) {
 					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AmmErrors);
 					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
@@ -2583,6 +2615,50 @@ static std::shared_ptr<KeptAprFile> OpenKeptAprFile(const std::filesystem::path&
 	return table.emplace(std::move(key), std::move(kept)).first->second;
 }
 
+// KYTY_APR_UNMAPPED_WAIT_MS=N (default 30000; 0 off): an APR read whose destination in the AMM
+// window is not mapped yet waits up to N ms for the map, then fails with EFAULT instead of
+// crashing in the copy. Streaming code (PPSA01474's archive reader) gates such a read on a
+// wait-on-address that the thread submitting the AMM map satisfies; when that thread is slow (a
+// boot that builds shaders), the synchronous executor's 1 s wait bound and the engine's wait
+// cap give up first and the read overtook the map: the copy hit an unmapped page.
+static uint64_t AprUnmappedWaitMs() {
+	static const uint64_t ms = [] {
+		const char* value = std::getenv("KYTY_APR_UNMAPPED_WAIT_MS");
+		return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {30000};
+	}();
+	return ms;
+}
+
+static bool WaitForAmmDestination(uint64_t destination, uint64_t size) {
+	if (destination >= AMM_VA_START + AMM_VA_SIZE || destination + size <= AMM_VA_START ||
+	    LibKernel::Memory::IsCommittedSpan(destination, size)) {
+		return true;
+	}
+	const auto wait_ms = AprUnmappedWaitMs();
+	if (wait_ms == 0) {
+		return true; // the previous behaviour: copy and fault
+	}
+	HangWatchdog::Scope scope("apr-unmapped-destination", destination, size);
+	const auto start    = std::chrono::steady_clock::now();
+	const auto deadline = start + std::chrono::milliseconds(wait_ms);
+	auto       poll     = std::chrono::microseconds(100);
+	bool       mapped   = false;
+	while (!(mapped = LibKernel::Memory::IsCommittedSpan(destination, size)) &&
+	       std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(poll);
+		poll = std::min(poll * 2, std::chrono::microseconds(2000));
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (!mapped || reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("\tAPR read into unmapped AMM memory 0x%016" PRIx64 "+0x%" PRIx64 ": waited %lld ms for its map: %s\n",
+		     destination, size,
+		     static_cast<long long>(
+		         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()),
+		     mapped ? "mapped, reading" : "still unmapped, read fails (EFAULT)");
+	}
+	return mapped;
+}
+
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprRead);
@@ -2640,6 +2716,11 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	if (readable == 0) {
 		close();
 		return OK;
+	}
+
+	if (!WaitForAmmDestination(destination, readable)) {
+		close();
+		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
 	if (AprPrepareWriteEnabled()) {

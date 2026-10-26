@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -182,6 +184,10 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // Whether [vaddr, vaddr + size) lies in guest memory mapped for the GPU (the renderer's mapped
 // ranges, the same ones its fault handler resolves). False before InstallGpuResources.
 [[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
+// Whether every byte of [vaddr, vaddr + size) is mapped (committed guest ranges, no reservation or gap).
+[[nodiscard]] bool     IsCommittedSpan(uint64_t vaddr, uint64_t size);
+// The unhandled-fault report: what the kernel and the GPU tracker know about an address.
+[[nodiscard]] std::string DescribeAddressForCrash(uint64_t vaddr);
 // The committed, non-private, GPU-mapped allocation containing vaddr; false for anything else.
 [[nodiscard]] bool     GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.

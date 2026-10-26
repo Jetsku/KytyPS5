@@ -938,6 +938,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				append("thread was in: {}\n", doing);
 			}
 		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			// What the faulting address was: an unmapped page, a protected view, a range the GPU
+			// tracker no longer maps, or memory a queued AMM map still has to back.
+			append("fault address: 0x{:016x}\n", info->access_violation_vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			MEMORY_BASIC_INFORMATION mbi {};
+			if (VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &mbi, sizeof(mbi)) != 0) {
+				append("host page: base=0x{:x} alloc=0x{:x} size=0x{:x} state=0x{:x} protect=0x{:x} type=0x{:x}\n",
+				       reinterpret_cast<uint64_t>(mbi.BaseAddress), reinterpret_cast<uint64_t>(mbi.AllocationBase),
+				       static_cast<uint64_t>(mbi.RegionSize), static_cast<uint32_t>(mbi.State),
+				       static_cast<uint32_t>(mbi.Protect), static_cast<uint32_t>(mbi.Type));
+			}
+#endif
+			append("{}", Libs::LibKernel::Memory::DescribeAddressForCrash(info->access_violation_vaddr));
+		}
 		append("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 		       "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
 		       "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
