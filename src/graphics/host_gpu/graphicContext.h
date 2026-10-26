@@ -67,6 +67,10 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// KYTY_FULLSCREEN_EXCLUSIVE=0|1 (Windows): the swapchain asks the driver to keep out of exclusive
+	// fullscreen (0) or allows it (1), through VK_EXT_full_screen_exclusive; -1 (unset, or the
+	// extension missing): the driver's own choice.
+	int                                full_screen_exclusive                 = -1;
 	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
 	// KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h): VK_AMD_buffer_marker enabled for breadcrumbs, and
