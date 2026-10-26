@@ -543,14 +543,12 @@
            <widget class="QCheckBox" name="checkBox_vulkan_validation">
             <property name="toolTip"><string>Enable Vulkan validation layers</string></property>
             <property name="text"><string>Vulkan validation</string></property>
-            <property name="checked"><bool>true</bool></property>
            </widget>
           </item>
           <item row="0" column="2" colspan="2">
            <widget class="QCheckBox" name="checkBox_shader_validation">
             <property name="toolTip"><string>Validate SPIR-V binary</string></property>
             <property name="text"><string>Shader validation</string></property>
-            <property name="checked"><bool>true</bool></property>
            </widget>
           </item>
           <item row="1" column="0" colspan="2">

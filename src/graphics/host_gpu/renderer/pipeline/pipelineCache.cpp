@@ -42,6 +42,7 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -1340,6 +1341,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	});
 	spvtools::ValidatorOptions validator_options;
 	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
+	// KYTY_UNIFORM_BUFFERS emits std430-style dword arrays in uniform blocks; the device enables
+	// uniformBufferStandardLayout whenever it allows that path, so validate with the same rules.
+	validator_options.SetUniformBufferStandardLayout(
+	    ShaderRecompiler::Spirv::GetHostBufferRobustness().uniform_dword_loads_return_zero);
 	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
 		return true;
 	}
