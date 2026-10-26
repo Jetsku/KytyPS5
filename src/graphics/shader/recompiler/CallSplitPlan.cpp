@@ -654,6 +654,7 @@ Planner::Result Planner::Plan(std::span<const uint32_t> code, uint64_t base,
 		site.resume        = plan.resume;
 		for (const auto& state: plan.state) {
 			site.callees.push_back(state.code);
+			site.pending.push_back(state.code == nullptr && !state.unusable);
 		}
 		site.record_slots = plan.record_slots;
 		const auto index  = [&](uint16_t code_value) {

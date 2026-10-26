@@ -64,6 +64,7 @@ struct Run {
 	struct SiteRun {
 		std::shared_ptr<const Code>              resume;
 		std::vector<std::shared_ptr<const Code>> callees;
+		std::vector<bool>                        pending; // per callee: not planned yet (null code)
 		std::vector<uint32_t>                    record_slots;
 		uint32_t                                 exec_lo_slot  = 0; // uniform dwords
 		uint32_t                                 exec_hi_slot  = 0;

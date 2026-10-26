@@ -1296,6 +1296,12 @@ static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderReco
 thread_local const ShaderRecompiler::CallSplit::Code*          t_split_code = nullptr;
 thread_local std::shared_ptr<ShaderRecompiler::CallSplit::Run> t_split_run;
 
+// Programs with calls go through ExpandComputeCalls: KYTY_SHADER_CALLS (expansion, and splitting
+// with KYTY_SHADER_CALLS_SPLIT) or KYTY_SHADER_CALLS_SPLIT alone (splitting only).
+static bool CallProgramsHandled() {
+	return ShaderRecompiler::GetCodegenOptions().shader_calls || ShaderRecompiler::CallSplit::Planner::Enabled();
+}
+
 // False: the dispatch is skipped (a split plan is being built).
 static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInfo& input_info) {
 	const auto wave_size = input_info.wave_size;
@@ -1306,8 +1312,8 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 		params.call_expansion = split->digest;
 		return true;
 	}
-	if (!ShaderRecompiler::GetCodegenOptions().shader_calls || !params.back_code.empty() ||
-	    params.code.empty() || !ComputeProgramMayCall(params)) {
+	if (!CallProgramsHandled() || !params.back_code.empty() || params.code.empty() ||
+	    !ComputeProgramMayCall(params)) {
 		return true;
 	}
 	const auto read_memory = [](uint64_t address, std::span<uint32_t> words) {
@@ -1335,6 +1341,10 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 				t_split_run           = std::move(run);
 				return true;
 		}
+	}
+	if (!ShaderRecompiler::GetCodegenOptions().shader_calls) {
+		// KYTY_SHADER_CALLS_SPLIT alone: a program that is not split keeps its code (skipped as before).
+		return true;
 	}
 	auto&                            expander = CallExpander();
 	ShaderRecompiler::CompileOptions options;
@@ -7357,8 +7367,7 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareComputeProgramSpeculative
 		return SpeculativeResult::ReadFailed;
 	}
 	// A program with calls is expanded on the serial path only (ExpandComputeCalls).
-	if (ShaderRecompiler::GetCodegenOptions().shader_calls && params.back_code.empty() &&
-	    ComputeProgramMayCall(params)) {
+	if (CallProgramsHandled() && params.back_code.empty() && ComputeProgramMayCall(params)) {
 		return SpeculativeResult::Ineligible;
 	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >

@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Bit-exactness probes of the GLSL twins in rt_psr_common.inc (rt_hardware_tests compares them
+// with the CPU):
+//   mode 0: PsrDivBits on (a, b) pairs of raw bits
+//   mode 1: PsrTriangleExact and PsrTriangleTest on (a, b, c, origin, direction) cases
+
+#include "rt_psr_common.inc"
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Params {
+	uint64_t cases;
+	uint64_t results;
+	uint     count;
+	uint     mode;
+} pc;
+
+vec3 CaseVec3(PsrWords src, uint at) {
+	return vec3(uintBitsToFloat(src.w[at]), uintBitsToFloat(src.w[at + 1u]),
+	            uintBitsToFloat(src.w[at + 2u]));
+}
+
+void main() {
+	uint id = gl_GlobalInvocationID.x;
+	if (id >= pc.count) {
+		return;
+	}
+	PsrWords src = PsrWords(pc.cases);
+	RwWords  dst = RwWords(pc.results);
+	if (pc.mode == 0u) {
+		dst.w[id] = PsrDivBits(src.w[id * 2u], src.w[id * 2u + 1u]);
+		return;
+	}
+	// 16 dwords per case: a, b, c, origin, direction, one unused.
+	uint   at  = id * 16u;
+	PsrRay ray = PsrMakeRay(CaseVec3(src, at + 9u), CaseVec3(src, at + 12u), vec3(0.0), 0.0);
+	vec3   a   = CaseVec3(src, at);
+	vec3   b   = CaseVec3(src, at + 3u);
+	vec3   c   = CaseVec3(src, at + 6u);
+	float  t_num;
+	float  t_den;
+	PsrTriangleExact(a, b, c, ray, t_num, t_den);
+	float t;
+	bool  positive;
+	bool  hit             = PsrTriangleTest(a, b, c, ray, t, positive);
+	dst.w[id * 4u + 0u]   = floatBitsToUint(t_num);
+	dst.w[id * 4u + 1u]   = floatBitsToUint(t_den);
+	dst.w[id * 4u + 2u]   = hit ? floatBitsToUint(t) : 0u;
+	dst.w[id * 4u + 3u]   = (hit ? 1u : 0u) | (positive ? 2u : 0u);
+}
