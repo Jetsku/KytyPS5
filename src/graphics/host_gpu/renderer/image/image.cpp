@@ -11,6 +11,8 @@
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include <vulkan/vulkan_format_traits.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -422,6 +424,57 @@ bool Image::TransitIsNoOp(vk::ImageLayout                             destinatio
 	       !static_cast<bool>(state.access_mask & TransitWriteAccess);
 }
 
+// KYTY_ZERO_NEW_IMAGES=1 (default off; chenxiao07/KytyPS5 2f9d9604a, c0a4d2465): a new image's
+// memory is the PS5's fresh memory, zeroed, not whatever the VRAM had (Vulkan leaves a new image
+// undefined). An image leaving the undefined layout as a whole by a transition is cleared to zero
+// first. Left out: block-compressed images (always uploaded), sparse residency images (memory
+// bound to some levels only) and images without transfer-destination usage. Uploads take their
+// own barrier (Image::Upload), so an image made from guest bytes is not cleared. Demon's Souls at
+// 1080p FSR with a wide squeeze read a new image's undefined contents in its first frame's
+// history and kept NaN or huge values there for the whole session (mostly RADV).
+static bool ZeroNewImages() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_ZERO_NEW_IMAGES");
+		const bool  zero  = value != nullptr && value[0] == '1';
+		if (zero) {
+			std::printf("Zero new images: on (KYTY_ZERO_NEW_IMAGES=1)\n");
+		}
+		return zero;
+	}();
+	return on;
+}
+
+// `aspect`: every aspect of the image's format (Image::FullAspectMask: X8D24 is depth alone and S8
+// stencil alone, both cleared as depth/stencil).
+static void ZeroNewImage(vk::Image image, vk::ImageAspectFlags aspect, vk::CommandBuffer command_buffer) {
+	vk::ImageSubresourceRange whole {};
+	whole.aspectMask = aspect;
+	whole.levelCount = VK_REMAINING_MIP_LEVELS;
+	whole.layerCount = VK_REMAINING_ARRAY_LAYERS;
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.oldLayout           = vk::ImageLayout::eUndefined;
+	barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image;
+	barrier.subresourceRange    = whole;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command_buffer.pipelineBarrier2(dependency);
+	if (!(aspect & vk::ImageAspectFlagBits::eColor)) {
+		const vk::ClearDepthStencilValue zero {0.0f, 0};
+		command_buffer.clearDepthStencilImage(image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	} else {
+		vk::ClearColorValue zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
+		command_buffer.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	}
+}
+
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
                     bool deferrable) {
@@ -432,6 +485,16 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (predicted && skip.verify == 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitSkips);
 		return;
+	}
+	if (backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
+	    destination_layout != vk::ImageLayout::eUndefined && backing.image && !backing.sparse &&
+	    ZeroNewImages() && (backing.usage & vk::ImageUsageFlagBits::eTransferDst) &&
+	    vk::blockExtent(backing.format)[0] == 1) {
+		m_scheduler.EndRendering();
+		ZeroNewImage(backing.image, FullAspectMask(backing.format), command_buffer);
+		backing.state = {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		                 vk::ImageLayout::eTransferDstOptimal};
+		NoteImageStateChange();
 	}
 	KYTY_GPU_OP_SITE("image.transition");
 	const auto transfer_access =
