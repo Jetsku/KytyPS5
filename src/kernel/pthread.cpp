@@ -15,6 +15,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/guestTsc.h"
 #include "kernel/memory.h"
 #include "kernel/pendingSignals.h"
 #include "libs/errno.h"
@@ -28,6 +29,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -255,6 +257,44 @@ static uint64_t KernelGetElapsedTsc() {
 	const auto initial_tsc = KernelGetInitialTsc();
 	const auto current_tsc = KernelReadTscNative();
 	return current_tsc >= initial_tsc ? current_tsc - initial_tsc : 0;
+}
+
+// The guest TSC domain (guestTsc.h): the host TSC capped at 2^32 Hz, anchored at the process start.
+// KYTY_HOST_TSC_SIMULATE=<Hz> (diagnostic): the guest clock behaves as on a host whose TSC runs at
+// that frequency (host ticks are scaled to it first), e.g. 4700000000 to reproduce #1910 on a CPU
+// below 2^32 Hz. Guest code executing RDTSC itself still sees the real host ticks.
+struct KernelGuestTscClock {
+	uint64_t        frequency = 0;
+	GuestTsc::Scale simulate;
+	GuestTsc::Scale scale;
+
+	[[nodiscard]] uint64_t ToGuest(uint64_t raw) const { return scale.ToGuest(simulate.ToGuest(raw)); }
+	[[nodiscard]] uint64_t Ticks(uint64_t elapsed) const { return scale.Ticks(simulate.Ticks(elapsed)); }
+};
+
+static const KernelGuestTscClock& KernelGetGuestTscClock() {
+	static const KernelGuestTscClock clock = [] {
+		KernelGuestTscClock c;
+		auto                measured = KernelGetTscFrequencyNative();
+		if (const char* sim = std::getenv("KYTY_HOST_TSC_SIMULATE"); sim != nullptr && *sim != '\0') {
+			const auto value = std::strtoull(sim, nullptr, 10);
+			if (value >= GuestTsc::kMinGuestTscFrequency && measured != 0) {
+				c.simulate = GuestTsc::Scale(measured, value, KernelGetInitialTsc());
+				LOGF("Guest TSC: simulating a %" PRIu64 " Hz host TSC (measured %" PRIu64 " Hz)\n",
+				     value, measured);
+				measured = value;
+			}
+		}
+		c.frequency = GuestTsc::ChooseFrequency(measured, std::getenv("KYTY_GUEST_TSC_FREQUENCY"));
+		c.scale     = GuestTsc::Scale(measured, c.frequency, KernelGetInitialTsc());
+		if (!c.scale.Identity()) {
+			LOGF("Guest TSC: host %" PRIu64 " Hz, guest %" PRIu64
+			            " Hz (KYTY_GUEST_TSC_FREQUENCY=0 reports the host value)\n",
+			            measured, c.frequency);
+		}
+		return c;
+	}();
+	return clock;
 }
 
 static uint64_t KernelGetProcessTimeUsNative() {
@@ -4088,11 +4128,11 @@ int KYTY_SYSV_ABI KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_t
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
-	return KernelGetTscFrequencyNative();
+	return KernelGetGuestTscClock().frequency;
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
-	return KernelReadTscNative();
+	return KernelGetGuestTscClock().ToGuest(KernelReadTscNative());
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
@@ -4107,11 +4147,12 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
-	return KernelGetElapsedTsc();
+	// Equal to sceKernelReadTsc() minus its process-start value.
+	return KernelGetGuestTscClock().Ticks(KernelGetElapsedTsc());
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency() {
-	return KernelGetTscFrequencyNative();
+	return KernelGetGuestTscClock().frequency;
 }
 
 void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {

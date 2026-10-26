@@ -1061,6 +1061,12 @@ if(LINUX)
 	target_link_libraries(eop_timestamp_tests Threads::Threads)
 endif()
 
+add_executable(guest_tsc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GuestTscTests.cpp")
+target_include_directories(guest_tsc_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(gpu_write_ranges_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuWriteRangesTests.cpp")
+target_include_directories(gpu_write_ranges_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
@@ -1213,6 +1219,8 @@ if(BUILD_TESTING)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
+	add_test(NAME guest_tsc COMMAND $<TARGET_FILE:guest_tsc_tests>)
+	add_test(NAME gpu_write_ranges COMMAND $<TARGET_FILE:gpu_write_ranges_tests>)
 	add_test(NAME host_input_pulse COMMAND $<TARGET_FILE:host_input_pulse_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
