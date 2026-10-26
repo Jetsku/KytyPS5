@@ -29,6 +29,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -320,6 +324,94 @@ bool PredictRenderDepthTarget(const GraphicContext& graphics, const HW::Context&
 	return true;
 }
 
+// KYTY_STENCIL_REF_TRACE=<ref> (diagnostic, default off): prints the guest depth/stencil state of
+// draws testing or writing that stencil reference, once per distinct state.
+namespace {
+struct StencilTraceDraw {
+	uint32_t index_count = 0;
+	uint64_t ps_addr     = 0;
+	uint32_t color_count = 0;
+	uint32_t mrt_mask    = 0;
+};
+thread_local StencilTraceDraw g_stencil_trace_draw;
+} // namespace
+
+void SetStencilTraceDraw(uint32_t index_count, uint64_t ps_addr, uint32_t color_count,
+                         uint32_t mrt_mask) {
+	g_stencil_trace_draw = {index_count, ps_addr, color_count, mrt_mask};
+}
+
+static void TraceStencilRefState(const HW::Context& hw, const RenderDepthInfo& r) {
+	static const int ref = [] {
+		const auto* value = std::getenv("KYTY_STENCIL_REF_TRACE");
+		return value != nullptr && value[0] != '\0' ? std::atoi(value) : -1;
+	}();
+	const auto& sm = hw.GetStencilMask();
+	if (ref < 0 || (sm.stencil_testval != ref && sm.stencil_opval != ref)) {
+		return;
+	}
+	const auto& dc = hw.GetDepthControl();
+	const auto& sc = hw.GetStencilControl();
+	const auto& rc = hw.GetRenderControl();
+	const auto& ro = hw.GetDepthRenderOverride();
+	const auto& z  = hw.GetDepthRenderTarget();
+	const auto& sh = hw.GetShaderRegisters().db_shader_control;
+	char line[1024];
+	std::snprintf(line, sizeof(line),
+	              "StencilRefTrace: dc z=%d zw=%d zfunc=%u bounds=%d st=%d sfunc=%u/%u bf=%d | sc "
+	              "fail=%u zpass=%u zfail=%u bf=%u/%u/%u | sm test=%u mask=0x%02x wmask=0x%02x "
+	              "opval=%u bf test=%u mask=0x%02x wmask=0x%02x opval=%u | rc dclr=%d sclr=%d | ro "
+	              "zv=%d zd=%d sv=%d sd=%d | view zro=%d sro=%d | shctl kill=%d zexp=%d mask=%d "
+	              "zbeh=%u other=0x%08x a2m_dis=%d | host dw=%d dfunc=%d sload=%d",
+	              dc.z_enable, dc.z_write_enable, dc.zfunc, dc.depth_bounds_enable, dc.stencil_enable,
+	              dc.stencilfunc, dc.stencilfunc_bf, dc.backface_enable, sc.stencil_fail,
+	              sc.stencil_zpass, sc.stencil_zfail, sc.stencil_fail_bf, sc.stencil_zpass_bf,
+	              sc.stencil_zfail_bf, sm.stencil_testval, sm.stencil_mask, sm.stencil_writemask,
+	              sm.stencil_opval, sm.stencil_testval_bf, sm.stencil_mask_bf, sm.stencil_writemask_bf,
+	              sm.stencil_opval_bf, rc.depth_clear_enable, rc.stencil_clear_enable,
+	              ro.force_z_valid, ro.force_z_dirty, ro.force_stencil_valid, ro.force_stencil_dirty,
+	              z.depth_view.depth_write_disable, z.depth_view.stencil_write_disable,
+	              sh.shader_kill_enable, sh.shader_z_export_enable, sh.shader_mask_export_enable,
+	              sh.shader_z_behavior, sh.other_bits, sh.alpha_to_mask_disable,
+	              r.depth_write_enable, static_cast<int>(r.depth_compare_op),
+	              r.stencil_load_clear_enable);
+	// Colour side of the same draw: blend per MRT 0-3, target and shader masks, colour control
+	// and the export formats.
+	const auto& shr = hw.GetShaderRegisters();
+	const auto& cc  = hw.GetColorControl();
+	auto        used = std::strlen(line);
+	used += static_cast<size_t>(std::snprintf(
+	    line + used, sizeof(line) - used, " | cb tmask=0x%08x smask=0x%08x mode=%u rop=0x%02x fmt=%u/%u/%u/%u",
+	    hw.GetRenderTargetMask(), shr.m_cbShaderMask, cc.mode, cc.op, shr.target_output_mode[0],
+	    shr.target_output_mode[1], shr.target_output_mode[2], shr.target_output_mode[3]));
+	used += static_cast<size_t>(std::snprintf(
+	    line + used, sizeof(line) - used, " | draw idx=%u ps=0x%010llx colors=%u mrt=0x%x",
+	    g_stencil_trace_draw.index_count,
+	    static_cast<unsigned long long>(g_stencil_trace_draw.ps_addr),
+	    g_stencil_trace_draw.color_count, g_stencil_trace_draw.mrt_mask));
+	for (uint32_t slot = 0; slot < 4 && used < sizeof(line); slot++) {
+		const auto& b = hw.GetBlendControl(slot);
+		used += static_cast<size_t>(std::snprintf(
+		    line + used, sizeof(line) - used, " b%u=%d:%u,%u,%u/%u,%u,%u,%d,byp%d,f%u/%u", slot, b.enable,
+		    b.color_srcblend, b.color_comb_fcn, b.color_destblend, b.alpha_srcblend,
+		    b.alpha_comb_fcn, b.alpha_destblend, b.separate_alpha_blend,
+		    hw.GetRenderTarget(slot).info.blend_bypass,
+		    static_cast<uint32_t>(hw.GetRenderTarget(slot).info.format),
+		    static_cast<uint32_t>(hw.GetRenderTarget(slot).info.channel_type)));
+	}
+	static std::mutex                     mutex;
+	static std::unordered_set<std::string> seen;
+	std::scoped_lock                       lock {mutex};
+	if (seen.insert(line).second) {
+		std::printf("%s\n", line);
+		LOGF("%s\n", line);
+		if (auto* file = std::fopen("_StencilRefTrace.txt", "a"); file != nullptr) {
+			std::fprintf(file, "%s\n", line);
+			std::fclose(file);
+		}
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
@@ -397,6 +489,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
+	r.stencil_load_clear_enable = r.stencil_clear_enable;
 	r.stencil_clear_value = hw.GetStencilClearValue();
 	// Explicit clears until AcquireRenderTargets adds a pending HTile clear (upstream 57791645e).
 	r.load_clear_aspects = {};
@@ -429,6 +522,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		r.stencil_front = vk::StencilOpState {};
 		r.stencil_back  = vk::StencilOpState {};
 	}
+	TraceStencilRefState(hw, r);
 	// r.desc is the memo's description (KYTY_DRAW_SEQUENCE_FAST: its last lookup may repeat).
 	r.image_id = FindTargetImage(r.desc, false, TargetDescMemoEnabled() ? &memo.lookup : nullptr);
 	BindRenderTarget(r.image_id);
@@ -502,10 +596,12 @@ bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b) {
 	// Every field, named in declaration order (see ResolveRenderDepthTarget): a new field stops
 	// this compiling until it is compared below.
 	const auto& [a_desc, a_clear, a_load_clear, a_clear_value, a_test, a_write, a_compare,
-	             a_bounds, a_min_bounds, a_max_bounds, a_stencil_clear, a_stencil_clear_value,
+	             a_bounds, a_min_bounds, a_max_bounds, a_stencil_clear, a_stencil_load_clear,
+	             a_stencil_clear_value,
 	             a_stencil_test, a_front, a_back, a_image] = a;
 	const auto& [b_desc, b_clear, b_load_clear, b_clear_value, b_test, b_write, b_compare,
-	             b_bounds, b_min_bounds, b_max_bounds, b_stencil_clear, b_stencil_clear_value,
+	             b_bounds, b_min_bounds, b_max_bounds, b_stencil_clear, b_stencil_load_clear,
+	             b_stencil_clear_value,
 	             b_stencil_test, b_front, b_back, b_image] = b;
 	const auto same_float = [](float x, float y) {
 		return std::bit_cast<uint32_t>(x) == std::bit_cast<uint32_t>(y);
@@ -514,7 +610,8 @@ bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b) {
 	       same_float(a_clear_value, b_clear_value) && a_test == b_test && a_write == b_write &&
 	       a_compare == b_compare && a_bounds == b_bounds &&
 	       same_float(a_min_bounds, b_min_bounds) && same_float(a_max_bounds, b_max_bounds) &&
-	       a_stencil_clear == b_stencil_clear && a_stencil_clear_value == b_stencil_clear_value &&
+	       a_stencil_clear == b_stencil_clear && a_stencil_load_clear == b_stencil_load_clear &&
+	       a_stencil_clear_value == b_stencil_clear_value &&
 	       a_stencil_test == b_stencil_test && a_front == b_front && a_back == b_back &&
 	       a_image == b_image;
 }

@@ -28,6 +28,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/eventQueueFilters.h"
 #include "kernel/pthread.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
@@ -1237,8 +1238,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
 		Log::WriteToConsoleAndLog(
-		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
-		    "displaying PQ video-out pixels unchanged.\n");
+		    "HDR output is unavailable: the game's HDR10 (PQ) video-out frames are converted to SDR "
+		    "for display (KYTY_HDR_TO_SDR=0 shows the PQ pixels unchanged).\n");
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
@@ -1469,6 +1470,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_presenter.Renderer().NotifyGpuProgress();
 
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+		Controller::OnGuestFlip();
 		// A completed guest flip (one per presented layer group), not the polling iterations of
 		// FlipQueue::Flip. This is a CPU presentation marker; it does not measure GPU execution
 		// time.

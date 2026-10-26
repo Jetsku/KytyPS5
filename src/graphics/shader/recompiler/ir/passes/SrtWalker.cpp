@@ -10,7 +10,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -22,6 +24,66 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// KYTY_SRT_GPU_FILL_DIAG=1 (diagnostic, default off; needs KYTY_SRT_GPU_FILL=1): host reads of
+// GPU-written SRT dwords the fill did not take, by shader and flat slot (or "descriptor/other"
+// outside the flat refresh, "trace" inside a replayed flat refresh), every 10 s on the console.
+bool GpuFillDiagEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SRT_GPU_FILL_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+constexpr uint32_t DiagSlotNone  = UINT32_MAX;
+constexpr uint32_t DiagSlotTrace = UINT32_MAX - 1u;
+
+void NoteGpuFillMiss(const ResourcePlan& program, uint32_t slot) {
+	struct Key {
+		uint64_t hash;
+		uint32_t slot;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const { return key.hash * 31u + key.slot; }
+	};
+	static std::mutex                                mutex;
+	static std::unordered_map<Key, uint64_t, KeyHash> misses;
+	static auto last = std::chrono::steady_clock::now();
+	std::scoped_lock lock(mutex);
+	misses[{program.shader_hash, slot}]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(10)) {
+		return;
+	}
+	last = now;
+	std::vector<std::pair<Key, uint64_t>> sorted(misses.begin(), misses.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::string line = "SrtGpuFill misses 10s:";
+	for (size_t i = 0; i < std::min<size_t>(sorted.size(), 12); i++) {
+		const auto& [key, count] = sorted[i];
+		if (key.slot == DiagSlotNone) {
+			line += fmt::format(" {:016x}/other x{}", key.hash, count);
+		} else if (key.slot == DiagSlotTrace) {
+			line += fmt::format(" {:016x}/trace x{}", key.hash, count);
+		} else {
+			line += fmt::format(" {:016x}/slot{}{} x{}", key.hash, key.slot,
+			                    key.slot < program.gpu_fill_slots.size() && program.gpu_fill_slots[key.slot] != 0u &&
+			                            key.hash == program.shader_hash
+			                        ? "(fillable)"
+			                        : "",
+			                    count);
+		}
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+	misses.clear();
+}
+
+} // namespace
+
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	if (runtime.read_specialization_memory == nullptr) {
 		runtime.try_read_clean_backing = nullptr;
@@ -31,6 +93,9 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	// Strict reads are host values by definition: never left to the GPU.
+	runtime.gpu_written = nullptr;
+	runtime.gpu_fills   = nullptr;
 	return runtime;
 }
 
@@ -173,9 +238,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -428,7 +495,11 @@ private:
 		if (inst == nullptr) {
 			Fail(use_pc, "invalid typed planning value");
 		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
+		if (m_visited.contains(inst)) {
+			return;
+		}
+		const auto cycle = m_visiting_set.contains(inst) ? std::ranges::find(m_visiting, inst)
+		                                                 : m_visiting.end();
 		if (cycle != m_visiting.end()) {
 			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
 				return value->GetOpcode() == ValueOpcode::Phi;
@@ -439,39 +510,66 @@ private:
 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
 			                         ValueOpcodeName(inst->GetOpcode())));
 		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return;
-		}
 		m_visiting.push_back(inst);
+		m_visiting_set.insert(inst);
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
 			Collect(inst->Arg(index), use_pc);
 		}
 		m_visiting.pop_back();
-		m_visited.push_back(inst);
+		m_visiting_set.erase(inst);
+		m_visited.insert(inst);
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
 		    (m_variant_reads && !EvaluableBeforeDispatch(inst->Arg(0)))) {
-			if (std::ranges::find(m_program.dynamic_reads, value) ==
-			    m_program.dynamic_reads.end()) {
+			if (m_dynamic_reads.insert(inst).second) {
 				m_program.dynamic_reads.push_back(value);
 			}
 			return;
 		}
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+		// Equivalent reads have the same opcode and memory metadata (EquivalentValue compares
+		// them first): only the slots of that shape are compared.
+		auto& candidates = m_slots_by_shape[ReadShape(*inst)];
+		for (const auto slot: candidates) {
 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
 				m_patches.push_back({inst, slot, false});
 				return;
 			}
 		}
 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+		candidates.push_back(slot);
 		m_program.srt_reads.push_back({value, slot});
 		m_patches.push_back({inst, slot, true});
 	}
 
+	// What EquivalentValue compares first for two runtime reads: the opcode and the memory entry's
+	// fields (offset, kind) that equal entries share.
+	uint64_t ReadShape(const Inst& inst) const {
+		const auto index = inst.Flags<MemoryFlags>().index;
+		uint64_t   shape = static_cast<uint64_t>(inst.GetOpcode()) << 48u;
+		if (index < m_program.memory_info.size()) {
+			const auto& memory = m_program.memory_info[index];
+			shape ^= (static_cast<uint64_t>(memory.offset) << 8u) ^ static_cast<uint64_t>(memory.kind);
+		}
+		return shape;
+	}
+
 	void PatchReads() {
+		// Block conditions and indirect targets by the instruction they name, so a patch does
+		// not scan every block.
+		std::unordered_map<const Inst*, std::vector<size_t>> conditions;
+		std::unordered_map<const Inst*, std::vector<size_t>> targets;
+		for (size_t index = 0; index < m_program.block_info.size(); ++index) {
+			const auto& info = m_program.block_info[index];
+			if (const auto* inst = info.condition.Resolve().TryInstruction(); inst != nullptr) {
+				conditions[inst].push_back(index);
+			}
+			if (const auto* inst = info.indirect_target.Resolve().TryInstruction(); inst != nullptr) {
+				targets[inst].push_back(index);
+			}
+		}
 		for (const auto& patch: m_patches) {
 			auto* block = patch.inst->Parent();
 			auto& list  = block->Instructions();
@@ -485,12 +583,18 @@ private:
 			for (const auto& use: uses) {
 				use.user->SetArg(use.operand, flat);
 			}
-			for (auto& info: m_program.block_info) {
-				if (info.condition.Resolve() == Value(patch.inst)) {
-					info.condition = flat;
+			if (const auto found = conditions.find(patch.inst); found != conditions.end()) {
+				for (const auto index: found->second) {
+					if (m_program.block_info[index].condition.Resolve() == Value(patch.inst)) {
+						m_program.block_info[index].condition = flat;
+					}
 				}
-				if (info.indirect_target.Resolve() == Value(patch.inst)) {
-					info.indirect_target = flat;
+			}
+			if (const auto found = targets.find(patch.inst); found != targets.end()) {
+				for (const auto index: found->second) {
+					if (m_program.block_info[index].indirect_target.Resolve() == Value(patch.inst)) {
+						m_program.block_info[index].indirect_target = flat;
+					}
 				}
 			}
 			if (patch.keep) {
@@ -523,7 +627,10 @@ private:
 
 	Program&           m_program;
 	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
+	std::unordered_set<const Inst*> m_visiting_set;
+	std::unordered_set<const Inst*> m_visited;
+	std::unordered_set<const Inst*> m_dynamic_reads;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_slots_by_shape;
 	std::vector<Patch> m_patches;
 	bool               m_variant_reads = false;
 	std::unordered_map<const Inst*, bool> m_evaluable_memo;
@@ -1423,6 +1530,18 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 		result = 0;
 		return true;
 	}
+	if (m_runtime.gpu_written != nullptr && !m_fill_active && GpuFillDiagEnabled() &&
+	    address != 0 && m_runtime.gpu_written(address)) [[unlikely]] {
+		NoteGpuFillMiss(m_program, m_diag_slot);
+	}
+	if (m_fill_active && m_runtime.gpu_written(address)) [[unlikely]] {
+		// KYTY_SRT_GPU_FILL: only the shader uses this slot, and the GPU wrote its bytes; the
+		// renderer copies them into the flat buffer on the GPU before the dispatch, where reading
+		// them here would wait for the GPU.
+		m_runtime.gpu_fills->push_back({m_fill_offset, address});
+		result = 0;
+		return true;
+	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
@@ -1908,6 +2027,11 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				return true;
 			}
 			return false;
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
+			if (!binary()) return false;
+			result = inst.GetOpcode() == ValueOpcode::IEqual64 ? a == b : a != b;
+			return true;
 		case ValueOpcode::ULessThan32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
@@ -2058,6 +2182,27 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) return false;
+		evaluator.m_diag_slot = index;
+		if (!clean && m_runtime.gpu_fills != nullptr &&
+		    read.flat_offset < m_program.gpu_fill_slots.size() &&
+		    (m_program.gpu_fill_slots[read.flat_offset] == 1u ||
+		     (m_program.gpu_fill_slots[read.flat_offset] == 2u &&
+		      m_runtime.gpu_fill_store_offsets))) [[unlikely]] {
+			// KYTY_SRT_GPU_FILL: this slot alone, outside read runs; its one raw read (ReadRawWord)
+			// leaves GPU-written bytes to the GPU.
+			m_fill_active = true;
+			m_fill_offset = read.flat_offset;
+			const bool ok = index < m_program.flat_read_roots.size()
+			    ? EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
+			    : Evaluate(read.value, flat[read.flat_offset]);
+			m_fill_active = false;
+			m_diag_slot   = DiagSlotNone;
+			if (!ok) {
+				return false;
+			}
+			++index;
+			continue;
+		}
 		if (evaluator.m_runtime.try_read_clean_backing != nullptr &&
 		    index < m_program.srt_read_run_ends.size() &&
 		    m_program.srt_read_run_ends[index] > index) {
@@ -2081,6 +2226,7 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		const bool ok = index < m_program.flat_read_roots.size()
 		    ? evaluator.EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
 		    : evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		evaluator.m_diag_slot = DiagSlotNone;
 		if (!ok) {
 			return false;
 		}
@@ -2762,7 +2908,13 @@ bool SrtTraceSession::FlatBuffer(SrtWalker& walker, std::vector<uint32_t>& flat)
 		}
 		return ok;
 	}
+	for (auto* each: m_walkers) {
+		each->m_diag_slot = DiagSlotTrace;
+	}
 	const auto* call = NextCall(id);
+	for (auto* each: m_walkers) {
+		each->m_diag_slot = DiagSlotNone;
+	}
 	if (call == nullptr) {
 		return walker.RefreshFlatBufferImpl(flat);
 	}

@@ -109,7 +109,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
+		     return image.indirect_search_iterations != 0u || image.bindless;
 	     });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
@@ -678,6 +678,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	}
 	if (program.stage != ShaderType::Compute) {
 		NoteGraphicsAddTid(program, state.lane_count, state.wave_clusters);
+	}
+	if (program.stage == ShaderType::Mesh) {
+		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
 	}
 	DefineModule(state);
 	EmitProgram(state);

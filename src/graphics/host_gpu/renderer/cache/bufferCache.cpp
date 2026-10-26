@@ -1,3 +1,4 @@
+#include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
@@ -43,6 +44,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -257,7 +259,13 @@ bool SideReadbackGpuThreadEnabled() {
 	return enabled;
 }
 
-// Aligned side-copy window in bytes: a power of two between 4 KiB and 1 MiB (default 64 KiB).
+// Aligned side-copy window in bytes: a power of two between 4 KiB and 4 MiB (default 4 MiB, was
+// 64 KiB). It is also the staging stride of each side-readback slot (16 slots: 64 MiB of download
+// memory), so the live window below never exceeds it. Miles Morales' game threads poll
+// GPU-written bytes across neighbouring pages: one launch, 5 ABBA quartets at the "Previously on"
+// prompt, 4 MiB vs 64 KiB: +17.8% flips/s (SE 4.2%), CP time per flip unchanged (+2.5 ms, SE 4.6),
+// guest read faults ~690 -> ~510 per frame.
+// Default 64 KiB in this line (as int21); the Insomniac title presets set 4096.
 uint64_t SideReadbackWindow() {
 	constexpr uint64_t Default = 64 * 1024;
 	const auto*        value   = std::getenv("KYTY_READBACK_SIDE_COPY_WINDOW_KB");
@@ -266,11 +274,27 @@ uint64_t SideReadbackWindow() {
 	}
 	char*      end = nullptr;
 	const auto kib = std::strtoull(value, &end, 10);
-	if (end == value || *end != '\0' || kib < 4 || kib > 1024 || (kib & (kib - 1)) != 0) {
+	if (end == value || *end != '\0' || kib < 4 || kib > 4096 || (kib & (kib - 1)) != 0) {
 		return Default;
 	}
 	return kib * 1024;
 }
+
+// KYTY_READBACK_SIDE_WINDOW_LIVE_KB (live; unset or 0 = KYTY_READBACK_SIDE_COPY_WINDOW_KB): the
+// aligned window a side readback copies around a fault, a power of two of at least 4 KiB, capped
+// at the startup window (the staging stride). A wider window serves the neighbouring GPU-written
+// bytes of a polled page with the same copy, so fewer guest reads fault and wait (port of senaxx
+// 2559c2737, which widened its drain window from 512 KiB to 4 MiB for the same engine's polling).
+Live::Switch g_side_window_live("KYTY_READBACK_SIDE_WINDOW_LIVE_KB", [](const char* value) -> int64_t {
+	if (value == nullptr) {
+		return 0;
+	}
+	const auto kib = std::strtoull(value, nullptr, 10);
+	if (kib < 4 || kib > 4096 || (kib & (kib - 1)) != 0) {
+		return 0;
+	}
+	return static_cast<int64_t>(kib * 1024);
+});
 
 // KYTY_READBACK_MERGE_GAP_KB=<KiB> (live, default 0 = one region per range; 64 was the fork's): GPU-written ranges
 // of one readback less than this far apart share one vkCmdCopyBuffer region (chenxiao07 9239c5773).
@@ -689,6 +713,34 @@ int RangeMemoVerifyMode() {
 bool RelaxedQueriesEnabled() {
 	static const bool enabled = ParseEnvU64("KYTY_TRACKER_RELAXED_QUERIES", 1) != 0;
 	return enabled;
+}
+
+// KYTY_WRITE_DATA_GPU_PAGE (default 0 in this line, 1 in the Insomniac title presets; live): BufferCache::TryWriteDataGpu.
+Live::Switch g_write_data_gpu_page("KYTY_WRITE_DATA_GPU_PAGE", [](const char* value) -> int64_t {
+	return value == nullptr || value[0] == '\0' ? 0 : static_cast<int64_t>(std::strtoll(value, nullptr, 10));
+});
+
+// KYTY_TEXEL_RELAXED_SYNC (default 0 in this line, 2 in the Insomniac title presets; 1; 0 off; live): formatted (texel) read bindings use the
+// same lock-free "nothing to upload" test as raw reads (1), and the read-binding memo
+// (ObtainReadBinding, 2), followed by the image step (SynchronizeBufferFromImage) that only texel
+// reads do. Before, every texel read walked the tracker under its region locks: Miles Morales binds
+// ~6 texel buffers of ~4 MiB per draw, and each took 15.5 us (1: 3.7 us, 2: 0.6 us), two thirds of
+// the command processor's time. The tracker part of a read synchronization only uploads CPU-dirty
+// page runs and clears their CPU-dirty bits (GPU ownership, image staleness and epochs are the
+// written path's), so with no CPU-dirty page it does nothing. KYTY_TRACKER_RELAXED_VERIFY and
+// KYTY_BINDING_EPOCH_MEMO_VERIFY check both shortcuts (Miles Morales: 0 mismatches); Astro Bot's
+// Sky Garden CP time is unchanged (live A/B 0 vs 2: 34.16 vs 34.20 ms/flip).
+Live::Switch g_texel_relaxed_sync("KYTY_TEXEL_RELAXED_SYNC", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0') {
+		return 0;
+	}
+	return static_cast<int64_t>(std::strtoll(value, nullptr, 10));
+});
+bool TexelRelaxedSyncEnabled() {
+	return g_texel_relaxed_sync.Get() != 0;
+}
+bool TexelBindingMemoEnabled() {
+	return g_texel_relaxed_sync.Get() >= 2;
 }
 
 // KYTY_BINDING_EPOCH_MEMO (default on; =0 off): read bindings reused within a sync epoch
@@ -2324,9 +2376,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	const auto buffer_end   = buffer_begin + buffer.Size();
 	const auto page_begin   = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer_begin);
 	const auto page_end = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE), buffer_end);
-	const auto aligned  = Common::AlignDown(vaddr, side.window);
+	const auto live_window = static_cast<uint64_t>(g_side_window_live.Get());
+	const auto window = live_window != 0 ? std::min(live_window, side.window) : side.window;
+	const auto aligned  = Common::AlignDown(vaddr, window);
 	const auto window_begin = std::max(aligned, buffer_begin);
-	const auto window_end   = std::min(aligned + side.window, buffer_end);
+	const auto window_end   = std::min(aligned + window, buffer_end);
 	if (((page_begin | page_end | window_begin | window_end) % TRACKER_PAGE_SIZE) != 0) {
 		return other(Profiler::FrameEvent::ReadbackSideOtherAlignment);
 	}
@@ -2547,6 +2601,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.queue)), value, producer);
 		NoteWatchdogSubmit(m_graphics.queue, submit);
 		submit_result = m_graphics.queue.submit(1, &submit, nullptr);
+	}
+	if (submit_result == vk::Result::eErrorDeviceLost) {
+		// The fatal exit below has no breadcrumbs of its own: report the device fault and NV
+		// checkpoints first (KYTY_DEVICE_FAULT_DIAGNOSTICS=1).
+		DumpDeviceLossDiagnostics(m_graphics, value);
 	}
 	RequireVulkanSuccess(submit_result, "submit side readback");
 
@@ -3095,9 +3154,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
 	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
 	// GPU-written images; the BDA hot-pass verification scans in full.
-	if (!is_written && !is_texel_buffer && (stats == nullptr || stats->verify_fault_epoch == 0) &&
-	    RelaxedNothingToUpload(vaddr, size)) {
-		return false;
+	if (!is_written && (!is_texel_buffer || TexelRelaxedSyncEnabled()) &&
+	    (stats == nullptr || stats->verify_fault_epoch == 0) && RelaxedNothingToUpload(vaddr, size)) {
+		// A texel read still takes the bytes of GPU-written images that start at its address.
+		return is_texel_buffer ? SynchronizeBufferFromImage(buffer, vaddr, size) : false;
 	}
 	// KYTY_WRITTEN_SYNC_SKIP (bufferCache.h): a range the GPU already owns entirely. (Only texel
 	// READS do more than the tracker work below.)
@@ -3677,9 +3737,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-	if (!is_written && !is_texel_buffer && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
+	if (!is_written && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
 	    GuestGpu::IsGpuThread()) {
-		return ObtainReadBinding(vaddr, size, id);
+		if (!is_texel_buffer) {
+			return ObtainReadBinding(vaddr, size, id);
+		}
+		if (TexelBindingMemoEnabled()) {
+			// KYTY_TEXEL_RELAXED_SYNC=2: the memo decides the tracker part; a stream copy is a
+			// guest-byte copy as before (ObtainBufferNow streams small texel reads too).
+			auto result = ObtainReadBinding(vaddr, size, id);
+			if (result.first != &m_stream_buffer) {
+				(void)SynchronizeBufferFromImage(*result.first, vaddr, size);
+			}
+			return result;
+		}
 	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
 }
@@ -4386,6 +4457,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainImageStagingBuffer(uint64_t size
 	return {source, 0};
 }
 
+// An image whose memory is only partly mapped: streaming games (Miles Morales' AMM pool) map the
+// resident part of a texture and leave the rest of its range unmapped. The unmapped bytes read as
+// zeros, as a GPU read of an unmapped page does on the console, instead of ending the emulator.
+bool ReadPartlyUnmappedImageBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (!Libs::LibKernel::Memory::CopySparseMemory(vaddr, data, size)) {
+		return false;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("Image backing 0x%016" PRIx64 "+0x%" PRIx64
+		     " is partly unmapped: its unmapped bytes read as zero\n",
+		     vaddr, size);
+	}
+	return true;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -4407,7 +4494,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (source == nullptr) EXIT("BufferCache: failed to read mapped guest image backing\n");
 	auto* staging = source->Mapped().data() + stage_offset;
 	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	    !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+	    !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size) &&
+	    !ReadPartlyUnmappedImageBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	if (source == &m_staging_buffer) m_staging_buffer.Commit();
@@ -4459,7 +4547,17 @@ bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t
 	}
 	// Only bytes owned by recorded GPU work need ordering on the GPU timeline; everything else
 	// keeps the CPU write (which faults into the usual invalidation when tracked).
-	if (!HasGpuDirtyBytes(vaddr, size) && !HasPendingBackingPublication(vaddr, size)) {
+	// KYTY_WRITE_DATA_GPU_PAGE (default 1; 0 off; live): the 4 KiB pages around the range count
+	// too. A CPU write into a page the GPU owns faults and drains the GPU even when the GPU wrote
+	// other bytes of that page (Miles Morales writes 208-byte constants next to 1448 bytes a
+	// compute shader wrote: ~3 drains and ~12 ms of the command processor per frame).
+	const bool page_granular = g_write_data_gpu_page.Get() != 0;
+	const auto page_begin    = vaddr & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+	const auto page_end      = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+	const auto check_begin   = page_granular ? page_begin : vaddr;
+	const auto check_size    = page_granular ? page_end - page_begin : size;
+	if (!HasGpuDirtyBytes(check_begin, check_size) &&
+	    !HasPendingBackingPublication(check_begin, check_size)) {
 		return false;
 	}
 	KYTY_GPU_OP_SITE("buffercache.write_data");
@@ -4733,6 +4831,35 @@ BufferCache::PageStates BufferCache::CountPageStates(uint64_t vaddr, uint64_t si
 
 bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.GpuMirrorMatches(vaddr, size);
+}
+
+bool BufferCache::GpuFillSource(uint64_t vaddr, vk::Buffer* handle, uint64_t* offset) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	constexpr uint64_t size = sizeof(uint32_t);
+	if ((vaddr & (size - 1u)) != 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !m_gpu_modified_ranges.Contains(vaddr, size)) {
+		return false;
+	}
+	if ((!m_early_released.empty() && OverlapsUnpublished(vaddr, size)) ||
+	    HasPendingBackingPublication(vaddr, size)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (buffer.is_deleted || !buffer.IsInBounds(vaddr, size) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (handle != nullptr) {
+		*handle = buffer.Handle();
+	}
+	if (offset != nullptr) {
+		*offset = buffer.Offset(vaddr);
+	}
+	return true;
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
@@ -5643,8 +5770,116 @@ bool BdaWritesVerify() {
 	return GetBdaWritesMode() == BdaWritesMode::Verify;
 }
 
+namespace {
+
+// KYTY_BDA_HEAPS (default off): see BufferCache::NoteBdaFault. KYTY_BDA_HEAP_MB (default 64) is the
+// window around a fault (inside its allocation) that it makes resident.
+bool BdaHeapsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BDA_HEAPS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// The windows learned so far persist in _PipelineCache/<title>.bdaheaps ("start size" in hex per line):
+// the first dispatch that stores to a cold page drops those stores, so the next start makes them resident
+// before it.
+std::filesystem::path BdaHeapsPath() {
+	std::string title_id;
+	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
+	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
+		return {};
+	}
+	return std::filesystem::path("_PipelineCache") / (title_id + ".bdaheaps");
+}
+
+uint64_t BdaHeapLimit() {
+	static const uint64_t limit = [] {
+		const auto* value = std::getenv("KYTY_BDA_HEAP_MB");
+		const auto  mb    = value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : 64u;
+		return mb << 20u;
+	}();
+	return limit;
+}
+
+} // namespace
+
+void BufferCache::NoteBdaFault(uint64_t vaddr, uint64_t size) {
+	if (!BdaHeapsEnabled() || size == 0) {
+		return;
+	}
+	uint64_t alloc_start = 0;
+	uint64_t alloc_bytes = 0;
+	if (!Libs::LibKernel::Memory::GetGpuBufferMapping(vaddr, &alloc_start, &alloc_bytes)) {
+		return;
+	}
+	// The window is a multiple of its size, clipped to the allocation: neighbouring faults share it.
+	const auto window = std::max<uint64_t>(BdaHeapLimit(), CACHING_PAGESIZE);
+	const auto start  = std::max(alloc_start, vaddr & ~(window - 1u));
+	const auto end    = std::min(alloc_start + alloc_bytes, (vaddr & ~(window - 1u)) + window);
+	if (end <= start || end - start <= size) {
+		return;
+	}
+	const auto bytes = end - start;
+	{
+		std::scoped_lock lock {m_bda_heaps_mutex};
+		for (const auto& [heap_start, heap_size]: m_bda_heaps) {
+			if (heap_start == start && heap_size == bytes) {
+				return;
+			}
+		}
+		m_bda_heaps.emplace_back(start, bytes);
+		if (const auto path = BdaHeapsPath(); !path.empty()) {
+			std::error_code error;
+			std::filesystem::create_directories(path.parent_path(), error);
+			if (auto* file = std::fopen(path.string().c_str(), "w"); file != nullptr) {
+				for (const auto& [heap_start, heap_size]: m_bda_heaps) {
+					std::fprintf(file, "%" PRIx64 " %" PRIx64 "\n", heap_start, heap_size);
+				}
+				std::fclose(file);
+			}
+		}
+	}
+	(void)FindBuffer(start, bytes);
+	LOGF("KYTY_BDA_HEAPS: BDA fault at 0x%016" PRIx64 ": 0x%016" PRIx64 "+0x%" PRIx64
+	            " is resident now\n",
+	            vaddr, start, bytes);
+	
+}
+
 void BufferCache::PrepareBdaWrites() {
 	EXIT_IF(!BdaWritesEnabled());
+	if (BdaHeapsEnabled()) {
+		std::vector<std::pair<uint64_t, uint64_t>> heaps;
+		{
+			std::scoped_lock lock {m_bda_heaps_mutex};
+			if (!m_bda_heaps_loaded) {
+				m_bda_heaps_loaded = true;
+				if (const auto path = BdaHeapsPath(); !path.empty()) {
+					if (auto* file = std::fopen(path.string().c_str(), "r"); file != nullptr) {
+						unsigned long long heap_start = 0;
+						unsigned long long heap_size  = 0;
+						while (std::fscanf(file, "%llx %llx", &heap_start, &heap_size) == 2) {
+							m_bda_heaps.emplace_back(heap_start, heap_size);
+						}
+						std::fclose(file);
+						LOGF("KYTY_BDA_HEAPS: %zu window(s) loaded from %s\n", m_bda_heaps.size(),
+						     path.string().c_str());
+					}
+				}
+			}
+			heaps = m_bda_heaps;
+		}
+		for (const auto& [start, bytes]: heaps) {
+			uint64_t mapped_start = 0;
+			uint64_t mapped_size  = 0;
+			if (Libs::LibKernel::Memory::GetGpuBufferMapping(start, &mapped_start, &mapped_size) &&
+			    mapped_start <= start && start + bytes <= mapped_start + mapped_size) {
+				(void)FindBuffer(start, bytes);
+			}
+		}
+	}
 	m_fault_manager.PrepareBdaWrites();
 	// The dispatch may overwrite any known fill.
 	ForgetKnownFills(0, uint64_t {1} << 40u);
@@ -5865,6 +6100,10 @@ uint32_t BufferCache::ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> s
 	// The guest-write transition once per dword run, before any byte lands.
 	RangeSet dwords;
 	for (const auto& store: stores) {
+		// A shader storing through a garbage pointer logs an address outside the guest space.
+		if (!GuestRange {store.Address() & ~uint64_t {3}, sizeof(uint32_t)}.Valid()) {
+			continue;
+		}
 		dwords.Add(store.Address() & ~uint64_t {3}, sizeof(uint32_t));
 	}
 	RangeSet refused;
@@ -5882,6 +6121,10 @@ uint32_t BufferCache::ApplyBdaStoreLog(std::span<const FaultManager::BdaStore> s
 	for (const auto& store: stores) {
 		const auto address = store.Address() & ~uint64_t {3};
 		uint32_t   word    = 0;
+		if (!GuestRange {address, sizeof(word)}.Valid()) {
+			dropped++;
+			continue;
+		}
 		if (refused.Intersects(address, sizeof(word)) ||
 		    !Libs::LibKernel::Memory::TryReadBacking(address, &word, sizeof(word))) {
 			dropped++;

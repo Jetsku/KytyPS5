@@ -102,6 +102,14 @@ struct GraphicContext {
 	// made it a hard requirement in fd66f580b; shaders that index storage-buffer arrays
 	// non-uniformly need it).
 	bool                               storage_buffer_array_non_uniform_indexing_enabled = false;
+	// Descriptor indexing for bindless images (BindlessTable, Senaxx): runtime arrays indexed
+	// non-uniformly, partially bound, updated after bind. Enabled when supported unless
+	// KYTY_BINDLESS=0. The limit is the update-after-bind sampled images one set and one stage may
+	// hold; bindless_layout is created on first use (BindlessSetLayout, under its mutex).
+	bool                               bindless_enabled                      = false;
+	uint32_t                           bindless_max_sampled_images           = 0;
+	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
+	Common::Mutex                      bindless_layout_mutex;
 	// VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a compatible color format
 	// (D32 <-> R32, D16 <-> R16). KYTY_DIRECT_IMAGE_COPY_M8=0 leaves the extension disabled.
 	bool                               maintenance8_enabled                  = false;

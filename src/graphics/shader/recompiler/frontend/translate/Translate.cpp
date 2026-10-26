@@ -140,7 +140,11 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
+		case Decoder::OperandKind::SharedBase:
+		case Decoder::OperandKind::PrivateBase:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
+		case Decoder::OperandKind::SharedLimit:
+		case Decoder::OperandKind::PrivateLimit: return IR::U32(IR::Value(UINT32_MAX));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::Vgpr:
@@ -471,6 +475,18 @@ IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) {
+	if (operand.kind >= Decoder::OperandKind::SharedBase &&
+	    operand.kind <= Decoder::OperandKind::PrivateLimit) {
+		flat_aperture_seen = true;
+	}
+	if (operand.kind == Decoder::OperandKind::SharedBase ||
+	    operand.kind == Decoder::OperandKind::SharedLimit) {
+		return {ReadRawU32(operand), IR::U32(IR::Value(IR::SharedApertureHigh))};
+	}
+	if (operand.kind == Decoder::OperandKind::PrivateBase ||
+	    operand.kind == Decoder::OperandKind::PrivateLimit) {
+		return {ReadRawU32(operand), IR::U32(IR::Value(IR::PrivateApertureHigh))};
+	}
 	if (operand.kind == Decoder::OperandKind::ExecLo) {
 		return {ir.GetExecLo(), ir.GetExecHi()};
 	}
@@ -1306,11 +1322,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (mesh.split_groups != 0) {
 				group = entry_ir.IAdd(group, draw(IR::PushData::MeshFirstGroupDword));
 			}
-			const auto primitive_chunk = entry_ir.IMul(group, u32(mesh.primitives_per_group));
+			const auto primitive_chunk = mesh.fast_launch ? group :
+			    entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
-			const auto chunk = entry_ir.IMul(primitive_chunk, step);
-			const auto vertices =
+			const auto chunk = mesh.fast_launch ? group : entry_ir.IMul(primitive_chunk, step);
+			const auto vertices = mesh.fast_launch ? u32(mesh.vertices_per_group) :
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
 			    entry_ir.ULessThan(vertices, size), u32(0),
@@ -1335,6 +1352,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
+			if (mesh.fast_launch) {
+				// Fast launch broadcasts the subgroup's base vertex and instance to every lane:
+				// ES VGPR count 1 -> v5 is the vertex index, v6 the instance index.
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
+				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+			} else {
 			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 			// center in every subgroup; strip winding follows the global primitive.
 			const auto vertex = entry_ir.IMul(local, step);
@@ -1385,6 +1409,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			// The instance ID counts from 0; the start instance is the draw's.
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
 			                      builtin(IR::StageInputKind::WorkgroupId, 1));
+			}
 			if (options.input_info.vertex != nullptr && options.input_info.vertex->start_instance_sgpr >= 0) {
 				entry_ir.SetScalarReg(
 				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr), draw(2));
@@ -1394,8 +1419,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			// As for VS: the guest instance ID counts from 0 and the start instance comes
+			// from its SGPR, while Vulkan's InstanceIndex already includes the base instance.
+			const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
+			entry_ir.SetVectorReg(
+			    static_cast<IR::VectorReg>(5),
+			    entry_ir.ISub(builtin(IR::StageInputKind::InstanceIndex), base_instance));
+			if (options.input_info.vertex != nullptr &&
+			    options.input_info.vertex->start_instance_sgpr >= 0) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr),
+				    base_instance);
+			}
 		} else if (options.stage == ShaderType::TessellationControl) {
 			const auto& tess = options.input_info.vertex->tess;
 			entry_ir.SetScalarReg(
@@ -1499,6 +1534,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
 	bool lds_write_pending = false;
+	bool flat_aperture     = false;
+	const bool flat_aperture_bvh = GetCodegenOptions().flat_aperture_bvh;
+	for (const auto& instruction: decoded.instructions) {
+		flat_aperture |= flat_aperture_bvh &&
+		                 (instruction.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY ||
+		                  instruction.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY);
+		for (const auto* operand: {&instruction.src0, &instruction.src1, &instruction.src2,
+		                           &instruction.src3}) {
+			flat_aperture |= operand->kind >= Decoder::OperandKind::SharedBase &&
+			                 operand->kind <= Decoder::OperandKind::PrivateLimit;
+		}
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs,
@@ -1506,6 +1553,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		// Blocks are visited in address order; keep unordered LDS writes pending across
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);
+		translator.SetFlatAperture(flat_aperture);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

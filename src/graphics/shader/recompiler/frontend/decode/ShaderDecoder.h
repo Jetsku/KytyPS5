@@ -792,6 +792,10 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	SharedLimit,
+	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
 };

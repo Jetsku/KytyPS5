@@ -24,6 +24,10 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
 	return !has_stencil || htile_stencil_disabled || has_htile;
 }
 
+// KYTY_STENCIL_REF_TRACE: the draw whose depth target resolves next (diagnostic).
+void SetStencilTraceDraw(uint32_t index_count, uint64_t ps_addr, uint32_t color_count,
+                         uint32_t mrt_mask);
+
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;
@@ -38,6 +42,8 @@ struct RenderDepthInfo {
 	float                       depth_min_bounds         = 0.0f;
 	float                       depth_max_bounds         = 0.0f;
 	bool                        stencil_clear_enable     = false;
+	// stencil_clear_enable, or a stencil-tracking HTile cleared by a fill (see renderDraw.cpp).
+	bool                        stencil_load_clear_enable = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;
 	vk::StencilOpState          stencil_front;

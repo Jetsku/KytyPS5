@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -47,6 +49,14 @@ constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 // guest range before it is reserved (main.cpp's early CUDA initialization) derives its bound from
 // this, so the two cannot drift apart.
 constexpr uint64_t GUEST_ADDRESS_SPACE_END = 0xfc00000000ull;
+
+// The AMM virtual-address window (sceAmprAmmGetVirtualAddressRanges): the top 64 GiB of the guest
+// user range, below the 1 TiB the GPU tables address. Ordinary mappings never take addresses here
+// (FindGuestFreeRange, ReserveAligned), so AMM map commands at fixed addresses cannot replace a
+// mapping the kernel placed there. With the window at 0x1000000000 Miles Morales' streaming
+// pages replaced its own direct-memory heap at that address.
+constexpr uint64_t kAmmWindowBase = 0x00ec00000000ull;
+constexpr uint64_t kAmmWindowSize = 0x001000000000ull;
 
 struct VirtualQueryInfo {
 	uintptr_t start;
@@ -135,6 +145,10 @@ void                   SetFlexibleMemorySize(uint64_t size);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The AMM engine's pending maps (libAmpr.cpp): whether a queued or running AMM map command still has
+// to map the address (the host fault handler waits for it, KYTY_FAULT_AMM_WAIT_MS).
+void                   SetPendingAmmMapHook(bool (*covers)(uint64_t vaddr));
+[[nodiscard]] bool     PendingAmmMapCovers(uint64_t vaddr);
 // TryReadBacking whose destination may hold partial bytes when it fails (the caller discards it
 // then): any size through a per-thread mapping record, without the mapping lock (see
 // GuestBackingStore::TryReadBackingDirect). Any thread.
@@ -176,12 +190,22 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // Whether [vaddr, vaddr + size) lies in guest memory mapped for the GPU (the renderer's mapped
 // ranges, the same ones its fault handler resolves). False before InstallGpuResources.
 [[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
+// Whether every byte of [vaddr, vaddr + size) is mapped (committed guest ranges, no reservation or gap).
+[[nodiscard]] bool     IsCommittedSpan(uint64_t vaddr, uint64_t size);
+// The unhandled-fault report: what the kernel and the GPU tracker know about an address.
+[[nodiscard]] std::string DescribeAddressForCrash(uint64_t vaddr);
+// The committed, non-private, GPU-mapped allocation containing vaddr; false for anything else.
+[[nodiscard]] bool     GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // Upstream's descriptor-dependency reader (57cf08688/783d9f8d6): on the GPU thread, GPU-dirty
 // buffer bytes are read back first, then the backing is read.
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread (KYTY_SRT_GPU_FILL): the guest dword at vaddr is GPU-written bytes one registered
+// buffer holds (BufferCache::GpuFillSource), so a GPU copy reads its current value where a host
+// read would wait for the GPU.
+[[nodiscard]] bool     IsGpuFillableWord(uint64_t vaddr);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.

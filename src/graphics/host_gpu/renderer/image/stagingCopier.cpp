@@ -85,8 +85,11 @@ void StagingCopier::Run(Job& job) {
 			const auto bytes = std::min(Slice, range.size - done);
 			auto*      dst   = range.destination + done;
 			const auto src   = range.guest_address + done;
+			// A partly unmapped slice (streamed textures map only their resident part) keeps its
+			// mapped bytes; its unmapped bytes read as zero.
 			if (!LibKernel::Memory::TryReadBacking(src, dst, bytes) &&
-			    !LibKernel::Memory::TryReadSparseBacking(src, dst, bytes)) {
+			    !LibKernel::Memory::TryReadSparseBacking(src, dst, bytes) &&
+			    !LibKernel::Memory::CopySparseMemory(src, dst, bytes)) {
 				// The range was mapped when the refresh was recorded; unmapping drains the GPU
 				// (and so this job) first. Never leave a submission waiting on a failed copy.
 				std::memset(dst, 0, bytes);

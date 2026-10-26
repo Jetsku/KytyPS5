@@ -9,6 +9,8 @@
 #include "titleSound.h"
 #include "updateChecker.h"
 
+#include "common/u59Preset.h"
+
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
@@ -34,6 +36,8 @@
 #include <QtCore>
 
 #include <cstdint>
+#include <filesystem>
+#include <vector>
 
 #include "ui_main_dialog.h"
 
@@ -486,8 +490,39 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 }
 #endif
 
+// u59-preset.<TITLE_ID>.json next to the launcher (or one folder up, like u59-preset.json): its
+// variables go over the bundled preset in this game's process only. The emulator names the file
+// (KYTY_TITLE_PRESET) in its startup log.
+static void ApplyTitlePreset(QProcess* process, const QString& title_id) {
+	// The launcher reuses its QProcess: every launch starts from the system environment, so a
+	// previous title's preset never carries over (also when this title has no valid preset).
+	process->setProcessEnvironment(QProcessEnvironment::systemEnvironment());
+	const QDir                         app_dir(QApplication::applicationDirPath());
+	std::vector<std::filesystem::path> dirs {std::filesystem::path(app_dir.absolutePath().toStdU16String())};
+	if (QDir parent = app_dir; parent.cdUp()) {
+		dirs.emplace_back(parent.absolutePath().toStdU16String());
+	}
+	const auto result = Common::U59Preset::LoadTitle(dirs, title_id.toStdString());
+	if (result.status == Common::U59Preset::Status::Missing) {
+		return;
+	}
+	if (result.status != Common::U59Preset::Status::Loaded) {
+		qWarning().noquote() << QString::fromStdString(Common::U59Preset::TitleFileName(title_id.toStdString()))
+		                     << "was not applied:" << QString::fromStdString(result.error);
+		return;
+	}
+	auto environment = QProcessEnvironment::systemEnvironment();
+	for (const auto& entry: result.entries) {
+		environment.insert(QString::fromStdString(entry.key), QString::fromStdString(entry.value));
+	}
+	environment.insert(QStringLiteral("KYTY_TITLE_PRESET"),
+	                   QString::fromStdU16String(result.path.u16string()));
+	process->setProcessEnvironment(environment);
+}
+
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
+	ApplyTitlePreset(process, info.title_id);
 
 	QFileInfo f(interpreter);
 	auto      dir = f.absoluteDir();
@@ -535,9 +570,10 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setWorkingDirectory(dir.path());
 	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
 	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
-	// or the user's environment still applies (the emulator default is off).
+	// or the user's environment still applies (the emulator default is off). It goes over the
+	// environment ApplyTitlePreset set, so a title preset stays applied.
 	if (info.present_mode == Configuration::PresentMode::Immediate && info.smooth_frametime_fix) {
-		auto environment = QProcessEnvironment::systemEnvironment();
+		auto environment = process->processEnvironment();
 		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"), QStringLiteral("1"));
 		process->setProcessEnvironment(environment);
 	}

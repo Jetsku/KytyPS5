@@ -7,6 +7,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <vector>
 #include <cstdio>
 #include <filesystem>
 #include <renderdoc_app.h>
@@ -162,7 +164,35 @@ static void StartCapture() {
 	CaptureStatus("capture started");
 }
 
+// KYTY_RENDERDOC_CAPTURE_FLIPS=<n>[,<n>...] (default none): request a capture at these guest flip
+// counts, as F1 would, for unattended runs.
+static void AutoCaptureOnFlip() {
+	static const std::vector<uint64_t> flips = [] {
+		std::vector<uint64_t> list;
+		const auto* value = std::getenv("KYTY_RENDERDOC_CAPTURE_FLIPS");
+		for (const char* p = value; p != nullptr && *p != '\0';) {
+			char* end = nullptr;
+			const auto n = std::strtoull(p, &end, 0);
+			if (end == p) break;
+			list.push_back(n);
+			p = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	if (flips.empty()) return;
+	static uint64_t flip = 0;
+	++flip;
+	for (const auto n: flips) {
+		if (n == flip) {
+			std::printf("RenderDoc: automatic capture at guest flip %llu (KYTY_RENDERDOC_CAPTURE_FLIPS)\n",
+			            static_cast<unsigned long long>(flip));
+			RenderDocRequestCapture();
+		}
+	}
+}
+
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	AutoCaptureOnFlip();
 	const auto state = g_state.load(std::memory_order_acquire);
 	if (g_api == nullptr || state == RenderDocState::Idle) {
 		return;

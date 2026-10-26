@@ -673,6 +673,81 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan TracedPlan() {
   return ExtractResourcePlan(program);
 }
 
+// KYTY_SRT_GPU_FILL (GpuFillSlots): of three flat reads through one user-data-free table, the
+// one a descriptor uses stays a host value; the one the shader only stores as data may be left
+// to the GPU (1), and so may the one only a buffer store's offset uses (2: the renderer then
+// takes the binding as written whole). A slot is left when the runtime reports its dword
+// GPU-written: the snapshot gets a placeholder and a fill, the other slots their values.
+uint64_t g_gpu_written_address = 0;
+bool GpuWrittenForTest(uint64_t address) { return address == g_gpu_written_address; }
+
+void TestGpuFillSlotsLeaveShaderOnlyReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  alignas(16) static std::array<uint32_t, 4> table{0x1111u, 0x2222u, 0x3333u, 0u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &value_block = AddValueBlock(program);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  program.memory_info.push_back(memory);
+  auto &handle = value_block.AppendNewInst(
+      ValueOpcode::GetAddressResource,
+      {Value(static_cast<uint32_t>(address)), Value(static_cast<uint32_t>(address >> 32u))});
+  auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
+  std::array<Value, 3> flat;
+  for (uint32_t i = 0; i < flat.size(); i++) {
+    auto &raw = value_block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                          {Value(&handle), Value(i * 4u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40 + i * 4u});
+    program.srt_reads.push_back({Value(&raw), i});
+    flat[i] = Value(&value_block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(i)}));
+  }
+  DescriptorSource source;
+  source.dwords[0] = flat[0];
+  source.dwords[1] = Value(0u);
+  source.dwords[2] = Value(0u);
+  source.dwords[3] = Value(0u);
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto &buffer = value_block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                           {flat[0], Value(0u), Value(0u), Value(0u)});
+  value_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+                            {Value(&buffer), Value(0u), flat[2], Value(0u), flat[1], Value(true)});
+  const auto plan = ExtractResourcePlan(program);
+  Check(plan.gpu_fill_slots.size() == 3 && plan.gpu_fill_slots[0] == 0u &&
+            plan.gpu_fill_slots[1] == 1u && plan.gpu_fill_slots[2] == 2u,
+        "GPU-fill slots: the descriptor read is a host value, the others qualify");
+
+  for (const bool fill : {false, true}) {
+    for (const uint32_t written : {0u, 1u, 2u}) {
+      g_gpu_written_address = address + written * 4u;
+      SrtRuntime runtime{};
+      if (fill) {
+        runtime.gpu_written = GpuWrittenForTest;
+        runtime.gpu_fill_store_offsets = true;
+      }
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "GPU-fill materialization failed");
+      const bool left = fill && written != 0u;
+      Check(snapshot.flattened_srt.size() == 3 && snapshot.flattened_srt[0] == 0x1111u &&
+                snapshot.flattened_srt[1] == (left && written == 1u ? 0u : 0x2222u) &&
+                snapshot.flattened_srt[2] == (left && written == 2u ? 0u : 0x3333u),
+            "GPU-fill materialization changed a host slot or read a GPU slot");
+      Check(left ? (snapshot.gpu_fills.size() == 1 && snapshot.gpu_fills[0].flat_offset == written &&
+                    snapshot.gpu_fills[0].address == address + written * 4u)
+                 : snapshot.gpu_fills.empty(),
+            "GPU-fill list wrong");
+    }
+  }
+}
+
 void TestTraceReplayMatchesWalk() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   alignas(4096) static std::array<uint32_t, 2048> pages{};
@@ -781,6 +856,7 @@ int main() {
   TestSpeculativeRuntimeMatchesSerial();
   TestRecordedPreparationCertifies();
   TestTraceReplayMatchesWalk();
+  TestGpuFillSlotsLeaveShaderOnlyReads();
   }
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

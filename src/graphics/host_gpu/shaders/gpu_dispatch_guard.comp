@@ -1,0 +1,32 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Dispatch argument guard (KYTY_INDIRECT_GUARD, renderer/dispatchGuard.h). Copies one guest
+// DispatchIndirect record (3 dwords) into the guard slot, replaced by 0,0,0 when a component or the
+// product exceeds the host limits: a record the emulation produced from stale or garbage data would
+// otherwise hang the device. Slot dwords: {x, y, z, flag(1 = replaced), raw x, raw y, raw z, 0}.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Args { uint words[]; } args;
+layout(set = 0, binding = 1, std430) writeonly buffer Out { uint words[]; } slot;
+layout(push_constant) uniform Push {
+	uint args_word;
+	uint out_word;
+	uint max_dim;
+	uint max_total;
+} push_data;
+
+void main() {
+	uint x = args.words[push_data.args_word];
+	uint y = args.words[push_data.args_word + 1u];
+	uint z = args.words[push_data.args_word + 2u];
+	bool bad = x > push_data.max_dim || y > push_data.max_dim || z > push_data.max_dim ||
+	           (uint64_t(x) * uint64_t(y) * uint64_t(z)) > uint64_t(push_data.max_total);
+	uint o = push_data.out_word;
+	slot.words[o] = bad ? 0u : x;
+	slot.words[o + 1u] = bad ? 0u : y;
+	slot.words[o + 2u] = bad ? 0u : z;
+	slot.words[o + 3u] = bad ? 1u : 0u;
+	slot.words[o + 4u] = x;
+	slot.words[o + 5u] = y;
+	slot.words[o + 6u] = z;
+	slot.words[o + 7u] = 0u;
+}

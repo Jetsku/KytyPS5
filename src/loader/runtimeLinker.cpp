@@ -31,6 +31,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +44,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -794,7 +797,36 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 	}
 #endif
 	const GuestLoad::FaultScope guest_load(guest_code ? info->native_context : nullptr);
-	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	// KYTY_FAULT_AMM_WAIT_MS=N (default 5000; 0 off; after IDXTRI's Wolverine fix): an access to
+	// memory that a queued AMM map command will map waits for that map, up to N ms, and then runs
+	// again. On the hardware the map runs within microseconds; here its queue can sit behind a wait
+	// on the emulated GPU, and the access faulted fatally on the unmapped page.
+	if (!handled && access != GpuAccess::Execute &&
+	    Libs::LibKernel::Memory::PendingAmmMapCovers(info->access_violation_vaddr)) {
+		static const int64_t wait_ms = [] {
+			const char* value = std::getenv("KYTY_FAULT_AMM_WAIT_MS");
+			return value != nullptr && value[0] != '\0' ? std::strtoll(value, nullptr, 10) : int64_t {5000};
+		}();
+		const auto start    = std::chrono::steady_clock::now();
+		const auto deadline = start + std::chrono::milliseconds(std::max<int64_t>(wait_ms, 0));
+		while (std::chrono::steady_clock::now() < deadline &&
+		       Libs::LibKernel::Memory::PendingAmmMapCovers(info->access_violation_vaddr)) {
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+		// The map ran (or the wait ended): the access runs again and faults anew if it must.
+		handled = !Libs::LibKernel::Memory::PendingAmmMapCovers(info->access_violation_vaddr);
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("Host fault at 0x%016" PRIx64 ": waited %lld us for a queued AMM map: %s\n",
+			            info->access_violation_vaddr,
+			            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                       std::chrono::steady_clock::now() - start)
+			                                       .count()),
+			            handled ? "retrying" : "still pending");
+			std::fflush(stdout);
+		}
+	}
 	if (handled) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 	}
@@ -905,6 +937,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (doing[0] != '\0') {
 				append("thread was in: {}\n", doing);
 			}
+		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			// What the faulting address was: an unmapped page, a protected view, a range the GPU
+			// tracker no longer maps, or memory a queued AMM map still has to back.
+			append("fault address: 0x{:016x}\n", info->access_violation_vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			MEMORY_BASIC_INFORMATION mbi {};
+			if (VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &mbi, sizeof(mbi)) != 0) {
+				append("host page: base=0x{:x} alloc=0x{:x} size=0x{:x} state=0x{:x} protect=0x{:x} type=0x{:x}\n",
+				       reinterpret_cast<uint64_t>(mbi.BaseAddress), reinterpret_cast<uint64_t>(mbi.AllocationBase),
+				       static_cast<uint64_t>(mbi.RegionSize), static_cast<uint32_t>(mbi.State),
+				       static_cast<uint32_t>(mbi.Protect), static_cast<uint32_t>(mbi.Type));
+			}
+#endif
+			append("{}", Libs::LibKernel::Memory::DescribeAddressForCrash(info->access_violation_vaddr));
 		}
 		append("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 		       "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"

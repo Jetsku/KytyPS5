@@ -1,0 +1,795 @@
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+
+#include "common/alignment.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/threads.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+
+namespace Libs::Graphics {
+
+bool BindlessEngineEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_ENGINE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint32_t BindlessImagesPerArray(const GraphicContext& graphics) {
+	if (!graphics.bindless_enabled) {
+		return 0;
+	}
+	return std::min(BindlessTable::MaxImagesPerArray,
+	                graphics.bindless_max_sampled_images / BindlessTable::ImageArrays);
+}
+
+vk::DescriptorSetLayout BindlessSetLayout(GraphicContext& graphics) {
+	if (!graphics.bindless_enabled) {
+		return nullptr;
+	}
+	Common::LockGuard lock(graphics.bindless_layout_mutex);
+	if (graphics.bindless_layout != nullptr) {
+		return graphics.bindless_layout;
+	}
+	const auto images_per_array = BindlessImagesPerArray(graphics);
+	if (images_per_array <= BindlessTable::PlaceholderColors) {
+		LOGF("Bindless table: the device allows too few update-after-bind sampled images (%u)\n",
+		     graphics.bindless_max_sampled_images);
+		return nullptr;
+	}
+	using Binding = BindlessTable::Binding;
+	constexpr auto image_flags = vk::DescriptorBindingFlagBits::ePartiallyBound |
+	                             vk::DescriptorBindingFlagBits::eUpdateAfterBind |
+	                             vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	// The buffers are written once, at creation, so they need no update-after-bind.
+	constexpr auto buffer_flags = vk::DescriptorBindingFlags {};
+	const std::array<vk::DescriptorSetLayoutBinding, 6> bindings {{
+	    {Binding::Images2D, vk::DescriptorType::eSampledImage, images_per_array,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Binding::Images2DArray, vk::DescriptorType::eSampledImage, images_per_array,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Binding::ImagesCube, vk::DescriptorType::eSampledImage, images_per_array,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Binding::Images3D, vk::DescriptorType::eSampledImage, images_per_array,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Binding::Translation, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll,
+	     nullptr},
+	    {Binding::Feedback, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll,
+	     nullptr},
+	}};
+	const std::array<vk::DescriptorBindingFlags, 6> binding_flags {
+	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags};
+	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
+	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
+	flags_info.pBindingFlags = binding_flags.data();
+	vk::DescriptorSetLayoutCreateInfo layout_info {};
+	layout_info.pNext        = &flags_info;
+	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
+	layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	layout_info.pBindings    = bindings.data();
+	vk::DescriptorSetLayout layout = nullptr;
+	if (graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &layout) !=
+	    vk::Result::eSuccess) {
+		LOGF("Bindless table: creating the descriptor set layout failed\n");
+		return nullptr;
+	}
+	graphics.bindless_layout = layout;
+	return layout;
+}
+
+BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler,
+                             PageManager& page_manager)
+    : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager) {}
+
+BindlessTable::~BindlessTable() {
+	Destroy();
+	Common::LockGuard lock(m_graphics.bindless_layout_mutex);
+	if (m_graphics.bindless_layout != nullptr) {
+		m_graphics.device.destroyDescriptorSetLayout(m_graphics.bindless_layout, nullptr);
+		m_graphics.bindless_layout = nullptr;
+	}
+}
+
+void BindlessTable::Destroy() {
+	for (uint32_t i = 0; i < Placeholders; i++) {
+		if (m_placeholder_views[i] != nullptr) {
+			m_graphics.device.destroyImageView(m_placeholder_views[i], nullptr);
+			m_placeholder_views[i] = nullptr;
+		}
+		if (m_placeholders[i].image != nullptr) {
+			m_graphics.DeleteImage(m_placeholders[i]);
+		}
+	}
+	m_translation.reset();
+	m_feedback.reset();
+	m_feedback_snapshot.reset();
+	if (m_pool != nullptr) {
+		m_graphics.device.destroyDescriptorPool(m_pool, nullptr);
+		m_pool = nullptr;
+	}
+	m_set = nullptr;
+}
+
+bool BindlessTable::Supported() const noexcept {
+	return m_graphics.bindless_enabled;
+}
+
+bool BindlessTable::EnsureCreated() {
+	if (m_set != nullptr) {
+		return true;
+	}
+	if (m_creation_failed || !m_graphics.bindless_enabled || !m_scheduler.Active() ||
+	    m_scheduler.Current().IsInvalid()) {
+		return false;
+	}
+	const auto layout = BindlessSetLayout(m_graphics);
+	if (layout == nullptr) {
+		m_creation_failed = true;
+		return false;
+	}
+	m_images_per_array = BindlessImagesPerArray(m_graphics);
+
+	const std::array<vk::DescriptorPoolSize, 2> sizes {{
+	    {vk::DescriptorType::eSampledImage, m_images_per_array * ImageArrays},
+	    {vk::DescriptorType::eStorageBuffer, 2},
+	}};
+	vk::DescriptorPoolCreateInfo pool_info {};
+	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
+	pool_info.maxSets       = 1;
+	pool_info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	pool_info.pPoolSizes    = sizes.data();
+	vk::DescriptorSet set   = nullptr;
+	if (m_graphics.device.createDescriptorPool(&pool_info, nullptr, &m_pool) != vk::Result::eSuccess) {
+		LOGF("Bindless table: creating the descriptor pool failed\n");
+		m_pool            = nullptr;
+		m_creation_failed = true;
+		return false;
+	}
+	vk::DescriptorSetAllocateInfo allocate_info {};
+	allocate_info.descriptorPool     = m_pool;
+	allocate_info.descriptorSetCount = 1;
+	allocate_info.pSetLayouts        = &layout;
+	if (m_graphics.device.allocateDescriptorSets(&allocate_info, &set) != vk::Result::eSuccess) {
+		LOGF("Bindless table: allocating the descriptor set failed\n");
+		Destroy();
+		m_creation_failed = true;
+		return false;
+	}
+
+	// Both live in host-visible memory: the host writes translations and clears feedback flags
+	// directly, while shaders access them at device speed where the device allows. The host
+	// reads the flags from a host-cached snapshot (RecordFeedbackSnapshot).
+	m_translation = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
+	m_feedback    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
+	m_feedback_snapshot = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download,
+	                                               0, AllFlags,
+	                                               TranslationEntries * sizeof(uint32_t));
+	if (m_translation->Mapped().empty() || m_feedback->Mapped().empty() ||
+	    m_feedback_snapshot->Mapped().empty()) {
+		LOGF("Bindless table: the translation or feedback buffer is not host-visible\n");
+		Destroy();
+		m_creation_failed = true;
+		return false;
+	}
+	// Written on the host before any command that reads them is submitted (Senaxx cleared them
+	// in a fenced submission of its own): translation[0], the entry of keys outside their heap,
+	// is placeholder slot 1; every other entry and every feedback flag is 0. A region allocated
+	// after a snapshot was recorded reads as "no requests" until the next.
+	std::fill(m_translation->Mapped().begin(), m_translation->Mapped().end(), uint8_t {0});
+	reinterpret_cast<uint32_t*>(m_translation->Mapped().data())[0] = 1u;
+	std::fill(m_feedback->Mapped().begin(), m_feedback->Mapped().end(), uint8_t {0});
+	std::fill(m_feedback_snapshot->Mapped().begin(), m_feedback_snapshot->Mapped().end(),
+	          uint8_t {0});
+	m_translation->Flush(0, m_translation->Size());
+	m_feedback->Flush(0, m_feedback->Size());
+	m_feedback_snapshot->Flush(0, m_feedback_snapshot->Size());
+	SetVulkanObjectNameF(m_graphics.device, m_translation->Handle(), "Bindless Translation");
+	SetVulkanObjectNameF(m_graphics.device, m_feedback->Handle(), "Bindless Feedback");
+
+	const std::array<vk::DescriptorBufferInfo, 2> buffer_infos {{
+	    {m_translation->Handle(), 0, VK_WHOLE_SIZE},
+	    {m_feedback->Handle(), 0, VK_WHOLE_SIZE},
+	}};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t i = 0; i < writes.size(); i++) {
+		writes[i].dstSet          = set;
+		writes[i].dstBinding      = Translation + i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[i].pBufferInfo     = &buffer_infos[i];
+	}
+	m_graphics.device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0,
+	                                       nullptr);
+	m_set = set;
+	if (!CreatePlaceholders()) {
+		LOGF("Bindless table: creating the placeholder textures failed\n");
+		Destroy();
+		m_creation_failed = true;
+		return false;
+	}
+	LOGF("Bindless table: %u images per array, %u translation entries\n", m_images_per_array,
+	     TranslationEntries);
+	return true;
+}
+
+bool BindlessTable::CreatePlaceholders() {
+	struct Kind {
+		vk::ImageType        type;
+		vk::ImageViewType    view;
+		uint32_t             layers;
+		vk::ImageCreateFlags flags;
+	};
+	const std::array<Kind, ImageArrays> kinds {{
+	    {vk::ImageType::e2D, vk::ImageViewType::e2D, 1, {}},
+	    {vk::ImageType::e2D, vk::ImageViewType::e2DArray, 1, {}},
+	    {vk::ImageType::e2D, vk::ImageViewType::eCube, 6, vk::ImageCreateFlagBits::eCubeCompatible},
+	    {vk::ImageType::e3D, vk::ImageViewType::e3D, 1, {}},
+	}};
+	// Placeholder i: view type i % ImageArrays, colour (slot) i / ImageArrays.
+	for (uint32_t i = 0; i < Placeholders; i++) {
+		const auto&         kind = kinds[i % ImageArrays];
+		vk::ImageCreateInfo info {};
+		info.flags         = kind.flags;
+		info.imageType     = kind.type;
+		info.format        = vk::Format::eR8G8B8A8Unorm;
+		info.extent        = vk::Extent3D {1, 1, 1};
+		info.mipLevels     = 1;
+		info.arrayLayers   = kind.layers;
+		info.samples       = vk::SampleCountFlagBits::e1;
+		info.tiling        = vk::ImageTiling::eOptimal;
+		info.usage         = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+		info.initialLayout = vk::ImageLayout::eUndefined;
+		if (!m_graphics.CreateImage(info, m_placeholders[i])) {
+			return false;
+		}
+		vk::ImageViewCreateInfo view {};
+		view.image            = m_placeholders[i].image;
+		view.viewType         = kind.view;
+		view.format           = info.format;
+		view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, kind.layers};
+		if (m_graphics.device.createImageView(&view, nullptr, &m_placeholder_views[i]) !=
+		    vk::Result::eSuccess) {
+			m_placeholder_views[i] = nullptr;
+			return false;
+		}
+	}
+
+	// Cleared in the command buffer being recorded, outside rendering, before the first command
+	// that can sample them (Senaxx used a fenced submission of its own).
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto sink = command.HelperSink();
+	std::array<vk::ImageMemoryBarrier, Placeholders> to_transfer {};
+	std::array<vk::ImageMemoryBarrier, Placeholders> to_read {};
+	for (uint32_t i = 0; i < Placeholders; i++) {
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+		                                       kinds[i % ImageArrays].layers};
+		to_transfer[i].srcAccessMask       = {};
+		to_transfer[i].dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_transfer[i].oldLayout           = vk::ImageLayout::eUndefined;
+		to_transfer[i].newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		to_transfer[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer[i].image               = m_placeholders[i].image;
+		to_transfer[i].subresourceRange    = range;
+		to_read[i]                         = to_transfer[i];
+		to_read[i].srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
+		to_read[i].dstAccessMask           = vk::AccessFlagBits::eShaderRead;
+		to_read[i].oldLayout               = vk::ImageLayout::eTransferDstOptimal;
+		to_read[i].newLayout               = vk::ImageLayout::eShaderReadOnlyOptimal;
+	}
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+	                     {}, 0, nullptr, 0, nullptr, Placeholders, to_transfer.data());
+	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 grey (not resident), slot
+	// 1 red (key outside its heap), slot 2 blue (pending), to see which case a surface is in.
+	const bool debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
+	const auto color        = [debug_colors](float r, float g, float b) {
+        return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
+		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+	};
+	const std::array<vk::ClearColorValue, PlaceholderColors> colors {
+	    color(0.5f, 0.5f, 0.5f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f)};
+	for (uint32_t i = 0; i < Placeholders; i++) {
+		sink.clearColorImage(m_placeholders[i].image, vk::ImageLayout::eTransferDstOptimal,
+		                     &colors[i / ImageArrays], 1, &to_transfer[i].subresourceRange);
+	}
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                     vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 0, nullptr,
+	                     Placeholders, to_read.data());
+
+	std::array<vk::DescriptorImageInfo, Placeholders> infos {};
+	std::array<vk::WriteDescriptorSet, Placeholders>  writes {};
+	for (uint32_t i = 0; i < Placeholders; i++) {
+		infos[i]                  = {nullptr, m_placeholder_views[i],
+		                             vk::ImageLayout::eShaderReadOnlyOptimal};
+		writes[i].dstSet          = m_set;
+		writes[i].dstBinding      = Images2D + i % ImageArrays;
+		writes[i].dstArrayElement = i / ImageArrays;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eSampledImage;
+		writes[i].pImageInfo      = &infos[i];
+	}
+	m_graphics.device.updateDescriptorSets(Placeholders, writes.data(), 0, nullptr);
+	return true;
+}
+
+bool BindlessTable::IsPlaceholder(vk::ImageView view) const noexcept {
+	return std::ranges::find(m_placeholder_views, view) != m_placeholder_views.end();
+}
+
+void BindlessTable::WatchHeap(Heap& heap) {
+	heap.watched_entries  = heap.guest_entries;
+	heap.watch_generation = m_watch_generation.load(std::memory_order_acquire);
+	// A record pointer heap watches its records (the pointers); RevalidateBindlessKeys follows
+	// what they point at.
+	const bool pointers = heap.record_pointer != UINT32_MAX;
+	const auto table    = pointers ? heap.base : heap.base + heap.table_offset;
+	const auto begin    = Common::AlignDown(table, TRACKER_PAGE_SIZE);
+	const auto records  = heap.nested_keys != 0 ? heap.guest_entries / heap.nested_keys
+	                                            : heap.guest_entries;
+	const auto end      = Common::AlignUp(
+        table + uint64_t {records} * (pointers ? heap.stride : 32u), TRACKER_PAGE_SIZE);
+	if (end <= begin) {
+		return;
+	}
+	std::scoped_lock lock {m_watch_mutex};
+	auto watch = std::ranges::find_if(m_watches, [&](const Watch& w) { return w.begin == begin; });
+	if (watch == m_watches.end()) {
+		watch        = m_watches.insert(m_watches.end(), Watch {});
+		watch->begin = begin;
+		watch->end   = begin;
+	}
+	if (end <= watch->end) {
+		return;
+	}
+	// The heap grew (or is new): watch the pages it now covers.
+	const auto first = static_cast<size_t>((watch->end - begin) / TRACKER_PAGE_SIZE);
+	const auto pages = static_cast<size_t>((end - begin) / TRACKER_PAGE_SIZE);
+	watch->watched.resize(pages, 0u);
+	watch->written.resize(pages, 0u);
+	watch->end = end;
+	for (size_t page = first; page < pages; page++) {
+		watch->watched[page] = 1;
+	}
+	m_page_manager.UpdatePageWatchers<true>(begin + first * TRACKER_PAGE_SIZE,
+	                                        (pages - first) * TRACKER_PAGE_SIZE);
+	if (begin < m_watch_low.load(std::memory_order_relaxed)) {
+		m_watch_low.store(begin, std::memory_order_release);
+	}
+	if (end > m_watch_high.load(std::memory_order_relaxed)) {
+		m_watch_high.store(end, std::memory_order_release);
+	}
+}
+
+void BindlessTable::OnCpuWrite(uint64_t vaddr, uint64_t size) noexcept {
+	// Called for every CPU write fault: most are nowhere near a heap and must not take the lock.
+	if (vaddr + size <= m_watch_low.load(std::memory_order_acquire) ||
+	    vaddr >= m_watch_high.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::scoped_lock lock {m_watch_mutex};
+	for (auto& watch: m_watches) {
+		const auto begin = std::max(watch.begin, Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+		const auto end   = std::min(watch.end, vaddr + size);
+		for (auto address = begin; address < end; address += TRACKER_PAGE_SIZE) {
+			const auto page = static_cast<size_t>((address - watch.begin) / TRACKER_PAGE_SIZE);
+			if (watch.watched[page] == 0) {
+				continue;
+			}
+			// The faulting write must go through: stop watching the page until the next sync.
+			watch.watched[page] = 0;
+			watch.written[page] = 1;
+			m_page_manager.UpdatePageWatchers<false>(address, TRACKER_PAGE_SIZE);
+			m_heap_writes.store(true, std::memory_order_release);
+		}
+	}
+}
+
+void BindlessTable::UnwatchRange(uint64_t vaddr, uint64_t size) {
+	if (vaddr + size <= m_watch_low.load(std::memory_order_acquire) ||
+	    vaddr >= m_watch_high.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::scoped_lock lock {m_watch_mutex};
+	for (auto& watch: m_watches) {
+		if (vaddr + size <= watch.begin || vaddr >= watch.end) {
+			continue;
+		}
+		// Part of the table is unmapped: drop the whole watch. WatchHeap builds it again the
+		// next time a draw uses the heap, over what is mapped then.
+		for (size_t page = 0; page < watch.watched.size(); page++) {
+			if (watch.watched[page] != 0) {
+				m_page_manager.UpdatePageWatchers<false>(watch.begin + page * TRACKER_PAGE_SIZE,
+				                                         TRACKER_PAGE_SIZE);
+			}
+		}
+		watch.watched.clear();
+		watch.written.clear();
+		watch.end = watch.begin;
+		m_watch_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+}
+
+void BindlessTable::TakeWrittenRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	ranges.clear();
+	std::scoped_lock lock {m_watch_mutex};
+	m_heap_writes.store(false, std::memory_order_release);
+	for (auto& watch: m_watches) {
+		for (size_t page = 0; page < watch.written.size(); page++) {
+			if (watch.written[page] == 0) {
+				continue;
+			}
+			const auto address  = watch.begin + page * TRACKER_PAGE_SIZE;
+			watch.written[page] = 0;
+			// Watched again before the caller reads the entries: a later write is not lost.
+			if (watch.watched[page] == 0) {
+				watch.watched[page] = 1;
+				m_page_manager.UpdatePageWatchers<true>(address, TRACKER_PAGE_SIZE);
+			}
+			if (!ranges.empty() && ranges.back().second == address) {
+				ranges.back().second += TRACKER_PAGE_SIZE;
+			} else {
+				ranges.emplace_back(address, address + TRACKER_PAGE_SIZE);
+			}
+		}
+	}
+}
+
+bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
+	// Headroom so a growing heap rarely moves; a move re-writes the keys resolved so far.
+	const auto capacity = std::max(entries, std::min<uint32_t>(entries * 2u, 1u << 16u));
+	if (capacity > TranslationEntries - m_next_region) {
+		return false;
+	}
+	const auto old_region  = heap.region;
+	const auto old_entries = heap.entries;
+	heap.region            = m_next_region;
+	heap.entries           = capacity;
+	m_next_region += capacity;
+	heap.slots.resize(capacity, 0u);
+	heap.settled.resize(capacity, 0u);
+	heap.descriptors.resize(capacity);
+	heap.images.resize(capacity);
+	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	for (uint32_t key = 0; key < capacity; key++) {
+		uint32_t value = ShaderRecompiler::IR::BindlessPending;
+		if (key < old_entries && heap.settled[key] != 0) {
+			value = heap.slots[key];
+		}
+		translation[heap.region + key] = value;
+		feedback[heap.region + key]    = 0;
+	}
+	m_translation->Flush(heap.region * sizeof(uint32_t), capacity * sizeof(uint32_t));
+	m_feedback->Flush(heap.region * sizeof(uint32_t), capacity * sizeof(uint32_t));
+	LOGF("Bindless heap region: base=0x%016" PRIx64 " binding=%u region=%u entries=%u (was %u at "
+	     "%u)\n",
+	     heap.base, heap.binding, heap.region, capacity, old_entries, old_region);
+	return true;
+}
+
+BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
+    uint64_t base, uint32_t table_offset, uint32_t binding, uint32_t entries,
+    const ShaderRecompiler::IR::ImageResource& resource, uint32_t stride, uint32_t record_pointer,
+    uint32_t nested_vsharp, uint32_t nested_heap, uint32_t nested_keys) {
+	if (entries == 0 || m_set == nullptr) {
+		return nullptr;
+	}
+	for (auto& heap: m_heaps) {
+		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding &&
+		    heap.stride == stride && heap.record_pointer == record_pointer &&
+		    heap.nested_vsharp == nested_vsharp && heap.nested_heap == nested_heap &&
+		    heap.nested_keys == nested_keys) {
+			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
+				return nullptr;
+			}
+			heap.guest_entries = std::max(heap.guest_entries, entries);
+			return &heap;
+		}
+	}
+	auto& heap         = m_heaps.emplace_back();
+	heap.base          = base;
+	heap.table_offset   = table_offset;
+	heap.stride         = stride;
+	heap.record_pointer = record_pointer;
+	heap.nested_vsharp  = nested_vsharp;
+	heap.nested_heap    = nested_heap;
+	heap.nested_keys    = nested_keys;
+	heap.binding        = binding;
+	heap.resource      = resource;
+	heap.guest_entries = entries;
+	if (!AllocateRegion(heap, std::max(entries, 1u << 14u))) {
+		m_heaps.pop_back();
+		return nullptr;
+	}
+	return &heap;
+}
+
+uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
+	if (binding >= ImageArrays) {
+		return 0;
+	}
+	// Keys are settled again whenever the guest rewrites a heap entry or a texture is evicted,
+	// and each settle took a new slot: the array would fill up over a long session.
+	if (auto& free = m_free_slots[binding];
+	    !free.empty() && m_scheduler.IsFree(free.front().second)) {
+		const auto slot = free.front().first;
+		free.pop_front();
+		m_slot_free[binding][slot] = 0;
+		return slot;
+	}
+	if (m_next_slot[binding] >= m_images_per_array) {
+		return 0;
+	}
+	return m_next_slot[binding]++;
+}
+
+void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
+	static const bool reuse = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_SLOT_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!reuse || binding >= ImageArrays || slot < PlaceholderColors) {
+		return;
+	}
+	auto& flags = m_slot_free[binding];
+	if (flags.size() <= slot) {
+		flags.resize(static_cast<size_t>(slot) + 1u, 0);
+	}
+	// A slot already waiting on the free list must not be queued twice: two keys would get it.
+	if (flags[slot] != 0) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("Bindless: slot %u/%u freed twice; kept once\n", binding, slot);
+		}
+		return;
+	}
+	flags[slot] = 1;
+	// Command buffers recorded so far may still sample the slot.
+	m_free_slots[binding].emplace_back(slot, m_scheduler.CurrentTick());
+}
+
+void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view,
+                              vk::ImageLayout layout) {
+	const vk::DescriptorImageInfo info {nullptr, view, layout};
+	vk::WriteDescriptorSet        write {};
+	write.dstSet          = m_set;
+	write.dstBinding      = binding;
+	write.dstArrayElement = slot;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eSampledImage;
+	write.pImageInfo      = &info;
+	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	if (binding >= ImageArrays) {
+		return;
+	}
+	auto& views = m_slot_views[binding];
+	if (views.size() <= slot) {
+		views.resize(slot + 1u);
+	}
+	if (const auto old = views[slot]; old != nullptr) {
+		if (const auto found = m_view_slots.find(static_cast<VkImageView>(old));
+		    found != m_view_slots.end()) {
+			std::erase(found->second, std::pair {binding, slot});
+			if (found->second.empty()) {
+				m_view_slots.erase(found);
+			}
+		}
+	}
+	const bool placeholder = IsPlaceholder(view);
+	views[slot]            = placeholder ? vk::ImageView {} : view;
+	if (!placeholder && view != nullptr) {
+		m_view_slots[static_cast<VkImageView>(view)].emplace_back(binding, slot);
+	}
+}
+
+uint32_t BindlessTable::ReleaseSlotKeys(uint32_t binding, uint32_t slot) {
+	uint32_t keys = 0;
+	for (auto& heap: m_heaps) {
+		if (heap.binding != binding) {
+			continue;
+		}
+		for (uint32_t key = 0; key < heap.slots.size(); key++) {
+			if (heap.slots[key] != slot) {
+				continue;
+			}
+			if (const auto id = heap.images[key]; id) {
+				if (const auto refs = m_image_refs.find(ImageKey(id)); refs != m_image_refs.end()) {
+					std::erase(refs->second, std::pair<Heap*, uint32_t> {&heap, key});
+					if (refs->second.empty()) {
+						m_image_refs.erase(refs);
+					}
+				}
+				std::erase(heap.resolved, id);
+				heap.checked_generation = 0;
+			}
+			heap.slots[key]   = 0;
+			heap.settled[key] = 0;
+			heap.images[key]  = {};
+			SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+			keys++;
+		}
+	}
+	return keys;
+}
+
+bool BindlessTable::ReleaseViews(std::span<const CachedImageView> views) {
+	if (m_set == nullptr || m_view_slots.empty()) {
+		return false;
+	}
+	bool held = false;
+	for (const auto& cached: views) {
+		const auto found = m_view_slots.find(static_cast<VkImageView>(cached.view));
+		if (cached.view == nullptr || found == m_view_slots.end()) {
+			continue;
+		}
+		const auto slots = found->second; // WriteSlot edits the map
+		for (const auto& [binding, slot]: slots) {
+			held            = true;
+			const auto keys = ReleaseSlotKeys(binding, slot);
+			WriteSlot(binding, slot, PlaceholderView(binding, 0),
+			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			// Only a slot this took from keys goes to the free list: one no key uses is on it
+			// already (ReleaseKey / OnImageUnregistered keep its view until it is reused).
+			if (keys != 0) {
+				FreeSlot(binding, slot);
+			}
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 16) {
+				LOGF("Bindless: binding %u slot %u still held a view of an image being dropped "
+				     "(%u keys); repointed to the placeholder\n",
+				     binding, slot, keys);
+			}
+		}
+	}
+	return held;
+}
+
+void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {
+	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	translation[heap.region + key] = slot;
+	m_translation->Flush((heap.region + key) * sizeof(uint32_t), sizeof(uint32_t));
+}
+
+void BindlessTable::RecordFeedbackSnapshot() {
+	if (m_set == nullptr || !m_scheduler.Active()) {
+		return;
+	}
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid()) {
+		return;
+	}
+	// Regions are allocated contiguously after word 0, so one copy covers every heap.
+	const vk::DeviceSize size = vk::DeviceSize {m_next_region} * sizeof(uint32_t);
+	command.EndRendering();
+	const auto              sink = command.HelperSink();
+	vk::BufferMemoryBarrier flags_written {};
+	flags_written.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	flags_written.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	flags_written.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	flags_written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	flags_written.buffer              = m_feedback->Handle();
+	flags_written.offset              = 0;
+	flags_written.size                = size;
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                     vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &flags_written, 0,
+	                     nullptr);
+	const vk::BufferCopy copy {0, 0, size};
+	sink.copyBuffer(m_feedback->Handle(), m_feedback_snapshot->Handle(), 1, &copy);
+	auto snapshot_written          = flags_written;
+	snapshot_written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	snapshot_written.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	snapshot_written.buffer        = m_feedback_snapshot->Handle();
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+	                     0, nullptr, 1, &snapshot_written, 0, nullptr);
+	m_snapshot_tick = m_scheduler.CurrentTick();
+}
+
+bool BindlessTable::SnapshotReady() {
+	return m_snapshot_tick != 0 && m_scheduler.IsFree(m_snapshot_tick);
+}
+
+void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+	bool cleared = false;
+	for (uint32_t key = 0; key < heap.entries; key++) {
+		if (snapshot[heap.region + key] == 1u) {
+			// A flag the GPU sets again after the snapshot may be lost here; a key that is
+			// still pending is flagged again by the next draw that samples it.
+			feedback[heap.region + key] = 0;
+			keys.push_back(key);
+			cleared = true;
+		}
+	}
+	if (cleared) {
+		m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+	}
+}
+
+uint32_t BindlessTable::TakeWordZero() {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(0, sizeof(uint32_t));
+	const auto value = snapshot[0];
+	if (value != 0) {
+		feedback[0] = 0;
+		m_feedback->Flush(0, sizeof(uint32_t));
+	}
+	return value;
+}
+
+void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
+	m_image_refs[ImageKey(id)].emplace_back(&heap, key);
+}
+
+bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key, bool free_slot) {
+	const auto id      = heap.images[key];
+	bool       no_refs = false;
+	if (id) {
+		const auto found = m_image_refs.find(ImageKey(id));
+		if (found != m_image_refs.end()) {
+			std::erase(found->second, std::pair<Heap*, uint32_t> {&heap, key});
+			const bool in_heap = std::any_of(found->second.begin(), found->second.end(),
+			                                 [&](const auto& ref) { return ref.first == &heap; });
+			if (!in_heap) {
+				std::erase(heap.resolved, id);
+				// Erasing shifts the images RenderExecutor::CommitBindings counted as checked.
+				heap.checked_generation = 0;
+			}
+			if (found->second.empty()) {
+				m_image_refs.erase(found);
+				no_refs = true;
+			}
+		}
+	}
+	if (heap.slots[key] != 0 && free_slot) {
+		FreeSlot(heap.binding, heap.slots[key]);
+	}
+	heap.slots[key]   = 0;
+	heap.settled[key] = 0;
+	heap.images[key]  = {};
+	SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+	return no_refs;
+}
+
+void BindlessTable::OnImageUnregistered(ImageId id) {
+	const auto found = m_image_refs.find(ImageKey(id));
+	if (found == m_image_refs.end()) {
+		return;
+	}
+	for (const auto& [heap, key]: found->second) {
+		if (heap->slots[key] != 0) {
+			// Placeholder 0 of the heap's own view type.
+			WriteSlot(heap->binding, heap->slots[key], PlaceholderView(heap->binding, 0),
+			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			FreeSlot(heap->binding, heap->slots[key]);
+		}
+		heap->slots[key]   = 0;
+		heap->settled[key] = 0;
+		heap->images[key]  = {};
+		SetTranslation(*heap, key, ShaderRecompiler::IR::BindlessPending);
+		std::erase(heap->resolved, id);
+		heap->checked_generation = 0;
+		m_unregistered_keys++;
+	}
+	m_image_refs.erase(found);
+}
+
+} // namespace Libs::Graphics

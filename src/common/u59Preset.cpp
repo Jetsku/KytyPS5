@@ -2,6 +2,7 @@
 
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fmt/format.h>
 #include <fstream>
@@ -34,11 +35,11 @@ bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& erro
 	return true;
 }
 
-LoadResult Load(const std::vector<std::filesystem::path>& dirs) {
+static LoadResult LoadNamed(const std::vector<std::filesystem::path>& dirs, std::string_view name) {
 	LoadResult result;
 	for (const auto& dir: dirs) {
 		result.searched.push_back(dir);
-		const auto      path = dir / FileName;
+		const auto      path = dir / std::filesystem::path(std::string(name));
 		std::error_code ec;
 		if (!std::filesystem::exists(path, ec)) {
 			continue;
@@ -61,6 +62,25 @@ LoadResult Load(const std::vector<std::filesystem::path>& dirs) {
 	}
 	result.status = Status::Missing;
 	return result;
+}
+
+LoadResult Load(const std::vector<std::filesystem::path>& dirs) {
+	return LoadNamed(dirs, FileName);
+}
+
+std::string TitleFileName(std::string_view title_id) {
+	return fmt::format("u59-preset.{}.json", title_id);
+}
+
+LoadResult LoadTitle(const std::vector<std::filesystem::path>& dirs, std::string_view title_id) {
+	const bool valid = title_id.size() == 9 &&
+	                   std::all_of(title_id.begin(), title_id.end(), [](char ch) {
+		                   return (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+	                   });
+	if (!valid) {
+		return {};
+	}
+	return LoadNamed(dirs, TitleFileName(title_id));
 }
 
 std::string Describe(const LoadResult& result) {

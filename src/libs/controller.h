@@ -93,6 +93,8 @@ void  CycleSetting(Setting setting);
 float GetSettingScale(Setting setting);
 // scePadGetTriggerEffectState: per trigger, the state of the game's effect at the trigger's travel.
 void GetTriggerEffectState(int32_t* state);
+// Counts guest flips for frame-timed KYTY_PAD_SCRIPT presses.
+void OnGuestFlip();
 
 int  PadCheckHandle(int handle);
 bool PadInitialized();

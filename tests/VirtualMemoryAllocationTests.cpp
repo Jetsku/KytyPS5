@@ -3190,6 +3190,70 @@ void TestAmmUnmapAcceptsHolesAndRestoresGpuRange() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestOrdinaryMappingsAvoidAmmWindow() {
+	// The AMM window (sceAmprAmmGetVirtualAddressRanges) belongs to AMM map commands, which map at
+	// fixed addresses. A direct map hinted at the window, or at 0x1000000000 (where Miles Morales
+	// maps its heap; the old window started there), must stay out of the window, and a fixed map
+	// inside it must still work.
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "OrdinaryMappingsAvoidAmmWindow";
+	constexpr uint64_t page = SceKernelPageSize;
+	int64_t            phys = 0;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(SceKernelDirectMemoryStart, KernelGetDirectMemorySize(),
+	                                   page * 2, page, SceKernelMtypeC, &phys),
+	        "KernelAllocateDirectMemory");
+	const auto outside = [](uint64_t address, uint64_t size) {
+		return address + size <= kAmmWindowBase || address >= kAmmWindowBase + kAmmWindowSize;
+	};
+	for (const uint64_t hint: {uint64_t {0}, uint64_t {0x1000000000ull}, kAmmWindowBase,
+	                           kAmmWindowBase + kAmmWindowSize - page}) {
+		void* addr = reinterpret_cast<void*>(hint);
+		CheckOk(test, KernelMapDirectMemory(&addr, page, SceKernelProtCpuRw, 0, phys, page),
+		        "KernelMapDirectMemory(hint)");
+		const auto base         = reinterpret_cast<uint64_t>(addr);
+		char       message[128] = {};
+		std::snprintf(message, sizeof(message),
+		              "hint 0x%016" PRIx64 " mapped inside the AMM window at 0x%016" PRIx64, hint,
+		              base);
+		Check(test, base != 0 && outside(base, page), message);
+		CheckOk(test, KernelMunmap(base, page), "KernelMunmap(hinted)");
+	}
+	void* reserved = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserved, page, 0, page), "KernelReserveVirtualRange");
+	Check(test, outside(reinterpret_cast<uint64_t>(reserved), page),
+	      "a hint-less reservation landed inside the AMM window");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(reserved), page), "KernelMunmap(reserved)");
+
+	constexpr int MapFixed = 0x10;
+	void*         fixed    = reinterpret_cast<void*>(kAmmWindowBase + page * 4);
+	CheckOk(test,
+	        KernelMapDirectMemory(&fixed, page, SceKernelProtCpuRw, MapFixed, phys + page, page),
+	        "KernelMapDirectMemory(fixed inside the AMM window)");
+	Check(test, reinterpret_cast<uint64_t>(fixed) == kAmmWindowBase + page * 4,
+	      "fixed map inside the AMM window moved");
+	*static_cast<volatile uint64_t*>(fixed) = 0x0123456789abcdefull;
+	Check(test, *static_cast<volatile uint64_t*>(fixed) == 0x0123456789abcdefull,
+	      "fixed map inside the AMM window is not writable");
+	// A streamed texture maps only its resident part: a read across the unmapped rest gets the
+	// mapped bytes and zeros (ReadPartlyUnmappedImageBacking, StagingCopier).
+	{
+		std::vector<uint8_t> bytes(page * 2, 0xcd);
+		Check(test, CopySparseMemory(kAmmWindowBase + page * 4, bytes.data(), bytes.size()),
+		      "a read across a mapped and an unmapped AMM page succeeds");
+		uint64_t first = 0;
+		std::memcpy(&first, bytes.data(), sizeof(first));
+		Check(test,
+		      first == 0x0123456789abcdefull &&
+		          std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(page), bytes.end(),
+		                      [](uint8_t b) { return b == 0; }),
+		      "the mapped page reads its bytes and the unmapped page reads zeros");
+	}
+	CheckOk(test, UnmapAmmMemory(kAmmWindowBase + page * 4, page), "UnmapAmmMemory");
+	CheckOk(test, KernelReleaseDirectMemory(phys, page * 2), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMemoryPoolAlignmentContracts() {
 	const char* test = "MemoryPoolAlignmentContracts";
 	void*       addr = nullptr;
@@ -5220,6 +5284,7 @@ int main(int argc, char** argv) {
 	RunTest(TestClampRangeMemoFollowsMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestAmmUnmapAcceptsHolesAndRestoresGpuRange);
+	RunTest(TestOrdinaryMappingsAvoidAmmWindow);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);

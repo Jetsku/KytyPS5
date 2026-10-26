@@ -501,6 +501,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
+# KYTY_INDIRECT_GUARD (renderer/dispatchGuard.h): sanitises GPU-produced DispatchIndirect counts.
+set(gpu_dispatch_guard_source "${gpu_tiler_shader_dir}/gpu_dispatch_guard.comp")
+set(gpu_dispatch_guard_spv "${gpu_mesh_generated_dir}/gpu_dispatch_guard.spv")
+set(gpu_dispatch_guard_header "${gpu_mesh_generated_dir}/gpu_dispatch_guard_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_dispatch_guard_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_dispatch_guard_spv}" "${gpu_dispatch_guard_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_dispatch_guard_spv} -DOUTPUT=${gpu_dispatch_guard_header}
+	        -DSYMBOL=GPU_DISPATCH_GUARD_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_dispatch_guard_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_dispatch_guard_header}")
 
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
@@ -633,6 +648,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(scalar_provenance_tests common fmt::fmt xbyak::xbyak)
@@ -874,6 +890,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	# The IR it includes (Program.cpp, Value.cpp) reads KYTY_IR_LINEAR_USES from the codegen options.
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
@@ -893,6 +910,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.cpp"
@@ -926,6 +944,14 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
+
+# AJM batch jobs run at sceAjmBatchStart (KYTY_AJM_DEFER; libs/ajm.cpp compiled into the test).
+add_executable(ajm_defer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmDeferTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_defer_tests common fmt::fmt LibAtrac9 FFmpeg::ffmpeg opus)
+target_include_directories(ajm_defer_tests PRIVATE ${inc_headers})
 
 # libSceAudioPropagation HLE state (libs/audioPropagation.h): handles and the direct-sound render.
 add_executable(audio_propagation_tests EXCLUDE_FROM_ALL
@@ -1082,6 +1108,10 @@ add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# AMM submission order (libs/amprOrder.h).
+add_executable(ampr_order_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AmprOrderTests.cpp")
+target_include_directories(ampr_order_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(occlusion_reset_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionResetTests.cpp")
 target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
 target_link_libraries(occlusion_reset_tests common)
@@ -1217,6 +1247,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_gpu_keep COMMAND $<TARGET_FILE:image_gpu_keep_tests>)
 	add_test(NAME clear_register_decode COMMAND $<TARGET_FILE:clear_register_decode_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
+	add_test(NAME ampr_order COMMAND $<TARGET_FILE:ampr_order_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
 	add_test(NAME guest_tsc COMMAND $<TARGET_FILE:guest_tsc_tests>)
@@ -1266,6 +1297,9 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --codegen-only)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
+	# Bindless images: a T# read from a descriptor heap at a key loaded per lane (Miles' RT kernels).
+	add_test(NAME bindless_codegen
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-codegen-only)
 	add_test(NAME gi_probe_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gi-probe-codegen-only)
 	add_test(NAME gi_probe
@@ -1366,6 +1400,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_mix COMMAND $<TARGET_FILE:audio_mix_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME ajm_defer COMMAND $<TARGET_FILE:ajm_defer_tests>)
 	add_test(NAME audio_propagation COMMAND $<TARGET_FILE:audio_propagation_tests>)
 	add_test(NAME unresolved_import_log COMMAND $<TARGET_FILE:unresolved_import_log_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
@@ -2502,6 +2537,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		ajm_defer_tests
 		audio_propagation_tests
 		unresolved_import_log_tests
 		pad_haptics_tests

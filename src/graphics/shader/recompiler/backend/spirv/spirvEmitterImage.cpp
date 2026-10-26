@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include <algorithm>
 #include <bit>
@@ -1003,6 +1004,63 @@ void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
 	});
 }
 
+// The bindless slot of the image handle's key: translation[region + key] when the key is inside
+// the heap's entry count (both from the flattened SRT, patched by the host), otherwise and while
+// the texture is pending, a placeholder slot. A pending key is flagged in the feedback buffer for
+// the host to resolve; every lane that reads an entry sees the same translation, so the
+// unconditional store never races with a different value.
+static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& image,
+                             IR::Value image_arg) {
+	auto&       state  = ctx.state;
+	const auto* handle = image_arg.ResolveInstruction();
+	EXIT_IF(handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
+	        state.bindless_translation_variable == 0);
+	const auto key  = ctx.Def(handle->Arg(0));
+	const auto Load = [&](uint32_t variable, uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, variable, ConstantU32(state, 0), index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto base     = Load(state.flattened_srt_variable,
+	                           ConstantU32(state, image.indirect_mapping_offset));
+	const auto count    = Load(state.flattened_srt_variable,
+	                           ConstantU32(state, image.indirect_mapping_offset + 1u));
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
+	const auto entry    = Binary(state, spv::OpIAdd, TypeU32(state), base, key);
+	const auto index    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), index, in_range, entry,
+	                          ConstantU32(state, 0u));
+	const auto raw     = Load(state.bindless_translation_variable, index);
+	const auto pending = Binary(state, spv::OpIEqual, TypeBool(state), raw,
+	                            ConstantU32(state, IR::BindlessPending));
+	if (state.bindless_feedback_variable != 0) {
+		const auto pending_flag = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), pending_flag, pending,
+		                          ConstantU32(state, 1u), ConstantU32(state, 0u));
+		// Diagnostics: a key outside its heap leaves itself (with the top bit set) in
+		// feedback word 0, which belongs to no heap.
+		const auto marked_key = Binary(state, spv::OpBitwiseOr, TypeU32(state), key,
+		                               ConstantU32(state, 0x80000000u));
+		const auto flag = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), flag, in_range, pending_flag,
+		                          marked_key);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+		                          index);
+		state.builder.AddFunction(spv::OpStore, pointer, flag);
+	}
+	const auto slot = state.builder.AllocateId();
+	// Pending keys sample a placeholder while their texture is loaded.
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, pending,
+	                          ConstantU32(state, IR::BindlessPendingSlot), raw);
+	state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+	return slot;
+}
+
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
@@ -1011,6 +1069,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
+	state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, image_arg) : 0u;
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
@@ -1332,7 +1391,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			return sample;
 		};
-		if (image.indirect_root != mem.resource) {
+		if (image.indirect_root != mem.resource || image.bindless) {
 			const auto sample = EmitSample(mem.resource);
 			auto       result = sample;
 			if (!dref) {

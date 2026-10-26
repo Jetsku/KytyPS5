@@ -116,6 +116,39 @@ void TestLoad() {
 	std::filesystem::remove_all(root, ec);
 }
 
+// u59-preset.<TITLE_ID>.json: found like the bundled preset, only for a well-formed title id.
+void TestLoadTitle() {
+	const auto root = std::filesystem::temp_directory_path() /
+	                  ("kyty_u59_title_preset_tests_" + std::to_string(KYTY_TEST_PID));
+	std::error_code ec;
+	std::filesystem::remove_all(root, ec);
+	const auto first  = root / "launcher";
+	const auto second = root;
+	std::filesystem::create_directories(first, ec);
+	Check(!ec, "the test can create its directories");
+
+	Check(TitleFileName("PPSA01417") == "u59-preset.PPSA01417.json", "the title file name");
+	Check(LoadTitle({first, second}, "PPSA01417").status == Status::Missing,
+	      "no title file: Missing");
+	WriteFile(second / "u59-preset.PPSA01417.json", R"({"KYTY_DRAW_RUN": "0"})");
+	const auto title = LoadTitle({first, second}, "PPSA01417");
+	Check(title.status == Status::Loaded && title.entries.size() == 1 &&
+	          title.entries[0].key == "KYTY_DRAW_RUN" && title.entries[0].value == "0" &&
+	          title.path == second / "u59-preset.PPSA01417.json",
+	      "the title file one folder up is found");
+	Check(LoadTitle({first, second}, "PPSA21567").status == Status::Missing,
+	      "another title does not take this title's file");
+	// The title presets this repository ships parse.
+	const auto shipped = LoadTitle({std::filesystem::path(KYTY_U59_PRESET_DIR)}, "PPSA01417");
+	Check(shipped.status == Status::Loaded && !shipped.entries.empty(),
+	      "tools/u59-preset.PPSA01417.json loads");
+	for (const char* bad: {"", "PPSA0141", "../PPSA0141", "ppsa01417", "PPSA01417x"}) {
+		Check(LoadTitle({first, second}, bad).status == Status::Missing,
+		      "a malformed title id loads nothing");
+	}
+	std::filesystem::remove_all(root, ec);
+}
+
 // The preset this repository ships parses, covers every marker and sets what the defaults need.
 void TestShippedPreset() {
 	const auto shipped = Load({std::filesystem::path(KYTY_U59_PRESET_DIR)});
@@ -237,6 +270,7 @@ void TestCodegenDefaults() {
 int main() {
 	TestParse();
 	TestLoad();
+	TestLoadTitle();
 	TestShippedPreset();
 	TestTextureSparseResidency();
 	TestStartupWarnings();

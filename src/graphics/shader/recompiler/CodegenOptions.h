@@ -98,6 +98,11 @@ struct CodegenOptions {
 	// (Bryan's companion change, dropping the sin/cos |x| >= 2^23 select, is not exact on the RTX
 	// 3090 and is not applied.)
 	bool short_f32_helpers = false;
+	// KYTY_VS_LANE_WRAP32=0: V_MBCNT of a wave32 vertex shader no longer wraps the lane index at 32
+	// when KYTY_WAVE32_CLUSTERS=0 (Integer.cpp). With clusters (the default) the lane id is already
+	// the low 5 bits on hosts with wider subgroups, and a 32-wide host has no higher lanes, so the
+	// wrap is emitted only with clusters off.
+	bool vs_lane_wrap32 = true;
 	// KYTY_FAST_FMINMAX=0: emulate f32 min/max/min3/max3/med3 with two bit classifications per
 	// min/max instead of one compare-and-select plus a single two-zeros test.
 	bool fast_float_min_max = true;
@@ -149,6 +154,12 @@ struct CodegenOptions {
 	// slower on the RTX 3090 for Astro Bot's heaviest LDS kernel (cs 0x6856320a9c6f89fd: 1.42 -> 2.33 ms).
 	// Device-buffer LDS and GDS keep their branches.
 	bool branchless_lds = false;
+	// KYTY_FLAT_APERTURE_BVH=1 (default off; Wolverine preset): a program with an
+	// IMAGE_BVH*_INTERSECT_RAY routes its FLAT accesses by aperture even when it never reads an
+	// aperture register. The PS5 ray-traversal stack addresses LDS/scratch through FLAT with
+	// hard-coded aperture high words (V_MED3_U32 hi, 0x80000000, 0x70000000), so its pushes were
+	// global stores, which cannot compile (Wolverine cs 0x2ea3957af2daf690).
+	bool flat_aperture_bvh = false;
 	// KYTY_LANE_LOCAL=1 (default off; chenxiao07/KytyPS5 9907780e1, 9bb47e15d): a wave64 compute program
 	// proven lane-local (Frontend::IsWaveLaneLocal: its lanes' results depend on no lane outside their
 	// 32-lane half) runs one guest lane per host invocation on a host whose compute subgroups are fixed at
@@ -215,6 +226,12 @@ struct CodegenOptions {
 	// indirect V#) access is Volatile, not only MUBUF accesses with GLC/DLC. A guest loop that polls
 	// memory written by another workgroup or queue then rereads it instead of a cached or hoisted value.
 	bool volatile_loads = false;
+	// KYTY_INDIRECT_COHERENT=1 (default 0): a GLC/DLC load or dword store through a V# the shader computed
+	// (ResourceKind::IndirectBuffer, read through BDA) is Coherent and Volatile, as the same load
+	// through a bound V# already is. Without it the load is a plain one the driver may hoist out of
+	// a polling loop or serve from a non-coherent cache: a decoupled look-back scan (Ratchet &
+	// Clank's 0xba61d861c2b03285) spins forever on a partition flag another workgroup published.
+	bool indirect_coherent = false;
 	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
 	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
 	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared
@@ -222,6 +239,11 @@ struct CodegenOptions {
 	// the region of the outer selection externally entered (Wolverine's 0x09161b28ae4039bb). The
 	// copies run the same instructions; nothing after them can tell them apart.
 	bool cfg_clone_exits = false;
+	// KYTY_STORAGE_LENGTH_ZERO=1 (default 0): a storage-buffer OpArrayLength of 0 counts as unbounded
+	// (0xffffffff), leaving the bounds check to the device. NVIDIA returns 0 for a binding of 2 GiB or
+	// more (Insomniac binds its whole vertex pool, 3 GiB, through one V#); with this switch the
+	// descriptor range is no longer capped (KYTY_STORAGE_RANGE_CAP auto), so data past 2 GiB reads.
+	bool storage_length_zero = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -245,6 +267,12 @@ struct CodegenOptions {
 	// deferred-lighting and GI kernels are dropped, and with the game's lighting patches off lit
 	// geometry renders black. KYTY_SRT_VARIANT_READS=0 restores the old planning.
 	bool srt_variant_reads = true;
+	// KYTY_SHADER_CALLS=1 (default off in this line; on in the Insomniac title presets): compute
+	// programs that call functions through S_SWAPPC_B64 have their callees expanded into them
+	// (ShaderCalls.h) instead of being skipped. Programs without
+	// calls are not affected either way, so it is not part of the codegen fingerprint: an expanded
+	// program is a different input (its code and key carry the callees).
+	bool shader_calls = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,

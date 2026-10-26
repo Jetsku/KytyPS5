@@ -68,6 +68,10 @@ void NoteGuestWriteStream(uint64_t address, uint64_t size);
 // KYTY_BDA_WRITES=verify: dropped writes and written pages under a GPU-modified image are fatal.
 [[nodiscard]] bool BdaWritesVerify();
 
+// Reads an image's guest range when part of it is not mapped (streamed textures map only their
+// resident part): mapped bytes as they are, unmapped bytes as zero. False when nothing can be read.
+[[nodiscard]] bool ReadPartlyUnmappedImageBacking(uint64_t vaddr, void* data, uint64_t size);
+
 struct BufferContentRevision {
 	BufferId id;
 	uint64_t write_revision;
@@ -153,6 +157,10 @@ public:
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_HEAPS: a BDA access faulted at [vaddr, vaddr + size): the GPU-mapped allocation holding it
+	// becomes resident now and before every later BDA-writing dispatch (its other pages are the
+	// destinations of that and the next dispatches, which would drop their stores and atomics).
+	void NoteBdaFault(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -227,6 +235,13 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_SRT_GPU_FILL (GPU thread): the guest dword at `vaddr` is GPU-written bytes that one
+	// registered buffer holds, with nothing newer elsewhere (no image over it, no pending
+	// publication or early release), so a GPU copy from that buffer reads its current value.
+	// The buffer's handle and the dword's offset in it go to `handle` / `offset` when not null.
+	// No buffer is created or synchronized.
+	[[nodiscard]] bool GpuFillSource(uint64_t vaddr, vk::Buffer* handle = nullptr,
+	                                 uint64_t* offset = nullptr);
 	// KYTY_READBACK_FLUSH_SIDE (bufferCache.cpp): guest reads served by a side copy after the
 	// command processor submitted the recording that wrote their bytes (process-wide; tests).
 	[[nodiscard]] static uint64_t ReadbackFlushSideCopies() noexcept;
@@ -582,6 +597,12 @@ private:
 	void SettleHotPages(uint64_t vaddr, uint64_t size);
 	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// `nothing` (optional): set when the call provably synchronized nothing because no image
+	// starts at or overlaps the range (KYTY_TEXEL_SYNC_MEMO).
+	[[nodiscard]] bool SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                                     bool* nothing);
+	[[nodiscard]] bool SynchronizeBufferFromImageImpl(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                                  bool* nothing);
 	// The texel-read download of one image that owns all of its bytes and starts at the read
 	// (SynchronizeBufferFromImage's image found by TextureCache::FindImageFromRange).
 	[[nodiscard]] bool SynchronizeBufferFromOwner(Buffer& buffer, Common::SlotId image_id);
@@ -721,6 +742,10 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	// KYTY_BDA_HEAPS: allocations made resident by NoteBdaFault, re-ensured before BDA writers.
+	std::mutex                                        m_bda_heaps_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_heaps;
+	bool                                              m_bda_heaps_loaded = false;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	uint64_t                                          m_unregister_epoch = 0;

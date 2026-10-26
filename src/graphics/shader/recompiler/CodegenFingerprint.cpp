@@ -3,6 +3,7 @@
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kytyCodegenVersion.h"
 
@@ -120,6 +121,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.branchless_lds) {
 		b.Text("branchless_lds");
 	}
+	if (options.indirect_coherent) {
+		b.Text("indirect_coherent");
+	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}
@@ -138,9 +142,23 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.uniform_buffers && GetHostUniformBufferRobust()) {
 		b.Text("uniform_buffers");
 	}
+	if (options.flat_aperture_bvh) {
+		b.Text("flat_aperture_bvh");
+	}
+	if (options.storage_length_zero) {
+		b.Text("storage_length_zero_or");
+	}
+	if (options.vs_lane_wrap32 && options.wave32_clusters == Wave32Clusters::Off) {
+		b.Text("vs_lane_wrap32");
+	}
 	if (options.lane_local) {
 		b.Text("lane_local");
 		b.U8(GetHostComputeSubgroups32() ? 1u : 0u);
+	}
+	// Bindless images (ir/BindlessBindings.h): resource tracking may turn an indirect image the
+	// enumeration cannot cover into a bindless one.
+	if (IR::BindlessImagesEnabled()) {
+		b.Text("bindless_images");
 	}
 
 	// Host device state the emitter reads (set once by the device layer).

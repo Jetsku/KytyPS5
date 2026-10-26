@@ -396,6 +396,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 	state = {destination_stage, destination_access, destination_layout, guest};
 	NoteImageStateChange();
+	// A slot of the bindless table samples it in a read-only layout (E5 restores it).
+	NoteBindlessStateChange(*this);
 	return barriers;
 }
 

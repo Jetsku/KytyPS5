@@ -69,13 +69,15 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       mesh.split_groups});
+		                       mesh.split_groups, static_cast<uint32_t>(mesh.fast_launch),
+		                       mesh.passes});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
 		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		                       tess.domain, tess.partitioning, tess.output_topology, tess.min_tess_level,
+		                       tess.max_tess_level});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {

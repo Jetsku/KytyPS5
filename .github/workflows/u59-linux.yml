@@ -111,6 +111,8 @@ jobs:
           mkdir -p "$release"
           cp -a _Build/linux/install/. "$release/"
           cp tools/u59-preset.json "$release/"
+          # Per-title overrides (u59-preset.<TITLE_ID>.json, common/u59Preset.h) ship next to it.
+          find tools -maxdepth 1 -name 'u59-preset.*.json' -exec cp {} "$release/" \;
           cp docs/EXPERIMENTAL.md "$release/U59-README.md"
           cp docs/LINUX-U59.md "$release/LINUX-U59.md"
           cp LICENSE "$release/"

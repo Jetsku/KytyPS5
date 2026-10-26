@@ -1862,6 +1862,68 @@ void TestNggVertexEntryState() {
   }
 }
 
+void TestNativeDataCacheInvalidation() {
+  using namespace ShaderRecompiler;
+  // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT.
+  const std::array cache_ops = {0xe1c40000u, 0u, 0xbf8c0000u,
+                               0xe1c80000u, 0u, 0xbf8c0000u, EncodeSopp(0x01)};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(cache_ops, decoded);
+  for (const uint32_t index : {0u, 2u}) {
+    const auto &inst = decoded.instructions[index];
+    Check(inst.opcode == (index == 0 ? Decoder::Opcode::BUFFER_GL0_INV
+                                    : Decoder::Opcode::BUFFER_GL1_INV) &&
+              inst.word_count == 2 && inst.src_count == 0 && inst.data_dwords == 0 &&
+              (inst.dst.kind == Decoder::OperandKind::Unknown ||
+               inst.dst.kind == Decoder::OperandKind::Null),
+          "RDNA2 cache invalidation acquired a buffer operand or lost its encoding");
+  }
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  options.input_info.compute = &compute;
+  // KYTY_DCACHE_INV is opt-in in this line (int21); the barrier shape is tested with it on.
+  const auto saved_codegen = ShaderRecompiler::GetCodegenOptions();
+  auto       dcache_codegen = saved_codegen;
+  dcache_codegen.dcache_invalidate = true;
+  ShaderRecompiler::SetCodegenOptions(dcache_codegen);
+  struct RestoreCodegen {
+    ShaderRecompiler::CodegenOptions saved;
+    ~RestoreCodegen() { ShaderRecompiler::SetCodegenOptions(saved); }
+  } restore_codegen{saved_codegen};
+  for (const uint32_t wave_size : {32u, 64u}) {
+    compute.threads_num[0] = compute.wave_size = options.wave_size = wave_size;
+    const auto minimal = RecompileForTest(cache_ops, options);
+    CheckSpirvBinaryValidates(minimal.spirv);
+    Check(minimal.program.info.buffers.empty(),
+          "cache invalidation introduced a phantom buffer binding");
+    const auto source = DisassembleSpirvBinary(minimal.spirv);
+    const auto first = source.find("OpMemoryBarrier %uint_1 %uint_2114");
+    const auto second = source.find("OpMemoryBarrier %uint_1 %uint_2114", first + 1);
+    Check(first != std::string::npos && second != std::string::npos &&
+              source.find("OpMemoryBarrier", second + 1) == std::string::npos &&
+              source.find("OpControlBarrier") == std::string::npos,
+          "cache invalidation must fence device memory once per wave without convergence");
+
+    const std::array reload = {
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 0, 0),
+        0xe1c40000u, 0u, 0xbf8c0000u,
+        EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(1, 0, 0),
+        EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(1, 0, 0), EncodeSopp(0x01),
+    };
+    const auto result = RecompileForTest(reload, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto store = result.ir_dump.find("StoreBufferU32");
+    const auto fence = result.ir_dump.find("DataCacheInvalidate");
+    const auto load = result.ir_dump.find("LoadBufferU32");
+    Check(store < fence && fence < load && load != std::string::npos &&
+              DisassembleSpirvBinary(result.spirv).find(" Coherent") != std::string::npos,
+          "plain buffer reload lost its cache fence order or coherent visibility");
+  }
+}
+
 void TestNativeStoreCompletion() {
   using namespace ShaderRecompiler;
   const std::array register_wait = {EncodeSopk(0x17, 4, static_cast<int16_t>(0x9234)), EncodeSopp(0x01)};
@@ -10577,6 +10639,11 @@ void TestMeshExportStorage() {
     const auto reg = std::ranges::find(layout.user_data_registers, 13u);
     Check(reg != layout.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
+    // A vertex exported at (0,0,0,0) marks its bit, and primitives using it are culled.
+    Check(source.find("OpAtomicOr") != std::string::npos &&
+              source.find("OpAll") != std::string::npos &&
+              source.find("OpLogicalOr") != std::string::npos,
+          "mesh shader lost the zero-position primitive cull");
     for (const auto dword :
          {static_cast<uint32_t>(reg - layout.user_data_registers.begin()),
           layout.memory_offset_dword}) {
@@ -10636,8 +10703,9 @@ void TestMeshExportStorage() {
     }
     // The Pathless shader 35869c17ce783c88 exceeds the host's 28 KiB budget
     // when its four vertex exports and primitive exports are shared arrays.
-    Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u && shared_bytes <= 28672u,
-          "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
+    Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u + 6u * 4u && shared_bytes <= 28672u,
+          "mesh staging must retain guest LDS, shared Layer, allocation and the zero-position "
+          "mask within the host budget");
     Check(private_bytes == (4u * 16u + 4u + 4u * 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }
@@ -10767,6 +10835,77 @@ void TestMeshIndirectParams() {
   };
   CheckMeshIndirectParams(constant, false, false);
   CheckMeshIndirectParams(indexed, true, true);
+}
+
+// Eight wave32 waves (256 threads) are twice NVIDIA's mesh workgroup limit: the subgroup runs in
+// two passes of 128 invocations, cut at its barrier, and the vertex index it computes before the
+// barrier reaches the export after it through a per-pass Private array.
+void TestMeshPassesAcrossBarrier() {
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t code[] = {
+      EncodeSMovB32(12, 255), 0x1003u,              // 3 vertices, 1 primitive
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x06, 1, 256 + 5),                // v1 = float(v5), the vertex index
+      EncodeSopp(0x0a),                            // s_barrier
+      EncodeVop1(0x01, 0, 128),                    // v0 = 0
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(1, 1, 1, 1),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kPointList);
+  mesh.wave_size = 32;
+  mesh.host_subgroup_size = 32;
+  mesh.threads_num[0] = 256;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 128;
+  mesh.primitives_per_group = 1;
+  mesh.vertices_per_group = 1;
+  mesh.max_vertices = 128;
+  mesh.max_primitives = 256;
+  mesh.passes = mesh.PassesFor(128);
+  Check(mesh.passes == 2, "a 256-thread wave32 subgroup does not take two passes of 128");
+  std::array<uint32_t, 14> user_data{};
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = 32;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  const auto result =
+      RecompileForTest(code, options, nullptr, nullptr, PushData::MeshDrawDwordCount);
+  // Validation also rejects a value one segment function uses from another.
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto count = [&](std::string_view text) {
+    size_t found = 0;
+    for (auto at = source.find(text); at != std::string::npos; at = source.find(text, at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  Check(source.find("LocalSize 128 1 1") != std::string::npos,
+        "a two-pass mesh workgroup is not 128 invocations");
+  Check(count("OpFunctionCall %void") == 4,
+        "each of the two segments is not called once per pass");
+  // The pass, the position and primitive lanes, and the vertex index crossing the barrier.
+  Check(count("OpVariable %_ptr_Private_") >= 4,
+        "no value crosses the barrier in a Private array");
+
+  // A barrier that a branch can skip cannot be cut: the shader gives up instead.
+  const uint32_t nested[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeSopc(0x06, 0, 128), // s_cmp_eq_u32 s0, 0 (user data)
+      EncodeSopp(0x05, 1),      // s_cbranch_scc1 over the barrier
+      EncodeSopp(0x0a),
+      EncodeVop1(0x01, 0, 128),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  Check(ShaderRecompiler::TranslateProgram(nested, options).skip_dispatch,
+        "a barrier inside a branch did not stop the mesh passes");
 }
 
 void TestMergedShaderUserDataSnapshot() {
@@ -11314,7 +11453,7 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   Check(jump->terminator.indirect_selector_values.size() == 2,
         "S_SETPC_B64 jump table did not retain selector mapping");
   Check(
-      (result.ir_dump.find("SLoadDword") == std::string::npos),
+      (result.ir_dump.find("LoadAddressU32") == std::string::npos),
       "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "dispatcher SPIR-V lacks OpSwitch");
@@ -11375,7 +11514,9 @@ void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
         "unreachable S_SETPC metadata suppressed a reachable scalar load component");
 }
 
-void TestNewShaderRecompilerSetpcDwordJumpTable() {
+// offset_sgpr 106 aliases the vcc_lo selector, like PPSA34015's
+// s_load_dword s17, s[22:23], s17.
+void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),             // skip one unreachable block
       EncodeSMovB32(100, 129),         // unreachable
@@ -11385,20 +11526,20 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
       EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
       0x00000034u,
       EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
-      EncodeSmem0(0x00, 6, 2),
-      (106u << 25u) | 4u,          // s_load_dword s6, s[4:5], vcc_lo offset:4
-      EncodeSopp(0x0c, 0),         // s_waitcnt 0
-      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
-      EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
-      EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
-      EncodeSMovB32(1, 129),       // case 0
+      EncodeSmem0(0x00, offset_sgpr, 2),
+      (106u << 25u) | 4u,  // s_load_dword offset, s[4:5], vcc_lo offset:4
+      EncodeSopp(0x0c, 0), // s_waitcnt 0
+      EncodeSop2(0x01, 4, 4, offset_sgpr), // s_sub_u32 s4, s4, offset
+      EncodeSop2(0x05, 5, 5, 128),         // s_subb_u32 s5, s5, 0
+      EncodeSop1(0x20, 0, 4),              // s_setpc_b64 s[4:5]
+      EncodeSMovB32(1, 129),               // case 0
       EncodeSopp(0x02, 1),
       EncodeSMovB32(2, 129), // case 1
       EncodeSopp(0x01, 0),
       0u,
       0x00000010u,
       0x00000008u,
-      0x00000010u, // table at pc 0x44, targets relative backward from pc 0x40
+      0x00000010u, // table at pc 0x4c, targets relative backward from pc 0x48
   };
 
   auto options = MakeCompileOptions(ShaderType::Compute);
@@ -11434,7 +11575,7 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
                 result.program.block_info,
                 [](const auto &info) { return info.start_pc == 0x04u; }),
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
-  Check((result.ir_dump.find("SLoadDword") == std::string::npos),
+  Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
   Check(SpirvContainsOpcode(result.spirv, 251),
         "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
@@ -15852,8 +15993,22 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
 } // namespace
 } // namespace Libs::Graphics
 
+
+// This line keeps the switch default off (int21 behaviour); the test turns it on unless set.
+static void DefaultEnv(const char* name, const char* value) {
+  if (std::getenv(name) != nullptr) {
+    return;
+  }
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 0);
+#endif
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
+  DefaultEnv("KYTY_MESH_CULL", "full");
 
   EnsureConfigInitialized();
   if (argc == 2 && std::strcmp(argv[1], "--unused-pixel-inputs-only") == 0) {
@@ -15981,6 +16136,7 @@ int main(int argc, char **argv) {
   TestImageAddressOperands();
   TestComputeDerivativesHostExtension();
   TestSopkCompareImmediateExtension();
+  TestNativeDataCacheInvalidation();
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestVopcCmpxClassF16Decoder();
@@ -16065,13 +16221,15 @@ int main(int argc, char **argv) {
   TestMeshIndirectParams();
   TestGeometryOutputGuard();
   TestReadOnlyBuffers();
+  TestMeshPassesAcrossBarrier();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTable(6);
+  TestNewShaderRecompilerSetpcDwordJumpTable(106);
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();

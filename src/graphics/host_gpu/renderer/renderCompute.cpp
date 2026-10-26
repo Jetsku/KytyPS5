@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -44,9 +45,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -60,6 +64,193 @@ static std::atomic<uint64_t> g_overlap_direct {0}, g_overlap_pairs {0}, g_overla
     g_overlap_indirect {0}, g_overlap_empty_indirect {0};
 static Live::Switch g_skip_empty_indirect("KYTY_SKIP_EMPTY_INDIRECT", Live::ParseDefaultOn);
 static std::atomic<int64_t> g_overlap_last_print_ns {0};
+
+// KYTY_DISPATCH_TRACE=<hash>[,<hash>...] or all (hexadecimal guest shader hashes, diagnostic): logs the
+// first KYTY_DISPATCH_TRACE_LIMIT (default 64) dispatches of each listed program: tick, groups or
+// indirect argument address (with the argument bytes guest memory holds and whether a GPU write of
+// them is pending), the first 16 user SGPRs and the bound buffers.
+struct DispatchTraceRequest {
+	std::vector<uint64_t> hashes;
+	uint32_t              limit = 64;
+};
+static const DispatchTraceRequest& DispatchTrace() {
+	static const DispatchTraceRequest request = [] {
+		DispatchTraceRequest parsed;
+		if (const auto* value = std::getenv("KYTY_DISPATCH_TRACE"); value != nullptr) {
+			std::string_view text(value);
+			while (!text.empty()) {
+				const auto comma = text.find(',');
+				const auto item  = std::string(text.substr(0, comma));
+				if (item == "all") {
+					parsed.hashes.push_back(0);
+				} else if (!item.empty()) {
+					parsed.hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+				}
+				if (comma == std::string_view::npos) break;
+				text.remove_prefix(comma + 1);
+			}
+		}
+		if (const auto* value = std::getenv("KYTY_DISPATCH_TRACE_LIMIT"); value != nullptr) {
+			parsed.limit = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		}
+		return parsed;
+	}();
+	return request;
+}
+
+static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& input_info,
+                          const uint32_t* groups, uint64_t args_addr) {
+	const auto& request = DispatchTrace();
+	if (request.hashes.empty()) return;
+	const auto& program = *input_info.stage.program;
+	// 0 in the list (KYTY_DISPATCH_TRACE=all) traces every program.
+	const bool all     = std::ranges::find(request.hashes, uint64_t {0}) != request.hashes.end();
+	const auto found   = std::ranges::find(request.hashes, program.shader_hash);
+	if (!all && found == request.hashes.end()) return;
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint32_t> counts;
+	uint32_t                                      ordinal = 0;
+	{
+		std::scoped_lock lock(mutex);
+		ordinal = counts[program.shader_hash]++;
+	}
+	if (ordinal >= request.limit) return;
+	std::string text = fmt::format("DispatchTrace: hash=0x{:016x} #{} tick={} gpu_tick={}",
+	                               program.shader_hash, ordinal,
+	                               context.GetCommandScheduler().CurrentTick(),
+	                               context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick());
+	if (groups != nullptr) {
+		text += fmt::format(" groups={}x{}x{}", groups[0], groups[1], groups[2]);
+	} else {
+		uint32_t   args[3] {};
+		const bool read  = LibKernel::Memory::TryReadBacking(args_addr, args, sizeof(args));
+		const bool dirty = context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args));
+		text += fmt::format(" indirect=0x{:x} guest_args={}{}x{}x{}{}", args_addr, read ? "" : "?",
+		                    args[0], args[1], args[2], dirty ? " (gpu-dirty)" : "");
+	}
+	text += " ud:";
+	const auto& user_data = input_info.stage.resources->user_data;
+	for (size_t i = 0; i < std::min<size_t>(user_data.size(), 16); i++) {
+		text += fmt::format(" {:08x}", user_data[i]);
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto r =
+		    DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]);
+		text += fmt::format(" | b{}{}=0x{:x}/s{}/n{}", i, program.info.buffers[i].written ? "w" : "",
+		                    r.Base48(), r.Stride(), r.NumRecords());
+	}
+	LOGF("%s\n", text.c_str());
+}
+
+// KYTY_DISPATCH_PEEK=<address>+<bytes>[,<address>+<bytes>...] (hexadecimal address, or s<N>[@<hex
+// offset>] for the address in user SGPRs N and N + 1, at most 4
+// ranges of at most 64 bytes, diagnostic, with KYTY_DISPATCH_TRACE): around every traced dispatch
+// (within the trace limit), copies the GPU's bytes of each range before and after it into a
+// download buffer and logs them once the tick completed ("DispatchPeek"). The copies wait for all
+// earlier work and the dispatch, so the traced dispatch loses its overlap with its neighbours.
+struct DispatchPeekRange {
+	uint64_t address = 0;
+	uint32_t bytes   = 0;
+	// s<N>[@<offset>]: the 48-bit address in user SGPRs N and N + 1 (a V# base or a pointer),
+	// plus offset; UINT32_MAX for a fixed address.
+	uint32_t user_sgpr = UINT32_MAX;
+};
+static const std::vector<DispatchPeekRange>& DispatchPeekRanges() {
+	static const std::vector<DispatchPeekRange> ranges = [] {
+		std::vector<DispatchPeekRange> parsed;
+		if (const auto* value = std::getenv("KYTY_DISPATCH_PEEK"); value != nullptr) {
+			std::string_view text(value);
+			while (!text.empty() && parsed.size() < 4) {
+				const auto comma = text.find(',');
+				const auto item  = std::string(text.substr(0, comma));
+				const auto plus  = item.find('+');
+				if (plus != std::string::npos) {
+					DispatchPeekRange range;
+					const auto base = item.substr(0, plus);
+					if (!base.empty() && base[0] == 's') {
+						range.user_sgpr = static_cast<uint32_t>(std::strtoul(base.c_str() + 1, nullptr, 10));
+						const auto at   = base.find('@');
+						range.address =
+						    at == std::string::npos ? 0 : std::strtoull(base.c_str() + at + 1, nullptr, 16);
+					} else {
+						range.address = std::strtoull(base.c_str(), nullptr, 16);
+					}
+					range.bytes   = std::min<uint32_t>(
+                        static_cast<uint32_t>(std::strtoul(item.substr(plus + 1).c_str(), nullptr, 0)),
+                        64u) & ~3u;
+					if ((range.address != 0 || range.user_sgpr != UINT32_MAX) && range.bytes != 0) {
+						parsed.push_back(range);
+					}
+				}
+				if (comma == std::string_view::npos) break;
+				text.remove_prefix(comma + 1);
+			}
+		}
+		return parsed;
+	}();
+	return ranges;
+}
+
+static bool DispatchPeekWanted(const ShaderComputeInputInfo& input_info) {
+	const auto& request = DispatchTrace();
+	if (DispatchPeekRanges().empty() || request.hashes.empty()) return false;
+	const auto hash = input_info.stage.program->shader_hash;
+	const bool all  = std::ranges::find(request.hashes, uint64_t {0}) != request.hashes.end();
+	return all || std::ranges::find(request.hashes, hash) != request.hashes.end();
+}
+
+// phase 0 = before the dispatch, 1 = after it.
+static void DispatchPeek(RenderContext& context, CommandBuffer& command,
+                         const ShaderComputeInputInfo& input_info, uint32_t phase) {
+	const auto hash = input_info.stage.program->shader_hash;
+	constexpr uint32_t SlotBytes = 4 * 64;
+	constexpr uint32_t Slots     = 512;
+	static std::unique_ptr<Buffer>                 download;
+	static uint32_t                                next_slot = 0;
+	static std::unordered_map<uint64_t, uint32_t>  peeks;
+	if (peeks[hash] >= DispatchTrace().limit * 2) return;
+	const auto ordinal = peeks[hash]++;
+	auto&      cache   = context.GetBufferCache();
+	if (download == nullptr) {
+		download = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(),
+		                                    MemoryUsage::Download, 0, AllFlags,
+		                                    uint64_t {SlotBytes} * Slots);
+	}
+	const auto slot   = next_slot++ % Slots;
+	auto ranges = DispatchPeekRanges();
+	const auto& user_data = input_info.stage.resources->user_data;
+	for (auto& range: ranges) {
+		if (range.user_sgpr == UINT32_MAX) continue;
+		const auto low  = range.user_sgpr < user_data.size() ? user_data[range.user_sgpr] : 0u;
+		const auto high = range.user_sgpr + 1 < user_data.size() ? user_data[range.user_sgpr + 1] : 0u;
+		range.address += low | (static_cast<uint64_t>(high & 0xffffu) << 32u);
+	}
+	command.EndRendering();
+	for (uint32_t i = 0; i < ranges.size(); i++) {
+		const auto [source, offset] = cache.ObtainBuffer(ranges[i].address, ranges[i].bytes, false);
+		if (source == nullptr) continue;
+		download->CopyFrom(command, *source, offset, uint64_t {slot} * SlotBytes + i * 64u,
+		                   ranges[i].bytes, vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead, vk::AccessFlagBits::eMemoryRead |
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead);
+	}
+	const auto tick = context.GetCommandScheduler().CurrentTick();
+	context.GetCommandScheduler().DeferOperation([slot, ranges, hash, phase, ordinal, tick] {
+		download->Invalidate(uint64_t {slot} * SlotBytes, SlotBytes);
+		const auto* bytes = download->Mapped().data() + uint64_t {slot} * SlotBytes;
+		std::string text  = fmt::format("DispatchPeek: hash=0x{:016x} #{} {} tick={}", hash,
+		                                ordinal / 2, phase == 0 ? "before" : "after", tick);
+		for (uint32_t i = 0; i < ranges.size(); i++) {
+			text += fmt::format(" | 0x{:x}:", ranges[i].address);
+			for (uint32_t word = 0; word < ranges[i].bytes / 4; word++) {
+				uint32_t value = 0;
+				std::memcpy(&value, bytes + i * 64u + word * 4u, sizeof(value));
+				text += fmt::format(" {:08x}", value);
+			}
+		}
+		LOGF("%s\n", text.c_str());
+	});
+}
 
 static void PrintDispatchOverlap(bool enabled) {
 	const auto now = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -507,6 +698,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	auto& pipeline = *pipeline_or_null;
+	const bool peek = DispatchPeekWanted(input_info);
+	if (peek) DispatchPeek(m_context, buffer, input_info, 0);
 	auto& bindings = m_compute_bindings;
 	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
@@ -639,6 +832,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     static_cast<int32_t>(r.LodBias()));
 		}
 	}
+	{
+		const uint32_t traced_groups[3] {thread_group_x, thread_group_y, thread_group_z};
+		TraceDispatch(m_context, input_info, traced_groups, 0);
+	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DispatchInitiatorOrderedAppendEnable = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -674,6 +871,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
 	}
+	if (peek) DispatchPeek(m_context, buffer, input_info, 1);
 	// A proven uniform buffer fill leaves a known value (e.g. DCC fast-clear codes). Recording
 	// it lets consumers skip reading the range back while nothing else writes it.
 	{
@@ -795,6 +993,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	auto& pipeline = *pipeline_or_null;
+	const bool peek = DispatchPeekWanted(input_info);
+	if (peek) DispatchPeek(m_context, buffer, input_info, 0);
 	auto& bindings = m_compute_bindings;
 	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
@@ -823,6 +1023,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	DispatchGuard::Slot guard_slot {};
+	if (DispatchGuard::Enabled()) {
+		if (m_dispatch_guard == nullptr) {
+			m_dispatch_guard = std::make_unique<DispatchGuard>(m_context);
+		}
+		guard_slot = m_dispatch_guard->Reserve();
+	}
 	RebindBuffers(bindings);
 	// KYTY_REBIND_AFTER_JOIN: the bindings' lookups joined the argument buffer (or one another's).
 	if (RebindAfterJoinEnabled()) {
@@ -840,6 +1047,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
 	buffer.BeginEmission();
+	vk::Buffer dispatch_buffer = args_buffer->Handle();
+	uint64_t   dispatch_offset = args_offset;
+	if (guard_slot.buffer) {
+		m_dispatch_guard->Record(buffer, guard_slot, args_buffer->Handle(), args_offset,
+		                         program.shader_hash);
+		dispatch_buffer = guard_slot.buffer;
+		dispatch_offset = guard_slot.offset;
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -871,13 +1086,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier,
 		                                0, nullptr, 0, nullptr);
 	}
+	TraceDispatch(m_context, input_info, nullptr, args_addr);
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
+	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
 	}
+	if (peek) DispatchPeek(m_context, buffer, input_info, 1);
 	ResetBindings();
 }
 
