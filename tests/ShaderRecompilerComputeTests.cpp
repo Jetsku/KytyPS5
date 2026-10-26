@@ -23753,6 +23753,33 @@ public:
       Require(name, "write drain",
               waited && copied && unrelated && third_words[16] == before_write[16],
               "a CP write after a queued upload did not wait for its host copy, or leaked into it");
+
+      // KYTY_UPLOAD_DMA_WRITE_DRAIN=frame: a label elsewhere leaves the queued copy to the worker
+      // (as =1), a flip makes it first.
+      Live::Testing::StageText("KYTY_UPLOAD_DMA_WRITE_DRAIN=frame\n");
+      Live::OnCpFlip();
+      Require(name, "write drain frame on", UploadDmaWriteDrainEnabled(),
+              "KYTY_UPLOAD_DMA_WRITE_DRAIN=frame did not switch on");
+      Require(name, "guest write 3", context.InvalidateMemory(base, upload_size),
+              "the re-dirtied range is not mapped");
+      Libs::LibKernel::Memory::WriteBacking(base, before_write.data(), upload_size);
+      dma->HoldWorkerForTest(true);
+      const auto [fourth, fourth_offset] = cache.ObtainBuffer(base, upload_size, false, false);
+      const bool label_left = !dma->DrainHostCopies(base + upload_size + 64, sizeof(uint32_t), true);
+      const bool label_pending = dma->HostCopyBytesDone() != dma->HostCopyBytesQueued();
+      std::thread release_frame([dma] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        dma->HoldWorkerForTest(false);
+      });
+      const bool frame_waited = dma->DrainHostCopies(0, 1, true, true);
+      const bool frame_copied = dma->HostCopyBytesDone() == dma->HostCopyBytesQueued();
+      Libs::LibKernel::Memory::WriteBacking(base + 64, &later, sizeof(later));
+      release_frame.join();
+      const auto fourth_words = read_back(fourth->Handle(), fourth_offset, upload_size);
+      Require(name, "write drain frame",
+              label_left && label_pending && frame_waited && frame_copied &&
+                  fourth_words[16] == before_write[16],
+              "=frame drained on an unrelated label, or a flip did not make the queued host copy");
       Live::Testing::StageText("KYTY_UPLOAD_DMA_WRITE_DRAIN=\n");
       Live::OnCpFlip();
     }

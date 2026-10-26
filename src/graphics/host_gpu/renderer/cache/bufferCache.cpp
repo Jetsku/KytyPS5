@@ -4165,6 +4165,13 @@ void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
 	NoteGuestWriteStream(address, size);
 }
 
+void StreamCopyDefer::NoteFrameBoundary() {
+	if (auto* dma = g_write_drain_dma; dma != nullptr && UploadDmaWriteDrainEnabled() &&
+	                                   GuestGpu::IsGpuThread()) {
+		(void)dma->DrainHostCopies(0, 1, true, true);
+	}
+}
+
 void StreamCopyDefer::NoteGuestWrite(uint64_t address, uint64_t size) {
 	// KYTY_UPLOAD_DMA_WRITE_DRAIN (uploadDma.h): the guest may observe this write (a label) and
 	// then rewrite memory an earlier upload still has to read, so every queued host copy is made

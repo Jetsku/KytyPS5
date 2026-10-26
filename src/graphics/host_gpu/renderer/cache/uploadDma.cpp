@@ -59,6 +59,9 @@ int64_t ParseWriteDrain(const char* value) {
 	if (value != nullptr && std::strcmp(value, "labels") == 0) {
 		return 4;
 	}
+	if (value != nullptr && std::strcmp(value, "frame") == 0) {
+		return 8;
+	}
 	return Live::ParseDefaultOff(value);
 }
 Live::Switch g_write_drain("KYTY_UPLOAD_DMA_WRITE_DRAIN", ParseWriteDrain);
@@ -319,7 +322,7 @@ bool UploadDma::ClaimAndCopy(HostCopyTicket& ticket, bool cp) {
 	return true;
 }
 
-bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all) {
+bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all, bool frame) {
 	const auto mode = g_write_drain.Get();
 	if (mode == 0 || size == 0) {
 		return false;
@@ -332,7 +335,8 @@ bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all) {
 	}
 	// =labels: a write the guest may observe makes every queued host copy first; =all always does;
 	// otherwise (=1, or a GPU-only write) only the ones reading these bytes.
-	const bool every = mode == 2 || (mode == 4 && all);
+	// =frame: a flip makes every queued host copy too.
+	const bool every = mode == 2 || (mode == 4 && all) || (mode == 8 && frame);
 	const auto end   = address + size;
 	m_drain.checks++;
 	const auto start = std::chrono::steady_clock::now();
@@ -370,7 +374,7 @@ bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all) {
 	if (log && m_drain.waits <= 16) {
 		std::printf("Upload DMA write drain: CP write [0x%016" PRIx64 ", +0x%" PRIx64
 		            ") made queued host copies first (%s, %" PRIu64 " ns)\n",
-		            address, size, every ? "all" : "overlapping", ns);
+		            address, size, frame ? "frame" : every ? "all" : "overlapping", ns);
 		std::fflush(stdout);
 	}
 	if (log && (m_drain.waits & 0xfffu) == 1) {

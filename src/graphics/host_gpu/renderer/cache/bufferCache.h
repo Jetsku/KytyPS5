@@ -58,6 +58,9 @@ void NoteGuestWrite(uint64_t address, uint64_t size);
 // host copies that read the same bytes. NoteGuestWrite (labels written at CP time, WRITE_DATA,
 // flip labels) makes every queued host copy first.
 void NoteGpuOnlyWrite(uint64_t address, uint64_t size);
+// GPU thread, at a flip (the frame boundary): KYTY_UPLOAD_DMA_WRITE_DRAIN=frame makes every
+// queued host copy first (uploadDma.h).
+void NoteFrameBoundary();
 // The stream-copy part both share (internal).
 void NoteGuestWriteStream(uint64_t address, uint64_t size);
 } // namespace StreamCopyDefer
