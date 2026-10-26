@@ -695,7 +695,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // floor is the end of the guest range itself: CUDA then sits right above it and opens no hole in
 // guest VA (measured: 0xfd00000000-0xfec0000000 with the floor at 1008 GiB). The first attempt uses
 // that floor. A failed cuInit can be retried, so if it fails (a driver that wants more room, or a
-// guest range that grew towards 1 TiB) the floor steps down by 64 GiB until cuInit succeeds; the
+// guest range that grew towards 1 TiB) the floor steps down by 64 GiB, skipping the AMM window at the
+// top of the guest range (kernel/memory.h kAmmWindowBase), until cuInit succeeds; the
 // log line then says how much of the guest range CUDA took, since a fixed-address guest mapping
 // there would fail.
 // KYTY_CUDA_EARLY_INIT=1 turns it on (default off: it adds a DLL, CUDA threads and startup time to
@@ -746,10 +747,13 @@ static void InitCudaEarly() {
 		first  = std::min<uint64_t>(static_cast<uint64_t>(std::atoi(value)), 65536) * GiB;
 		search = false;
 	}
-	int      result = -1;
-	uint64_t floor  = first;
-	uint64_t taken  = 0;
-	int      tries  = 0;
+	const uint64_t amm_begin = Libs::LibKernel::Memory::kAmmWindowBase;
+	const uint64_t amm_end   = amm_begin + Libs::LibKernel::Memory::kAmmWindowSize;
+	int            result    = -1;
+	uint64_t       floor     = first;
+	uint64_t       taken     = 0;
+	uint64_t       amm_taken = 0;
+	int            tries     = 0;
 	for (;;) {
 		// Hold the free ranges below the floor.
 		std::vector<void*> held;
@@ -774,11 +778,13 @@ static void InitCudaEarly() {
 			}
 			next = end;
 		}
-		const auto before = floor < guest_end ? ReservedBytesIn(floor, guest_end) : 0;
-		result            = init(0);
+		const auto before     = floor < guest_end ? ReservedBytesIn(floor, guest_end) : 0;
+		const auto amm_before = ReservedBytesIn(amm_begin, amm_end);
+		result                = init(0);
 		tries++;
 		if (result == 0 && floor < guest_end) {
-			taken = ReservedBytesIn(floor, guest_end) - before;
+			taken     = ReservedBytesIn(floor, guest_end) - before;
+			amm_taken = ReservedBytesIn(amm_begin, amm_end) - amm_before;
 		}
 		for (void* ptr: held) {
 			VirtualFree(ptr, 0, MEM_RELEASE);
@@ -787,6 +793,12 @@ static void InitCudaEarly() {
 			break;
 		}
 		floor = floor > LowestTry + Step ? floor - Step : LowestTry;
+		// CUDA's range lands right above the floor: a floor inside the AMM window (or less than one
+		// step below it) would put it where AMM map commands place pages at fixed addresses
+		// (kAmmWindowBase), so the search continues one step below the window.
+		if (floor > amm_begin - Step && floor < amm_end) {
+			floor = amm_begin - Step;
+		}
 	}
 	if (result != 0) {
 		::printf("CUDA: early initialization failed (cuInit %d, %d floor(s) tried down to %" PRIu64
@@ -797,8 +809,11 @@ static void InitCudaEarly() {
 		         tries, tries == 1 ? "y" : "ies");
 	} else {
 		::printf("CUDA: initialized with the floor at %" PRIu64 " GiB, inside the guest address space (ends at %" PRIu64
-		         " GiB): CUDA holds %" PRIu64 " MiB of guest VA, which fixed-address guest mappings cannot use\n",
-		         floor / GiB, guest_end / GiB, taken >> 20u);
+		         " GiB): CUDA holds %" PRIu64 " MiB of guest VA, which fixed-address guest mappings cannot use%s\n",
+		         floor / GiB, guest_end / GiB, taken >> 20u,
+		         amm_taken != 0 ? " (some of it in the AMM window: games that use AMM may fail, turn "
+		                          "KYTY_CUDA_EARLY_INIT off for them)"
+		                        : "");
 	}
 }
 #endif
