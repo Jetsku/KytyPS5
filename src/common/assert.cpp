@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <string>
 
@@ -28,9 +29,35 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 	                   line);
 }
 
+// The calling thread's return addresses as module+offset (resolved offline against the PDB, e.g.
+// llvm-symbolizer --obj=kyty_emulator.exe with the offset added to the image base).
+static std::string FatalStack() {
+#if defined(_WIN32)
+	void*      frames[48] = {};
+	const auto count      = CaptureStackBackTrace(2, 48, frames, nullptr);
+	std::string text      = "--- Stack ---";
+	for (USHORT i = 0; i < count; i++) {
+		HMODULE module = nullptr;
+		char    name[MAX_PATH] = {};
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                       static_cast<LPCSTR>(frames[i]), &module) != 0 &&
+		    GetModuleFileNameA(module, name, MAX_PATH) != 0) {
+			const char* base = std::strrchr(name, '\\');
+			text += fmt::format("\n  {}+0x{:x}", base != nullptr ? base + 1 : name,
+			                    reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(module));
+		} else {
+			text += fmt::format("\n  0x{:x}", reinterpret_cast<uintptr_t>(frames[i]));
+		}
+	}
+	return text + "\n";
+#else
+	return {};
+#endif
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	HangWatchdog::NoteFatal(text, file, line);
-	Log::WriteFatal(BuildFatalReport(title, text, file, line));
+	Log::WriteFatal(BuildFatalReport(title, text, file, line) + FatalStack());
 	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
