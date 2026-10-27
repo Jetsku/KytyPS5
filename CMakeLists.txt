@@ -870,7 +870,7 @@ add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 target_include_directories(ime_dialog_tests PRIVATE ${inc_headers})
 
 add_executable(range_set_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/RangeSetTests.cpp")
-target_link_libraries(range_set_tests common)
+target_link_libraries(range_set_tests fmt::fmt common)
 target_include_directories(range_set_tests PRIVATE ${inc_headers})
 
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
