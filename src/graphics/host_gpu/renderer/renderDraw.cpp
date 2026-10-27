@@ -5588,6 +5588,21 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
+	// KYTY_RESOLVE_CACHE_VIEW=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 e1134351f from
+	// the GTA V fork 6bb0811e): a target can lie inside a larger image (a face of a cube, a slice of
+	// an array the guest points a colour target at); FindImage then moved the view to that level
+	// and layer, which is where the resolve reads and writes. Off: the register view's level and
+	// layer (every face lands in the first).
+	static const bool cache_view = [] {
+		const char* value = std::getenv("KYTY_RESOLVE_CACHE_VIEW");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	if (cache_view) {
+		destination.Resolve(source,
+		                    {src.desc.view_info.base_level, 1, src.desc.view_info.base_layer, 1},
+		                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
+		return true;
+	}
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;

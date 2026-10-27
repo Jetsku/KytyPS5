@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -819,9 +820,26 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 		destination_copies.clear();
 		used = 0;
 	};
+	// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 42e9c7e38): each level's extent within both images,
+	// as CopyImage: the source's extent alone wrote past a smaller destination. A block-compressed
+	// source is cut on a block boundary (a partial block only where it ends both images).
+	const bool clamp_to_destination = Common::SkipInvalidEnabled();
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		const auto fit = [&](uint32_t source_size, uint32_t destination_size) {
+			const uint32_t source_texels = std::max(source_size >> level, 1u);
+			if (!clamp_to_destination) {
+				return source_texels;
+			}
+			const uint32_t destination_texels = std::max(destination_size >> level, 1u);
+			const uint32_t texels             = std::min(source_texels, destination_texels);
+			return source_texels == destination_texels ? texels
+			                                           : texels / source_block * source_block;
+		};
+		const auto width             = fit(source.backing.extent.width, backing.extent.width);
+		const auto height            = fit(source.backing.extent.height, backing.extent.height);
+		if (width == 0 || height == 0) {
+			continue;
+		}
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;
@@ -1112,8 +1130,12 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	const bool note_dead = DeadViewScrubEnabled();
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
+			if (note_dead) {
+				NoteImageViewDestroyed(cached.view, info.data.address, info.pixel_format);
+			}
 			m_graphics.device.destroyImageView(cached.view, nullptr);
 		}
 	}

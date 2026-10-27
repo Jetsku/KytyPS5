@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/onceValue.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -3027,6 +3028,14 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 		transfer.valid = IsSupportedDepthPlaneReadback(info) && info.resources.layers != 0 &&
 		             info.data.size % info.resources.layers == 0 &&
 		             Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
+		// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 28bed064f): a depth image whose rows (pitch x
+		// height) do not fit in its share of its range is not downloaded (DownloadDepth would end
+		// the emulator); it stays until it is safe to free, as an unsupported one does.
+		if (transfer.valid && Common::SkipInvalidEnabled()) {
+			const uint64_t guest_slice =
+			    static_cast<uint64_t>(info.pitch) * info.extent.height * info.bytes_per_block;
+			transfer.valid = guest_slice <= info.data.size / info.resources.layers;
+		}
 		return transfer;
 	}
 	if (info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -3100,6 +3109,23 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
+	// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 8c9355135): a slice its range cannot hold (an image
+	// made with more layers than its range has room for) is left as it is rather than ending the
+	// emulator in the tiler.
+	if (const uint64_t slice_bytes =
+	        static_cast<uint64_t>(info.pitch) * info.extent.height * info.bytes_per_block;
+	    (info.extent.height == 0 || slice_bytes > full_slice_size) && Common::SkipInvalidEnabled()) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth %s 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u pitch %u, %u bytes a texel, %u layers: a slice needs 0x%" PRIx64
+			     " bytes and has 0x%" PRIx64 "; not uploaded\n",
+			     image.depth_id ? "stencil" : "image", info.data.address, info.data.size,
+			     info.extent.width, info.extent.height, info.pitch, info.bytes_per_block, layers,
+			     slice_bytes, full_slice_size);
+		}
+		return;
+	}
 	auto copies = BuildDepthCopies(info, full_slice_size, image.depth_id
 	                                                        ? vk::ImageAspectFlagBits::eStencil
 	                                                        : vk::ImageAspectFlagBits::eDepth);
@@ -5800,6 +5826,18 @@ void TextureCache::DownloadDepth(Image& image, vk::Buffer destination, uint64_t 
 	const uint64_t guest_slice    = texels_per_slice * info.bytes_per_block;
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
+	if (guest_slice > full_slice_size && Common::SkipInvalidEnabled()) {
+		// As in UploadImage, a slice its range cannot hold is not written back.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth image 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u, %u layers: a slice needs 0x%" PRIx64 " bytes and has 0x%" PRIx64
+			     "; not written back\n",
+			     info.data.address, info.data.size, info.extent.width, info.extent.height, layers,
+			     guest_slice, full_slice_size);
+		}
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
 	auto copies = BuildDepthCopies(info, full_slice_size, vk::ImageAspectFlagBits::eDepth);
 	if (transfer_bytes == info.bytes_per_block) {
