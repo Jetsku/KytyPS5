@@ -2530,6 +2530,39 @@ static bool TargetsRecurrent(RenderContext& context, const DrawRenderState& stat
 	return recurrent(state.depth_info.image_id);
 }
 
+// KYTY_SKIP_EXEMPT=1 (default off; on in the GT7 preset): draws into a reflection cube (a color
+// target of 6n square layers) and G-buffer passes (two color targets or more, each at least
+// 256x256, with a depth test that can fail and a depth write) may be skipped while their pipelines
+// build from their first frame, not only once the targets recur (adapted from usa-ratt/KytyPS5-GT7
+// rounds 91 and 146, a5a933c6d / 013717a4e: GT7's race start drew its cube and the car view's
+// G-buffer for the first time and compiled 33 and 64 pipelines on the GPU thread).
+static bool SkipExemptEnabled() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_SKIP_EXEMPT");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static bool SkipExemptDraw(const DrawRenderState& state) {
+	if (state.color_count == 0) return false;
+	const auto& first = state.color_info[0].desc.info;
+	if (first.resources.layers >= 6u && first.resources.layers % 6u == 0u &&
+	    first.extent.width == first.extent.height) {
+		return true; // a reflection cube
+	}
+	const auto& depth = state.depth_info;
+	if (state.color_count < 2u || !static_cast<bool>(depth.image_id) || !depth.depth_test_enable ||
+	    !depth.depth_write_enable || depth.depth_compare_op == vk::CompareOp::eAlways) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto extent = state.color_info[i].Extent();
+		if (extent.width < 256u || extent.height < 256u) return false;
+	}
+	return true; // a G-buffer pass
+}
+
 // Why a draw may not be skipped while its pipeline builds (0: it may), for KYTY_PIPELINE_SKIP_STATS.
 enum class SkipRefusal : uint8_t { None, Stages, Occlusion, NotRecurrent, Program, LinearTarget, DepthClear, Count };
 constexpr const char* SkipRefusalNames[] = {"skippable", "stages", "occlusion", "not-recurrent",
@@ -2547,7 +2580,8 @@ static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState
 	if (context.GetOcclusionCounter().Active()) {
 		return SkipRefusal::Occlusion;
 	}
-	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state)) {
+	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state) &&
+	    !(SkipExemptEnabled() && SkipExemptDraw(state))) {
 		return SkipRefusal::NotRecurrent;
 	}
 	for (const auto& stage: vertex_stages) {
