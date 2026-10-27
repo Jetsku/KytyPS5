@@ -399,6 +399,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.U32(v.indirect_mapping_offset);
 	w.U32(v.indirect_search_iterations);
 	w.Bool(v.bindless);
+	w.Bool(v.clamp_half_float);
 	w.Words(v.indirect_resources);
 }
 
@@ -423,6 +424,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.indirect_mapping_offset    = r.U32();
 	v.indirect_search_iterations = r.U32();
 	v.bindless                   = r.Bool();
+	v.clamp_half_float           = r.Bool();
 	v.indirect_resources         = r.Words();
 }
 
@@ -559,6 +561,7 @@ void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {
 	w.Bool(v.fmask);
 	w.Bool(v.bindless);
 	w.U32(v.fmask_fragments);
+	w.Bool(v.clamp_half_float);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Image& v) {
@@ -574,6 +577,7 @@ void Read(CodecReader& r, ResourceSpecialization::Image& v) {
 	v.fmask                      = r.Bool();
 	v.bindless                   = r.Bool();
 	v.fmask_fragments            = static_cast<uint8_t>(r.U32());
+	v.clamp_half_float           = r.Bool();
 }
 
 void Write(CodecWriter& w, const ResourcePlan::EvaluationOperand& v) {

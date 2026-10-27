@@ -436,6 +436,15 @@ struct CodegenOptions {
 	// lanes read zero and write nothing, as the array's accesses do. KYTY_LDS_SLOTS_LOG=1 prints the
 	// verdict per program.
 	bool lds_slots = false;
+	// KYTY_FLOAT_STORE_CLAMP=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 cfa8a479e): the
+	// guest GPU converts a float to a 16-bit float the D3D way, rounding toward zero, so a finite
+	// value beyond the half range is stored as the largest half (65504) of its sign; the host's
+	// conversion gives infinity, which one bright pixel spreads over the frame through bloom and
+	// exposure. Stores into 16-bit float storage images, 32-bit exports to 16-bit float render
+	// targets (ShaderPixelInputInfo::target_half_float_mask) and formatted 16-bit float buffer
+	// stores clamp first; formatted 11/10-bit float stores give the largest finite value instead of
+	// infinity for finite overflow.
+	bool float_store_clamp = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,

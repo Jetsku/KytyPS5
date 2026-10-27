@@ -21,7 +21,7 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 38 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
+// Members: 39 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
 // loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
 // lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
@@ -166,6 +166,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.lds_slots) {
 		b.Text("lds_slots");
+	}
+	if (options.float_store_clamp) {
+		b.Text("float_store_clamp");
 	}
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");

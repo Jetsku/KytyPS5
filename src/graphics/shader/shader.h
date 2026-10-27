@@ -285,6 +285,10 @@ struct ShaderPixelInputInfo {
 	// Last before the runtime field: the fields above keep the offsets older shader journals and
 	// pipeline lists stored.
 	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
+	// KYTY_FLOAT_STORE_CLAMP: MRT i goes to a 16-bit float render target (bit i); its 32-bit
+	// exports clamp to the half range. In padding before `stage`: the struct keeps its size, and
+	// stored journals and pipeline lists read it as zero (ShaderSanitizeStoredInputInfo).
+	uint8_t                                        target_half_float_mask = 0;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
@@ -300,6 +304,7 @@ inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
 	if (mode > static_cast<uint8_t>(ShaderPixelParameterMode::Rectangle)) {
 		info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	}
+	info.target_half_float_mask = 0;
 }
 inline void ShaderSanitizeStoredInputInfo(ShaderComputeInputInfo& info) {
 	uint8_t async = 0;

@@ -7469,6 +7469,35 @@ void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& p
 	}
 }
 
+// KYTY_FLOAT_STORE_CLAMP (usa-ratt/KytyPS5-GT7 cfa8a479e): the MRTs that go to a 16-bit float
+// render target, whose 32-bit exports then clamp to the half range as the guest GPU stores them.
+// Only with the default export routing (no KYTY_CB_SHADER_MASK_EXPORTS remap).
+static void ApplyHalfFloatTargets(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
+	pixel_info.target_half_float_mask = 0;
+	if (!ShaderRecompiler::GetCodegenOptions().float_store_clamp ||
+	    pixel_info.target_shader_mask != UINT32_MAX) {
+		return;
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX && slot < 8u; slot++) {
+		if (pixel_info.target_output_mode[slot] == 0) {
+			continue;
+		}
+		const auto& rt = context.GetRenderTarget(slot);
+		if (rt.base.addr != 0 && rt.info.channel_type == Prospero::ChannelType::kFloat &&
+		    (rt.info.format == Prospero::ChannelLayout::k16 ||
+		     rt.info.format == Prospero::ChannelLayout::k16_16 ||
+		     rt.info.format == Prospero::ChannelLayout::k16_16_16_16)) {
+			pixel_info.target_half_float_mask |= static_cast<uint8_t>(1u << slot);
+		}
+	}
+	if (pixel_info.dual_source_blending) {
+		// MRT1 is the second blend source of target 0.
+		pixel_info.target_half_float_mask =
+		    static_cast<uint8_t>((pixel_info.target_half_float_mask & ~2u) |
+		                         ((pixel_info.target_half_float_mask & 1u) << 1u));
+	}
+}
+
 void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
                     ShaderVertexInputInfo& last_vertex_stage, bool tess_active = false,
                     bool rect_list = false) {
@@ -7612,6 +7641,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		ApplyPixelParameterMode(context, user_config, mesh_active, tess_active, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
+		ApplyHalfFloatTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, vertex_info[tess_active ? 2u : 0u], tess_active,
 	               Prospero::IsRectList(user_config.GetPrimType()));
@@ -7713,6 +7743,7 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 		ApplyPixelParameterMode(context, user_config, vertex_info.logical_stage == ShaderType::Mesh,
 		                        false, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
+		ApplyHalfFloatTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, vertex_info, false,
 	               Prospero::IsRectList(user_config.GetPrimType()));

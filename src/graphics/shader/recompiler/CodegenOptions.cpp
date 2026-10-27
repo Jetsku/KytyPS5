@@ -145,6 +145,7 @@ CodegenOptions FromEnvironment() {
 	options.ps_per_vertex = EnvFlag("KYTY_PS_PER_VERTEX", options.ps_per_vertex);
 	options.clip_guard    = EnvFlag("KYTY_CLIP_GUARD", options.clip_guard);
 	options.lds_slots     = EnvFlag("KYTY_LDS_SLOTS", options.lds_slots);
+	options.float_store_clamp = EnvFlag("KYTY_FLOAT_STORE_CLAMP", options.float_store_clamp);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.
 	const auto flush_off = [](const char* name) {

@@ -442,7 +442,25 @@ static uint32_t EmitF32ToI32Bits(EmitterState& state, uint32_t value, uint32_t m
 	return EmitBinaryU32(state, spv::OpBitwiseAnd, bits, ConstantU32(state, mask));
 }
 
+uint32_t EmitClampToHalfRangeBits(EmitterState& state, uint32_t f32_bits) {
+	const auto magnitude = EmitBinaryU32(state, spv::OpBitwiseAnd, f32_bits,
+	                                     ConstantU32(state, 0x7fffffffu));
+	// 0x477fe000 is 65504, the largest half; 0x7f800000 and above are infinity and NaN.
+	const auto beyond = Binary(
+	    state, spv::OpLogicalAnd, TypeBool(state),
+	    EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x477fe000u),
+	    EmitCompareU32Constant(state, spv::OpULessThan, magnitude, 0x7f800000u));
+	const auto largest = EmitBinaryU32(
+	    state, spv::OpBitwiseOr,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, f32_bits, ConstantU32(state, 0x80000000u)),
+	    ConstantU32(state, 0x477fe000u));
+	return EmitSelectU32(state, beyond, largest, f32_bits);
+}
+
 static uint32_t EmitF32ToHalfBits(EmitterState& state, uint32_t raw) {
+	if (GetCodegenOptions().float_store_clamp) {
+		raw = EmitClampToHalfRangeBits(state, raw);
+	}
 	const auto value = EmitBitcastU32ToF32(state, raw);
 	const auto pair  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
@@ -469,8 +487,10 @@ static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t raw, uint32_t 
 	    state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftRightLogical, biased, ConstantU32(state, shift)),
 	    ConstantU32(state, 112u << mantissa_bits));
 	const auto normal_clamped = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state),
-	                          GLSLstd450UMin, normal, ConstantU32(state, infinity));
+	// KYTY_FLOAT_STORE_CLAMP: finite overflow gives the largest finite value, as the guest GPU.
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state), GLSLstd450UMin, normal,
+	    ConstantU32(state, GetCodegenOptions().float_store_clamp ? infinity - 1u : infinity));
 	const auto value    = EmitBitcastU32ToF32(state, raw);
 	const auto denormal = EmitF32ToU32(
 	    state, EmitScaledRoundEven(state, value,

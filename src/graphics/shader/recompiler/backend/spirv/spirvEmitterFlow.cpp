@@ -653,6 +653,24 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    !uint_output && !exp.compr && exp.index < 8u &&
+		    (state.input_info.pixel->target_half_float_mask & (1u << exp.index)) != 0u) {
+			// KYTY_FLOAT_STORE_CLAMP: a 32-bit export to a 16-bit float target keeps the guest's
+			// range (the largest half, not the host's infinity). Packed half exports are in range.
+			uint32_t components[4] {};
+			for (uint32_t component = 0; component < 4u; component++) {
+				const auto bits = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits,
+				                          Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value),
+				                          component);
+				components[component] = Unary(state, spv::OpBitcast, TypeF32(state),
+				                              EmitClampToHalfRangeBits(state, bits));
+			}
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, value, components[0],
+			                          components[1], components[2], components[3]);
+		}
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && !uint_output &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.

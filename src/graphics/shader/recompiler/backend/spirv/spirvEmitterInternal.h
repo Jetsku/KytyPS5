@@ -625,6 +625,11 @@ inline constexpr auto EmitSelectValueU32 =
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
 
+// KYTY_FLOAT_STORE_CLAMP: the bits of a 32-bit float (u32) bound for a 16-bit float format, the
+// guest GPU's way: a finite value beyond the half range becomes the largest half of its sign
+// (65504); infinity and NaN pass unchanged.
+uint32_t EmitClampToHalfRangeBits(EmitterState& state, uint32_t f32_bits);
+
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
 
 inline constexpr auto EmitOrU32 = EmitNative<spv::OpBitwiseOr, IR::Type::U32, uint32_t, uint32_t>;
