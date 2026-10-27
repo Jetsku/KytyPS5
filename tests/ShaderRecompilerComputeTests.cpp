@@ -53329,6 +53329,25 @@ void CheckDeadImageViewScrub() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// usa-ratt/KytyPS5-GT7 3f9cef931: video-out DCC with 128-byte independent blocks (GT7 at 120 Hz).
+void CheckVideoOutDcc128() {
+  using Libs::Graphics::ClassifyVideoOutCompression;
+  using Libs::Graphics::VideoOutCompression;
+  Require("VideoOutDcc", "128B independent blocks",
+          ClassifyVideoOutCompression(true, 0x100000u, 0x00100024u, 0) ==
+              VideoOutCompression::Dcc128_128_128,
+          "DCC control 0x00100024 was not accepted");
+  Require("VideoOutDcc", "known layouts unchanged",
+          ClassifyVideoOutCompression(true, 0x100000u, 0x48u, 0) ==
+                  VideoOutCompression::Dcc256_256_0 &&
+              ClassifyVideoOutCompression(true, 0x100000u, 0x208u, 0) ==
+                  VideoOutCompression::Dcc256_64_64 &&
+              ClassifyVideoOutCompression(true, 0x100000u, 0x00100025u, 0) ==
+                  VideoOutCompression::Unsupported,
+          "the other DCC controls changed classification");
+  std::printf("[host]    %-32s ok\n", "VideoOutDcc");
+}
+
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
   (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
@@ -60230,6 +60249,7 @@ int main(int argc, char **argv) {
     CheckRenderTargetFormatContract();
     CheckTenBitRenderTargetFormat();
     CheckDeadImageViewScrub();
+    CheckVideoOutDcc128();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
@@ -60286,6 +60306,7 @@ int main(int argc, char **argv) {
   CheckRenderTargetFormatContract();
   CheckTenBitRenderTargetFormat();
   CheckDeadImageViewScrub();
+  CheckVideoOutDcc128();
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
