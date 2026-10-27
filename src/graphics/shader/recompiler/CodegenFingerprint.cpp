@@ -127,6 +127,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}
+	if (options.heap_key_mask) {
+		b.Text("heap_key_mask");
+	}
 	if (options.wave64_warps) {
 		b.Text("wave64_warps");
 	}

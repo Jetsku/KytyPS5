@@ -5077,6 +5077,30 @@ std::optional<uint64_t> BufferCache::PendingBackingPublicationTick(uint64_t vadd
 	return latest;
 }
 
+// KYTY_DIRECT_READ_WAIT (adapted from KytyPS5-Frank 1c9ad7586): a direct read of guest memory
+// that bypasses page protection (TryReadBufferBacking: the SRT walker's buffer reads) found bytes a
+// queued download still has to publish: their older value is in the backing until the
+// publication's tick completes and its priority operation has run. Waits for that publication
+// (a few rounds, as a later download can queue another one), else drains everything recorded.
+void BufferCache::WaitBackingPublications(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	for (int round = 0; round < 8; round++) {
+		const auto tick = PendingBackingPublicationTick(vaddr, size);
+		if (!tick) {
+			return;
+		}
+		if (!m_scheduler.IsFree(*tick)) {
+			m_scheduler.Wait(*tick);
+		}
+		m_scheduler.WaitPriorityOperations(*tick);
+	}
+	if (HasPendingBackingPublication(vaddr, size)) {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }

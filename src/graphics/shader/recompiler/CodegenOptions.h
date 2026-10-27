@@ -244,6 +244,15 @@ struct CodegenOptions {
 	// more (Insomniac binds its whole vertex pool, 3 GiB, through one V#); with this switch the
 	// descriptor range is no longer capped (KYTY_STORAGE_RANGE_CAP auto), so data past 2 GiB reads.
 	bool storage_length_zero = false;
+	// KYTY_HEAP_KEY_MASK=1 (default 0; on in the PPSA03671 title preset): a T# read from a heap at
+	// (key << 5) & mask, with the mask's low five bits clear and a key only the shader knows (a
+	// V_READFIRSTLANE of a lane value), is planned as the heap record of key & (mask >> 5): a bindless
+	// image when the device has them (ResourceTracking, MatchTableOffset). With such a key, a heap T#
+	// whose word 0 the shader also uses as a value (0x885fa47aec73f696 spills it with V_WRITELANE
+	// before the sample) gets the same bindless plan. Without it such a program is skipped
+	// ("computes a descriptor at runtime that has no BDA path"). Exact; only programs that were
+	// skipped change.
+	bool heap_key_mask = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -273,6 +282,13 @@ struct CodegenOptions {
 	// calls are not affected either way, so it is not part of the codegen fingerprint: an expanded
 	// program is a different input (its code and key carry the callees).
 	bool shader_calls = false;
+	// KYTY_CALL_TRACE_WAVE32=1 (default 0; on in the PPSA03671 title preset): the S_SWAPPC_B64 call
+	// trace (AnalyzeShaderCalls) counts a V_CMP mask or carry-out of a wave32 program as one SGPR
+	// (not a pair), and a register range that nothing before the call writes and no later write can
+	// loop back to holds its entry value. PPSA03671's tiled material kernels (0x384f47083f0d5e08 and
+	// three more) were skipped because a V_CMP to s11 looked like a write of their SRT pointer s12.
+	// Only programs whose trace failed change; not in the fingerprint (as KYTY_SHADER_CALLS).
+	bool call_trace_wave32 = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
