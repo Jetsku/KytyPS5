@@ -18,6 +18,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 uint32_t TrackResources(Program& program, bool indirect_scalar_buffers = false,
                         bool bda_writes = false,
                         const ShaderWorkgroupInputInfo* workgroup = nullptr);
+// Tests: KYTY_TEXTURE_LAYER_BOUND forced on (1) or off (0); -1: the switch decides.
+void SetLayerBoundForTest(int enabled);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

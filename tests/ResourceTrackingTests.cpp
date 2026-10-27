@@ -3807,6 +3807,66 @@ void TestShaderInfoAndBindingLayout() {
         "binding layout did not collect live typed user-data values");
 }
 
+// KYTY_TEXTURE_LAYER_BOUND (ResourceTracking ArrayIndexBound): a 2D array sample whose layer
+// coordinate is a constant 5.0 is bound at layer 5; a layer from user data gets no bound; with the
+// switch off nothing is bound.
+void TestArrayLayerBound() {
+  const auto sample = [](Value layer, bool on) {
+    SetLayerBoundForTest(on ? 1 : 0);
+    Fixture fixture;
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      words[word] = fixture.UserData(word);
+    }
+    const auto image = fixture.Image(words, 0x40);
+    const auto sampler = fixture.Sampler(
+        {fixture.UserData(8u), fixture.UserData(9u), fixture.UserData(10u), fixture.UserData(11u)});
+    const auto address = fixture.Emit(
+        ValueOpcode::MakeImageAddress,
+        {Value(0u), Value(0u), layer, Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2DArray;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+                 fixture.AddMemory(memory, 0x40));
+    fixture.PlanAndTrack();
+    SetLayerBoundForTest(-1);
+    Check(fixture.program.info.images.size() == 1u, "array sample lost its image");
+    return fixture.program.info.images[0].max_array_index;
+  };
+  Check(sample(Value(0x40a00000u), true) == 5u, "a constant layer 5.0 was not bound at 5");
+  Check(sample(Value(0x40a00000u), false) == ImageResource::NoArrayIndexBound,
+        "the layer bound was computed with the switch off");
+
+
+  {
+    SetLayerBoundForTest(1);
+    Fixture fixture;
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      words[word] = fixture.UserData(word);
+    }
+    const auto image = fixture.Image(words, 0x40);
+    const auto sampler = fixture.Sampler(
+        {fixture.UserData(8u), fixture.UserData(9u), fixture.UserData(10u), fixture.UserData(11u)});
+    const auto address = fixture.Emit(
+        ValueOpcode::MakeImageAddress,
+        {Value(0u), Value(0u), fixture.UserData(20u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2DArray;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+                 fixture.AddMemory(memory, 0x40));
+    fixture.PlanAndTrack();
+    SetLayerBoundForTest(-1);
+    Check(fixture.program.info.images.size() == 1u &&
+              fixture.program.info.images[0].max_array_index == ImageResource::NoArrayIndexBound,
+          "a layer from user data was bounded");
+  }
+}
+
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
@@ -4440,6 +4500,7 @@ int main() {
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
+    Run("array layer bound", TestArrayLayerBound);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);

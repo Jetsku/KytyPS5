@@ -46,14 +46,20 @@ namespace {
 // KYTY_TEXTURE_LAYER_BOUND=1 (default off; chenxiao07/KytyPS5 d44e93d81, 6b57b4939, c965985ff): the
 // largest layer each sampled 1D/2D array's samples and gathers can reach (ImageResource::
 // max_array_index); its view then holds no layer past it (descriptors.cpp).
+std::atomic<int> g_layer_bound_test {-1}; // SetLayerBoundForTest: -1 the switch decides
 bool LayerBoundEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_TEXTURE_LAYER_BOUND");
 		return value != nullptr && value[0] == '1';
 	}();
-	return enabled;
+	const int test = g_layer_bound_test.load(std::memory_order_relaxed);
+	return test >= 0 ? test != 0 : enabled;
 }
 } // namespace
+
+void SetLayerBoundForTest(int enabled) {
+	g_layer_bound_test.store(enabled, std::memory_order_relaxed);
+}
 
 namespace {
 
