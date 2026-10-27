@@ -152,6 +152,7 @@ PipelineList::Info TestInfo() {
 	info.producer         = "PipelineListTests";
 	info.input_info_sizes = InputSizes;
 	info.created_unix     = 1234;
+	info.state_format     = PipelineList::StateFormat;
 	return info;
 }
 
@@ -229,7 +230,8 @@ void TestExportAndRoundTrip() {
 	std::string        error;
 	CHECK(PipelineList::Decode(bytes, decoded, &error));
 	CHECK(decoded.info.title_id == "PPSA00000" && decoded.info.app_version == "01.000.000" &&
-	      decoded.info.input_info_sizes == InputSizes && decoded.info.created_unix == 1234);
+	      decoded.info.input_info_sizes == InputSizes && decoded.info.created_unix == 1234 &&
+	      decoded.info.state_format == PipelineList::StateFormat);
 	CHECK(decoded.levels == file.levels && decoded.shaders.size() == 2 && decoded.permutations.size() == 3);
 	CHECK(decoded.shaders[1].static_state == file.shaders[1].static_state &&
 	      decoded.shaders[1].input_info == file.shaders[1].input_info &&

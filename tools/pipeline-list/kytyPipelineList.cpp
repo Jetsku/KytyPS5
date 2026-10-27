@@ -124,6 +124,7 @@ int Export(const Arguments& args) {
 	}
 	info.producer     = args.producer;
 	info.created_unix = NowUnix();
+	info.state_format = PipelineList::StateFormat;
 	std::vector<uint8_t> image;
 	if (!ReadFile(Executable(args), image)) {
 		std::fprintf(stderr, "cannot read %s\n", Executable(args).string().c_str());
@@ -274,8 +275,8 @@ int Merge(const Arguments& args) {
 			info.created_unix = NowUnix();
 			builder           = std::make_unique<PipelineList::Builder>(info);
 		} else if (file.info.title_id != info.title_id || file.info.app_version != info.app_version ||
-		           file.info.input_info_sizes != info.input_info_sizes) {
-			std::fprintf(stderr, "%s is for another title, version or input layout\n", input.c_str());
+		           file.info.input_info_sizes != info.input_info_sizes || file.info.state_format != info.state_format) {
+			std::fprintf(stderr, "%s is for another title, version, input layout or pipeline state format\n", input.c_str());
 			return 2;
 		}
 		builder->AddList(file, stats);
@@ -290,10 +291,12 @@ int Info(const Arguments& args) {
 	if (!ReadFile(args.inputs[0], bytes)) return 2;
 	PipelineList::File file;
 	if (!Load(args.inputs[0], file)) return 2;
-	std::printf("%s: %zu bytes\n  title %s, version %s, producer %s, input infos %u %u %u, created %llu\n",
+	std::printf("%s: %zu bytes\n  title %s, version %s, producer %s, input infos %u %u %u, created %llu, pipeline "
+	            "state format %u (this tool: %u), %zu data files\n",
 	            args.inputs[0].c_str(), bytes.size(), file.info.title_id.c_str(), file.info.app_version.c_str(),
 	            file.info.producer.c_str(), file.info.input_info_sizes[0], file.info.input_info_sizes[1],
-	            file.info.input_info_sizes[2], static_cast<unsigned long long>(file.info.created_unix));
+	            file.info.input_info_sizes[2], static_cast<unsigned long long>(file.info.created_unix),
+	            file.info.state_format, PipelineList::StateFormat, file.files.size());
 	std::vector<std::pair<uint32_t, std::vector<uint8_t>>> sections;
 	(void)PipelineList::DecodeSections(bytes, sections);
 	for (const auto& [id, raw]: sections) std::printf("  section %u: %zu raw bytes\n", id, raw.size());

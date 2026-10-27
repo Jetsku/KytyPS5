@@ -6382,18 +6382,24 @@ bool NormalizeListSource(const GraphicContext& graphics, ShaderJournal::Source& 
 } // namespace
 
 void PipelineCache::InitializePipelineList() {
+	// Unset (default): PipelineLists/<title>.kyplst next to the emulator when it exists (a release
+	// ships them; nothing is logged when there is none). "1": that file, logged when missing. "0": off.
+	// Any other value: that file.
 	const auto* setting = std::getenv("KYTY_PIPELINE_LIST");
 	const bool  prepare = EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0;
-	const bool  off     = setting == nullptr || *setting == '\0' || std::strcmp(setting, "0") == 0;
+	const bool  unset   = setting == nullptr || *setting == '\0';
+	const bool  off     = !unset && std::strcmp(setting, "0") == 0;
 	if (off && !prepare) return;
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) return;
 	const auto begin = CompileClockNs();
-	const auto path  = off || std::strcmp(setting, "1") == 0
+	const auto path  = unset || off || std::strcmp(setting, "1") == 0
 	                       ? std::filesystem::path("PipelineLists") / (title_id + ".kyplst")
 	                       : std::filesystem::path(setting);
 	std::vector<uint8_t> bytes;
 	{
+		std::error_code exists_error;
+		if (unset && !prepare && !std::filesystem::exists(path, exists_error)) return;
 		std::ifstream   in(path, std::ios::binary);
 		std::error_code error;
 		const auto      size = std::filesystem::file_size(path, error);
@@ -6462,10 +6468,17 @@ void PipelineCache::InitializePipelineList() {
 	PipelineList::ResolveStats stats;
 	auto resolved = PipelineList::Resolve(file, sizes, read, read_image, stats);
 	if (stats.resolved * 2 < stats.shaders) {
-		PipelineCacheLog("Pipeline list: only {} of {} shaders match this game's executable ({} differ, {} with "
-		                 "another input layout): ignored",
-		                 stats.resolved, stats.shaders, stats.mismatched, stats.other_input_layout);
+		PipelineCacheLog("Pipeline list: only {} of {} shaders match this game's files ({} differ, {} with "
+		                 "another input layout, made by {}): ignored",
+		                 stats.resolved, stats.shaders, stats.mismatched, stats.other_input_layout, file.info.producer);
 		return;
+	}
+	if (file.info.state_format != PipelineList::StateFormat && !file.pipelines.empty()) {
+		PipelineCacheLog("Pipeline list: {} was made by {} with pipeline state format {} (this build: {}); its {} "
+		                 "pipelines are not replayed, only its shaders are precompiled",
+		                 Common::PathToString(path), file.info.producer, file.info.state_format,
+		                 PipelineList::StateFormat, file.pipelines.size());
+		file.pipelines.clear();
 	}
 	// This device's inputs and static keys; the permutations' identities follow from them.
 	uint64_t not_here = 0;

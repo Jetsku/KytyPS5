@@ -100,7 +100,16 @@ struct Info {
 	// producer: the stage input info bytes are those structs.
 	std::array<uint32_t, 3> input_info_sizes {};
 	uint64_t                created_unix = 0;
+	// The renderer's pipeline state format the pipelines were recorded with (StateFormat of the
+	// producer; 0: a list older than the field). A list of another format keeps its shaders (the
+	// precompile is still exact) but its pipelines are not replayed: they would describe create infos
+	// this build no longer makes.
+	uint32_t state_format = 0;
 };
+// Bump when CreatePipelineInternal (pipeline/shaders.cpp) or GraphicsPipelineSnapshot changes the
+// graphics pipeline create infos it makes for the same draw state (released lists then keep only
+// their shaders until they are re-recorded).
+inline constexpr uint32_t StateFormat = 1;
 
 struct Shader {
 	CodeFile file      = CodeFile::Executable;

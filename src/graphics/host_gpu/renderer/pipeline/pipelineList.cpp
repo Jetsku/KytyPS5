@@ -99,6 +99,7 @@ std::vector<uint8_t> EncodeInfo(const PipelineList::Info& info) {
 	PutText(out, info.producer);
 	for (const auto size: info.input_info_sizes) Put<uint32_t>(out, size);
 	Put<uint64_t>(out, info.created_unix);
+	Put<uint32_t>(out, info.state_format);
 	return out;
 }
 
@@ -195,6 +196,8 @@ bool DecodeInfo(std::span<const uint8_t> bytes, PipelineList::Info& info) {
 	info.producer    = r.Text();
 	for (auto& size: info.input_info_sizes) size = r.Get<uint32_t>();
 	info.created_unix = r.Get<uint64_t>();
+	if (r.Failed()) return false;
+	info.state_format = r.AtEnd() ? 0u : r.Get<uint32_t>(); // appended field (0: older list)
 	return !r.Failed(); // later formats may append fields
 }
 
