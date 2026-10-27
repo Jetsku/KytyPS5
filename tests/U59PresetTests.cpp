@@ -139,7 +139,7 @@ void TestLoadTitle() {
 	Check(LoadTitle({first, second}, "PPSA21567").status == Status::Missing,
 	      "another title does not take this title's file");
 	// The title presets this repository ships parse.
-	for (const char* id: {"PPSA01417", "PPSA01474", "PPSA03671", "PPSA08705"}) {
+	for (const char* id: {"PPSA01340", "PPSA01341", "PPSA01342", "PPSA01417", "PPSA01474", "PPSA03671", "PPSA08705"}) {
 		const auto shipped = LoadTitle({std::filesystem::path(KYTY_U59_PRESET_DIR)}, id);
 		Check(shipped.status == Status::Loaded && !shipped.entries.empty(),
 		      "every shipped tools/u59-preset.<TITLE_ID>.json loads");
