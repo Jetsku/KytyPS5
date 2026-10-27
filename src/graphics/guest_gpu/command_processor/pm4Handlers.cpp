@@ -2545,6 +2545,19 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 			}
 			return num_values + 1u;
 		}
+		if (Common::SkipInvalidEnabled()) {
+			// usa-ratt/KytyPS5-GT7 8f279c916 (adapted): GT7 writes the removed PS block offsets
+			// 0x000/0x001 together mid-race. A SET_SH_REG of registers without a handler is
+			// skipped and logged (the first 8) instead of ending the emulator; the register tables
+			// keep those slots unhandled (indirect ones are skipped in CpOpIndirectShRegs).
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				LOGF("\t temporary: skipping SET_SH_REG of unhandled register 0x%03" PRIx32
+				     " (%u values, first 0x%08" PRIx32 ")\n",
+				     cmd_offset, num_values, num_values != 0 ? buffer[1] : 0u);
+			}
+			return num_values + 1u;
+		}
 		EXIT("unknown shader register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 		     "\n\tcmd_offset = %08" PRIx32 "\n",
 		     num_dw - dw, cmd_id, cmd_offset);
@@ -3940,24 +3953,6 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	// PS block offsets 0x000/0x001, written together by GT7 mid-race. 0x001 matches
-	// SPI_SHADER_PGM_RSRC4_PS (the PS form of the ignored RSRC4_GS/HS hints); 0x000 is
-	// unconfirmed. Neither affects translation: accepted with KYTY_SKIP_INVALID, first values
-	// logged.
-	if (Common::SkipInvalidEnabled()) {
-		for (uint32_t offset = 0; offset <= 1; offset++) {
-			if (g_hw_sh_indirect_func[offset] != nullptr) {
-				continue;
-			}
-			g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1, std::memory_order_relaxed) < 8u) {
-					LOGF("\t temporary: ignoring PS SH register 0x%03" PRIx32 " = 0x%08" PRIx32 "\n",
-					     cmd_offset, value);
-				}
-			};
-		}
-	}
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
