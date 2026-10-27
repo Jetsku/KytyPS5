@@ -182,11 +182,14 @@ Recording MakeRecording(const std::string& level, vk::PrimitiveTopology topology
 	return r;
 }
 
-PipelineList::Builder::LocateFn LocatorFor(const std::vector<uint8_t>& image) {
-	return [&image](std::span<const uint32_t> code) {
+PipelineList::Builder::LocateFn LocatorFor(const std::vector<uint8_t>& image,
+                                           PipelineList::CodeFile file = PipelineList::CodeFile::Executable) {
+	return [&image, file](std::span<const uint32_t> code) -> std::optional<PipelineList::Builder::Location> {
 		const std::span bytes(reinterpret_cast<const uint8_t*>(code.data()), code.size_bytes());
 		const auto      query = PipelineList::QueryFor(bytes);
-		return PipelineList::FindCode(image, std::span(&query, 1))[0];
+		const auto      found = PipelineList::FindCode(image, std::span(&query, 1))[0];
+		if (!found.has_value()) return std::nullopt;
+		return PipelineList::Builder::Location {file, *found};
 	};
 }
 
@@ -502,10 +505,59 @@ void TestRewrite() {
 	CHECK(!PipelineList::RewriteSnapshotModules(truncated, [](uint32_t) { return uint64_t {0}; }));
 }
 
+// Shaders kept in a game data file (Insomniac titles: d/material): located there, named by the
+// files section, read from that file when resolving; a list without data files has no such section.
+void TestDataFiles() {
+	auto                  recording = MakeRecording("level_a", vk::PrimitiveTopology::eTriangleList);
+	std::vector<uint64_t> offsets;
+	const auto            data = Image(recording.sources, offsets);
+	PipelineList::Builder     builder(TestInfo());
+	const auto                material = builder.AddFile("d/material");
+	CHECK(static_cast<uint32_t>(material) == 1 && builder.AddFile("d/material") == material);
+	PipelineList::ExportStats stats;
+	builder.AddJournals(recording.sources, recording.entries, recording.pipelines, LocatorFor(data, material), stats);
+	const auto file = builder.Finish();
+	CHECK(stats.sources_located == 2 && file.files.size() == 1 && file.shaders[0].file == material &&
+	      file.shaders[1].offset == offsets[1]);
+	const auto         bytes = PipelineList::Encode(file);
+	PipelineList::File decoded;
+	CHECK(PipelineList::Decode(bytes, decoded) && decoded.files == file.files && decoded.shaders[0].file == material);
+	std::vector<std::pair<uint32_t, std::vector<uint8_t>>> sections;
+	CHECK(PipelineList::DecodeSections(bytes, sections) && sections.size() == 6);
+	// Resolving reads the data file, not the executable.
+	const std::vector<uint8_t> executable(64, 0);
+	PipelineList::ResolveStats resolve_stats;
+	const auto resolved = PipelineList::Resolve(
+	    decoded, InputSizes,
+	    [&](PipelineList::CodeFile which, uint64_t offset, std::span<uint8_t> out) {
+		    const auto& image = which == material ? data : executable;
+		    if (offset > image.size() || out.size() > image.size() - offset) return false;
+		    std::memcpy(out.data(), image.data() + offset, out.size());
+		    return true;
+	    },
+	    {}, resolve_stats);
+	CHECK(resolve_stats.resolved == 2 && resolved.usable[0] && resolved.usable[1]);
+	// A shader naming a file the list does not have, or a path leaving the game folder, is refused.
+	auto bad = file;
+	bad.shaders[0].file = static_cast<PipelineList::CodeFile>(2);
+	PipelineList::File out;
+	CHECK(!PipelineList::Decode(PipelineList::Encode(bad), out));
+	auto escape     = file;
+	escape.files[0] = "../secret";
+	CHECK(!PipelineList::Decode(PipelineList::Encode(escape), out));
+	// Merging keeps the data file of each shader.
+	PipelineList::Builder     merged(TestInfo());
+	PipelineList::ExportStats merge_stats;
+	merged.AddList(decoded, merge_stats);
+	const auto again = merged.Finish();
+	CHECK(again.files == file.files && again.shaders[1].file == material);
+}
+
 } // namespace
 
 int main() {
 	TestExportAndRoundTrip();
+	TestDataFiles();
 	TestResolve();
 	TestMergedStage();
 	TestMerge();

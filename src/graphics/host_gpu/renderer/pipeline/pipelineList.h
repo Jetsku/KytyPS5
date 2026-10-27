@@ -81,12 +81,16 @@ enum class SectionId : uint32_t {
 	Shaders      = 3,
 	Permutations = 4,
 	Pipelines    = 5,
+	Files        = 6, // the game data files shaders are read from (optional; CodeFile 1..n)
 };
 
 // The file a shader's code is read from.
+// 0 is the game's executable (/app0/eboot.bin); n >= 1 is File::files[n - 1], a data file of the
+// game (path relative to /app0, '/' separated): Insomniac titles keep most shader code in d/material.
 enum class CodeFile : uint32_t {
-	Executable = 0, // the game's executable (/app0/eboot.bin)
+	Executable = 0,
 };
+inline constexpr uint32_t MaxDataFiles = 4096;
 
 struct Info {
 	std::string title_id;    // TITLE_ID of param.json / param.sfo
@@ -146,6 +150,7 @@ struct File {
 	std::vector<Shader>      shaders;
 	std::vector<Permutation> permutations;
 	std::vector<Pipeline>    pipelines;
+	std::vector<std::string> files; // data files (CodeFile n >= 1 is files[n - 1])
 };
 
 [[nodiscard]] std::vector<uint8_t> Encode(const File& file, int zstd_level = 19);
@@ -195,9 +200,15 @@ public:
 
 	// One recording run: its shader journal content and pipeline journal records. `locate` gives the
 	// executable offset of a source's code (nullopt: not found, the source is dropped).
-	using LocateFn = std::function<std::optional<uint64_t>(std::span<const uint32_t> code)>;
+	struct Location {
+		CodeFile file   = CodeFile::Executable;
+		uint64_t offset = 0;
+	};
+	using LocateFn = std::function<std::optional<Location>(std::span<const uint32_t> code)>;
 	void AddJournals(const std::vector<ShaderJournal::Source>& sources, const std::vector<ShaderJournal::Entry>& entries,
 	                 const std::vector<PipelineJournal::Record>& pipelines, const LocateFn& locate, ExportStats& stats);
+	// The data file named `path` (relative to /app0) as a CodeFile, added to the list's table once.
+	CodeFile AddFile(const std::string& path);
 	// Another list (merge).
 	void AddList(const File& other, ExportStats& stats);
 

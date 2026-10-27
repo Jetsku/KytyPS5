@@ -26,7 +26,7 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 	s.m_mesh = allow_mesh && info.stageCount != 0 && info.pStages[0].stage == vk::ShaderStageFlagBits::eMeshEXT;
 	if (info.flags != vk::PipelineCreateFlags {} || info.renderPass != nullptr ||
 	    info.basePipelineHandle != nullptr || info.layout == nullptr ||
-	    info.pTessellationState != nullptr || (info.pVertexInputState == nullptr) != s.m_mesh ||
+	    (info.pTessellationState != nullptr && !allow_mesh) || (info.pVertexInputState == nullptr) != s.m_mesh ||
 	    (info.pInputAssemblyState == nullptr) != s.m_mesh || info.pViewportState == nullptr ||
 	    info.pRasterizationState == nullptr || info.pMultisampleState == nullptr ||
 	    info.pColorBlendState == nullptr || info.pDynamicState == nullptr) {
@@ -42,6 +42,16 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 		rendering = reinterpret_cast<const vk::PipelineRenderingCreateInfo*>(next);
 	}
 	if (rendering == nullptr) return nullptr;
+	// Tessellation (allow_mesh only: the journal and known keys, not the library path): the patch size;
+	// the stages may then also hold one tessellation control and one evaluation shader.
+	if (info.pTessellationState != nullptr) {
+		const auto& tess = *info.pTessellationState;
+		if (s.m_mesh || tess.pNext != nullptr || tess.flags != vk::PipelineTessellationStateCreateFlags {}) {
+			return nullptr;
+		}
+		s.m_tessellation                 = true;
+		s.m_tess_state.patchControlPoints = tess.patchControlPoints;
+	}
 	s.m_rendering.viewMask                = rendering->viewMask;
 	s.m_rendering.depthAttachmentFormat   = rendering->depthAttachmentFormat;
 	s.m_rendering.stencilAttachmentFormat = rendering->stencilAttachmentFormat;
@@ -74,7 +84,7 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 		} else if (stage.stage == vk::ShaderStageFlagBits::eFragment &&
 		           s.m_fragment_module == nullptr) {
 			s.m_fragment_module = stage.module;
-		} else {
+		} else if (!s.m_tessellation || !s.AddTessellationStage(stage.stage)) {
 			return nullptr;
 		}
 		s.m_stages.push_back(stage);
@@ -237,6 +247,8 @@ void GraphicsPipelineSnapshot::Wire() {
 	m_create.pDepthStencilState  = m_has_depth_stencil ? &m_depth_stencil : nullptr;
 	m_create.pColorBlendState    = &m_color_blend;
 	m_create.pDynamicState       = &m_dynamic;
+	m_tess_state.pNext           = nullptr;
+	m_create.pTessellationState  = m_tessellation ? &m_tess_state : nullptr;
 	m_create.layout              = layout;
 	m_create.basePipelineIndex   = base_index;
 }
@@ -244,6 +256,8 @@ void GraphicsPipelineSnapshot::Wire() {
 namespace {
 
 constexpr uint32_t SnapshotMagic = 0x324e5350u; // "PSN2"
+// With tessellation (more stages and the patch size); other pipelines keep "PSN2" and their keys.
+constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3"
 constexpr uint32_t SnapshotEnd   = 0x00444e45u; // "END"
 
 class WordWriter {
@@ -347,7 +361,7 @@ private:
 
 bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const ModuleHashFn& module_hash) const {
 	WordWriter w(out);
-	w.U32(SnapshotMagic);
+	w.U32(m_tessellation ? SnapshotMagicTess : SnapshotMagic);
 	w.U32(m_mesh ? 1u : 0u);
 	w.U32(m_rendering.viewMask);
 	w.Enum(m_rendering.depthAttachmentFormat);
@@ -363,6 +377,7 @@ bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const Modul
 		w.Text(m_stage_names[i]);
 		w.U32(m_stage_subgroups[i].requiredSubgroupSize);
 	}
+	if (m_tessellation) w.U32(m_tess_state.patchControlPoints);
 	w.U32(static_cast<uint32_t>(m_bindings.size()));
 	for (const auto& b: m_bindings) {
 		w.U32(b.binding);
@@ -448,13 +463,15 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 	std::unique_ptr<GraphicsPipelineSnapshot> copy(new GraphicsPipelineSnapshot());
 	auto&                                     s = *copy;
 	WordReader                                r(words);
-	if (r.U32() != SnapshotMagic) return nullptr;
+	const auto                                magic = r.U32();
+	if (magic != SnapshotMagic && magic != SnapshotMagicTess) return nullptr;
+	s.m_tessellation                      = magic == SnapshotMagicTess;
 	s.m_mesh                              = r.U32() != 0;
 	s.m_rendering.viewMask                = r.U32();
 	s.m_rendering.depthAttachmentFormat   = r.Enum<vk::Format>();
 	s.m_rendering.stencilAttachmentFormat = r.Enum<vk::Format>();
 	for (auto n = r.Count(8); n != 0; --n) s.m_color_formats.push_back(r.Enum<vk::Format>());
-	for (auto n = r.Count(2); n != 0; --n) {
+	for (auto n = r.Count(s.m_tessellation ? 5 : 2); n != 0; --n) {
 		vk::PipelineShaderStageCreateInfo stage {};
 		stage.stage       = static_cast<vk::ShaderStageFlagBits>(r.U32());
 		const auto hash   = r.U64();
@@ -468,13 +485,14 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 			s.m_vertex_module = stage.module;
 		} else if (stage.stage == vk::ShaderStageFlagBits::eFragment && s.m_fragment_module == nullptr) {
 			s.m_fragment_module = stage.module;
-		} else {
+		} else if (!s.m_tessellation || !s.AddTessellationStage(stage.stage)) {
 			return nullptr;
 		}
 		s.m_stages.push_back(stage);
 		s.m_stage_names.push_back(std::move(name));
 	}
 	if (s.m_vertex_module == nullptr) return nullptr;
+	if (s.m_tessellation) s.m_tess_state.patchControlPoints = r.U32();
 	for (auto n = r.Count(64); n != 0; --n) {
 		vk::VertexInputBindingDescription b {};
 		b.binding   = r.U32();
@@ -560,13 +578,14 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 std::vector<uint64_t> GraphicsPipelineSnapshot::SerializedModules(std::span<const uint32_t> words) {
 	std::vector<uint64_t> hashes;
 	WordReader            r(words);
-	if (r.U32() != SnapshotMagic) return {};
+	const auto            magic = r.U32();
+	if (magic != SnapshotMagic && magic != SnapshotMagicTess) return {};
 	(void)r.U32();
 	(void)r.U32();
 	(void)r.U32();
 	(void)r.U32();
 	for (auto n = r.Count(8); n != 0; --n) (void)r.U32();
-	for (auto n = r.Count(2); n != 0; --n) {
+	for (auto n = r.Count(magic == SnapshotMagicTess ? 5 : 2); n != 0; --n) {
 		(void)r.U32();
 		hashes.push_back(r.U64());
 		(void)r.Text();

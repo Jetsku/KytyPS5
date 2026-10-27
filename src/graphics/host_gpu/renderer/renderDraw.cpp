@@ -2472,35 +2472,69 @@ static bool TargetsRecurrent(RenderContext& context, const DrawRenderState& stat
 	return recurrent(state.depth_info.image_id);
 }
 
-static bool DrawOnlyChangesPicture(RenderContext& context, const DrawRenderState& state,
+// Why a draw may not be skipped while its pipeline builds (0: it may), for KYTY_PIPELINE_SKIP_STATS.
+enum class SkipRefusal : uint8_t { None, Stages, Occlusion, NotRecurrent, Program, LinearTarget, DepthClear, Count };
+constexpr const char* SkipRefusalNames[] = {"skippable", "stages", "occlusion", "not-recurrent",
+                                            "program", "linear-target", "depth-clear"};
+
+static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState& state,
                                    std::span<const ShaderVertexInputInfo> vertex_stages, bool mesh_active) {
-	if (mesh_active || vertex_stages.size() != 1 || context.GetOcclusionCounter().Active()) {
-		return false;
+	if (mesh_active || vertex_stages.size() != 1) {
+		return SkipRefusal::Stages;
+	}
+	if (context.GetOcclusionCounter().Active()) {
+		return SkipRefusal::Occlusion;
 	}
 	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state)) {
-		return false;
+		return SkipRefusal::NotRecurrent;
 	}
 	for (const auto& stage: vertex_stages) {
 		if (stage.stage.program == nullptr || !DrawRunProgramEligible(*stage.stage.program)) {
-			return false;
+			return SkipRefusal::Program;
 		}
 	}
 	if (state.ps_active && (state.ps_input_info.stage.program == nullptr ||
 	                        !DrawRunProgramEligible(*state.ps_input_info.stage.program))) {
-		return false;
+		return SkipRefusal::Program;
 	}
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		if (!state.color_info[i].desc.info.IsTiled()) {
-			return false;
+			return SkipRefusal::LinearTarget;
 		}
 	}
 	const auto& depth = state.depth_info;
 	if (static_cast<bool>(depth.image_id) &&
 	    (!depth.desc.info.IsTiled() || depth.depth_clear_enable || depth.load_clear_aspects ||
 	     depth.stencil_clear_enable)) {
-		return false;
+		return SkipRefusal::DepthClear;
 	}
-	return true;
+	return SkipRefusal::None;
+}
+
+// KYTY_PIPELINE_SKIP_STATS=1 (diagnostics): the time draws spent in the pipeline lookup by why they
+// could or could not be skipped, logged every 10 s (where a cold start's CP pipeline waits remain).
+static bool SkipStatsEnabled() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_STATS");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static void NoteSkipLookup(SkipRefusal reason, uint64_t ns) {
+	static uint64_t totals_ns[static_cast<size_t>(SkipRefusal::Count)] {};
+	static uint64_t slow[static_cast<size_t>(SkipRefusal::Count)] {};
+	static auto     last = std::chrono::steady_clock::now();
+	totals_ns[static_cast<size_t>(reason)] += ns;
+	if (ns > 1'000'000) slow[static_cast<size_t>(reason)]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(10)) return;
+	last = now;
+	std::string line = "Pipeline skip stats (lookup ms, lookups over 1 ms):";
+	for (size_t i = 0; i < static_cast<size_t>(SkipRefusal::Count); i++) {
+		line += fmt::format(" {} {:.1f}/{}", SkipRefusalNames[i], static_cast<double>(totals_ns[i]) / 1e6, slow[i]);
+	}
+	LOGF("%s\n", line.c_str());
 }
 
 void RenderExecutor::BeginDrawRun() {
@@ -4313,11 +4347,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const bool wait_stats     = PipelineWaitStats();
 		const auto pipeline_begin = wait_stats ? std::chrono::steady_clock::now()
 		                                       : std::chrono::steady_clock::time_point {};
-		const bool skippable = planned_pipeline == nullptr && pipeline_cache.PipelineSkipEnabled() &&
-		                       DrawOnlyChangesPicture(m_context, state, vertex_stages, mesh_active);
+		const bool skip_on    = planned_pipeline == nullptr && pipeline_cache.PipelineSkipEnabled();
+		const auto refusal    = skip_on ? DrawSkipRefusal(m_context, state, vertex_stages, mesh_active)
+		                                : SkipRefusal::Stages;
+		const bool skippable  = skip_on && refusal == SkipRefusal::None;
+		const bool skip_stats = skip_on && SkipStatsEnabled();
+		const auto lookup_begin =
+		    skip_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
 		    primitive_restart_enable, *programs, skippable);
+		if (skip_stats) {
+			NoteSkipLookup(refusal, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                  std::chrono::steady_clock::now() - lookup_begin)
+			                                                  .count()));
+		}
 		if (wait_stats) {
 			NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
 		}

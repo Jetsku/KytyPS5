@@ -6155,10 +6155,22 @@ void PipelineCache::InitializePipelineList() {
 		                 Common::PathToString(executable));
 		return;
 	}
-	const PipelineList::ReadCodeFn read = [&](PipelineList::CodeFile, uint64_t offset, std::span<uint8_t> out) {
-		code_file.clear();
-		code_file.seekg(static_cast<std::streamoff>(offset));
-		return static_cast<bool>(code_file.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size())));
+	// Data files (list format with a files section): opened once each, next to the executable (/app0).
+	std::map<uint32_t, std::unique_ptr<std::ifstream>> data_files;
+	const PipelineList::ReadCodeFn read = [&](PipelineList::CodeFile which, uint64_t offset, std::span<uint8_t> out) {
+		std::ifstream* in    = &code_file;
+		const auto     index = static_cast<uint32_t>(which);
+		if (index != 0) {
+			auto& opened = data_files[index];
+			if (opened == nullptr && index <= file.files.size()) {
+				opened = std::make_unique<std::ifstream>(executable.parent_path() / file.files[index - 1], std::ios::binary);
+			}
+			if (opened == nullptr || !*opened) return false;
+			in = opened.get();
+		}
+		in->clear();
+		in->seekg(static_cast<std::streamoff>(offset));
+		return static_cast<bool>(in->read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size())));
 	};
 	const PipelineList::ReadImageFn read_image = [&](PipelineList::CodeFile) {
 		std::vector<uint8_t> image;
@@ -8309,6 +8321,18 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	if (!prefetched && !built_fast && !fast_result.cache_hit) NotePipelineCreated(create_ns);
 	if (content.key != 0 && (m_journal != nullptr || m_journal_replay != nullptr)) {
 		NoteJournalPipeline(content.key, content.words, content.snapshot_words, content.identities, guest);
+	} else if (m_journal != nullptr) {
+		// A pipeline the journal cannot hold (no content key): counted by kind, logged at powers of two.
+		static std::atomic<uint64_t> unkeyed[4] {};
+		const auto kind = topology == vk::PrimitiveTopology::ePatchList ? (vertex_info.size() > 1 ? 1 : 2)
+		                  : vertex_info.size() > 1                       ? 3
+		                                                                 : 0;
+		const auto n    = unkeyed[kind].fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & (n - 1)) == 0) {
+			PipelineCacheLog("Pipeline journal: {} {} pipelines created without a journal key so far (VS 0x{:016x})", n,
+			                 kind == 1 ? "tessellation" : kind == 2 ? "rect-list" : kind == 3 ? "multi-stage" : "other",
+			                 vs_hash);
+		}
 	}
 	return remember(*iter->second);
 }

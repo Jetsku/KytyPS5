@@ -257,12 +257,52 @@ int main() {
 		CHECK(GraphicsPipelineSnapshot::Capture(vertex.info, true) == nullptr);
 	}
 
-	// Ineligible create infos are not captured (tessellation).
+	// Tessellation: not captured for the library path; with allow_mesh (journal and known keys) the
+	// control and evaluation stages and the patch size round-trip, under another magic, so pipelines
+	// without tessellation keep their words.
 	{
 		Example tess;
 		vk::PipelineTessellationStateCreateInfo tessellation {};
-		tess.info.pTessellationState = &tessellation;
+		tessellation.patchControlPoints = 16;
+		tess.info.pTessellationState    = &tessellation;
 		CHECK(GraphicsPipelineSnapshot::Capture(tess.info) == nullptr);
+		vk::PipelineShaderStageCreateInfo stages[4] {};
+		stages[0]                 = tess.stages[0];
+		stages[1].stage           = vk::ShaderStageFlagBits::eTessellationControl;
+		stages[1].module          = FakeHandle<vk::ShaderModule>(0x1000);
+		stages[1].pName           = "main";
+		stages[2].stage           = vk::ShaderStageFlagBits::eTessellationEvaluation;
+		stages[2].module          = FakeHandle<vk::ShaderModule>(0x2000);
+		stages[2].pName           = "main";
+		stages[3]                 = tess.stages[1];
+		tess.info.stageCount      = 4;
+		tess.info.pStages         = stages;
+		tess.input_assembly.topology = vk::PrimitiveTopology::ePatchList;
+		const auto captured = GraphicsPipelineSnapshot::Capture(tess.info, true);
+		CHECK(captured != nullptr);
+		if (captured != nullptr) {
+			std::vector<uint32_t> tess_words;
+			CHECK(captured->Serialize(tess_words, HashOf) && tess_words[0] != words[0]);
+			CHECK(GraphicsPipelineSnapshot::SerializedModules(tess_words).size() == 4);
+			const auto back = GraphicsPipelineSnapshot::Deserialize(tess_words, ModuleFor, layout);
+			CHECK(back != nullptr);
+			if (back != nullptr) {
+				const auto& info = back->Info();
+				CHECK(info.stageCount == 4 && info.pStages[2].stage == vk::ShaderStageFlagBits::eTessellationEvaluation);
+				CHECK(info.pTessellationState != nullptr && info.pTessellationState->patchControlPoints == 16);
+				std::vector<uint32_t> again;
+				CHECK(back->Serialize(again, [](vk::ShaderModule module) {
+					return HashOf(FakeHandle<vk::ShaderModule>(HandleValue(module) - 1));
+				}) && again == tess_words);
+			}
+			// A different patch size is another pipeline.
+			tessellation.patchControlPoints = 3;
+			std::vector<uint32_t> other;
+			CHECK(GraphicsPipelineSnapshot::Capture(tess.info, true)->Serialize(other, HashOf) && other != tess_words);
+		}
+		// Two control stages are refused.
+		stages[2].stage = vk::ShaderStageFlagBits::eTessellationControl;
+		CHECK(GraphicsPipelineSnapshot::Capture(tess.info, true) == nullptr);
 	}
 
 	if (g_failed != 0) {

@@ -1,10 +1,11 @@
 // kyty_pipeline_list: makes and checks KYPLST1 pipeline lists (pipelineList.h, KYTY_PIPELINE_LIST).
 //
 //   export --out <list> --game <app0 dir> (--shaders <shader journal> --pipelines <pipeline journal>)...
-//          [--exe <executable>] [--producer <text>]
+//          [--exe <executable>] [--producer <text>] [--data <file relative to app0>]...
 //       Merges recorded journals (_PipelineCache/<title>.shaders.journal and .pipelines.journal of one
-//       or more recording runs) into a list. Shaders are located in the game executable; the list
-//       keeps their offsets and hashes, never their code.
+//       or more recording runs) into a list. Shaders are located in the game executable, else in the
+//       --data files (Insomniac titles: d/material, d/materialgraph); the list keeps their file,
+//       offsets and hashes, never their code.
 //   merge --out <list> <list>...        Union of lists of the same title, version and input layout.
 //   info <list>                         Header, counts, levels, section sizes.
 //   check <list> --game <app0 dir> [--exe <executable>]
@@ -33,7 +34,7 @@ namespace {
 struct Arguments {
 	std::string                                      command;
 	std::string                                      out, game, exe, producer = "kyty_pipeline_list";
-	std::vector<std::string>                         shaders, pipelines, inputs;
+	std::vector<std::string>                         shaders, pipelines, inputs, data;
 };
 
 bool ReadFile(const std::filesystem::path& path, std::vector<uint8_t>& bytes) {
@@ -190,15 +191,50 @@ int Export(const Arguments& args) {
 		}
 	}
 	const auto found = PipelineList::FindCode(image, queries);
-	size_t     located = 0;
-	for (const auto& offset: found) located += offset.has_value() ? 1 : 0;
+	std::vector<PipelineList::Builder::Location> where(queries.size());
+	std::vector<bool>                            have(queries.size(), false);
+	size_t                                       located = 0;
+	for (size_t q = 0; q < found.size(); q++) {
+		if (!found[q].has_value()) continue;
+		where[q] = {PipelineList::CodeFile::Executable, *found[q]};
+		have[q]  = true;
+		located++;
+	}
 	std::printf("located %zu of %zu distinct shader codes in the executable\n", located, queries.size());
-	const PipelineList::Builder::LocateFn locate = [&](std::span<const uint32_t> code) -> std::optional<uint64_t> {
+	PipelineList::Builder builder(info);
+	// The rest in the data files, in the order given (the first file holding a code wins).
+	for (const auto& data: args.data) {
+		std::vector<size_t>                  rest;
+		std::vector<PipelineList::CodeQuery> rest_queries;
+		for (size_t q = 0; q < queries.size(); q++) {
+			if (have[q]) continue;
+			rest.push_back(q);
+			rest_queries.push_back(queries[q]);
+		}
+		if (rest.empty()) break;
+		std::vector<uint8_t> data_image;
+		if (!ReadFile(std::filesystem::path(args.game) / data, data_image)) {
+			std::fprintf(stderr, "cannot read %s in %s\n", data.c_str(), args.game.c_str());
+			return 2;
+		}
+		const auto data_found = PipelineList::FindCode(data_image, rest_queries);
+		size_t     in_file    = 0;
+		for (size_t r = 0; r < rest.size(); r++) {
+			if (!data_found[r].has_value()) continue;
+			if (in_file == 0) (void)builder.AddFile(data);
+			where[rest[r]] = {builder.AddFile(data), *data_found[r]};
+			have[rest[r]]  = true;
+			in_file++;
+		}
+		std::printf("located %zu more in %s\n", in_file, data.c_str());
+	}
+	const PipelineList::Builder::LocateFn locate =
+	    [&](std::span<const uint32_t> code) -> std::optional<PipelineList::Builder::Location> {
 		const auto hash = PipelineList::CodeHash({reinterpret_cast<const uint8_t*>(code.data()), code.size_bytes()});
 		const auto it   = query_of.find({hash.low, hash.high});
-		return it == query_of.end() ? std::nullopt : found[it->second];
+		if (it == query_of.end() || !have[it->second]) return std::nullopt;
+		return where[it->second];
 	};
-	PipelineList::Builder     builder(info);
 	PipelineList::ExportStats stats;
 	for (const auto& run: runs) {
 		builder.AddJournals(run.shaders->Sources(), run.shaders->Entries(), run.pipelines->Loaded(), locate, stats);
@@ -288,9 +324,22 @@ PipelineList::Resolved ResolveAgainst(const Arguments& args, const PipelineList:
 		std::fprintf(stderr, "cannot read %s\n", Executable(args).string().c_str());
 		image.clear();
 	}
-	const PipelineList::ReadCodeFn read = [&](PipelineList::CodeFile, uint64_t offset, std::span<uint8_t> out) {
-		if (offset > image.size() || out.size() > image.size() - offset) return false;
-		std::memcpy(out.data(), image.data() + offset, out.size());
+	// Data files: read once when first named.
+	auto data_images = std::make_shared<std::map<uint32_t, std::vector<uint8_t>>>();
+	const PipelineList::ReadCodeFn read = [&, data_images](PipelineList::CodeFile code_file, uint64_t offset,
+	                                                       std::span<uint8_t> out) {
+		const auto index = static_cast<uint32_t>(code_file);
+		const std::vector<uint8_t>* source = &image;
+		if (index != 0) {
+			auto [it, added] = data_images->try_emplace(index);
+			if (added && (index > file.files.size() ||
+			              !ReadFile(std::filesystem::path(args.game) / file.files[index - 1], it->second))) {
+				it->second.clear();
+			}
+			source = &it->second;
+		}
+		if (offset > source->size() || out.size() > source->size() - offset) return false;
+		std::memcpy(out.data(), source->data() + offset, out.size());
 		return true;
 	};
 	return PipelineList::Resolve(file, file.info.input_info_sizes, read, [&](PipelineList::CodeFile) { return image; }, stats);
@@ -400,6 +449,8 @@ int main(int argc, char** argv) {
 			args.shaders.push_back(value());
 		} else if (arg == "--pipelines") {
 			args.pipelines.push_back(value());
+		} else if (arg == "--data") {
+			args.data.push_back(value());
 		} else {
 			args.inputs.push_back(arg);
 		}

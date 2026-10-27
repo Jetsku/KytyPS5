@@ -122,6 +122,20 @@ private:
 	std::vector<vk::DynamicState>                              m_dynamic_states;
 	vk::ShaderModule                                           m_vertex_module   = nullptr;
 	vk::ShaderModule                                           m_fragment_module = nullptr;
+	// Tessellation (Capture with allow_mesh): the patch size and which extra stages are present.
+	bool                                                       m_tessellation    = false;
+	vk::PipelineTessellationStateCreateInfo                    m_tess_state {};
+	uint32_t                                                   m_tess_stages     = 0; // ShaderStageFlags seen
+	bool AddTessellationStage(vk::ShaderStageFlagBits stage) {
+		const auto bit = static_cast<uint32_t>(stage);
+		if ((stage != vk::ShaderStageFlagBits::eTessellationControl &&
+		     stage != vk::ShaderStageFlagBits::eTessellationEvaluation && stage != vk::ShaderStageFlagBits::eGeometry) ||
+		    (m_tess_stages & bit) != 0) {
+			return false;
+		}
+		m_tess_stages |= bit;
+		return true;
+	}
 };
 
 // The library cache and link step. Not thread-safe: the caller serializes Create (PipelineCache

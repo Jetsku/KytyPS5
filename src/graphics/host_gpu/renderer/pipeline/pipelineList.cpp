@@ -109,6 +109,28 @@ std::vector<uint8_t> EncodeLevels(const std::vector<std::string>& levels) {
 	return out;
 }
 
+std::vector<uint8_t> EncodeFiles(const std::vector<std::string>& files) {
+	std::vector<uint8_t> out;
+	Put<uint32_t>(out, static_cast<uint32_t>(files.size()));
+	for (const auto& file: files) PutText(out, file);
+	return out;
+}
+
+bool DecodeFiles(std::span<const uint8_t> bytes, std::vector<std::string>& files) {
+	Reader     r(bytes);
+	const auto count = r.Count(4);
+	for (uint32_t i = 0; i < count && !r.Failed(); i++) files.push_back(r.Text());
+	if (r.Failed() || !r.AtEnd() || files.size() > PipelineList::MaxDataFiles) return false;
+	// Relative paths inside the game folder only.
+	for (const auto& file: files) {
+		if (file.empty() || file.front() == '/' || file.front() == '\\' || file.find(':') != std::string::npos ||
+		    file.find("..") != std::string::npos) {
+			return false;
+		}
+	}
+	return true;
+}
+
 std::vector<uint8_t> EncodeShaders(const std::vector<PipelineList::Shader>& shaders) {
 	std::vector<uint8_t> out;
 	Put<uint32_t>(out, static_cast<uint32_t>(shaders.size()));
@@ -209,7 +231,7 @@ bool DecodeShaders(std::span<const uint8_t> bytes, std::vector<PipelineList::Sha
 		s.plain_mip_stats_variant = r.Get<uint8_t>() != 0;
 		s.static_state            = r.Array<uint32_t>();
 		s.input_info              = r.Bytes();
-		if (file != static_cast<uint32_t>(PipelineList::CodeFile::Executable) ||
+		if (file > PipelineList::MaxDataFiles ||
 		    kind > static_cast<uint8_t>(ShaderJournal::Kind::Compute) || s.code_size == 0 ||
 		    s.code_size > (64u << 20u) / 4u || s.back_code_size > (64u << 20u) / 4u) {
 			return false;
@@ -432,13 +454,15 @@ namespace PipelineList {
 // Encoding ---------------------------------------------------------------------------------------
 
 std::vector<uint8_t> Encode(const File& file, int zstd_level) {
-	const std::pair<SectionId, std::vector<uint8_t>> sections[] = {
+	std::vector<std::pair<SectionId, std::vector<uint8_t>>> sections = {
 	    {SectionId::Info, EncodeInfo(file.info)},
 	    {SectionId::Levels, EncodeLevels(file.levels)},
 	    {SectionId::Shaders, EncodeShaders(file.shaders)},
 	    {SectionId::Permutations, EncodePermutations(file.permutations)},
 	    {SectionId::Pipelines, EncodePipelines(file.pipelines)},
 	};
+	// Only lists that read code from data files carry the files section.
+	if (!file.files.empty()) sections.emplace_back(SectionId::Files, EncodeFiles(file.files));
 	std::vector<uint8_t> out(FileMagic, FileMagic + sizeof(FileMagic));
 	Put<uint32_t>(out, FormatVersion);
 	Put<uint32_t>(out, static_cast<uint32_t>(std::size(sections)));
@@ -528,6 +552,12 @@ bool Decode(std::span<const uint8_t> bytes, File& file, std::string* error) {
 	if (!DecodePipelines(*pipelines, file.permutations.size(), file.levels.size(), file.pipelines)) {
 		return Fail(error, "malformed pipelines section");
 	}
+	if (const auto* files = find(SectionId::Files); files != nullptr && !DecodeFiles(*files, file.files)) {
+		return Fail(error, "malformed files section");
+	}
+	for (const auto& shader: file.shaders) {
+		if (static_cast<uint32_t>(shader.file) > file.files.size()) return Fail(error, "a shader names a missing file");
+	}
 	return true;
 }
 
@@ -538,13 +568,14 @@ bool Decode(std::span<const uint8_t> bytes, File& file, std::string* error) {
 bool RewriteSnapshotModules(std::span<uint32_t> words, const std::function<uint64_t(uint32_t)>& hash_for) {
 	constexpr uint32_t SnapshotMagic = 0x324e5350u; // "PSN2"
 	const size_t       size          = words.size();
-	if (size < 7 || words[0] != SnapshotMagic) return false;
+	constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3": with tessellation stages
+	if (size < 7 || (words[0] != SnapshotMagic && words[0] != SnapshotMagicTess)) return false;
 	size_t     position = 5; // magic, mesh flag, view mask, depth format, stencil format
 	const auto colors   = words[position++];
 	if (colors > 8 || size - position < colors + 1) return false;
 	position += colors;
 	const auto stages = words[position++];
-	if (stages > 2) return false;
+	if (stages > (words[0] == SnapshotMagicTess ? 5u : 2u)) return false;
 	for (uint32_t i = 0; i < stages; i++) {
 		if (size - position < 4) return false; // flags, hash (two words), entry point length
 		position++;
@@ -717,16 +748,19 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 			stats.sources_unlocated++;
 			continue;
 		}
-		const auto offset      = locate(source.code);
-		const auto back_offset = source.back_code.empty() ? std::optional<uint64_t> {0} : locate(source.back_code);
-		if (!offset.has_value() || !back_offset.has_value()) {
+		const auto offset = locate(source.code);
+		auto       back_offset =
+		    source.back_code.empty() || !offset.has_value() ? offset : locate(source.back_code);
+		if (source.back_code.empty() && back_offset.has_value()) back_offset->offset = 0;
+		// Both halves of a merged stage in the same file.
+		if (!offset.has_value() || !back_offset.has_value() || back_offset->file != offset->file) {
 			stats.sources_unlocated++;
 			continue;
 		}
 		const auto bytes = AsBytes(source.code);
 		Shader     shader;
-		shader.file      = CodeFile::Executable;
-		shader.offset    = *offset;
+		shader.file      = offset->file;
+		shader.offset    = offset->offset;
 		shader.code_size = source.code_size;
 		const auto hash  = CodeHash(bytes);
 		shader.code_hash_low           = hash.low;
@@ -735,7 +769,7 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 		if (!source.back_code.empty()) {
 			const auto back      = AsBytes(source.back_code);
 			const auto back_hash = CodeHash(back);
-			shader.back_offset      = *back_offset;
+			shader.back_offset      = back_offset->offset;
 			shader.back_code_size   = static_cast<uint32_t>(source.back_code.size());
 			shader.back_hash_low    = back_hash.low;
 			shader.back_hash_high   = back_hash.high;
@@ -812,11 +846,21 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 	}
 }
 
+CodeFile Builder::AddFile(const std::string& path) {
+	for (size_t i = 0; i < m_file.files.size(); i++) {
+		if (m_file.files[i] == path) return static_cast<CodeFile>(i + 1);
+	}
+	m_file.files.push_back(path);
+	return static_cast<CodeFile>(m_file.files.size());
+}
+
 void Builder::AddList(const File& other, ExportStats& stats) {
 	std::vector<uint32_t> shader_of(other.shaders.size());
 	for (size_t i = 0; i < other.shaders.size(); i++) {
-		bool added   = false;
-		shader_of[i] = AddShader(other.shaders[i], added);
+		bool added  = false;
+		auto shader = other.shaders[i];
+		if (shader.file != CodeFile::Executable) shader.file = AddFile(other.files[static_cast<uint32_t>(shader.file) - 1]);
+		shader_of[i] = AddShader(shader, added);
 		stats.sources++;
 		if (added) {
 			stats.sources_located++;
@@ -902,6 +946,8 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 		for (size_t q = 0; q < relocate.size(); q++) {
 			if (!found[q].has_value()) continue;
 			auto& piece = pieces[relocate[q]];
+			// Data-file shaders are not relocated into the executable.
+			if (file.shaders[piece.shader].file != CodeFile::Executable) continue;
 			std::memcpy(piece.code.data(), image.data() + *found[q], piece.query.size_bytes);
 			piece.found  = true;
 			piece.offset = *found[q];
