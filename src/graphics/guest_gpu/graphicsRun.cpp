@@ -941,13 +941,60 @@ static uint32_t IdleFlushMinDraws() {
 	return static_cast<uint32_t>(g_idle_flush_draws.Get());
 }
 
-void CommandProcessor::MaybeFlushIdleGpu() {
+// KYTY_DRAW_FLUSH_INTERVAL / KYTY_DISPATCH_FLUSH_INTERVAL (default 0 = off; strxno/KytyPS5-GT7
+// 1f4ccc4fb, whose own defaults are 16 and 4): submit the recording after that many draws /
+// dispatches in it, whether or not the GPU is idle, so the GPU starts on them earlier and a
+// readback waiting for a recent tick waits for fewer commands. Inside an active rendering instance
+// a draw count waits for 4x the interval (or the instance's end), as the idle flush does. Live
+// switches (common/liveSwitch.h).
+static Live::Switch g_draw_flush_interval("KYTY_DRAW_FLUSH_INTERVAL", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 65536ul));
+});
+static Live::Switch g_dispatch_flush_interval("KYTY_DISPATCH_FLUSH_INTERVAL",
+                                              [](const char* value) -> int64_t {
+	                                              const auto parsed =
+	                                                  value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	                                              return static_cast<int64_t>(std::min(parsed, 65536ul));
+                                              });
+
+bool CommandProcessor::MaybeFlushPeriodic(bool dispatch) {
+	const auto interval =
+	    static_cast<uint32_t>(dispatch ? g_dispatch_flush_interval.Get() : g_draw_flush_interval.Get());
+	if (interval == 0) {
+		return false;
+	}
+	const auto current = GetScheduler().CurrentTick();
+	if (current != m_periodic_flush_tick) {
+		// Something submitted since the last count: restart both counts.
+		m_periodic_flush_tick       = current;
+		m_periodic_flush_draws      = 0;
+		m_periodic_flush_dispatches = 0;
+	}
+	auto& count = dispatch ? m_periodic_flush_dispatches : m_periodic_flush_draws;
+	if (++count < interval) {
+		return false;
+	}
+	if (CurrentBuffer().ActiveRenderingSerial() != 0 && count < interval * 4u) {
+		return false;
+	}
+	if (!OptionalSubmitAllowed()) {
+		return false;
+	}
+	BufferFlush();
+	return true;
+}
+
+void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
 	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
 	// this producer at most, not for everything recorded until then (KYTY_READBACK_EAGER).
 	if (m_renderer.GetBufferCache().TakeEagerFlushRequest(CurrentBuffer().ActiveRenderingSerial() !=
 	                                                     0)) {
 		BufferFlush();
+		return;
+	}
+	if (MaybeFlushPeriodic(dispatch)) {
 		return;
 	}
 	const auto min_draws = IdleFlushMinDraws();
@@ -3083,7 +3130,7 @@ void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, command, thread_group_x,
 		                                              thread_group_y, thread_group_z, mode,
 		                                              IsAsyncComputeQueue());
-		MaybeFlushIdleGpu();
+		MaybeFlushIdleGpu(true);
 	}
 }
 
@@ -3142,7 +3189,7 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), op.args_addr,
 	                                                op.mode, IsAsyncComputeQueue());
-	MaybeFlushIdleGpu();
+	MaybeFlushIdleGpu(true);
 }
 
 void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint32_t control) {
