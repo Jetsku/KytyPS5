@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
@@ -548,6 +549,9 @@ public:
 		if (m_owner->Encoding()) {
 			m_owner->m_encoder->beginRendering(info);
 		} else {
+			if (DeadViewScrubEnabled()) {
+				ScrubDeadRenderingViews(info, "a draw's rendering");
+			}
 			m_owner->m_buffer.beginRendering(info);
 		}
 	}
@@ -661,6 +665,9 @@ public:
 		if (m_owner->Encoding()) {
 			m_owner->m_encoder->pushDescriptorSetKHR(point, layout, set, count, writes);
 		} else {
+			if (DeadViewScrubEnabled()) {
+				ScrubDeadDescriptorViews(writes, count, "descriptors");
+			}
 			m_owner->m_buffer.pushDescriptorSetKHR(point, layout, set, count, writes);
 		}
 	}
@@ -671,6 +678,9 @@ public:
 		if (m_owner->Encoding()) {
 			m_owner->m_encoder->updateDescriptorSets(set, count, writes);
 		} else {
+			if (DeadViewScrubEnabled()) {
+				ScrubDeadDescriptorViews(writes, count, "descriptors");
+			}
 			device.updateDescriptorSets(count, writes, 0, nullptr);
 		}
 	}

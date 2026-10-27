@@ -53244,6 +53244,91 @@ void CheckEmbeddedFetchVertexOffset() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
+// The 2_10_10_10 layout (its 2-bit component first, at the bottom) as a render target, with the
+// reversed channel order GT7 uses when a race is left, and as a texture of the same memory: the
+// host's A2B10G10R10 holds the 2-bit component in alpha, both ways the same (usa-ratt/KytyPS5-GT7
+// a33e0a273 / e31c3c3dc).
+void CheckTenBitRenderTargetFormat() {
+  constexpr const char *name = "TenBitRenderTarget";
+  namespace P = Libs::Graphics::Prospero;
+  const auto target = Libs::Graphics::TextureGetRenderTargetFormat(
+      P::ChannelLayout::k2_10_10_10, P::ChannelType::kUNorm, P::ChannelOrder::kReversed);
+  Require(name, "reversed UNorm target",
+          target.format == vk::Format::eA2B10G10R10UnormPack32 &&
+              target.bytes_per_element == 4u &&
+              target.export_mapping == P::ColorMappingBgra,
+          "the reversed 2_10_10_10 UNorm target did not map to A2B10G10R10");
+  const auto standard = Libs::Graphics::TextureGetRenderTargetFormat(
+      P::ChannelLayout::k2_10_10_10, P::ChannelType::kUInt, P::ChannelOrder::kStandard);
+  Require(name, "standard UInt target",
+          standard.format == vk::Format::eA2B10G10R10UintPack32 &&
+              standard.export_mapping == P::ColorComponentMapping{0x39u},
+          "the 2_10_10_10 UInt target did not keep its 2-bit component in alpha");
+  const auto texture =
+      Libs::Graphics::TextureGetSurfaceFormatInfo(P::BufferFormat::k2_10_10_10UNorm);
+  Require(name, "texture of the target",
+          texture.vk_format == vk::Format::eA2B10G10R10UnormPack32 &&
+              texture.host_to_storage == P::ColorComponentMapping{0x39u},
+          "a 2_10_10_10 texture does not read the components its target wrote");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// KYTY_DEAD_VIEW_SCRUB (usa-ratt/KytyPS5-GT7 ae60f82a5 / d0406d616): destroyed image views are
+// replaced with null views in a rendering's attachments and in storage-image descriptors. A view
+// created again with a destroyed handle is live again; live handles, and sampled images, are left
+// alone.
+void CheckDeadImageViewScrub() {
+  constexpr const char *name = "DeadImageViewScrub";
+  using namespace Libs::Graphics;
+  const auto handle = [](uintptr_t value) {
+    return vk::ImageView(reinterpret_cast<VkImageView>(value));
+  };
+  const auto dead = handle(0x7e57000010u);
+  const auto live = handle(0x7e57000020u);
+  const auto reborn = handle(0x7e57000030u);
+  NoteImageViewDestroyed(dead, 0x1200000000u, vk::Format::eR8G8B8A8Unorm);
+  NoteImageViewDestroyed(reborn, 0, vk::Format::eUndefined);
+  NoteImageViewCreated(reborn);
+  Require(name, "liveness",
+          !DiagnosticViewIsLive(dead) && DiagnosticViewIsLive(live) &&
+              DiagnosticViewIsLive(reborn) && DiagnosticViewIsLive(nullptr),
+          "a destroyed view counted as live, or a live or recreated one as destroyed");
+
+  std::array<vk::RenderingAttachmentInfo, 2> colors{};
+  colors[0].imageView = live;
+  colors[1].imageView = dead;
+  vk::RenderingAttachmentInfo depth{};
+  depth.imageView = dead;
+  vk::RenderingInfo rendering{};
+  rendering.colorAttachmentCount = static_cast<uint32_t>(colors.size());
+  rendering.pColorAttachments = colors.data();
+  rendering.pDepthAttachment = &depth;
+  ScrubDeadRenderingViews(rendering, "the host check");
+  Require(name, "attachments",
+          colors[0].imageView == live && !colors[1].imageView && !depth.imageView,
+          "a destroyed attachment view was kept, or a live one dropped");
+
+  std::array<vk::DescriptorImageInfo, 2> storage{};
+  storage[0].imageView = dead;
+  storage[1].imageView = live;
+  vk::DescriptorImageInfo sampled{};
+  sampled.imageView = dead;
+  std::array<vk::WriteDescriptorSet, 2> writes{};
+  writes[0].descriptorType = vk::DescriptorType::eStorageImage;
+  writes[0].descriptorCount = static_cast<uint32_t>(storage.size());
+  writes[0].pImageInfo = storage.data();
+  writes[1].descriptorType = vk::DescriptorType::eSampledImage;
+  writes[1].descriptorCount = 1;
+  writes[1].pImageInfo = &sampled;
+  ScrubDeadDescriptorViews(writes.data(), static_cast<uint32_t>(writes.size()), "the host check");
+  Require(name, "descriptors",
+          !storage[0].imageView && storage[1].imageView == live && sampled.imageView == dead,
+          "storage descriptors kept a destroyed view, or other descriptors were changed");
+  // No destroyed handle is left behind for the checks that follow.
+  NoteImageViewCreated(dead);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
   (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
@@ -60143,6 +60228,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
     CheckRenderTargetFormatContract();
+    CheckTenBitRenderTargetFormat();
+    CheckDeadImageViewScrub();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
@@ -60197,6 +60284,8 @@ int main(int argc, char **argv) {
   }
   VulkanHarness vulkan;
   CheckRenderTargetFormatContract();
+  CheckTenBitRenderTargetFormat();
+  CheckDeadImageViewScrub();
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
