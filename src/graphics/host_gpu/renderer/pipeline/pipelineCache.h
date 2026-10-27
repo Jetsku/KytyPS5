@@ -226,6 +226,8 @@ public:
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                                 const GraphicsPrograms& programs, bool skippable);
 	[[nodiscard]] bool PipelineSkipEnabled() const noexcept { return m_skip != nullptr; }
+	// KYTY_PIPELINE_SKIP_TESS: tessellated draws may be skipped / built in the background too.
+	[[nodiscard]] static bool SkipTessellatedEnabled();
 	// KYTY_PIPELINE_SKIP_FRAME_BUDGET_US: the frame the next skippable draws belong to (CP thread).
 	void NoteSkipFrame(uint64_t frame) noexcept {
 		if (frame != m_skip_frame) {

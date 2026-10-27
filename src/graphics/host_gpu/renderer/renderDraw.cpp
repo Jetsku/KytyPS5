@@ -2479,7 +2479,11 @@ constexpr const char* SkipRefusalNames[] = {"skippable", "stages", "occlusion", 
 
 static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState& state,
                                    std::span<const ShaderVertexInputInfo> vertex_stages, bool mesh_active) {
-	if (mesh_active || vertex_stages.size() != 1) {
+	// KYTY_PIPELINE_SKIP_TESS: tessellated draws (LS/HS/TES) may be skipped too. GT7's car bodies
+	// and scenery are tessellated; their cold pipelines (200k-word stages) were built on the GPU
+	// thread while the game stood still (usa-ratt/KytyPS5-GT7 skips every draw that writes no memory).
+	const bool tess_ok = vertex_stages.size() == 3 && PipelineCache::SkipTessellatedEnabled();
+	if (mesh_active || (vertex_stages.size() != 1 && !tess_ok)) {
 		return SkipRefusal::Stages;
 	}
 	if (context.GetOcclusionCounter().Active()) {

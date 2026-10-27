@@ -4905,16 +4905,22 @@ struct PipelineCache::PrefetchState {
 		if (drop_on_stop) (void)queue.DropPending();
 		queue.Stop();
 	}
-	// True when this call queued the build.
-	bool Request(const GraphicsPipelineKey& key, const ShaderVertexInputInfo& vertex,
+	// True when this call queued the build. `vertices` holds the vertex stage, or LS/HS/TES of a
+	// tessellated draw (KYTY_PIPELINE_SKIP_TESS).
+	bool Request(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertices,
 	             const ShaderPixelInputInfo* pixel, const GraphicsPrograms& programs) {
 		std::lock_guard lock(mutex);
 		if (stopped || pending.size() >= max_pending || pending.contains(key)) return false;
+		if (vertices.empty() || vertices.size() > 3) return false;
 		// Interface/resource arrays are copied. Compiled program metadata and shader modules
 		// are immutable and owned by ProgramCache until after Stop has joined every task.
+		std::array<ShaderVertexInputInfo, 3> stages {};
+		std::copy(vertices.begin(), vertices.end(), stages.begin());
+		const size_t stage_count = vertices.size();
 		auto task = std::make_shared<std::packaged_task<Result()>>(
-		    [this, key, vertex, pixel_copy = pixel != nullptr ? std::optional(*pixel) : std::nullopt,
-		     programs] {
+		    [this, key, stages, stage_count,
+		     pixel_copy = pixel != nullptr ? std::optional(*pixel) : std::nullopt, programs] {
+			    const auto& vertex = stages[0];
 			    Profiler::SetThreadName("PipelineCompiler");
 			    Result result {std::make_unique<Pipeline>()};
 			    const auto begin = CompileClockNs();
@@ -4930,7 +4936,8 @@ struct PipelineCache::PrefetchState {
 				    };
 			    }
 			    CreatePipelineInternal(cache.m_graphics, *result.pipeline, key.rendering,
-			                           key.vertex_input, {&vertex, 1},
+			                           key.vertex_input,
+			                           std::span<const ShaderVertexInputInfo>(stages.data(), stage_count),
 			                           pixel_copy ? &*pixel_copy : nullptr, programs,
 			                           key.static_params, cache.m_driver_cache,
 			                           keyed_hook ? &keyed_hook : nullptr);
@@ -7136,6 +7143,13 @@ void VerifyParallelPrograms(const PipelineCache::GraphicsPrograms&      parallel
 
 } // namespace
 
+// KYTY_PIPELINE_SKIP_TESS=1 (default off; the GT7 preset): the skip builder and the prefetch pool
+// build tessellated pipelines too, so their draws are skipped instead of waiting on the GPU thread.
+bool PipelineCache::SkipTessellatedEnabled() {
+	static const bool on = EnvU64("KYTY_PIPELINE_SKIP_TESS", 0) != 0;
+	return on;
+}
+
 bool PipelineCache::TessellationActive(const HW::UserConfig& user_config) {
 	return user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 }
@@ -7944,7 +7958,7 @@ void PipelineCache::PrefetchGraphicsPipeline(const PipelineTargets& targets, con
 	if (!BuildGraphicsPipelineKey(targets, ctx, user_config, vertex_info, pixel_info, topology,
 	    primitive_restart_enable, programs, false, key) || !m_mutex.TryLock()) return;
 	// Recheck under the map lock: CP creation cannot race a speculative request into a second job.
-	if (!m_graphics_pipelines.contains(key)) m_prefetch->Request(key, vertex_info, pixel_info, programs);
+	if (!m_graphics_pipelines.contains(key)) m_prefetch->Request(key, {&vertex_info, 1}, pixel_info, programs);
 	m_mutex.Unlock();
 }
 
@@ -8090,8 +8104,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	// driver has not built: a background thread builds it (optimized, journaled when published)
 	// and the draw is skipped until it is there, after waiting KYTY_PIPELINE_SKIP_WAIT_US for it
 	// (a driver-cache hit is usually done by then). A full queue falls back to building it here.
-	if (skippable && vertex_info.size() == 1 && topology != vk::PrimitiveTopology::ePatchList &&
-	    !graphics_debug_dump_enabled()) {
+	// KYTY_PIPELINE_SKIP_TESS: tessellated draws (three vertex stages, patch lists) as well.
+	const bool background_ok =
+	    (vertex_info.size() == 1 && topology != vk::PrimitiveTopology::ePatchList) ||
+	    (vertex_info.size() == 3 && SkipTessellatedEnabled());
+	if (skippable && background_ok && !graphics_debug_dump_enabled()) {
 		bool           queued = false;
 		PrefetchState* source = m_skip.get();
 		{
@@ -8105,7 +8122,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 				source = m_prefetch.get();
 				queued = true;
 			} else {
-				queued = m_skip->Request(key, vs_input_info, ps_input_info, programs);
+				queued = m_skip->Request(key, vertex_info, ps_input_info, programs);
 			}
 		}
 		uint64_t wait_ns = queued ? m_skip_wait_ns : 0;
@@ -8164,8 +8181,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			wait_begin = 0;
 		}
 	}
-	if (ready_from == nullptr && m_prefetch != nullptr && vertex_info.size() == 1 &&
-	    topology != vk::PrimitiveTopology::ePatchList && !graphics_debug_dump_enabled()) {
+	if (ready_from == nullptr && m_prefetch != nullptr && background_ok &&
+	    !graphics_debug_dump_enabled()) {
 		{
 			Common::LockGuard lock(m_mutex);
 			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
@@ -8173,7 +8190,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			}
 			// Reserve the key before releasing the map. Other preparation threads may submit
 			// independent keys while this draw waits, allowing compiles to overlap each other.
-			if (PipelinePrefetchEnabled()) m_prefetch->Request(key, vs_input_info, ps_input_info, programs);
+			if (PipelinePrefetchEnabled()) m_prefetch->Request(key, vertex_info, ps_input_info, programs);
 		}
 		wait_begin = CompileClockNs();
 		ready = m_prefetch->Take(key);
