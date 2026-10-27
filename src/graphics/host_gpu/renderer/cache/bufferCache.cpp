@@ -345,6 +345,7 @@ Live::Switch g_readback_flush_side("KYTY_READBACK_FLUSH_SIDE", Live::ParseDefaul
 // Boletaria walk -0.76 ms a frame (guest readbacks 51 -> 19 a frame, read faults 120 -> 89).
 Live::Switch g_readback_span("KYTY_READBACK_SPAN", Live::ParseDefaultOff);
 std::atomic<uint64_t> g_readback_span_copies {0};
+std::atomic<uint64_t> g_readback_span_drains {0}; // ReadMemoryDrain windows that took neighbours
 std::atomic<uint64_t> g_readback_flush_side_copies {0};
 
 // KYTY_READBACK_SIDE_WRITES (live, default on; =0 drains as before): a write fault on a GPU-owned
@@ -2710,9 +2711,58 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+	// KYTY_READBACK_SPAN (reads): the registered buffers next to this one, within the aligned
+	// window, share the drain (one wait instead of a fault and a drain each).
+	std::vector<std::pair<Buffer*, GuestRange>> neighbours;
+	if (!is_write && g_readback_span.On()) {
+		const auto aligned_begin = Common::AlignDown(vaddr, WindowSize);
+		const auto aligned_end   = aligned_begin + WindowSize;
+		const auto owner_at      = [&](uint64_t at) -> Buffer* {
+            const auto* next = m_page_table.Find(at >> PageTable::kPageBits);
+            if (next == nullptr || !*next || IsBufferInvalid(*next)) {
+                return nullptr;
+            }
+            auto& found = m_slot_buffers[*next];
+            return &found != &buffer && found.IsInBounds(at, 1) ? &found : nullptr;
+		};
+		for (auto at = window_begin; at > aligned_begin;) {
+			auto* next = owner_at(at - 1);
+			if (next == nullptr) {
+				break;
+			}
+			const auto begin = std::max(aligned_begin, next->CpuAddress());
+			neighbours.push_back({next, {begin, at - begin}});
+			at = begin;
+		}
+		for (auto at = window_end; at < aligned_end;) {
+			auto* next = owner_at(at);
+			if (next == nullptr) {
+				break;
+			}
+			const auto end = std::min(aligned_end, next->CpuAddress() + next->Size());
+			neighbours.push_back({next, {at, end - at}});
+			at = end;
+		}
+	}
 	trace.begin = window_begin;
 	trace.size  = window_end - window_begin;
-	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+	std::vector<GuestRange> drained;
+	const bool main_downloaded = DownloadBufferMemory(buffer, window_begin, window_end - window_begin);
+	bool       downloaded      = main_downloaded;
+	for (const auto& [next, range]: neighbours) {
+		if (DownloadBufferMemory(*next, range.address, range.size)) {
+			downloaded = true;
+			drained.push_back(range);
+		}
+	}
+	if (!neighbours.empty() && downloaded) {
+		const auto count = g_readback_span_drains.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((count & (count - 1)) == 0 && count <= 4096) {
+			std::printf("Readback span: %" PRIu64 " drains took neighbouring buffers (KYTY_READBACK_SPAN)\n", count);
+			std::fflush(stdout);
+		}
+	}
+	if (downloaded) {
 		trace.downloaded = true;
 		if (async != nullptr) {
 			// KYTY_ASYNC_DRAIN: submit the download and go on; the guest thread waits for it.
@@ -2726,7 +2776,12 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
-		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		if (main_downloaded) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		}
+		for (const auto& range: drained) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(range.address, range.size);
+		}
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
