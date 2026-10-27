@@ -5105,6 +5105,12 @@ void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
 	NoteGuestWriteStream(address, size);
 }
 
+bool StreamCopyDefer::LabelWaitsForHostCopies() {
+	auto* dma = g_write_drain_dma;
+	return dma != nullptr && UploadDmaWriteDrainEnabled() && GuestGpu::IsGpuThread() &&
+	       dma->LabelsWaitForHostCopies();
+}
+
 void StreamCopyDefer::NoteFrameBoundary() {
 	if (auto* dma = g_write_drain_dma; dma != nullptr && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {

@@ -4108,8 +4108,23 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	const bool ordered = !proxy && !all && !selected && !no_order && gpu.HasDeferredLabels();
-	if (!proxy && !all && !selected && !ordered) {
+	// KYTY_UPLOAD_DMA_WRITE_DRAIN=defer: host copies are queued that read guest bytes later; the
+	// guest may rewrite those bytes once it sees this label, so it is written at its tick's
+	// completion (after the transfer the worker submits behind the copies).
+	const bool copies = !proxy && !all && !selected && !ordered &&
+	                    StreamCopyDefer::LabelWaitsForHostCopies();
+	if (!proxy && !all && !selected && !ordered && !copies) {
 		return false;
+	}
+	if (copies) {
+		static std::atomic<uint64_t> deferred_for_copies {0};
+		const auto count = deferred_for_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((count & (count - 1)) == 0 && count <= 65536) {
+			std::printf("Upload DMA write drain: %llu labels written at their tick's completion behind queued host "
+			            "copies (KYTY_UPLOAD_DMA_WRITE_DRAIN=defer)\n",
+			            static_cast<unsigned long long>(count));
+			std::fflush(stdout);
+		}
 	}
 	m_defer_next_label = false;
 	// KYTY_LABEL_REUSE_TRACE=1 (diagnostic; superkeka/KytyPS5-bc250 review, accuracy insight 1):

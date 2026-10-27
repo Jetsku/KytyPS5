@@ -25127,6 +25127,22 @@ public:
               label_left && label_pending && frame_waited && frame_copied &&
                   fourth_words[16] == before_write[16],
               "=frame drained on an unrelated label, or a flip did not make the queued host copy");
+
+      // KYTY_UPLOAD_DMA_WRITE_DRAIN=defer: while a host copy is queued, labels wait for their
+      // tick's completion (LabelsWaitForHostCopies); once it is made, they are written at once.
+      Live::Testing::StageText("KYTY_UPLOAD_DMA_WRITE_DRAIN=defer\n");
+      Live::OnCpFlip();
+      Require(name, "guest write 4", context.InvalidateMemory(base, upload_size),
+              "the re-dirtied range is not mapped");
+      Libs::LibKernel::Memory::WriteBacking(base, before_write.data(), upload_size);
+      dma->HoldWorkerForTest(true);
+      (void)cache.ObtainBuffer(base, upload_size, false, false);
+      const bool defer_waits = dma->LabelsWaitForHostCopies();
+      dma->HoldWorkerForTest(false);
+      (void)dma->DrainHostCopies(0, 1, true, true);
+      const bool defer_clear = !dma->LabelsWaitForHostCopies();
+      Require(name, "write drain defer", defer_waits && defer_clear,
+              "=defer did not hold labels behind a queued host copy, or held them after it was made");
       Live::Testing::StageText("KYTY_UPLOAD_DMA_WRITE_DRAIN=\n");
       Live::OnCpFlip();
     }

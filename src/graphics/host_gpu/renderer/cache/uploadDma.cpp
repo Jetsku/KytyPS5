@@ -62,6 +62,9 @@ int64_t ParseWriteDrain(const char* value) {
 	if (value != nullptr && std::strcmp(value, "frame") == 0) {
 		return 8;
 	}
+	if (value != nullptr && std::strcmp(value, "defer") == 0) {
+		return 16;
+	}
 	return Live::ParseDefaultOff(value);
 }
 Live::Switch g_write_drain("KYTY_UPLOAD_DMA_WRITE_DRAIN", ParseWriteDrain);
@@ -344,7 +347,7 @@ bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all, bool 
 	// =labels: a write the guest may observe makes every queued host copy first; =all always does;
 	// otherwise (=1, or a GPU-only write) only the ones reading these bytes.
 	// =frame: a flip makes every queued host copy too.
-	const bool every = mode == 2 || (mode == 4 && all) || (mode == 8 && frame);
+	const bool every = mode == 2 || (mode == 4 && all) || ((mode == 8 || mode == 16) && frame);
 	const auto end   = address + size;
 	m_drain.checks++;
 	const auto start = std::chrono::steady_clock::now();
@@ -392,6 +395,16 @@ bool UploadDma::DrainHostCopies(uint64_t address, uint64_t size, bool all, bool 
 		std::fflush(stdout);
 	}
 	return true;
+}
+
+bool UploadDma::LabelsWaitForHostCopies() {
+	if (g_write_drain.Get() != 16) {
+		return false;
+	}
+	while (!m_tickets.empty() && m_tickets.front()->state.load(std::memory_order_acquire) == 2) {
+		m_tickets.pop_front();
+	}
+	return !m_tickets.empty();
 }
 
 uint64_t UploadDma::PendingValue() {

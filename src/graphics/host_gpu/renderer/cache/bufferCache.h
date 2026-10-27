@@ -63,6 +63,9 @@ void NoteGpuOnlyWrite(uint64_t address, uint64_t size);
 // GPU thread, at a flip (the frame boundary): KYTY_UPLOAD_DMA_WRITE_DRAIN=frame makes every
 // queued host copy first (uploadDma.h).
 void NoteFrameBoundary();
+// GPU thread: KYTY_UPLOAD_DMA_WRITE_DRAIN=defer and host copies are queued, so a label written now
+// is to be written at its tick's completion instead (CommandProcessor::TryDeferLabel).
+[[nodiscard]] bool LabelWaitsForHostCopies();
 // The stream-copy part both share (internal).
 void NoteGuestWriteStream(uint64_t address, uint64_t size);
 } // namespace StreamCopyDefer
