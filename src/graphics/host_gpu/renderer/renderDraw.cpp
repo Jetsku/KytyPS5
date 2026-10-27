@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -2360,7 +2361,21 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 		const auto colors       = std::span {state.color_info, state.color_count};
 		const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
 		                                                    : state.color_info[0].desc.info.samples;
-		if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+		// KYTY_EQAA_MIXED (usa-ratt/KytyPS5-GT7 18979e65b): colours of one count over depth of
+		// another, which the device's mixed attachment samples take (EQAA: GT7's countdown and
+		// replay passes with 2 depth samples and 1 colour), keep every attachment.
+		const auto first_color_samples =
+		    state.color_count != 0 ? state.color_info[0].desc.info.samples : 0u;
+		const bool mixed_ok =
+		    state.depth_info.image_id && state.color_count != 0 &&
+		    buffer.GetGraphics().mixed_attachment_samples !=
+		        GraphicContext::MixedAttachmentSamples::None &&
+		    std::ranges::all_of(colors,
+		                        [&](const RenderColorInfo& color) {
+			                        return color.desc.info.samples == first_color_samples;
+		                        }) &&
+		    buffer.GetGraphics().AcceptsMixedSamples(first_color_samples, pass_samples);
+		if (!mixed_ok && std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
 			    return color.desc.info.samples != pass_samples;
 		    })) {
 			const auto raster =
@@ -4019,6 +4034,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run
 		return;
+	}
+	// KYTY_EQAA_MIXED through NV mixed samples (colour samples below depth samples): no per-sample
+	// shading. A pixel shader that shades per sample runs its per-pixel copy (shaders.cpp); one
+	// without such a copy (the rewrite gave up) is skipped instead of losing the device.
+	if (state.ps_active && state.color_count != 0 && state.depth_info.image_id &&
+	    state.color_info[0].desc.info.samples < state.depth_info.desc.info.samples &&
+	    buffer.GetGraphics().mixed_attachment_samples ==
+	        GraphicContext::MixedAttachmentSamples::Nv &&
+	    !EqaaPerSampleShading()) {
+		if (const auto variant = PixelRate::Find(state.programs.pixel.id);
+		    variant.shades_per_sample && variant.module == nullptr) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Pipeline: EQAA draw skipped: pixel shader 0x%016" PRIx64
+				     " shades per sample and has no per-pixel copy (KYTY_EQAA_MIXED)\n",
+				     state.ps_input_info.stage.program != nullptr
+				         ? state.ps_input_info.stage.program->shader_hash
+				         : uint64_t {0});
+			}
+			m_run_active = false;
+			return;
+		}
 	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -84,6 +85,39 @@ struct GraphicContext {
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b, df310f7a9): attachments with
+	// different sample counts in one draw (PS5 EQAA: depth at the coverage count, colour at the
+	// fragment count). AMD allows either side to be larger; NV only colour < depth, rasterizing at
+	// the depth count. None: the switch is off or the device has neither extension.
+	enum class MixedAttachmentSamples : uint8_t { None, Amd, Nv };
+	MixedAttachmentSamples             mixed_attachment_samples              = MixedAttachmentSamples::None;
+	// Whether one draw can attach colour and depth at these sample counts (0 colour: depth only).
+	[[nodiscard]] bool AcceptsMixedSamples(uint32_t color_samples,
+	                                       uint32_t depth_samples) const noexcept {
+		if (color_samples == 0 || color_samples == depth_samples) {
+			return true;
+		}
+		switch (mixed_attachment_samples) {
+			case MixedAttachmentSamples::Amd: return true;
+			case MixedAttachmentSamples::Nv: return color_samples < depth_samples;
+			case MixedAttachmentSamples::None: return false;
+		}
+		return false;
+	}
+	// The (raster samples, depth/stencil sample mask, colour sample mask) combinations the device
+	// lists for VK_NV_coverage_reduction_mode's TRUNCATE (colour sample i covered by raster sample
+	// i alone, as the PS5's colour buffer sees only the samples exposed to it; MERGE lets both
+	// triangles of a shared edge blend into its pixels). Empty: MERGE.
+	std::vector<std::array<uint32_t, 3>> coverage_truncate_combinations;
+	[[nodiscard]] bool CoverageTruncate(uint32_t raster, uint32_t depth, uint32_t color) const {
+		for (const auto& combination: coverage_truncate_combinations) {
+			if (combination[0] == raster && (combination[1] & depth) != 0 &&
+			    (combination[2] & color) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
 	bool                               precise_occlusion_enabled             = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.

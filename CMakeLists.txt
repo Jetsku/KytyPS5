@@ -1303,6 +1303,9 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --codegen-only)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
+	# KYTY_EQAA_MIXED: per-pixel copies of pixel shaders that read SampleId (pixelRateVariant.h).
+	add_test(NAME pixel_rate_variant
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pixel-rate-only)
 	# Bindless images: a T# read from a descriptor heap at a key loaded per lane (Miles' RT kernels).
 	add_test(NAME bindless_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-codegen-only)

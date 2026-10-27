@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -283,8 +284,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                       .pName  = "main"};
 	}
 	if (ps_active) {
+		// KYTY_EQAA_MIXED through NV mixed samples (fewer colour than raster samples) must not
+		// shade per sample (VUID-VkPipelineMultisampleStateCreateInfo-rasterizationSamples-01415):
+		// a pixel shader that reads its sample index runs its per-pixel copy (pixelRateVariant.h;
+		// draws of one without a copy are skipped, RenderExecutor::ExecutePreparedDraw).
+		auto module = pixel_program.module;
+		if (rendering.color_samples != 0 &&
+		    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
+		    !EqaaPerSampleShading()) {
+			if (const auto variant = PixelRate::Find(pixel_program.id); variant.module != nullptr) {
+				module = variant.module;
+			}
+		}
 		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
-		                                       .module = pixel_program.module,
+		                                       .module = module,
 		                                       .pName  = "main"};
 	}
 	// One guest wave per host subgroup where the device lets the stage require it (mesh and
@@ -561,6 +574,41 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	rendering_info.pColorAttachmentFormats = rendering.color_formats.data();
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
+	// KYTY_EQAA_MIXED (usa-ratt/KytyPS5-GT7 18979e65b, df310f7a9): mixed attachment samples,
+	// rasterization at the larger count and each attachment at its own
+	// (VK_AMD_mixed_attachment_samples / VK_NV_framebuffer_mixed_samples). Through NV's the colour
+	// sample takes its own raster sample's coverage (TRUNCATE) where the device lists it: with
+	// MERGE a pixel whose raster samples two triangles of one blended mesh share blends twice.
+	std::array<vk::SampleCountFlagBits, RENDER_COLOR_ATTACHMENTS_MAX> color_attachment_samples {};
+	vk::AttachmentSampleCountInfoAMD               attachment_sample_count {};
+	vk::PipelineCoverageReductionStateCreateInfoNV coverage_reduction {};
+	if (rendering.color_samples != 0) {
+		EXIT_IF(graphics.mixed_attachment_samples ==
+		        GraphicContext::MixedAttachmentSamples::None);
+		for (uint32_t i = 0; i < rendering.color_count; i++) {
+			color_attachment_samples[i] = vulkan_sample_count(rendering.color_samples);
+		}
+		attachment_sample_count.colorAttachmentCount    = rendering.color_count;
+		attachment_sample_count.pColorAttachmentSamples = color_attachment_samples.data();
+		attachment_sample_count.depthStencilAttachmentSamples =
+		    vulkan_sample_count(rendering.depth_samples);
+		attachment_sample_count.pNext = rendering_info.pNext;
+		rendering_info.pNext          = &attachment_sample_count;
+		const auto raster_samples     = static_cast<uint32_t>(multisampling.rasterizationSamples);
+		if (graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
+		    graphics.CoverageTruncate(raster_samples, rendering.depth_samples,
+		                              rendering.color_samples)) {
+			coverage_reduction.coverageReductionMode = vk::CoverageReductionModeNV::eTruncate;
+			coverage_reduction.pNext                 = multisampling.pNext;
+			multisampling.pNext                      = &coverage_reduction;
+			static std::atomic_bool logged           = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Pipeline: NV mixed samples (raster %u, depth %u, colour %u): coverage "
+				     "reduction TRUNCATE\n",
+				     raster_samples, rendering.depth_samples, rendering.color_samples);
+			}
+		}
+	}
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;

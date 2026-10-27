@@ -1220,8 +1220,11 @@ private:
 	                         const PipelineCache::Pipeline& pipeline, bool fresh);
 	// Records the metadata clears a dispatch's buffer writes establish; whether it recorded one
 	// (renderCompute.cpp, KYTY_COMPUTE_META_CLEAR_DISPATCH).
+	// keep_dispatch (optional): set when a cleared HTile is also a colour target's CMASK
+	// (KYTY_CMASK_MSAA), whose dispatch must still run.
 	bool                      UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
-	                                                  const CommandBuffer&          buffer);
+	                                                  const CommandBuffer&          buffer,
+	                                                  bool* keep_dispatch = nullptr);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);

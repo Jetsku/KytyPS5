@@ -48,6 +48,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -58302,6 +58303,146 @@ void CheckCpSeqOps(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+namespace Libs::Graphics {
+
+// KYTY_EQAA_MIXED (usa-ratt/KytyPS5-GT7 827bc377d, test c88a47a2f): EQAA through NV mixed
+// samples must not shade per sample, and a SampleId input does. The per-pixel copy of such a pixel
+// shader (SpirvWithoutSampleId) is valid SPIR-V with no SampleId built-in; before SPIR-V 1.4 the
+// entry point's interface loses the variable, from 1.4 on it keeps it as a Private 0.
+void CheckPixelRateSampleIdVariant() {
+  constexpr const char *name = "PixelRateSampleIdVariant";
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble SPIR-V");
+    return text;
+  };
+  const auto entry_point = [](const std::string &text) {
+    const auto begin = text.find("OpEntryPoint");
+    return begin == std::string::npos
+               ? std::string()
+               : text.substr(begin, text.find('\n', begin) - begin);
+  };
+  const auto check = [&](const char *what, const std::vector<u32> &spirv) {
+    const auto before = disassemble(spirv);
+    Require(name, what, before.find("BuiltIn SampleId") != std::string::npos,
+            "the fragment case does not read SampleId");
+    Require(name, what, Libs::Graphics::SpirvShadesPerSample(spirv),
+            "a shader reading SampleId was not seen to shade per sample");
+    const auto variant = Libs::Graphics::SpirvWithoutSampleId(spirv);
+    Require(name, what, !variant.empty(),
+            "a shader reading SampleId was not rewritten");
+    ValidateSpirv(name, variant);
+    const auto after = disassemble(variant);
+    Require(name, what,
+            after.find("SampleId") == std::string::npos &&
+                after.find("SampleRateShading") == std::string::npos &&
+                after.find("Private") != std::string::npos,
+            "the copy still reads SampleId (or declares SampleRateShading), or "
+            "its sample index is not a Private 0");
+    const bool keeps_interface_entry = spirv.size() > 1 && spirv[1] >= 0x00010400u;
+    const auto variable_name = before.find("%gl_SampleID") != std::string::npos
+                                   ? std::string("%gl_SampleID")
+                                   : std::string();
+    if (!variable_name.empty()) {
+      const bool listed = entry_point(after).find(variable_name) != std::string::npos;
+      Require(name, what, listed == keeps_interface_entry,
+              keeps_interface_entry
+                  ? "a SPIR-V 1.4+ interface dropped the Private variable"
+                  : "a SPIR-V 1.3 interface still lists the variable");
+    }
+    Require(name, what, Libs::Graphics::SpirvWithoutSampleId(variant).empty() &&
+                            !Libs::Graphics::SpirvShadesPerSample(variant),
+            "the copy was rewritten again");
+  };
+
+  check("ancillary SampleId", CompileFragmentCase(GraphicsAncillarySampleId()).spirv);
+
+  Require(name, "no sample index",
+          Libs::Graphics::SpirvWithoutSampleId(
+              CompileFragmentCase(GraphicsAncillaryLayer(false)).spirv)
+              .empty() &&
+              !Libs::Graphics::SpirvShadesPerSample(
+                  CompileFragmentCase(GraphicsAncillaryLayer(false)).spirv),
+          "a shader without SampleId got a per-pixel copy");
+
+  // The variable's id is small, and so are literal operands: here it is %9, as are the
+  // PushConstant storage class and GLSL.std.450 Ceil. Only <id> operands count as other uses.
+  const auto colliding = [&](const char *what, bool sample_position) {
+    std::string source = R"(OpCapability Shader
+OpCapability SampleRateShading
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+)";
+    source += sample_position
+                  ? "OpEntryPoint Fragment %main \"main\" %9 %out %position\n"
+                  : "OpEntryPoint Fragment %main \"main\" %9 %out\n";
+    source += R"(OpExecutionMode %main OriginUpperLeft
+OpName %9 "gl_SampleID"
+OpDecorate %9 Flat
+OpDecorate %9 BuiltIn SampleId
+OpDecorate %out Location 0
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+)";
+    if (sample_position) {
+      source += "OpDecorate %position BuiltIn SamplePosition\n";
+    }
+    source += R"(%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%v4float = OpTypeVector %float 4
+%ptr_in_int = OpTypePointer Input %int
+%9 = OpVariable %ptr_in_int Input
+%ptr_out = OpTypePointer Output %v4float
+%out = OpVariable %ptr_out Output
+%block = OpTypeStruct %float
+%ptr_pc = OpTypePointer PushConstant %block
+%pc = OpVariable %ptr_pc PushConstant
+%ptr_pc_float = OpTypePointer PushConstant %float
+%int_0 = OpConstant %int 0
+)";
+    if (sample_position) {
+      source += "%ptr_in_v2float = OpTypePointer Input %v2float\n"
+                "%position = OpVariable %ptr_in_v2float Input\n";
+    }
+    source += R"(%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %int %9
+%id_float = OpConvertSToF %float %id
+%member = OpAccessChain %ptr_pc_float %pc %int_0
+%value = OpLoad %float %member
+%ceil = OpExtInst %float %1 Ceil %value
+%sum = OpFAdd %float %id_float %ceil
+%vec = OpCompositeConstruct %v4float %sum %sum %sum %sum
+OpStore %out %vec
+OpReturn
+OpFunctionEnd
+)";
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_1);
+    std::vector<u32> spirv;
+    Require(name, what,
+            tools.Assemble(source, &spirv,
+                           SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS),
+            "the hand-written module did not assemble");
+    ValidateSpirv(name, spirv);
+    return spirv;
+  };
+  check("literal operands equal to the id", colliding("colliding literals", false));
+  // A SamplePosition input shades per sample as well: no copy (its draws are skipped).
+  const auto position = colliding("SamplePosition", true);
+  Require(name, "SamplePosition",
+          Libs::Graphics::SpirvWithoutSampleId(position).empty() &&
+              Libs::Graphics::SpirvShadesPerSample(position),
+          "a shader reading SamplePosition got a per-pixel copy");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+} // namespace Libs::Graphics
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -60078,6 +60219,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-writes-only") == 0) {
     VulkanHarness vulkan;
     BdaWriteTests::RunAll(&vulkan);
+    return 0;
+  }
+  // CPU only: per-pixel copies of pixel shaders that read SampleId (KYTY_EQAA_MIXED).
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-rate-only") == 0) {
+    Libs::Graphics::EnsureConfigInitialized();
+    Libs::Graphics::CheckPixelRateSampleIdVariant();
     return 0;
   }
   // CPU only: heap-indexed T#s through bindless images (ShaderBindlessTests.inc).

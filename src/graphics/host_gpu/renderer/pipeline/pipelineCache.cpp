@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "common/ramStats.h"
 
 #include "common/assert.h"
@@ -1779,6 +1780,28 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// The validator's verdict on a per-pixel copy (pixelRateVariant.h), whatever --shader-validation
+// says; failures are logged.
+bool ValidatePixelRateSpirv(uint64_t shader_hash, const std::vector<uint32_t>& spirv) {
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	std::string          messages;
+	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&,
+	                                     const char* message) {
+		messages += message;
+		messages += '\n';
+	});
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetUniformBufferStandardLayout(
+	    ShaderRecompiler::Spirv::GetHostBufferRobustness().uniform_dword_loads_return_zero);
+	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
+		return true;
+	}
+	LOGF_COLOR(Log::Color::BrightRed,
+	           "per-pixel copy SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", shader_hash,
+	           messages.c_str());
+	return false;
+}
+
 // Background spirv-val (KYTY_SHADER_VALIDATION_ASYNC, default on; only when
 // shader_validation_enabled is set). spirv-val cost 11.7 ms per shader on average (median 5.2 ms,
 // up to 235 ms for a 1.45 MB module) over 248 SPIR-V modules dumped from Astro Bot, and grows
@@ -2322,6 +2345,15 @@ struct PipelineCache::ProgramCache {
 		g_shader_modules.Add(module, emitted.spirv);
 		times.module_ns = CompileClockNs() - module_begin;
 		EXIT_IF(module == nullptr);
+		// KYTY_EQAA_MIXED on NV mixed samples: a pixel shader that shades per sample gets a
+		// per-pixel copy for EQAA draws (pixelRateVariant.h); registered under its id below.
+		bool             shades_per_sample = false;
+		vk::ShaderModule pixel_rate_module = nullptr;
+		if (pixel_rate_variants && options.stage == ShaderType::Pixel &&
+		    SpirvShadesPerSample(emitted.spirv)) {
+			shades_per_sample = true;
+			pixel_rate_module = CompilePixelRateVariant(options, emitted.spirv);
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(emitted.spirv.size()), options.wave_size);
@@ -2332,6 +2364,9 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
+		if (shades_per_sample) {
+			PixelRate::Register(id, true, pixel_rate_module);
+		}
 		ShaderProgram plain {};
 		if (!emitted.spirv_plain.empty()) {
 			if (validator == nullptr) {
@@ -2345,12 +2380,20 @@ struct PipelineCache::ProgramCache {
 			const auto plain_module = CompileSPV(emitted.spirv_plain, device);
 			EXIT_IF(plain_module == nullptr);
 			g_shader_modules.Add(plain_module, emitted.spirv_plain);
+			// The plain variant shades per sample as the program does (KYTY_EQAA_MIXED).
+			vk::ShaderModule plain_rate_module = nullptr;
+			if (shades_per_sample) {
+				plain_rate_module = CompilePixelRateVariant(options, emitted.spirv_plain);
+			}
 			if (validator != nullptr) {
 				validator->Submit(options.dump_label, stage_name, options.shader_hash,
 				                  std::move(emitted.spirv_plain), options.maintenance8_enabled);
 			}
 			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 			GpuOpProfiler::RegisterShader(plain_id, stage_name, options.shader_hash);
+			if (shades_per_sample) {
+				PixelRate::Register(plain_id, true, plain_rate_module);
+			}
 			plain = {.id = plain_id, .module = plain_module};
 		}
 		return {
@@ -2360,6 +2403,49 @@ struct PipelineCache::ProgramCache {
 		    .plain          = plain,
 		};
 	}
+
+	// The module NV mixed-sample draws use for a pixel shader that reads its sample index
+	// (SpirvWithoutSampleId), or null. The first copies are validated whatever
+	// --shader-validation says: the rewrite is mechanical, but a broken copy is a broken pipeline.
+	vk::ShaderModule CompilePixelRateVariant(const ShaderRecompiler::CompileOptions& options,
+	                                         const std::vector<uint32_t>&            spirv) {
+		auto variant = SpirvWithoutSampleId(spirv);
+		if (variant.empty()) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Pipeline: pixel shader 0x%016" PRIx64
+				     " shades per sample in a form the per-pixel copy does not rewrite; its EQAA "
+				     "draws are skipped (KYTY_EQAA_MIXED)\n",
+				     options.shader_hash);
+			}
+			return nullptr;
+		}
+		constexpr uint32_t CheckedCopies = 32;
+		if (pixel_rate_checked.load(std::memory_order_relaxed) < CheckedCopies ||
+		    pixel_rate_failed.load(std::memory_order_relaxed)) {
+			if (!ValidatePixelRateSpirv(options.shader_hash, variant)) {
+				pixel_rate_failed.store(true, std::memory_order_relaxed);
+				LOGF("Pipeline: the per-pixel copy of pixel shader 0x%016" PRIx64
+				     " is not valid SPIR-V; its EQAA draws are skipped\n",
+				     options.shader_hash);
+				return nullptr;
+			}
+			pixel_rate_checked.fetch_add(1, std::memory_order_relaxed);
+		}
+		const auto                   variant_module = CompileSPV(variant, device);
+		static std::atomic<uint32_t> logged {0};
+		if (variant_module != nullptr && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Pipeline: pixel shader 0x%016" PRIx64
+			     " reads its sample index: EQAA draws run a per-pixel copy (index 0)\n",
+			     options.shader_hash);
+		}
+		return variant_module;
+	}
+
+	// KYTY_EQAA_MIXED with NV mixed samples (and not KYTY_EQAA_PER_SAMPLE=1): per-pixel copies.
+	bool                  pixel_rate_variants = false;
+	std::atomic<uint32_t> pixel_rate_checked {0};
+	std::atomic<bool>     pixel_rate_failed {false};
 
 	template <typename InputInfo>
 	static ShaderType StageOf(const InputInfo& input_info) {
@@ -3566,6 +3652,8 @@ struct PipelineCache::ProgramCache {
 		        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
 			// Only possible when another cursor mapped to the same push-data start (both
 			// NoStart): keep permutations unique and drop this equal copy.
+			PixelRate::Forget(device, compiled->handle.id);
+			PixelRate::Forget(device, compiled->plain.id);
 			g_shader_modules.Destroy(device, compiled->handle.module);
 			if (compiled->plain.module != nullptr) {
 				g_shader_modules.Destroy(device, compiled->plain.module);
@@ -4195,6 +4283,8 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			entry.permutations.ForEach([&](const Permutation& permutation) {
+				PixelRate::Forget(device, permutation.handle.id);
+				PixelRate::Forget(device, permutation.plain.id);
 				g_shader_modules.Destroy(device, permutation.handle.module);
 				if (permutation.plain.module != nullptr) {
 					g_shader_modules.Destroy(device, permutation.plain.module);
@@ -6343,6 +6433,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	m_pipeline_generation.store(
 	    (g_pipeline_cache_instances.fetch_add(1, std::memory_order_relaxed) + 1) << 32u,
 	    std::memory_order_relaxed);
+	m_program_cache->pixel_rate_variants =
+	    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
+	    !EqaaPerSampleShading();
 	InitializeDriverCache();
 	InitializePipelineList();
 	InitializeKnownPipelines();
@@ -7759,11 +7852,32 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 		if (attachment_samples == 0) {
 			attachment_samples = targets.depth_samples;
 		} else if (attachment_samples != targets.depth_samples) {
-			if (fatal) {
-				EXIT("mixed color/depth sample counts are unsupported: %u and %u\n",
-				     attachment_samples, targets.depth_samples);
+			// KYTY_EQAA_MIXED=1 (usa-ratt/KytyPS5-GT7 18979e65b): PS5 EQAA, colour at the
+			// fragment count and depth at the coverage count, through mixed attachment samples
+			// (AMD: either side larger; NV: colour < depth, rasterizing at the depth count).
+			using MixedSamples             = GraphicContext::MixedAttachmentSamples;
+			const auto     mixed           = m_graphics.mixed_attachment_samples;
+			const uint32_t color_samples   = attachment_samples;
+			const uint32_t depth_samples   = targets.depth_samples;
+			const bool     allowed = mixed == MixedSamples::Amd ||
+			                     (mixed == MixedSamples::Nv && color_samples < depth_samples);
+			if (!allowed) {
+				if (fatal) {
+					EXIT("mixed color/depth sample counts are unsupported: %u and %u\n",
+					     attachment_samples, targets.depth_samples);
+				}
+				return false;
 			}
-			return false;
+			rendering.color_samples = color_samples;
+			rendering.depth_samples = depth_samples;
+			attachment_samples      = std::max(color_samples, depth_samples);
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Pipeline: mixed attachment samples (%s, KYTY_EQAA_MIXED): colour %u, depth "
+				     "%u, raster %u\n",
+				     mixed == MixedSamples::Amd ? "AMD" : "NV", color_samples, depth_samples,
+				     attachment_samples);
+			}
 		}
 	}
 	if (targets.color_count == 0 && !with_depth) {
@@ -7789,6 +7903,13 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
+	if (static_params.sample_shading_enable && rendering.color_samples != 0 &&
+	    m_graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv) {
+		// NV mixed samples may not shade per sample (VUID-VkPipelineMultisampleStateCreateInfo-
+		// rasterizationSamples-01415): per pixel, with the per-pixel copy of a shader reading its
+		// sample index (pixelRateVariant.h).
+		static_params.sample_shading_enable = false;
+	}
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		if (fatal) {
 			EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");

@@ -85,6 +85,11 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	// KYTY_EQAA_MIXED: the colour and depth attachments' sample counts when they differ (mixed
+	// attachment samples; rasterization runs at PipelineStaticParameters::samples); both 0 when
+	// every attachment has the rasterization count.
+	uint32_t                                             color_samples  = 0;
+	uint32_t                                             depth_samples  = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -392,6 +397,10 @@ private:
 			}
 			Mix(hash, static_cast<uint32_t>(rendering.depth_format));
 			Mix(hash, static_cast<uint32_t>(rendering.stencil_format));
+			if (rendering.color_samples != 0) {
+				Mix(hash, rendering.color_samples);
+				Mix(hash, rendering.depth_samples);
+			}
 		}
 	};
 

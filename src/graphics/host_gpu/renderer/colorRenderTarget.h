@@ -18,6 +18,10 @@ namespace Libs::Graphics {
 // KYTY_CMASK_MSAA=1 (default off; upstream fe3857a17, PPSA13794): CMASK fast clears of
 // multisampled targets are materialized as well (all samples take the clear colour).
 [[nodiscard]] bool CmaskMsaaEnabled();
+// KYTY_EQAA_MIXED=1 (default off; usa-ratt/KytyPS5-GT7 18979e65b): EQAA colour targets of any
+// coverage/fragment ratio get a host image at the fragment count, and their draws use mixed
+// attachment samples (or the single-sample fallback) against the depth target's count.
+[[nodiscard]] bool EqaaMixedTargets();
 
 // KYTY_DRAW_SEQUENCE_FAST: a draw reuses what the draws before it resolved when it consumes the
 // same state and the reuse is proven exact (colorRenderTarget.cpp). Unset or 1: every part; 0:
