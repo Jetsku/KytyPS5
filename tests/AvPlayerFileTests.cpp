@@ -69,11 +69,25 @@ void CheckStream(FileStreamer& stream, const std::vector<uint8_t>& data) {
 	          std::equal(bytes.begin(), bytes.end(), data.begin() + 123), "FFmpeg seeks reset buffered reads");
 }
 
+struct GuestHeap {
+	std::vector<std::pair<uint8_t*, uint32_t>> live;
+	unsigned allocations = 0;
+	bool Owns(const uint8_t* buffer, uint32_t size) const {
+		return std::any_of(live.begin(), live.end(), [&](const auto& block) {
+			return buffer >= block.first && buffer + size <= block.first + block.second;
+		});
+	}
+};
+
 struct Callbacks {
 	const std::vector<uint8_t>& data;
 	unsigned opens = 0;
 	unsigned closes = 0;
 	bool premature_eof = false;
+	// When set, every read must land in a buffer from this allocator: the game's callback may
+	// read through AMPR, which accepts only guest memory (KYTY_AVPLAYER_GUEST_READ).
+	const GuestHeap* heap = nullptr;
+	bool foreign_buffer = false;
 };
 int KYTY_SYSV_ABI Open(void* object, const char*) {
 	++static_cast<Callbacks*>(object)->opens;
@@ -85,6 +99,9 @@ int KYTY_SYSV_ABI Close(void* object) {
 }
 int KYTY_SYSV_ABI Read(void* object, uint8_t* buffer, uint64_t offset, uint32_t size) {
 	auto& state = *static_cast<Callbacks*>(object);
+	if (state.heap != nullptr && !state.heap->Owns(buffer, size)) {
+		state.foreign_buffer = true;
+	}
 	if (state.premature_eof) {
 		return 0;
 	}
@@ -93,6 +110,21 @@ int KYTY_SYSV_ABI Read(void* object, uint8_t* buffer, uint64_t offset, uint32_t 
 	return static_cast<int>(bytes);
 }
 uint64_t KYTY_SYSV_ABI Size(void* object) { return static_cast<Callbacks*>(object)->data.size(); }
+void* KYTY_SYSV_ABI GuestAllocate(void* object, uint32_t, uint32_t size) {
+	auto& heap = *static_cast<GuestHeap*>(object);
+	auto* block = new uint8_t[size];
+	heap.live.emplace_back(block, size);
+	++heap.allocations;
+	return block;
+}
+void KYTY_SYSV_ABI GuestDeallocate(void* object, void* memory) {
+	auto& live = static_cast<GuestHeap*>(object)->live;
+	const auto it = std::find_if(live.begin(), live.end(),
+	                             [&](const auto& block) { return block.first == memory; });
+	Check(it != live.end(), "deallocate a block of this allocator");
+	delete[] it->first;
+	live.erase(it);
+}
 
 struct VideoMemory {
 	unsigned allocations        = 0;
@@ -204,6 +236,24 @@ int main() {
 		Check(io->read_packet(io->opaque, &byte, 1) == AVERROR(EIO), "reject premature EOF");
 	}
 	Check(callbacks.opens == 1 && callbacks.closes == 1, "close callback exactly once");
+	for (const bool guest_read: {false, true}) {
+		GuestHeap heap;
+		Callbacks guest {payload};
+		guest.heap = &heap;
+		const AvPlayerFileReplacement guest_files {&guest, Open, Close, Read, Size};
+		const AvPlayerMemAllocator    guest_memory {&heap, GuestAllocate, GuestDeallocate, nullptr,
+		                                            nullptr};
+		{
+			FileStreamer callback(guest_files, guest_memory, guest_read);
+			Check(callback.Init("callback"), "open guest callback stream with a guest allocator");
+			CheckStream(callback, payload);
+		}
+		// Off (the default), the callback gets FFmpeg's host buffer as before.
+		Check(guest.foreign_buffer != guest_read,
+		      "the read callback's buffer is not where KYTY_AVPLAYER_GUEST_READ puts it");
+		Check((heap.allocations > 0) == guest_read && heap.live.empty(),
+		      "free every guest read buffer");
+	}
 	{
 		FileStreamer missing({});
 		Check(!missing.Init("/unmounted/movie.bin"), "reject unmapped media");
