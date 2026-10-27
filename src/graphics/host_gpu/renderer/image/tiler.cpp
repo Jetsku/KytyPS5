@@ -394,7 +394,9 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 	dispatches.reserve(infos.size());
 	for (const auto& info: infos) {
 		EXIT_IF((transform == ColorTransform::SwapBgra16 && info.bytes_per_element != 8u) ||
-		        (transform == ColorTransform::Reverse10_11_11 && info.bytes_per_element != 4u));
+		        ((transform == ColorTransform::Reverse10_11_11 ||
+		          transform == ColorTransform::Narrow10_11_11) &&
+		         info.bytes_per_element != 4u));
 		TileBlockLayout block {};
 		const uint32_t  tiled_width  = info.tiled_width != 0 ? info.tiled_width : info.pitch;
 		const uint32_t  tiled_height = info.tiled_height != 0 ? info.tiled_height : info.height;
@@ -1479,7 +1481,8 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	uint32_t element_bytes = 0;
 	switch (transform) {
 		case ColorTransform::SwapBgra16: element_bytes = 8; break;
-		case ColorTransform::Reverse10_11_11: element_bytes = 4; break;
+		case ColorTransform::Reverse10_11_11:
+		case ColorTransform::Narrow10_11_11: element_bytes = 4; break;
 		default: EXIT("invalid color transform\n");
 	}
 	EXIT_IF(input.size == 0 || input.size % element_bytes != 0 ||

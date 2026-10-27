@@ -17,7 +17,54 @@
 
 namespace Libs::Graphics {
 
-enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+// Narrow10_11_11: KYTY_10_11_11_RED (see Red10_11_11InRed).
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Narrow10_11_11 };
+
+// KYTY_10_11_11_RED=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 473c43a3d). A guest
+// 10_11_11 float image is held with red in the host's red: the B10G11R11 image takes no channel
+// mapping, and the transfers convert the bits (Narrow10_11_11, Guest10_11_11ToHost). By default
+// the host image holds blue in red behind a view swizzle (Reverse10_11_11), which a storage view
+// cannot take: what compute stored came back with red and blue swapped when sampled (GT7's light
+// probe arrays: orange street lights lit the night blue). Off by default because Astro Bot's
+// galaxy map was not checked with it.
+[[nodiscard]] inline bool Red10_11_11InRed() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_10_11_11_RED");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Narrow10_11_11: the guest word holds red in its low 10 bits (5-bit exponent, 5-bit mantissa),
+// green in the next 11 and blue in the top 11; the host's B10G11R11 holds red in its low 11 bits,
+// green in the next 11 and blue in the top 10. Each component keeps its place; the narrower field
+// drops the lowest mantissa bit (truncated; a NaN stays a NaN). The GPU tiler does the same
+// (gpu_tiler_color.inc, transform 3).
+[[nodiscard]] constexpr uint32_t NarrowSmallFloat(uint32_t bits, uint32_t mantissa_bits) {
+	const uint32_t narrow = bits >> 1u;
+	const uint32_t mask   = (1u << mantissa_bits) - 1u;
+	const bool     nan    = (bits >> mantissa_bits) == 0x1fu && (bits & mask) != 0u;
+	return nan && (narrow & (mask >> 1u)) == 0u ? narrow | 1u : narrow;
+}
+
+[[nodiscard]] constexpr uint32_t Guest10_11_11ToHost(uint32_t packed) {
+	const uint32_t red   = packed & 0x3ffu;
+	const uint32_t green = (packed >> 10u) & 0x7ffu;
+	const uint32_t blue  = NarrowSmallFloat(packed >> 21u, 6);
+	return (red << 1u) | (green << 11u) | (blue << 22u);
+}
+
+[[nodiscard]] constexpr uint32_t Host10_11_11ToGuest(uint32_t packed) {
+	const uint32_t red   = NarrowSmallFloat(packed & 0x7ffu, 6);
+	const uint32_t green = (packed >> 11u) & 0x7ffu;
+	const uint32_t blue  = packed >> 22u;
+	return red | (green << 10u) | ((blue << 1u) << 21u);
+}
+
+// A 32-bit clear or fill word of the guest's layout in the host's (Narrow10_11_11 only).
+[[nodiscard]] constexpr uint32_t GuestColorWordToHost(uint32_t word, ColorTransform transform) {
+	return transform == ColorTransform::Narrow10_11_11 ? Guest10_11_11ToHost(word) : word;
+}
 
 // DCC of a video-out buffer, named by its CB_DCC_CONTROL block sizes: maximum uncompressed,
 // maximum compressed, independent blocks (0: none).
@@ -87,7 +134,8 @@ struct ImageInfo {
 		if (bgra16) return ColorTransform::SwapBgra16;
 		switch (guest_format) {
 			case Prospero::BufferFormat::k10_11_11Float:
-				return ColorTransform::Reverse10_11_11;
+				return Red10_11_11InRed() ? ColorTransform::Narrow10_11_11
+				                          : ColorTransform::Reverse10_11_11;
 			default: return ColorTransform::None;
 		}
 	}

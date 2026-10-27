@@ -235,9 +235,14 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.dcc_clear_register_valid &&
 		       (ClearRegisterWideEnabled()
-		            ? DecodePackedColorClear64(format, metadata.dcc_clear_word,
-		                                       metadata.dcc_clear_word1, clear)
-		            : DecodePackedColorClear(format, metadata.dcc_clear_word, clear));
+		            ? DecodePackedColorClear64(
+		                  format,
+		                  GuestColorWordToHost(metadata.dcc_clear_word, desc.info.GetColorTransform()),
+		                  metadata.dcc_clear_word1, clear)
+		            : DecodePackedColorClear(
+		                  format,
+		                  GuestColorWordToHost(metadata.dcc_clear_word, desc.info.GetColorTransform()),
+		                  clear));
 	}
 	clear = {};
 	if (code == 0x00) {
@@ -4622,8 +4627,10 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		return;
 	}
 	vk::ClearValue clear {};
-	if (!DecodePackedColorClear64(view.format, desc.cmask.clear_word0, desc.cmask.clear_word1,
-	                              clear.color)) {
+	if (!DecodePackedColorClear64(view.format,
+	                              GuestColorWordToHost(desc.cmask.clear_word0,
+	                                                   desc.info.GetColorTransform()),
+	                              desc.cmask.clear_word1, clear.color)) {
 		Profiler::CountFrameEvent(Event::CmaskFastClearFormat);
 		description_noop();
 		return;
@@ -5868,8 +5875,10 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		// KYTY_WIDE_FILL_CLEAR (default off, live): a fill of an image with 64- or 128-bit texels is a clear
 		// too; otherwise only a zero RGBA16F fill and the 32-bit formats are.
 		const bool wide_fill = g_wide_fill_clear.Get() != 0;
-		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, packed_clear, clear.color)
-		                : DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color))) {
+		// KYTY_10_11_11_RED: the fill word is in the guest's layout.
+		const auto host_clear = GuestColorWordToHost(packed_clear, image.info.GetColorTransform());
+		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
+		                : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
 			return false;
 		}
 	} else {

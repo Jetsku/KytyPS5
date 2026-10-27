@@ -36,6 +36,10 @@ struct HostFormatInfo {
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
 	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
+		// KYTY_10_11_11_RED: red in red, no mapping (the transfers convert the bits).
+		if (Red10_11_11InRed()) {
+			return {vk::Format::eB10G11R11UfloatPack32, {}};
+		}
 		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
 	}
 	if (order == Prospero::ChannelOrder::kAlt) {
