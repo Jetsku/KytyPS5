@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <string>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -38,6 +39,8 @@ std::atomic_int32_t  g_shader_clock_shift {0};
 std::atomic_bool     g_guard_vertex_outputs {false};
 std::atomic_bool     g_guard_mesh_outputs {false};
 std::atomic_uint8_t  g_wave_clusters {0}; // HostWaveClusters: bit 0 vertex, 1 pixel, 2 mesh
+// KYTY_LDS_SLOTS verdicts of programs with function-scope LDS: 0 slots, 1 array kept.
+std::array<std::atomic<uint64_t>, 2> g_lds_slot_verdicts {};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -309,6 +312,12 @@ void NoteClusteredProgram(const IR::Program& program) {
 
 } // namespace
 
+uint64_t LdsSlotVerdicts(uint32_t verdict) {
+	return verdict < g_lds_slot_verdicts.size()
+	           ? g_lds_slot_verdicts[verdict].load(std::memory_order_relaxed)
+	           : 0u;
+}
+
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
@@ -402,6 +411,38 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
+					if (GetCodegenOptions().lds_slots && !requirements.lds_slots_blocked) {
+						if (const auto key = StaticLdsSlot(program, inst); key.has_value()) {
+							auto&      keys = requirements.lds_slot_keys;
+							const auto at   = std::lower_bound(keys.begin(), keys.end(), *key);
+							if (at == keys.end() || *at != *key) {
+								keys.insert(at, *key);
+							}
+						} else {
+							requirements.lds_slots_blocked = true;
+							static const bool log = [] {
+								const auto* value = std::getenv("KYTY_LDS_SLOTS_LOG");
+								return value != nullptr && value[0] == '1';
+							}();
+							if (log) {
+								// The first access that is not an own-lane dword: its opcode and
+								// its address' defining opcode (two levels).
+								const auto  address = inst.Arg(0).Resolve();
+								const auto* def     = address.TryInstruction();
+								std::string chain   = def == nullptr ? "immediate/arg" : "";
+								for (int depth = 0; def != nullptr && depth < 3; depth++) {
+									chain += std::string(depth ? " <- " : "") +
+									         std::string(IR::ValueOpcodeName(def->GetOpcode()));
+									const auto next = def->NumArgs() > 0 ? def->Arg(0).Resolve() : IR::Value {};
+									def = next.IsEmpty() ? nullptr : next.TryInstruction();
+								}
+								std::printf("LDS slots: 0x%016" PRIx64 " blocked by %s at %s\n",
+								            program.shader_hash,
+								            std::string(IR::ValueOpcodeName(inst.GetOpcode())).c_str(),
+								            chain.c_str());
+							}
+						}
+					}
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
@@ -670,6 +711,31 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 				            program.shader_hash, state.wave_local_branches.size(), branches,
 				            sync_blocks.size());
 			}
+		}
+	}
+	// KYTY_LDS_SLOTS: one guest lane per invocation, every LDS access an own-lane dword (each key
+	// k reaches element LaneId + k of this invocation's array, so distinct keys never alias), and
+	// every lane's element in bounds (LaneId < wave_size), as the array's bounds check would allow.
+	if (state.requirements.function_lds && GetCodegenOptions().lds_slots) {
+		const auto& keys = state.requirements.lds_slot_keys; // sorted (AnalyzeProgramRequirements)
+		const uint64_t lanes = std::max<uint32_t>(program.wave_size, 1u);
+		state.lds_slot_plan  = state.lane_count == 1 && !state.requirements.lds_slots_blocked &&
+		                      !keys.empty() && keys.size() <= 64u &&
+		                      static_cast<uint64_t>(keys.back()) + lanes <= LdsDwordCount(state);
+		g_lds_slot_verdicts[state.lds_slot_plan ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+		static const bool log = [] {
+			const auto* value = std::getenv("KYTY_LDS_SLOTS_LOG");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (log) {
+			std::printf("LDS slots: stage %u 0x%016" PRIx64 ": %s (%u-dword function array, %zu "
+			            "offset(s)%s, lanes/invocation %u)\n",
+			            static_cast<unsigned>(program.stage), program.shader_hash,
+			            state.lds_slot_plan ? "slots in variables" : "array kept",
+			            LdsDwordCount(state), keys.size(),
+			            state.requirements.lds_slots_blocked ? ", an access is not an own-lane dword"
+			                                                 : "",
+			            state.lane_count);
 		}
 	}
 	state.wave_clusters = state.lane_count == 1 && WaveClustersActive(program);

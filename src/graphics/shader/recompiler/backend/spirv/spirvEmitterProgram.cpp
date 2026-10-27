@@ -1345,7 +1345,13 @@ void EmitProgram(EmitterState& state) {
 			}
 		}
 	}
-	if (state.requirements.function_lds) {
+	if (state.requirements.function_lds && state.lds_slot_plan) {
+		for (const auto& [key, variable]: state.lds_slot_variables) {
+			state.builder.AddFunction(spv::OpVariable,
+			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+			                          variable, spv::StorageClassFunction);
+		}
+	} else if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
 		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),

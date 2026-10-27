@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <type_traits>
@@ -70,6 +71,11 @@ struct SpirvRequirements {
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	// KYTY_LDS_SLOTS (CodegenOptions::lds_slots): the element offsets k of a non-compute stage's
+	// function-scope LDS accesses when each is a dword access of element LaneId + k
+	// (StaticLdsSlot), and whether some access is not (then the array stays).
+	std::vector<uint32_t> lds_slot_keys;
+	bool                  lds_slots_blocked = false;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	// A pixel shader's DS_APPEND/DS_CONSUME elect a non-helper lane (KYTY_PS_APPEND_LIVE_ELECTION).
@@ -174,6 +180,10 @@ struct EmitterState {
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_length              = 0;
 	uint32_t                                         lds_variable            = 0;
+	// With lds_slot_plan, one Function variable per element offset (lds_slot_keys) in place of the
+	// function-scope LDS array (KYTY_LDS_SLOTS).
+	bool                                             lds_slot_plan = false;
+	std::map<uint32_t, uint32_t>                     lds_slot_variables;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
@@ -639,6 +649,13 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off: this program's stage skips the flushes
+// (EmitFlushF32DenormToSignedZero then returns its operand).
+bool     DenormFlushSkipped(const EmitterState& state);
+// KYTY_LDS_SLOTS: the element offset k of a dword LDS access whose dword index is LaneId + k
+// (address (LaneId << 2) + c, or LaneId * 4 + c, plus the DS offset; k = c >> 2), or none.
+std::optional<uint32_t> StaticLdsSlot(const IR::Program& program, const IR::Inst& inst);
+uint64_t DenormFlushCounter(uint32_t stage_index);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 

@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include <array>
+#include <atomic>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -229,7 +232,34 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return EmitBitcastU32ToF32(state, result_bits);
 }
 
+namespace {
+// Shader-side denormal flushes emitted, by DenormFlushStage (pixel, compute, geometry).
+std::array<std::atomic<uint64_t>, 3> g_denorm_flushes {};
+
+size_t DenormFlushStage(const EmitterState& state) {
+	switch (state.program.stage) {
+		case ShaderType::Pixel: return 0;
+		case ShaderType::Compute: return 1;
+		default: return 2;
+	}
+}
+} // namespace
+
+uint64_t DenormFlushCounter(uint32_t stage_index) {
+	return g_denorm_flushes[stage_index].load(std::memory_order_relaxed);
+}
+
+bool DenormFlushSkipped(const EmitterState& state) {
+	const auto skip = GetCodegenOptions().denorm_flush_skip;
+	return (skip & (1u << DenormFlushStage(state))) != 0u;
+}
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (CodegenOptions::denorm_flush_skip).
+	if (DenormFlushSkipped(state)) {
+		return value;
+	}
+	g_denorm_flushes[DenormFlushStage(state)].fetch_add(1, std::memory_order_relaxed);
 	// A zero is its own sign bits, so "magnitude below the smallest normal" needs no separate
 	// non-zero test: selecting the sign bits of +-0 returns +-0 unchanged.
 	const auto bits      = state.builder.AllocateId();
@@ -294,3 +324,11 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint64_t EmittedDenormFlushes(uint32_t stage_index) {
+	return stage_index < 3u ? Emitter::DenormFlushCounter(stage_index) : 0u;
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv
