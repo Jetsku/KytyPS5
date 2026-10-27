@@ -13716,6 +13716,25 @@ void TestBlendMappingClassification() {
     Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
           "separate alpha lowering accepted a different blend equation");
   }
+
+  // KYTY_UI_TEXT_BLEND (usa-ratt/KytyPS5-GT7 429692dd3): colour One, alpha Zero over a
+  // source-alpha destination factor. Without the switch: unsupported, as before.
+  blend = HW::BlendControl{};
+  blend.separate_alpha_blend = true;
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kOne);
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kZero);
+  for (const auto destination : {Factor::kOneMinusSrcAlpha, Factor::kSrcAlpha}) {
+    blend.color_destblend = blend.alpha_destblend = static_cast<uint8_t>(destination);
+    Check(ClassifyBlendMapping(blend, Prospero::ColorMappingAbgr, true) ==
+                  Support::OneAlphaZero &&
+              ClassifyBlendMapping(blend, Prospero::ColorMappingAbgr, false) ==
+                  Support::Unsupported &&
+              ClassifyBlendMapping(blend, Prospero::ColorMappingRgba, true) == Support::Direct,
+          "UI text blending (colour One, alpha Zero) was not lowered through the second source");
+  }
+  blend.alpha_destblend = static_cast<uint8_t>(Factor::kOne);
+  Check(ClassifyBlendMapping(blend, Prospero::ColorMappingAbgr, true) == Support::Unsupported,
+        "UI text blending accepted a different alpha destination factor");
 }
 
 void TestLogicalAlphaBlendExport() {

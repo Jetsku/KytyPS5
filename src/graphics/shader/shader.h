@@ -230,7 +230,15 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
-enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+// OneAlphaZero (KYTY_BLEND_ALPHA_REMAP with KYTY_UI_TEXT_BLEND=1, usa-ratt/KytyPS5-GT7 429692dd3,
+// from Franseven): colour One, alpha Zero over a source-alpha destination factor (UI text).
+enum class ShaderAlphaBlendSource : uint8_t {
+	None,
+	SourceAlpha,
+	SourceAlphaOne,
+	SourceAlphaZero,
+	OneAlphaZero
+};
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {

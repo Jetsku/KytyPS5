@@ -7315,10 +7315,22 @@ void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& p
 		pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 		pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
 	} else if (BlendAlphaRemapEnabled() && blending && pixel_info.target_output_mode[0] != 0 &&
-	           pixel_info.target_output_mode[0] != 7 &&
-	           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
-	                       std::end(pixel_info.target_output_mode),
-	                       [](uint8_t mode) { return mode == 0; })) {
+	           pixel_info.target_output_mode[0] != 7 && [&] {
+		           // KYTY_UI_TEXT_BLEND: exports to render targets that are not bound are dead and
+		           // do not block taking over MRT1 (Franseven).
+		           const bool ui_text = UiTextBlendEnabled();
+		           for (uint32_t slot = 1; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			           if (pixel_info.target_output_mode[slot] == 0) {
+				           continue;
+			           }
+			           if (!ui_text || (context.GetRenderTarget(slot).base.addr != 0 &&
+			                            render_target_mask_slot(context.GetRenderTargetMask(),
+			                                                    slot) != 0)) {
+				           return false;
+			           }
+		           }
+		           return true;
+	           }()) {
 		// The export mapping moves alpha out of the fourth channel: MRT1 carries logical alpha,
 		// or the per-channel source factors, as a second blend source (KYTY_BLEND_ALPHA_REMAP;
 		// upstream 73615c31f, 0bef3fc0d, 94e7d239d).
@@ -7332,9 +7344,16 @@ void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& p
 			case BlendMappingSupport::SourceAlphaZero:
 				pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
 				break;
+			case BlendMappingSupport::OneAlphaZero:
+				pixel_info.alpha_blend_source = ShaderAlphaBlendSource::OneAlphaZero;
+				break;
 			default: break;
 		}
 		if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+			// The dead exports past MRT1 (KYTY_UI_TEXT_BLEND) are dropped.
+			for (uint32_t slot = 2; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+				pixel_info.target_output_mode[slot] = 0;
+			}
 			pixel_info.dual_source_blending     = true;
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = {};
@@ -7829,11 +7848,27 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 						blend.color_destblend =
 						    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
 						break;
+					case ShaderAlphaBlendSource::OneAlphaZero:
+						// The second source: 1 or 0 for each physical colour channel (0 where
+						// logical alpha lies), logical Sa in its A for the destination factor.
+						// Physical A holds a logical colour channel, so its source factor is One.
+						blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+						blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+						blend.alpha_srcblend  = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+						blend.alpha_destblend = blend.color_destblend;
+						blend.alpha_comb_fcn  = blend.color_comb_fcn;
+						break;
 					case ShaderAlphaBlendSource::None: break;
 				}
 				static_params.color_srcblend[slot]       = blend.color_srcblend;
 				static_params.color_destblend[slot]      = blend.color_destblend;
 				static_params.separate_alpha_blend[slot] = false;
+				if (alpha_source == ShaderAlphaBlendSource::OneAlphaZero) {
+					static_params.alpha_srcblend[slot]       = blend.alpha_srcblend;
+					static_params.alpha_destblend[slot]      = blend.alpha_destblend;
+					static_params.alpha_comb_fcn[slot]       = blend.alpha_comb_fcn;
+					static_params.separate_alpha_blend[slot] = true;
+				}
 			}
 			if (alpha_remap) {
 				// Kept in the key (its layout is persisted); the factors above carry the remap.
