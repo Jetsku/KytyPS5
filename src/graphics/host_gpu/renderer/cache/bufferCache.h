@@ -270,6 +270,9 @@ public:
 	                                               uint64_t tick);
 	void EndBackingPublication(uint64_t token);
 	[[nodiscard]] bool HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const;
+	// GPU thread (KYTY_DIRECT_READ_WAIT): waits until no queued backing publication covers the range,
+	// so a direct read of guest memory sees the bytes a download in flight is about to publish.
+	void WaitBackingPublications(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::optional<uint64_t> PendingBackingPublicationTick(uint64_t vaddr,
 	                                                                  uint64_t size) const;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);

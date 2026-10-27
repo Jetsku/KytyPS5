@@ -413,10 +413,273 @@ void CheckMilesNestedHeap() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 
+// PPSA03671's material pixel shaders (KYTY_HEAP_KEY_MASK): the heap key is a V_READFIRSTLANE of a
+// lane value, and the T# offset is masked after the scale: S_LSHL_B32 5, then S_AND_B32 0x01ffffe0,
+// then S_BUFFER_LOAD_DWORDX8 from the heap's V#. `uniform_key` takes the key from user data s12
+// instead (a value the SRT walk evaluates before the draw), which must keep its flat slot.
+// `word0_data`: no mask, but T# word 0 is also stored as a value (0x885fa47aec73f696 spills it with
+// V_WRITELANE): before, a word 0 with another use had no plan and the program was skipped.
+std::vector<u32> MaskedHeapKeyCode(bool uniform_key, bool word0_data = false) {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u);
+  AppendVMovLiteral(&code, 4, 0x3f000000u);
+  AppendVMovLiteral(&code, 5, 0x00000000u);
+  if (uniform_key) {
+    code.push_back(EncodeSop1(0x03u, 22, 12)); // s_mov_b32 s22, s12
+  } else {
+    code.push_back(EncodeVop1(0x02, 22, Vgpr(1))); // v_readfirstlane_b32 s22, v1
+  }
+  code.push_back(EncodeSop2(0x1eu, 23, 22, InlineU32(5))); // s_lshl_b32 s23, s22, 5
+  if (!word0_data) {
+    code.push_back(EncodeSop2(0x0eu, 23, 23, 255)); // s_and_b32 s23, s23, 0x01ffffe0
+    code.push_back(0x01ffffe0u);
+  }
+  code.push_back(EncodeSmem0(0x0bu, 32, 2)); // s_buffer_load_dwordx8 s[32:39], s[4:7], s23
+  code.push_back(EncodeSmem1(0, 23));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  // image_sample_l v2, v[3:5], s[32:39], s[8:11] dmask 0x1
+  code.push_back(EncodeMimg0(0x24u, 0x1u));
+  code.push_back(EncodeMimg1(2, 3, 32 / 4, 8 / 4));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  if (word0_data) {
+    code.push_back(EncodeVop1(0x01, 6, 32)); // v_mov_b32 v6, s32
+    AppendVMovU32(&code, 7, 4);
+    AppendBufferStoreDword(&code, 6, 7);
+  }
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckMaskedHeapKey() {
+  constexpr const char *name = "BindlessMaskedHeapKey";
+  const auto code = MaskedHeapKeyCode(false);
+  auto user_data = MilesHeapUserData();
+  user_data[12] = 3u;
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  const auto is_bindless = [](const ShaderRecompiler::TranslateResult &translated) {
+    const auto &images = translated.program.info.images;
+    if (images.size() != 1u) return false;
+    const auto &source = translated.program.descriptor_sources.at(images[0].source);
+    return source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless &&
+           source.indirect_descriptor->table_offset == 0u &&
+           source.indirect_descriptor->table_stride == 32u;
+  };
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+
+  // Switch off: the masked offset has no plan and the program is skipped, as before.
+  {
+    codegen.heap_key_mask = false;
+    ScopedCodegenOptions scope(codegen);
+    const auto skipped = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "switch off", skipped.skip_dispatch,
+            "the masked heap key was planned without KYTY_HEAP_KEY_MASK");
+  }
+  codegen.heap_key_mask = true;
+  ScopedCodegenOptions scope(codegen);
+  // Without bindless images there is still no plan.
+  {
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+    const auto skipped = ShaderRecompiler::TranslateProgram(code, options);
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+    Require(name, "without bindless images", skipped.skip_dispatch,
+            "the masked heap key was planned without bindless images");
+  }
+  // A key from user data keeps its flat slot (no indirect plan), switch on or off.
+  {
+    const auto uniform_code = MaskedHeapKeyCode(true);
+    const auto translated = ShaderRecompiler::TranslateProgram(uniform_code, options);
+    Require(name, "uniform key",
+            !translated.skip_dispatch && translated.program.info.images.size() == 1u &&
+                !translated.program.descriptor_sources.at(translated.program.info.images[0].source)
+                     .indirect_descriptor.has_value(),
+            "a key the SRT walk evaluates no longer has its flat slot");
+  }
+  // T# word 0 also used as a value: skipped without the switch, a bindless lookup with it, and a
+  // flat slot for a key the SRT walk evaluates.
+  {
+    const auto word0_code = MaskedHeapKeyCode(false, true);
+    auto off = codegen;
+    off.heap_key_mask = false;
+    {
+      ScopedCodegenOptions off_scope(off);
+      Require(name, "word 0 switch off",
+              ShaderRecompiler::TranslateProgram(word0_code, options).skip_dispatch,
+              "a shared T# word 0 was planned without KYTY_HEAP_KEY_MASK");
+    }
+    const auto shared = ShaderRecompiler::TranslateProgram(word0_code, options);
+    Require(name, "word 0", !shared.skip_dispatch && is_bindless(shared),
+            "a shared T# word 0 with a lane key is not a bindless heap lookup");
+    const auto uniform = ShaderRecompiler::TranslateProgram(MaskedHeapKeyCode(true, true), options);
+    Require(name, "word 0 uniform key",
+            !uniform.skip_dispatch && uniform.program.info.images.size() == 1u &&
+                !uniform.program.descriptor_sources.at(uniform.program.info.images[0].source)
+                     .indirect_descriptor.has_value(),
+            "a shared T# word 0 with a key the SRT walk evaluates no longer has its flat slot");
+  }
+
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the masked heap key was skipped with KYTY_HEAP_KEY_MASK");
+  Require(name, "bindless plan", is_bindless(translated),
+          "the image is not a bindless heap lookup at stride 32");
+  // The shader looks up key & 0xfffff: (key << 5) & 0x01ffffe0 == (key & 0xfffff) << 5.
+  u32 masks = 0;
+  for (const auto *block : translated.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::BitwiseAnd32) continue;
+      const auto mask = inst.Arg(1).Resolve();
+      masks += mask.IsImmediate() && mask.U32() == 0x000fffffu;
+    }
+  }
+  Require(name, "masked key", masks >= 1u, "no key & 0xfffff in the program");
+
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  std::vector<u32> memory(0x4000u, 0u);
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.bindless_heaps.size() == 1u && resources.bindless_heaps[0].base == 0x4000u &&
+              resources.bindless_heaps[0].table_offset == 0u,
+          "the masked heap did not materialize");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "bindless SPIR-V",
+          CountSpirv(result.spirv, "\"bindless_translation\"") == 1u &&
+              CountSpirv(result.spirv, "OpImageSampleExplicitLod") >= 1u,
+          "the sample does not go through the bindless arrays");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
+// PPSA03671's material callbacks (KYTY_HEAP_KEY_MASK): the waterfall record {function, data} at
+// key << 4 gives the data pointer s[14:15]; the heap V# is S_LOAD_DWORDX4 at +16 through it (no
+// middle buffer, unlike Miles' nested heap) and the T# S_BUFFER_LOAD_DWORDX8 at the inner key << 5.
+std::vector<u32> RecordHeapCode() {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u);
+  AppendVMovLiteral(&code, 4, 0x3f000000u);
+  AppendVMovLiteral(&code, 5, 0x00000000u);
+  code.push_back(EncodeSop1(0x04u, 20, 126)); // s_mov_b64 s[20:21], exec
+  const auto loop = code.size();
+  code.push_back(EncodeVop1(0x02, 22, Vgpr(1)));  // v_readfirstlane_b32 s22, v1
+  code.push_back(EncodeVopc(0xc2u, 22, 1));       // v_cmp_eq_u32 vcc, s22, v1
+  code.push_back(EncodeSop1(0x24u, 24, 106));     // s_and_saveexec_b64 s[24:25], vcc
+  code.push_back(EncodeSop2(0x1eu, 106, 22, InlineU32(4))); // s_lshl_b32 vcc_lo, s22, 4
+  code.push_back(EncodeSmem0(0x0au, 12, 2));      // s_buffer_load_dwordx4 s[12:15], s[4:7], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeSmem0(0x02u, 60, 7));      // s_load_dwordx4 s[60:63], s[14:15], 16 (heap V#)
+  code.push_back(EncodeSmem1(16, 125));
+  code.push_back(EncodeSmem0(0x02u, 40, 7));      // s_load_dwordx4 s[40:43], s[14:15], 32 (S#)
+  code.push_back(EncodeSmem1(32, 125));
+  code.push_back(EncodeVop1(0x02, 23, Vgpr(0)));  // v_readfirstlane_b32 s23, v0: the inner key
+  code.push_back(EncodeSop2(0x1eu, 26, 23, InlineU32(5))); // s_lshl_b32 s26, s23, 5
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeSmem0(0x0bu, 64, 30));     // s_buffer_load_dwordx8 s[64:71], s[60:63], s26
+  code.push_back(EncodeSmem1(0, 26));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[64:71], s[40:43]
+  code.push_back(EncodeMimg1(2, 3, 64 / 4, 40 / 4));
+  code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec
+  code.push_back(EncodeSop1(0x04u, 126, 24));     // s_mov_b64 exec, s[24:25]
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(back) & 0xffffu));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckRecordHeap() {
+  constexpr const char *name = "BindlessRecordHeap";
+  const auto code = RecordHeapCode();
+  const auto user_data = MilesHeapUserData();
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+  {
+    codegen.heap_key_mask = false;
+    ScopedCodegenOptions scope(codegen);
+    Require(name, "switch off", ShaderRecompiler::TranslateProgram(code, options).skip_dispatch,
+            "the record heap was planned without KYTY_HEAP_KEY_MASK");
+  }
+  codegen.heap_key_mask = true;
+  ScopedCodegenOptions scope(codegen);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the record heap T# was skipped with KYTY_HEAP_KEY_MASK");
+  const auto &images = translated.program.info.images;
+  Require(name, "bindless plan", images.size() == 1u, "expected one image");
+  const auto &source = translated.program.descriptor_sources.at(images[0].source);
+  Require(name, "bindless plan",
+          source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless &&
+              source.indirect_descriptor->record_pointer == 8u &&
+              source.indirect_descriptor->table_stride == 16u &&
+              source.indirect_descriptor->nested_vsharp == 16u &&
+              source.indirect_descriptor->nested_heap == UINT32_MAX &&
+              source.indirect_descriptor->nested_keys != 0u,
+          "the image is not a record heap");
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  std::vector<u32> memory(0x4000u, 0u);
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.bindless_heaps.size() == 1u &&
+              resources.bindless_heaps[0].nested_vsharp == 16u &&
+              resources.bindless_heaps[0].nested_heap == UINT32_MAX,
+          "the record heap did not materialize");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "bindless SPIR-V", CountSpirv(result.spirv, "\"bindless_translation\"") == 1u,
+          "the sample does not go through the bindless arrays");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
 void RunCodegen() {
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
   CheckMilesNestedHeap();
+  CheckMaskedHeapKey();
+  CheckRecordHeap();
 }
 
 } // namespace BindlessTests

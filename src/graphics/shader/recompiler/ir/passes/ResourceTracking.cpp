@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -625,10 +626,20 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset) const {
+	// KYTY_HEAP_KEY_MASK=1 (CodegenOptions::heap_key_mask, default off): a heap offset
+	// (key << 5) & mask, with the mask's low five bits clear, is the record of key & (mask >> 5)
+	// (PPSA03671's material pixel shaders: a V_READFIRSTLANE key, S_LSHL_B32 5, S_AND_B32 0x01ffffe0,
+	// S_BUFFER_LOAD_DWORDX8). Only for a key the host cannot evaluate (a lane value): such a program
+	// was skipped before, and a key the SRT walk evaluates keeps its flat slot.
+	// The masked form: `masked` is the S_AND whose result the offset adds to, `key_mask` the mask
+	// to apply to the key (UINT32_MAX when the offset is a plain key << 5).
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t* key_mask = nullptr,
+	                      Inst** masked = nullptr) const {
 		offset = 0;
+		if (key_mask != nullptr) *key_mask = UINT32_MAX;
+		if (masked != nullptr) *masked = nullptr;
 		for (;;) {
-			const auto* inst = value.Resolve().TryInstruction();
+			auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
 				return false;
 			}
@@ -637,6 +648,29 @@ private:
 			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && key_mask != nullptr &&
+			    masked != nullptr && GetCodegenOptions().heap_key_mask) {
+				uint32_t mask = 0;
+				const auto operand = ImmediateU32(inst->Arg(1), mask) ? 0u
+				                     : ImmediateU32(inst->Arg(0), mask) ? 1u
+				                                                        : 2u;
+				if (operand == 2u || mask == 0u || (mask & 31u) != 0u) {
+					return false;
+				}
+				const auto* shift = inst->Arg(operand).Resolve().TryInstruction();
+				if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+				    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), immediate) ||
+				    immediate != 5u) {
+					return false;
+				}
+				key = shift->Arg(0).Resolve();
+				if (key.GetType() != Type::U32 || ValidateRuntimeValue(m_program, key)) {
+					return false;
+				}
+				*key_mask = mask >> 5u;
+				*masked   = inst;
+				return true;
 			}
 			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
 				return false;
@@ -1037,6 +1071,66 @@ private:
 		return {};
 	}
 
+	// KYTY_HEAP_KEY_MASK (adapted from KytyPS5-Frank's ResolveDescriptorPhi): a descriptor word that
+	// is a Phi web where the register held the T# word on the sampling paths and a data value on
+	// others (PPSA03671's 0xbf3eac34fedbad2d restores a spilled heap T# with V_READLANE after loops
+	// that reuse the spill lanes). The one leaf read from the descriptor's own table (`reference`,
+	// the table of its plain words) is the word; every other leaf must be plainly data (an
+	// immediate, a value with uses outside Phis and image handles, or a computed value), so two
+	// real descriptors still count as selected.
+	Value ResolveDescriptorPhi(Value value, const Inst* reference) const {
+		if (const auto invariant = ResolveInvariantPhi(m_program, value); !invariant.IsEmpty()) {
+			return invariant;
+		}
+		value            = value.Resolve();
+		const auto* root = value.TryInstruction();
+		if (reference == nullptr || root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+			return {};
+		}
+		Value                           found;
+		std::vector<const Inst*>        pending {root};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty()) {
+			const auto* phi = pending.back();
+			pending.pop_back();
+			if (!seen.insert(phi).second) {
+				continue;
+			}
+			for (size_t i = 0; i < phi->NumArgs(); i++) {
+				const auto  leaf = phi->Arg(i).Resolve();
+				const auto* inst = leaf.TryInstruction();
+				if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+					pending.push_back(inst);
+					continue;
+				}
+				const bool data =
+				    leaf.IsImmediate() ||
+				    (inst != nullptr && std::ranges::any_of(inst->Uses(), [](const Use& use) {
+					     const auto op = use.user->GetOpcode();
+					     return op != ValueOpcode::Phi && op != ValueOpcode::GetImageResource;
+				     }));
+				if (data) {
+					continue;
+				}
+				uint32_t    memory_index = 0;
+				const auto* memory = inst != nullptr ? ScalarReadMemory(*inst, memory_index) : nullptr;
+				if (memory == nullptr) {
+					if (inst != nullptr && inst->GetOpcode() == ValueOpcode::GetUserData) {
+						return {};
+					}
+					continue;
+				}
+				const auto* table = inst->Arg(0).Resolve().TryInstruction();
+				if (table == nullptr || !EquivalentValue(m_program, Value(table), Value(reference)) ||
+				    (!found.IsEmpty() && !EquivalentValue(m_program, found, leaf))) {
+					return {};
+				}
+				found = leaf;
+			}
+		}
+		return found;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -1044,11 +1138,32 @@ private:
 		Inst* table_handle = nullptr;
 		Value key;
 		uint32_t table_offset = 0;
+		uint32_t key_mask     = UINT32_MAX;
+		Inst*    masked       = nullptr;
+		bool     word0_shared = false;
+		// KYTY_HEAP_KEY_MASK: the table of the descriptor's plain (non-Phi) words, for
+		// ResolveDescriptorPhi.
+		const Inst* reference_table = nullptr;
+		if (GetCodegenOptions().heap_key_mask) {
+			for (uint32_t dword = 0; dword < plan.reads.size() && reference_table == nullptr; ++dword) {
+				const auto* plain = handle.Arg(dword).Resolve().TryInstruction();
+				uint32_t    memory_index = 0;
+				if (plain != nullptr && plain->GetOpcode() != ValueOpcode::Phi &&
+				    ScalarReadMemory(*plain, memory_index) != nullptr) {
+					reference_table = plain->Arg(0).Resolve().TryInstruction();
+				}
+			}
+		}
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read != nullptr && read->GetOpcode() == ValueOpcode::Phi && reference_table != nullptr) {
+				read = ResolveDescriptorPhi(Value(read), reference_table).TryInstruction();
+			}
 			if (read == nullptr) {
 				return false;
 			}
+			uint32_t current_mask   = UINT32_MAX;
+			Inst*    current_masked = nullptr;
 			uint32_t memory_index = 0;
 			const auto* memory = ScalarReadMemory(*read, memory_index);
 			if (memory == nullptr || memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
@@ -1065,7 +1180,7 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
@@ -1073,7 +1188,9 @@ private:
 			if (dword == 0u) {
 				key = current_key;
 				table_offset = offset;
-			} else if (!EquivalentValue(m_program, key, current_key) ||
+				key_mask     = current_mask;
+				masked       = current_masked;
+			} else if (!EquivalentValue(m_program, key, current_key) || key_mask != current_mask ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
@@ -1110,8 +1227,15 @@ private:
 					       std::ranges::find(image_users, use.user->Arg(0).Resolve().TryInstruction()) !=
 					           image_users.end();
 				});
-				if ((!lod_words_only && !data_words) || dword == 0u) {
+				// KYTY_HEAP_KEY_MASK: word 0 too, for a heap key only the shader knows (checked below,
+				// the plan is then bindless). PPSA03671's material pixel shader 0x885fa47aec73f696
+				// spills word 0 with V_WRITELANE and restores it with V_READLANE before the sample.
+				if ((!lod_words_only && !data_words) ||
+				    (dword == 0u && !GetCodegenOptions().heap_key_mask)) {
 					return false;
+				}
+				if (dword == 0u) {
+					word0_shared = true;
 				}
 				plan.memory[dword] = UINT32_MAX;
 				continue;
@@ -1120,6 +1244,11 @@ private:
 			plan.reads[dword] = read;
 		}
 
+		// A shared word 0 (KYTY_HEAP_KEY_MASK) only for a key the host cannot evaluate: a key the
+		// SRT walk evaluates keeps its flat slot, as before.
+		if (word0_shared && ValidateRuntimeValue(m_program, key)) {
+			return false;
+		}
 		DescriptorSource table_source;
 		if (!MakeRuntimeTableSource(*table_handle, pc, table_source)) {
 			return false;
@@ -1184,7 +1313,9 @@ private:
 			}
 			return true;
 		};
-		if (!enumerable()) {
+		// A masked key is a lane value (MatchTableOffset): no enumeration covers it. A shared
+		// word 0 has no planning read for the material selector either.
+		if (masked != nullptr || word0_shared || !enumerable()) {
 			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
 				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
 				       ImageResourceClass::Sampled;
@@ -1197,6 +1328,17 @@ private:
 			indirect.table_stride = 32u;
 			indirect.bindless     = true;
 			material_source       = {};
+		}
+		if (masked != nullptr) {
+			// The shader looks up key & (mask >> 5), computed where the S_AND computes the offset
+			// (the key dominates it, and it dominates the T# reads).
+			auto*      block = masked->Parent();
+			const auto where = std::ranges::find_if(block->Instructions(),
+			                                        [&](const Inst& inst) { return &inst == masked; });
+			if (where == block->Instructions().end()) {
+				return false;
+			}
+			key = Value(&*block->PrependNewInst(where, ValueOpcode::BitwiseAnd32, {key, Value(key_mask)}));
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -1526,6 +1668,112 @@ private:
 		return true;
 	}
 
+	// KYTY_HEAP_KEY_MASK: the heap of PPSA03671's material callbacks (expanded S_SWAPPC_B64 callees
+	// of the tiled material kernels, e.g. 0xe6d76d24f59f8015): the T# is an S_BUFFER_LOAD_DWORDX8 at
+	// key << 5 from a heap whose V# is S_LOAD_DWORDX4 at a fixed offset through the record pointer
+	// (a 16-byte record {function, data} at a waterfall key << 4; the callee gets the data pointer).
+	// The nested form without the middle buffer: nested_heap = UINT32_MAX tells the host that the V#
+	// at nested_vsharp past the pointer is the heap itself.
+	bool TryMakeRecordHeapImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (!GetCodegenOptions().heap_key_mask || !BindlessImagesEnabled() ||
+		    handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    !std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			    return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+			           ImageResourceClass::Sampled;
+		    })) {
+			return false;
+		}
+		plan = {};
+		plan.memory.fill(UINT32_MAX);
+		const Inst* heap_handle  = nullptr;
+		Value       inner_key;
+		uint32_t    table_offset = 0;
+		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+			auto*      read         = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t   memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			Value      current_key;
+			uint32_t   offset = 0;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    (memory->offset & 3u) != 0u || memory->offset > INT32_MAX ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    memory->offset > UINT32_MAX - offset) {
+				return false;
+			}
+			offset += memory->offset;
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    (heap_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(heap_handle), Value(current)))) {
+				return false;
+			}
+			if (dword == 0u) {
+				inner_key    = current_key;
+				table_offset = offset;
+			} else if (!EquivalentValue(m_program, inner_key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * 4u != offset) {
+				return false;
+			}
+			heap_handle = current;
+			const std::array<const Inst*, 1> image_users {&handle};
+			if (UsesOnly(*read, image_users)) {
+				plan.memory[dword] = memory_index;
+				plan.reads[dword]  = read;
+			}
+		}
+		// The heap's V#: S_LOAD_DWORDX4 at a fixed offset through the record pointer.
+		const Inst* pointer       = nullptr;
+		uint32_t    nested_vsharp = 0;
+		if (!MatchConsecutiveWords(*heap_handle, ValueOpcode::GetAddressResource, pointer,
+		                           nested_vsharp)) {
+			return false;
+		}
+		Inst*    table_handle   = nullptr;
+		Value    record_key;
+		uint32_t shift          = 0;
+		uint32_t record_pointer = 0;
+		if (!MatchRecordPointer(*pointer, table_handle, record_key, shift, record_pointer)) {
+			return false;
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*table_handle, pc, table_source) ||
+		    table_source.dword_count != 4u) {
+			return false;
+		}
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.table_offset   = table_offset;
+		indirect.table_stride   = 1u << shift;
+		indirect.record_pointer = record_pointer;
+		indirect.nested_vsharp  = nested_vsharp;
+		indirect.nested_heap    = UINT32_MAX;
+		indirect.nested_keys    = NestedKeys;
+		indirect.bindless       = true;
+		indirect.table_source   = InternSource(table_source);
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
+		            image_source.dwords.begin() + 4u);
+		image_source.indirect_descriptor = indirect;
+		// key = record * NestedKeys + inner, or UINT32_MAX (outside every heap) for an inner key
+		// past NestedKeys, as for the nested heap.
+		auto*      block = handle.Parent();
+		const auto where = std::ranges::find_if(block->Instructions(),
+		                                        [&](const Inst& inst) { return &inst == &handle; });
+		const auto scaled = Value(&*block->PrependNewInst(where, ValueOpcode::IMul32,
+		                                                  {record_key, Value(NestedKeys)}));
+		const auto sum = Value(&*block->PrependNewInst(where, ValueOpcode::IAdd32, {scaled, inner_key}));
+		const auto inside = Value(&*block->PrependNewInst(where, ValueOpcode::ULessThan32,
+		                                                  {inner_key, Value(NestedKeys)}));
+		const auto key = Value(&*block->PrependNewInst(where, ValueOpcode::SelectU32,
+		                                               {inside, sum, Value(UINT32_MAX)}));
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = key;
+		plan.roots  = image_source.dwords;
+		return true;
+	}
+
 	bool IsBindlessPlan(const IndirectImagePlan& plan) const {
 		const auto* source = Source(plan.source);
 		return source != nullptr && source->indirect_descriptor.has_value() &&
@@ -1583,7 +1831,8 @@ private:
 				IndirectImagePlan plan;
 				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
 				    TryMakeRecordPointerImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
-				    TryMakeNestedRecordImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				    TryMakeNestedRecordImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeRecordHeapImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					for (const auto index: plan.memory) {
 						if (index != UINT32_MAX) {
 							if (index >= m_planning_memory.size()) m_planning_memory.resize(index + 1u, 0u);

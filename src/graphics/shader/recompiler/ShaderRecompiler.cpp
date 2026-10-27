@@ -583,7 +583,10 @@ static bool IsUnsupportedCall(const Decoder::Instruction& inst) {
 // scalar ops and lane masks write a pair, SMEM loads their dword count); a second destination
 // (carry-out) counts as a pair. Unsupported instructions other than calls write nothing known;
 // calls write their return address to their SDST pair.
-static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg) {
+// `wave32` (KYTY_CALL_TRACE_WAVE32, a wave32 program): a lane mask (V_CMP result, carry-out) is
+// one SGPR, not a pair. PPSA03671's material kernels keep their SRT pointer in s12..s13 and write
+// V_CMP masks to s11, which the pair width took for writes of s12.
+static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg, bool wave32 = false) {
 	if (inst.opcode == Decoder::Opcode::UNSUPPORTED) {
 		const auto sdst = (inst.raw[0] >> 16u) & 0x7fu;
 		return IsUnsupportedCall(inst) && (sdst == reg || sdst + 1u == reg);
@@ -599,6 +602,7 @@ static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg) {
 		}
 		// A 32-bit result of a 64-bit source (S_FF1_I32_B64, S_BCNT1_I32_B64, S_FLBIT_I32_B64): one.
 		if (name.ends_with("32_B64")) return 1u;
+		if (wave32 && name.starts_with("V_CMP")) return 1u;
 		return name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64") ||
 		               name.ends_with("_F64") || name.starts_with("V_CMP")
 		           ? 2u
@@ -608,7 +612,7 @@ static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg) {
 		return operand.kind == Decoder::OperandKind::Sgpr && reg >= operand.reg &&
 		       reg < operand.reg + count;
 	};
-	return covers(inst.dst, width) || covers(inst.dst2, 2u);
+	return covers(inst.dst, width) || covers(inst.dst2, wave32 ? 1u : 2u);
 }
 
 // Diagnostics for a program skipped for S_SWAPPC_B64: the functions its calls jump to, as the
@@ -630,7 +634,10 @@ FindCallTargets(const Decoder::Program& decoded, const CompileOptions& options, 
         return reg >= options.user_data_base &&
                reg - options.user_data_base < options.user_data.size();
 	};
-	const auto writes_sgpr = WritesSgpr;
+	const bool wave32      = GetCodegenOptions().call_trace_wave32 && options.wave_size == 32u;
+	const auto writes_sgpr = [wave32](const Decoder::Instruction& inst, uint32_t reg) {
+		return WritesSgpr(inst, reg, wave32);
+	};
 	std::set<uint32_t> labels;
 	for (const auto& inst: insts) {
 		if (Decoder::IsDirectBranch(inst.opcode)) {
@@ -791,6 +798,10 @@ static std::string DescribeCallTargets(std::span<const CallTarget> targets, uint
 static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
                                              const CompileOptions& options, std::string& failures) {
 	const auto& insts     = decoded.instructions;
+	const bool  wave32    = GetCodegenOptions().call_trace_wave32 && options.wave_size == 32u;
+	const auto  WritesSgpr32 = [wave32](const Decoder::Instruction& inst, uint32_t reg) {
+		return WritesSgpr(inst, reg, wave32);
+	};
 	const auto  user_sgpr = [&](uint32_t reg) {
         return reg >= options.user_data_base &&
                reg - options.user_data_base < options.user_data.size();
@@ -811,7 +822,7 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 			    insts[i].opcode == Decoder::Opcode::S_SETPC_B64) {
 				return Unknown;
 			}
-			if (WritesSgpr(insts[i], reg)) {
+			if (WritesSgpr32(insts[i], reg)) {
 				return static_cast<ptrdiff_t>(i);
 			}
 		}
@@ -839,7 +850,7 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 		}
 		const auto writes_range = [&](size_t i) {
 			for (uint32_t r = reg; r < reg + count; r++) {
-				if (WritesSgpr(insts[i], r)) return true;
+				if (WritesSgpr32(insts[i], r)) return true;
 			}
 			return false;
 		};
@@ -857,7 +868,7 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 			}
 			bool ok = candidate >= 0;
 			for (uint32_t r = reg; ok && r < reg + count; r++) {
-				ok = WritesSgpr(insts[static_cast<size_t>(candidate)], r);
+				ok = WritesSgpr32(insts[static_cast<size_t>(candidate)], r);
 			}
 			const auto cand_pc = ok ? insts[static_cast<size_t>(candidate)].pc : 0u;
 			for (size_t i = 0; ok && i < static_cast<size_t>(candidate); i++) {
@@ -878,6 +889,26 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 			if (ok) {
 				return candidate;
 			}
+			// KYTY_CALL_TRACE_WAVE32: nothing before `at` writes the range and no later write can
+			// loop back to `at`: the range holds its entry value (PPSA03671's material kernels
+			// reload s[8:15] from s12 only after their callback loop).
+			if (candidate == Unknown && GetCodegenOptions().call_trace_wave32) {
+				bool entry = true;
+				size_t later = insts.size();
+				for (size_t i = at; entry && i < insts.size(); i++) {
+					if (later == insts.size() && writes_range(i)) {
+						later = i;
+					}
+					entry = later == insts.size() || !Decoder::IsDirectBranch(insts[i].opcode) ||
+					        insts[i].branch_target > insts[at].pc;
+				}
+				for (const auto& inst: insts) {
+					entry = entry && inst.opcode != Decoder::Opcode::S_SETPC_B64;
+				}
+				if (entry) {
+					return Top;
+				}
+			}
 		}
 		// Else every write of the range anywhere in the program must be the same
 		// load (a compiler reload of one descriptor), at least one of them before `at`.
@@ -885,7 +916,7 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 		for (size_t i = 0; i < insts.size(); i++) {
 			bool writes = false;
 			for (uint32_t r = reg; r < reg + count && !writes; r++) {
-				writes = WritesSgpr(insts[i], r);
+				writes = WritesSgpr32(insts[i], r);
 			}
 			if (!writes) {
 				continue;
@@ -935,7 +966,7 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 			std::string writers;
 			for (size_t i = 0; i < insts.size(); i++) {
 				for (uint32_t r = reg; r < reg + count; r++) {
-					if (WritesSgpr(insts[i], r)) {
+					if (WritesSgpr32(insts[i], r)) {
 						writers += fmt::format(" 0x{:x}:{}:s{}", insts[i].pc,
 						                       magic_enum::enum_name(insts[i].opcode), r);
 						break;
@@ -1055,9 +1086,12 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 			fail("no S_LSHL_B32 record index");
 			continue;
 		}
+		// KYTY_CALL_TRACE_WAVE32: a table V# held in user data itself (no load step; PPSA03671's
+		// 0xfc0537b7278db60c keeps it in s[8:11]) is evaluated from the user data as it is.
 		if (!resolve(record.src0.reg, 4u, static_cast<size_t>(load), 0u, table, origin) ||
-		    table.steps.empty()) {
-			fail(fmt::format("table descriptor s{} not traced ({})", record.src0.reg, resolve_why));
+		    (table.steps.empty() && !GetCodegenOptions().call_trace_wave32)) {
+			fail(fmt::format("table descriptor s{} not traced ({})", record.src0.reg,
+			                 resolve_why.empty() ? std::string("held in user data") : resolve_why));
 			continue;
 		}
 		table.table_index = record.src0.reg - origin;

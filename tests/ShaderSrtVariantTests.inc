@@ -607,6 +607,88 @@ void CallTablesTraced() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+// KYTY_CALL_TRACE_WAVE32: PPSA03671's tiled material kernels (wave32) write a V_CMP mask to s11
+// before their callback loop, load the table V# from the SRT pointer s[12:13] inside it, and reload
+// s[8:15] from s[12:13] only after it. A wave32 V_CMP writes one SGPR, and s[12:13] holds its entry
+// value at the call: the table is the user-data pointer's +144.
+void CallTablesTracedWave32() {
+  constexpr const char *name = "CallTablesTracedWave32";
+  std::vector<u32> code;
+  code.push_back(EncodeVop3Word0(0x004u, 11));           // v_cmp_gt_f32 s11, v0, v1
+  code.push_back(EncodeVop3Word1(Vgpr(0), Vgpr(1)));
+  code.push_back(EncodeSopp(0x04, 0));                   // s_cbranch_scc0 to the next block
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x02, 0, 6));               // s_load_dwordx4 s[0:3], s[12:13], 144
+  code.push_back(EncodeSmem1(144, 125));
+  code.push_back(EncodeSmem0(0x0a, 0, 0));               // s_buffer_load_dwordx4 s[0:3], s[0:3], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 0));
+  code.push_back(EncodeSMovB32(15, 1));
+  code.push_back(0xbe8e210eu);                           // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSmem0(0x03, 8, 6));               // s_load_dwordx8 s[8:15], s[12:13], 64
+  code.push_back(EncodeSmem1(64, 125));
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  options.wave_size = 32;
+  auto codegen = GetCodegenOptions();
+  codegen.call_trace_wave32 = false;
+  {
+    ScopedCodegenOptions scope(codegen);
+    const auto before = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "switch off", before.skip_dispatch && before.call_tables.empty(),
+            "the table was traced without KYTY_CALL_TRACE_WAVE32");
+  }
+  codegen.call_trace_wave32 = true;
+  ScopedCodegenOptions scope(codegen);
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  const auto &tables = result.call_tables;
+  Require(name, "table",
+          result.skip_dispatch && tables.size() == 1u && tables[0].user_sgpr == 12u &&
+              tables[0].return_sgpr == 14u && tables[0].record_shift == 4u &&
+              tables[0].target_word == 0u && tables[0].table_index == 0u &&
+              tables[0].steps.size() == 1u && !tables[0].steps[0].buffer &&
+              tables[0].steps[0].offset == 144 && tables[0].steps[0].dwords == 4u,
+          "the wave32 call table was not traced (" + std::to_string(tables.size()) + " found)");
+  // Wave64: the V_CMP writes s[11:12], so s12 has no single reaching definition.
+  options.wave_size = 64;
+  const auto wave64 = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "wave64", wave64.call_tables.empty(),
+          "a wave64 V_CMP pair over s12 was ignored");
+  // The table V# in user data itself (0xfc0537b7278db60c: s[8:11]): no load step.
+  options.wave_size = 32;
+  {
+    std::vector<u32> direct;
+    direct.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+    direct.push_back(EncodeSmem0(0x0a, 0, 4));                // s_buffer_load_dwordx4 s[0:3], s[8:11], vcc_lo
+    direct.push_back(EncodeSmem1(0, 106));
+    direct.push_back(EncodeSMovB32(14, 0));
+    direct.push_back(EncodeSMovB32(15, 1));
+    direct.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15]
+    AppendEnd(&direct);
+    const auto traced = ShaderRecompiler::TranslateProgram(direct, options);
+    Require(name, "user-data table",
+            traced.call_tables.size() == 1u && traced.call_tables[0].user_sgpr == 8u &&
+                traced.call_tables[0].steps.empty() && traced.call_tables[0].table_index == 0u,
+            "a table V# held in user data was not traced");
+  }
+  // A later write that can loop back to the call keeps the range unknown.
+  std::vector<u32> looping = code;
+  looping.pop_back(); // s_endpgm
+  // The lshl is word 3; the branch offset counts from the word after the branch.
+  const auto back = 3 - static_cast<int32_t>(looping.size() + 1u);
+  looping.push_back(EncodeSopp(0x04, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc0 to the lshl
+  AppendEnd(&looping);
+  const auto loop = ShaderRecompiler::TranslateProgram(looping, options);
+  Require(name, "loop back", loop.call_tables.empty(),
+          "a reload that can loop back to the call was taken as the entry value");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 // KYTY_SHADER_CALLS: guest memory for the expansion side of the call tests: (guest address, words).
 struct FakeGuestMemory {
   std::vector<std::pair<uint64_t, std::vector<u32> *>> regions;
@@ -847,6 +929,7 @@ void RunAll(VulkanHarness *vulkan) {
     CallIsSkipped();
     CallTargetsFromUserData();
     CallTablesTraced();
+    CallTablesTracedWave32();
     vulkan->CheckCallTargetDump();
     NullBasedFlatReadReadsZero();
     VariantPlanIsFound();

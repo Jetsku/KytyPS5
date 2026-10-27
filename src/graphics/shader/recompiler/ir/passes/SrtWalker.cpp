@@ -486,38 +486,59 @@ private:
 		std::abort();
 	}
 
-	void Collect(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			return;
-		}
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) {
-			Fail(use_pc, "invalid typed planning value");
-		}
-		if (m_visited.contains(inst)) {
-			return;
-		}
-		const auto cycle = m_visiting_set.contains(inst) ? std::ranges::find(m_visiting, inst)
-		                                                 : m_visiting.end();
-		if (cycle != m_visiting.end()) {
-			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			});
-			if (contains_phi) {
+	// Depth first over the operands, each instruction finished after its operands. An explicit
+	// stack (the m_visiting path) instead of recursion, in the same order: an operand chain through
+	// thousands of blocks (PPSA03671's expanded material kernel 0xe6d76d24f59f8015) overflowed a
+	// 1 MiB thread stack.
+	void Collect(Value root, uint32_t use_pc) {
+		std::vector<size_t> next_operand; // per m_visiting entry pushed here
+		const size_t        base = m_visiting.size();
+		// Starts `value`'s instruction, unless it needs no visit.
+		const auto enter = [&](Value value) {
+			value = value.Resolve();
+			if (value.IsImmediate()) {
 				return;
 			}
-			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
-			                         ValueOpcodeName(inst->GetOpcode())));
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) {
+				Fail(use_pc, "invalid typed planning value");
+			}
+			if (m_visited.contains(inst)) {
+				return;
+			}
+			const auto cycle = m_visiting_set.contains(inst) ? std::ranges::find(m_visiting, inst)
+			                                                 : m_visiting.end();
+			if (cycle != m_visiting.end()) {
+				const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* other) {
+					return other->GetOpcode() == ValueOpcode::Phi;
+				});
+				if (contains_phi) {
+					return;
+				}
+				Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+				                         ValueOpcodeName(inst->GetOpcode())));
+			}
+			m_visiting.push_back(inst);
+			m_visiting_set.insert(inst);
+			next_operand.push_back(0);
+		};
+		enter(root);
+		while (m_visiting.size() > base) {
+			auto* inst = m_visiting.back();
+			if (auto& next = next_operand.back(); next < inst->NumArgs()) {
+				enter(inst->Arg(next++));
+				continue;
+			}
+			next_operand.pop_back();
+			m_visiting.pop_back();
+			m_visiting_set.erase(inst);
+			m_visited.insert(inst);
+			Finish(inst);
 		}
-		m_visiting.push_back(inst);
-		m_visiting_set.insert(inst);
-		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			Collect(inst->Arg(index), use_pc);
-		}
-		m_visiting.pop_back();
-		m_visiting_set.erase(inst);
-		m_visited.insert(inst);
+	}
+
+	void Finish(Inst* inst) {
+		const auto value = Value(inst);
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}

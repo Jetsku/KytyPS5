@@ -2138,10 +2138,13 @@ static bool ReadBindlessEntry(const BindlessHeap& heap, uint32_t key, uint32_t* 
 		if (!LibKernel::Memory::TryReadBacking(address + heap.nested_vsharp, vsharp.data(), 16u)) {
 			return false;
 		}
+		// nested_heap UINT32_MAX (KYTY_HEAP_KEY_MASK, PPSA03671's material callbacks): that V# is
+		// the heap itself.
 		const auto buffer =
 		    static_cast<uint64_t>(vsharp[0]) | (static_cast<uint64_t>(vsharp[1] & 0xffffu) << 32u);
-		if (buffer == 0 || static_cast<uint64_t>(heap.nested_heap) + 16u > vsharp[2] ||
-		    !LibKernel::Memory::TryReadBacking(buffer + heap.nested_heap, vsharp.data(), 16u)) {
+		if (heap.nested_heap != UINT32_MAX &&
+		    (buffer == 0 || static_cast<uint64_t>(heap.nested_heap) + 16u > vsharp[2] ||
+		     !LibKernel::Memory::TryReadBacking(buffer + heap.nested_heap, vsharp.data(), 16u))) {
 			return false;
 		}
 		const auto inner = key % heap.nested_keys;

@@ -1193,8 +1193,17 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		// KYTY_DIRECT_READ_WAIT=1 (default 0; on in the PPSA03671 title preset): bytes a queued
+		// download has yet to publish are not current in the backing either (BufferCache::
+		// WaitBackingPublications; adapted from KytyPS5-Frank 1c9ad7586).
+		static const bool wait_publications = [] {
+			const char* value = std::getenv("KYTY_DIRECT_READ_WAIT");
+			return value != nullptr && value[0] == '1';
+		}();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
+		} else if (wait_publications && buffers.HasPendingBackingPublication(vaddr, size)) {
+			buffers.WaitBackingPublications(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
