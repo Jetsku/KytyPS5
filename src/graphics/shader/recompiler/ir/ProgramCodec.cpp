@@ -19,17 +19,17 @@ namespace {
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
 // Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
-// ImageResource 21; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// ImageResource 22; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
 // 16, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
-// ResourceSpecialization 2 (Buffer 3, Image 11).
+// ResourceSpecialization 2 (Buffer 3, Image 12).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 72, "IR::BufferResource changed: update ProgramCodec");
-static_assert(sizeof(ImageResource) == 80, "IR::ImageResource changed: update ProgramCodec");
+static_assert(sizeof(ImageResource) == 88, "IR::ImageResource changed: update ProgramCodec");
 static_assert(sizeof(SamplerResource) == 16, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
@@ -64,7 +64,7 @@ static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
               "IR::ResourceSpecialization::Buffer changed: update ProgramCodec");
-static_assert(sizeof(ResourceSpecialization::Image) == 36,
+static_assert(sizeof(ResourceSpecialization::Image) == 40,
               "IR::ResourceSpecialization::Image changed: update ProgramCodec");
 #endif
 
