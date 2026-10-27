@@ -20,12 +20,17 @@
 //       Re-stamps a list for another copy of the game (another version or SKU): each shader is looked up in
 //       the other executable (at its recorded offset, then by hash), shaders not found are dropped with
 //       their pipelines, the title and version are replaced. Prints the match counts.
+//   upgrade <list> --out <list>
+//       Rewrites the vertex stage input infos of a list recorded before the mesh pass and
+//       tessellation clamp fields (stored size 16 bytes smaller: int21 and older builds) into this
+//       build's layout, with those fields at their defaults; other input infos must already match.
 //   verify <list> --game <app0 dir> [--exe <executable>] [--shaders <shader journal>]...
 //       The no-code proof: no 64-byte window of the listed shaders' code (read from the executable)
 //       or of any journaled shader's code occurs in the file or in any decompressed section.
 //       Exit code 1 when one does.
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <chrono>
@@ -225,8 +230,10 @@ int Export(const Arguments& args) {
 	bool             have_sizes = false;
 	for (size_t i = 0; i < args.shaders.size(); i++) {
 		std::vector<uint8_t> shader_identity, pipeline_identity;
+		// "--pipelines none": a shader journal without pipelines (its shaders still precompile).
+		const bool no_pipelines = args.pipelines[i] == "none";
 		if (!ShaderJournal::ReadIdentity(args.shaders[i], shader_identity) ||
-		    !PipelineJournal::ReadIdentity(args.pipelines[i], pipeline_identity)) {
+		    (!no_pipelines && !PipelineJournal::ReadIdentity(args.pipelines[i], pipeline_identity))) {
 			std::fprintf(stderr, "%s or %s is not a journal\n", args.shaders[i].c_str(), args.pipelines[i].c_str());
 			return 2;
 		}
@@ -252,7 +259,7 @@ int Export(const Arguments& args) {
 		}
 		run.shaders = shared;
 		PipelineJournal::Settings pipeline_settings;
-		pipeline_settings.path              = U8(args.pipelines[i]);
+		pipeline_settings.path              = no_pipelines ? std::filesystem::path() : U8(args.pipelines[i]);
 		pipeline_settings.identity          = pipeline_identity;
 		pipeline_settings.background_writer = false;
 		pipeline_settings.sealed_writes     = true; // never writes
@@ -430,6 +437,64 @@ int Merge(const Arguments& args) {
 	}
 	PrintExport(stats);
 	return Write(builder->Finish(), args.out);
+}
+
+// A vertex input info of the layout before ShaderMeshInputInfo::fast_launch/passes and
+// ShaderTessellationInputInfo::min/max_tess_level (8 bytes each) in this build's layout.
+bool UpgradeVertexInputInfo(std::vector<uint8_t>& bytes) {
+	constexpr size_t now       = Libs::Graphics::ShaderStoredInputInfoSize<Libs::Graphics::ShaderVertexInputInfo>();
+	constexpr size_t mesh_at   = offsetof(Libs::Graphics::ShaderVertexInputInfo, mesh) +
+	                           offsetof(Libs::Graphics::ShaderMeshInputInfo, fast_launch);
+	constexpr size_t mesh_size = offsetof(Libs::Graphics::ShaderMeshInputInfo, passes) + sizeof(uint32_t) -
+	                             offsetof(Libs::Graphics::ShaderMeshInputInfo, fast_launch);
+	constexpr size_t tess_at   = offsetof(Libs::Graphics::ShaderVertexInputInfo, tess) +
+	                           offsetof(Libs::Graphics::ShaderTessellationInputInfo, min_tess_level);
+	static_assert(mesh_size == 8 && mesh_at < tess_at && tess_at + 8 <= now);
+	if (bytes.size() != now - 16) return false;
+	std::vector<uint8_t> out;
+	out.reserve(now);
+	out.insert(out.end(), bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(mesh_at));
+	const uint8_t mesh_defaults[8] = {0, 0, 0, 0, 1, 0, 0, 0}; // fast_launch false (and padding), passes 1
+	out.insert(out.end(), std::begin(mesh_defaults), std::end(mesh_defaults));
+	out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(mesh_at),
+	           bytes.begin() + static_cast<std::ptrdiff_t>(tess_at - 8));
+	out.insert(out.end(), 8, uint8_t {0}); // min/max tess level 0
+	out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(tess_at - 8), bytes.end());
+	if (out.size() != now) return false;
+	bytes = std::move(out);
+	return true;
+}
+
+int Upgrade(const Arguments& args) {
+	if (args.inputs.size() != 1 || args.out.empty()) return 2;
+	PipelineList::File file;
+	if (!Load(args.inputs[0], file)) return 2;
+	const std::array<uint32_t, 3> now {static_cast<uint32_t>(Libs::Graphics::ShaderStoredInputInfoSize<Libs::Graphics::ShaderVertexInputInfo>()),
+	                                   static_cast<uint32_t>(sizeof(Libs::Graphics::ShaderPixelInputInfo)),
+	                                   static_cast<uint32_t>(sizeof(Libs::Graphics::ShaderComputeInputInfo))};
+	if (file.info.input_info_sizes == now) {
+		std::printf("%s already has this build's input layout\n", args.inputs[0].c_str());
+		return Write(file, args.out);
+	}
+	if (file.info.input_info_sizes[0] != now[0] - 16 || file.info.input_info_sizes[1] != now[1] ||
+	    file.info.input_info_sizes[2] != now[2]) {
+		std::fprintf(stderr, "%s: input infos %u %u %u cannot be upgraded to %u %u %u\n", args.inputs[0].c_str(),
+		             file.info.input_info_sizes[0], file.info.input_info_sizes[1], file.info.input_info_sizes[2], now[0],
+		             now[1], now[2]);
+		return 2;
+	}
+	size_t upgraded = 0;
+	for (auto& shader: file.shaders) {
+		if (shader.kind != ShaderJournal::Kind::Vertex) continue;
+		if (!UpgradeVertexInputInfo(shader.input_info)) {
+			std::fprintf(stderr, "a vertex shader's input info has %zu bytes\n", shader.input_info.size());
+			return 2;
+		}
+		upgraded++;
+	}
+	file.info.input_info_sizes = now;
+	std::printf("upgraded %zu vertex input infos\n", upgraded);
+	return Write(file, args.out);
 }
 
 int Info(const Arguments& args) {
@@ -685,6 +750,7 @@ int main(int argc, char** argv) {
 	if (args.command == "check") return Check(args);
 	if (args.command == "retarget") return Retarget(args);
 	if (args.command == "verify") return Verify(args);
+	if (args.command == "upgrade") return Upgrade(args);
 	std::fprintf(stderr, "unknown command %s\n", args.command.c_str());
 	return 2;
 }
