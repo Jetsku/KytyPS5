@@ -53222,10 +53222,91 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// KYTY_TESS_INDEXED (usa-ratt/KytyPS5-GT7 70341d775): an HS that reads an LS record whose control
+// point is a loaded index (GT7's stencil tables) is rejected without the switch and accepted with
+// it when the index's stride is the LS one; the read lowers to a clamped ControlInput access.
+void CheckTessellationIndexedRead() {
+  using namespace ShaderRecompiler;
+  const char *name = "TessellationIndexedRead";
+  constexpr u32 ls_stride = 48;
+  constexpr u32 hs_stride = 32;
+  std::vector<u32> local;
+  local.push_back(EncodeVop2(0x0b, 21, 255u, 3)); // v_mul_u32_u24 v21, ls_stride, v3
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0x0d, 4));             // ds_write_b32 v21, v5 offset:4
+  local.push_back(EncodeDs1Ex(0, 0, 5, 21));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+  local.push_back(0xffffffffu);
+
+  std::vector<u32> control;
+  AppendVMovLiteral(&control, 30, 0);              // v30 = 0: the table's address
+  control.push_back(EncodeDs0(0x36));              // ds_read_b32 v20, v30: the loaded index
+  control.push_back(EncodeDs1Ex(20, 0, 0, 30));
+  control.push_back(EncodeVop2(0x0b, 21, 255u, 20)); // v21 = ls_stride * index
+  control.push_back(ls_stride);
+  control.push_back(EncodeDs0(0x36, 4));           // ds_read_b32 v22, v21 offset:4
+  control.push_back(EncodeDs1Ex(22, 0, 0, 21));
+  AppendVop3(&control, 0x148, 34, Vgpr(1), InlineU32(8), InlineU32(5)); // control point
+  control.push_back(EncodeVop2(0x0b, 35, 255u, 34)); // v35 = hs_stride * cp
+  control.push_back(hs_stride);
+  control.push_back(EncodeMubuf0(0x1c, 4));        // buffer_store_dword v22, v35, s2 offen
+  control.push_back(EncodeMubuf1(22, 2, 35, 2));
+  AppendEnd(&control);
+
+  const auto saved = GetCodegenOptions();
+  const auto analyse = [&](bool indexed) {
+    auto options = saved;
+    options.tess_indexed = indexed;
+    SetCodegenOptions(options);
+    ShaderTessellationInputInfo tess{.input_control_points = 4,
+                                    .output_control_points = 4,
+                                    .domain = 2u,
+                                    .partitioning = 0u,
+                                    .output_topology = 2u};
+    std::string why;
+    const bool accepted = AnalyzeTessellationPrograms(local, control, tess, 0, 0, {}, &why);
+    return std::pair{accepted, tess};
+  };
+  const auto [rejected, off] = analyse(false);
+  Require(name, "rejected without the switch", !rejected,
+          "a loaded control point index must stay rejected with KYTY_TESS_INDEXED off");
+  const auto [accepted, tess] = analyse(true);
+  Require(name, "accepted with the switch",
+          accepted && tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          "a loaded control point index with the LS stride must be accepted");
+
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = ShaderType::TessellationControl;
+  vertex.tess = tess;
+  CompileOptions options;
+  options.stage = ShaderType::TessellationControl;
+  options.input_info.vertex = &vertex;
+  auto translated = TranslateProgram(control, options);
+  Require(name, "translated", !translated.skip_dispatch, "the HS must not be skipped");
+  bool computed_input = false;
+  for (const auto *block : translated.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() == IR::ValueOpcode::GetTessellationAttribute &&
+          static_cast<IR::TessellationAttribute>(inst.Arg(0).U32()) ==
+              IR::TessellationAttribute::ControlInput &&
+          !inst.Arg(1).IsImmediate()) {
+        computed_input = true;
+      }
+    }
+  }
+  Require(name, "indexed control input", computed_input,
+          "the indexed LDS read must lower to a ControlInput read at a computed address");
+  auto result = CompileProgram(std::move(translated), options, {});
+  ValidateSpirv(name, result.spirv);
+  SetCodegenOptions(saved);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
   CheckTessellationProgram("TessellationBranchedStore", 124, 128, true);
+  CheckTessellationIndexedRead();
 }
 
 void CheckEmbeddedFetchVertexOffset() {

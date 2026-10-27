@@ -82,6 +82,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
 		                       tess.domain, tess.partitioning, tess.output_topology, tess.min_tess_level,
 		                       tess.max_tess_level});
+		// KYTY_TESS_INDEXED: the patch-constant range both stages declare (0 without the switch).
+		if (tess.patch_size != 0u) key.insert(key.end(), {tess.patch_base, tess.patch_size});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {

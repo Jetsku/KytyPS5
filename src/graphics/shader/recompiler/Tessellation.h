@@ -26,8 +26,9 @@ namespace Decoder {
 struct Program;
 }
 // `decoded` (optional) is the guest program: its HS ring stores with constant addresses past the
-// per-vertex area are patch constants even when the IR address does not fold.
-void LowerTessellationMemory(IR::Program& program, const CompileOptions& options,
-                             const Decoder::Program* decoded = nullptr);
+// per-vertex area are patch constants even when the IR address does not fold. Returns nullptr, or
+// (KYTY_TESS_INDEXED only) why the stage cannot be modelled: the caller skips its draws.
+const char* LowerTessellationMemory(IR::Program& program, const CompileOptions& options,
+                                    const Decoder::Program* decoded = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler
