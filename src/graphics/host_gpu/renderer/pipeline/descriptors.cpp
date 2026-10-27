@@ -1391,8 +1391,15 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
 
 vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                           uint32_t                                        index,
-                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
-	auto       descriptor     = NativeSamplerDescriptor(program, index, value);
+                                          const ShaderRecompiler::IR::DescriptorValue&    value,
+                                          bool normalize_unnormalized) {
+	auto descriptor = NativeSamplerDescriptor(program, index, value);
+	if (normalize_unnormalized) {
+		// KYTY_UNNORMALIZED_FIX: the hull shader's copy divides its coordinates by the mip's size
+		// (SpirvNormalizedExplicitLod), so FORCE_UNNORMALIZED (word 0 bit 15) goes, and the S#'s
+		// LOD range and clamps apply as they are.
+		descriptor.fields[0] &= ~(1u << 15u);
+	}
 	const bool integer_border = program.info.samplers[index].integer_border;
 	if (!SamplerMemoEnabled()) {
 		return m_context.GetSamplerCache().GetSampler(descriptor, integer_border);
@@ -2719,6 +2726,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// KYTY_DRAW_PREP_BINDINGS samplers: the handles the worker found (never evicted); a null one is
 	// resolved here as before.
 	const bool plan_samplers = plan != nullptr && plan->samplers_valid &&
+	                           !prepared.normalize_unnormalized &&
 	                           plan->samplers.size() == program.info.samplers.size();
 	if (!keep_images) {
 		prepared.samplers.reserve(program.info.samplers.size());
@@ -2729,8 +2737,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		planned_samplers += sampler != nullptr ? 1u : 0u;
 		if (sampler == nullptr || verify) {
 			// Native filtering/border variants share their source sampler's snapshot entry.
-			const auto serial = NativeSampler(
-			    program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]);
+			const auto serial =
+			    NativeSampler(program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
+			                  prepared.normalize_unnormalized);
 			if (sampler != nullptr) {
 				DrawPrep::CountBindingVerifyCheck();
 				if (sampler != serial) {

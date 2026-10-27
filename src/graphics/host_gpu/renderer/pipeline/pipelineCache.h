@@ -120,6 +120,9 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	// KYTY_UNNORMALIZED_FIX: this is a hull shader's normalized-LOD copy (pixelRateVariant.h); the
+	// draw binds its samplers with FORCE_UNNORMALIZED cleared.
+	bool             normalized_samplers = false;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };

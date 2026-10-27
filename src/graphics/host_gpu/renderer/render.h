@@ -1173,7 +1173,8 @@ private:
 	std::unique_ptr<XFrameTextureSets> m_xframe_sets;
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                        uint32_t                                        index,
-	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
+	                                        const ShaderRecompiler::IR::DescriptorValue&    value,
+	                                        bool normalize_unnormalized = false);
 	// keep_images (KYTY_DRAW_RUN continuation): the image rebinding and target rediscovery are
 	// skipped (the previous draw's bindings are kept).
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,

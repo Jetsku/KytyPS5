@@ -4217,6 +4217,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareBindings");
 		// KYTY_DRAW_RUN continuation: the stages keep the previous draw's textures and samplers.
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			// KYTY_UNNORMALIZED_FIX: a hull shader's normalized-LOD copy binds normalized samplers.
+			bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i],
 			                plan_stages ? &plan->vertex : nullptr, m_run_active);
 			descriptor_stages[stage_count++] = &bindings.vertex[i];
@@ -4308,6 +4310,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
 		// No plan: its shader data was taken by the first preparation above.
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i], nullptr);
 		}
 		if (state.ps_active) {

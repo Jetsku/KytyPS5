@@ -58732,6 +58732,120 @@ OpFunctionEnd
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// KYTY_UNNORMALIZED_FIX (usa-ratt/KytyPS5-GT7 45ac971cc). The copy of a stage whose explicit-LOD samples take normalized coordinates
+// (SpirvNormalizedExplicitLod): valid SPIR-V that queries the levels and the
+// size of the mip the LOD names and divides the spatial coordinates by it,
+// leaving the array layer, for a 2D array image (the hull shaders' depth
+// pyramid) and a 2D one with an offset, in a module with no int type or
+// ImageQuery capability of its own; a module with no such sample gives nothing.
+void CheckNormalizedExplicitLod() {
+  constexpr const char *name = "NormalizedExplicitLod";
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble SPIR-V");
+    return text;
+  };
+  const auto count = [](const std::string &text, const std::string &what) {
+    size_t found = 0;
+    for (auto at = text.find(what); at != std::string::npos;
+         at = text.find(what, at + what.size())) {
+      found++;
+    }
+    return found;
+  };
+  const auto assemble = [&](const char *what, const std::string &source) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_1);
+    std::vector<u32> module;
+    Require(name, what, tools.Assemble(source, &module),
+            "the hand-written module did not assemble");
+    ValidateSpirv(name, module);
+    return module;
+  };
+  const std::string source = R"(OpCapability Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+OpDecorate %pyramid DescriptorSet 0
+OpDecorate %pyramid Binding 0
+OpDecorate %flat DescriptorSet 0
+OpDecorate %flat Binding 1
+OpDecorate %sampler DescriptorSet 0
+OpDecorate %sampler Binding 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%v3float = OpTypeVector %float 3
+%v4float = OpTypeVector %float 4
+%uint = OpTypeInt 32 0
+%array_image = OpTypeImage %float 2D 0 1 0 1 Unknown
+%flat_image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%sampler_type = OpTypeSampler
+%array_sampled = OpTypeSampledImage %array_image
+%flat_sampled = OpTypeSampledImage %flat_image
+%ptr_array = OpTypePointer UniformConstant %array_image
+%ptr_flat = OpTypePointer UniformConstant %flat_image
+%ptr_sampler = OpTypePointer UniformConstant %sampler_type
+%pyramid = OpVariable %ptr_array UniformConstant
+%flat = OpVariable %ptr_flat UniformConstant
+%sampler = OpVariable %ptr_sampler UniformConstant
+%ptr_out = OpTypePointer Output %v4float
+%out = OpVariable %ptr_out Output
+%x = OpConstant %float 37.5
+%y = OpConstant %float 12.5
+%layer = OpConstant %float 0
+%lod = OpConstant %float 3
+%lod0 = OpConstant %float 0
+%coord3 = OpConstantComposite %v3float %x %y %layer
+%coord2 = OpConstantComposite %v2float %x %y
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%image = OpLoad %array_image %pyramid
+%image2 = OpLoad %flat_image %flat
+%s = OpLoad %sampler_type %sampler
+%si = OpSampledImage %array_sampled %image %s
+%si2 = OpSampledImage %flat_sampled %image2 %s
+%a = OpImageSampleExplicitLod %v4float %si %coord3 Lod %lod
+%b = OpImageSampleExplicitLod %v4float %si2 %coord2 Lod %lod0
+%c = OpFAdd %v4float %a %b
+OpStore %out %c
+OpReturn
+OpFunctionEnd
+)";
+  const auto module = assemble("explicit LOD samples", source);
+  const auto copy = Libs::Graphics::SpirvNormalizedExplicitLod(module);
+  Require(name, "explicit LOD samples", !copy.empty(),
+          "a module with explicit-LOD samples was not rewritten");
+  ValidateSpirv(name, copy);
+  const auto text = disassemble(copy);
+  Require(name, "explicit LOD samples",
+          count(text, "OpCapability ImageQuery") == 1 &&
+              count(text, "OpImageQueryLevels") == 2 &&
+              count(text, "OpImageQuerySizeLod %v3int") == 1 &&
+              count(text, "OpImageQuerySizeLod %v2int") == 1 &&
+              count(text, "OpFDiv") == 4 && count(text, "SClamp") == 2 &&
+              count(text, " Floor ") == 2,
+          "the samples' coordinates are not divided by their mip's size, or "
+          "the layer is");
+
+  std::string none = source;
+  const auto from = none.find("%a = OpImageSampleExplicitLod");
+  const auto to = none.find("%c = OpFAdd");
+  none.replace(from, to - from,
+               "%a = OpImageSampleImplicitLod %v4float %si %coord3\n"
+               "%b = OpImageSampleImplicitLod %v4float %si2 %coord2\n");
+  Require(name, "no explicit LOD",
+          Libs::Graphics::SpirvNormalizedExplicitLod(
+              assemble("no explicit LOD", none))
+              .empty(),
+          "a module without explicit-LOD samples was rewritten");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
@@ -60663,6 +60777,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--pixel-rate-only") == 0) {
     Libs::Graphics::EnsureConfigInitialized();
     Libs::Graphics::CheckPixelRateSampleIdVariant();
+    Libs::Graphics::CheckNormalizedExplicitLod();
     return 0;
   }
   // CPU only: heap-indexed T#s through bindless images (ShaderBindlessTests.inc).

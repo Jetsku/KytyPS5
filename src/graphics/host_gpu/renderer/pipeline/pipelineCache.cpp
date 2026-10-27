@@ -2407,6 +2407,15 @@ struct PipelineCache::ProgramCache {
 			shades_per_sample = true;
 			pixel_rate_module = CompilePixelRateVariant(options, emitted.spirv);
 		}
+		// KYTY_UNNORMALIZED_FIX: a hull shader that samples gets a copy whose explicit-LOD samples
+		// take normalized coordinates (pixelRateVariant.h), registered under its id below with an
+		// id of its own; GetGraphicsPrograms runs it where the draw's HS samplers are all
+		// unnormalized.
+		vk::ShaderModule normalized_module = nullptr;
+		if (options.stage == ShaderType::TessellationControl && UnnormalizedSamplingFix() &&
+		    !emitted.info.info.sampled_pairs.empty()) {
+			normalized_module = CompileNormalizedVariant(options, emitted.spirv);
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(emitted.spirv.size()), options.wave_size);
@@ -2419,6 +2428,11 @@ struct PipelineCache::ProgramCache {
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
 		if (shades_per_sample) {
 			PixelRate::Register(id, true, pixel_rate_module);
+		}
+		if (normalized_module != nullptr) {
+			const auto variant_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+			GpuOpProfiler::RegisterShader(variant_id, stage_name, options.shader_hash);
+			NormalizedLod::Register(id, normalized_module, variant_id);
 		}
 		ShaderProgram plain {};
 		if (!emitted.spirv_plain.empty()) {
@@ -2494,6 +2508,45 @@ struct PipelineCache::ProgramCache {
 		}
 		return variant_module;
 	}
+
+	// The copy of a hull shader whose explicit-LOD samples take normalized coordinates
+	// (SpirvNormalizedExplicitLod), or null. The first copies and every one after a failure are
+	// validated; one that fails is not used (its draws sample as before).
+	vk::ShaderModule CompileNormalizedVariant(const ShaderRecompiler::CompileOptions& options,
+	                                          const std::vector<uint32_t>&            spirv) {
+		constexpr uint32_t MaxFailures = 8;
+		if (normalized_failures.load(std::memory_order_relaxed) >= MaxFailures) {
+			return nullptr;
+		}
+		const auto variant = SpirvNormalizedExplicitLod(spirv);
+		if (variant.empty()) {
+			return nullptr;
+		}
+		constexpr uint32_t CheckedCopies = 32;
+		if (normalized_copies.load(std::memory_order_relaxed) < CheckedCopies ||
+		    normalized_failures.load(std::memory_order_relaxed) > 0 ||
+		    Config::ShaderValidationEnabled()) {
+			if (!ValidatePixelRateSpirv(options.shader_hash, variant)) {
+				const auto failures =
+				    normalized_failures.fetch_add(1, std::memory_order_relaxed) + 1u;
+				LOGF("Pipeline: the normalized-LOD copy of hull shader 0x%016" PRIx64
+				     " is not valid SPIR-V; its draws sample as before (%u such so far)\n",
+				     options.shader_hash, failures);
+				return nullptr;
+			}
+		}
+		const auto module = CompileSPV(variant, device);
+		if (module != nullptr && normalized_copies.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Pipeline: hull shader 0x%016" PRIx64
+			     " samples at an explicit LOD: a copy with normalized coordinates is used where "
+			     "its samplers are unnormalized (KYTY_UNNORMALIZED_FIX)\n",
+			     options.shader_hash);
+		}
+		return module;
+	}
+
+	std::atomic<uint32_t> normalized_copies {0};
+	std::atomic<uint32_t> normalized_failures {0};
 
 	// KYTY_EQAA_MIXED with NV mixed samples (and not KYTY_EQAA_PER_SAMPLE=1): per-pixel copies.
 	bool                  pixel_rate_variants = false;
@@ -3707,6 +3760,7 @@ struct PipelineCache::ProgramCache {
 			// NoStart): keep permutations unique and drop this equal copy.
 			PixelRate::Forget(device, compiled->handle.id);
 			PixelRate::Forget(device, compiled->plain.id);
+			NormalizedLod::Forget(device, compiled->handle.id);
 			g_shader_modules.Destroy(device, compiled->handle.module);
 			if (compiled->plain.module != nullptr) {
 				g_shader_modules.Destroy(device, compiled->plain.module);
@@ -4338,6 +4392,7 @@ struct PipelineCache::ProgramCache {
 			entry.permutations.ForEach([&](const Permutation& permutation) {
 				PixelRate::Forget(device, permutation.handle.id);
 				PixelRate::Forget(device, permutation.plain.id);
+				NormalizedLod::Forget(device, permutation.handle.id);
 				g_shader_modules.Destroy(device, permutation.handle.module);
 				if (permutation.plain.module != nullptr) {
 					g_shader_modules.Destroy(device, permutation.plain.module);
@@ -7474,6 +7529,49 @@ static PipelineCache::GraphicsPrograms SkipUnmaterializable(const char* why) {
 	return {};
 }
 
+// KYTY_UNNORMALIZED_FIX (usa-ratt/KytyPS5-GT7 45ac971cc): whether every sampler the stage samples
+// through has FORCE_UNNORMALIZED set (S# word 0 bit 15) in this draw's snapshot.
+static bool StageSamplersAllUnnormalized(const ShaderStageRuntime& stage) {
+	if (!stage || stage.program->info.sampled_pairs.empty()) {
+		return false;
+	}
+	const auto& info = stage.program->info;
+	for (const auto& pair: info.sampled_pairs) {
+		if (pair.sampler >= info.samplers.size()) {
+			return false;
+		}
+		const auto index = info.samplers[pair.sampler].snapshot_index;
+		if (index >= stage.resources->samplers.size()) {
+			return false;
+		}
+		const auto& value = stage.resources->samplers[index];
+		if (value.dword_count == 0 || ((value.dwords[0] >> 15u) & 1u) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// A hull shader sampling through unnormalized samplers only runs its copy with normalized
+// coordinates (pixelRateVariant.h), under an id of its own (its pipelines differ); its samplers are
+// made normalized when the draw binds them (ShaderProgram::normalized_samplers).
+static void ApplyNormalizedLod(PipelineCache::GraphicsPrograms&      programs,
+                               std::array<ShaderVertexInputInfo, 3>& vertex_info) {
+	for (uint32_t i = 0; i < 3; i++) {
+		auto& program = programs.vertex[i];
+		if (!program || vertex_info[i].logical_stage != ShaderType::TessellationControl) {
+			continue;
+		}
+		const auto variant = NormalizedLod::Find(program.id);
+		if (variant.module == nullptr || !StageSamplersAllUnnormalized(vertex_info[i].stage)) {
+			continue;
+		}
+		program.module              = variant.module;
+		program.id                  = variant.variant_id;
+		program.normalized_samplers = true;
+	}
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -7547,7 +7645,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				    m_program_cache->Get(vertex_params[i], vertex_inputs[i], preps.vertex[i],
 				                         push_data_cursor, read_attempt, scratch, evaluation);
 			}
-			if (!read_attempt.materialization_failed) return result;
+			if (!read_attempt.materialization_failed) {
+				if (tess_active && UnnormalizedSamplingFix()) {
+					ApplyNormalizedLod(result, vertex_inputs);
+				}
+				return result;
+			}
 			// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
 			// Restart all stages before final bindings/uploads, including their SRT refresh.
 			if (!read_attempt.Synchronize()) {
