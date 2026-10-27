@@ -3656,6 +3656,34 @@ vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCo
 	return m_upload_dma->RingHandle();
 }
 
+// KYTY_UPLOAD_UNMAPPED_ZERO=1 (default off; the GT7 preset; Senaxx 3e8c01a09 via
+// usa-ratt/KytyPS5-GT7): an upload of a buffer range the guest no longer has mapped (AMM maps
+// streaming textures in blocks; a bindless texture resolve uploaded one byte past the 32 KiB
+// block the game had mapped: an access violation in UploadCopies) reads zeros instead. Off by
+// default: one range query per guest copy.
+static bool UploadUnmappedZeroEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_UNMAPPED_ZERO");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// True (and `destination` zeroed, logged) when [address, address + size) is not all mapped.
+static bool ZeroUnmappedUpload(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (!UploadUnmappedZeroEnabled() || LibKernel::Memory::IsCommittedSpan(address, size)) {
+		return false;
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("BufferCache: upload of unmapped guest memory 0x%016" PRIx64 " size=0x%" PRIx64
+		     " reads as zero\n",
+		     address, size);
+	}
+	std::memset(destination, 0, static_cast<size_t>(size));
+	return true;
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size, size_t guest_copies,
                                      const uint8_t* host_data, uint64_t host_base,
@@ -3689,7 +3717,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (alias != nullptr) {
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
 				                     copy.size, buffer.CpuAddress() + copy.dstOffset});
-			} else {
+			} else if (index >= guest_copies ||
+			           !ZeroUnmappedUpload(mapped + copy.srcOffset,
+			                               buffer.CpuAddress() + copy.dstOffset, copy.size)) {
 				std::memcpy(mapped + copy.srcOffset, source_of(index, copy), copy.size);
 			}
 			copy.srcOffset += base_offset;
@@ -3703,6 +3733,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	PageManager::ApplyPendingProtects(); // KYTY_DEFER_PROTECTS: copied here
 	for (size_t index = 0; index < copies.size(); index++) {
 		const auto& copy = copies[index];
+		if (index < guest_copies &&
+		    ZeroUnmappedUpload(temporary->Mapped().data() + copy.srcOffset,
+		                       buffer.CpuAddress() + copy.dstOffset, copy.size)) {
+			continue;
+		}
 		std::memcpy(temporary->Mapped().data() + copy.srcOffset, source_of(index, copy),
 		            copy.size);
 	}
