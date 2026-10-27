@@ -5006,6 +5006,10 @@ struct PipelineCache::PrefetchState {
 			auto it = pending.find(key);
 			if (it == pending.end()) return Poll::Absent;
 			if (!it->second.future.valid()) return Poll::Pending;
+			// A draw asks for it now: the build moves to the front of the queue (if it has not
+			// started), ahead of look-ahead requests no draw is waiting for (GT7 fork round 144's
+			// "an awaited job is compiled next", usaratt/KytyPS5-GT7 df5055a09).
+			queue.Promote(it->second.ticket);
 			if (it->second.future.wait_for(std::chrono::nanoseconds(wait_ns)) != std::future_status::ready) {
 				return Poll::Pending;
 			}
