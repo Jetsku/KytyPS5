@@ -451,6 +451,12 @@ struct CodegenOptions {
 	// the scales and offsets VTE disables, and the CLIP_DISABLE emulation's affine offset is
 	// homogeneous (offset * W, minus W), which only matched before for W == 1.
 	bool vte_cntl = false;
+	// KYTY_SNAPSHOT_WRITTEN_GUARD=1 (default off; the GT7 preset; Senaxx/KytyPS5-GT7 2e002fb55):
+	// the SRT plan's CPU snapshot of scalar loads through CPU-evaluable pointers (PlanBuilder, the
+	// fork's 8d77c9242, which our line already has) leaves out a load whose pointer base is also the
+	// base of a buffer or address the shader writes or updates atomically: its waves must see those
+	// writes, which a snapshot taken before the dispatch does not.
+	bool snapshot_written_guard = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,
