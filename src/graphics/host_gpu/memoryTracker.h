@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/watchRange.h"
 
 #include <algorithm>
 #include <atomic>
@@ -149,6 +150,9 @@ private:
 		static_assert(std::is_invocable_v<Flush&>);
 		static_assert(std::is_nothrow_invocable_v<AheadFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
+		if (WatchRange::Enabled()) {
+			WatchRange::Note(write_fault ? "CPU write fault" : "CPU invalidate", vaddr, size);
+		}
 		// KYTY_FAULT_AHEAD_ADAPT (SetFaultAheadOverride): a larger window for write faults.
 		FaultPolicy policy = m_fault_policy;
 		if (const auto ahead = s_ahead_override.load(std::memory_order_relaxed);

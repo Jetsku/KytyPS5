@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "graphics/host_gpu/watchRange.h"
 #include "common/prepPhases.h"
 
 #include "common/assert.h"
@@ -3332,6 +3333,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	     magic_enum::enum_name(gpu_mode));
 
 	MapGpuRange(out_addr, len);
+	Libs::Graphics::WatchRange::Note("map direct memory", out_addr, len);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -3557,6 +3559,7 @@ static int UnmapMemoryRange(const VirtualRanges::Range& range, uint64_t vaddr, s
 
 // The ABI entry point and batch operations hold g_memory_operation_mutex.
 static int UnmapMemory(uint64_t vaddr, size_t len) {
+	Libs::Graphics::WatchRange::Note("unmap", vaddr, len);
 	LOGF("\t start = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n",
 	     vaddr, len);
@@ -4259,6 +4262,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	}
 
 	MapGpuRange(out_addr, len);
+	Libs::Graphics::WatchRange::Note("map direct memory", out_addr, len);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);

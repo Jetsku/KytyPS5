@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "graphics/host_gpu/watchRange.h"
 
 namespace Libs::Graphics {
 
@@ -345,6 +346,7 @@ bool MemoryTracker::GpuMirrorMatches(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+	WatchRange::Note("tracker CPU-modified", vaddr, size);
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
@@ -354,6 +356,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+	WatchRange::Note("tracker GPU-modified", vaddr, size);
 	CheckNotInUploadCallback();
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuMark);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -363,6 +366,7 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+	WatchRange::Note("tracker GPU-unmark", vaddr, size);
 	CheckNotInUploadCallback();
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuUnmark);
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

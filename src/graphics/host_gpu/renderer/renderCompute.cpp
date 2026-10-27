@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/watchRange.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "common/assert.h"
@@ -690,6 +691,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& program   = *input_info.stage.program;
+	WatchRange::SetCurrentOp("CS", program.shader_hash);
 	const auto& resources = *input_info.stage.resources;
 	// A recorded metadata clear consumes the dispatch unless KYTY_COMPUTE_META_CLEAR_DISPATCH keeps
 	// its guest writes (upstream 01ce97388).
@@ -1055,6 +1057,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;
+	WatchRange::SetCurrentOp("CS", program.shader_hash);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
