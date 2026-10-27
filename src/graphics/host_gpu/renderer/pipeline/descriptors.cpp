@@ -1212,10 +1212,50 @@ static bool SamplerMemoEnabled() {
 	return enabled;
 }
 
+// KYTY_CUBE_EDGE_CLAMP=1 (from usa-ratt/KytyPS5-GT7 round 142). A cube map is sampled as a 2D
+// array of its faces (face coordinates and face index from V_CUBE*, CubeAxis/CubeLayer), so the
+// sampler's address mode applies inside each face. The console's cube addressing ignores it and
+// filters across the face edges; with WRAP (what a sky's sampler often has) bilinear filtering at
+// an edge blends in the face's opposite edge: a thin line along the face edges in the sky and a
+// shade step where a reflection cube's coarse mips meet (GT7). CLAMP_LAST_TEXEL keeps each face's
+// filtering inside it.
+static bool CubeEdgeClamp() {
+	static std::atomic<int64_t> slot {Common::OnceUnset};
+	return Common::Once(slot, [] {
+		       const char* value   = std::getenv("KYTY_CUBE_EDGE_CLAMP");
+		       const bool  enabled = value != nullptr && value[0] == '1';
+		       if (enabled) {
+			       LOGF("Cube maps: samplers used only with cube maps clamp at the face edges "
+			            "(KYTY_CUBE_EDGE_CLAMP=1)\n");
+		       }
+		       return enabled ? 1 : 0;
+	       }) != 0;
+}
+
+// Whether every image this sampler is paired with is a cube map.
+static bool SamplesCubesOnly(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                             uint32_t                                        sampler) {
+	bool any = false;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.sampler != sampler) {
+			continue;
+		}
+		if (pair.image >= program.info.images.size() || !program.info.images[pair.image].cube) {
+			return false;
+		}
+		any = true;
+	}
+	return any;
+}
+
 ShaderSamplerResource NativeSamplerDescriptor(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                               uint32_t                                        index,
                                               const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+	if (CubeEdgeClamp() && SamplesCubesOnly(program, index)) {
+		// CLAMP_X and CLAMP_Y (bits 0-2 and 3-5) to CLAMP_LAST_TEXEL (2).
+		descriptor.fields[0] = (descriptor.fields[0] & ~0x3fu) | 2u | (2u << 3u);
+	}
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
