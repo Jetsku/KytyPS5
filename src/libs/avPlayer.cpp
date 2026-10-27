@@ -1159,7 +1159,16 @@ public:
 			}
 		}
 		video_stats.shown.fetch_add(1, std::memory_order_relaxed);
-		if (current_video) {
+		// The previously shown frame's buffer goes back to the decoder one Video() call later: the
+		// game's GPU work may still sample it, and a decoder that runs ahead overwrote it while that
+		// was pending (torn chroma in ASTRO's PLAYROOM's intro). With only two buffers holding one
+		// would leave the decoder none, so it goes back at once as before.
+		if (previous_video) {
+			video_buffers.Push(std::move(previous_video));
+		}
+		if (current_video && max_video_buffers > 2) {
+			previous_video = std::move(current_video->buffer);
+		} else if (current_video) {
 			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
@@ -1238,6 +1247,7 @@ private:
 		video_buffers.Clear();
 		audio_buffers.Clear();
 		if (!retain_output_buffers) {
+			previous_video.reset();
 			current_video.reset();
 			current_audio.reset();
 		}
@@ -1339,7 +1349,7 @@ private:
 	bool AllocateBuffers() {
 		if (video_id) {
 			auto size     = VideoBufferSize(fmt->streams[video_id.value()]);
-			auto retained = current_video ? 1u : 0u;
+			auto retained = (previous_video ? 1u : 0u) + (current_video ? 1u : 0u);
 			for (size_t i = retained; i < static_cast<size_t>(max_video_buffers); i++) {
 				auto buffer = std::make_unique<GuestBuffer>(mem, 0x100, size, true);
 				if (!buffer->Valid()) {
@@ -1889,6 +1899,7 @@ private:
 	WorkQueue<ReadyFrame>                    audio_frames;
 	std::optional<ReadyFrame>                current_video;
 	std::optional<ReadyFrame>                current_audio;
+	std::unique_ptr<GuestBuffer>             previous_video;
 	VideoStats                               video_stats;
 	LibKernel::Pthread                       demux_thread = nullptr;
 	LibKernel::Pthread                       video_thread = nullptr;

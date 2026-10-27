@@ -177,9 +177,10 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	}
 	// Let the producer refill, then model the game's immediate late-frame retries.
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	for (unsigned i = 0; i < 5; ++i) {
+	// One buffer is shown and one is held for the previously shown frame.
+	for (unsigned i = 0; i < 4; ++i) {
 		const auto previous = info.time_stamp;
-		Check(source.Video(&info), "six output buffers keep five video frames ready");
+		Check(source.Video(&info), "six output buffers keep four video frames ready");
 		Check(info.time_stamp > previous, "video retries return successive frames");
 	}
 	Check(source.Pause() == 0, "pause video");
@@ -195,6 +196,7 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers");
 }
+
 void CheckDecoderThreads() {
 	Check(ParseVideoDecoderThreads(nullptr, 32) == 8 && ParseVideoDecoderThreads("auto", 32) == 8,
 	      "auto decoder threads are capped at 8");
@@ -237,6 +239,28 @@ void CheckLateFramesSkipped() {
 	}
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers after skipping");
+}
+
+void CheckTwoVideoBuffers() {
+	// With two output buffers, holding the previous frame must not leave the decoder without one.
+	VideoMemory memory;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source source(allocator, {}, {}, 2, false, 0);
+	Check(source.Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0,
+	      "open video fixture with two buffers");
+	source.SetSync(1);
+	Check(source.Start() == 0, "start video workers with two buffers");
+	AvPlayerFrameInfoEx info {};
+	for (unsigned i = 0; i < 8; ++i) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+		while (!source.Video(&info)) {
+			Check(std::chrono::steady_clock::now() < deadline,
+			      "two output buffers keep video playing");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
+	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
+	      "stop releases both video buffers");
 }
 }
 
@@ -305,6 +329,7 @@ int main() {
 	CheckDecoderThreads();
 	CheckVideoReadAhead(root);
 	CheckLateFramesSkipped();
+	CheckTwoVideoBuffers();
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");
