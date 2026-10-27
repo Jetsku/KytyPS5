@@ -2377,6 +2377,26 @@ ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
 	return result;
 }
 
+bool TextureCache::HeapExtentHeld(const ImageInfo& info, bool exact_format) {
+	if (info.data.Empty()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	bool             held = false;
+	for (const auto id: FindImagesInRegion(info.data.address, info.data.size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			continue;
+		}
+		if (SameBacking(image->info, info, exact_format)) {
+			return false;
+		}
+		held |= image->bindless_pinned && image->info.data.address == info.data.address &&
+		        image->info.type == info.type && image->info.extent != info.extent;
+	}
+	return held;
+}
+
 bool TextureCache::MsDepthSample0Enabled() {
 	static std::atomic<int64_t> slot {Common::OnceUnset};
 	return Common::Once(slot, [] {

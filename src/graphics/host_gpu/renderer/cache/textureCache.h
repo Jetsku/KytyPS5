@@ -271,6 +271,13 @@ public:
 	// Needs aliases aged by frames (KYTY_IMAGE_ALIAS_AGE).
 	[[nodiscard]] static bool AliasBytesEnabled();
 
+	// KYTY_BINDLESS_HOLD_EXTENT (adapted from upstream 95bbc9c65): whether a bindless heap lookup
+	// of `info` should wait instead of creating an image. Heaps hold a descriptor per
+	// dynamic-resolution extent of a render target, and only one extent at an address holds data:
+	// true when no registered image has the lookup's backing but a registered bindless-pinned
+	// image of the same type at the same address has another extent. Takes m_lock.
+	[[nodiscard]] bool HeapExtentHeld(const ImageInfo& info, bool exact_format);
+
 private:
 	enum class TransferDirection { Upload, Download };
 	// Why an image is refreshed: a read of its contents (sampling, copies, presentation) or a

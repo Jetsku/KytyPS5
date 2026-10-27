@@ -2223,9 +2223,36 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	if (as_array) {
 		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
 	}
+	auto& texture_cache = m_context.GetTextureCache();
+	// KYTY_BINDLESS_HOLD_EXTENT=1 (default 0; on in the PPSA03671 preset; adapted from upstream
+	// 95bbc9c65): heaps hold a descriptor per dynamic-resolution extent of a render target, and
+	// only one extent at an address holds data. A key whose texture has no image while another
+	// extent at its address is pinned by a heap creates no second image (which would be filled
+	// from stale guest bytes and fight the render target over its memory): it stays pending and
+	// is asked for again by the next draw that samples it, until such an image exists.
+	static const bool hold_extent = [] {
+		const char* env = std::getenv("KYTY_BINDLESS_HOLD_EXTENT");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (hold_extent) {
+		const auto desc       = BuildTextureDescription(resource, descriptor);
+		const bool conversion = TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
+		                        Prospero::BufferFormat::kInvalid;
+		if (texture_cache.HeapExtentHeld(desc.info, conversion)) {
+			heap.settled[key]            = 0;
+			m_bindless_transient_failure = true;
+			table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 8) {
+				LOGF("Bindless: key %u of heap 0x%016" PRIx64 " (binding %u) held: another extent "
+				     "at 0x%016" PRIx64 " is pinned (KYTY_BINDLESS_HOLD_EXTENT)\n",
+				     key, heap.base, heap.binding, desc.info.data.address);
+			}
+			return false;
+		}
+	}
 	TextureBinding binding;
 	ResolveTexture(resource, value, binding);
-	auto& texture_cache = m_context.GetTextureCache();
 	auto* image         = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
 		table.SetTranslation(heap, key, 0u);
