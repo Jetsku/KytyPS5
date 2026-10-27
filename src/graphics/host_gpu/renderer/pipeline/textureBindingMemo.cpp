@@ -151,6 +151,7 @@ TextureBindingMemo::Key TextureBindingMemo::MakeKey(const ShaderRecompiler::IR::
 	key.depth_compare     = resource.depth_compare;
 	key.cube              = resource.cube;
 	key.r128              = resource.r128;
+	key.max_array_index   = resource.max_array_index;
 	return key;
 }
 

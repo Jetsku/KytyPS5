@@ -1471,6 +1471,7 @@ private:
 		bool                                     cube              = false;
 		bool                                     r128              = false;
 		bool                                     atomic64          = false;
+		uint32_t                                 max_array_index   = UINT32_MAX; // KYTY_TEXTURE_LAYER_BOUND
 
 		bool operator==(const TextureDescriptionKey&) const = default;
 	};

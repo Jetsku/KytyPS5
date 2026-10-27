@@ -3076,6 +3076,14 @@ ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
 	return result;
 }
 
+bool TextureCache::HoldsImage(const ImageInfo& info) {
+	if (info.data.Empty()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	return static_cast<bool>(FindImageWithSameBacking(info, false));
+}
+
 bool TextureCache::HeapExtentHeld(const ImageInfo& info, bool exact_format) {
 	if (info.data.Empty()) {
 		return false;

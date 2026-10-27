@@ -890,6 +890,70 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	}
 }
 
+// KYTY_TEXTURE_LAYER_RANGE=1 (default off; chenxiao07/KytyPS5's HoldLayerRange, without its
+// HoldLayers growth): a sampled one-level array texture whose view reads a few of its layers (from
+// a base past the first, or bounded by KYTY_TEXTURE_LAYER_BOUND) is held as the array of the
+// layers the view reads, not whole, when no image holds the whole array already. Demon's Souls'
+// streamed texture pools are one T# of up to ~3,600 1024x1024 BC layers of which a view reads up
+// to 256: held whole they were images of 1-3.6 GB, each new layer count a new upload.
+static bool TextureLayerRangeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_LAYER_RANGE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, uint32_t max_layers) {
+	constexpr uint64_t LayerRangeLeftOut = uint64_t {64} << 20u;
+	const auto&        full              = desc.info;
+	const auto         first             = desc.view_info.base_layer;
+	const auto         count             = desc.view_info.layer_count;
+	const bool         fits              = full.resources.layers <= max_layers;
+	if (count == 0 || full.resources.layers < 2 || first + count > full.resources.layers ||
+	    count == full.resources.layers || full.resources.levels != 1 || full.samples != 1 ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() ||
+	    full.mip_layout[0].offset != 0 || full.mip_layout[0].size != full.data.size ||
+	    full.data.size % full.resources.layers != 0 || (fits && cache.HoldsImage(full))) {
+		return;
+	}
+	// One level with nothing before or after it: the layers are whole slices, one after another.
+	const uint64_t slice = full.data.size / full.resources.layers;
+	if ((fits && count > full.resources.layers / 2 && slice * first < LayerRangeLeftOut) ||
+	    count > max_layers) {
+		return;
+	}
+	ImageInfo from        = full;
+	from.data             = {full.data.address + slice * first, slice * count};
+	from.resources.layers = count;
+	from.mip_layout       = {};
+	PopulateTextureMipLayout(from);
+	if (from.data.address % (uint64_t {64} << 10u) != 0 || from.mip_layout[0].offset != 0 ||
+	    from.mip_layout[0].size != from.data.size) {
+		return;
+	}
+	if (full.data.size >= (uint64_t {256} << 20u)) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("TextureCache: array view held as layers %u..%u of %u (0x%llx, %llu of %llu MiB; "
+			            "KYTY_TEXTURE_LAYER_RANGE)\n",
+			            first, first + count - 1, full.resources.layers,
+			            static_cast<unsigned long long>(from.data.address),
+			            static_cast<unsigned long long>(from.data.size >> 20u),
+			            static_cast<unsigned long long>(full.data.size >> 20u));
+		}
+	}
+	desc.info                 = from;
+	desc.view_info.base_layer = 0;
+}
+
+// A sampled array's view: its layers from the base, no more than the shader can reach
+// (ImageResource::max_array_index, computed with KYTY_TEXTURE_LAYER_BOUND=1 only; chenxiao07/KytyPS5
+// d44e93d81). Demon's Souls' texture-pool views read 256 of up to 2,255 layers.
+static uint32_t ArrayViewLayers(const ShaderRecompiler::IR::ImageResource& resource, uint32_t layers) {
+	return resource.max_array_index < layers ? resource.max_array_index + 1u : layers;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -932,7 +996,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -946,7 +1010,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			if (view.base_layer >= image_layers) {
 				EXIT("texture array base layer is out of bounds\n");
 			}
-			view.layer_count = image_layers - view.base_layer;
+			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
@@ -1476,7 +1540,8 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		                                 resource.shader_swizzle, resource.read,
 		                                 resource.written,        resource.atomic,
 		                                 resource.depth_compare,  resource.cube,
-		                                 resource.r128,           resource.atomic64};
+		                                 resource.r128,           resource.atomic64,
+		                                 resource.max_array_index};
 		// TextureBindingMemo::Hash is this cache's hash of the dwords and key.
 		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
 		if (entry.valid && entry.key == key &&
@@ -1502,6 +1567,9 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 			                      false);
 		}
 		return;
+	}
+	if (!storage && TextureLayerRangeEnabled()) {
+		HoldLayerRange(texture_cache, desc, m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxImageArrayLayers);
 	}
 	// Only descriptor-derived geometry is retained. FindImage may alter the local
 	// description and must still resolve ownership, aliases, uploads and metadata.

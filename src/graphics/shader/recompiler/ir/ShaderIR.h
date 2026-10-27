@@ -227,6 +227,8 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+	// max_array_index when no bound of an array image's layer coordinate was shown.
+	static constexpr uint32_t NoArrayIndexBound = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      first_use_pc      = 0;
@@ -261,6 +263,11 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// A sampled array image's largest layer the shader can read, counted from the view's base
+	// layer (ResourceTracking: every sample and gather of it takes its layer coordinate from
+	// values of a known range). Its view needs no layer past it (KYTY_TEXTURE_LAYER_BOUND,
+	// descriptors.cpp TextureViewInfo).
+	uint32_t                      max_array_index = NoArrayIndexBound;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;

@@ -620,6 +620,9 @@ private:
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
+	// Whether a registered image has `info`'s backing (FindImageWithSameBacking under m_lock;
+	// descriptors.cpp HoldLayerRange, KYTY_TEXTURE_LAYER_RANGE).
+	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
 	[[nodiscard]] ImageId       FindImageWithSameBacking(const ImageInfo& requested,
 	                                                     bool exact_format) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,

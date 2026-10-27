@@ -81,6 +81,8 @@ public:
 		bool                                      depth_compare     = false;
 		bool                                      cube              = false;
 		bool                                      r128              = false;
+		// KYTY_TEXTURE_LAYER_BOUND: the view's layer count follows it (descriptors.cpp).
+		uint32_t                                  max_array_index   = UINT32_MAX;
 
 		bool operator==(const Key&) const = default;
 	};
