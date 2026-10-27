@@ -38,7 +38,8 @@ struct LoadResult {
 };
 
 // Parses preset text. False with `error` set for anything but a JSON object whose keys start with
-// KYTY_ or TRACY_ and whose values are strings (the launcher then applies nothing).
+// KYTY_ or TRACY_ and whose values are strings (the launcher then applies nothing). A trailing comma
+// and // or /* */ comments are accepted; a syntax error names its line and column.
 [[nodiscard]] bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& error);
 
 // The first directory of `dirs` that holds FileName decides; Missing when none does.

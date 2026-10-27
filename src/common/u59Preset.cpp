@@ -14,8 +14,22 @@ namespace Common::U59Preset {
 
 bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& error) {
 	entries.clear();
-	const auto document = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
-	if (document.is_discarded() || !document.is_object()) {
+	// Hand-edited presets (issue #85: two keys added, then the whole file was not applied and the
+	// game ran on the code defaults): a trailing comma and // comments are accepted, and any other
+	// syntax error names its line and column.
+	nlohmann::json document;
+	try {
+		document = nlohmann::json::parse(text.begin(), text.end(), nullptr, true,
+		                                 /*ignore_comments=*/true, /*ignore_trailing_commas=*/true);
+	} catch (const nlohmann::json::parse_error& e) {
+		std::string_view what = e.what();
+		if (const auto at = what.find("] "); what.starts_with("[json.exception") && at != what.npos) {
+			what.remove_prefix(at + 2);
+		}
+		error = fmt::format("not valid JSON ({}); check for a missing comma or quote", what);
+		return false;
+	}
+	if (!document.is_object()) {
 		error = "not a JSON object";
 		return false;
 	}

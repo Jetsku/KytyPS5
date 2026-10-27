@@ -70,6 +70,15 @@ void TestParse() {
 	Check(!Parse("{\"KYTY_A\": \"1\"", entries, error) && entries.empty() && !error.empty(),
 	      "truncated JSON is invalid");
 	Check(!Parse(R"(["KYTY_A"])", entries, error), "an array is not a preset");
+	// Issue #85: keys added by hand with a comma after the last one.
+	Check(Parse("{\n  \"KYTY_A\": \"1\",\n  \"KYTY_B\": \"2\",\n}\n", entries, error) &&
+	          entries.size() == 2 && entries[1].key == "KYTY_B",
+	      "a trailing comma after the last key is accepted");
+	Check(Parse("{\n  // added by me\n  \"KYTY_A\": \"1\"\n}", entries, error) && entries.size() == 1,
+	      "a // comment line is accepted");
+	Check(!Parse("{\n  \"KYTY_A\": \"1\"\n  \"KYTY_B\": \"2\"\n}", entries, error) &&
+	          entries.empty() && Contains(error, "line 3"),
+	      "a missing comma is rejected and its line is named");
 	Check(!Parse(R"({"KYTY_A": "1", "PATH": "x"})", entries, error) && entries.empty() &&
 	          Contains(error, "PATH"),
 	      "a key outside KYTY_/TRACY_ rejects the whole file and is named");
