@@ -1136,6 +1136,34 @@ void EnsureConfigInitialized() {
   }
 }
 
+void TestDeclaredShaderHashMarker() {
+  // A shader may start with a real s_mov_b32 vcc_hi, <constant>: the binary-info marker word.
+  // With KYTY_SKIP_INVALID (default) the block must lie inside the code and be signed; the
+  // block is not read otherwise (Senaxx c47f0bb1b via usa-ratt/KytyPS5-GT7).
+  alignas(256) static uint32_t plain[60] = {0xBEEB03FFu, 0x3D00EAF7u};
+  Check(ShaderDeclaredHashForTest(reinterpret_cast<uint64_t>(plain), sizeof(plain)) == 0,
+        "a marker whose block leaves the code must give no declared hash");
+
+  alignas(256) static uint32_t unsigned_block[16] = {0xBEEB03FFu, 3u};
+  unsigned_block[12] = 0x11223344u;
+  Check(ShaderDeclaredHashForTest(reinterpret_cast<uint64_t>(unsigned_block),
+                                  sizeof(unsigned_block)) == 0,
+        "a binary-info block without a signature must give no declared hash");
+
+  // A true marker: block at word (3 + 1) * 2 = 8, "OrbShdr", hash0/hash1 at words 12/13.
+  alignas(256) static uint32_t signed_block[16] = {0xBEEB03FFu, 3u};
+  std::memcpy(&signed_block[8], "OrbShdr", 7);
+  signed_block[12] = 0x11223344u;
+  signed_block[13] = 0x55667788u;
+  Check(ShaderDeclaredHashForTest(reinterpret_cast<uint64_t>(signed_block),
+                                  sizeof(signed_block)) == 0x5566778811223344ull,
+        "a signed block inside the code keeps its declared hash");
+  // Unknown code size (0): only the signature is checked.
+  Check(ShaderDeclaredHashForTest(reinterpret_cast<uint64_t>(signed_block), 0) ==
+            0x5566778811223344ull,
+        "a signed block with an unknown code size keeps its declared hash");
+}
+
 void TestResourceDescriptorClassification() {
   uint32_t raw_texture[8] = {};
   raw_texture[3] = 9u << 28u;
@@ -16091,6 +16119,7 @@ int main(int argc, char **argv) {
   TestRayTracingStub();
   TestRayTracingSharedFunction();
   TestTraversalLoopBreakRegion();
+  TestDeclaredShaderHashMarker();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

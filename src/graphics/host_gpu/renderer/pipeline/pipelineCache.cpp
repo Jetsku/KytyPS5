@@ -7332,7 +7332,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return SkipUnmaterializable("a tessellated draw's LS/HS/TES set is not supported");
 		}
 	} else {
+		(void)ShaderTakePrepareFailed();
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		if (ShaderTakePrepareFailed()) {
+			// KYTY_SKIP_INVALID: already logged per shader by PrepareProgram.
+			return SkipUnmaterializable("a draw's vertex stage cannot be described (null or "
+			                            "uncommitted vertex tables, or a GS that emits no vertex)");
+		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -7421,9 +7427,13 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	}
 	const auto read_failed = [] { return DrawPrep::ActiveRecorder()->reads->Failed(); };
 	// The same static stage preparation as GetGraphicsPrograms (non-tessellated).
+	(void)ShaderTakePrepareFailed();
 	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;
+	}
+	if (ShaderTakePrepareFailed()) {
+		return SpeculativeResult::Ineligible; // the serial path skips the draw
 	}
 	if (vertex_info.logical_stage == ShaderType::Mesh) {
 		FinishMeshStage(m_graphics, vertex_info);
