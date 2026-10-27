@@ -460,6 +460,8 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_blit_depth_to_color32 gpu_blit_depth_to_color32.comp)
 add_gpu_blit_shader(gpu_blit_color32_to_depth gpu_blit_color32_to_depth.frag)
+add_gpu_blit_shader(gpu_blit_ms_depth_sample0 gpu_blit_ms_depth_sample0.frag)
+add_gpu_blit_shader(gpu_blit_ms_stencil_sample0 gpu_blit_ms_stencil_sample0.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_video_out_downscale gpu_video_out_downscale.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
@@ -1309,6 +1311,9 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --codegen-only)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
+	# KYTY_EQAA_MIXED: per-pixel copies of pixel shaders that read SampleId (pixelRateVariant.h).
+	add_test(NAME pixel_rate_variant
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pixel-rate-only)
 	# Bindless images: a T# read from a descriptor heap at a key loaded per lane (Miles' RT kernels).
 	add_test(NAME bindless_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-codegen-only)

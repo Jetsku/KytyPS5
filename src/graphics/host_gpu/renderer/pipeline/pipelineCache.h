@@ -88,6 +88,11 @@ struct PipelineRenderingState {
 	// KYTY_LAYER_CLAMP: the bound layer count when a vertex-side stage exports the render target
 	// array index (ShaderRecompiler::IR::LayerLimitSpecId), else 0.
 	uint32_t                                             layer_limit    = 0;
+	// KYTY_EQAA_MIXED: the colour and depth attachments' sample counts when they differ (mixed
+	// attachment samples; rasterization runs at PipelineStaticParameters::samples); both 0 when
+	// every attachment has the rasterization count.
+	uint32_t                                             color_samples  = 0;
+	uint32_t                                             depth_samples  = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -403,6 +408,10 @@ private:
 			Mix(hash, static_cast<uint32_t>(rendering.stencil_format));
 			if (rendering.layer_limit != 0) {
 				Mix(hash, rendering.layer_limit);
+			}
+			if (rendering.color_samples != 0) {
+				Mix(hash, rendering.color_samples);
+				Mix(hash, rendering.depth_samples);
 			}
 		}
 	};

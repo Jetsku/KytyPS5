@@ -5,6 +5,8 @@
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
 #include "gpu_blit_shaders/gpu_blit_depth_to_color32_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "gpu_blit_shaders/gpu_blit_ms_depth_sample0_spv.h"
+#include "gpu_blit_shaders/gpu_blit_ms_stencil_sample0_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -17,6 +19,15 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+namespace {
+
+[[nodiscard]] bool FormatHasStencil(vk::Format format) {
+	return format == vk::Format::eD16UnormS8Uint || format == vk::Format::eD24UnormS8Uint ||
+	       format == vk::Format::eD32SfloatS8Uint;
+}
+
+} // namespace
 
 BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler) {
@@ -43,6 +54,8 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 
 	m_vertex_shader   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_graphics.device);
 	m_fragment_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, m_graphics.device);
+	m_sample0_shader  = CompileSPV(GPU_BLIT_MS_DEPTH_SAMPLE0_SPV, m_graphics.device);
+	m_stencil0_shader = CompileSPV(GPU_BLIT_MS_STENCIL_SAMPLE0_SPV, m_graphics.device);
 
 	// Depth <-> 32-bit color reinterpretation passes.
 	const auto& limits  = m_graphics.physical_device_properties.limits;
@@ -125,6 +138,11 @@ BlitHelper::~BlitHelper() {
 	if (m_fragment_shader != nullptr) {
 		m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
 	}
+	for (auto* module: {&m_sample0_shader, &m_stencil0_shader}) {
+		if (*module != nullptr) {
+			m_graphics.device.destroyShaderModule(*module, nullptr);
+		}
+	}
 	if (m_vertex_shader != nullptr) {
 		m_graphics.device.destroyShaderModule(m_vertex_shader, nullptr);
 	}
@@ -150,9 +168,14 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	stages[0].module = m_vertex_shader;
 	stages[0].pName  = "main";
 	const bool color32 = key.kind == PipelineKind::Color32ToDepth;
+	// MsStencilSample0 writes a colour attachment (R8_UINT), the others a depth attachment.
+	const bool color_output = key.kind == PipelineKind::MsStencilSample0;
 	EXIT_IF(color32 && m_c2d_fragment_shader == nullptr);
 	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	stages[1].module = color32 ? m_c2d_fragment_shader : m_fragment_shader;
+	stages[1].module = color32                                      ? m_c2d_fragment_shader
+	                   : key.kind == PipelineKind::MsDepthSample0   ? m_sample0_shader
+	                   : key.kind == PipelineKind::MsStencilSample0 ? m_stencil0_shader
+	                                                                : m_fragment_shader;
 	stages[1].pName  = "main";
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input {};
@@ -166,17 +189,28 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	vk::PipelineMultisampleStateCreateInfo multisample {};
 	multisample.rasterizationSamples = samples;
 	vk::PipelineDepthStencilStateCreateInfo depth {};
-	depth.depthTestEnable  = VK_TRUE;
-	depth.depthWriteEnable = VK_TRUE;
+	depth.depthTestEnable  = color_output ? VK_FALSE : VK_TRUE;
+	depth.depthWriteEnable = color_output ? VK_FALSE : VK_TRUE;
 	depth.depthCompareOp   = vk::CompareOp::eAlways;
+	vk::PipelineColorBlendAttachmentState color_attachment {};
+	color_attachment.colorWriteMask = vk::ColorComponentFlagBits::eR;
 	vk::PipelineColorBlendStateCreateInfo color_blend {};
+	if (color_output) {
+		color_blend.attachmentCount = 1;
+		color_blend.pAttachments    = &color_attachment;
+	}
 	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 	vk::PipelineDynamicStateCreateInfo dynamic {};
 	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
 	dynamic.pDynamicStates    = dynamic_states.data();
 
 	vk::PipelineRenderingCreateInfo rendering {};
-	rendering.depthAttachmentFormat = key.format;
+	if (color_output) {
+		rendering.colorAttachmentCount    = 1;
+		rendering.pColorAttachmentFormats = &key.format;
+	} else {
+		rendering.depthAttachmentFormat = key.format;
+	}
 	if (color32 && key.format == vk::Format::eD32SfloatS8Uint) {
 		// CopyColor32ToDepth binds the combined view as the stencil attachment too.
 		rendering.stencilAttachmentFormat = key.format;
@@ -279,6 +313,114 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
+	m_scheduler.GetDynamicState().Invalidate();
+}
+
+void BlitHelper::CopyMsDepthSample0(Image& source, Image& destination) {
+	KYTY_GPU_OP_SITE("blit.ms_depth_sample0");
+	CopyMsSample0(source, destination, false);
+}
+
+void BlitHelper::CopyMsStencilSample0(Image& source, Image& destination) {
+	KYTY_GPU_OP_SITE("blit.ms_stencil_sample0");
+	CopyMsSample0(source, destination, true);
+}
+
+void BlitHelper::CopyMsSample0(Image& source, Image& destination, bool stencil) {
+	const auto& source_info      = source.info;
+	const auto& destination_info = destination.info;
+	EXIT_IF(DepthAspectTransferFormat(source.backing.format) == vk::Format::eUndefined ||
+	        (stencil ? (!FormatHasStencil(source.backing.format) ||
+	                    destination.backing.format != vk::Format::eR8Uint)
+	                 : DepthAspectTransferFormat(destination.backing.format) ==
+	                       vk::Format::eUndefined) ||
+	        source.backing.samples <= 1 || destination.backing.samples != 1 ||
+	        source.backing.image_type != vk::ImageType::e2D ||
+	        destination.backing.image_type != vk::ImageType::e2D ||
+	        source_info.extent.width != destination_info.extent.width ||
+	        source_info.extent.height != destination_info.extent.height ||
+	        source.backing.layers == 0 || source.backing.layers != destination.backing.layers ||
+	        source.backing.image == nullptr || destination.backing.image == nullptr);
+	destination.NoteContentWrite();
+	m_scheduler.EndRendering();
+
+	auto& command_buffer = m_scheduler.Current();
+	auto  command        = command_buffer.Handle();
+	source.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+	               {}, command);
+	const auto destination_layout = stencil ? vk::ImageLayout::eColorAttachmentOptimal
+	                                        : vk::ImageLayout::eDepthStencilAttachmentOptimal;
+	destination.Transit(destination_layout,
+	                    stencil ? vk::AccessFlagBits2::eColorAttachmentWrite
+	                            : vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+	                    {}, command);
+	const auto pipeline =
+	    GetPipeline({1, destination.backing.format,
+	                 stencil ? PipelineKind::MsStencilSample0 : PipelineKind::MsDepthSample0});
+	const uint32_t width  = destination_info.extent.width;
+	const uint32_t height = destination_info.extent.height;
+
+	// Layer by layer (an array's each), through 2D views.
+	for (uint32_t layer = 0; layer < destination.backing.layers; layer++) {
+		// FindView turns these view formats into the depth/stencil image's own format with the
+		// depth or the stencil aspect.
+		ImageViewInfo source_view_info {};
+		source_view_info.format     = stencil ? vk::Format::eS8Uint : vk::Format::eD32Sfloat;
+		source_view_info.type       = vk::ImageViewType::e2D;
+		source_view_info.aspect     = stencil ? vk::ImageAspectFlagBits::eStencil
+		                                      : vk::ImageAspectFlagBits::eDepth;
+		source_view_info.base_layer = layer;
+		source_view_info.usage      = vk::ImageUsageFlagBits::eSampled;
+		const auto source_view      = source.FindView(source_view_info);
+
+		ImageViewInfo destination_view_info {};
+		destination_view_info.format     = destination.backing.format;
+		destination_view_info.type       = vk::ImageViewType::e2D;
+		destination_view_info.aspect     = stencil ? vk::ImageAspectFlagBits::eColor
+		                                           : vk::ImageAspectFlagBits::eDepth;
+		destination_view_info.base_layer = layer;
+		destination_view_info.usage      = stencil ? vk::ImageUsageFlagBits::eColorAttachment
+		                                           : vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		const auto destination_view      = destination.FindView(destination_view_info);
+
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = destination_view;
+		attachment.imageLayout = destination_layout;
+		// The fullscreen triangle writes every texel of the render area.
+		attachment.loadOp  = vk::AttachmentLoadOp::eDontCare;
+		attachment.storeOp = vk::AttachmentStoreOp::eStore;
+
+		vk::RenderingInfo rendering {};
+		rendering.renderArea.extent = vk::Extent2D {width, height};
+		rendering.layerCount        = 1;
+		if (stencil) {
+			rendering.colorAttachmentCount = 1;
+			rendering.pColorAttachments    = &attachment;
+		} else {
+			rendering.pDepthAttachment = &attachment;
+		}
+		command.beginRendering(&rendering);
+
+		vk::DescriptorImageInfo descriptor_image {};
+		descriptor_image.imageView   = source_view;
+		descriptor_image.imageLayout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+		vk::WriteDescriptorSet descriptor_write {};
+		descriptor_write.dstBinding      = 0;
+		descriptor_write.descriptorCount = 1;
+		descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;
+		descriptor_write.pImageInfo      = &descriptor_image;
+		command_buffer.PushDescriptors(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
+		                               &descriptor_write);
+		command_buffer.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+		const vk::Viewport viewport {0.0f, 0.0f, static_cast<float>(width),
+		                             static_cast<float>(height), 0.0f, 1.0f};
+		const vk::Rect2D   scissor {{0, 0}, {width, height}};
+		command.setViewport(0, 1, &viewport);
+		command.setScissor(0, 1, &scissor);
+		command.draw(3, 1, 0, 0);
+		command.endRendering();
+	}
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
 	m_scheduler.GetDynamicState().Invalidate();
 }

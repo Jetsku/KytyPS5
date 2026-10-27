@@ -1145,6 +1145,29 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	// Its copies (SingleSampleDepth, SingleSampleStencil, SubExtentCopy) go with it.
+	if (!m_single_sample_depths.empty() || !m_single_sample_stencils.empty() ||
+	    !m_sub_extent_copies.empty()) [[unlikely]] {
+		for (auto* copies: {&m_single_sample_depths, &m_single_sample_stencils}) {
+			if (const auto copy = copies->find(id); copy != copies->end()) {
+				const auto copy_id = copy->second.copy;
+				copies->erase(copy);
+				if (copy_id) {
+					ReleaseUnregisteredImage(copy_id);
+				}
+			}
+		}
+		if (const auto copies = m_sub_extent_copies.find(id); copies != m_sub_extent_copies.end()) {
+			const auto entries = std::move(copies->second);
+			m_sub_extent_copies.erase(copies);
+			for (const auto& entry: entries) {
+				if (entry.copy) {
+					ReleaseUnregisteredImage(entry.copy);
+				}
+			}
+		}
+		image = m_slot_images.try_get(id);
+	}
 	if (HangTrace::Enabled()) {
 		const auto tick = m_scheduler.CurrentTick();
 		HangTrace::RecordImageFree(image->info.data.address, image->info.extent.width,
@@ -2347,6 +2370,247 @@ ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
 		}
 	});
 	return result;
+}
+
+bool TextureCache::MsDepthSample0Enabled() {
+	static std::atomic<int64_t> slot {Common::OnceUnset};
+	return Common::Once(slot, [] {
+		       const char* value = std::getenv("KYTY_MS_DEPTH_SAMPLE0");
+		       const bool  on    = value != nullptr && value[0] == '1';
+		       if (on) {
+			       LOGF("Multisample depth read as single-sample: from a copy of its first sample "
+			            "(KYTY_MS_DEPTH_SAMPLE0=1)\n");
+		       }
+		       return on ? 1 : 0;
+	       }) != 0;
+}
+
+void TextureCache::ReleaseUnregisteredImage(ImageId id) {
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || image->registered) {
+		return;
+	}
+	if (on_image_views_dropped && !image->views.empty()) {
+		(void)on_image_views_dropped(image->views);
+	}
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation([this, id] {
+			m_slot_images.erase(id);
+			NoteImageStateChange();
+		});
+	} else {
+		m_slot_images.erase(id);
+		NoteImageStateChange();
+	}
+}
+
+ImageId TextureCache::SingleSampleDepth(ImageId id) {
+	return SingleSampleCopyOf(id, false);
+}
+
+ImageId TextureCache::SingleSampleStencil(ImageId depth_id) {
+	return SingleSampleCopyOf(depth_id, true);
+}
+
+ImageId TextureCache::SingleSampleCopyOf(ImageId id, bool stencil) {
+	if (!MsDepthSample0Enabled()) {
+		return id;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto*      source = m_slot_images.try_get(id);
+	const auto       format = source != nullptr ? source->backing.format : vk::Format::eUndefined;
+	const bool       has_stencil = format == vk::Format::eD16UnormS8Uint ||
+	                         format == vk::Format::eD24UnormS8Uint ||
+	                         format == vk::Format::eD32SfloatS8Uint;
+	if (source == nullptr || !source->registered || source->binding.needs_rebind ||
+	    source->backing.samples <= 1 || !source->info.IsDepth() || (stencil && !has_stencil) ||
+	    source->backing.image == nullptr || source->backing.image_type != vk::ImageType::e2D ||
+	    source->info.resources.layers == 0 ||
+	    source->info.resources.layers != source->backing.layers ||
+	    source->info.resources.levels != 1 || source->depth_id) {
+		return id;
+	}
+	// What FindTexture does with an image it binds, for the source of the copy: its use is noted
+	// and what the CPU or a buffer write put in its memory is uploaded first (which moves its
+	// content serial, so the copy is made again).
+	TouchImage(m_slot_images[id]);
+	RefreshImage(id);
+	if (stencil) {
+		const auto stencil_ids = m_slot_images[id].stencil_ids;
+		for (const auto stencil_id: stencil_ids) {
+			if (const auto* plane = m_slot_images.try_get(stencil_id);
+			    plane != nullptr && plane->depth_id == id && plane->registered) {
+				RefreshImage(stencil_id);
+			}
+		}
+	}
+	source = &m_slot_images[id];
+	// The stencil changes with the depth image (draws, clears, copies) and its stencil planes
+	// (their own uploads).
+	uint64_t serial = source->ContentSerial();
+	if (stencil) {
+		for (const auto stencil_id: source->stencil_ids) {
+			if (const auto* plane = m_slot_images.try_get(stencil_id); plane != nullptr) {
+				serial = serial * 31u + plane->ContentSerial() + 1u;
+			}
+		}
+	}
+	const auto width  = source->info.extent.width;
+	const auto height = source->info.extent.height;
+	const auto layers = source->info.resources.layers;
+	auto&      entry  = (stencil ? m_single_sample_stencils : m_single_sample_depths)[id];
+	auto*      copy   = entry.copy ? m_slot_images.try_get(entry.copy) : nullptr;
+	if (copy == nullptr || copy->info.extent.width != width ||
+	    copy->info.extent.height != height || copy->info.resources.layers != layers) {
+		if (copy != nullptr) {
+			ReleaseUnregisteredImage(entry.copy);
+		}
+		const uint32_t bytes = stencil ? 1u : 4u;
+		ImageInfo      info {};
+		info.pixel_format    = stencil ? vk::Format::eR8Uint : vk::Format::eD32Sfloat;
+		info.guest_format    = stencil ? Prospero::BufferFormat::k8UInt : source->info.guest_format;
+		info.type            = source->info.type;
+		info.extent          = {width, height, 1};
+		info.resources       = {1, layers};
+		info.pitch           = width;
+		info.bytes_per_block = bytes;
+		info.samples         = 1;
+		info.tile_mode       = Prospero::TileMode::kLinear;
+		info.mip_layout[0]   = {0, uint64_t {width} * height * bytes, width, height};
+		const auto guest     = source->info.data.address;
+		const auto samples   = source->backing.samples;
+		const auto copy_id   = InsertImage(info);
+		// InsertImage may move the slots: entry and source are looked up again.
+		auto& fresh  = (stencil ? m_single_sample_stencils : m_single_sample_depths)[id];
+		fresh.copy   = copy_id;
+		fresh.serial = UINT64_MAX;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: %s0x%012" PRIx64
+			     " %ux%u, %u layers, %u samples: read from a copy of its first sample\n",
+			     stencil ? "the stencil of " : "", guest, width, height, layers, samples);
+		}
+	}
+	auto& current = (stencil ? m_single_sample_stencils : m_single_sample_depths)[id];
+	auto& target  = m_slot_images[current.copy];
+	target.tick_accessed_last  = m_scheduler.CurrentTick();
+	target.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	if (current.serial != serial) {
+		if (stencil) {
+			m_blit_helper.CopyMsStencilSample0(m_slot_images[id], target);
+		} else {
+			m_blit_helper.CopyMsDepthSample0(m_slot_images[id], target);
+		}
+		current.serial = serial;
+	}
+	return current.copy;
+}
+
+bool TextureCache::SubExtentCopyEnabled() {
+	static std::atomic<int64_t> slot {Common::OnceUnset};
+	return Common::Once(slot, [] {
+		       const char* value = std::getenv("KYTY_SUB_EXTENT_COPY");
+		       return value != nullptr && value[0] == '1' ? 1 : 0;
+	       }) != 0;
+}
+
+ImageId TextureCache::SubExtentCopy(ImageId id, const ImageInfo& requested) {
+	if (!SubExtentCopyEnabled()) {
+		return id;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto*      source = m_slot_images.try_get(id);
+	if (source == nullptr || !source->registered || source->depth_id ||
+	    source->backing.image == nullptr || source->binding.needs_rebind) {
+		return id;
+	}
+	const auto& info = source->info;
+	if (info.data.Empty() || info.IsDepth() || info.HasStencil() || info.IsBlock() ||
+	    info.IsVolume() || source->backing.samples != 1 ||
+	    source->backing.image_type != vk::ImageType::e2D || requested.samples != 1 ||
+	    requested.type != info.type || requested.data.address != info.data.address ||
+	    requested.data.size != info.data.size || requested.tile_mode != info.tile_mode ||
+	    requested.resources != info.resources || requested.resources.levels != 1 ||
+	    requested.extent.depth != info.extent.depth || requested.extent.width == 0 ||
+	    requested.extent.height == 0 || requested.extent.width > info.extent.width ||
+	    requested.extent.height > info.extent.height ||
+	    (requested.extent.width == info.extent.width &&
+	     requested.extent.height == info.extent.height) ||
+	    source->backing.extent.width != info.extent.width ||
+	    source->backing.extent.height != info.extent.height ||
+	    !ImageViewOps::FormatsCompatible(info.pixel_format, requested.pixel_format)) {
+		return id;
+	}
+	// FindTexture's refresh of an image it binds, for the image the copy is made from (an upload
+	// moves its content serial, so the copy is made again).
+	TouchImage(m_slot_images[id]);
+	RefreshImage(id);
+	source            = &m_slot_images[id];
+	const auto width  = requested.extent.width;
+	const auto height = requested.extent.height;
+	const auto tick   = m_scheduler.CurrentTick();
+	auto*      copies = &m_sub_extent_copies[id];
+	size_t     index  = copies->size();
+	for (size_t i = 0; i < copies->size(); i++) {
+		if ((*copies)[i].width == width && (*copies)[i].height == height &&
+		    m_slot_images.try_get((*copies)[i].copy) != nullptr) {
+			index = i;
+			break;
+		}
+	}
+	if (index == copies->size()) {
+		// At most 4 extents an image: the one used longest ago goes.
+		if (copies->size() >= 4) {
+			size_t oldest = 0;
+			for (size_t i = 1; i < copies->size(); i++) {
+				if ((*copies)[i].used < (*copies)[oldest].used) {
+					oldest = i;
+				}
+			}
+			const auto old = (*copies)[oldest].copy;
+			copies->erase(copies->begin() + static_cast<std::ptrdiff_t>(oldest));
+			if (old) {
+				ReleaseUnregisteredImage(old);
+			}
+		}
+		ImageInfo copy_info {};
+		copy_info.pixel_format    = source->info.pixel_format;
+		copy_info.guest_format    = source->info.guest_format;
+		copy_info.type            = source->info.type;
+		copy_info.extent          = {width, height, source->info.extent.depth};
+		copy_info.resources       = source->info.resources;
+		copy_info.pitch           = width;
+		copy_info.bytes_per_block = source->info.bytes_per_block;
+		copy_info.samples         = 1;
+		copy_info.tile_mode       = Prospero::TileMode::kLinear;
+		copy_info.bgra16          = source->info.bgra16;
+		copy_info.mip_layout[0]   = {0, uint64_t {width} * height * source->info.bytes_per_block,
+		                             width, height};
+		const auto guest          = source->info.data.address;
+		const auto source_width   = source->info.extent.width;
+		const auto source_height  = source->info.extent.height;
+		const auto copy_id        = InsertImage(copy_info);
+		copies                    = &m_sub_extent_copies[id];
+		copies->push_back({copy_id, width, height, UINT64_MAX, tick});
+		index = copies->size() - 1;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("TextureCache: 0x%012" PRIx64 " %ux%u read as a %ux%u texture (same memory and "
+			     "tiling): from a copy of that corner (KYTY_SUB_EXTENT_COPY)\n",
+			     guest, source_width, source_height, width, height);
+		}
+	}
+	auto& entry             = (*copies)[index];
+	auto& copy              = m_slot_images[entry.copy];
+	entry.used              = tick;
+	copy.tick_accessed_last = tick;
+	copy.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	if (entry.serial != m_slot_images[id].ContentSerial()) {
+		// Within both images: the corner of the source the copy's extent covers.
+		copy.CopyImage(m_slot_images[id]);
+		entry.serial = m_slot_images[id].ContentSerial();
+	}
+	return entry.copy;
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
@@ -4331,6 +4595,16 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		if (ColourMetadataTargetsDepth("CMASK", id, m_slot_images[id])) {
 			return;
+		}
+		// KYTY_CMASK_MSAA (usa-ratt/KytyPS5-GT7 8a0b6058f): GT7 reuses memory within a frame, and
+		// a depth target's HTile can start where a (multisampled) colour target keeps its CMASK
+		// (the in-car map). A compute fill there clears the depth target's HTile and must still
+		// run, so this target reads the filled CMASK too (IsColorMeta, UpdateComputeMetaClears).
+		if (CmaskMsaaEnabled() && desc.cmask.range.Valid()) {
+			if (m_color_metas.size() >= 4096) {
+				m_color_metas.clear();
+			}
+			m_color_metas.insert(desc.cmask.range.address);
 		}
 	}
 	const auto  range  = desc.cmask.range;
@@ -7289,6 +7563,11 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end();
+}
+
+bool TextureCache::IsColorMeta(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	return !m_color_metas.empty() && m_color_metas.contains(address);
 }
 
 // Live switch (common/liveSwitch.h). Every change of m_surface_metas bumps m_surface_meta_generation

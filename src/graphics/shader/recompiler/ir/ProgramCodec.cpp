@@ -558,6 +558,7 @@ void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {
 	w.Bool(v.cube);
 	w.Bool(v.fmask);
 	w.Bool(v.bindless);
+	w.U32(v.fmask_fragments);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Image& v) {
@@ -572,6 +573,7 @@ void Read(CodecReader& r, ResourceSpecialization::Image& v) {
 	v.cube                       = r.Bool();
 	v.fmask                      = r.Bool();
 	v.bindless                   = r.Bool();
+	v.fmask_fragments            = static_cast<uint8_t>(r.U32());
 }
 
 void Write(CodecWriter& w, const ResourcePlan::EvaluationOperand& v) {

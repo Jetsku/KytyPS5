@@ -1675,7 +1675,8 @@ void TestSampleAdjustSamplerScratch() {
                 "SampleAdjust canonicalization discarded border-mode bits");
 }
 
-void TestFmaskLoadSpecialization() {
+// format_word: image descriptor dword 1 (format in bits 20..28); expected: the low FMASK word.
+void TestFmaskLoadSpecializationFor(uint32_t format_word, uint32_t expected) {
   namespace Prospero = Libs::Graphics::Prospero;
   Fixture fixture;
   std::array<Value, 8> words;
@@ -1721,7 +1722,7 @@ void TestFmaskLoadSpecialization() {
   fixture.PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture.program);
   std::array<uint32_t, 9> user_data{
-      0x303ac300u, 0xca100000u, 0x021bc3bfu, 0x91800004u,
+      0x303ac300u, format_word, 0x021bc3bfu, 0x91800004u,
       0u, 0x00700000u, 0u, 0u};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
@@ -1743,7 +1744,7 @@ void TestFmaskLoadSpecialization() {
   result = vector->Arg(0);
   uint32_t value = 0;
   Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(result, value) &&
-            value == 0x76543210u,
+            value == expected,
         "FMASK load did not return the native sample-to-fragment mapping");
   user_data[8] = 1;
   Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(result, value) &&
@@ -1763,6 +1764,18 @@ void TestFmaskLoadSpecialization() {
   Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, rebound) &&
             rebound != specialization && snapshot.images.size() == 2,
         "rebinding FMASK as a texture reused the metadata specialization");
+}
+
+void TestFmaskLoadSpecialization() {
+  // kFmask8_S4_F4: one fragment per sample, identity mapping.
+  TestFmaskLoadSpecializationFor(0xca100000u, 0x76543210u);
+  // kFmask8_S4_F2 (EQAA 4 samples / 2 fragments) without KYTY_EQAA_MIXED: the identity, as before.
+  TestFmaskLoadSpecializationFor(0xca000000u, 0x76543210u);
+  // With KYTY_EQAA_MIXED (usa-ratt/KytyPS5-GT7 18979e65b): sample i reads host sample i mod 2.
+  Libs::Graphics::ShaderRecompiler::IR::SetEqaaFmaskMapForTesting(true);
+  TestFmaskLoadSpecializationFor(0xca000000u, 0x10101010u);
+  TestFmaskLoadSpecializationFor(0xca100000u, 0x76543210u);
+  Libs::Graphics::ShaderRecompiler::IR::SetEqaaFmaskMapForTesting(false);
 }
 
 void TestGatherLodSamplerValidation() {

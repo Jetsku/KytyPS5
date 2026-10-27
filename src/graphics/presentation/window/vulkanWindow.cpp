@@ -1425,6 +1425,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			create_info.pNext = &diagnostics_features;
 		}
 	}
+	// KYTY_EQAA_MIXED with NV mixed samples: TRUNCATE coverage reduction (CreateVulkan added the
+	// extension only when the device has the feature).
+	vk::PhysicalDeviceCoverageReductionModeFeaturesNV coverage_reduction {};
+	if (HasExtension(device_extensions, VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME)) {
+		coverage_reduction.coverageReductionMode = VK_TRUE;
+		coverage_reduction.pNext                 = const_cast<void*>(create_info.pNext);
+		create_info.pNext                        = &coverage_reduction;
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
@@ -2204,6 +2212,79 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		// KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b, df310f7a9): PS5 EQAA renders
+		// colour at its fragment count and depth at its coverage count, through mixed attachment
+		// samples. With NV's, the colour sample takes its own raster sample's coverage (TRUNCATE,
+		// VK_NV_coverage_reduction_mode) where the device lists it; KYTY_COVERAGE_REDUCTION=merge
+		// keeps MERGE.
+		if (const char* eqaa = std::getenv("KYTY_EQAA_MIXED"); eqaa != nullptr && eqaa[0] == '1') {
+			using MixedSamples = GraphicContext::MixedAttachmentSamples;
+			if (HasExtension(available_extensions, VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
+				graphic_ctx.mixed_attachment_samples = MixedSamples::Amd;
+			} else if (HasExtension(available_extensions,
+			                        VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
+				graphic_ctx.mixed_attachment_samples = MixedSamples::Nv;
+				const char* reduction = std::getenv("KYTY_COVERAGE_REDUCTION");
+				const bool  merge     = reduction != nullptr && std::strcmp(reduction, "merge") == 0;
+				if (!merge &&
+				    HasExtension(available_extensions, VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME) &&
+				    VULKAN_HPP_DEFAULT_DISPATCHER
+				            .vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV !=
+				        nullptr) {
+					vk::PhysicalDeviceCoverageReductionModeFeaturesNV supported_reduction {};
+					vk::PhysicalDeviceFeatures2                       reduction_query {};
+					reduction_query.pNext = &supported_reduction;
+					graphic_ctx.physical_device.getFeatures2(&reduction_query);
+					const auto combinations =
+					    EnumerateVulkan<vk::FramebufferMixedSamplesCombinationNV>(
+					        "vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV",
+					        [&](uint32_t* count, vk::FramebufferMixedSamplesCombinationNV* values) {
+						        return graphic_ctx.physical_device
+						            .getSupportedFramebufferMixedSamplesCombinationsNV(count,
+						                                                               values);
+					        });
+					std::string list;
+					for (const auto& combination: combinations) {
+						if (combination.coverageReductionMode !=
+						    vk::CoverageReductionModeNV::eTruncate) {
+							continue;
+						}
+						// The depth/stencil and colour counts are masks of the counts allowed.
+						const auto raster = static_cast<uint32_t>(combination.rasterizationSamples);
+						const auto depths = static_cast<uint32_t>(
+						    static_cast<VkSampleCountFlags>(combination.depthStencilSamples));
+						const auto colors = static_cast<uint32_t>(
+						    static_cast<VkSampleCountFlags>(combination.colorSamples));
+						graphic_ctx.coverage_truncate_combinations.push_back(
+						    {raster, depths, colors});
+						list += " " + std::to_string(raster) + "/" + std::to_string(depths) + "/" +
+						        std::to_string(colors);
+					}
+					if (!graphic_ctx.coverage_truncate_combinations.empty()) {
+						// The extension only with its feature (VulkanCreateDevice turns it on).
+						if (supported_reduction.coverageReductionMode) {
+							device_extensions.push_back(VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME);
+						} else {
+							graphic_ctx.coverage_truncate_combinations.clear();
+							list += " (not used: no coverageReductionMode feature)";
+						}
+					}
+					LOGF("Vulkan coverage reduction TRUNCATE (raster samples/depth masks/colour "
+					     "masks):%s\n",
+					     list.empty() ? " none" : list.c_str());
+				} else {
+					LOGF("Vulkan coverage reduction: MERGE%s\n",
+					     merge ? " (KYTY_COVERAGE_REDUCTION=merge)"
+					           : " (no VK_NV_coverage_reduction_mode)");
+				}
+			}
+			LOGF("Vulkan mixed attachment samples (KYTY_EQAA_MIXED=1): %s\n",
+			     graphic_ctx.mixed_attachment_samples == MixedSamples::Amd  ? "AMD"
+			     : graphic_ctx.mixed_attachment_samples == MixedSamples::Nv ? "NV"
+			                                                                : "unsupported");
 		}
 		// KYTY_GPU_TIMING (diagnostic) and KYTY_EOP_TIMESTAMPS=gpu only: maps GPU timestamps to the
 		// CPU clock and extends timestamp ordering guarantees across submissions. Not enabled for

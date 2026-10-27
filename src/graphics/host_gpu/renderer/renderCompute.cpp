@@ -1,4 +1,5 @@
 #include "common/debugCounters.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -316,7 +317,8 @@ static bool ComputeMetaClearDispatchEnabled() {
 
 // Whether a metadata clear was recorded.
 bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
-                                            const CommandBuffer&          buffer) {
+                                            const CommandBuffer&          buffer,
+                                            bool*                         keep_dispatch) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -339,7 +341,14 @@ bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				cleared |= cache.ClearMeta(descriptor.Base48());
+				const bool meta_cleared = cache.ClearMeta(descriptor.Base48());
+				cleared |= meta_cleared;
+				// KYTY_CMASK_MSAA (usa-ratt/KytyPS5-GT7 8a0b6058f): a colour target keeps its
+				// CMASK at the same address as this HTile: the fill still runs for it.
+				if (meta_cleared && keep_dispatch != nullptr && CmaskMsaaEnabled() &&
+				    cache.IsColorMeta(descriptor.Base48())) {
+					*keep_dispatch = true;
+				}
 			}
 		}
 	}
@@ -658,7 +667,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& resources = *input_info.stage.resources;
 	// A recorded metadata clear consumes the dispatch unless KYTY_COMPUTE_META_CLEAR_DISPATCH keeps
 	// its guest writes (upstream 01ce97388).
-	if (UpdateComputeMetaClears(input_info, buffer) && !ComputeMetaClearDispatchEnabled()) {
+	bool keep_meta_dispatch = false;
+	if (UpdateComputeMetaClears(input_info, buffer, &keep_meta_dispatch) &&
+	    !ComputeMetaClearDispatchEnabled() && !keep_meta_dispatch) {
 		ResetBindings();
 		return;
 	}

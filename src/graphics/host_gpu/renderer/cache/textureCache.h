@@ -210,6 +210,8 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	// KYTY_CMASK_MSAA: a colour target's CMASK starts at this address (MaterializeCmaskClear).
+	[[nodiscard]] bool IsColorMeta(uint64_t address);
 	// KYTY_META_CLEAR_MEMO=1 (default off; BryanKAdams/KytyPS5 c36bbff): the last answer is kept for
 	// its address while m_surface_meta_generation holds, without m_lock. Called by the GPU (CP)
 	// thread only (the depth-target resolution of draws).
@@ -226,6 +228,26 @@ public:
 	[[nodiscard]] uint64_t Frame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
 	// The image of a slot id, or nullptr when the slot is free (GPU thread).
 	[[nodiscard]] Image* TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
+	// KYTY_MS_DEPTH_SAMPLE0=1 (from usa-ratt/KytyPS5-GT7 rounds 122-124): a texture binding that
+	// reads a multisample depth image through a single-sample dimension (the shader then has a
+	// single-sample image: ResourceMaterialization's DescriptorDimension) reads a single-sample
+	// copy of its first sample, as the console's texture unit does. SingleSampleDepth: a D32
+	// image of the depth (each layer of an array), SingleSampleStencil (argument: the depth
+	// image): an R8_UINT image of the stencil. The copy has no guest memory (never registered),
+	// is refreshed when its source's content serial moved, and goes with its source image. Any
+	// other image (or the switch off): the argument. GPU thread.
+	[[nodiscard]] static bool MsDepthSample0Enabled();
+	[[nodiscard]] ImageId SingleSampleDepth(ImageId id);
+	[[nodiscard]] ImageId SingleSampleStencil(ImageId depth_id);
+	// KYTY_SUB_EXTENT_COPY=1 (from usa-ratt/KytyPS5-GT7 429692dd3, Franseven's case): a texture
+	// narrower or shorter than the single-sample colour image at its address, with the same guest
+	// layout (same memory size and tiling: UI text drawn with a narrower viewport into a wider
+	// target, then sampled at the narrower width). A view cannot shrink the extent, so normalized
+	// coordinates would reach the image's columns past the texture's: the texture reads a copy of
+	// the image's corner of its extent, made again whenever the image changed (content serial).
+	// The image keeps all its pixels. Any other request (or the switch off): `id`. GPU thread.
+	[[nodiscard]] static bool SubExtentCopyEnabled();
+	[[nodiscard]] ImageId SubExtentCopy(ImageId id, const ImageInfo& requested);
 	void RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
@@ -581,6 +603,28 @@ private:
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<uint64_t, ImageId>             m_null_images;
+	// SingleSampleDepth's and SingleSampleStencil's copies, by the multisample depth image they
+	// copy: the copy and the source content serial it holds.
+	struct SingleSampleCopy {
+		ImageId  copy {};
+		uint64_t serial = UINT64_MAX;
+	};
+	std::unordered_map<ImageId, SingleSampleCopy>      m_single_sample_depths;
+	// KYTY_CMASK_MSAA: the addresses colour targets' CMASK starts at (IsColorMeta), at most 4096.
+	std::unordered_set<uint64_t>                       m_color_metas;
+	std::unordered_map<ImageId, SingleSampleCopy>      m_single_sample_stencils;
+	// SubExtentCopy's copies, by the image they copy (at most 4 extents each).
+	struct SubExtentCopyEntry {
+		ImageId  copy {};
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		uint64_t serial = UINT64_MAX;
+		uint64_t used   = 0;
+	};
+	std::unordered_map<ImageId, std::vector<SubExtentCopyEntry>> m_sub_extent_copies;
+	[[nodiscard]] ImageId SingleSampleCopyOf(ImageId id, bool stencil);
+	// Releases an image that was never registered (a SingleSample* copy) once the GPU is done.
+	void ReleaseUnregisteredImage(ImageId id);
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::atomic<uint64_t>                             m_frame {0};

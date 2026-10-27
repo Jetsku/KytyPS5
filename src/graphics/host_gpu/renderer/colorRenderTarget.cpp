@@ -45,6 +45,14 @@ bool CmaskFastClearEnabled() {
 	return enabled;
 }
 
+bool EqaaMixedTargets() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EQAA_MIXED");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 bool CmaskMsaaEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_CMASK_MSAA");
@@ -331,12 +339,27 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
-	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
+	bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
+	// KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b): any EQAA target (NUM_SAMPLES,
+	// the coverage count, above NUM_FRAGMENTS, the stored colours; both log2). The guest surface
+	// layout follows the fragment count, so the host image does too; the extra coverage samples
+	// reach only the depth attachment (mixed attachment samples, PipelineCache) and the FMASK
+	// emulation maps each sample onto an existing fragment. GT7's countdown and replay passes:
+	// 2 depth samples, 1 colour.
+	if (rt.attrib.num_samples > rt.attrib.num_fragments && EqaaMixedTargets()) {
+		approximate_eqaa = render_sample_count(rt.attrib.num_samples) != 0;
+	}
 	if (approximate_eqaa) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog(
-			    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
+			if (rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
+			} else {
+				LOGF("EQAA colour target (KYTY_EQAA_MIXED): %ux coverage, %ux fragments, the host "
+				     "image has %u samples\n",
+				     render_sample_count(rt.attrib.num_samples), samples, samples);
+			}
 		}
 	}
 	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments && !approximate_eqaa)) {

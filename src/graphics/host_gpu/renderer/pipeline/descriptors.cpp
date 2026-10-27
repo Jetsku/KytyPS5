@@ -1199,9 +1199,23 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	const auto found               = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	// KYTY_MS_DEPTH_SAMPLE0=1 (usa-ratt/KytyPS5-GT7 rounds 122-124): the shader reads a
+	// multisample depth T# through a single-sample dimension (DescriptorDimension made its image a
+	// single-sample one): the binding gets a copy of the first sample (GT7 replays: the light
+	// sprites' occlusion test, the depth reduction the CPU reads back).
+	const bool single_sample_read =
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
+	const bool ms_depth_sample0 = TextureCache::MsDepthSample0Enabled() && single_sample_read;
+	bool       copy_binding     = false;
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+		if (ms_depth_sample0 && !storage && image->backing.samples > 1) {
+			id           = texture_cache.SingleSampleStencil(id);
+			image        = &texture_cache.GetImage(id);
+			copy_binding = image->backing.samples == 1;
+		}
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
@@ -1210,6 +1224,11 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 			desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
 			binding.image_id = texture_cache.FindImage(desc);
 			return;
+		}
+		if (ms_depth_sample0 && image->backing.samples > 1) {
+			id           = texture_cache.SingleSampleDepth(id);
+			image        = &texture_cache.GetImage(id);
+			copy_binding = image->backing.samples == 1;
 		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
@@ -1233,8 +1252,42 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
+		// KYTY_SUB_EXTENT_COPY=1 (usa-ratt/KytyPS5-GT7 429692dd3, Franseven): a texture smaller
+		// than the colour image at its address, with the same memory and tiling (UI text drawn
+		// into part of a wider target), reads a copy of the image's corner: a view of the image
+		// would stretch its coordinates over the whole image.
+		if (TextureCache::SubExtentCopyEnabled()) {
+			if (const auto copy_id = texture_cache.SubExtentCopy(id, desc.info); copy_id != id) {
+				id           = copy_id;
+				image        = &texture_cache.GetImage(id);
+				copy_binding = true; // not memoized either: each resolution refreshes the copy
+			}
+		}
+	}
+	if (ms_depth_sample0 && image->backing.samples > 1) {
+		// A multisample image left for a single-sample shader image (a colour image under a
+		// depth-tiled multisample T#, or a depth image no copy was made of): a mismatch Vulkan
+		// leaves undefined (wrong reads or a lost device), so a null texture instead.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: 0x%012" PRIx64 " %ux%u fmt %d, %u "
+			     "samples, %u layers, %u levels, %s%s: no single-sample copy, a null texture\n",
+			     image->info.data.address, image->info.extent.width, image->info.extent.height,
+			     static_cast<int>(image->info.pixel_format), image->backing.samples,
+			     image->info.resources.layers, image->info.resources.levels,
+			     image->info.IsDepth() ? "a depth image" : "a colour image",
+			     stencil_association ? " (its stencil)" : "");
+		}
+		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                         : TextureCache::BindingType::Texture);
+		binding.image_id = texture_cache.FindImage(desc);
+		return;
 	}
 	binding.image_id = id;
+	if (copy_binding) {
+		// Not memoized: each resolution refreshes the copy from its source.
+		return;
+	}
 	if (memo) {
 		const bool view_rebased =
 		    desc.view_info.base_level != base_level || desc.view_info.base_layer != base_layer;
@@ -1252,10 +1305,50 @@ static bool SamplerMemoEnabled() {
 	return enabled;
 }
 
+// KYTY_CUBE_EDGE_CLAMP=1 (from usa-ratt/KytyPS5-GT7 round 142). A cube map is sampled as a 2D
+// array of its faces (face coordinates and face index from V_CUBE*, CubeAxis/CubeLayer), so the
+// sampler's address mode applies inside each face. The console's cube addressing ignores it and
+// filters across the face edges; with WRAP (what a sky's sampler often has) bilinear filtering at
+// an edge blends in the face's opposite edge: a thin line along the face edges in the sky and a
+// shade step where a reflection cube's coarse mips meet (GT7). CLAMP_LAST_TEXEL keeps each face's
+// filtering inside it.
+static bool CubeEdgeClamp() {
+	static std::atomic<int64_t> slot {Common::OnceUnset};
+	return Common::Once(slot, [] {
+		       const char* value   = std::getenv("KYTY_CUBE_EDGE_CLAMP");
+		       const bool  enabled = value != nullptr && value[0] == '1';
+		       if (enabled) {
+			       LOGF("Cube maps: samplers used only with cube maps clamp at the face edges "
+			            "(KYTY_CUBE_EDGE_CLAMP=1)\n");
+		       }
+		       return enabled ? 1 : 0;
+	       }) != 0;
+}
+
+// Whether every image this sampler is paired with is a cube map.
+static bool SamplesCubesOnly(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                             uint32_t                                        sampler) {
+	bool any = false;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.sampler != sampler) {
+			continue;
+		}
+		if (pair.image >= program.info.images.size() || !program.info.images[pair.image].cube) {
+			return false;
+		}
+		any = true;
+	}
+	return any;
+}
+
 ShaderSamplerResource NativeSamplerDescriptor(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                               uint32_t                                        index,
                                               const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+	if (CubeEdgeClamp() && SamplesCubesOnly(program, index)) {
+		// CLAMP_X and CLAMP_Y (bits 0-2 and 3-5) to CLAMP_LAST_TEXEL (2).
+		descriptor.fields[0] = (descriptor.fields[0] & ~0x3fu) | 2u | (2u << 3u);
+	}
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
