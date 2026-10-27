@@ -595,10 +595,79 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto info = Format::GetFormatInfo(format);
 	EXIT_IF(Prospero::RemapTextureFormat(format) == format || info.component_count == 0u ||
 	        info.component_count > 4u);
-	EXIT_IF(info.type != Format::ComponentType::Uscaled &&
-	        (info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
-	         info.byte_size != sizeof(uint32_t)));
+	// Non-packed: scaled formats on a normalized backing. Packed: the raw word in a k32UInt
+	// backing (KYTY_PACKED_TEXTURES decodes UNorm/UScaled ones too).
+	EXIT_IF(info.packed_bitfield
+	            ? info.type == Format::ComponentType::Float || info.byte_size != sizeof(uint32_t)
+	            : info.type != Format::ComponentType::Uscaled &&
+	                  info.type != Format::ComponentType::Sscaled);
 	return info;
+}
+
+bool PackedFloatResult(const Format::BufferFormatInfo& info) {
+	return info.type != Format::ComponentType::Uint && info.type != Format::ComponentType::Sint;
+}
+
+// Bits of a decoded value as ResultVector consumes them for a uint image: 32-bit words, or the
+// half in the low 16 bits for a D16 read.
+uint32_t PackedResultBits(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t value_f32) {
+	if (mem.data_bits != 16u) {
+		return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), value_f32);
+	}
+	const auto pair = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 2), pair,
+	                              value_f32, ZeroF32(ctx.state));
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpExtInst, TypeU32(ctx.state), result, GlslStd450(ctx.state),
+	                              GLSLstd450PackHalf2x16, pair);
+	return result;
+}
+
+uint32_t PackedOneBits(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                       const Format::BufferFormatInfo& info) {
+	if (!PackedFloatResult(info)) {
+		return ConstantU32(ctx.state, 1u);
+	}
+	return ConstantU32(ctx.state, mem.data_bits == 16u ? 0x3c00u : 0x3f800000u);
+}
+
+// One component of a packed word, decoded to the guest's number format.
+uint32_t DecodePackedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                               const Format::BufferFormatInfo& info, uint32_t packed,
+                               uint32_t component) {
+	using Format::ComponentType;
+	const auto bits = info.component_bits[component];
+	const bool sign = info.type == ComponentType::Snorm || info.type == ComponentType::Sscaled ||
+	                  info.type == ComponentType::Sint;
+	const auto value = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(
+	    sign ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, TypeU32(ctx.state), value, packed,
+	    ConstantU32(ctx.state, info.component_bit_offset[component]), ConstantU32(ctx.state, bits));
+	if (!PackedFloatResult(info)) {
+		return value;
+	}
+	auto converted =
+	    Unary(ctx.state, sign ? spv::OpConvertSToF : spv::OpConvertUToF, TypeF32(ctx.state), value);
+	if (info.type == ComponentType::Unorm) {
+		converted = Binary(ctx.state, spv::OpFDiv, TypeF32(ctx.state), converted,
+		                   ConstantF32Value(ctx.state, float((1u << bits) - 1u)));
+	} else if (info.type == ComponentType::Snorm) {
+		converted          = Binary(ctx.state, spv::OpFDiv, TypeF32(ctx.state), converted,
+		                            ConstantF32Value(ctx.state, float((1u << (bits - 1u)) - 1u)));
+		const auto clamped = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpExtInst, TypeF32(ctx.state), clamped,
+		                              GlslStd450(ctx.state), GLSLstd450FMax, converted,
+		                              ConstantF32Value(ctx.state, -1.0f));
+		converted = clamped;
+	}
+	return PackedResultBits(ctx, mem, converted);
+}
+
+// Normalized backing value back to the scaled integer it stands for.
+float ScaledFactor(const Format::BufferFormatInfo& info) {
+	const auto bits = info.component_bits[0];
+	return info.type == Format::ComponentType::Sscaled ? float((1u << (bits - 1u)) - 1u)
+	                                                   : float((1u << bits) - 1u);
 }
 
 uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem) {
@@ -624,6 +693,10 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	}
 	uint32_t components[4] {};
 	for (uint32_t component = 0; component < info.component_count; component++) {
+		if (info.packed_bitfield && PackedFloatResult(info)) {
+			components[component] = DecodePackedComponent(ctx, mem, info, packed, component);
+			continue;
+		}
 		components[component] = ctx.state.builder.AllocateId();
 		if (info.packed_bitfield) {
 			ctx.state.builder.AddFunction(spv::OpBitFieldUExtract, scalar_type,
@@ -633,9 +706,11 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 		} else {
 			ctx.state.builder.AddFunction(spv::OpCompositeExtract, scalar_type,
 			                              components[component], texel, component);
-			// UNorm backing preserves the guest's filtering; scaling precedes swizzle constants.
-			components[component] = Binary(ctx.state, spv::OpFMul, scalar_type, components[component],
-			                               ConstantF32Value(ctx.state, 255.0f));
+			// Normalized backing preserves the guest's filtering; scaling precedes swizzle
+			// constants.
+			components[component] =
+			    Binary(ctx.state, spv::OpFMul, scalar_type, components[component],
+			           ConstantF32Value(ctx.state, ScaledFactor(info)));
 		}
 	}
 	for (uint32_t component = info.component_count; component < 4u; component++) {
@@ -647,8 +722,8 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	for (uint32_t component = 0; component < 4u; component++) {
 		const auto selector = (swizzle >> (component * 3u)) & 7u;
 		if (selector == 1u) {
-			selected[component] = info.packed_bitfield ? ConstantU32(ctx.state, 1u)
-			                                          : ConstantF32Value(ctx.state, 1.0f);
+			selected[component] = info.packed_bitfield ? PackedOneBits(ctx, mem, info)
+			                                           : ConstantF32Value(ctx.state, 1.0f);
 		} else if (selector >= 4u) {
 			selected[component] = components[selector - 4u];
 		} else {
@@ -674,17 +749,16 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	const auto vector_type   = ImageVectorType(ctx.state, numeric_class, 4);
 	if (selector < 4u) {
 		uint32_t value;
-		switch (info.type) {
-			case Format::ComponentType::Uscaled:
-				value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
-				break;
-			default: value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u); break;
+		if (!info.packed_bitfield) {
+			value = ConstantF32Value(ctx.state, selector == 1u ? 1.0f : 0.0f);
+		} else {
+			value = selector == 1u ? PackedOneBits(ctx, mem, info) : ConstantU32(ctx.state, 0u);
 		}
 		return ctx.state.builder.Constant(spv::OpConstantComposite, vector_type, value, value,
 		                                  value, value);
 	}
 	if (!info.packed_bitfield) {
-		const auto scale  = ConstantF32Value(ctx.state, 255.0f);
+		const auto scale  = ConstantF32Value(ctx.state, ScaledFactor(info));
 		const auto scales = ctx.state.builder.Constant(spv::OpConstantComposite, vector_type,
 		                                                scale, scale, scale, scale);
 		return Binary(ctx.state, spv::OpFMul, vector_type, gathered, scales);
@@ -695,8 +769,12 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		const auto packed = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), packed, gathered,
 		                              lane);
-		values[lane]        = ctx.state.builder.AllocateId();
 		const auto physical = (selector - 4u) % info.component_count;
+		if (PackedFloatResult(info)) {
+			values[lane] = DecodePackedComponent(ctx, mem, info, packed, physical);
+			continue;
+		}
+		values[lane] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(ctx.state), values[lane],
 		                              packed,
 		                              ConstantU32(ctx.state, info.component_bit_offset[physical]),

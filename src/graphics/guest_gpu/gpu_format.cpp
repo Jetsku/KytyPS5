@@ -3,7 +3,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <atomic>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::Prospero {
 namespace {
@@ -16,22 +18,43 @@ struct FormatInfo {
 	bool               sampled_texture;
 	bool               uint_texture;
 	bool               sint_texture = false;
+	// KYTY_PACKED_TEXTURES=1 only (the entry is absent otherwise, as before).
+	bool               packed_textures_only = false;
 };
+
+// KYTY_PACKED_TEXTURES=1 (from usa-ratt/KytyPS5-GT7 141dca3a7 round 140, Franseven): scaled
+// formats sample through the normalized format of the same layout (the shader scales back), and
+// the packed 11_11_10 UNorm/UScaled layouts (formats 30 and 32, GT7) through a k32UInt backing the
+// shader decodes. Off: those draws' textures stay null, as before.
+bool PackedTexturesEnabled() {
+	static std::atomic<int> value {-1};
+	auto                    current = value.load(std::memory_order_relaxed);
+	if (current < 0) {
+		const char* text = std::getenv("KYTY_PACKED_TEXTURES");
+		current          = text != nullptr && text[0] == '1' ? 1 : 0;
+		value.store(current, std::memory_order_relaxed);
+	}
+	return current != 0;
+}
 
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
 	{BufferFormat::k8SNorm, 1, 0, 1, true, false},
+	{BufferFormat::k8SScaled, 1, 0, 0, true, false, false, true},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
 	{BufferFormat::k8SInt, 1, 0, 1, true, false, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
+	{BufferFormat::k16UScaled, 2, 0, 0, true, false, false, true},
+	{BufferFormat::k16SScaled, 2, 0, 0, true, false, false, true},
 	{BufferFormat::k16UInt, 2, 0, 2, true, true},
 	{BufferFormat::k16SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k16Float, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UScaled, 2, 0, 0, true, false},
 	{BufferFormat::k8_8SNorm, 2, 0, 2, true, false},
+	{BufferFormat::k8_8SScaled, 2, 0, 0, true, false, false, true},
 	{BufferFormat::k8_8UInt, 2, 0, 2, true, true},
 	{BufferFormat::k8_8SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k32UInt, 4, 0, 4, true, true},
@@ -39,9 +62,15 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32Float, 4, 0, 4, true, false},
 	{BufferFormat::k16_16UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k16_16SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k16_16UScaled, 4, 0, 0, true, false, false, true},
+	{BufferFormat::k16_16SScaled, 4, 0, 0, true, false, false, true},
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	// Packed layouts without a sampleable host format: a k32UInt backing the shader decodes
+	// (RemapTextureFormat), so they read as uint images.
+	{BufferFormat::k11_11_10UNorm, 4, 0, 0, true, true, false, true},
+	{BufferFormat::k11_11_10UScaled, 4, 0, 0, true, true, false, true},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
@@ -49,6 +78,8 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k10_10_10_2UInt, 4, 0, 4, true, true},
 	{BufferFormat::k8_8_8_8UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k8_8_8_8SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k8_8_8_8UScaled, 4, 0, 0, true, false, false, true},
+	{BufferFormat::k8_8_8_8SScaled, 4, 0, 0, true, false, false, true},
 	{BufferFormat::k8_8_8_8UInt, 4, 0, 4, true, true},
 	{BufferFormat::k8_8_8_8SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k32_32UInt, 8, 0, 8, true, true},
@@ -56,6 +87,8 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32_32Float, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16UNorm, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16SNorm, 8, 0, 8, true, false},
+	{BufferFormat::k16_16_16_16UScaled, 8, 0, 0, true, false, false, true},
+	{BufferFormat::k16_16_16_16SScaled, 8, 0, 0, true, false, false, true},
 	{BufferFormat::k16_16_16_16UInt, 8, 0, 8, true, true},
 	{BufferFormat::k16_16_16_16SInt, 8, 0, 8, true, false, true},
 	{BufferFormat::k16_16_16_16Float, 8, 0, 8, true, false},
@@ -177,7 +210,11 @@ constexpr auto kFormatInfoLookup = MakeFormatInfoLookup();
 
 const FormatInfo* FindFormatInfo(BufferFormat format) {
 	const auto index = static_cast<size_t>(format);
-	return index < kFormatInfoLookup.size() ? kFormatInfoLookup[index] : nullptr;
+	const auto* info = index < kFormatInfoLookup.size() ? kFormatInfoLookup[index] : nullptr;
+	if (info != nullptr && info->packed_textures_only && !PackedTexturesEnabled()) {
+		return nullptr;
+	}
+	return info;
 }
 
 } // namespace
@@ -247,6 +284,27 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		default: break;
+	}
+	if (!PackedTexturesEnabled()) {
+		return format;
+	}
+	// KYTY_PACKED_TEXTURES: scaled formats through the normalized format of the same layout,
+	// which keeps filtering (the shader scales back; SScaled's most negative value reads one
+	// higher, as SNorm clamps it to -1); packed 11_11_10 UNorm/UScaled as the raw word.
+	switch (format) {
+		case BufferFormat::k8SScaled: return BufferFormat::k8SNorm;
+		case BufferFormat::k16UScaled: return BufferFormat::k16UNorm;
+		case BufferFormat::k16SScaled: return BufferFormat::k16SNorm;
+		case BufferFormat::k8_8SScaled: return BufferFormat::k8_8SNorm;
+		case BufferFormat::k16_16UScaled: return BufferFormat::k16_16UNorm;
+		case BufferFormat::k16_16SScaled: return BufferFormat::k16_16SNorm;
+		case BufferFormat::k8_8_8_8UScaled: return BufferFormat::k8_8_8_8UNorm;
+		case BufferFormat::k8_8_8_8SScaled: return BufferFormat::k8_8_8_8SNorm;
+		case BufferFormat::k16_16_16_16UScaled: return BufferFormat::k16_16_16_16UNorm;
+		case BufferFormat::k16_16_16_16SScaled: return BufferFormat::k16_16_16_16SNorm;
+		case BufferFormat::k11_11_10UNorm:
+		case BufferFormat::k11_11_10UScaled: return BufferFormat::k32UInt;
 		default: return format;
 	}
 }
