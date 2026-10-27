@@ -187,6 +187,15 @@ void TestDisabledMappingTabs() {
 	Check(mapped.Custom() && mapped.FindKey(SDLK_J) == ControlFromName("Cross") &&
 	          mapped.PadControl(south) == ControlFromName("Circle"),
 	      "explicit mappings no longer override defaults");
+	// Entries another build's launcher wrote (unknown controls, sources or keys) are left out
+	// with KYTY_SKIP_INVALID's default; the known ones still apply.
+	options.keymap = {"Cross=J", "SomeOtherBuildOption=BlueNeon", "Square=NoSuchKey",
+	                  "Pad:NoSuchControl=South", "Pad:Triangle=NoSuchSource", "Pad:Circle=South"};
+	Config::Load(options);
+	const InputMap unknown;
+	Check(unknown.Custom() && unknown.FindKey(SDLK_J) == ControlFromName("Cross") &&
+	          unknown.PadControl(south) == ControlFromName("Circle"),
+	      "unknown mapping entries were not left out");
 }
 } // namespace
 
