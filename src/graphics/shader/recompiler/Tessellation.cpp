@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/skipInvalid.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -12,8 +13,11 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
@@ -60,7 +64,8 @@ bool MergeTessellationJoin(TessellationJoin& join, const TessellationRegisters& 
 
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
                                    uint32_t control_points, uint32_t input_stride, uint64_t hash,
-                                   std::unordered_map<uint32_t, uint32_t>* constant_stores = nullptr) {
+                                   std::unordered_map<uint32_t, uint32_t>* constant_stores = nullptr,
+                                   std::string* rejection = nullptr) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
@@ -69,6 +74,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	const auto dump = [&] {
 		if (const char* env = std::getenv("KYTY_TESS_DUMP"); env != nullptr && env[0] == '1')
 			LOGF("%s\n", ProgramToString(program).c_str());
+	};
+	// GT7 (usa-ratt/KytyPS5-GT7 round 138): a program this analysis cannot model ended the
+	// emulator. With KYTY_SKIP_INVALID (default on) the set is rejected and its patch draws are
+	// skipped instead; the first failure is kept for the caller's log.
+	std::string failure;
+	const auto  fail = [&](std::string why) {
+		if (!Common::SkipInvalidEnabled()) EXIT("%s\n", why.c_str());
+		if (failure.empty()) failure = std::move(why);
 	};
 	TessellationRegisters entry {};
 	entry[local ? 3u : 1u] =
@@ -175,18 +188,20 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				const auto address = read(inst.src0);
 				if (address.kind != Kind::Affine) {
 					dump();
-					EXIT("%s tessellation address is not affine at pc 0x%08x (shader 0x%016" PRIx64
-					     ")\n",
-					     stage_name, inst.pc, hash);
+					fail(fmt::format("{} tessellation address is not affine at pc 0x{:08x} (shader "
+					                 "0x{:016x})",
+					                 stage_name, inst.pc, hash));
+					return false;
 				}
 				if (address.coefficient != 0u) {
 					const auto expected = control_read ? input_stride : stride;
 					if ((address.coefficient & 3u) != 0u ||
 					    (expected != 0u && expected != address.coefficient)) {
 						dump();
-						EXIT("%s tessellation stride %u conflicts with %u at pc 0x%08x (shader "
-						     "0x%016" PRIx64 ")\n",
-						     stage_name, address.coefficient, expected, inst.pc, hash);
+						fail(fmt::format("{} tessellation stride {} conflicts with {} at pc 0x{:08x} "
+						                 "(shader 0x{:016x})",
+						                 stage_name, address.coefficient, expected, inst.pc, hash));
+						return false;
 					}
 					if (!control_read) stride = address.coefficient;
 				} else if (control_store && constant_stores != nullptr) {
@@ -261,9 +276,13 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	// A join register only moves from unreached to known to Unknown, so this ends.
 	while (pass(false)) {}
 	pass(true);
-	if (stride == 0u) {
+	if (failure.empty() && stride == 0u) {
 		dump();
-		EXIT("%s tessellation stride was not found (shader 0x%016" PRIx64 ")\n", stage_name, hash);
+		fail(fmt::format("{} tessellation stride was not found (shader 0x{:016x})", stage_name, hash));
+	}
+	if (!failure.empty()) {
+		if (rejection != nullptr) *rejection = failure;
+		return 0u;
 	}
 	return stride;
 }
@@ -323,9 +342,10 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 
 } // namespace
 
-void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
+bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info, uint64_t local_hash,
-                                 uint64_t control_hash, std::span<const uint32_t> evaluation) {
+                                 uint64_t control_hash, std::span<const uint32_t> evaluation,
+                                 std::string* rejection) {
 	// Every tessellated draw prepares its programs; the interface depends only on
 	// the two programs and the control point counts.
 	struct Key {
@@ -350,16 +370,39 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		if (const auto found = strides.find(key); found != strides.end()) {
 			info.ls_stride = found->second.first;
 			info.hs_stride = found->second.second;
-			return;
+			// A rejected set is cached as zero strides (its reason was logged once).
+			if (info.ls_stride == 0u || info.hs_stride == 0u) {
+				if (rejection != nullptr) *rejection = "rejected before";
+				return false;
+			}
+			return true;
 		}
 	}
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
-	info.ls_stride =
-	    ReflectTessellationStride(local_program, true, info.input_control_points, 0u, local_hash);
-	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
-	                                           info.ls_stride, control_hash);
+	std::string why;
+	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u,
+	                                           local_hash, nullptr, &why);
+	info.hs_stride = info.ls_stride == 0u
+	                     ? 0u
+	                     : ReflectTessellationStride(control_program, false,
+	                                                 info.output_control_points, info.ls_stride,
+	                                                 control_hash, nullptr, &why);
+	if (info.ls_stride == 0u || info.hs_stride == 0u) {
+		LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64
+		     " not supported, its patch draws are skipped: %s\n",
+		     local_hash, control_hash, why.c_str());
+		std::printf("Warning: tessellation set LS 0x%016" PRIx64 " / HS 0x%016" PRIx64
+		            " not supported (%s); its patch draws are skipped (KYTY_SKIP_INVALID)\n",
+		            local_hash, control_hash, why.c_str());
+		if (cacheable) {
+			std::lock_guard lock(mutex);
+			strides.emplace(key, std::pair {0u, 0u});
+		}
+		if (rejection != nullptr) *rejection = why;
+		return false;
+	}
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u domain=%u "
 	     "partitioning=%u topology=%u levels=%g..%g (LS 0x%016" PRIx64 ", HS 0x%016" PRIx64 ")\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
@@ -378,6 +421,7 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		std::lock_guard lock(mutex);
 		strides.emplace(key, std::pair {info.ls_stride, info.hs_stride});
 	}
+	return true;
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options,

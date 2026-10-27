@@ -170,7 +170,21 @@ void LinkPixelParameters(bool link, ShaderVertexInputInfo& vertex, const ShaderP
 }
 
 // Entries from older revisions accumulate in the driver cache; start over beyond this size.
-constexpr uint64_t MaxDriverCacheFileSize = 512ull * 1024 * 1024;
+// KYTY_DRIVER_CACHE_MAX_MB (default 512, at most 3584: vkGetPipelineCacheData sizes past 4 GiB
+// are refused) raises it per title. GT7's pipelines are huge (usa-ratt/KytyPS5-GT7 rounds 65 and
+// 92 measured 0.8 to 3.75 GB): at 512 MB the cache was discarded at every start, so each session
+// compiled everything again.
+uint64_t DriverCacheFileCap() {
+	static const uint64_t cap = [] {
+		uint64_t mb = 512;
+		if (const char* value = std::getenv("KYTY_DRIVER_CACHE_MAX_MB");
+		    value != nullptr && value[0] != '\0') {
+			mb = std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 64u, 3584u);
+		}
+		return mb * 1024ull * 1024ull;
+	}();
+	return cap;
+}
 
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
@@ -223,14 +237,14 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 
 // Cache file layout: DriverCacheSignature text, XXH3-64 of the payload, payload
 // (vkGetPipelineCacheData output). Fills `payload` and returns true only for a complete,
-// matching file within MaxDriverCacheFileSize.
+// matching file within DriverCacheFileCap().
 bool ReadDriverCacheFile(const std::filesystem::path& file_path, const std::string& signature,
                          std::vector<uint8_t>& payload, bool log_invalid) {
 	payload.clear();
 	const auto   path = Common::PathToString(file_path);
 	Common::File file(file_path, Common::File::Mode::Read);
 	const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-	if (file_size < signature.size() + sizeof(uint64_t) || file_size > MaxDriverCacheFileSize) {
+	if (file_size < signature.size() + sizeof(uint64_t) || file_size > DriverCacheFileCap()) {
 		file.Close();
 		if (log_invalid) {
 			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
@@ -6231,7 +6245,7 @@ void PipelineCache::RunListPrepare() {
 	                 static_cast<double>(CompileClockNs() - begin) / 1e9, static_cast<double>(shaders_ns) / 1e9,
 	                 static_cast<double>(CompileClockNs() - begin - shaders_ns) / 1e9, t.replayed.load(),
 	                 t.journal_built.load(), t.prewarm_built.load(), size,
-	                 size > MaxDriverCacheFileSize ? " (over the 512 MB file cap: the next start discards it)" : "");
+	                 size > DriverCacheFileCap() ? " (over the file cap, KYTY_DRIVER_CACHE_MAX_MB: the next start discards it)" : "");
 	std::fflush(nullptr);
 	std::_Exit(0);
 }
@@ -6541,6 +6555,9 @@ void PipelineCache::InitializeProgramDiskCache() {
 	settings.path           = path;
 	settings.identity       = ShaderRecompiler::CodegenFingerprint();
 	settings.periodic_saves = EnvU64("KYTY_PROGRAM_CACHE_SAVE", 1) != 0;
+	// KYTY_PROGRAM_CACHE_MAX_MB (default 512, 64..3584): GT7 fills 512 MiB of translated programs
+	// in its first sessions, after which new programs were no longer kept.
+	settings.max_file_bytes = std::clamp<uint64_t>(EnvU64("KYTY_PROGRAM_CACHE_MAX_MB", 512), 64u, 3584u) << 20u;
 	const auto& properties  = m_graphics.GetPhysicalDeviceProperties();
 	const auto  device      = fmt::format("device {:08x}:{:08x}:{:08x}", properties.vendorID,
 	                                      properties.deviceID, properties.driverVersion);
@@ -6629,7 +6646,7 @@ struct PipelineCache::DriverCacheSaver {
 		}
 	}
 
-	// WriteDriverCache result of a periodic save skipped for exceeding MaxDriverCacheFileSize.
+	// WriteDriverCache result of a periodic save skipped for exceeding DriverCacheFileCap().
 	static constexpr uint64_t WriteOversized = UINT64_MAX;
 
 	PipelineCache&        cache;
@@ -6701,12 +6718,12 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (periodic && prefix.size() + payload.size() > MaxDriverCacheFileSize) {
+	if (periodic && prefix.size() + payload.size() > DriverCacheFileCap()) {
 		// The loader rejects such a file and starts over; keep the last file that it accepts.
 		// The exit save still writes it, which is what resets an overgrown cache.
 		PipelineCacheLog("Vulkan pipeline cache: {} bytes exceed the {} byte cap; periodic saves "
 		                 "stop, the exit save still writes it",
-		                 payload.size(), MaxDriverCacheFileSize);
+		                 payload.size(), DriverCacheFileCap());
 		return DriverCacheSaver::WriteOversized;
 	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
@@ -7211,8 +7228,22 @@ void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
 			// Upstream feed075a9. CLIP_DISABLE also disables user planes. How they combine with
 			// shader clip and cull distances is unverified; draw push constants reach VS/mesh and
 			// PS only, and the generated RECTLIST stages do not forward clip distances.
-			EXIT_NOT_IMPLEMENTED((last_vertex_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 ||
-			                     tess_active || rect_list);
+			const bool unmodelled = (last_vertex_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 ||
+			                        tess_active || rect_list;
+			if (unmodelled && Common::SkipInvalidEnabled()) {
+				// GT7 (usa-ratt/KytyPS5-GT7 round 104): tessellated draws (Tokyo, the LM55 VGT
+				// page) set user planes; they are drawn without the planes instead of ending.
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 4u) {
+					LOGF("User clip planes 0x%02x ignored (shader clip distances 0x%04x, "
+					     "tessellation %d, rect list %d)\n",
+					     static_cast<unsigned>(clip_control.user_clip_planes),
+					     static_cast<unsigned>(last_vertex_stage.pa_cl_vs_out_cntl & 0xffffu),
+					     tess_active ? 1 : 0, rect_list ? 1 : 0);
+				}
+				return;
+			}
+			EXIT_NOT_IMPLEMENTED(unmodelled);
 			last_vertex_stage.user_clip_planes = clip_control.user_clip_planes;
 		}
 		return;
@@ -7263,7 +7294,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	    "Programs::PrepareStatic", TracyFunction, TracyFile, static_cast<uint32_t>(__LINE__), 0};
 	Profiler::ScopedBlock static_zone(&prepare_static_location, Profiler::DetailedEnabled());
 	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		bool unsupported = false;
+		vertex_params    = PrepareTessellationPrograms(vertex_regs, context, vertex_info,
+		                                               Common::SkipInvalidEnabled() ? &unsupported
+		                                                                               : nullptr);
+		if (unsupported) {
+			return SkipUnmaterializable("a tessellated draw's LS/HS/TES set is not supported");
+		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}

@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -34,6 +35,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -1430,16 +1432,44 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            std::array<ShaderVertexInputInfo, 3>& input_info) {
+                            std::array<ShaderVertexInputInfo, 3>& input_info, bool* unsupported) {
 	const auto& sh        = context.GetShaderRegisters();
 	const auto  local     = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
-	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
-	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
-	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
-	EXIT_NOT_IMPLEMENTED((context.GetShaderStages() & 0x4u) == 0 ||
-	                     (context.GetShaderStages() & 0x00600020u) != 0);
+	if (unsupported != nullptr) *unsupported = false;
+	const bool unsupported_types = local.type != Prospero::ShaderBinaryType::kHsFront ||
+	                               control.type != Prospero::ShaderBinaryType::kHsBack ||
+	                               evaluation.type != Prospero::ShaderBinaryType::kGs;
+	const uint32_t stages             = context.GetShaderStages();
+	const bool     unsupported_stages = (stages & 0x4u) == 0 || (stages & 0x00600020u) != 0;
+	// GT7 (usa-ratt/KytyPS5-GT7 round 138): a set this path cannot run (no hull stage, a GS after
+	// the tessellator, a wave32 hull or domain stage, other binary types) has its patch draws
+	// skipped with KYTY_SKIP_INVALID (default on) instead of ending the emulator. Logged once per
+	// set and stage mask.
+	if ((unsupported_types || unsupported_stages) && unsupported != nullptr &&
+	    Common::SkipInvalidEnabled()) {
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		std::scoped_lock                    lock(logged_mutex);
+		if (logged.size() < 64u &&
+		    logged.insert(regs.ls_regs.data_addr ^ (uint64_t {stages} << 1u)).second) {
+			LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64
+			     " not supported, its patch draws are skipped: VGT_SHADER_STAGES_EN 0x%08x "
+			     "(%s%s%s%s), binary types %u/%u/%u\n",
+			     regs.ls_regs.data_addr, regs.hs_regs.data_addr, stages,
+			     (stages & 0x4u) == 0 ? "no hull stage; " : "",
+			     (stages & 0x20u) != 0 ? "a geometry shader after the tessellator; " : "",
+			     (stages & 0x00200000u) != 0 ? "wave32 hull stage; " : "",
+			     (stages & 0x00400000u) != 0 ? "wave32 domain stage" : "",
+			     static_cast<unsigned>(local.type), static_cast<unsigned>(control.type),
+			     static_cast<unsigned>(evaluation.type));
+		}
+		*unsupported = true;
+		return {};
+	}
+	EXIT_NOT_IMPLEMENTED(unsupported_types);
+	EXIT_NOT_IMPLEMENTED(unsupported_stages);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
@@ -1490,8 +1520,14 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	// The analysis caches the LS/HS strides per program pair and control point counts itself
 	// (the tess line's cache; int21's per-pair layout cache of upstream c71589124 is not used with it).
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess, params[0].hash,
-	                                              params[1].hash, params[2].code);
+	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess,
+	                                                   params[0].hash, params[1].hash,
+	                                                   params[2].code)) {
+		// The analysis logged the set once; without a caller that can skip, end as before.
+		EXIT_IF(unsupported == nullptr);
+		*unsupported = true;
+		return {};
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}
