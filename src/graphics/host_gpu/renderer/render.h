@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <functional>
 #include <array>
 #include <memory>
 #include <optional>
@@ -1245,6 +1246,25 @@ private:
 	                       uint32_t groups_z);
 	struct CallSplitState;
 	std::shared_ptr<CallSplitState> m_call_split; // shared_ptr: destroyed where it is complete
+	// KYTY_CALL_PARTITIONS (callPartitionDispatch.cpp, shader/recompiler/ShaderCalls.h): a dispatch of
+	// a partitioned program runs once per partition. A step is the partition one run of
+	// DispatchDirectOne / DispatchIndirectOne dispatches (its code, report set and target).
+	struct PartitionStep {
+		const void* code   = nullptr; // a CallSplit::Code
+		uint64_t    report = 0;
+		uint64_t    target = 0;
+	};
+	void DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                       uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                       bool async_compute, const PartitionStep* step,
+	                       std::shared_ptr<const void>* partition_run);
+	void DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+	                         uint32_t mode, bool async_compute, const PartitionStep* step,
+	                         std::shared_ptr<const void>* partition_run);
+	void DispatchPartitions(CommandBuffer& buffer, const std::shared_ptr<const void>& run,
+	                        const std::function<void(const PartitionStep&)>& dispatch);
+	struct CallPartitionState;
+	std::shared_ptr<CallPartitionState> m_call_partition;
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;

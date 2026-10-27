@@ -219,6 +219,10 @@ public:
 	// leaves the dispatch's run (a CallSplit::Run) for TakeCallSplitRun.
 	static void SelectCallSplitCode(const void* code);
 	[[nodiscard]] static std::shared_ptr<const void> TakeCallSplitRun();
+	// KYTY_CALL_PARTITIONS: the dispatch's partitions (a ShaderRecompiler::CallPartitionRun), and
+	// the keys a partition program's report set held.
+	[[nodiscard]] static std::shared_ptr<const void> TakePartitionRun();
+	static void ReportPartitionKeys(uint64_t program, std::span<const uint32_t> keys);
 	// Draw-prep (KYTY_DRAW_PREP_DISPATCH): GetComputeProgram as a speculative preparation, as
 	// PrepareGraphicsProgramsSpeculative for a draw (every read through the active recorder,
 	// nothing synchronized; published programs only, or clean compiles with

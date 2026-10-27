@@ -98,6 +98,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::CallStateStore:
 		case ValueOpcode::CallStateStoreChanged:
 		case ValueOpcode::CallStateProbe:
+		case ValueOpcode::CallStateReport:
 		case ValueOpcode::Barrier:
 		case ValueOpcode::SharedMemoryBarrier: return true;
 		default: return false;

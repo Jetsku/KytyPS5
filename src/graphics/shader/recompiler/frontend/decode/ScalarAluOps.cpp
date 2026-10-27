@@ -334,6 +334,10 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.word_count       = 1u + (simm & 0xfffu);
 		inst.raw[0]           = word;
 		EXIT_IF(word_index + inst.word_count > code.size());
+		// The first payload words too (the partition markers read their register there).
+		for (uint32_t i = 1; i < inst.word_count && i < MaxInstructionRawWords; i++) {
+			inst.raw[i] = code[word_index + i];
+		}
 		return;
 	}
 

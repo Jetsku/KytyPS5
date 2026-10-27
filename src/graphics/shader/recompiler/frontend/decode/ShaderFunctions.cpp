@@ -490,8 +490,47 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 				}
 				return true;
 			};
+			// A partition (ShaderCallSite::partition): the target the dispatch passes in runs its body,
+			// every other one is reported and its lanes leave the wave; then the skip path.
+			const auto marker = [&](CallStateOp op) {
+				result.push_back(EncodeCallStateWord(op, 1u));
+				result.push_back(site.source_reg);
+			};
+			const auto emit_partition = [&](uint32_t restore) -> bool {
+				if (site.addresses.empty()) {
+					marker(CallStateOp::PartitionDrop);
+					skip(0);
+					return true;
+				}
+				std::vector<uint32_t> exits;
+				marker(CallStateOp::PartitionCompare);
+				const auto miss = static_cast<uint32_t>(result.size());
+				result.push_back(SCbranchScc0);
+				if (restore != 0) result.push_back(restore);
+				if (!emit_body(functions.at({site.addresses.front(), site.return_reg}), exits)) return false;
+				relocations.emplace_back(miss, static_cast<uint32_t>(result.size()));
+				marker(CallStateOp::PartitionDrop);
+				skip(restore);
+				merge(exits);
+				return true;
+			};
 			bool emitted = false;
-			if (dual) {
+			if (site.partition && site.addresses.size() > 1u) {
+				reason = "a partition with more than one target";
+				return false;
+			}
+			if (site.partition && !dual) {
+				emitted = emit_partition(0);
+			} else if (site.partition) {
+				const auto select = static_cast<uint32_t>(result.size());
+				result.push_back(SCbranchScc1);
+				std::vector<uint32_t> exits;
+				emitted = emit_partition(SetScc0);
+				exits.push_back(branch());
+				relocations.emplace_back(select, static_cast<uint32_t>(result.size()));
+				emitted = emitted && emit_partition(SetScc1);
+				merge(exits);
+			} else if (dual) {
 				const auto select = static_cast<uint32_t>(result.size());
 				result.push_back(SCbranchScc1);
 				std::vector<uint32_t> exits;

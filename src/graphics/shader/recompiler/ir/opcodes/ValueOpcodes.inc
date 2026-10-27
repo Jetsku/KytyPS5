@@ -235,6 +235,8 @@ VALUE_OPCODE(CallStateLoad, U32, U64)
 VALUE_OPCODE(CallStateStore, Void, U64, U32)
 VALUE_OPCODE(CallStateStoreChanged, Void, U64, U32, U32)
 VALUE_OPCODE(CallStateProbe, Void, U32, U32)
+// KYTY_CALL_PARTITIONS: report set address, key, leader lane (ShaderCalls.h).
+VALUE_OPCODE(CallStateReport, Void, U64, U32, U1)
 VALUE_OPCODE(Ballot, U32x4, U1)
 VALUE_OPCODE(AnyLane, U1, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)

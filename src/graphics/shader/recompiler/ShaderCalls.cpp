@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <fmt/format.h>
 #include <fstream>
+#include <magic_enum.hpp>
+#include <set>
 #include <xxhash.h>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -360,6 +362,197 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 		program.pinned = key;
 	}
 	return true;
+}
+
+bool CallPartitionsEnabled() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_PARTITIONS");
+		return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+	}();
+	return value;
+}
+
+uint32_t CallPartitionMinTargets() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_PARTITION_MIN");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 0)) : 16u;
+	}();
+	return value;
+}
+
+uint32_t CallPartitionMaxParts() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_CALL_PARTITION_MAX");
+		return std::max(text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 0)) : 64u, 1u);
+	}();
+	return value;
+}
+
+// After usa-ratt/KytyPS5-GT7 PartitionUnsafe (round 99): an instruction outside the call that
+// would see lanes a partition dropped (they run in another dispatch of the shader).
+std::string CallPartitionUnsafe(std::span<const uint32_t> code) {
+	Decoder::Program program;
+	Decoder::DecodeProgram(code, program, true);
+	using Decoder::Opcode;
+	for (const auto& inst: program.instructions) {
+		const char* why = nullptr;
+		if (inst.src0.dpp) {
+			why = "DPP reads other lanes";
+		} else if (inst.gds) {
+			why = "GDS is shared between dispatches";
+		} else if (inst.family == Decoder::Family::DS && inst.opcode != Opcode::DS_READ_ADDTID_B32 &&
+		           inst.opcode != Opcode::DS_WRITE_ADDTID_B32) {
+			why = "LDS shares data between lanes";
+		} else {
+			switch (inst.opcode) {
+				case Opcode::S_BARRIER: why = "a barrier waits for the other lanes"; break;
+				case Opcode::S_SENDMSG: why = "a message"; break;
+				case Opcode::V_READLANE_B32:
+				case Opcode::V_WRITELANE_B32:
+				case Opcode::V_PERMLANE16_B32:
+				case Opcode::V_PERMLANEX16_B32: why = "a lane access reads other lanes"; break;
+				case Opcode::IMAGE_GET_LOD:
+				case Opcode::IMAGE_GATHER4_C:
+				case Opcode::IMAGE_GATHER4_C_O:
+				case Opcode::IMAGE_GATHER4H: why = "an implicit level of detail reads other lanes"; break;
+				case Opcode::IMAGE_SAMPLE:
+					if ((inst.image_sample_flags &
+					     (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagLevelZero |
+					      Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagCd)) == 0) {
+						why = "an implicit level of detail reads other lanes";
+					}
+					break;
+				default:
+					if (magic_enum::enum_name(inst.opcode).find("ATOMIC") != std::string_view::npos) {
+						why = "an atomic would run once per partition";
+					}
+					break;
+			}
+		}
+		if (why != nullptr) return fmt::format("{} (pc 0x{:x})", why, inst.pc);
+	}
+	return {};
+}
+
+bool ShaderCallExpander::Partition(std::span<const uint32_t> code, uint64_t base,
+                                   const CompileOptions& options, const Decoder::ShaderCodeReader& read,
+                                   CallPartitionRun& run) {
+	if (!CallPartitionsEnabled() || options.stage != ShaderType::Compute) return false;
+	std::scoped_lock lock(m_mutex);
+	const auto       key = base ^ (options.shader_hash * 0x9e3779b97f4a7c15ull) ^ code.size();
+	auto [entry, inserted] = m_programs.try_emplace(key);
+	auto& program          = entry->second;
+	if (inserted) {
+		const auto analysis = AnalyzeShaderCalls(code, options);
+		if (analysis.calls.empty() || !analysis.failures.empty()) {
+			program.usable = false;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_SHADER_CALLS: {} shader 0x{:016x} is not expanded: {}.\n", StageLabel(options.stage),
+			    options.shader_hash, analysis.calls.empty() ? std::string("no call found") : analysis.failures));
+		}
+		for (const auto& call: analysis.calls) {
+			program.calls.push_back({.trace = call});
+		}
+	}
+	if (!program.usable || program.partition_state < 0) return false;
+	if (program.partition_state == 0) {
+		std::string why;
+		if (program.calls.size() != 1u) {
+			why = fmt::format("{} calls", program.calls.size());
+		} else if (program.calls.front().trace.user_sgpr != UINT32_MAX || !program.calls.front().trace.table) {
+			why = "the call's target is user data, not a table";
+		} else {
+			why = CallPartitionUnsafe(code);
+		}
+		program.partition_state = why.empty() ? 1 : -1;
+		Log::WriteToConsoleAndLog(
+		    why.empty() ? fmt::format("KYTY_CALL_PARTITIONS: CS shader 0x{:016x} can be partitioned.\n",
+		                              options.shader_hash)
+		                : fmt::format("KYTY_CALL_PARTITIONS: CS shader 0x{:016x} is not partitioned: {}.\n",
+		                              options.shader_hash, why));
+		if (!why.empty()) return false;
+	}
+	// The table's targets (read again every rescan_interval dispatches, as Refresh does).
+	auto&         call = program.calls.front();
+	const auto    now  = program.dispatches++;
+	CallTableView view;
+	std::string   why;
+	if (!EvaluateCallTable(*call.trace.table, options.user_data, options.user_data_base, read, view, why)) {
+		return false;
+	}
+	auto [state, fresh] =
+	    call.tables.try_emplace(std::tuple {view.base, view.bytes, view.record_bytes, view.target_offset});
+	if (fresh || (rescan_interval != 0 && now - state->second.scanned_at >= rescan_interval)) {
+		if (!ReadCallTable(view, read, m_table_words, why)) return false;
+		const auto digest = XXH3_64bits(m_table_words.data(), m_table_words.size() * sizeof(uint32_t));
+		if (fresh || digest != state->second.digest) {
+			std::set<uint64_t> found;
+			CallTableTargets(view, m_table_words, found);
+			state->second.targets.assign(found.begin(), found.end());
+		}
+		state->second.digest     = digest;
+		state->second.scanned_at = now;
+	}
+	const auto& targets = state->second.targets;
+	if (targets.size() < CallPartitionMinTargets()) return false;
+	program.partition_targets = targets;
+	run.program               = key;
+	run.shader_hash           = options.shader_hash;
+	run.parts.clear();
+	const auto make_part = [&](uint64_t target) -> const CallPartitionPart* {
+		if (const auto found = program.partition_parts.find(target); found != program.partition_parts.end()) {
+			return found->second.code != nullptr ? &found->second : nullptr;
+		}
+		Decoder::ShaderCallSite site {
+		    .pc = call.trace.pc, .source_reg = call.trace.source_reg, .return_reg = call.trace.return_reg};
+		site.partition = true;
+		if (target != 0) site.addresses.push_back(target);
+		Decoder::ShaderCallExpansion expansion;
+		std::string                  reason;
+		auto&                        part = program.partition_parts[target];
+		part.target                       = target;
+		if (!Decoder::ExpandShaderCalls(code, base, std::span(&site, 1u), read, options.wave_size, expansion,
+		                                reason) ||
+		    (target != 0 && expansion.inlined == 0)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_CALL_PARTITIONS: CS shader 0x{:016x}: no partition for target 0x{:x}: {}.\n",
+			    options.shader_hash, target & AddressMask,
+			    !reason.empty() ? reason
+			                    : (expansion.dropped.empty() ? std::string("not placed") : expansion.dropped.front())));
+			return nullptr;
+		}
+		part.digest = XXH3_64bits(expansion.code.data(), expansion.code.size() * sizeof(uint32_t)) | 1u;
+		part.code   = std::make_shared<const std::vector<uint32_t>>(std::move(expansion.code));
+		m_retained.push_back(part.code);
+		Dump(fmt::format("part_{:016x}_{:x}", options.shader_hash, target & AddressMask), *part.code);
+		return &part;
+	};
+	for (const auto target: program.partition_known) {
+		if (run.parts.size() >= CallPartitionMaxParts()) break;
+		if (!std::ranges::binary_search(targets, target) || m_dropped.contains(target & AddressMask)) continue;
+		if (const auto* part = make_part(target); part != nullptr) run.parts.push_back(*part);
+	}
+	if (run.parts.empty()) {
+		if (const auto* part = make_part(0); part != nullptr) run.parts.push_back(*part);
+	}
+	return !run.parts.empty();
+}
+
+void ShaderCallExpander::ReportPartitionKeys(uint64_t program_key, std::span<const uint32_t> keys) {
+	std::scoped_lock lock(m_mutex);
+	const auto       found = m_programs.find(program_key);
+	if (found == m_programs.end()) return;
+	auto&              program = found->second;
+	std::set<uint32_t> reported(keys.begin(), keys.end());
+	reported.erase(0u);
+	for (const auto target: program.partition_targets) {
+		if (!reported.contains(static_cast<uint32_t>(target) | 1u)) continue;
+		if (std::ranges::find(program.partition_known, target) != program.partition_known.end()) continue;
+		program.partition_known.push_back(target);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_CALL_PARTITIONS: program 0x{:016x}: target 0x{:x} reported ({} known of {} in the table).\n",
+		    program_key, target & AddressMask, program.partition_known.size(), program.partition_targets.size()));
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

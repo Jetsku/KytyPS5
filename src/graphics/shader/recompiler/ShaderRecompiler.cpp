@@ -1207,6 +1207,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		return skipped;
 	}
 
+	// KYTY_CALL_PARTITIONS: a partition program (ShaderCalls.h) drops lanes at its markers.
+	struct PartitionScope {
+		~PartitionScope() { IR::SetPartitionDropLanes(false); }
+	} partition_scope;
+	IR::SetPartitionDropLanes(std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::S_KYTY_CALL_STATE &&
+		       inst.offset == static_cast<uint32_t>(Decoder::CallStateOp::PartitionDrop);
+	}));
+
 	// Call-split programs (CallSplit.h) start with their header marker.
 	std::optional<CallSplit::Translation> split;
 	struct SplitScope {

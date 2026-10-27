@@ -72,7 +72,23 @@ U1 IREmitter::GetExec() {
 	return U1(Emit(ValueOpcode::GetExec));
 }
 
+namespace {
+thread_local bool t_partition_drop_lanes = false;
+} // namespace
+
+void SetPartitionDropLanes(bool value) noexcept {
+	t_partition_drop_lanes = value;
+}
+
+bool PartitionDropLanes() noexcept {
+	return t_partition_drop_lanes;
+}
+
 void IREmitter::SetExec(U1 value) {
+	// KYTY_CALL_PARTITIONS: lanes a partition marker dropped never come back into EXEC.
+	if (t_partition_drop_lanes) {
+		value = LogicalAnd(value, LogicalNot(GetGotoVariable(PartitionDropVariable)));
+	}
 	Emit(ValueOpcode::SetExec, {value});
 }
 

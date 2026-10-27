@@ -96,6 +96,12 @@ void Translator::EmitCallStateRecipe(const void* recipe_pointer, std::vector<IR:
 }
 
 void Translator::S_KYTY_CALL_STATE(const Decoder::Instruction& inst) {
+	if (const auto partition_op = static_cast<Decoder::CallStateOp>(inst.offset);
+	    partition_op == Decoder::CallStateOp::PartitionCompare ||
+	    partition_op == Decoder::CallStateOp::PartitionDrop) {
+		EmitCallPartition(inst);
+		return;
+	}
 	auto* split = CallSplit::Current();
 	EXIT_IF(split == nullptr || program.wave_size != 64u);
 	const auto& header   = split->header;
@@ -266,6 +272,41 @@ void Translator::S_KYTY_CALL_STATE(const Decoder::Instruction& inst) {
 		}
 	}
 	EXIT("unknown S_KYTY_CALL_STATE operation %u at pc 0x%08x", inst.offset, inst.pc);
+}
+
+// KYTY_CALL_PARTITIONS (ShaderCalls.h): the partition markers of an expanded call. The target pair
+// is s[reg:reg+1]; push-data parameters 0/1 are the report set's address, 2/3 the dispatch's target.
+void Translator::EmitCallPartition(const Decoder::Instruction& inst) {
+	EXIT_IF(inst.word_count != 2u);
+	const uint32_t pair_reg = inst.raw[1]; // the payload (DecodeSopp keeps it)
+	EXIT_IF(pair_reg + 1u >= IR::NumScalarRegs);
+	Decoder::Operand lo_operand;
+	lo_operand.kind = Decoder::OperandKind::Sgpr;
+	lo_operand.reg  = pair_reg;
+	Decoder::Operand hi_operand = lo_operand;
+	hi_operand.reg             = pair_reg + 1u;
+	const auto lo    = ReadRawU32(lo_operand);
+	const auto hi    = ReadRawU32(hi_operand);
+	const auto param = [&](uint32_t index) {
+		return IR::U32(ir.Emit(IR::ValueOpcode::CallStateParam, {IR::Value(index)}));
+	};
+	if (static_cast<Decoder::CallStateOp>(inst.offset) == Decoder::CallStateOp::PartitionCompare) {
+		ir.SetScc(ir.LogicalAnd(ir.IEqual(lo, param(IR::CallPartitionParamTargetLo)),
+		                        ir.IEqual(hi, param(IR::CallPartitionParamTargetHi))));
+		return;
+	}
+	// One report per wave: the first active lane inserts the target's low word (with bit 0 set,
+	// so it is never zero) into the dispatch's report set.
+	const auto exec   = ir.GetExec();
+	const auto lane   = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	const auto first  = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {lane, exec}));
+	const auto leader = ir.LogicalAnd(exec, ir.IEqual(lane, first));
+	const auto base   = ir.ConstructU64(param(IR::CallPartitionParamReportLo), param(IR::CallPartitionParamReportHi));
+	ir.Emit(IR::ValueOpcode::CallStateReport, {base, IR::U32(ir.BitwiseOr(lo, IR::U32(IR::Value(1u)))), leader});
+	// The active lanes leave the wave: IREmitter::SetExec keeps them out of every later EXEC.
+	ir.SetGotoVariable(IR::PartitionDropVariable,
+	                   ir.LogicalOr(ir.GetGotoVariable(IR::PartitionDropVariable), exec));
+	ir.SetExec(IR::U1(IR::Value(false)));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

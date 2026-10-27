@@ -572,6 +572,19 @@ struct DescriptorBinding {
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
+// KYTY_CALL_PARTITIONS (ShaderCalls.h): a partition program's call-state push parameters (the
+// report set's device address, the dispatch's target pair) and the goto variable that holds the
+// lanes its drop markers took out of the wave (IREmitter::SetExec leaves them out of EXEC).
+constexpr uint32_t CallPartitionParamReportLo = 0;
+constexpr uint32_t CallPartitionParamReportHi = 1;
+constexpr uint32_t CallPartitionParamTargetLo = 2;
+constexpr uint32_t CallPartitionParamTargetHi = 3;
+constexpr uint32_t CallPartitionReportSlots   = 512;
+constexpr uint32_t PartitionDropVariable      = 0x7ffffff0u;
+// Set by the translation of a program with partition markers (thread of that translation).
+void SetPartitionDropLanes(bool value) noexcept;
+[[nodiscard]] bool PartitionDropLanes() noexcept;
+
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;

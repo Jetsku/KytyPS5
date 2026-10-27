@@ -1315,6 +1315,7 @@ static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderReco
 // lookup produced (taken by the renderer).
 thread_local const ShaderRecompiler::CallSplit::Code*          t_split_code = nullptr;
 thread_local std::shared_ptr<ShaderRecompiler::CallSplit::Run> t_split_run;
+thread_local std::shared_ptr<ShaderRecompiler::CallPartitionRun> t_partition_run;
 
 // Programs with calls go through ExpandComputeCalls: KYTY_SHADER_CALLS (expansion, and splitting
 // with KYTY_SHADER_CALLS_SPLIT) or KYTY_SHADER_CALLS_SPLIT alone (splitting only).
@@ -1326,6 +1327,7 @@ static bool CallProgramsHandled() {
 static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInfo& input_info) {
 	const auto wave_size = input_info.wave_size;
 	t_split_run.reset();
+	t_partition_run.reset();
 	if (const auto* split = std::exchange(t_split_code, nullptr); split != nullptr) {
 		params.guest_base     = params.Base();
 		params.code           = split->words;
@@ -1367,6 +1369,22 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 		return true;
 	}
 	auto&                            expander = CallExpander();
+	// KYTY_CALL_PARTITIONS: one dispatch per known target of a large table call (ShaderCalls.h).
+	if (ShaderRecompiler::CallPartitionsEnabled()) {
+		ShaderRecompiler::CompileOptions part_options;
+		part_options.stage       = ShaderType::Compute;
+		part_options.wave_size   = wave_size;
+		part_options.shader_hash = params.hash;
+		part_options.user_data   = std::span(params.user_data).first(params.user_data_count);
+		auto run = std::make_shared<ShaderRecompiler::CallPartitionRun>();
+		if (expander.Partition(params.code, params.Base(), part_options, read_memory, *run)) {
+			params.guest_base     = params.Base();
+			params.code           = *run->parts.front().code;
+			params.call_expansion = run->parts.front().digest;
+			t_partition_run       = std::move(run);
+			return true;
+		}
+	}
 	ShaderRecompiler::CompileOptions options;
 	options.stage       = ShaderType::Compute;
 	options.wave_size   = wave_size;
@@ -7779,6 +7797,14 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 
 void PipelineCache::SelectCallSplitCode(const void* code) {
 	t_split_code = static_cast<const ShaderRecompiler::CallSplit::Code*>(code);
+}
+
+std::shared_ptr<const void> PipelineCache::TakePartitionRun() {
+	return std::exchange(t_partition_run, nullptr);
+}
+
+void PipelineCache::ReportPartitionKeys(uint64_t program, std::span<const uint32_t> keys) {
+	CallExpander().ReportPartitionKeys(program, keys);
 }
 
 std::shared_ptr<const void> PipelineCache::TakeCallSplitRun() {

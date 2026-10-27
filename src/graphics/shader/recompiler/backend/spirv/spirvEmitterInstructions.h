@@ -246,6 +246,7 @@ void                  EmitCallStateStore(EmitterState& state, uint32_t address, 
 void                  EmitCallStateStoreChanged(EmitterState& state, uint32_t address, uint32_t value,
                                                 uint32_t original);
 void                  EmitCallStateProbe(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitCallStateReport(EmitterState& state, uint32_t base, uint32_t key, uint32_t leader);
 uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);

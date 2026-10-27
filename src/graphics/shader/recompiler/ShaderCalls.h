@@ -61,6 +61,34 @@ void CallTableTargets(const CallTableView& view, std::span<const uint32_t> words
 // KYTY_SHADER_CALLS_STICKY (default on): ShaderCallExpander::sticky.
 [[nodiscard]] bool StickyExpansionsDefault();
 
+// KYTY_CALL_PARTITIONS=1 (default off; on in the GT7 / PPSA03671 presets): a compute program whose
+// one call is a table call with at least KYTY_CALL_PARTITION_MIN targets (default 16), and whose
+// code outside the call cannot see lanes leave the wave (no LDS, barriers, lane reads, DPP,
+// implicit derivatives, atomics or messages), is dispatched once per target ("partition"), each
+// dispatch's program inlining that one target. Lanes calling another target report it (an open
+// hash set in a small device buffer the renderer reads back) and leave the wave, so each lane runs
+// its material in exactly one dispatch. A program none of whose targets is known yet runs one
+// "probe" partition that only reports. Targets stay known (KYTY_CALL_PARTITION_MAX, default 64,
+// partitions per dispatch). After usa-ratt/KytyPS5-GT7 rounds 99 and 118 (799e327cc, 3d2a02104):
+// GT7's material passes call one of about 300 functions; one program with all of them does not
+// compile in minutes, and our split dispatch needs wave64 one-wave workgroups.
+[[nodiscard]] bool     CallPartitionsEnabled();
+[[nodiscard]] uint32_t CallPartitionMinTargets();
+[[nodiscard]] uint32_t CallPartitionMaxParts();
+// Why the code outside the call keeps a program from being partitioned (empty when it does not).
+[[nodiscard]] std::string CallPartitionUnsafe(std::span<const uint32_t> code);
+
+struct CallPartitionPart {
+	std::shared_ptr<const std::vector<uint32_t>> code;
+	uint64_t                                     digest = 0;
+	uint64_t                                     target = 0; // 0: the probe partition
+};
+struct CallPartitionRun {
+	uint64_t                       program     = 0; // report-set key (ShaderCallExpander program)
+	uint64_t                       shader_hash = 0;
+	std::vector<CallPartitionPart> parts;
+};
+
 class ShaderCallExpander {
 public:
 	struct Expanded {
@@ -77,6 +105,12 @@ public:
 	// False (logged once per program) when the program does not expand: it is compiled as is.
 	bool Expand(std::span<const uint32_t> code, uint64_t base, const CompileOptions& options,
 	            const Decoder::ShaderCodeReader& read, Expanded& expanded);
+
+	// KYTY_CALL_PARTITIONS: false when the program is not partitioned (then Expand applies).
+	bool Partition(std::span<const uint32_t> code, uint64_t base, const CompileOptions& options,
+	               const Decoder::ShaderCodeReader& read, CallPartitionRun& run);
+	// The keys a partition's report set holds (target low word | 1): their targets become known.
+	void ReportPartitionKeys(uint64_t program, std::span<const uint32_t> keys);
 
 	uint32_t rescan_interval = 64;
 	// Once every call of a program reaches two targets, that expansion is kept for every table
@@ -107,6 +141,12 @@ private:
 		std::map<uint64_t, Cached> expansions; // by target set
 		uint64_t                   pinned = 0; // KYTY_SHADER_CALLS_STICKY: the expansion kept for every table
 		std::string                last_failure;
+		// KYTY_CALL_PARTITIONS: 0 not decided, 1 partitioned, -1 not.
+		int                                    partition_state = 0;
+		std::vector<uint64_t>                  partition_targets; // the table's, ascending
+		std::vector<uint64_t>                  partition_known;   // in the order they were reported
+		std::map<uint64_t, CallPartitionPart>  partition_parts;   // by target (0: the probe)
+
 	};
 
 	bool Refresh(Program& program, std::span<const uint32_t> code, uint64_t base,

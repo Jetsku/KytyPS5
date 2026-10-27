@@ -34,6 +34,10 @@ struct ShaderCallSite {
 	uint32_t              source_reg = 0;
 	uint32_t              return_reg = 0;
 	std::vector<uint64_t> addresses; // ascending, distinct, nonzero
+	// KYTY_CALL_PARTITIONS (ShaderCalls.h): one partition of the call. At most one address, whose
+	// body runs when the target pair equals the target the dispatch passes in (PartitionCompare);
+	// every other target is reported and its lanes dropped (PartitionDrop).
+	bool partition = false;
 
 	bool operator==(const ShaderCallSite&) const = default;
 };

@@ -567,6 +567,23 @@ bool OrderedAppendSplitEnabled() {
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	std::shared_ptr<const void> run;
+	DispatchDirectOne(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
+	                  nullptr, &run);
+	if (run != nullptr) {
+		// KYTY_CALL_PARTITIONS: once per partition (callPartitionDispatch.cpp).
+		DispatchPartitions(buffer, run, [&](const PartitionStep& step) {
+			DispatchDirectOne(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+			                  async_compute, &step, nullptr);
+		});
+	}
+}
+
+void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer,
+                                       uint32_t thread_group_x, uint32_t thread_group_y,
+                                       uint32_t thread_group_z, uint32_t mode, bool async_compute,
+                                       const PartitionStep*         step,
+                                       std::shared_ptr<const void>* partition_run) {
 	KYTY_GPU_OP_SITE("dispatch");
 	// KYTY_CP_GAP_STATS: this scope's phases (drawPrep/cpGaps.h).
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
@@ -639,7 +656,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// register snapshot, when its certificate holds; otherwise the serial lookup. Workers prepare
 	// graphics-queue dispatches only (MakeComputeInputInfo leaves async_compute false).
 	auto* const prepared = std::exchange(m_prepared_dispatch, nullptr);
-	if (prepared != nullptr && !async_compute && DrawPrep::ValidateDispatch(*prepared, input_info)) {
+	if (step != nullptr) {
+		PipelineCache::SelectCallSplitCode(step->code);
+	}
+	if (step == nullptr && prepared != nullptr && !async_compute &&
+	    DrawPrep::ValidateDispatch(*prepared, input_info)) {
 		if (DrawPrep::VerifyMode() != 0) {
 			// The serial lookup on copies; it only reads memory the certificate proved clean.
 			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
@@ -655,6 +676,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info,
 		                                                                 m_compute_prep);
+	}
+	if (step != nullptr) {
+		PipelineCache::SelectCallSplitCode(nullptr);
+	}
+	if (partition_run != nullptr) {
+		if (auto run = PipelineCache::TakePartitionRun(); run != nullptr) {
+			*partition_run = std::move(run);
+			ResetBindings();
+			return;
+		}
 	}
 	CpGaps::Phase(CpGaps::Cat::DispatchOp);
 	// KYTY_RT_DUMP_BVH (diagnostic): before any binding is prepared (its readbacks may flush the
@@ -742,6 +773,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
+	if (step != nullptr && input_info.stage.program->bindings.call_state_dword !=
+	                         ShaderRecompiler::IR::PushData::NoStart) {
+		const auto dword = input_info.stage.program->bindings.call_state_dword;
+		const uint32_t params[ShaderRecompiler::IR::BindingLayout::CallStateDwords] = {
+		    static_cast<uint32_t>(step->report), static_cast<uint32_t>(step->report >> 32u),
+		    static_cast<uint32_t>(step->target), static_cast<uint32_t>(step->target >> 32u), 0u, 0u, 0u};
+		std::copy(std::begin(params), std::end(params), bindings.shader_data.begin() + dword);
+	}
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		// The requested thread extents initialize EXEC (upstream e4aca7a60).
 		std::copy(std::begin(input_info.dispatch_threads_num),
@@ -973,6 +1012,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	std::shared_ptr<const void> run;
+	DispatchIndirectOne(submit_id, buffer, args_addr, mode, async_compute, nullptr, &run);
+	if (run != nullptr) {
+		DispatchPartitions(buffer, run, [&](const PartitionStep& step) {
+			DispatchIndirectOne(submit_id, buffer, args_addr, mode, async_compute, &step, nullptr);
+		});
+	}
+}
+
+void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buffer,
+                                         uint64_t args_addr, uint32_t mode, bool async_compute,
+                                         const PartitionStep*         step,
+                                         std::shared_ptr<const void>* partition_run) {
 	KYTY_GPU_OP_SITE("dispatch.indirect");
 	g_overlap_indirect.fetch_add(1, std::memory_order_relaxed);
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
@@ -1006,7 +1058,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			return;
 		}
 	}
-	if (prepared != nullptr && !async_compute && DrawPrep::ValidateDispatch(*prepared, input_info)) {
+	if (step != nullptr) {
+		PipelineCache::SelectCallSplitCode(step->code);
+	}
+	if (step == nullptr && prepared != nullptr && !async_compute &&
+	    DrawPrep::ValidateDispatch(*prepared, input_info)) {
 		if (DrawPrep::VerifyMode() != 0) {
 			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
 			auto serial_info = input_info;
@@ -1021,6 +1077,16 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_compute_prep);
+	}
+	if (step != nullptr) {
+		PipelineCache::SelectCallSplitCode(nullptr);
+	}
+	if (partition_run != nullptr) {
+		if (auto run = PipelineCache::TakePartitionRun(); run != nullptr) {
+			*partition_run = std::move(run);
+			ResetBindings();
+			return;
+		}
 	}
 	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
 	if (!compute_program) {
@@ -1049,6 +1115,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
+	if (step != nullptr && input_info.stage.program->bindings.call_state_dword !=
+	                         ShaderRecompiler::IR::PushData::NoStart) {
+		const auto dword = input_info.stage.program->bindings.call_state_dword;
+		const uint32_t params[ShaderRecompiler::IR::BindingLayout::CallStateDwords] = {
+		    static_cast<uint32_t>(step->report), static_cast<uint32_t>(step->report >> 32u),
+		    static_cast<uint32_t>(step->target), static_cast<uint32_t>(step->target >> 32u), 0u, 0u, 0u};
+		std::copy(std::begin(params), std::end(params), bindings.shader_data.begin() + dword);
+	}
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
 	if (input_info.stage.program->info.uses_dma) {
