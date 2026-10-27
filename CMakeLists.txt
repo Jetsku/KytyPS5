@@ -554,6 +554,7 @@ list(APPEND kyty_codegen_sources
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_defs.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/viewportTransform.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
 )
