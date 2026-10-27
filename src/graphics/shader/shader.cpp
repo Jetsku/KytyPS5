@@ -1172,7 +1172,30 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 
 	EXIT_NOT_IMPLEMENTED((regs.ps_input_ena & ~supported_ps_input_bits) != 0);
 	EXIT_NOT_IMPLEMENTED((regs.ps_input_addr & ~supported_ps_input_bits) != 0);
-	EXIT_NOT_IMPLEMENTED(regs.ps_input_ena != regs.ps_input_addr);
+	// SPI_PS_INPUT_ADDR lays the VGPRs out, SPI_PS_INPUT_ENA is the part of them the hardware
+	// fills: an input in ADDR alone keeps its VGPRs, with undefined values
+	// (ShaderGetStaticInputInfoPS). Each pair of them once in the log.
+	if (regs.ps_input_ena != regs.ps_input_addr) {
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> reported;
+		bool                                first = false;
+		{
+			std::lock_guard lock(mutex);
+			first =
+			    reported.size() < 64 &&
+			    reported
+			        .insert((static_cast<uint64_t>(regs.ps_input_ena) << 32u) | regs.ps_input_addr)
+			        .second;
+		}
+		if (first) {
+			::printf("PS inputs: SPI_PS_INPUT_ENA = 0x%08" PRIx32
+			         ", SPI_PS_INPUT_ADDR = 0x%08" PRIx32 ", the VGPRs laid out as ADDR\n",
+			         regs.ps_input_ena, regs.ps_input_addr);
+			LOGF("PS inputs: SPI_PS_INPUT_ENA = 0x%08" PRIx32 ", SPI_PS_INPUT_ADDR = 0x%08" PRIx32
+			     ", the VGPRs laid out as ADDR\n",
+			     regs.ps_input_ena, regs.ps_input_addr);
+		}
+	}
 
 	const uint32_t inputs = regs.ps_input_addr;
 	uint32_t       reg    = 0;
@@ -1334,12 +1357,15 @@ static void ShaderGetStaticInputInfoPS(
 	}
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
+	// The VGPRs follow SPI_PS_INPUT_ADDR (layout_inputs); the inputs in both registers are the
+	// ones the hardware fills (active_inputs). They differ only when the game sets them apart.
+	const uint32_t layout_inputs = sh.ps_input_addr;
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
 	if ((active_inputs & 0x00000002u) != 0) {
-		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
+		ps_info.ps_perspective_center_vgpr = (layout_inputs & 0x00000001u) != 0 ? 2u : 0u;
 	}
 	if ((active_inputs & 0x00000004u) != 0) {
-		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
+		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(layout_inputs & 0x3u);
 	}
 	// SPI_PS_INPUT_ADDR order: persp sample, center, centroid (2 VGPRs each), persp pull (3),
 	// linear sample, center, centroid (2 each).
@@ -1363,11 +1389,14 @@ static void ShaderGetStaticInputInfoPS(
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
 	}
-	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
-	ps_info.ps_pos_y                     = (active_inputs & 0x00000200u) != 0;
-	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
-	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
-	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
+	// A position or front-face input in ADDR alone keeps its VGPR: it gets the value anyway (the
+	// hardware leaves it undefined), so the VGPRs after it stay where the shader reads them. The
+	// ancillary VGPR is the last of them; reading the sample index would turn on sample shading.
+	ps_info.ps_pos_x                     = (layout_inputs & 0x00000100u) != 0;
+	ps_info.ps_pos_y                     = (layout_inputs & 0x00000200u) != 0;
+	ps_info.ps_pos_z                     = (layout_inputs & 0x00000400u) != 0;
+	ps_info.ps_pos_w                     = (layout_inputs & 0x00000800u) != 0;
+	ps_info.ps_front_face                = (layout_inputs & 0x00001000u) != 0;
 	// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects integer masks instead of float +/-1.
 	ps_info.ps_front_face_all_bits       = (sh.baryc_cntl & 0x01000000u) != 0;
 	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
