@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -4177,7 +4178,7 @@ private:
 	// interpolated value, a product). Another lane's layer is clamped to the view as well, its texel never seen.
 	uint32_t ArrayIndexBound(const Inst& inst, const MemoryInfo& memory, ValueOpcode op) {
 		const auto dimension = memory.image_dimension;
-		if ((op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw) || memory.image_cube ||
+		if ((op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw) ||
 		    (dimension != Decoder::ImageDimension::Dim1DArray && dimension != Decoder::ImageDimension::Dim2DArray) ||
 		    inst.NumArgs() < 3)
 			return ImageResource::NoArrayIndexBound;

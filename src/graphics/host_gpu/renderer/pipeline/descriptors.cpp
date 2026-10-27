@@ -1072,7 +1072,8 @@ static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, u
 // (ImageResource::max_array_index, computed with KYTY_TEXTURE_LAYER_BOUND=1 only; chenxiao07/KytyPS5
 // d44e93d81). Demon's Souls' texture-pool views read 256 of up to 2,255 layers.
 static uint32_t ArrayViewLayers(const ShaderRecompiler::IR::ImageResource& resource, uint32_t layers) {
-	return resource.max_array_index < layers ? resource.max_array_index + 1u : layers;
+	// (A cube array's layer coordinate counts cubes, its faces six layers each: never bounded.)
+	return !resource.cube && resource.max_array_index < layers ? resource.max_array_index + 1u : layers;
 }
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,

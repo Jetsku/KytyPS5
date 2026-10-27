@@ -281,6 +281,11 @@ public:
 	// restricted to the images whose first byte lies in [address, address + size) (Erlou93/
 	// KytyPS5-Yotei's rule, which acts on images starting at the written address only). GPU thread.
 	void InvalidateMemoryFromGPUImageStarts(uint64_t address, uint64_t size);
+	// Whether a registered image has `info`'s backing (FindImageWithSameBacking under m_lock;
+	// descriptors.cpp HoldLayerRange / HoldFromBaseLevel).
+	[[nodiscard]] bool HoldsImage(const ImageInfo& info);
+	// Whether an image over the range was written by the GPU (KYTY_TEXTURE_REDUCE leaves those whole).
+	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
 	// Whether any cached image overlaps the range (RenderContext::UnmapMemory: CPU-only unmaps skip
 	// the GPU drain).
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
@@ -620,11 +625,6 @@ private:
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
-	// Whether a registered image has `info`'s backing (FindImageWithSameBacking under m_lock;
-	// descriptors.cpp HoldLayerRange, KYTY_TEXTURE_LAYER_RANGE).
-	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
-	// Whether an image over the range was written by the GPU (KYTY_TEXTURE_REDUCE leaves those whole).
-	[[nodiscard]] bool          HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] ImageId       FindImageWithSameBacking(const ImageInfo& requested,
 	                                                     bool exact_format) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
