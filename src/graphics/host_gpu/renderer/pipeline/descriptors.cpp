@@ -3510,10 +3510,51 @@ void NoteRebindAfterJoin(const char* kind, const char* name) {
 	}
 }
 
+void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) {
+	static const uint64_t span = [] {
+		const char* value = std::getenv("KYTY_DMA_PREFAULT_KB");
+		return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 0ull)
+		       << 10u;
+	}();
+	if (span == 0 || stage.program == nullptr || stage.resources == nullptr) {
+		return;
+	}
+	const auto& program = *stage.program;
+	const auto& user    = stage.resources->user_data;
+	// A 64-bit SGPR pair starts at an even register; a pointer a scalar load reads through is
+	// 4-byte aligned. Pages that are not committed are left alone (MakeResident).
+	for (size_t reg = program.user_data_base % 2u; reg + 1u < user.size(); reg += 2u) {
+		const uint32_t low  = user[reg];
+		const uint32_t high = user[reg + 1u];
+		if ((low & 3u) != 0 || high == 0 || high > 0xffffu) {
+			continue;
+		}
+		const uint64_t address = low | (uint64_t {high} << 32u);
+		const auto     made    = buffers.MakeResident(address, span);
+		if (made == 0) {
+			continue;
+		}
+		static std::atomic<uint64_t> total {0};
+		const auto count = total.fetch_add(made, std::memory_order_relaxed) + made;
+		if (count <= 32 || (count & (count - 1u)) == 0) {
+			LOGF("BufferCache: %u pages shader %016" PRIx64 " reads through user data s[%zu:%zu] "
+			     "0x%012" PRIx64 " had no cached buffer: cached before it runs (%" PRIu64
+			     " so far; KYTY_DMA_PREFAULT_KB)\n",
+			     made, program.shader_hash, program.user_data_base + reg,
+			     program.user_data_base + reg + 1u, address, count);
+		}
+	}
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors, bool keep_images) {
 	bool uses_dma = false;
 	bool uses_bvh = false;
+	for (auto* stage: stages) {
+		if (stage->runtime->program->info.uses_dma) {
+			PrefaultDmaPointers(m_context.GetBufferCache(), *stage->runtime);
+		}
+	}
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;

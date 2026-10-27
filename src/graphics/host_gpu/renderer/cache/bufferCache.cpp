@@ -3151,6 +3151,34 @@ bool BufferCache::TakeEagerFlushRequest(bool in_rendering) {
 	return true;
 }
 
+// usa-ratt/KytyPS5-GT7 d3260d78e.
+uint32_t BufferCache::MakeResident(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || vaddr > UINT64_MAX - size) {
+		return 0;
+	}
+	uint32_t   made  = 0;
+	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
+	const auto last  = (vaddr + size - 1u) & ~(CACHING_PAGESIZE - 1u);
+	for (uint64_t page = first; page <= last; page += CACHING_PAGESIZE) {
+		if (!GuestRange {page, CACHING_PAGESIZE}.Valid()) {
+			break;
+		}
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner != nullptr && *owner) {
+			// Read through the page table alone, it would age out of the cache.
+			TouchBuffer(m_slot_buffers[*owner]);
+			continue;
+		}
+		if (Libs::LibKernel::Memory::ClampRangeSizeQuiet(page, CACHING_PAGESIZE) !=
+		    CACHING_PAGESIZE) {
+			continue;
+		}
+		(void)ObtainBuffer(page, CACHING_PAGESIZE, false, false);
+		made++;
+	}
+	return made;
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;

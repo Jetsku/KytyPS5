@@ -123,6 +123,13 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
 NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                 TextureCache::BindingType binding);
 
+// KYTY_DMA_PREFAULT_KB=<n> (default 0, off; usa-ratt/KytyPS5-GT7 d3260d78e): before a shader
+// that reads guest memory through its page table (DMA) runs, the first n KiB its user-data
+// pointers point at are made resident (BufferCache::MakeResident). GT7's light-probe bake reads
+// its per-probe constants that way, a new page per probe; pages it read as zeros wrote whole cubes
+// of NaN (black or tinted lighting, different from load to load).
+void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage);
+
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] uint32_t

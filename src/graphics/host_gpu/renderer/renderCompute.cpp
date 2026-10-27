@@ -749,6 +749,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The native dispatch size bounds workgroup ids for write-range proofs.
 	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
 	bindings.has_dispatch_groups = true;
+	if (program.info.uses_dma) {
+		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
+	}
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	if (program.info.uses_dma) {
@@ -1046,6 +1049,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
+	if (input_info.stage.program->info.uses_dma) {
+		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
+	}
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;
