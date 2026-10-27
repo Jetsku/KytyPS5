@@ -1176,9 +1176,23 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	const auto found               = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	// KYTY_MS_DEPTH_SAMPLE0=1 (usa-ratt/KytyPS5-GT7 rounds 122-124): the shader reads a
+	// multisample depth T# through a single-sample dimension (DescriptorDimension made its image a
+	// single-sample one): the binding gets a copy of the first sample (GT7 replays: the light
+	// sprites' occlusion test, the depth reduction the CPU reads back).
+	const bool single_sample_read =
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
+	const bool ms_depth_sample0 = TextureCache::MsDepthSample0Enabled() && single_sample_read;
+	bool       copy_binding     = false;
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+		if (ms_depth_sample0 && !storage && image->backing.samples > 1) {
+			id           = texture_cache.SingleSampleStencil(id);
+			image        = &texture_cache.GetImage(id);
+			copy_binding = image->backing.samples == 1;
+		}
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
@@ -1188,13 +1202,52 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 			binding.image_id = texture_cache.FindImage(desc);
 			return;
 		}
+		if (ms_depth_sample0 && image->backing.samples > 1) {
+			id           = texture_cache.SingleSampleDepth(id);
+			image        = &texture_cache.GetImage(id);
+			copy_binding = image->backing.samples == 1;
+		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
+		// KYTY_SUB_EXTENT_COPY=1 (usa-ratt/KytyPS5-GT7 429692dd3, Franseven): a texture smaller
+		// than the colour image at its address, with the same memory and tiling (UI text drawn
+		// into part of a wider target), reads a copy of the image's corner: a view of the image
+		// would stretch its coordinates over the whole image.
+		if (TextureCache::SubExtentCopyEnabled()) {
+			if (const auto copy_id = texture_cache.SubExtentCopy(id, desc.info); copy_id != id) {
+				id           = copy_id;
+				image        = &texture_cache.GetImage(id);
+				copy_binding = true; // not memoized either: each resolution refreshes the copy
+			}
+		}
+	}
+	if (ms_depth_sample0 && image->backing.samples > 1) {
+		// A multisample image left for a single-sample shader image (a colour image under a
+		// depth-tiled multisample T#, or a depth image no copy was made of): a mismatch Vulkan
+		// leaves undefined (wrong reads or a lost device), so a null texture instead.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: 0x%012" PRIx64 " %ux%u fmt %d, %u "
+			     "samples, %u layers, %u levels, %s%s: no single-sample copy, a null texture\n",
+			     image->info.data.address, image->info.extent.width, image->info.extent.height,
+			     static_cast<int>(image->info.pixel_format), image->backing.samples,
+			     image->info.resources.layers, image->info.resources.levels,
+			     image->info.IsDepth() ? "a depth image" : "a colour image",
+			     stencil_association ? " (its stencil)" : "");
+		}
+		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                         : TextureCache::BindingType::Texture);
+		binding.image_id = texture_cache.FindImage(desc);
+		return;
 	}
 	binding.image_id = id;
+	if (copy_binding) {
+		// Not memoized: each resolution refreshes the copy from its source.
+		return;
+	}
 	if (memo) {
 		const bool view_rebased =
 		    desc.view_info.base_level != base_level || desc.view_info.base_layer != base_layer;

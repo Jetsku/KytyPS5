@@ -23,6 +23,12 @@ public:
 	KYTY_CLASS_NO_COPY(BlitHelper);
 
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
+	// KYTY_MS_DEPTH_SAMPLE0 (from usa-ratt/KytyPS5-GT7 rounds 122-124): the first sample of a
+	// multisample depth image into a single-sample D32 image of its size and layers
+	// (CopyMsDepthSample0), and the first sample of its stencil into an R8_UINT image
+	// (CopyMsStencilSample0), for texture reads that see it as single-sample.
+	void CopyMsDepthSample0(Image& source, Image& destination);
+	void CopyMsStencilSample0(Image& source, Image& destination);
 
 	// Single-pass, bit-exact replacements for Image::CopyImageWithBuffer between a D32 depth
 	// image (D32_SFLOAT or the depth aspect of D32_SFLOAT_S8_UINT, whose stencil is preserved)
@@ -36,7 +42,12 @@ public:
 	void               CopyColor32ToDepth(Image& source, Image& destination);
 
 private:
-	enum class PipelineKind : uint32_t { ColorToMsDepth, Color32ToDepth };
+	enum class PipelineKind : uint32_t {
+		ColorToMsDepth,
+		Color32ToDepth,
+		MsDepthSample0,
+		MsStencilSample0
+	};
 
 	struct PipelineKey {
 		uint32_t     samples = 1;
@@ -62,6 +73,7 @@ private:
 	};
 
 	[[nodiscard]] vk::Pipeline GetPipeline(PipelineKey key);
+	void                       CopyMsSample0(Image& source, Image& destination, bool stencil);
 	[[nodiscard]] bool         SupportsColor32Side(const Image& color) const;
 
 	GraphicContext&         m_graphics;
@@ -70,6 +82,8 @@ private:
 	vk::PipelineLayout      m_pipeline_layout   = nullptr;
 	vk::ShaderModule        m_vertex_shader     = nullptr;
 	vk::ShaderModule        m_fragment_shader   = nullptr;
+	vk::ShaderModule        m_sample0_shader    = nullptr;
+	vk::ShaderModule        m_stencil0_shader   = nullptr;
 	std::vector<Pipeline>   m_pipelines;
 
 	bool                    m_reinterpret_supported = false;

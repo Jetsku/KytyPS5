@@ -112,11 +112,88 @@ bool NullBufferDescriptor(const ShaderBufferResource& descriptor, bool count = t
 	return true;
 }
 
+// KYTY_MS_DEPTH_SAMPLE0=1 (from usa-ratt/KytyPS5-GT7 round 124): -1 = not read yet.
+std::atomic<int> g_ms_depth_sample0 {-1};
+// KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b): the EQAA FMASK map. -1 = not read yet.
+std::atomic<int> g_eqaa_fmask_map {-1};
+
+bool EqaaFmaskMap() {
+	auto value = g_eqaa_fmask_map.load(std::memory_order_relaxed);
+	if (value < 0) [[unlikely]] {
+		const char* text = std::getenv("KYTY_EQAA_MIXED");
+		value            = text != nullptr && text[0] == '1' ? 1 : 0;
+		g_eqaa_fmask_map.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
+
+// EQAA FMASK formats (kFmask<bits>_S<samples>_F<fragments> with fewer fragments than samples):
+// the number of colour fragments stored per pixel. 0 for formats with one fragment per sample,
+// whose native mapping is the identity.
+uint8_t FmaskEqaaFragmentCount(Prospero::BufferFormat format) {
+	using F = Prospero::BufferFormat;
+	switch (format) {
+		case F::kFmask8_S2_F1:
+		case F::kFmask8_S4_F1:
+		case F::kFmask8_S8_F1:
+		case F::kFmask16_S16_F1: return 1;
+		case F::kFmask8_S4_F2:
+		case F::kFmask16_S8_F2:
+		case F::kFmask32_S16_F2: return 2;
+		case F::kFmask32_S8_F4:
+		case F::kFmask64_S16_F4: return 4;
+		case F::kFmask64_S16_F8: return 8;
+		default: return 0;
+	}
+}
+
+// One 32-bit word of an expanded FMASK value (four bits per sample) covering samples
+// first_sample..first_sample+7. Without EQAA (fragments == 0) sample i maps to host sample i;
+// with EQAA it maps to fragment (i mod fragments), so every index names a host sample that exists.
+constexpr uint32_t FmaskSampleMapWord(uint32_t fragments, uint32_t first_sample) {
+	if (fragments == 0) {
+		return first_sample == 0 ? 0x76543210u : 0xfedcba98u;
+	}
+	uint32_t word = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		word |= ((first_sample + i) % fragments) << (i * 4u);
+	}
+	return word;
+}
+static_assert(FmaskSampleMapWord(0, 0) == 0x76543210u && FmaskSampleMapWord(0, 8) == 0xfedcba98u);
+static_assert(FmaskSampleMapWord(8, 8) == 0x76543210u);
+static_assert(FmaskSampleMapWord(4, 0) == 0x32103210u);
+static_assert(FmaskSampleMapWord(2, 8) == 0x10101010u);
+static_assert(FmaskSampleMapWord(1, 0) == 0u);
+
+bool MsDepthSample0Dimension() {
+	auto value = g_ms_depth_sample0.load(std::memory_order_relaxed);
+	if (value < 0) [[unlikely]] {
+		const char* text = std::getenv("KYTY_MS_DEPTH_SAMPLE0");
+		value            = text != nullptr && text[0] == '1' ? 1 : 0;
+		g_ms_depth_sample0.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
+
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
+	// KYTY_MS_DEPTH_SAMPLE0=1: a multisample depth or stencil T# (depth tiling) read by an
+	// instruction of a single-sample dimension (image_sample, image_load without a sample index)
+	// reads its first sample on the console. The shader gets a single-sample image and the host
+	// binds a single-sample copy of that sample (TextureCache::SingleSampleDepth/Stencil).
+	// Otherwise the shader samples a multisample image (not valid SPIR-V): on NVIDIA the samples
+	// came back interleaved (GT7 replays: light sprites tested the wrong depth, the 16x16 depth
+	// reduction for the CPU read two pictures at once). Multisample colour T#s keep their
+	// multisample dimension.
+	constexpr uint32_t depth_tiling = static_cast<uint32_t>(Prospero::TileMode::kDepth);
+	const bool         single_sample_read =
+	    (requested == Decoder::ImageDimension::Dim2D ||
+	     requested == Decoder::ImageDimension::Dim2DArray) &&
+	    ((descriptor.dwords[3] >> 20u) & 0x1fu) == depth_tiling && MsDepthSample0Dimension();
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
 		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
 		case Prospero::ImageType::kColor1DArray:
@@ -132,12 +209,18 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 			}
 			return Decoder::ImageDimension::Dim2D;
 		case Prospero::ImageType::kColor2DMsaaArray:
+			if (single_sample_read) {
+				return is_array ? Decoder::ImageDimension::Dim2DArray
+				                : Decoder::ImageDimension::Dim2D;
+			}
 			if (is_array) {
 				return Decoder::ImageDimension::Dim2DMsaaArray;
 			}
 			return Decoder::ImageDimension::Dim2DMsaa;
 		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2DMsaa:
+			return single_sample_read ? Decoder::ImageDimension::Dim2D
+			                          : Decoder::ImageDimension::Dim2DMsaa;
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }
@@ -668,6 +751,14 @@ private:
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
+void SetEqaaFmaskMapForTesting(bool enabled) {
+	g_eqaa_fmask_map.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+void SetMsDepthSample0ForTesting(bool enabled) {
+	g_ms_depth_sample0.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 void SetUnmappedBufferProbe(SrtMappedRange probe) {
 	g_unmapped_buffer_probe.store(probe, std::memory_order_relaxed);
 }
@@ -771,6 +862,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
+		image.fmask_fragments =
+		    image.fmask && EqaaFmaskMap() ? FmaskEqaaFragmentCount(format) : uint8_t {0};
 		if (image.fmask) {
 			if (storage || base.depth_compare ||
 			    image.indirect_root != ImageResource::NoIndirectImage ||
@@ -1904,9 +1997,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			const auto& image = images[memory.resource];
 			if (specialization.images[memory.resource].fmask) {
 				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
-				// Vulkan MSAA stores each sample directly; FMASK's four-bit fragment indices
-				// therefore map each coverage sample to the same host sample.
-				constexpr uint32_t indices[] = {0x76543210u, 0xfedcba98u};
+				// The host image holds one sample per guest fragment. FMASK's four-bit fragment
+				// indices map coverage sample i to host sample i, or with EQAA (fewer fragments
+				// than samples, KYTY_EQAA_MIXED) to i mod fragments, so every index names a
+				// sample that exists.
+				const uint32_t fragments_per_pixel =
+				    specialization.images[memory.resource].fmask_fragments;
+				const uint32_t indices[] = {FmaskSampleMapWord(fragments_per_pixel, 0),
+				                            FmaskSampleMapWord(fragments_per_pixel, 8)};
 				std::array<Value, 2> fragments;
 				for (uint32_t component = 0; component < fragments.size(); component++) {
 					const auto selected = block->PrependNewInst(

@@ -28,6 +28,10 @@ struct ResourceSpecialization {
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          bindless                   = false;
+		// KYTY_EQAA_MIXED, EQAA FMASK only: colour fragments stored per pixel (1, 2, 4 or 8) when
+		// the format has fewer fragments than coverage samples, so samples share fragments; 0
+		// otherwise (the identity map).
+		uint8_t                       fmask_fragments            = 0;
 		bool                          operator==(const Image&) const = default;
 	};
 
@@ -53,6 +57,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // KYTY_SPEC_UNMAPPED_NULL: whether a V# base is inside a guest mapping (the binding's test; the V#
 // is nulled when not). Null: off. Set once by the renderer before draws.
 void SetUnmappedBufferProbe(SrtMappedRange probe);
+// Tests: KYTY_MS_DEPTH_SAMPLE0's specialization part (multisample depth T#s read through a
+// single-sample dimension specialize as single-sample images) without the environment.
+void SetMsDepthSample0ForTesting(bool enabled);
+// Tests: KYTY_EQAA_MIXED's FMASK part (EQAA FMASK formats map sample i to fragment i mod
+// fragments) without the environment.
+void SetEqaaFmaskMapForTesting(bool enabled);
 // V#s specialized as null by that rule so far.
 [[nodiscard]] uint64_t UnmappedBufferNulls();
 
