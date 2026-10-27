@@ -95,6 +95,11 @@ public:
 	// scratch) and a completion callback compares both results byte for byte (FrameEvent
 	// TilerImageVerifyChecks / TilerImageVerifyMismatches; the first mismatches are logged).
 	[[nodiscard]] static bool ImageDirectVerifyEnabled();
+	// KYTY_TILER_CAS (default 0): 8- and 16-bit elements are merged into their words with one
+	// compare-and-swap loop instead of an atomicAnd plus an atomicOr (strxno/KytyPS5-GT7
+	// c0afe8d27). The resulting words are the same; only the atomics differ. Read once, at the
+	// first pipeline creation (a specialization constant of the tiler shaders).
+	[[nodiscard]] static bool SubwordCas();
 	// Scratch lifetime: a scratch buffer (GetScratchBuffer, Detile, TransformColor, the internal
 	// passes) returns to the pool or is destroyed once the scheduler tick that last used it has
 	// completed. Without a ScratchHold that is the tick current at allocation, which is enough
