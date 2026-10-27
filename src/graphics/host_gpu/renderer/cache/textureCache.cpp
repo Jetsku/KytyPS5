@@ -2511,6 +2511,144 @@ ImageId TextureCache::SingleSampleCopyOf(ImageId id, bool stencil) {
 	return current.copy;
 }
 
+namespace {
+
+// KYTY_LIGHT_GRID_CAP: the shapes pixel shaders bind light grids with (NoteLightGridShape):
+// width, height, row pitch and layers, packed under the top bit; 0 is a free slot.
+std::array<std::atomic<uint64_t>, 16> g_light_grid_shapes {};
+
+uint64_t LightGridShapeKey(const ImageInfo& info) {
+	return (uint64_t {1} << 63u) | (info.extent.width & 0xffffu) |
+	       (static_cast<uint64_t>(info.extent.height & 0xffffu) << 16u) |
+	       (static_cast<uint64_t>(info.pitch & 0xffffu) << 32u) |
+	       (static_cast<uint64_t>(info.resources.layers & 0x7fffu) << 48u);
+}
+
+bool LightGridFormat(const ImageInfo& info) {
+	return info.pixel_format == vk::Format::eR32G32Uint && !info.IsTiled() && !info.IsVolume() &&
+	       info.resources.levels == 1 && info.resources.layers >= 2 && info.samples == 1 &&
+	       !info.data.Empty() && info.data.size <= 0x40000u;
+}
+
+bool IsLightGridShape(const ImageInfo& info) {
+	if (!LightGridFormat(info)) {
+		return false;
+	}
+	const auto key = LightGridShapeKey(info);
+	for (const auto& shape: g_light_grid_shapes) {
+		const auto value = shape.load(std::memory_order_relaxed);
+		if (value == key) {
+			return true;
+		}
+		if (value == 0) {
+			return false;
+		}
+	}
+	return false;
+}
+
+// No light grid cell of GT7's asks for this many lights (the counts seen are below 64); the
+// garbage ones ask for up to 65535.
+constexpr uint32_t LightGridMostLights = 1024;
+
+// A light grid's bytes: cell (x, y) of layer l is two words at l * layer bytes + (y * row + x) * 8,
+// a light-list offset and packed counts (the low 16 bits one of them). Cells that ask for more
+// than LightGridMostLights lights are counted and, with `repair`, emptied in place.
+uint32_t ScanLightGrid(uint8_t* bytes, uint64_t size, uint32_t width, uint32_t height,
+                       uint32_t layers, uint32_t row, bool repair) {
+	if (layers == 0 || size % layers != 0) {
+		return 0;
+	}
+	const uint64_t layer_bytes = size / layers;
+	if (static_cast<uint64_t>(row) * height * 8u > layer_bytes || width > row) {
+		return 0;
+	}
+	uint32_t garbage = 0;
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				const uint64_t at = layer * layer_bytes + (static_cast<uint64_t>(y) * row + x) * 8u;
+				uint32_t       packed = 0;
+				std::memcpy(&packed, bytes + at + 4u, sizeof(packed));
+				if ((packed & 0xffffu) <= LightGridMostLights) {
+					continue;
+				}
+				garbage++;
+				if (repair) {
+					std::memset(bytes + at, 0, 8u);
+				}
+			}
+		}
+	}
+	return garbage;
+}
+
+} // namespace
+
+bool TextureCache::LightGridCapEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIGHT_GRID_CAP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+void TextureCache::NoteLightGridShape(const ImageInfo& info) {
+	if (!LightGridFormat(info)) {
+		return;
+	}
+	const auto key = LightGridShapeKey(info);
+	for (auto& shape: g_light_grid_shapes) {
+		auto value = shape.load(std::memory_order_relaxed);
+		if (value == key) {
+			return;
+		}
+		if (value == 0) {
+			if (shape.compare_exchange_strong(value, key, std::memory_order_relaxed)) {
+				LOGF("LightGrid: pixel shaders read light grids of %ux%u cells, %u layers (row "
+				     "pitch %u): their uploads are checked (KYTY_LIGHT_GRID_CAP)\n",
+				     info.extent.width, info.extent.height, info.resources.layers, info.pitch);
+				return;
+			}
+			if (value == key) {
+				return;
+			}
+		}
+	}
+}
+
+void TextureCache::RepairLightGridUpload(const Image& image, Buffer& source,
+                                         uint64_t source_offset) {
+	const auto& info  = image.info;
+	const auto  range = info.data;
+	if (source.Mapped().size() < source_offset || source.Mapped().size() - source_offset < range.size) {
+		return;
+	}
+	// The guest bytes, read again into cached memory (the staging copy is write-combined, slow to
+	// read); when they hold such cells they are what is uploaded, repaired.
+	thread_local std::vector<uint8_t> guest;
+	guest.resize(static_cast<size_t>(range.size));
+	if (!LibKernel::Memory::TryReadBacking(range.address, guest.data(), range.size)) {
+		return;
+	}
+	const auto row = std::max(info.pitch, info.extent.width);
+	const auto garbage = ScanLightGrid(guest.data(), range.size, info.extent.width,
+	                                   info.extent.height, info.resources.layers, row, true);
+	if (garbage == 0) {
+		return;
+	}
+	std::memcpy(source.Mapped().data() + source_offset, guest.data(), static_cast<size_t>(range.size));
+	source.Flush(source_offset, range.size);
+	static std::atomic<uint64_t> found {0};
+	const auto                   n = found.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 24 || n % 64 == 0) {
+		LOGF("LightGrid: 0x%012" PRIx64 "+0x%" PRIx64 " (%ux%u, %u layers, pitch %u): %u cells ask "
+		     "for more than %u lights; uploaded as empty cells (%" PRIu64 " so far)\n",
+		     range.address, range.size, info.extent.width, info.extent.height,
+		     info.resources.layers, info.pitch, garbage, LightGridMostLights, n);
+	}
+}
+
 bool TextureCache::SubExtentCopyEnabled() {
 	static std::atomic<int64_t> slot {Common::OnceUnset};
 	return Common::Once(slot, [] {
@@ -3529,7 +3667,10 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		// Sources cover the resident prefix only (image.live; the whole range when fully
 		// resident): the bytes of levels no view can sample are neither read nor uploaded.
 		const auto live = image.live;
-		if (!partial.done && !TryAsyncFullUpload(image)) {
+		// KYTY_LIGHT_GRID_CAP: a light grid is uploaded here, from bytes it can repair.
+		const bool light_grid = LightGridCapEnabled() && image.FullyResident() &&
+		                        IsLightGridShape(image.info);
+		if (!partial.done && (light_grid || !TryAsyncFullUpload(image))) {
 			const bool cached_source = m_buffer_cache.IsRegionRegistered(live.address, live.size) ||
 			                           m_buffer_cache.IsRegionGpuModified(live.address, live.size);
 			Profiler::CountFrameEvent(cached_source ? Profiler::FrameEvent::TextureUploadBytesBuffer
@@ -3539,6 +3680,9 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 			    m_buffer_cache.ObtainBufferForImage(live.address, live.size);
 			if (source == nullptr) {
 				EXIT("TextureCache: failed to obtain image upload source\n");
+			}
+			if (light_grid && !cached_source) {
+				RepairLightGridUpload(image, *source, source_offset);
 			}
 			UploadImage(image, *source, source_offset);
 		}

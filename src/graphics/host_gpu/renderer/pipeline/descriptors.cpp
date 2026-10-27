@@ -2743,6 +2743,21 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
+		if (program.stage == ShaderType::Pixel && TextureCache::LightGridCapEnabled()) {
+			// KYTY_LIGHT_GRID_CAP (usa-ratt/KytyPS5-GT7 ecef51e59): a pixel shader's light grid
+			// has its later uploads checked (TextureCache::NoteLightGridShape).
+			for (uint32_t i = 0; i < count; i++) {
+				const auto& resource = program.info.images[i];
+				const auto& binding  = prepared.images[i];
+				const auto& info     = binding.desc.info;
+				if (!resource.written && binding.image_id &&
+				    info.pixel_format == vk::Format::eR32G32Uint && info.resources.layers > 1 &&
+				    (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+				     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D)) {
+					TextureCache::NoteLightGridShape(info);
+				}
+			}
+		}
 	}
 	texture_scope.Stop();
 	CommitStats::SubScope sampler_scope(CommitStats::Sub::Samplers);
