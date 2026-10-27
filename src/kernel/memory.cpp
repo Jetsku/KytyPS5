@@ -311,6 +311,20 @@ static bool ClampRangeMemoEnabled() {
 	return enabled;
 }
 
+// KYTY_CLAMP_COVERAGE_GEN=1 (default off; adapted from usa-ratt/KytyPS5-GT7 0b97a337b): the clamp
+// answers (KYTY_CLAMP_RANGE_MEMO's per-thread runs, and the binding plans' certificate through
+// VirtualRangesGeneration) stay valid across protection and name changes, which cannot change which
+// bytes are committed: only the changes of coverage (add, remove, release, replace) advance the
+// generation they check. A streaming game changes protections hundreds of times a second, and
+// every change made every thread's next clamps miss and re-walk the ranges under the lock.
+static bool ClampCoverageGenerationEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLAMP_COVERAGE_GEN");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 // KYTY_CLAMP_RANGE_MEMO_VERIFY=1|exit: every cached answer is compared with the locked lookup.
 static int ClampRangeMemoVerifyMode() {
 	static const int mode = [] {
@@ -371,7 +385,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
-		BumpGenerationUnlocked();
+		BumpGenerationUnlocked(true);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -402,7 +416,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
-		BumpGenerationUnlocked();
+		BumpGenerationUnlocked(true);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -434,7 +448,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
-		BumpGenerationUnlocked();
+		BumpGenerationUnlocked(true);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -450,7 +464,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
-		BumpGenerationUnlocked();
+		BumpGenerationUnlocked(true);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -586,7 +600,7 @@ public:
 			return 0;
 		}
 		if (ClampRangeMemoEnabled()) {
-			const auto generation = m_generation.load(std::memory_order_acquire);
+			const auto generation = ClampGenerationUnlocked(std::memory_order_acquire);
 			for (const auto& run: t_clamp_runs.entries) {
 				if (run.owner != this || run.generation != generation || virtual_addr < run.begin ||
 				    virtual_addr >= run.end) {
@@ -617,6 +631,10 @@ public:
 	// means every ClampRangeSize answer made after this read still holds.
 	[[nodiscard]] uint64_t Generation() const noexcept {
 		return m_generation.load(std::memory_order_acquire);
+	}
+	// What ClampRangeSize answers depend on (KYTY_CLAMP_COVERAGE_GEN: only coverage changes).
+	[[nodiscard]] uint64_t ClampGeneration() const noexcept {
+		return ClampGenerationUnlocked(std::memory_order_acquire);
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -649,9 +667,20 @@ private:
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
 	}
 
-	// Callers hold m_mutex, before they change m_ranges (KYTY_CLAMP_RANGE_MEMO).
-	void BumpGenerationUnlocked() noexcept {
+	// Callers hold m_mutex, before they change m_ranges (KYTY_CLAMP_RANGE_MEMO). `coverage`: the
+	// change can change which bytes are committed (KYTY_CLAMP_COVERAGE_GEN).
+	void BumpGenerationUnlocked(bool coverage = false) noexcept {
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		if (coverage) {
+			m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		}
+	}
+
+	// The generation the clamp answers are valid under: every change's, or with
+	// KYTY_CLAMP_COVERAGE_GEN only the coverage changes'.
+	[[nodiscard]] uint64_t ClampGenerationUnlocked(std::memory_order order) const noexcept {
+		return ClampCoverageGenerationEnabled() ? m_coverage_generation.load(order)
+		                                        : m_generation.load(order);
 	}
 
 	// ClampRangeSize's lookup; callers hold m_mutex. `remember`: record the run for this thread.
@@ -700,7 +729,7 @@ private:
 		if (remember) {
 			auto& runs = t_clamp_runs;
 			runs.entries[runs.next++ % runs.entries.size()] = {
-			    this, m_generation.load(std::memory_order_relaxed), run_begin, run_end,
+			    this, ClampGenerationUnlocked(std::memory_order_relaxed), run_begin, run_end,
 			    end_is_run_end};
 		}
 		if (size <= run_end - virtual_addr) {
@@ -733,7 +762,7 @@ private:
 		if (locked == cached) {
 			return;
 		}
-		if (m_generation.load(std::memory_order_relaxed) != generation) {
+		if (ClampGenerationUnlocked(std::memory_order_relaxed) != generation) {
 			t_clamp_totals.verify_races++;
 			return;
 		}
@@ -946,6 +975,8 @@ private:
 	Common::Mutex      m_mutex;
 	// Advanced before every change of m_ranges (KYTY_CLAMP_RANGE_MEMO); starts at 1.
 	std::atomic<uint64_t> m_generation {1};
+	// Advanced before every change that can change committed coverage (KYTY_CLAMP_COVERAGE_GEN).
+	std::atomic<uint64_t> m_coverage_generation {1};
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1827,7 +1858,7 @@ uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size) {
 }
 
 uint64_t VirtualRangesGeneration() noexcept {
-	return g_virtual_ranges != nullptr ? g_virtual_ranges->Generation() : 0;
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampGeneration() : 0;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
