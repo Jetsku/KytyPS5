@@ -381,6 +381,13 @@ struct CodegenOptions {
 	// GPU-written count wrote nothing). Atomics there still drop (no value to return).
 	// KYTY_BDA_STORE_LOG=0 restores the drop.
 	bool bda_store_log = true;
+	// KYTY_BINDLESS_3D_AS_ARRAY=1 (default 0; on in the PPSA03671 title preset; adapted from
+	// KytyPS5-Frank fed216ce8): a bindless 3D image instruction whose heap key holds a 2D or
+	// 2D-array T# reads it as a 2D array (the GPU addresses by the T# type). The host resolves such
+	// a key into the 2D-array binding with BindlessSlotArrayFlag; the shader declares both views,
+	// samples both and selects by the flag. Off: such keys sample the placeholder, as before.
+	// (Declared here, where it fills padding: sizeof(CodegenOptions) stays 112.)
+	bool bindless_3d_as_array = false;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the

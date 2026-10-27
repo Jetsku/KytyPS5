@@ -601,11 +601,10 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 uint32_t BindlessTable::ReleaseSlotKeys(uint32_t binding, uint32_t slot) {
 	uint32_t keys = 0;
 	for (auto& heap: m_heaps) {
-		if (heap.binding != binding) {
-			continue;
-		}
 		for (uint32_t key = 0; key < heap.slots.size(); key++) {
-			if (heap.slots[key] != slot) {
+			// The slot may be in another binding than the heap's (KYTY_BINDLESS_3D_AS_ARRAY).
+			const auto entry = heap.slots[key];
+			if (entry == 0 || SlotBinding(heap, entry) != binding || SlotIndex(entry) != slot) {
 				continue;
 			}
 			if (const auto id = heap.images[key]; id) {
@@ -760,7 +759,7 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key, bool free_slot) {
 		}
 	}
 	if (heap.slots[key] != 0 && free_slot) {
-		FreeSlot(heap.binding, heap.slots[key]);
+		FreeSlot(SlotBinding(heap, heap.slots[key]), SlotIndex(heap.slots[key]));
 	}
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
@@ -776,10 +775,13 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 	}
 	for (const auto& [heap, key]: found->second) {
 		if (heap->slots[key] != 0) {
-			// Placeholder 0 of the heap's own view type.
-			WriteSlot(heap->binding, heap->slots[key], PlaceholderView(heap->binding, 0),
+			// Placeholder 0 of the slot's own view type (the 2D-array binding for a
+			// KYTY_BINDLESS_3D_AS_ARRAY entry).
+			const auto binding = SlotBinding(*heap, heap->slots[key]);
+			const auto slot    = SlotIndex(heap->slots[key]);
+			WriteSlot(binding, slot, PlaceholderView(binding, 0),
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
-			FreeSlot(heap->binding, heap->slots[key]);
+			FreeSlot(binding, slot);
 		}
 		heap->slots[key]   = 0;
 		heap->settled[key] = 0;

@@ -674,12 +674,111 @@ void CheckRecordHeap() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 
+// KYTY_BINDLESS_3D_AS_ARRAY (PPSA03671's forward pixel shader bf3e, adapted from KytyPS5-Frank
+// fed216ce8): the Miles waterfall with a 3D IMAGE_SAMPLE_L, v[3:6] = (u, v, w, lod). A 3D heap's
+// key may hold a 2D or 2D-array T#; with the switch the shader declares the 2D-array view too,
+// samples both and selects by the translation entry's flag.
+std::vector<u32> VolumeHeapSampleCode() {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u); // u
+  AppendVMovLiteral(&code, 4, 0x3f000000u); // v
+  AppendVMovLiteral(&code, 5, 0x3f800000u); // w (layer 1 of a 2D array)
+  AppendVMovLiteral(&code, 6, 0x00000000u); // lod
+  code.push_back(EncodeSop1(0x04u, 20, 126)); // s_mov_b64 s[20:21], exec
+  const auto loop = code.size();
+  code.push_back(EncodeSop1(0x14u, 22, 20)); // s_ff1_i32_b64 s22, s[20:21]
+  code.push_back(EncodeVop3Word0(0x360u, 23)); // v_readlane_b32 s23, v1, s22
+  code.push_back(EncodeVop3Word1(Vgpr(1), 22));
+  code.push_back(EncodeVopc(0xc2u, 23, 1));    // v_cmp_eq_u32 vcc, s23, v1
+  code.push_back(EncodeSop1(0x24u, 24, 106));  // s_and_saveexec_b64 s[24:25], vcc
+  code.push_back(EncodeSop2(0x1eu, 106, 23, InlineU32(5))); // s_lshl_b32 vcc_lo, s23, 5
+  code.push_back(EncodeSmem0(0x0bu, 32, 2)); // s_buffer_load_dwordx8 s[32:39], s[4:7], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  // image_sample_l v2, v[3:6], s[32:39], s[8:11] dmask 0x1 dim:3D
+  code.push_back(EncodeMimg0(0x24u, 0x1u, 0, false, 2));
+  code.push_back(EncodeMimg1(2, 3, 32 / 4, 8 / 4));
+  code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec
+  code.push_back(EncodeSop1(0x04u, 126, 24));     // s_mov_b64 exec, s[24:25]
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1 loop
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckVolumeOverArray() {
+  constexpr const char *name = "BindlessVolumeOverArray";
+  const auto code = VolumeHeapSampleCode();
+  const auto user_data = MilesHeapUserData();
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  const auto compile = [&](bool as_array) {
+    codegen.bindless_3d_as_array = as_array;
+    ScopedCodegenOptions scope(codegen);
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "resource tracking", !translated.skip_dispatch,
+            "the 3D heap-indexed T# was skipped with bindless images");
+    const auto &images = translated.program.info.images;
+    Require(name, "bindless plan",
+            images.size() == 1u &&
+                images[0].dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D,
+            "expected one 3D image");
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    std::vector<u32> memory(0x4000u, 0u);
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+        .read_memory = ReadTestMemory,
+        .userdata = &memory,
+        .read_specialization_memory = ReadTestMemory,
+    };
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+            "the bindless image could not be materialized");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+    Require(name, "SPIR-V emit", !result.spirv.empty(), "no SPIR-V");
+    ValidateSpirv(name, result.spirv);
+    return result.spirv;
+  };
+  // Switch off: one 3D view, one sample, as before.
+  const auto off = compile(false);
+  Require(name, "switch off",
+          CountSpirv(off, "\"bindless_images\"") == 1u &&
+              CountSpirv(off, "OpImageSampleExplicitLod") == 1u,
+          "the 3D sample declares another view without KYTY_BINDLESS_3D_AS_ARRAY");
+  // Switch on: the 3D and 2D-array views, both sampled, the flag selects.
+  const auto on = compile(true);
+  Require(name, "both views",
+          CountSpirv(on, "\"bindless_images\"") == 2u &&
+              CountSpirv(on, "OpImageSampleExplicitLod") == 2u &&
+              CountSpirv(on, "1073741824") >= 1u,
+          "the 3D sample does not read the 2D-array view selected by BindlessSlotArrayFlag");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, on.size());
+}
+
 void RunCodegen() {
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
   CheckMilesNestedHeap();
   CheckMaskedHeapKey();
   CheckRecordHeap();
+  CheckVolumeOverArray();
 }
 
 } // namespace BindlessTests

@@ -18,6 +18,12 @@ inline constexpr uint32_t BindlessFeedback      = 5;
 inline constexpr uint32_t BindlessPending = 0xffffffffu;
 // The placeholder slot pending keys sample (slots 0-2 of each image array are placeholders).
 inline constexpr uint32_t BindlessPendingSlot = 2;
+// KYTY_BINDLESS_3D_AS_ARRAY (CodegenOptions::bindless_3d_as_array): in a 3D binding's region, the
+// key's T# is a 2D or 2D-array texture, held in the 2D-array binding at the slot in the low bits.
+// The hardware addresses by the T# type, not the instruction's dimension, so a 3D sample of it
+// reads layer round(z). Pending (all bits set) is told apart by the bit above.
+inline constexpr uint32_t BindlessSlotArrayFlag = 0x40000000u;
+inline constexpr uint32_t BindlessSlotFlagMask  = 0xc0000000u;
 
 // Whether resource tracking may turn an indirect image the enumeration cannot cover into a
 // bindless one (instead of skipping the program). The renderer sets it once, before the first

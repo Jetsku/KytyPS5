@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -180,6 +181,13 @@ struct EmitterState {
 	uint32_t                                         bindless_translation_variable = 0;
 	uint32_t                                         bindless_feedback_variable    = 0;
 	uint32_t                                         bindless_slot                 = 0;
+	// KYTY_BINDLESS_3D_AS_ARRAY: the raw translation entry behind bindless_slot
+	// (BindlessSlotArrayFlag marks a 2D or 2D-array texture a 3D image instruction samples).
+	uint32_t                                         bindless_translation_raw      = 0;
+	// While image_override_index names a resource, ImageResourceAt() returns image_override for
+	// it: the same instruction emitted against another view type of its texture.
+	uint32_t                                         image_override_index          = UINT32_MAX;
+	IR::ImageResource                                image_override {};
 	// The module's decoder of formatted loads through a computed V# (DefineIndirectFormatFunction).
 	uint32_t                                         indirect_format_function      = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
@@ -278,6 +286,19 @@ uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
+
+// KYTY_BINDLESS_3D_AS_ARRAY: a bindless sampled 3D image whose key may name a 2D or 2D-array
+// texture instead (adapted from KytyPS5-Frank fed216ce8).
+inline bool BindlessVolumeMayBeArray(const IR::ImageResource& image) {
+	return GetCodegenOptions().bindless_3d_as_array && image.bindless && !image.cube &&
+	       image.resource_class == IR::ImageResourceClass::Sampled &&
+	       image.dimension == Decoder::ImageDimension::Dim3D;
+}
+
+inline const IR::ImageResource& ImageResourceAt(const EmitterState& state, uint32_t index) {
+	return index == state.image_override_index ? state.image_override
+	                                           : state.program.info.images.at(index);
+}
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;

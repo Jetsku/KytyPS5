@@ -40,6 +40,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -2024,8 +2025,12 @@ bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t bindin
 	switch (descriptor.Type()) {
 		case Prospero::ImageType::kColor2D:
 		case Prospero::ImageType::kColor2DArray:
+			// KYTY_BINDLESS_3D_AS_ARRAY: a 3D image instruction reads a 2D or 2D-array T# as a
+			// 2D array (BindlessSlotArrayFlag).
 			return binding == ShaderRecompiler::IR::BindlessImages2D ||
-			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray ||
+			       (binding == ShaderRecompiler::IR::BindlessImages3D &&
+			        ShaderRecompiler::GetCodegenOptions().bindless_3d_as_array);
 		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImagesCube;
 		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
 		default: return false;
@@ -2206,8 +2211,20 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
+	// KYTY_BINDLESS_3D_AS_ARRAY (adapted from KytyPS5-Frank fed216ce8): the GPU addresses by the
+	// T# type, so a 3D instruction's 2D or 2D-array texture is a 2D array at layer round(z). It
+	// lives in the 2D-array binding; the translation entry's flag tells the shader.
+	const bool as_array = heap.binding == ShaderRecompiler::IR::BindlessImages3D &&
+	                      (descriptor.Type() == Prospero::ImageType::kColor2D ||
+	                       descriptor.Type() == Prospero::ImageType::kColor2DArray);
+	const uint32_t slot_binding =
+	    as_array ? ShaderRecompiler::IR::BindlessImages2DArray : heap.binding;
+	auto resource = heap.resource;
+	if (as_array) {
+		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+	}
 	TextureBinding binding;
-	ResolveTexture(heap.resource, value, binding);
+	ResolveTexture(resource, value, binding);
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image         = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
@@ -2229,22 +2246,23 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
-	const auto slot = table.AllocateSlot(heap.binding);
+	const auto slot = table.AllocateSlot(slot_binding);
 	if (slot == 0) {
 		m_bindless_transient_failure = true;
 		static std::atomic<uint32_t> reported = 0;
 		if (reported.fetch_add(1) < 8) {
 			LOGF("Bindless: binding %u has no free slot (%u per array); key %u of heap 0x%016" PRIx64
 			     " samples the placeholder\n",
-			     heap.binding, table.ImagesPerArray(), key, heap.base);
+			     slot_binding, table.ImagesPerArray(), key, heap.base);
 		}
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
-	table.WriteSlot(heap.binding, slot, view, layout);
-	heap.slots[key]         = slot;
+	table.WriteSlot(slot_binding, slot, view, layout);
+	const uint32_t entry = as_array ? (slot | ShaderRecompiler::IR::BindlessSlotArrayFlag) : slot;
+	heap.slots[key]         = entry;
 	heap.images[key]        = binding.image_id;
 	image->bindless_pinned  = true;
 	image->bindless_self_id = binding.image_id;
@@ -2255,7 +2273,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	}
 	heap.unchecked.push_back(binding.image_id);
 	table.AddImageReference(binding.image_id, heap, key);
-	table.SetTranslation(heap, key, slot);
+	table.SetTranslation(heap, key, entry);
 	return true;
 }
 
@@ -2298,7 +2316,7 @@ bool RenderExecutor::ResettleBindlessKey(BindlessHeap& heap, uint32_t key) {
 		return false;
 	}
 	if (keep) {
-		table.FreeSlot(heap.binding, old_slot);
+		table.FreeSlot(BindlessTable::SlotBinding(heap, old_slot), BindlessTable::SlotIndex(old_slot));
 	}
 	if (no_refs && image != nullptr && image->bindless_pinned && old_image != heap.images[key]) {
 		// No key refers to it any more: the texture cache may collect it again.

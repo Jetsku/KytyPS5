@@ -61,7 +61,10 @@ struct BindlessHeap {
 	uint32_t                            watched_entries  = 0;
 	uint64_t                            watch_generation = 0;
 	ShaderRecompiler::IR::ImageResource resource;
-	std::vector<uint32_t>               slots;     // per key; 0 = not resolved
+	// Per key, 0 = not resolved; else the translation entry: the slot in this heap's binding, or
+	// (BindlessSlotArrayFlag, KYTY_BINDLESS_3D_AS_ARRAY) in the 2D-array binding.
+	// BindlessTable::SlotBinding/SlotIndex decode it.
+	std::vector<uint32_t>               slots;
 	std::vector<uint8_t>                settled;   // per key; resolved, or known placeholder
 	std::vector<ImageId>                resolved;  // images to keep readable for draws
 	std::vector<ImageId>                unchecked; // settled since the last bindless draw (E5)
@@ -134,6 +137,19 @@ public:
 	// 0 when the array is full. A released slot is reused once the GPU has finished the work
 	// recorded before its release.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
+	// The binding and array slot a Heap::slots entry names.
+	[[nodiscard]] static uint32_t SlotBinding(const Heap& heap, uint32_t entry) noexcept {
+		return (entry & ShaderRecompiler::IR::BindlessSlotFlagMask) ==
+		               ShaderRecompiler::IR::BindlessSlotArrayFlag
+		           ? static_cast<uint32_t>(Images2DArray)
+		           : heap.binding;
+	}
+	[[nodiscard]] static uint32_t SlotIndex(uint32_t entry) noexcept {
+		return (entry & ShaderRecompiler::IR::BindlessSlotFlagMask) ==
+		               ShaderRecompiler::IR::BindlessSlotArrayFlag
+		           ? entry & ~ShaderRecompiler::IR::BindlessSlotFlagMask
+		           : entry;
+	}
 	// Queue a slot for reuse once the GPU is past the current tick (at most once; IDXTRI).
 	void FreeSlot(uint32_t binding, uint32_t slot);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);

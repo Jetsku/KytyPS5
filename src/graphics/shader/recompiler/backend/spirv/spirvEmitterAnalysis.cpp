@@ -161,7 +161,7 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
-	const auto& image_resource = state.program.info.images.at(resource);
+	const auto& image_resource = ImageResourceAt(state, resource);
 	if (image_resource.bindless) {
 		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
 		const auto type     = ImageType(state, image_resource);
@@ -180,7 +180,7 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	}
 	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
 	const auto image = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, ImageType(state, state.program.info.images.at(resource)),
+	state.builder.AddFunction(spv::OpLoad, ImageType(state, ImageResourceAt(state, resource)),
 	                          image, pointer);
 	return image;
 }
@@ -201,7 +201,7 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip,
                           uint32_t array_index) {
-	const auto& image_resource = state.program.info.images.at(resource);
+	const auto& image_resource = ImageResourceAt(state, resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
 	const auto  image          = LoadImageDescriptor(state, resource, mip, array_index);
 	const auto  sampled_image = state.builder.AllocateId();
@@ -221,7 +221,7 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip,
                                 uint32_t array_index) {
-	const auto& image = state.program.info.images.at(resource);
+	const auto& image = ImageResourceAt(state, resource);
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value());
@@ -237,7 +237,7 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel) {
-	const auto& image = state.program.info.images.at(resource);
+	const auto& image = ImageResourceAt(state, resource);
 	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage);
 	if (!image.atomic) {
 		state.builder.RequireCapability(spv::CapabilityStorageImageWriteWithoutFormat);
