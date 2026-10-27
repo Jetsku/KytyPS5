@@ -151,6 +151,21 @@ public:
 		});
 	}
 
+	// IsModified without `lock` (KYTY_TRACKER_LOCKFREE_DIRTY, adapted from usa-ratt/KytyPS5-GT7
+	// ba83f1a64, mainline #1284): the mirror words, published with release stores under `lock`
+	// after every change of the bits, read with acquire loads. For the thread that owns the
+	// GPU-dirty bits (the GPU thread): other threads only set CPU-dirty bits, under the lock and
+	// before the pages become writable, so the answer is the one a locked query made a moment
+	// earlier would give.
+	template <DirtySource source>
+	[[nodiscard]] bool IsModifiedAcquire(uint64_t offset, uint64_t size) const noexcept {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto& mirror      = source == DirtySource::Cpu ? m_cpu_mirror : m_gpu_mirror;
+		return RegionBits::AnyInRange(start, end, [&mirror](size_t word) {
+			return mirror[word].load(std::memory_order_acquire);
+		});
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -508,7 +523,7 @@ private:
 	// already equal their bits, and threads reading them keep their cache lines.
 	void PublishGpuMirror(size_t first = 0, size_t last = TRACKER_REGION_PAGES) noexcept {
 		for (size_t word = first / 64u; word < (last + 63u) / 64u; word++) {
-			m_gpu_mirror[word].store(m_gpu_dirty.Word(word), std::memory_order_relaxed);
+			m_gpu_mirror[word].store(m_gpu_dirty.Word(word), std::memory_order_release);
 		}
 	}
 	// Callers hold `lock` (or construct), after changing the CPU-dirty bits of pages [first,
@@ -517,7 +532,7 @@ private:
 	// fault no longer rewrites both mirror cache lines the GPU thread reads.
 	void PublishCpuMirror(size_t first = 0, size_t last = TRACKER_REGION_PAGES) noexcept {
 		for (size_t word = first / 64u; word < (last + 63u) / 64u; word++) {
-			m_cpu_mirror[word].store(m_cpu_dirty.Word(word), std::memory_order_relaxed);
+			m_cpu_mirror[word].store(m_cpu_dirty.Word(word), std::memory_order_release);
 		}
 	}
 

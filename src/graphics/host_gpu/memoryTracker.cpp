@@ -4,6 +4,10 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/watchRange.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
 namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
@@ -217,8 +221,36 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+namespace {
+
+// KYTY_TRACKER_LOCKFREE_DIRTY (MemoryTracker::SetLockFreeDirtyOwner).
+std::atomic<MemoryTracker::OwnerThreadFn> g_lockfree_owner {nullptr};
+
+bool LockFreeDirtyHere() noexcept {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TRACKER_LOCKFREE_DIRTY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) {
+		return false;
+	}
+	const auto is_owner = g_lockfree_owner.load(std::memory_order_acquire);
+	return is_owner != nullptr && is_owner();
+}
+
+} // namespace
+
+void MemoryTracker::SetLockFreeDirtyOwner(OwnerThreadFn is_owner) noexcept {
+	g_lockfree_owner.store(is_owner, std::memory_order_release);
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	if (LockFreeDirtyHere()) {
+		return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			return manager->IsModifiedAcquire<DirtySource::Cpu>(offset, bytes);
+		});
+	}
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
@@ -227,6 +259,11 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	if (LockFreeDirtyHere()) {
+		return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			return manager->IsModifiedAcquire<DirtySource::Gpu>(offset, bytes);
+		});
+	}
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);

@@ -147,6 +147,20 @@ static bool TrackerSpareEnabled() {
 	return enabled;
 }
 
+// KYTY_PROTECT_LOCK_SHARED=1 (default off; adapted from usa-ratt/KytyPS5-GT7 ba83f1a64, mainline
+// PR #1815): the page tracker's protections (ProtectTransient) take the guest address space's
+// lock shared instead of exclusively. They only read the mappings (and the live stacks), and the
+// page manager's region lock already orders changes of the same pages; every change of the
+// mappings, and the game's own mprotect, still takes it exclusively. Faulting game threads and
+// the GPU thread then no longer queue behind each other's protection calls.
+static bool ProtectLockShared() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PROTECT_LOCK_SHARED");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    !RemapTrackerProtectionEnabled()) {

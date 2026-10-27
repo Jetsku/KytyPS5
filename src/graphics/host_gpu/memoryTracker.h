@@ -29,6 +29,13 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// KYTY_TRACKER_LOCKFREE_DIRTY=1 (default off; adapted from usa-ratt/KytyPS5-GT7 ba83f1a64,
+	// mainline #1284): on the thread `is_owner` names (the GPU thread, which owns the GPU-dirty
+	// bits), IsRegionCpuModified and IsRegionGpuModified read
+	// the regions' published mirrors (RegionManager::IsModifiedAcquire) instead of taking their
+	// locks. Other threads lock as before. Set once by the buffer cache.
+	using OwnerThreadFn = bool (*)() noexcept;
+	static void SetLockFreeDirtyOwner(OwnerThreadFn is_owner) noexcept;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// IsRegionCpuModified and IsRegionGpuModified of one range with each region lock taken once.

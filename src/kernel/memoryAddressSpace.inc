@@ -1353,10 +1353,20 @@ public:
 			return false;
 		}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		const bool uffd = Common::UffdWriteWatch::Enabled();
+#else
+		constexpr bool uffd = false;
+#endif
+		// KYTY_PROTECT_LOCK_SHARED (memory.cpp): a reader of the mappings only.
+		if (!uffd && ProtectLockShared()) {
+			std::shared_lock lock(m_mutex);
+			return ProtectMappedUnlocked(vaddr, size, mode, TrackerSpareEnabled());
+		}
 		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		// KYTY_UFFD_WP (common/platform/uffdWriteWatch.h): write-watching without mprotect.
-		if (Common::UffdWriteWatch::Enabled()) {
+		if (uffd) {
 			return ProtectTrackedUnlocked(vaddr, size, mode);
 		}
 #endif

@@ -1567,6 +1567,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	m_range_memo_verify = m_range_memo != nullptr ? RangeMemoVerifyMode() : 0;
+	// KYTY_TRACKER_LOCKFREE_DIRTY (memoryTracker.h): the GPU thread owns the GPU-dirty bits.
+	MemoryTracker::SetLockFreeDirtyOwner(&GuestGpu::IsGpuThread);
 	if (m_upload_dma != nullptr) {
 		g_write_drain_dma = m_upload_dma.get(); // KYTY_UPLOAD_DMA_WRITE_DRAIN
 	}
@@ -2146,6 +2148,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 
 	if (gpu_thread) {
 		NoteEagerRead(vaddr, size, true);
+		if (FaultPagesCurrent(page_begin, page_end)) { // KYTY_CLEAN_PAGE
+			record(std::nullopt);
+			return;
+		}
 		std::shared_ptr<SideReadback> issued;
 		const auto                    result = TryIssueSideReadback(vaddr, size, issued);
 		if (result == SideIssueResult::Issued) {
@@ -2179,9 +2185,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	std::shared_ptr<SideReadback> issued;
 	auto                          result    = SideIssueResult::Other;
 	const auto                    sync_mark = diag ? ReadFaultDiag::NowNs() : 0;
+	bool                          current   = false; // KYTY_CLEAN_PAGE
 	gpu.SendCommandSync([&, this, vaddr, size, is_write] {
 		if (!is_write) {
 			NoteEagerRead(vaddr, size, false);
+		}
+		// KYTY_CLEAN_PAGE: another thread's read made the faulting pages current meanwhile; a
+		// side copy would only take the window's other GPU-written ranges, and this thread would
+		// wait for it.
+		if (FaultPagesCurrent(page_begin, page_end)) {
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			current = true;
+			return;
 		}
 		result = TryIssueSideReadback(vaddr, size, issued);
 		if ((result == SideIssueResult::CurrentWriter || result == SideIssueResult::Unbounded) &&
@@ -2207,6 +2224,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			ReadMemoryDrain(vaddr, size, is_write, trace);
 		}
 	});
+	if (current) {
+		diag_path("current");
+		record(std::nullopt);
+		return;
+	}
 	if (diag) {
 		diag->Fault().sendsync_ns = ReadFaultDiag::NowNs() - sync_mark;
 		switch (result) {
@@ -2265,11 +2287,41 @@ uint64_t BufferCache::ReadbackSideWriteCopies() noexcept {
 	return g_readback_side_writes_copies.load(std::memory_order_relaxed);
 }
 
+bool BufferCache::FaultPagesCurrent(uint64_t page_begin, uint64_t page_end) {
+	static const bool enabled = ParseEnvU64("KYTY_CLEAN_PAGE", 0) != 0;
+	if (!enabled || page_end <= page_begin) {
+		return false;
+	}
+	const auto bytes = page_end - page_begin;
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, bytes) ||
+	    HasGpuDirtyBytes(page_begin, bytes) || HasPendingBackingPublication(page_begin, bytes) ||
+	    OverlapsPendingSideReadback(page_begin, page_end) ||
+	    m_texture_cache.IsRegionGpuModified(page_begin, bytes)) {
+		return false;
+	}
+	static std::atomic<uint64_t> current {0};
+	if (const auto n = current.fetch_add(1, std::memory_order_relaxed) + 1;
+	    (n & (n - 1)) == 0 && n >= 64) {
+		LOGF("ReadMemory: %" PRIu64 " faults on pages another read had made current went on at "
+		     "once (KYTY_CLEAN_PAGE)\n",
+		     n);
+	}
+	return true;
+}
+
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
                                   ReadMemoryTrace& trace) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	HangWatchdog::Scope drain("buffer-readback-drain", vaddr, size, 0, 0, is_write);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	// KYTY_CLEAN_PAGE: nothing of these pages is left to download.
+	if (FaultPagesCurrent(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+	                      Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE))) {
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
 		return;
 	}
 	if (is_write && m_false_sharing && TryFalseSharingWrite(vaddr, size, trace)) {

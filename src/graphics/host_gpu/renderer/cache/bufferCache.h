@@ -666,6 +666,13 @@ private:
 	};
 	// The drain path: GPU thread only.
 	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+	// KYTY_CLEAN_PAGE=1 (adapted from usa-ratt/KytyPS5-GT7 ba83f1a64, its round 135), GPU thread:
+	// the faulting pages [page_begin, page_end) are no longer GPU-written for the tracker and hold
+	// no GPU-written bytes, no bytes of a readback or publication still to land, and no GPU-written
+	// image: another thread's read made them current between the fault and now. The access then
+	// needs nothing (a write only its CPU-dirty transition), instead of a download of the window's
+	// other GPU-written ranges that it waits for. False when the switch is off.
+	[[nodiscard]] bool FaultPagesCurrent(uint64_t page_begin, uint64_t page_end);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
