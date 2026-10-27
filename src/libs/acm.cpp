@@ -96,6 +96,16 @@ int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
 	return OK;
 }
 
+// Newer than the SDK 10 headers (NID GTfJ64qFCPw); Gran Turismo 7 calls it for every audio batch
+// after Start. It records nothing (batches are not executed) and returns OK, as the unresolved
+// import stub it replaces did, without that stub's log lines and counter.
+int KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority) {
+	PRINT_NAME();
+	(void)batch_info;
+	(void)priority;
+	return OK;
+}
+
 int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t block_count, void* in,
                                            uint32_t count, const void* const ir[],
                                            const float* gain, void* const out[]) {
