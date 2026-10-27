@@ -10,7 +10,9 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -37,9 +39,15 @@ public:
 
 private:
 	using SamplerKey = std::array<uint32_t, 5>;
+	// A Vulkan sampler's create info, packed: the discrete state (filters, address modes,
+	// anisotropy, compare, reduction, border, unnormalized coordinates) in the first three words,
+	// then the LOD bias, the minimum and the maximum LOD as float bits.
+	using VulkanKey   = std::array<uint32_t, 6>;
+	using DiscreteKey = std::array<uint32_t, 3>;
 
 	struct SamplerKeyHash {
-		std::size_t operator()(const SamplerKey& key) const {
+		template <size_t N>
+		std::size_t operator()(const std::array<uint32_t, N>& key) const {
 			std::size_t hash = 0;
 			for (auto value: key) {
 				hash ^= static_cast<std::size_t>(value) +
@@ -50,12 +58,30 @@ private:
 		}
 	};
 
+	struct LodVariant {
+		float       bias    = 0.0f;
+		float       min_lod = 0.0f;
+		float       max_lod = 0.0f;
+		vk::Sampler sampler = nullptr;
+	};
+
 	static uint64_t NextInstance() noexcept;
+
+	// The sampler for a create info (m_mutex held): one already made for the same state, a new one
+	// while the budget allows, or else (KYTY_SKIP_INVALID) the nearest in LOD of the same kind.
+	vk::Sampler FindOrCreate(const vk::SamplerCreateInfo& info, uint32_t reduction);
 
 	GraphicContext&                                             m_graphics;
 	const uint64_t                                              m_instance;
 	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
+	// The Vulkan samplers made, by create info (each made once, destroyed with the cache), and
+	// those of each discrete state.
+	std::unordered_map<VulkanKey, vk::Sampler, SamplerKeyHash>               m_vulkan_samplers;
+	std::unordered_map<DiscreteKey, std::vector<LodVariant>, SamplerKeyHash> m_variants;
+	uint32_t                                                                 m_budget         = 0;
+	uint64_t                                                                 m_nearest_reuses = 0;
+	size_t                                                                   m_next_count_log = 256;
 };
 
 } // namespace Libs::Graphics

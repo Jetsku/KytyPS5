@@ -2,8 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/skipInvalid.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <cstdint>
 #include <map>
 
@@ -12,6 +16,9 @@ namespace Libs::Graphics {
 class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
+		if (Ignored(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -44,6 +51,9 @@ public:
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
+		if (Ignored(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
@@ -73,6 +83,9 @@ public:
 	}
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
+		if (Ignored(address, size)) {
+			return false;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
@@ -82,6 +95,9 @@ public:
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+		if (Ignored(address, size)) {
+			return true;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
@@ -93,6 +109,9 @@ public:
 
 	template <typename Func>
 	void ForEachInRange(uint64_t address, uint64_t size, Func&& func) const {
+		if (Ignored(address, size)) {
+			return;
+		}
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it != m_ranges.begin()) {
@@ -110,6 +129,26 @@ public:
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 	// The number of disjoint ranges.
 	[[nodiscard]] size_t Size() const { return m_ranges.size(); }
+
+	// KYTY_SKIP_INVALID: an empty range touches nothing, so every operation on it is a no-op; a
+	// range whose end passes the top of the address space is a corrupt request (a garbage size) and
+	// is ignored (GT7's Cafe). The first few of each are logged. With the switch off both still end
+	// the emulator in End().
+	[[nodiscard]] static bool Ignored(uint64_t address, uint64_t size) {
+		const bool empty    = size == 0;
+		const bool overflow = !empty && size > UINT64_MAX - address;
+		if ((!empty && !overflow) || !Common::SkipInvalidEnabled()) {
+			return false;
+		}
+		static std::atomic_uint empty_count {0};
+		static std::atomic_uint overflow_count {0};
+		auto&                   count = empty ? empty_count : overflow_count;
+		if (count.fetch_add(1, std::memory_order_relaxed) < 4u) {
+			LOGF("RangeSet: temporary: ignoring %s range at 0x%016" PRIx64 " size 0x%016" PRIx64 "\n",
+			     empty ? "empty" : "overflowing", address, size);
+		}
+		return true;
+	}
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {

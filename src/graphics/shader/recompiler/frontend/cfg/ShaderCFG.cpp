@@ -998,25 +998,49 @@ struct TarjanState {
 	std::vector<StronglyConnectedComponent> components;
 };
 
-void TarjanVisit(TarjanState& state, uint32_t block_id) {
-	state.index[block_id]   = state.next_index;
-	state.lowlink[block_id] = state.next_index;
-	state.next_index++;
-	state.stack.push_back(block_id);
-	state.on_stack[block_id] = true;
+void TarjanFinish(TarjanState& state, uint32_t block_id);
 
-	const auto* block = state.graph->FindBlock(block_id);
-	if (block != nullptr) {
-		for (auto succ: block->successors) {
+// Iterative (usa-ratt/KytyPS5-GT7 d7cff8c2f): a CFG with a long chain of blocks (an expanded
+// material shader) recursed deep enough to overflow the thread's stack (0xc00000fd in TarjanVisit,
+// GT7 loading a night race). The frames visit the successors in the same order and finish the
+// blocks in the same post-order, so the components come out exactly as before.
+void TarjanVisit(TarjanState& state, uint32_t root) {
+	struct Frame {
+		uint32_t block = 0;
+		size_t   next  = 0; // the next successor to look at
+	};
+	std::vector<Frame> frames;
+	const auto         enter = [&](uint32_t block_id) {
+		state.index[block_id]   = state.next_index;
+		state.lowlink[block_id] = state.next_index;
+		state.next_index++;
+		state.stack.push_back(block_id);
+		state.on_stack[block_id] = true;
+		frames.push_back({block_id, 0});
+	};
+	enter(root);
+	while (!frames.empty()) {
+		const auto  block_id = frames.back().block;
+		const auto* block    = state.graph->FindBlock(block_id);
+		if (block != nullptr && frames.back().next < block->successors.size()) {
+			const auto succ = block->successors[frames.back().next++];
 			if (state.index[succ] == UINT32_MAX) {
-				TarjanVisit(state, succ);
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
+				enter(succ);
 			} else if (state.on_stack[succ]) {
 				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
 			}
+			continue;
+		}
+		frames.pop_back();
+		TarjanFinish(state, block_id);
+		if (!frames.empty()) {
+			const auto parent     = frames.back().block;
+			state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[block_id]);
 		}
 	}
+}
 
+void TarjanFinish(TarjanState& state, uint32_t block_id) {
 	if (state.lowlink[block_id] != state.index[block_id]) {
 		return;
 	}

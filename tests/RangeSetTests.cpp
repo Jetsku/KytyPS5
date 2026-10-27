@@ -281,8 +281,28 @@ void Benchmark() {
 }
 } // namespace
 
+// KYTY_SKIP_INVALID (default on): empty and address-space-wrapping ranges are no-ops.
+void TestIgnoredRanges() {
+    RangeSet ranges;
+    ranges.Add(0x1000, 0x100);
+    ranges.Add(0x5000, 0);
+    ranges.Add(0xffff'ffff'ffff'ff00ull, 0x200);
+    Check(Collect(ranges) == std::vector<Interval>{{0x1000, 0x1100}}, "ignored Add changed the set");
+    ranges.Subtract(0x1000, 0);
+    ranges.Subtract(0x1080, UINT64_MAX);
+    Check(Collect(ranges) == std::vector<Interval>{{0x1000, 0x1100}}, "ignored Subtract changed the set");
+    Check(!ranges.Intersects(0x1000, 0) && !ranges.Intersects(0x1000, UINT64_MAX),
+          "ignored range must not intersect");
+    Check(ranges.Contains(0x9000, 0), "an empty range is contained");
+    bool called = false;
+    ranges.ForEachInRange(0x1000, 0, [&](uint64_t, uint64_t) { called = true; });
+    ranges.ForEachInRange(0x1000, UINT64_MAX, [&](uint64_t, uint64_t) { called = true; });
+    Check(!called, "ignored range must not enumerate");
+}
+
 int main(int argc, char** argv) {
     if (argc == 1) {
+        TestIgnoredRanges();
         TestBoundaries();
         TestByteModel();
         TestAllocationContract();

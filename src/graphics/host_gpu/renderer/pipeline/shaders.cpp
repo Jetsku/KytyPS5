@@ -266,11 +266,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
+	// KYTY_LAYER_CLAMP: the bound layer count for the exported layer index's clamp.
+	const uint32_t                   layer_limit_value = rendering.layer_limit;
+	const vk::SpecializationMapEntry layer_limit_entry {ShaderRecompiler::IR::LayerLimitSpecId, 0,
+	                                                    sizeof(uint32_t)};
+	const vk::SpecializationInfo layer_limit_spec {1, &layer_limit_entry, sizeof(uint32_t),
+	                                               &layer_limit_value};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           NativeShaderStage(vertex_info[i].logical_stage),
 		                                       .module = programs.vertex[i].module,
 		                                       .pName  = "main"};
+		if (layer_limit_value != 0) {
+			shader_stages[shader_stage_count - 1].pSpecializationInfo = &layer_limit_spec;
+		}
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =

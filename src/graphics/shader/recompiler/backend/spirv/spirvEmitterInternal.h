@@ -218,6 +218,7 @@ struct EmitterState {
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
+	uint32_t                   layer_limit_constant                  = 0; // KYTY_LAYER_CLAMP
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;

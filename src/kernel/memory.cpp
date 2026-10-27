@@ -131,6 +131,21 @@ static bool RemapTrackerProtectionEnabled() {
 	return enabled;
 }
 
+// KYTY_TRACKER_SPARE=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 7d3a20afc, 9ae50c01c):
+// the page tracker's protections (ProtectTransient) change only mappings with backing, the memory
+// the GPU can use, leaving the program's code, stacks and runtime memory (private mappings) alone,
+// and leave the live stacks of threads that run on memory the game gave them writable. A GPU
+// buffer over the first page of GT7's code made it non-executable (a freeze after a license test);
+// one over a worker's stack made it read-only, and the write fault on the stack a thread runs on
+// ends the process silently (Scapes).
+static bool TrackerSpareEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TRACKER_SPARE");
+		return value != nullptr && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 static void ResyncGpuRangeProtection(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    !RemapTrackerProtectionEnabled()) {
@@ -3842,6 +3857,49 @@ static int ValidateDirectReleaseRange(int64_t start, size_t len) {
 	           : OK;
 }
 
+// KYTY_RELEASE_GAPS=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 bdab60022): the
+// unchecked KernelReleaseDirectMemory over a range that is not one allocated span (a gap, or a part
+// already released) releases each allocated run in it, as the console does; off, it releases
+// nothing and the memory stays allocated (GT7's pools then ran out of direct memory).
+static bool ReleaseGapsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RELEASE_GAPS");
+		return value != nullptr && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
+// The allocated parts of [start, start + len) (pool expansions left out), as runs of adjacent
+// blocks.
+static std::vector<std::pair<uint64_t, uint64_t>> AllocatedRuns(uint64_t start, uint64_t len) {
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	if (len == 0 || len > UINT64_MAX - start) {
+		return runs;
+	}
+	const auto        end = start + len;
+	Common::LockGuard lock(g_physical_memory->GetMutex());
+	const auto&       blocks = g_physical_memory->GetPhysicalBlocks();
+	auto              block  = blocks.upper_bound(start);
+	if (block != blocks.begin()) {
+		--block;
+	}
+	for (; block != blocks.end() && block->second.start_addr < end; ++block) {
+		const auto& b     = block->second;
+		const auto  b_end = b.start_addr + b.size;
+		if (b_end <= start || b.pool_expansion) {
+			continue;
+		}
+		const auto part_start = std::max(start, b.start_addr);
+		const auto part_end   = std::min(end, b_end);
+		if (!runs.empty() && runs.back().first + runs.back().second == part_start) {
+			runs.back().second += part_end - part_start;
+		} else {
+			runs.emplace_back(part_start, part_end - part_start);
+		}
+	}
+	return runs;
+}
+
 int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 	PRINT_NAME();
 
@@ -3854,7 +3912,28 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 		return validation;
 	}
 	if (len != 0) {
-		(void)ReleaseDirectMemoryInternal(start, len);
+		std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+		std::vector<PhysicalMemory::AllocatedBlock> span;
+		if (ReleaseDirectMemoryInternal(start, len) != OK && ReleaseGapsEnabled() &&
+		    !g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, &span)) {
+			// Not one allocated span (a failed unmap of an alias is left as it was).
+			uint64_t freed = 0;
+			uint32_t parts = 0;
+			for (const auto& [part_start, part_size]: AllocatedRuns(static_cast<uint64_t>(start), len)) {
+				if (ReleaseDirectMemoryInternal(static_cast<int64_t>(part_start), part_size) == OK) {
+					freed += part_size;
+					parts++;
+				}
+			}
+			static std::atomic<uint64_t> partial_releases {0};
+			const auto                   count = partial_releases.fetch_add(1) + 1u;
+			if (count <= 32u || std::has_single_bit(count)) {
+				LOGF("ReleaseDirectMemory: 0x%016" PRIx64 "+0x%" PRIx64 " is not one allocated span: "
+				     "its %u allocated parts were released (0x%" PRIx64 " bytes; %" PRIu64
+				     " such releases so far)\n",
+				     static_cast<uint64_t>(start), static_cast<uint64_t>(len), parts, freed, count);
+			}
+		}
 	}
 	return OK;
 }
@@ -4774,6 +4853,21 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+}
+
+void AddLiveThreadStack(uint64_t vaddr, uint64_t size) {
+	if (TrackerSpareEnabled() && g_guest_address_space != nullptr) {
+		g_guest_address_space->AddLiveStack(vaddr, size);
+	}
+}
+
+void RemoveLiveThreadStack(uint64_t vaddr, uint64_t size) {
+	// The tracker's protection of what it still watches there comes back (outside the
+	// address-space lock: the tracker protects through it).
+	if (TrackerSpareEnabled() && g_guest_address_space != nullptr &&
+	    g_guest_address_space->RemoveLiveStack(vaddr, size)) {
+		ResyncGpuRangeProtection(vaddr, size);
+	}
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

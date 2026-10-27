@@ -246,6 +246,10 @@ struct SamplerResource {
 	bool operator==(const SamplerResource& other) const = default;
 };
 
+// The specialization constant a pre-rasterization stage clamps its exported render target array
+// index with (KYTY_LAYER_CLAMP): the bound layer count (0: no clamp).
+inline constexpr uint32_t LayerLimitSpecId = 0x4c00u;
+
 struct SampledResourcePair {
 	uint32_t image        = 0;
 	uint32_t sampler      = 0;
@@ -596,9 +600,13 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 64;
-	static constexpr uint32_t MaxImages       = 64;
-	static constexpr uint32_t MaxSamplers     = 32;
+	// usa-ratt/KytyPS5-GT7 8b76a992a: raised from 64/64/32 for expanded table calls (each inlined
+	// GT7 material variant brings its own statically resolved descriptors). A shader past a limit
+	// fails translation (its draws are skipped), so only such shaders change; the fixed arrays
+	// sized by these are small (ResourceMaterialization, the emitter's buffer offsets).
+	static constexpr uint32_t MaxBuffers      = 256;
+	static constexpr uint32_t MaxImages       = 512;
+	static constexpr uint32_t MaxSamplers     = 128;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;

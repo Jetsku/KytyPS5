@@ -12,6 +12,7 @@
 #include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
+#include "common/skipInvalid.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -67,6 +68,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <xxhash.h>
 
@@ -899,6 +901,28 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// The render area must lie inside every attachment. The guest extent comes from discovery, the
+// attachment is a view of a cache image: should the image be smaller (an alias of a transient pool
+// recreated at another size, seen in GT7), rendering the guest extent would write past it. With
+// KYTY_SKIP_INVALID the area is bounded to the image, and logged.
+static vk::Extent2D ClampToBacking(const Image& image, uint32_t base_level, vk::Extent2D extent,
+                                   uint64_t address, const char* kind) {
+	const vk::Extent2D backing {std::max(image.info.extent.width >> base_level, 1u),
+	                            std::max(image.info.extent.height >> base_level, 1u)};
+	if ((backing.width >= extent.width && backing.height >= extent.height) ||
+	    !Common::SkipInvalidEnabled()) {
+		return extent;
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		LOGF("Render target: %s 0x%016" PRIx64 " is %ux%u but its image is %ux%u (level %u): "
+		     "render area bounded to the image\n",
+		     kind, address, extent.width, extent.height, backing.width, backing.height,
+		     base_level);
+	}
+	return {std::min(extent.width, backing.width), std::min(extent.height, backing.height)};
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -938,7 +962,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Identity(), true);
-		const auto extent       = target.Extent();
+		const auto extent       = ClampToBacking(image, view.base_level, target.Extent(),
+		                                         target.desc.info.data.address, "color");
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
@@ -1093,8 +1118,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Identity(), true);
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		const auto depth_extent =
+		    ClampToBacking(image, view.base_level,
+		                   {depth.desc.info.extent.width, depth.desc.info.extent.height},
+		                   depth.desc.info.data.address, "depth");
+		state.width               = std::min(state.width, depth_extent.width);
+		state.height              = std::min(state.height, depth_extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
@@ -2225,6 +2254,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 
+	if (std::exchange(m_depth_unsupported, false)) {
+		// A depth or stencil state the host cannot draw with (logged by ResolveRenderDepthTarget).
+		return false;
+	}
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
@@ -5555,6 +5588,21 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
+	// KYTY_RESOLVE_CACHE_VIEW=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 e1134351f from
+	// the GTA V fork 6bb0811e): a target can lie inside a larger image (a face of a cube, a slice of
+	// an array the guest points a colour target at); FindImage then moved the view to that level
+	// and layer, which is where the resolve reads and writes. Off: the register view's level and
+	// layer (every face lands in the first).
+	static const bool cache_view = [] {
+		const char* value = std::getenv("KYTY_RESOLVE_CACHE_VIEW");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	if (cache_view) {
+		destination.Resolve(source,
+		                    {src.desc.view_info.base_level, 1, src.desc.view_info.base_layer, 1},
+		                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
+		return true;
+	}
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;

@@ -411,6 +411,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
+	if (DeadViewScrubEnabled()) {
+		NoteImageViewCreated(view);
+	}
 	SetVulkanObjectNameF(
 	    m_graphics.device, view,
 	    "Kyty.ImageView[guest=0x{:016x} format={} aspect=0x{:x} mip={}+{} layer={}+{}]",

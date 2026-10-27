@@ -1538,6 +1538,9 @@ private:
 	[[nodiscard]] static bool DrawRunPipeSwapCompatible(
 	    const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
 	    const ShaderRecompiler::IR::CompiledShaderInfo& program);
+	// KYTY_SKIP_INVALID: the last ResolveRenderDepthTarget found a depth/stencil state the host
+	// cannot draw with (left without a depth target); PrepareDrawRenderState leaves the draw out.
+	bool          m_depth_unsupported  = false;
 	bool          m_run_targets_kept   = false; // KYTY_DRAW_RUN_TARGETS: the draw kept the record's
 	// KYTY_DRAW_RUN_TARGETS: whether the committed draw may keep the record's resolved targets.
 	[[nodiscard]] bool DrawRunTargetsCandidate(const CommandBuffer& buffer, const DrawRenderState& state,

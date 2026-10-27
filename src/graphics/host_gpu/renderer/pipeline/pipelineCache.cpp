@@ -7332,7 +7332,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return SkipUnmaterializable("a tessellated draw's LS/HS/TES set is not supported");
 		}
 	} else {
+		(void)ShaderTakePrepareFailed();
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		if (ShaderTakePrepareFailed()) {
+			// KYTY_SKIP_INVALID: already logged per shader by PrepareProgram.
+			return SkipUnmaterializable("a draw's vertex stage cannot be described (null or "
+			                            "uncommitted vertex tables, or a GS that emits no vertex)");
+		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -7421,9 +7427,13 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	}
 	const auto read_failed = [] { return DrawPrep::ActiveRecorder()->reads->Failed(); };
 	// The same static stage preparation as GetGraphicsPrograms (non-tessellated).
+	(void)ShaderTakePrepareFailed();
 	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;
+	}
+	if (ShaderTakePrepareFailed()) {
+		return SpeculativeResult::Ineligible; // the serial path skips the draw
 	}
 	if (vertex_info.logical_stage == ShaderType::Mesh) {
 		FinishMeshStage(m_graphics, vertex_info);
@@ -7605,6 +7615,29 @@ static void NoteExecOnNoop(const RenderDepthInfo& depth, const ShaderPixelInputI
 	}
 }
 
+// KYTY_LAYER_CLAMP: the least layer count of the bound attachments (0 without any).
+static uint32_t BoundLayerCount(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                bool with_depth) {
+	if (!ShaderRecompiler::GetCodegenOptions().layer_clamp) {
+		return 0;
+	}
+	uint32_t layers = UINT32_MAX;
+	for (const auto& color: colors) {
+		layers = std::min(layers, color.desc.view_info.layer_count);
+	}
+	if (with_depth) {
+		layers = std::min(layers, depth.desc.view_info.layer_count);
+	}
+	return layers == UINT32_MAX ? 0u : std::max(layers, 1u);
+}
+
+// KYTY_LAYER_CLAMP: whether the vertex-side stage exports the render target array index.
+static bool ExportsLayer(const ShaderVertexInputInfo& info) {
+	return info.stage && std::ranges::any_of(info.stage.program->info.outputs, [](const auto& output) {
+		       return output.kind == ShaderRecompiler::IR::StageOutputKind::Layer;
+	       });
+}
+
 bool PipelineCache::SamePipelineTargets(const PipelineTargets&           targets,
                                         std::span<const RenderColorInfo> colors,
                                         const RenderDepthInfo&           depth) {
@@ -7668,6 +7701,10 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
+	rendering.layer_limit       = ShaderRecompiler::GetCodegenOptions().layer_clamp &&
+	                                      targets.layer_count != 0 && ExportsLayer(vs_input_info)
+	                                  ? targets.layer_count
+	                                  : 0u;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < targets.color_count; i++) {
 		const auto& color = targets.colors[i];
@@ -7984,6 +8021,7 @@ void PipelineCache::PrefetchGraphicsPipeline(std::span<const RenderColorInfo> co
 	targets.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	targets.depth_min_bounds         = depth.depth_min_bounds;
 	targets.depth_max_bounds         = depth.depth_max_bounds;
+	targets.layer_count              = BoundLayerCount(colors, depth, targets.with_depth);
 
 	PrefetchGraphicsPipeline(targets, command.GetRegisters(), command.GetUserConfig(),
 	    vertex_info.front(), pixel_info, topology, primitive_restart_enable, programs);
@@ -8050,6 +8088,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	targets.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	targets.depth_min_bounds         = depth.depth_min_bounds;
 	targets.depth_max_bounds         = depth.depth_max_bounds;
+	targets.layer_count              = BoundLayerCount(colors, depth, targets.with_depth);
 
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
@@ -8418,8 +8457,37 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 			                                   pipeline, fast_result);
 		};
 	}
+	// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 ef6f66053, 7ecb6aec3): a compute pipeline the driver
+	// cannot build is kept as failed (build_failed) and its dispatches are skipped instead of
+	// ending the emulator (GT7 after several races). The log names the shader, the driver's answer
+	// and the device memory in use.
+	const bool tolerate_failure = Common::SkipInvalidEnabled();
+	vk::Result build_result     = vk::Result::eSuccess;
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
-	                       fast_hook ? &fast_hook : nullptr);
+	                       fast_hook ? &fast_hook : nullptr,
+	                       tolerate_failure ? &build_result : nullptr);
+	if (tolerate_failure && (build_result != vk::Result::eSuccess || cached->pipeline == nullptr)) {
+		static std::atomic<uint32_t> reported {0};
+		const auto                   count = reported.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 64u || std::has_single_bit(count)) {
+			const auto text = fmt::format(
+			    "Compute pipeline CS=0x{:016x}: the graphics driver could not build it "
+			    "(vkCreateComputePipelines returned {}; device memory in use: {} MB). Its dispatches "
+			    "are skipped from now on (KYTY_SKIP_INVALID; {} so far)\n",
+			    cs_hash, vk::to_string(build_result),
+			    m_graphics.CanReportMemoryUsage() ? m_graphics.GetDeviceMemoryUsage() >> 20u : 0,
+			    count);
+			LOGF("%s", text.c_str());
+			std::fprintf(stderr, "%s", text.c_str());
+		}
+		cached->pipeline        = nullptr;
+		cached->pipeline_layout = nullptr;
+		cached->build_failed    = true;
+		auto [failed, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+		EXIT_IF(!inserted);
+		FlushCompileStall();
+		return *failed->second;
+	}
 	GpuOpProfiler::RegisterComputePipeline(cached->pipeline, compute_program.id);
 	const auto created_pipeline = cached->pipeline;
 
@@ -8489,7 +8557,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
                                                               const ShaderProgram& compute_program) {
 	EXIT_IF(!compute_program || !input_info.stage);
 	if (!input_info.stage.program->info.uses_bvh) {
-		return &GetComputePipeline(input_info, compute_program);
+		auto& built = GetComputePipeline(input_info, compute_program);
+		return built.build_failed ? nullptr : &built; // KYTY_SKIP_INVALID: the dispatch is skipped
 	}
 	const auto id = compute_program.id;
 	auto&      rt = Rt();

@@ -86,7 +86,7 @@ struct ShaderMapEntry : ShaderMappedData {
 	bool has_declared_hash = false;
 };
 
-static uint64_t GetDeclaredShaderHash(uint64_t shader_addr);
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr, uint32_t code_size_bytes);
 
 static uint64_t RegisteredOrDeclaredShaderHash(uint64_t addr, const ShaderMapEntry& entry) {
 	if (RegisteredShaderCodeEnabled()) {
@@ -94,7 +94,7 @@ static uint64_t RegisteredOrDeclaredShaderHash(uint64_t addr, const ShaderMapEnt
 		// without re-registration. Declared IDs continue to select title-specific options.
 		return entry.has_declared_hash ? entry.registered_hash : 0;
 	}
-	return GetDeclaredShaderHash(addr);
+	return GetDeclaredShaderHash(addr, entry.code_size_bytes);
 }
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
@@ -120,7 +120,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		}
 		// Hash before taking the map lock: a guest read can fault and ask the GPU to publish bytes.
 		entry.code_hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
-		const auto declared = GetDeclaredShaderHash(addr);
+		const auto declared = GetDeclaredShaderHash(addr, data.code_size_bytes);
 		// Keep declared IDs used by our title-specific codegen options; headerless code uses XXH3.
 		entry.registered_hash = declared != 0 ? declared : entry.code_hash;
 		entry.has_declared_hash = declared != 0;
@@ -140,6 +140,19 @@ void ShaderUnmapCode(uint64_t addr, uint64_t size) {
 		return start >= addr ? start - addr < size : addr - start < bytes;
 	});
 	if (removed != 0) g_shader_map_generation.fetch_add(1, std::memory_order_release);
+}
+
+uint64_t ShaderDeclaredHashForTest(uint64_t shader_addr, uint32_t code_size_bytes) {
+	return GetDeclaredShaderHash(shader_addr, code_size_bytes);
+}
+
+// Set by PrepareProgram when KYTY_SKIP_INVALID skips the draw (ShaderTakePrepareFailed).
+static thread_local bool t_prepare_failed = false;
+
+bool ShaderTakePrepareFailed() {
+	const bool failed = t_prepare_failed;
+	t_prepare_failed  = false;
+	return failed;
 }
 
 uint64_t ShaderMapGeneration() {
@@ -214,12 +227,54 @@ static bool ShaderMetadataBatchEnabled() {
 	return enabled;
 }
 
-static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
+// A shader may start with a real s_mov_b32 vcc_hi, <constant>: the same word as the binary-info
+// marker 0xBEEB03FF (Senaxx c47f0bb1b via usa-ratt/KytyPS5-GT7: an engine PS whose "block" lay
+// ~8 GB past its code, an access violation). With KYTY_SKIP_INVALID the block counts only when it
+// lies inside the shader's code (when the size is known) and carries a known signature: "OrbShdr",
+// or the start of the "barefoot" trailer. Otherwise the shader has no declared hash, as shaders
+// without a marker. True markers are unaffected.
+static bool BinaryInfoInsideCode(uint32_t offset, uint32_t code_size_bytes) {
+	if (code_size_bytes == 0 || !Common::SkipInvalidEnabled()) {
+		return true;
+	}
+	const uint64_t start = (uint64_t {offset} + 1u) * 8u;
+	return start + sizeof(ShaderBinaryInfo) <= code_size_bytes;
+}
+
+static bool BinaryInfoSigned(const ShaderBinaryInfo& info) {
+	if (!Common::SkipInvalidEnabled()) {
+		return true;
+	}
+	return std::memcmp(info.signature, "OrbShdr", 7) == 0 ||
+	       std::memcmp(info.signature, "barefoo", 7) == 0;
+}
+
+static void LogRejectedBinaryInfo(const uint32_t* code, uint32_t offset, uint32_t code_size_bytes,
+                                  const char* why) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+		LOGF("Shader 0x%016" PRIx64 ": leading 0xBEEB03FF word is not a binary-info marker (block "
+		     "offset 0x%08" PRIx32 ", code 0x%x bytes: %s); content hash used\n",
+		     reinterpret_cast<uint64_t>(code), offset, code_size_bytes, why);
+	}
+}
+
+static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code, uint32_t code_size_bytes) {
 	EXIT_IF(code == nullptr);
 
 	if (code[0] == 0xBEEB03FF) {
-		return reinterpret_cast<const ShaderBinaryInfo*>(code +
-		                                                 static_cast<size_t>(code[1] + 1) * 2);
+		const uint32_t offset = code[1];
+		if (!BinaryInfoInsideCode(offset, code_size_bytes)) {
+			LogRejectedBinaryInfo(code, offset, code_size_bytes, "outside the code");
+			return nullptr;
+		}
+		const auto* info = reinterpret_cast<const ShaderBinaryInfo*>(
+		    code + static_cast<size_t>(offset + 1u) * 2);
+		if (!BinaryInfoSigned(*info)) {
+			LogRejectedBinaryInfo(code, offset, code_size_bytes, "no signature");
+			return nullptr;
+		}
+		return info;
 	}
 
 	return nullptr;
@@ -286,7 +341,7 @@ static bool CopyMetadataForPreparation(const ShaderMappedData& data, Preparation
 	return true;
 }
 
-static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr, uint32_t code_size_bytes) {
 	static const bool use_clean_backing = [] {
 		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
 		return value != nullptr && std::strcmp(value, "1") == 0;
@@ -322,8 +377,29 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 			if (read_word(code) != 0xBEEB03FF) return 0;
 			offset = read_word(code + 1);
 		}
+		if (!BinaryInfoInsideCode(offset, code_size_bytes)) {
+			LogRejectedBinaryInfo(code, offset, code_size_bytes, "outside the code");
+			return 0;
+		}
 		const auto* header = reinterpret_cast<const ShaderBinaryInfo*>(
 		    code + static_cast<size_t>(offset + 1u) * 2);
+		if (Common::SkipInvalidEnabled()) {
+			// The signature (KYTY_SKIP_INVALID) and the hashes in one probe.
+			ShaderBinaryInfo info {};
+			const bool       clean = LibKernel::Memory::TryReadGpuCleanBacking(
+			          reinterpret_cast<uint64_t>(header), &info, sizeof(info));
+			Profiler::CountFrameEvent(clean ? Profiler::FrameEvent::ShaderHeaderProbeHits
+			                                : Profiler::FrameEvent::ShaderHeaderProbeMisses);
+			if (!clean && speculative) {
+				return 0; // the failed probe already failed the preparation
+			}
+			const auto& block = clean ? info : *header;
+			if (!BinaryInfoSigned(block)) {
+				LogRejectedBinaryInfo(code, offset, code_size_bytes, "no signature");
+				return 0;
+			}
+			return (static_cast<uint64_t>(block.hash1) << 32u) | block.hash0;
+		}
 		std::array<uint32_t, 2> hashes {};
 		static_assert(offsetof(ShaderBinaryInfo, hash1) == offsetof(ShaderBinaryInfo, hash0) + sizeof(uint32_t));
 		const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(
@@ -336,7 +412,8 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 		return clean ? (static_cast<uint64_t>(hashes[1]) << 32u) | hashes[0]
 		             : (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0;
 	}
-	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
+	const auto* header =
+	    GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr), code_size_bytes);
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 }
 
@@ -980,8 +1057,29 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			r.fields[2] = sharp[2];
 			r.fields[3] = sharp[3];
 		}
-		EXIT_NOT_IMPLEMENTED(r.AddTid());
-		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
+		if (r.SwizzleEnabled() || r.AddTid()) {
+			// A swizzled vertex buffer, or one that adds the lane to the index (ADD_TID), has no
+			// Vulkan vertex input. With KYTY_SKIP_INVALID it is read as if linear (that attribute
+			// comes out wrong) and logged, each descriptor once, the first 32 (usa-ratt/KytyPS5-GT7
+			// bdab60022, 4feefde94: GT7 past its menus).
+			if (!Common::SkipInvalidEnabled()) {
+				EXIT_NOT_IMPLEMENTED(r.AddTid());
+				EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
+			}
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::lock_guard                     lock(logged_mutex);
+			const auto key = r.Base48() ^ (static_cast<uint64_t>(r.fields[3]) << 32u);
+			if (logged.size() < 32 && logged.insert(key).second) {
+				LOGF("Vertex input: %s vertex buffer read as if linear: attribute %u (semantic %u) "
+				     "V# [0x%08x 0x%08x 0x%08x 0x%08x] base 0x%012" PRIx64
+				     " stride %u records %u attribute format %u offset %u\n",
+				     r.SwizzleEnabled() ? (r.AddTid() ? "swizzled ADD_TID" : "swizzled") : "ADD_TID",
+				     i, static_cast<uint32_t>(in.semantic), r.fields[0], r.fields[1], r.fields[2],
+				     r.fields[3], r.Base48(), r.Stride(), r.NumRecords(),
+				     static_cast<uint32_t>(format), offset);
+			}
+		}
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
@@ -1105,6 +1203,52 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
+// Whether this is the first report of `kind` for the shader: a draw that fails to describe its
+// vertex inputs is skipped (KYTY_SKIP_INVALID), and a scene can issue it every frame.
+static bool FirstVertexInputReport(uint64_t shader_addr, uint32_t kind) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	std::lock_guard                     lock(mutex);
+	if (reported.size() >= 256) {
+		return false;
+	}
+	return reported.insert(shader_addr ^ (static_cast<uint64_t>(kind) << 56u)).second;
+}
+
+// KYTY_VERTEX_TABLE_CHECK=1 (default off; the GT7 preset): before the serial path reads a
+// shader's vertex attribute / buffer tables through the guest mapping, both spans are checked to
+// lie in committed guest memory; a draw whose user data holds no table address there is skipped
+// instead of ending in an access violation (usa-ratt/KytyPS5-GT7 0c807bea9, GT7 time trials). Off
+// by default: two range queries per serial vertex preparation.
+static bool VertexTableCheckEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_VERTEX_TABLE_CHECK");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static bool VertexTablesCommitted(const ShaderVertexMetadata& metadata, const uint32_t* attrib,
+                                  const uint32_t* buffer) {
+	if (metadata.input_semantics_count == 0) {
+		return true;
+	}
+	uint32_t max_semantic = 0;
+	for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
+		max_semantic = std::max<uint32_t>(max_semantic, metadata.input_semantics[i].semantic);
+	}
+	if (!LibKernel::Memory::IsCommittedSpan(reinterpret_cast<uint64_t>(attrib),
+	                                        (uint64_t {max_semantic} + 1u) * 4u)) {
+		return false;
+	}
+	uint32_t max_index = 0;
+	for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
+		max_index = std::max<uint32_t>(max_index, attrib[metadata.input_semantics[i].semantic] & 0x1fu);
+	}
+	return LibKernel::Memory::IsCommittedSpan(reinterpret_cast<uint64_t>(buffer),
+	                                          (uint64_t {max_index} + 1u) * 16u);
+}
+
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data,
@@ -1145,8 +1289,23 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
 
 		if (attrib == nullptr || buffer == nullptr) {
-			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
-			     shader_addr);
+			if (!Common::SkipInvalidEnabled() || FirstVertexInputReport(shader_addr, 2)) {
+				LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64
+				     " attrib_reg=%d buffer_reg=%d user_sgpr_num=%u\n",
+				     shader_addr, metadata.vertex_attrib_reg, metadata.vertex_buffer_reg,
+				     user_sgpr_num);
+			}
+			return false;
+		}
+		if (VertexTableCheckEnabled() && !DrawPrep::Speculative() &&
+		    !VertexTablesCommitted(metadata, attrib, buffer)) {
+			if (FirstVertexInputReport(shader_addr, 3)) {
+				LOGF("ShaderGetVertexInputInfo(): vertex tables outside guest memory "
+				     "shader=0x%016" PRIx64 " attrib=0x%016" PRIx64 " (s%d) buffer=0x%016" PRIx64
+				     " (s%d) user_sgpr_num=%u: the draw is skipped\n",
+				     shader_addr, reinterpret_cast<uint64_t>(attrib), metadata.vertex_attrib_reg,
+				     reinterpret_cast<uint64_t>(buffer), metadata.vertex_buffer_reg, user_sgpr_num);
+			}
 			return false;
 		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
@@ -1311,7 +1470,14 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 				return params;
 			}
-			EXIT("failed to prepare vertex shader program\n");
+			if (!Common::SkipInvalidEnabled()) {
+				EXIT("failed to prepare vertex shader program\n");
+			}
+			// Vertex tables the guest left null or outside guest memory, or metadata that does not
+			// parse (logged above): the draw is skipped (usa-ratt/KytyPS5-GT7 310573dd8, GT7
+			// entering its garage).
+			t_prepare_failed = true;
+			return params;
 		}
 		info.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		info.start_instance_sgpr = start_instance_sgpr;
@@ -1353,6 +1519,27 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
 	const auto& group = user_config.GetGeControl();
+	// A GS whose VGT_GS_MAX_VERT_OUT is 0 emits no vertex, so the draw puts nothing on screen.
+	// With KYTY_SKIP_INVALID it is skipped where the checks below would end the emulator (legacy
+	// GS, fast launch), logged once per shader (usa-ratt/KytyPS5-GT7 d62f20d7f, a time trial).
+	if (sh.m_vgtGsMaxVertOut == 0u && (!native_ngg || mesh.fast_launch) &&
+	    Common::SkipInvalidEnabled()) {
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint64_t> logged;
+		{
+			std::lock_guard lock(logged_mutex);
+			if (logged.size() < 64 && logged.insert(params.hash).second) {
+				LOGF("GS 0x%016" PRIx64 " at 0x%016" PRIx64 " emits no vertex (VGT_GS_MAX_VERT_OUT "
+				     "0; input primitive %u, output %u, GE %u/%u, max output %u): its draws are "
+				     "skipped\n",
+				     params.hash, regs.es_regs.data_addr, mesh.input_primitive,
+				     sh.m_vgtGsOutPrimType, group.primitive_group_size, group.vertex_group_size,
+				     mesh.max_vertices);
+			}
+		}
+		t_prepare_failed = true;
+		return params;
+	}
 	if (mesh.fast_launch) {
 		const auto& user_vgpr = user_config.GetGeUserVgprEn();
 		if (data.type != Prospero::ShaderBinaryType::kGs ||

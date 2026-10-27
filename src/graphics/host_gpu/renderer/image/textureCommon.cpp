@@ -56,6 +56,13 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 		case Prospero::BufferFormat::k5_5_5_1UNorm: return {format, Prospero::ColorMappingBgra};
 		case Prospero::BufferFormat::k1_5_5_5UNorm:
 		case Prospero::BufferFormat::k4_4_4_4UNorm: return {format, Prospero::ColorMappingAbgr};
+		// The 2-bit component (the first, at the bottom) in the host's alpha, the 10-bit ones in
+		// its red, green and blue: the precision matches, the bit layout does not (A2B10G10R10 has
+		// alpha at the top), so guest bytes read or written by the CPU come out shuffled. GT7
+		// renders to one when a race is left.
+		case Prospero::BufferFormat::k2_10_10_10UNorm:
+		case Prospero::BufferFormat::k2_10_10_10UInt:
+			return {format, Prospero::ColorComponentMapping {0x39u}}; // 1, 2, 3, 0
 		default: return {format, {}};
 	}
 }

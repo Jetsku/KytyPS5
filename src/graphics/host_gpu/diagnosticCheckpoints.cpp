@@ -14,8 +14,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -251,6 +254,150 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool que
 		Print(stage.c_str(), checkpoint);
 	}
 	std::fflush(stdout);
+}
+
+namespace {
+
+// Recently destroyed image views (NoteImageViewDestroyed), oldest first; a view created again with
+// the same handle leaves the set. Never destroyed: images may still be released during static
+// destruction.
+struct DeadView {
+	uint64_t   guest_address = 0;
+	vk::Format format        = vk::Format::eUndefined;
+};
+struct DeadViews {
+	static constexpr size_t                   Limit = 1u << 16u;
+	std::shared_mutex                         mutex;
+	std::unordered_map<VkImageView, DeadView> views;
+	std::deque<VkImageView>                   order;
+};
+DeadViews& GetDeadViews() {
+	static auto* registry = new DeadViews;
+	return *registry;
+}
+std::atomic<bool> g_any_dead_views {false};
+
+void ReportDeadView(const char* where, const char* what, uint32_t index, VkImageView view) {
+	static std::atomic<uint32_t> reported {0};
+	const auto                   count = reported.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (count > 32 && (count & (count - 1u)) != 0) {
+		return;
+	}
+	DeadView dead {};
+	{
+		auto&            registry = GetDeadViews();
+		std::shared_lock lock(registry.mutex);
+		if (const auto found = registry.views.find(view); found != registry.views.end()) {
+			dead = found->second;
+		}
+	}
+	LOGF("DEAD image view in %s: %s %u, view %p of guest 0x%016" PRIx64
+	     " format %d; replaced with a null view (%u so far)\n",
+	     where, what, index, static_cast<void*>(view), dead.guest_address,
+	     static_cast<int>(dead.format), count);
+}
+
+} // namespace
+
+bool DeadViewScrubEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEAD_VIEW_SCRUB");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void NoteImageViewCreated(vk::ImageView view) {
+	if (view == nullptr || !g_any_dead_views.load(std::memory_order_relaxed)) {
+		return;
+	}
+	auto&            registry = GetDeadViews();
+	std::unique_lock lock(registry.mutex);
+	registry.views.erase(static_cast<VkImageView>(view));
+}
+
+void NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Format format) {
+	if (view == nullptr) {
+		return;
+	}
+	const auto       key      = static_cast<VkImageView>(view);
+	auto&            registry = GetDeadViews();
+	std::unique_lock lock(registry.mutex);
+	const auto [entry, inserted] =
+	    registry.views.insert_or_assign(key, DeadView {guest_address, format});
+	if (inserted) {
+		registry.order.push_back(key);
+	}
+	while (registry.order.size() > DeadViews::Limit) {
+		registry.views.erase(registry.order.front());
+		registry.order.pop_front();
+	}
+	g_any_dead_views.store(true, std::memory_order_relaxed);
+}
+
+bool DiagnosticViewIsLive(vk::ImageView view) {
+	if (view == nullptr || !g_any_dead_views.load(std::memory_order_relaxed)) {
+		return true;
+	}
+	auto&            registry = GetDeadViews();
+	std::shared_lock lock(registry.mutex);
+	return !registry.views.contains(static_cast<VkImageView>(view));
+}
+
+void ScrubDeadRenderingViews(const vk::RenderingInfo& info, const char* where) {
+	if (!g_any_dead_views.load(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto clear = [](const vk::RenderingAttachmentInfo* attachment) {
+		auto* writable             = const_cast<vk::RenderingAttachmentInfo*>(attachment);
+		writable->imageView        = nullptr;
+		writable->resolveImageView = nullptr;
+		writable->resolveMode      = vk::ResolveModeFlagBits::eNone;
+	};
+	const auto scrub = [&](const vk::RenderingAttachmentInfo* attachment, const char* what,
+	                       uint32_t index) {
+		if (attachment == nullptr || DiagnosticViewIsLive(attachment->imageView)) {
+			return;
+		}
+		ReportDeadView(where, what, index, attachment->imageView);
+		clear(attachment);
+	};
+	for (uint32_t i = 0; i < info.colorAttachmentCount && info.pColorAttachments != nullptr; i++) {
+		scrub(info.pColorAttachments + i, "color attachment", i);
+	}
+	const auto depth_view =
+	    info.pDepthAttachment != nullptr ? info.pDepthAttachment->imageView : vk::ImageView {};
+	scrub(info.pDepthAttachment, "depth attachment", 0);
+	if (info.pStencilAttachment != nullptr && depth_view &&
+	    info.pStencilAttachment->imageView == depth_view && !DiagnosticViewIsLive(depth_view)) {
+		clear(info.pStencilAttachment); // the depth attachment's view, reported with it
+	} else {
+		scrub(info.pStencilAttachment, "stencil attachment", 0);
+	}
+}
+
+void ScrubDeadDescriptorViews(const vk::WriteDescriptorSet* writes, uint32_t count,
+                              const char* where) {
+	if (!g_any_dead_views.load(std::memory_order_relaxed) || writes == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const auto& write = writes[i];
+		// Storage images only: a write through a stale view faults, a read through one samples
+		// garbage (and checking every sampled image costs a lookup per texture per draw).
+		if (write.pImageInfo == nullptr ||
+		    write.descriptorType != vk::DescriptorType::eStorageImage) {
+			continue;
+		}
+		for (uint32_t k = 0; k < write.descriptorCount; k++) {
+			const auto& info = write.pImageInfo[k];
+			if (DiagnosticViewIsLive(info.imageView)) {
+				continue;
+			}
+			ReportDeadView(where, "descriptor binding", write.dstBinding, info.imageView);
+			const_cast<vk::DescriptorImageInfo&>(info).imageView = nullptr;
+		}
+	}
 }
 
 } // namespace Libs::Graphics

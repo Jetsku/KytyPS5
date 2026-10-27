@@ -441,6 +441,12 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 void ShaderUnmapCode(uint64_t addr, uint64_t size);
 // Changes after every shader map update (draw-prep certificates compare it).
 [[nodiscard]] uint64_t ShaderMapGeneration();
+// GetDeclaredShaderHash for tests: the binary-info hash of the code at shader_addr, or 0.
+uint64_t ShaderDeclaredHashForTest(uint64_t shader_addr, uint32_t code_size_bytes);
+// KYTY_SKIP_INVALID: true (and cleared) when the last PrepareProgram on this thread found the
+// stage undescribable (null or uncommitted vertex tables, a GS that emits no vertex): the draw is
+// skipped. Already logged.
+bool ShaderTakePrepareFailed();
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

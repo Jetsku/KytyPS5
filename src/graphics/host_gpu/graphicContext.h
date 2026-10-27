@@ -58,6 +58,18 @@ void WaitForDeviceLossDiagnostics(uint32_t start_ms = 500);
 [[nodiscard]] uint64_t NewestDiagnosticSequence();
 [[nodiscard]] const char* DiagnosticOpName(uint32_t op);
 
+// KYTY_DEAD_VIEW_SCRUB=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 ae60f82a5): destroyed
+// image views are remembered (the last 64K); one named as a rendering attachment or a storage-image
+// descriptor when the command runs is reported ("DEAD image view") and replaced with a null view
+// instead of being left to fault the GPU. The callers check DeadViewScrubEnabled(); the functions
+// themselves always work (tests).
+[[nodiscard]] bool DeadViewScrubEnabled();
+void               NoteImageViewCreated(vk::ImageView view);
+void               NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Format format);
+[[nodiscard]] bool DiagnosticViewIsLive(vk::ImageView view);
+void               ScrubDeadRenderingViews(const vk::RenderingInfo& info, const char* where);
+void ScrubDeadDescriptorViews(const vk::WriteDescriptorSet* writes, uint32_t count, const char* where);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;

@@ -137,6 +137,11 @@ struct CodegenOptions {
 	// KYTY_LOD_STATS_GATE=0: record GET_LOD_STATS feedback for every sample, including images whose
 	// T# has no mip-statistics counter, and issue the finest-level AtomicUMin unconditionally.
 	bool lod_stats_gate = true;
+	// KYTY_LAYER_CLAMP=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 8c71f0a6a): an exported
+	// render target array index past the bound layers (undefined in Vulkan: an NVIDIA device fault
+	// writing at address 0 in GT7 race draws) selects layer 0, as the hardware and D3D do. The
+	// bound layer count is a specialization constant (IR::LayerLimitSpecId) of the pipeline.
+	bool layer_clamp = false;
 	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
 	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
 	bool robust_buffer_loads = true;

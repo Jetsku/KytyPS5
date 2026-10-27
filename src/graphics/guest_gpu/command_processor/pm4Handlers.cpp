@@ -2,6 +2,7 @@
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -1199,9 +1200,20 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 	return first >= base && first - base < 4u && count <= 4u - (first - base);
 }
 
-static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
-                                               uint32_t value) {
-	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
+// The user accumulator registers are ignored; only their low 7 bits are defined. A value with
+// other bits set comes from a register list the game was rewriting as the GPU read it (GT7 at
+// launch). With KYTY_SKIP_INVALID it is logged a few times and ignored.
+static void HwShIgnoreUserAccumulatorRegister(uint32_t cmd_offset, uint32_t value) {
+	if ((value & ~0x7fu) == 0) {
+		return;
+	}
+	EXIT_NOT_IMPLEMENTED(!Common::SkipInvalidEnabled());
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+		LOGF("\t temporary: ignoring user accumulator register 0x%04" PRIx32 " = 0x%08" PRIx32
+		     " (undefined bits set)\n",
+		     cmd_offset, value);
+	}
 }
 
 KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
@@ -2041,6 +2053,55 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// KYTY_DROP_STALE_REG_LISTS=1 (default off; the GT7 preset): GT7's indirect register lists are
+// sometimes not register pairs at all around boot and scene changes (floats in the offset slots:
+// read before written, or after reuse). Applying the pairs that happen to decode puts random values
+// into real registers. A list with an offset outside its register file is dropped whole.
+static bool DropStaleRegisterLists() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_DROP_STALE_REG_LISTS");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static bool IndirectRegisterListIsStale(const uint32_t* list, uint32_t count, uint32_t num_regs,
+                                        uint32_t nop, const char* kind) {
+	if (!DropStaleRegisterLists()) {
+		return false;
+	}
+	uint32_t bad = count;
+	for (uint32_t i = 0; i < count; i++) {
+		const auto raw    = list[i * 2u];
+		const auto offset = NormalizeRegisterOffset(raw);
+		if (raw == 0xffffffffu || offset == nop || (raw == 0u && list[i * 2u + 1u] == 0u)) {
+			continue;
+		}
+		if (offset >= num_regs) {
+			bad = i;
+			break;
+		}
+	}
+	if (bad == count) {
+		return false;
+	}
+	static std::atomic<uint32_t> reports {0};
+	const auto                   report = reports.fetch_add(1, std::memory_order_relaxed);
+	if (report < 16u || (report & (report + 1u)) == 0u) {
+		LOGF("\t temporary: dropping stale indirect %s register list at %p: entry %" PRIu32
+		     " of %" PRIu32 " has offset 0x%08" PRIx32 " (%" PRIu32 " dropped so far)\n",
+		     kind, static_cast<const void*>(list), bad, count, list[bad * 2u], report + 1u);
+		if (report < 4u) {
+			for (uint32_t j = 0; j < count && j < 16u; j++) {
+				LOGF("\t   %s_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+				     "\n",
+				     kind, j, list[j * 2u], list[j * 2u + 1u]);
+			}
+		}
+	}
+	return true;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
@@ -2059,6 +2120,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
+	if (IndirectRegisterListIsStale(indirect_buffer, indirect_num_dw, Pm4::CX_NUM, Pm4::CX_NOP, "CX")) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2103,7 +2167,18 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			// GT7: lists read before written / after reuse. Skipped like the other unknown
+			// indirect entries (KYTY_SKIP_INVALID).
+			if (!Common::SkipInvalidEnabled()) {
+				EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			}
+			static std::atomic<uint32_t> unknown_reports {0};
+			if (unknown_reports.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				LOGF("\t temporary: skipping unknown indirect CX register 0x%" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
+			}
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2131,6 +2206,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
+	if (IndirectRegisterListIsStale(indirect_buffer, indirect_num_dw, Pm4::SH_NUM, Pm4::SH_NOP, "SH")) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2151,23 +2229,43 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		}
 
 		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			// Stale or partly written table entries (GT7 at boot, one run in several).
+			if (!Common::SkipInvalidEnabled()) {
+				EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
+				     "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
+			}
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				LOGF("\t temporary: skipping unknown indirect SH register offset 0x%08" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 ", index=%" PRIu32 "/%" PRIu32
+				     ", regs=0x%016" PRIx64 "\n",
+				     cmd_offset, raw_cmd_offset, value, i, indirect_num_dw, indirect_address);
+			}
+			continue;
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
-			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
-			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			static std::atomic<uint32_t> unknown_reports {0};
+			const bool                   skip = Common::SkipInvalidEnabled();
+			if (!skip || unknown_reports.fetch_add(1, std::memory_order_relaxed) < 4u) {
+				LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32
+				     ", regs=0x%016" PRIx64 ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "%s\n",
+				     i, indirect_num_dw, indirect_address, cmd_offset, value,
+				     skip ? " (skipped)" : "");
+				auto* dump_regs = indirect_buffer - i * 2;
+				for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+					LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+					     "\n",
+					     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				}
 			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			if (!skip) {
+				EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			}
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2194,6 +2292,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
+	if (IndirectRegisterListIsStale(indirect_buffer, indirect_num_dw, Pm4::UC_NUM, Pm4::UC_NOP, "UC")) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2209,21 +2310,55 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
-		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+		const bool skip_invalid = Common::SkipInvalidEnabled();
+		if (skip_invalid && raw_cmd_offset == 0u && value == 0u) {
+			// An all-zero pair: the list is not filled in yet or was released (GT7 leaving the
+			// garage). Register 0 has no handler.
+			static std::atomic<uint32_t> zero_reports {0};
+			if (zero_reports.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				LOGF("\t temporary: skipping all-zero indirect UC register entry %" PRIu32
+				     " of %" PRIu32 "\n",
+				     i, indirect_num_dw);
+			}
+			continue;
+		}
+		if (raw_cmd_offset == 0xffffffffu || cmd_offset >= Pm4::UC_NUM) {
+			// The 0xffffffff sentinel and offsets outside the UC range (GT7 leaving the World
+			// Circuit menu, amid stale register lists) are skipped as for CX and SH.
+			if (!skip_invalid) {
+				EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
+				     "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
+			}
+			static std::atomic<uint32_t> skip_reports {0};
+			if (skip_reports.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				LOGF("\t temporary: skipping indirect UC register offset 0x%08" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 ", entry %" PRIu32
+				     " of %" PRIu32 "\n",
+				     cmd_offset, raw_cmd_offset, value, i, indirect_num_dw);
+			}
+			continue;
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			static std::atomic<uint32_t> unknown_reports {0};
+			if (!skip_invalid || unknown_reports.fetch_add(1, std::memory_order_relaxed) < 16u) {
+				auto* dump_regs = indirect_buffer - i * 2;
+				for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+					LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+					     "\n",
+					     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				}
+				LOGF("\t unknown indirect UC register 0x%" PRIx32 " (raw 0x%08" PRIx32
+				     "), value = 0x%08" PRIx32 "%s\n",
+				     cmd_offset, raw_cmd_offset, value, skip_invalid ? " (skipped)" : "");
 			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			if (!skip_invalid) {
+				EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			}
+			continue;
 		}
 		pfunc(cp, cmd_offset, value);
 	}
@@ -2407,6 +2542,19 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		if (handled) {
 			for (uint32_t i = 0; i < num_values; i++) {
 				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
+			}
+			return num_values + 1u;
+		}
+		if (Common::SkipInvalidEnabled()) {
+			// usa-ratt/KytyPS5-GT7 8f279c916 (adapted): GT7 writes the removed PS block offsets
+			// 0x000/0x001 together mid-race. A SET_SH_REG of registers without a handler is
+			// skipped and logged (the first 8) instead of ending the emulator; the register tables
+			// keep those slots unhandled (indirect ones are skipped in CpOpIndirectShRegs).
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				LOGF("\t temporary: skipping SET_SH_REG of unhandled register 0x%03" PRIx32
+				     " (%u values, first 0x%08" PRIx32 ")\n",
+				     cmd_offset, num_values, num_values != 0 ? buffer[1] : 0u);
 			}
 			return num_values + 1u;
 		}

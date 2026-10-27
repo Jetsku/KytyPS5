@@ -1366,12 +1366,27 @@ void TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint
 		TileSurfaceLayout            layout {};
 		const TileSurfaceDescription description {
 		    format, tile, TileSurfaceDimension::Dim3D, width, height, depth, levels, 1};
-		if (!TileGetTiledTextureLayout(description, layout)) {
+		if (!TileGetTiledTextureLayout(description, layout) || layout.total_size > UINT32_MAX) {
+			// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 5d260c8fb): no layout (a T# read from memory
+			// that no longer holds a texture): the size stays 0, which texture binding treats as
+			// an invalid footprint (bound as null).
+			if (Common::SkipInvalidEnabled()) {
+				static std::atomic_bool logged {false};
+				if (Common::LogOnce(logged)) {
+					std::printf("Warning: 3D texture without a known layout left unsized "
+					            "(KYTY_SKIP_INVALID; logged once): format=%u tile=%u extent=%ux%ux%u "
+					            "levels=%u\n",
+					            static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width,
+					            height, depth, levels);
+				}
+				total_size = {};
+				return;
+			}
+			EXIT_NOT_IMPLEMENTED(layout.total_size > UINT32_MAX);
 			EXIT("unsupported 3D texture layout: format=%u tile=%u extent=%ux%ux%u levels=%u\n",
 			     static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width, height, depth,
 			     levels);
 		}
-		EXIT_NOT_IMPLEMENTED(layout.total_size > UINT32_MAX);
 		total_size.size  = static_cast<uint32_t>(layout.total_size);
 		total_size.align = layout.texture.block.block_size;
 		return;
@@ -1381,6 +1396,17 @@ void TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint
 	TileGetTextureSize(format, width, height, levels, tile, &slice_size, nullptr, nullptr);
 	total_size           = slice_size;
 	const uint64_t total = static_cast<uint64_t>(slice_size.size) * depth;
+	if (total > 0xffffffffull && Common::SkipInvalidEnabled()) {
+		static std::atomic_bool logged {false};
+		if (Common::LogOnce(logged)) {
+			std::printf("Warning: texture larger than 4 GB left unsized (KYTY_SKIP_INVALID; logged "
+			            "once): format=%u tile=%u extent=%ux%u depth=%u levels=%u\n",
+			            static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width, height,
+			            depth, levels);
+		}
+		total_size = {};
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(total > 0xffffffffull);
 	total_size.size = static_cast<uint32_t>(total);
 }

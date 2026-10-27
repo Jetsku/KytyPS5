@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
 
@@ -232,6 +233,14 @@ bool PlanBufferWrites(const CompiledShaderInfo& program, const ResourceSnapshot&
 bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
                     const PreparedDraw& prepared, PipelineCache::PipelineTargets& targets) {
 	targets = {};
+	// KYTY_LAYER_CLAMP: the key of a draw that exports the layer index takes the bound layer count,
+	// which only the resolution knows: the serial path.
+	if (ShaderRecompiler::GetCodegenOptions().layer_clamp && prepared.vertex_info.stage &&
+	    std::ranges::any_of(prepared.vertex_info.stage.program->info.outputs, [](const auto& output) {
+		    return output.kind == ShaderRecompiler::IR::StageOutputKind::Layer;
+	    })) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (prepared.pixel_active) {
 		for (const auto& output: prepared.pixel_info.stage.program->info.outputs) {

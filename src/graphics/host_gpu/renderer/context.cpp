@@ -1066,6 +1066,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	if (DeadViewScrubEnabled()) {
+		// KYTY_DEAD_VIEW_SCRUB: also checked when an encoded rendering runs (commandRecorder.cpp).
+		ScrubDeadRenderingViews(rendering, "a draw's rendering");
+	}
 	StateSink().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	--m_internal_recording;

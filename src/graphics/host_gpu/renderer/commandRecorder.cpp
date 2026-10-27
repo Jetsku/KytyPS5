@@ -414,7 +414,13 @@ struct CommandRecorder::NativeExecutor {
 	}
 
 	// ---- vk::CommandBuffer forwarding ----
-	void beginRendering(const vk::RenderingInfo& info) { command.beginRendering(info); }
+	void beginRendering(const vk::RenderingInfo& info) {
+		if (DeadViewScrubEnabled()) {
+			// KYTY_DEAD_VIEW_SCRUB: the views may have been destroyed since the call was encoded.
+			ScrubDeadRenderingViews(info, "a recorded rendering");
+		}
+		command.beginRendering(info);
+	}
 	void endRendering() { command.endRendering(); }
 	void pipelineBarrier2(const vk::DependencyInfo& info) { command.pipelineBarrier2(info); }
 	void pipelineBarrier(vk::PipelineStageFlags src, vk::PipelineStageFlags dst,
@@ -466,10 +472,16 @@ struct CommandRecorder::NativeExecutor {
 	// KYTY_RECORDER_DESCRIPTOR_SETS: the CP allocated the set and binds it in a later packet.
 	void updateDescriptorSets(vk::DescriptorSet /*set*/, uint32_t count,
 	                          const vk::WriteDescriptorSet* writes) {
+		if (DeadViewScrubEnabled()) {
+			ScrubDeadDescriptorViews(writes, count, "recorded descriptors");
+		}
 		owner.m_graphics.device.updateDescriptorSets(count, writes, 0, nullptr);
 	}
 	void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                          uint32_t count, const vk::WriteDescriptorSet* writes) {
+		if (DeadViewScrubEnabled()) {
+			ScrubDeadDescriptorViews(writes, count, "recorded descriptors");
+		}
 		command.pushDescriptorSetKHR(point, layout, set, count, writes);
 	}
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,

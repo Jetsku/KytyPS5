@@ -987,6 +987,29 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
+	if (skip) {
+		// usa-ratt/KytyPS5-GT7 767c1e25e, 5ef1f4c3c: a minimum LOD past the last mip, a base
+		// layer past the image's layers or a component selector no texture has (each an EXIT in
+		// TextureViewInfo): a bindless heap entry read while the guest rewrote it (GT7 races), or
+		// a T# read after its reuse. Bound as null (a bindless key stays on its placeholder).
+		if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
+			static std::atomic_bool logged {false};
+			return SkipTextureDescriptor(resource, descriptor, "texture minimum LOD past its last mip",
+			                             logged);
+		}
+		if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
+		    descriptor.BaseArray5() >= desc.info.resources.layers) {
+			static std::atomic_bool logged {false};
+			return SkipTextureDescriptor(resource, descriptor, "texture base layer past its layers",
+			                             logged);
+		}
+		if (!storage && resource.conversion_format == Prospero::BufferFormat::kInvalid &&
+		    !IsValidImageSwizzle(descriptor.DstSelXYZW())) {
+			static std::atomic_bool logged {false};
+			return SkipTextureDescriptor(resource, descriptor,
+			                             "texture component selector no texture has", logged);
+		}
+	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
@@ -1191,6 +1214,23 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		if (!IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
+		                                 descriptor.DstSelXYZW()) &&
+		    Common::SkipInvalidEnabled()) {
+			// usa-ratt/KytyPS5-GT7 5ef1f4c3c: an image the T# cannot view (a stale bindless heap
+			// entry, a reused T#): bound as null instead of ending the emulator.
+			static std::atomic_bool logged {false};
+			if (Common::LogOnce(logged)) {
+				std::printf("Warning: sampled texture over an image it cannot view (image format %d, "
+				            "view format %d, swizzle 0x%x) bound as null (KYTY_SKIP_INVALID; logged "
+				            "once): addr=0x%016" PRIx64 "\n",
+				            static_cast<int>(image->info.pixel_format), static_cast<int>(pixel_format),
+				            descriptor.DstSelXYZW(), descriptor.Base40());
+			}
+			desc             = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+			binding.image_id = texture_cache.FindImage(desc);
+			return;
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
@@ -3191,12 +3231,26 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			EXIT_IF(resource.mip_count == 0u);
+			// usa-ratt/KytyPS5-GT7 3d2a02104: a T# bound as a null texture (KYTY_SKIP_INVALID) has
+			// one level where the shader has a view for each of its T#'s: with KYTY_SKIP_INVALID
+			// the views past the binding's levels repeat its last one.
+			const uint32_t levels = std::max(binding.desc.view_info.level_count, 1u);
+			if (levels != resource.mip_count) {
+				EXIT_IF(!Common::SkipInvalidEnabled());
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					LOGF("Dynamic mips: shader %016" PRIx64 " tex[%u] 0x%012" PRIx64
+					     " has %u levels bound where the shader selects among %u: the views past "
+					     "them repeat its last level\n",
+					     program.shader_hash, i, binding.desc.info.data.address, levels,
+					     resource.mip_count);
+				}
+			}
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				desc.view_info.base_level += std::min(mip, levels - 1u);
 				desc.view_info.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
 				desc.view_info.min_lod = 0;

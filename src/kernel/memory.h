@@ -286,6 +286,10 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// KYTY_TRACKER_SPARE: a live thread's stack in memory the game gave it; the page tracker's
+// protections leave it writable until it is removed (GuestAddressSpace::AddLiveStack).
+void AddLiveThreadStack(uint64_t vaddr, uint64_t size);
+void RemoveLiveThreadStack(uint64_t vaddr, uint64_t size);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

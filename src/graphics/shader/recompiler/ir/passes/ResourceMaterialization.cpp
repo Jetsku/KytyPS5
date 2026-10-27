@@ -400,7 +400,7 @@ public:
 			for (uint32_t child = 0; child < count; ++child) {
 				auto slot = Hash(images[children_begin + child]);
 				while (m_ordinals[slot] != 0u) slot = (slot + 1u) & SlotMask;
-				m_ordinals[slot] = static_cast<uint8_t>(child + 1u);
+				m_ordinals[slot] = static_cast<uint16_t>(child + 1u);
 			}
 			m_indexed = true;
 		}
@@ -415,7 +415,7 @@ public:
 
 	void Insert(Lookup lookup) {
 		if (lookup.slot != UINT32_MAX) {
-			m_ordinals[lookup.slot] = static_cast<uint8_t>(lookup.ordinal);
+			m_ordinals[lookup.slot] = static_cast<uint16_t>(lookup.ordinal);
 		}
 	}
 
@@ -423,7 +423,7 @@ private:
 	static constexpr uint32_t LinearLimit = 8;
 	static constexpr uint32_t SlotCount = std::bit_ceil(ShaderInfo::MaxImages * 2u);
 	static constexpr uint32_t SlotMask = SlotCount - 1u;
-	static_assert(ShaderInfo::MaxImages <= UINT8_MAX);
+	static_assert(ShaderInfo::MaxImages < UINT16_MAX);
 
 	static uint32_t Hash(const DescriptorValue& descriptor) {
 		// Hash explicit fields, excluding any padding. Equality below still compares the
@@ -436,7 +436,7 @@ private:
 		return static_cast<uint32_t>(hash) & SlotMask;
 	}
 
-	std::array<uint8_t, SlotCount> m_ordinals;
+	std::array<uint16_t, SlotCount> m_ordinals;
 	bool                          m_indexed = false;
 };
 
