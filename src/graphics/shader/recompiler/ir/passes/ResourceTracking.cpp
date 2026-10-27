@@ -4194,10 +4194,11 @@ private:
 		if ((flags & Decoder::ImageSampleFlagBias) != 0u) layer++;
 		if ((flags & Decoder::ImageSampleFlagCompare) != 0u) layer++;
 		if ((flags & Decoder::ImageSampleFlagDerivative) != 0u) layer += 2u * spatial;
-		const auto component = Decoder::ImageAddressComponentLayout(flags, layer);
-		if (component.bit_width != 32u) return ImageResource::NoArrayIndexBound;
-		// (A component past the address's words reads 0: SpirvEmitter's AddressU32.)
-		const auto word = component.bit_offset / 32u;
+		// (16-bit coordinates, A16: no bound. Otherwise every component is one 32-bit word, as
+		// Decoder::ImageAddressComponentLayout lays them out. A component past the address's words
+		// reads 0: SpirvEmitter's AddressU32.)
+		if ((flags & Decoder::ImageSampleFlagA16) != 0u) return ImageResource::NoArrayIndexBound;
+		const auto word = layer;
 		if (word >= address->NumArgs()) return 0;
 		m_lanes          = ResultLanes(inst);
 		CollectLaneTerms();
