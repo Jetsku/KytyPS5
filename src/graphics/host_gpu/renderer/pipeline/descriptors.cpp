@@ -211,6 +211,21 @@ static uint64_t StorageRangeCap(const GraphicContext& graphics) {
 	return on ? uint64_t {0x7ffffffc} : std::numeric_limits<uint64_t>::max();
 }
 
+// KYTY_READ_BUFFER_TAIL=1 (default off; usa-ratt/KytyPS5-GT7 d875ff10f, round 84): a read-only
+// storage binding's range, which the shaders' bounds checks floor to whole dwords, is rounded up to
+// whole dwords instead of down. Byte and halfword reads index up to four and two times that
+// length, so a range ending inside a dword hid its last bytes: GT7's car glass reads a
+// 17,370-byte table (one byte per control point of its 965 patches), its last patch read the last
+// two bytes as zero and one corner rose half a metre above the roof (the roof spike). A written
+// binding keeps the rounding down, so a dword store cannot reach past its range.
+static bool ReadBufferTail() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READ_BUFFER_TAIL");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
@@ -268,10 +283,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
 	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
 	// no-op for every shader-side check, and it makes the device check match them.
-	const auto range =
+	auto range =
 	    std::min(size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
 	                                     : size + adjustment,
 	             StorageRangeCap(graphics));
+	// KYTY_READ_BUFFER_TAIL: a read-only binding is rounded up to whole dwords instead, so byte
+	// and halfword reads of the last partial dword are not hidden by the dword bounds checks.
+	if (ReadBufferTail() && !resource.written && (size + adjustment) % 4u != 0) {
+		const auto whole = Common::AlignUp(size + adjustment, uint64_t {4});
+		if (aligned_offset + whole <= buffer->Size()) {
+			range = std::min(whole, StorageRangeCap(graphics));
+		}
+	}
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	if (size > 0x7ffffffcu) {
 		// Bindings of 2 GiB or more (KYTY_STORAGE_RANGE_CAP / KYTY_STORAGE_LENGTH_ZERO): each guest
