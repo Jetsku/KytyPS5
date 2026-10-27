@@ -171,7 +171,44 @@ static std::atomic<Handler> g_first_handler {nullptr};
 // handler recognizes (guest memory tracking faults) before any other process-wide handler runs,
 // and passes everything else on unchanged, so the order seen by other exceptions is unaffected.
 static LONG WINAPI FirstExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
-	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+	auto* record = exception->ExceptionRecord;
+	// KYTY_READ_GUARD (kernel/memoryAddressSpace.inc): a guard page standing for a guest view's
+	// no access raised its fault (the guard is gone with it). Offered to the first handler as the
+	// read access violation no access would have raised; anything it does not take goes on as a
+	// guard-page violation (guest stack guards).
+	if (record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION && record->NumberParameters >= 2) {
+		const auto handler = g_first_handler.load(std::memory_order_acquire);
+		if (handler == nullptr) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		ExceptionInfo info {};
+		info.exception_address      = reinterpret_cast<uint64_t>(record->ExceptionAddress);
+		info.native_code            = record->ExceptionCode;
+		info.native_context         = exception->ContextRecord;
+		info.type                   = ExceptionType::AccessViolation;
+		info.access_violation_type  = record->ExceptionInformation[0] == 1 ? AccessViolationType::Write
+		                                                                   : AccessViolationType::Read;
+		info.access_violation_vaddr = record->ExceptionInformation[1];
+		const auto* context         = exception->ContextRecord;
+		info.rax = context->Rax;
+		info.rbx = context->Rbx;
+		info.rcx = context->Rcx;
+		info.rdx = context->Rdx;
+		info.rsi = context->Rsi;
+		info.rdi = context->Rdi;
+		info.rbp = context->Rbp;
+		info.rsp = context->Rsp;
+		info.r8  = context->R8;
+		info.r9  = context->R9;
+		info.r10 = context->R10;
+		info.r11 = context->R11;
+		info.r12 = context->R12;
+		info.r13 = context->R13;
+		info.r14 = context->R14;
+		info.r15 = context->R15;
+		return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	}
+	if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	const auto handler = g_first_handler.load(std::memory_order_acquire);

@@ -17,6 +17,63 @@ static constexpr uint64_t HOST_USER_MAX = GUEST_ADDRESS_SPACE_END - 1u;
 static constexpr uint64_t HOST_USER_ALLOC_END = kAmmWindowBase;
 static_assert(kAmmWindowBase > HOST_USER_MIN && kAmmWindowBase + kAmmWindowSize == HOST_USER_MAX + 1u);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// KYTY_READ_GUARD (default off; chenxiao07/KytyPS5 f53b4497a, 8de5e4024, 90c42c900, ee79829f0,
+// adapted): the GPU trackers' read protection of a guest view page (no access) is a guard page over
+// read-only instead. Windows' MEMORY_MANAGEMENT bug check 0x1A/0x41202 needs a no-access page of a
+// paged section view whose memory left RAM (a PC whose RAM runs full); guard pages ran clean under
+// the same paging in chenxiao's reproducer. A guard fault is served as the read fault no access
+// raised (hostException.cpp). A guard is one-shot: another thread may read the page between the
+// fault and its service without faulting (chenxiao saw ~1 in 90 at the Tower of Latria), so this
+// is a low-RAM safety mode, not a default.
+//   =1: always guards. =auto: guards while less than KYTY_READ_GUARD_MIN_AVAIL_MB (default 1536)
+//   of RAM is free, no access again from 512 MiB more (checked at most twice a second; pages
+//   protected earlier keep what they got).
+static bool ReadGuardNow() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_READ_GUARD");
+		if (value == nullptr || *value == '\0' || value[0] == '0') {
+			return 0;
+		}
+		const int chosen = std::strcmp(value, "auto") == 0 ? 2 : 1;
+		std::printf("Memory: guest read protection by guard pages %s (KYTY_READ_GUARD=%s)\n",
+		            chosen == 1 ? "always" : "while RAM is short", value);
+		return chosen;
+	}();
+	if (mode != 2) {
+		return mode == 1;
+	}
+	static const uint64_t minimum = [] {
+		const char* value = std::getenv("KYTY_READ_GUARD_MIN_AVAIL_MB");
+		return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {1536})
+		       << 20u;
+	}();
+	static std::atomic<uint64_t> checked_ms {0};
+	static std::atomic<bool>     pressure {false};
+	const uint64_t               now = GetTickCount64();
+	if (now - checked_ms.load(std::memory_order_relaxed) >= 500) {
+		checked_ms.store(now, std::memory_order_relaxed);
+		MEMORYSTATUSEX status {};
+		status.dwLength = sizeof(status);
+		if (GlobalMemoryStatusEx(&status) != 0) {
+			const bool was  = pressure.load(std::memory_order_relaxed);
+			const bool next = was ? status.ullAvailPhys < minimum + (uint64_t {512} << 20u)
+			                      : status.ullAvailPhys < minimum;
+			if (next != was) {
+				pressure.store(next, std::memory_order_relaxed);
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+					std::printf("Memory: %llu MiB of RAM free: guest read protection by %s (KYTY_READ_GUARD=auto)\n",
+					            static_cast<unsigned long long>(status.ullAvailPhys >> 20u),
+					            next ? "guard pages" : "no access again");
+				}
+			}
+		}
+	}
+	return pressure.load(std::memory_order_relaxed);
+}
+#endif
+
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
 	if (UINT64_MAX - base < range_size || candidate < base) {
@@ -1820,6 +1877,18 @@ private:
 				}
 				continue;
 			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// KYTY_READ_GUARD: a guest view's no access as a guard page over read-only.
+			if (range_start < range_end && mode == VirtualMemory::Mode::NoAccess &&
+			    region.type == MappingType::Backing && ReadGuardNow()) {
+				DWORD old = 0;
+				if (VirtualProtect(reinterpret_cast<void*>(range_start), range_end - range_start,
+				                   PAGE_GUARD | PAGE_READONLY, &old) == 0) {
+					return false;
+				}
+				continue;
+			}
+#endif
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
