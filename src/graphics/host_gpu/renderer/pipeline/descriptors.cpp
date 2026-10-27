@@ -890,6 +890,127 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	}
 }
 
+// The guest texture of the levels `first`.. of `full`, its larger levels left out: the tiled layout
+// puts the mip tail first and then the levels from the smallest up, so a 2D texture's levels from
+// `first` on are the first bytes of its memory, laid out as the texture of its size >> first with
+// that many fewer levels. An array's layers lie one after another, each with all its levels: the
+// smaller array keeps the whole memory (the slice stride stays), each layer's kept levels the
+// first bytes of its own. False where that does not hold byte for byte (every level's offset, size
+// and padding compared). (chenxiao07/KytyPS5 080986b3f, c965985ff.)
+static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& out) {
+	if (first == 0 || first >= full.resources.levels || full.resources.levels > full.mip_layout.size()) {
+		return false;
+	}
+	const auto shift = [&](uint32_t value) { return std::max((value + (1u << first) - 1u) >> first, 1u); };
+	out                  = full;
+	out.extent.width     = shift(full.extent.width);
+	out.extent.height    = shift(full.extent.height);
+	out.resources.levels = full.resources.levels - first;
+	// (A tiling the smaller texture has no layout for: TileGetTextureSize would end the emulator.)
+	if (TileSurfaceLayout probe {};
+	    full.tile_mode != Prospero::TileMode::kLinear &&
+	    !TileGetTiledTextureLayout({full.guest_format, full.tile_mode, TileSurfaceDimension::Dim2D,
+	                                out.extent.width, out.extent.height, 1, out.resources.levels, 1},
+	                               probe)) {
+		return false;
+	}
+	out.pitch = TileGetTexturePitch(full.guest_format, out.extent.width, full.tile_mode);
+	TileSizeAlign size {};
+	TileGetTextureTotalSize(full.guest_format, out.extent.width, out.extent.height, 1,
+	                        out.resources.levels, full.tile_mode, false, size);
+	if (size.size == 0 || size.size >= full.data.size || size.align == 0 ||
+	    full.data.address % size.align != 0) {
+		return false;
+	}
+	const auto layers = full.resources.layers;
+	if (layers > 1 && (full.data.size % layers != 0 || size.size > full.data.size / layers)) {
+		return false;
+	}
+	out.data       = {full.data.address, layers > 1 ? full.data.size : size.size};
+	out.mip_layout = {};
+	PopulateTextureMipLayout(out);
+	for (uint32_t level = 0; level < out.resources.levels; ++level) {
+		const auto& mip = out.mip_layout[level];
+		if (mip != full.mip_layout[first + level] || mip.size == 0 || mip.offset + mip.size > out.data.size) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// KYTY_TEXTURE_PREFIX=1 (default off; chenxiao07/KytyPS5): a sampled 2D texture whose T# starts at
+// level k > 0 is held as the texture of its levels k.. (TextureFromLevel), not whole.
+static bool TexturePrefixEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_PREFIX");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// KYTY_TEXTURE_REDUCE=0|1|2 (default 0 here; chenxiao's default 1 below 12 GiB of video memory):
+// a sampled 2D block-compressed texture (or array of them) of at least 1024 texels on a side is held
+// without its 1 or 2 largest levels (TextureFromLevel): the left-out levels take no video memory
+// and are not uploaded when the game writes them. Shaders then sample the smaller texture (a little
+// blur). Demon's Souls also streams none of those levels (loader/demonsSoulsTextureMips.cpp).
+uint32_t TextureReduceLevels() {
+	static const uint32_t levels = [] {
+		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
+		const uint32_t chosen = value != nullptr && value[0] != '\0'
+		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
+		                            : 0u;
+		if (chosen != 0) {
+			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
+			            "(KYTY_TEXTURE_REDUCE)\n",
+			            chosen);
+			std::fflush(stdout);
+		}
+		return chosen;
+	}();
+	return levels;
+}
+
+static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc) {
+	const auto  base = desc.view_info.base_level;
+	const auto  last = base + desc.view_info.level_count - 1u;
+	const auto& full = desc.info;
+	// The levels left out of a large BC texture (none where the view reads only those, nor of one
+	// the GPU wrote).
+	const auto reduce = TextureReduceLevels();
+	const auto drop   = reduce != 0 && full.IsBlock() &&
+	                          std::max(full.extent.width, full.extent.height) >= 1024u &&
+	                          full.resources.levels > reduce && last >= reduce &&
+	                          !cache.IsRegionGpuModified(full.data.address, full.data.size) &&
+	                          !cache.HasGpuWrittenImageOverlap(full.data.address, full.data.size)
+	                        ? reduce
+	                        : 0u;
+	// The first level held: the T#'s base, or past the levels left out.
+	const auto first_held = std::max(base, drop);
+	// (An array only for the levels left out: one held from its T#'s later base level is not tried.)
+	if (first_held == 0 || (drop == 0 && (!TexturePrefixEnabled() || full.resources.layers > 1)) ||
+	    full.resources.layers == 0 || full.samples != 1 || full.type != Prospero::ImageType::kColor2D ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() ||
+	    full.tile_mode == Prospero::TileMode::kLinear || full.tile_mode == Prospero::TileMode::kDepth ||
+	    full.tile_mode == Prospero::TileMode::kRenderTarget || cache.HoldsImage(full)) {
+		return;
+	}
+	ImageInfo from {};
+	for (uint32_t first = std::max(drop, 1u); first < first_held; ++first) {
+		if (TextureFromLevel(full, first, from) && cache.HoldsImage(from)) {
+			desc.info                  = from;
+			desc.view_info.base_level  = first_held - first;
+			desc.view_info.level_count = last - first_held + 1u;
+			return;
+		}
+	}
+	if (!TextureFromLevel(full, first_held, from)) {
+		return;
+	}
+	desc.info                  = from;
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = last - first_held + 1u;
+}
+
 // KYTY_TEXTURE_LAYER_RANGE=1 (default off; chenxiao07/KytyPS5's HoldLayerRange, without its
 // HoldLayers growth): a sampled one-level array texture whose view reads a few of its layers (from
 // a base past the first, or bounded by KYTY_TEXTURE_LAYER_BOUND) is held as the array of the
@@ -1567,6 +1688,10 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 			                      false);
 		}
 		return;
+	}
+	if (!storage && (TextureReduceLevels() != 0 || TexturePrefixEnabled())) {
+		// KYTY_TEXTURE_REDUCE / KYTY_TEXTURE_PREFIX: held from a later level.
+		HoldFromBaseLevel(texture_cache, desc);
 	}
 	if (!storage && TextureLayerRangeEnabled()) {
 		HoldLayerRange(texture_cache, desc, m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxImageArrayLayers);

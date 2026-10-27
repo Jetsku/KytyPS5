@@ -3076,6 +3076,20 @@ ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
 	return result;
 }
 
+bool TextureCache::HasGpuWrittenImageOverlap(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return true;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (image.IsGpuModified()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool TextureCache::HoldsImage(const ImageInfo& info) {
 	if (info.data.Empty()) {
 		return false;

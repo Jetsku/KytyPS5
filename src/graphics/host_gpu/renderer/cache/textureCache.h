@@ -623,6 +623,8 @@ private:
 	// Whether a registered image has `info`'s backing (FindImageWithSameBacking under m_lock;
 	// descriptors.cpp HoldLayerRange, KYTY_TEXTURE_LAYER_RANGE).
 	[[nodiscard]] bool          HoldsImage(const ImageInfo& info);
+	// Whether an image over the range was written by the GPU (KYTY_TEXTURE_REDUCE leaves those whole).
+	[[nodiscard]] bool          HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] ImageId       FindImageWithSameBacking(const ImageInfo& requested,
 	                                                     bool exact_format) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
