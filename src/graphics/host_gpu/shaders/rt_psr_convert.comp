@@ -1,0 +1,393 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// GPU conversion of Psr BVHs into host acceleration-structure inputs, without any readback.
+// BLAS modes take a job list (push `aux`, `aux_count`); one job per Psr BVH:
+//   mode 0  walk, one workgroup per job (breadth first): one AABB per leaf, from its parent box
+//   mode 1  expand leaf lists into float3 triangles (fast, approximate mode); y = job
+//   mode 2  mark AABBs [count, capacity) inactive (NaN); y = job
+//   mode 3  mark triangles [count, capacity) inactive (NaN); y = job
+// TLAS modes (direct push fields; the instance leaf list follows the node queue):
+//   mode 4  walk (one workgroup): list the reachable instance leaves
+//   mode 5  one invocation per listed instance: VkAccelerationStructureInstanceKHR and slot record
+// Counters (uint[8]): 0 leaves or instances written, 1 box nodes, 2 status bits, 3 queue use,
+// 4 triangles written.
+
+#include "rt_psr_common.inc"
+
+// The breadth-first queue is shared by the invocations of one workgroup.
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer QueueWords {
+	uint w[];
+};
+
+struct ConvertJob {
+	uint64_t base;
+	uint64_t aabbs;
+	uint64_t leaves;
+	uint64_t triangles;
+	uint64_t records;
+	uint64_t counters;
+	uint64_t queue;
+	uint     root;
+	uint     leaf_capacity;
+	uint     tri_capacity;
+	uint     queue_capacity;
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer ConvertJobs {
+	ConvertJob j[];
+};
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+	uint64_t page_table;
+	uint64_t page_first;
+	uint64_t base;
+	uint64_t out0;
+	uint64_t out1;
+	uint64_t queue;
+	uint64_t counters;
+	uint64_t aux;
+	uint     root;
+	uint     capacity;
+	uint     queue_capacity;
+	uint     mode;
+	uint     aux_count;
+} pc;
+
+const uint STATUS_UNSUPPORTED_NODE = 1u;
+const uint STATUS_QUEUE_OVERFLOW   = 2u;
+const uint STATUS_CAPACITY         = 4u;
+const uint STATUS_UNKNOWN_BLAS     = 16u;
+const uint STATUS_TRAP             = 32u;
+
+// Parameters of the walk this workgroup runs.
+struct WalkParams {
+	uint64_t base;
+	uint64_t out0;     // AABBs (BLAS) or instance descriptors (TLAS)
+	uint64_t out1;     // leaf pointers (BLAS) or slot records (TLAS)
+	uint64_t queue;
+	uint64_t counters;
+	uint     root;
+	uint     capacity;
+	uint     queue_capacity;
+	bool     tlas;
+};
+
+shared uint s_tail;
+shared uint s_count;
+shared uint s_nodes;
+shared uint s_status;
+
+void Fail(uint bits) {
+	atomicOr(s_status, bits);
+}
+
+// Host AABBs are inflated by 2^-16 of their magnitude and extent: the RT cores test them with the
+// driver's object-space ray, which is not bit-identical to the guest's, and a leaf the guest's box
+// test reaches must never be culled here (extra candidates only cost an exact leaf test).
+void EmitLeaf(WalkParams w, uint ptr, vec3 bmin, vec3 bmax) {
+	vec3 pad  = (max(abs(bmin), abs(bmax)) + max(bmax - bmin, vec3(0.0))) * (1.0 / 65536.0);
+	bmin      = bmin - pad;
+	bmax      = bmax + pad;
+	uint slot = atomicAdd(s_count, 1u);
+	if (slot >= w.capacity) {
+		Fail(STATUS_CAPACITY);
+		return;
+	}
+	RwFloats a  = RwFloats(w.out0);
+	uint     b  = slot * 6u;
+	a.f[b + 0u] = bmin.x;
+	a.f[b + 1u] = bmin.y;
+	a.f[b + 2u] = bmin.z;
+	a.f[b + 3u] = bmax.x;
+	a.f[b + 4u] = bmax.y;
+	a.f[b + 5u] = bmax.z;
+	RwWords(w.out1).w[slot] = ptr;
+}
+
+// A BLAS whose root is a leaf has no parent box: bound its triangles.
+void EmitLeafRoot(WalkParams w) {
+	vec3     bmin = vec3(PsrInf());
+	vec3     bmax = vec3(-PsrInf());
+	uint64_t list = PsrLeafAddress(w.base, w.root);
+	for (uint e = 0u; e < 1024u; e++) {
+		PsrWords entry   = PsrObject(list + uint64_t(e) * 8ul);
+		uint     tri_ptr = entry.w[0];
+		uint     info    = entry.w[1];
+		if ((tri_ptr & 7u) == 7u) {
+			break;
+		}
+		vec3 v0, v1, v2;
+		if (!PsrReadTriangle(w.base, tri_ptr, v0, v1, v2)) {
+			Fail(STATUS_UNSUPPORTED_NODE);
+			return;
+		}
+		bmin = min(bmin, min(v0, min(v1, v2)));
+		bmax = max(bmax, max(v0, max(v1, v2)));
+		if ((info & PSR_LEAF_LAST) != 0u) {
+			break;
+		}
+	}
+	EmitLeaf(w, w.root, bmin, bmax);
+}
+
+// Object-to-world (row-major 3x4) from the Psr world-to-object record, in double precision.
+void Invert(float m[12], out float r[12]) {
+	double a00 = m[0], a01 = m[1], a02 = m[2], t0 = m[3];
+	double a10 = m[4], a11 = m[5], a12 = m[6], t1 = m[7];
+	double a20 = m[8], a21 = m[9], a22 = m[10], t2 = m[11];
+	double c00 = a11 * a22 - a12 * a21;
+	double c01 = a12 * a20 - a10 * a22;
+	double c02 = a10 * a21 - a11 * a20;
+	double det = a00 * c00 + a01 * c01 + a02 * c02;
+	if (det == 0.0) {
+		for (int i = 0; i < 12; i++) {
+			r[i] = 0.0;
+		}
+		return;
+	}
+	double inv = 1.0 / det;
+	double r00 = c00 * inv;
+	double r01 = (a02 * a21 - a01 * a22) * inv;
+	double r02 = (a01 * a12 - a02 * a11) * inv;
+	double r10 = c01 * inv;
+	double r11 = (a00 * a22 - a02 * a20) * inv;
+	double r12 = (a02 * a10 - a00 * a12) * inv;
+	double r20 = c02 * inv;
+	double r21 = (a01 * a20 - a00 * a21) * inv;
+	double r22 = (a00 * a11 - a01 * a10) * inv;
+	r[0]       = float(r00);
+	r[1]       = float(r01);
+	r[2]       = float(r02);
+	r[3]       = float(-(r00 * t0 + r01 * t1 + r02 * t2));
+	r[4]       = float(r10);
+	r[5]       = float(r11);
+	r[6]       = float(r12);
+	r[7]       = float(-(r10 * t0 + r11 * t1 + r12 * t2));
+	r[8]       = float(r20);
+	r[9]       = float(r21);
+	r[10]      = float(r22);
+	r[11]      = float(-(r20 * t0 + r21 * t1 + r22 * t2));
+}
+
+uint64_t InstanceList() {
+	return pc.queue + uint64_t(pc.queue_capacity) * 4ul;
+}
+
+void EmitInstance(uint slot, uint leaf_ptr) {
+	RwWords counters = RwWords(pc.counters);
+	PsrInstance inst;
+	if (!PsrReadInstance(pc.base, leaf_ptr, inst)) {
+		atomicOr(counters.w[2], STATUS_UNSUPPORTED_NODE);
+		return;
+	}
+	// Host BLAS for (Psr base, root): table entries are {base, root, AS address, primitive table}.
+	int   found = -1;
+	RwU64 table = RwU64(pc.aux);
+	for (uint i = 0u; i < pc.aux_count; i++) {
+		if (table.q[i * 4u + 0u] == inst.blas && uint(table.q[i * 4u + 1u]) == inst.root) {
+			found = int(i);
+			break;
+		}
+	}
+	float xf[12];
+	Invert(inst.m, xf);
+	RwWords dst = RwWords(pc.out0);
+	uint    b   = slot * 16u;
+	for (uint i = 0u; i < 12u; i++) {
+		dst.w[b + i] = floatBitsToUint(xf[i]);
+	}
+	uint mask = inst.id_mask >> 24u;
+	// VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR when the guest does not cull.
+	uint vk_flags  = (inst.flags & PSR_CULL_DISABLE) != 0u ? 1u : 0u;
+	dst.w[b + 12u] = (slot & 0xffffffu) | (mask << 24u);
+	dst.w[b + 13u] = vk_flags << 24u;
+	uint64_t reference = 0ul;
+	uint64_t prims     = 0ul;
+	if (found >= 0) {
+		reference = table.q[uint(found) * 4u + 2u];
+		prims     = table.q[uint(found) * 4u + 3u];
+	} else {
+		atomicOr(counters.w[2], STATUS_UNKNOWN_BLAS);
+	}
+	dst.w[b + 14u] = uint(reference);
+	dst.w[b + 15u] = uint(reference >> 32);
+	// Slot record for the trace kernels: Psr record, BLAS base, per-primitive table, index|flags.
+	RwU64 slots             = RwU64(pc.out1);
+	slots.q[slot * 4u + 0u] = inst.address;
+	slots.q[slot * 4u + 1u] = inst.blas;
+	slots.q[slot * 4u + 2u] = prims;
+	slots.q[slot * 4u + 3u] = uint64_t(inst.index) | (uint64_t(inst.flags) << 32);
+}
+
+void Walk(WalkParams w) {
+	uint tid = gl_LocalInvocationIndex;
+	if (tid == 0u) {
+		s_tail   = 0u;
+		s_count  = 0u;
+		s_nodes  = 0u;
+		s_status = 0u;
+		if ((PsrLoad(w.base + PSR_HEADER_FLAGS) & PSR_HEADER_TRAP_BIT) != 0u) {
+			s_status = STATUS_TRAP;
+		} else if (PsrIsBox(w.root)) {
+			QueueWords(w.queue).w[0] = w.root;
+			s_tail                   = 1u;
+		} else if (w.tlas || w.root == PSR_INVALID) {
+			s_status = w.tlas ? STATUS_UNSUPPORTED_NODE : 0u;
+		} else {
+			EmitLeafRoot(w);
+		}
+	}
+	barrier();
+	uint head = 0u;
+	for (;;) {
+		uint end = s_tail;
+		barrier();
+		if (head == end || end > w.queue_capacity) {
+			break;
+		}
+		for (uint i = head + tid; i < end; i += gl_WorkGroupSize.x) {
+			uint   ptr = QueueWords(w.queue).w[i];
+			PsrBox box;
+			atomicAdd(s_nodes, 1u);
+			if (!PsrReadBox(w.base, ptr, box)) {
+				Fail(STATUS_UNSUPPORTED_NODE);
+				continue;
+			}
+			for (uint c = 0u; c < 4u; c++) {
+				uint child = box.child[c];
+				if (child == PSR_INVALID) {
+					continue;
+				}
+				if (PsrIsBox(child)) {
+					uint q = atomicAdd(s_tail, 1u);
+					if (q < w.queue_capacity) {
+						QueueWords(w.queue).w[q] = child;
+					} else {
+						Fail(STATUS_QUEUE_OVERFLOW);
+					}
+				} else if (w.tlas) {
+					uint slot = atomicAdd(s_count, 1u);
+					if (slot < w.capacity) {
+						RwWords(InstanceList()).w[slot] = child;
+					} else {
+						Fail(STATUS_CAPACITY);
+					}
+				} else {
+					EmitLeaf(w, child, box.bmin[c], box.bmax[c]);
+				}
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+		head = end;
+	}
+	barrier();
+	if (tid == 0u) {
+		RwWords counters = RwWords(w.counters);
+		counters.w[0]    = min(s_count, w.capacity);
+		counters.w[1]    = s_nodes;
+		counters.w[2]    = s_status;
+		counters.w[3]    = s_tail;
+	}
+}
+
+void ExpandLeaf(ConvertJob job, uint leaf) {
+	RwWords counters = RwWords(job.counters);
+	if (leaf >= counters.w[0]) {
+		return;
+	}
+	uint     ptr  = RwWords(job.leaves).w[leaf];
+	uint64_t list = PsrLeafAddress(job.base, ptr);
+	for (uint e = 0u; e < 1024u; e++) {
+		PsrWords entry   = PsrObject(list + uint64_t(e) * 8ul);
+		uint     tri_ptr = entry.w[0];
+		uint     info    = entry.w[1];
+		if ((tri_ptr & 7u) == 7u) {
+			break;
+		}
+		vec3 v0, v1, v2;
+		if (!PsrReadTriangle(job.base, tri_ptr, v0, v1, v2)) {
+			atomicOr(counters.w[2], STATUS_UNSUPPORTED_NODE);
+			break;
+		}
+		uint slot = atomicAdd(counters.w[4], 1u);
+		if (slot < job.tri_capacity) {
+			RwFloats v  = RwFloats(job.triangles);
+			uint     b  = slot * 9u;
+			v.f[b + 0u] = v0.x;
+			v.f[b + 1u] = v0.y;
+			v.f[b + 2u] = v0.z;
+			v.f[b + 3u] = v1.x;
+			v.f[b + 4u] = v1.y;
+			v.f[b + 5u] = v1.z;
+			v.f[b + 6u] = v2.x;
+			v.f[b + 7u] = v2.y;
+			v.f[b + 8u] = v2.z;
+			RwWords(job.records).w[slot * 2u + 0u] = tri_ptr;
+			RwWords(job.records).w[slot * 2u + 1u] = info;
+		} else {
+			atomicOr(counters.w[2], STATUS_CAPACITY);
+		}
+		if ((info & PSR_LEAF_LAST) != 0u) {
+			break;
+		}
+	}
+}
+
+void main() {
+	g_page_table = pc.page_table;
+	g_page_first = pc.page_first;
+	if (pc.mode == 4u) {
+		WalkParams w;
+		w.base           = pc.base;
+		w.out0           = pc.out0;
+		w.out1           = pc.out1;
+		w.queue          = pc.queue;
+		w.counters       = pc.counters;
+		w.root           = pc.root;
+		w.capacity       = pc.capacity;
+		w.queue_capacity = pc.queue_capacity;
+		w.tlas           = true;
+		Walk(w);
+		return;
+	}
+	if (pc.mode == 5u) {
+		uint slot = gl_GlobalInvocationID.x;
+		if (slot < RwWords(pc.counters).w[0]) {
+			EmitInstance(slot, RwWords(InstanceList()).w[slot]);
+		}
+		return;
+	}
+	uint job_index = pc.mode == 0u ? gl_WorkGroupID.x : gl_WorkGroupID.y;
+	if (job_index >= pc.aux_count) {
+		return;
+	}
+	ConvertJob job = ConvertJobs(pc.aux).j[job_index];
+	if (pc.mode == 0u) {
+		WalkParams w;
+		w.base           = job.base;
+		w.out0           = job.aabbs;
+		w.out1           = job.leaves;
+		w.queue          = job.queue;
+		w.counters       = job.counters;
+		w.root           = job.root;
+		w.capacity       = job.leaf_capacity;
+		w.queue_capacity = job.queue_capacity;
+		w.tlas           = false;
+		Walk(w);
+	} else if (pc.mode == 1u) {
+		ExpandLeaf(job, gl_GlobalInvocationID.x);
+	} else if (pc.mode == 2u || pc.mode == 3u) {
+		uint i        = gl_GlobalInvocationID.x;
+		bool aabbs    = pc.mode == 2u;
+		uint count    = RwWords(job.counters).w[aabbs ? 0u : 4u];
+		uint capacity = aabbs ? job.leaf_capacity : job.tri_capacity;
+		if (i < count || i >= capacity) {
+			return;
+		}
+		// A NaN first coordinate makes an AABB or triangle inactive.
+		RwFloats(aabbs ? job.aabbs : job.triangles).f[i * (aabbs ? 6u : 9u)] =
+		    uintBitsToFloat(0x7fc00000u);
+	}
+}

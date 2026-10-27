@@ -1,0 +1,147 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Software Psr traversal on the GPU, one ray per invocation: the reference path the hardware
+// kernels are checked against, and a lower bound for the cost of the emulated guest loop (the
+// guest routine additionally unions the children of a whole wave and emulates every node test).
+
+#include "rt_psr_common.inc"
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Params {
+	uint64_t tlas_base;
+	uint64_t page_table;
+	uint64_t page_first;
+	uint64_t rays;
+	uint64_t results;
+	uint     ray_count;
+	uint     stack_limit;
+} pc;
+
+void main() {
+	uint id = gl_GlobalInvocationID.x;
+	if (id >= pc.ray_count) {
+		return;
+	}
+	g_page_table = pc.page_table;
+	g_page_first = pc.page_first;
+	TraceRay src   = TraceRays(pc.rays).r[id];
+	PsrRay   world = PsrMakeRay(vec3(src.ox, src.oy, src.oz), vec3(src.dx, src.dy, src.dz),
+	                            vec3(src.ix, src.iy, src.iz), src.extent);
+
+	TraceOut result;
+	result.t              = 0.0;
+	result.info           = PSR_INVALID;
+	result.instance_index = PSR_INVALID;
+	result.tri_ptr        = 0u;
+	result.hit            = 0u;
+	result.nodes          = 0u;
+	result.candidates     = 0u;
+	result.status         = 0u;
+
+	float best = world.extent;
+
+	uint     stack_ptr[60];
+	uint64_t stack_blas = 0ul; // bit i: entry i belongs to the BLAS
+	uint     depth      = 0u;
+
+	PsrInstance inst;
+	inst.blas  = 0ul;
+	inst.flags = 0u;
+	inst.index = PSR_INVALID;
+	PsrRay obj = world;
+
+	uint ptr     = PSR_ROOT;
+	bool in_blas = false;
+	for (;;) {
+		result.nodes++;
+		if (result.nodes > (1u << 22u)) {
+			result.status = 3u;
+			break;
+		}
+		uint64_t base      = in_blas ? inst.blas : pc.tlas_base;
+		bool     have_next = false;
+		if (PsrIsBox(ptr)) {
+			PsrBox box;
+			if (!PsrReadBox(base, ptr, box)) {
+				result.status = 2u;
+				break;
+			}
+			PsrRay bounded = in_blas ? obj : world;
+			bounded.extent = best;
+			uint order[4];
+			uint count;
+			PsrBoxTest(box, bounded, order, count);
+			for (int i = int(count) - 1; i >= 1; i--) {
+				if (depth < pc.stack_limit) {
+					stack_ptr[depth] = order[i];
+					if (in_blas) {
+						stack_blas |= (1ul << depth);
+					} else {
+						stack_blas &= ~(1ul << depth);
+					}
+					depth++;
+				}
+			}
+			if (count > 0u) {
+				ptr       = order[0];
+				have_next = true;
+			}
+		} else if (ptr != PSR_INVALID && !in_blas) {
+			if (!PsrReadInstance(pc.tlas_base, ptr, inst)) {
+				result.status = 4u;
+				break;
+			}
+			if ((inst.id_mask >> 24u) != 0u) {
+				obj       = PsrTransformRay(world, inst.m);
+				ptr       = inst.root;
+				in_blas   = true;
+				have_next = ptr != PSR_INVALID;
+			}
+		} else if (ptr != PSR_INVALID) {
+			bool     cull_off = (inst.flags & PSR_CULL_DISABLE) != 0u;
+			bool     keep_neg = (inst.flags & PSR_FACING) != 0u;
+			uint64_t list     = PsrLeafAddress(base, ptr);
+			for (uint e = 0u; e < 1024u; e++) {
+				PsrWords entry   = PsrObject(list + uint64_t(e) * 8ul);
+				uint     tri_ptr = entry.w[0];
+				uint     info    = entry.w[1];
+				if ((tri_ptr & 7u) == 7u) {
+					break;
+				}
+				vec3 v0, v1, v2;
+				if (!PsrReadTriangle(base, tri_ptr, v0, v1, v2)) {
+					result.status = 5u;
+					break;
+				}
+				result.candidates++;
+				float t;
+				bool  positive;
+				if (PsrTriangleTest(v0, v1, v2, obj, t, positive)) {
+					bool facing_ok = cull_off || (positive != keep_neg);
+					if (facing_ok && !(t > best)) {
+						best                  = t;
+						result.hit            = 1u;
+						result.t              = t;
+						result.info           = info;
+						result.instance_index = inst.index;
+						result.tri_ptr        = tri_ptr;
+					}
+				}
+				if ((info & PSR_LEAF_LAST) != 0u) {
+					break;
+				}
+			}
+		}
+		if (have_next) {
+			continue;
+		}
+		if (depth == 0u) {
+			break;
+		}
+		depth--;
+		ptr     = stack_ptr[depth];
+		in_blas = ((stack_blas >> depth) & 1ul) != 0ul;
+	}
+	TraceOuts(pc.results).r[id] = result;
+}

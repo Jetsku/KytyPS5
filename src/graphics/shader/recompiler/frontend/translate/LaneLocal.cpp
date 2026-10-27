@@ -256,6 +256,8 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::S_TRAP:
 		case Opcode::S_TTRACEDATA: return "wave message";
 		case Opcode::IMAGE_GET_LOD: return "compute derivatives"; // (their quads: the two-lane layout's)
+		// Call-split state (CallSplit.h) is addressed by the wave's guest lanes.
+		case Opcode::S_KYTY_CALL_STATE: return "call state";
 		case Opcode::UNKNOWN:
 		case Opcode::UNSUPPORTED: return "unknown instruction";
 		default: break;

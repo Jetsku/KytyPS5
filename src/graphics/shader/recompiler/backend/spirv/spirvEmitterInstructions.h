@@ -239,6 +239,12 @@ uint32_t              EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst
 uint32_t              EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWqmU64(EmitterState& state, uint32_t value);
 uint32_t              EmitLaneId(EmitterState& state);
+uint32_t              EmitCallStateParam(EmitterState& state, IR::Value index);
+uint32_t              EmitCallStateLoad(EmitterState& state, uint32_t address);
+void                  EmitCallStateStore(EmitterState& state, uint32_t address, uint32_t value);
+void                  EmitCallStateStoreChanged(EmitterState& state, uint32_t address, uint32_t value,
+                                                uint32_t original);
+void                  EmitCallStateProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBallot(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);

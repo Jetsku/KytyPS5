@@ -1,0 +1,140 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Hardware-accelerated Psr trace with a ray query.
+//   HYBRID (default): the BLASes hold one procedural AABB per Psr leaf. Every candidate leaf runs
+//     the guest's triangle tests on the exact object-space ray with the guest's acceptance rule
+//     (closest hit, ties to the later hit, facing by instance flags), so only box traversal moves
+//     to the RT cores.
+//   TRIANGLES: opaque triangle BLASes; the RT cores decide hits (approximate: host watertightness
+//     and precision, no facing culling).
+
+#extension GL_EXT_ray_query : require
+
+#include "rt_psr_common.inc"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+
+layout(push_constant) uniform Params {
+	uint64_t page_table;
+	uint64_t page_first;
+	uint64_t rays;
+	uint64_t results;
+	uint64_t slots; // per TLAS instance: psr record, blas base, per-primitive table, index|flags
+	uint     ray_count;
+	uint     pad;
+} pc;
+
+void main() {
+	uint id = gl_GlobalInvocationID.x;
+	if (id >= pc.ray_count) {
+		return;
+	}
+	g_page_table = pc.page_table;
+	g_page_first = pc.page_first;
+	TraceRay src   = TraceRays(pc.rays).r[id];
+	PsrRay   world = PsrMakeRay(vec3(src.ox, src.oy, src.oz), vec3(src.dx, src.dy, src.dz),
+	                            vec3(src.ix, src.iy, src.iz), src.extent);
+
+	TraceOut result;
+	result.t              = 0.0;
+	result.info           = PSR_INVALID;
+	result.instance_index = PSR_INVALID;
+	result.tri_ptr        = 0u;
+	result.hit            = 0u;
+	result.nodes          = 0u;
+	result.candidates     = 0u;
+	result.status         = 0u;
+
+	rayQueryEXT rq;
+#ifdef TRIANGLES
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xff, world.o, 0.0, world.d, world.extent);
+	while (rayQueryProceedEXT(rq)) {
+	}
+	if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+		uint     slot  = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+		uint     prim  = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+		RwU64    s     = RwU64(pc.slots);
+		uint64_t table = s.q[slot * 4u + 2u];
+		result.hit            = 1u;
+		result.t              = rayQueryGetIntersectionTEXT(rq, true);
+		result.tri_ptr        = PsrWords(table).w[prim * 2u + 0u];
+		result.info           = PsrWords(table).w[prim * 2u + 1u];
+		result.instance_index = uint(s.q[slot * 4u + 3u]);
+	}
+#else
+	float best      = world.extent;
+	uint  last_slot = PSR_INVALID;
+	PsrRay obj      = world;
+	uint64_t blas   = 0ul;
+	uint64_t table  = 0ul;
+	uint  inst_index = PSR_INVALID;
+	uint  flags      = 0u;
+	rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0xff, world.o, 0.0, world.d, world.extent);
+	while (rayQueryProceedEXT(rq)) {
+		if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionAABBEXT) {
+			continue;
+		}
+		uint slot = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false));
+		uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+		if (slot != last_slot) {
+			// The exact guest object ray from the guest's own instance record.
+			RwU64    s      = RwU64(pc.slots);
+			uint64_t record = s.q[slot * 4u + 0u];
+			blas            = s.q[slot * 4u + 1u];
+			table           = s.q[slot * 4u + 2u];
+			uint64_t packed = s.q[slot * 4u + 3u];
+			inst_index      = uint(packed);
+			flags           = uint(packed >> 32);
+			PsrWords r      = PsrObject(record);
+			float    m[12];
+			for (uint i = 0u; i < 12u; i++) {
+				m[i] = uintBitsToFloat(r.w[i]);
+			}
+			obj       = PsrTransformRay(world, m);
+			last_slot = slot;
+		}
+		result.candidates++;
+		bool     cull_off = (flags & PSR_CULL_DISABLE) != 0u;
+		bool     keep_neg = (flags & PSR_FACING) != 0u;
+		uint     leaf     = PsrWords(table).w[prim];
+		uint64_t list     = PsrLeafAddress(blas, leaf);
+		bool     accepted = false;
+		for (uint e = 0u; e < 1024u; e++) {
+			PsrWords entry   = PsrObject(list + uint64_t(e) * 8ul);
+			uint     tri_ptr = entry.w[0];
+			uint     info    = entry.w[1];
+			if ((tri_ptr & 7u) == 7u) {
+				break;
+			}
+			vec3 v0, v1, v2;
+			if (!PsrReadTriangle(blas, tri_ptr, v0, v1, v2)) {
+				result.status = 5u;
+				break;
+			}
+			float t;
+			bool  positive;
+			if (PsrTriangleTest(v0, v1, v2, obj, t, positive)) {
+				bool facing_ok = cull_off || (positive != keep_neg);
+				if (facing_ok && !(t > best)) {
+					best                  = t;
+					accepted              = true;
+					result.hit            = 1u;
+					result.t              = t;
+					result.info           = info;
+					result.instance_index = inst_index;
+					result.tri_ptr        = tri_ptr;
+				}
+			}
+			if ((info & PSR_LEAF_LAST) != 0u) {
+				break;
+			}
+		}
+		if (accepted) {
+			rayQueryGenerateIntersectionEXT(rq, best);
+		}
+	}
+#endif
+	TraceOuts(pc.results).r[id] = result;
+}

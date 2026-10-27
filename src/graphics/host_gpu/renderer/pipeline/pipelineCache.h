@@ -210,6 +210,12 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);
+	// KYTY_SHADER_CALLS_SPLIT (recompiler/CallSplit.h): the next GetComputeProgram of this thread
+	// prepares the given split program of the dispatch's kernel instead of its code (null: the
+	// kernel). A GetComputeProgram of a kernel that is split prepares its first program (R_0) and
+	// leaves the dispatch's run (a CallSplit::Run) for TakeCallSplitRun.
+	static void SelectCallSplitCode(const void* code);
+	[[nodiscard]] static std::shared_ptr<const void> TakeCallSplitRun();
 	// Draw-prep (KYTY_DRAW_PREP_DISPATCH): GetComputeProgram as a speculative preparation, as
 	// PrepareGraphicsProgramsSpeculative for a draw (every read through the active recorder,
 	// nothing synchronized; published programs only, or clean compiles with

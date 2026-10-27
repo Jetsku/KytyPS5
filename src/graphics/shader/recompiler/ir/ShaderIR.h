@@ -572,6 +572,10 @@ struct DescriptorBinding {
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
+	// Call-split programs (CallSplit.h): CallStateDwords push dwords (state base, wave list and wave
+	// header addresses, wave stride), after the dispatch thread extents.
+	uint32_t                       call_state_dword = PushData::NoStart;
+	static constexpr uint32_t      CallStateDwords  = 7;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	// Per-draw GET_LOD_STATS field of each image (one dword each, LodStatsReport::ImageField:

@@ -322,6 +322,21 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t opcode = (word >> 16u) & 0x7fu;
 	const uint32_t simm   = word & 0xffffu;
 
+	if (opcode == CallStateSoppOpcode) {
+		// The emulator's call-split marker (CallSplit.h): sub-operation in simm[15:12], payload words
+		// in simm[11:0], the payload right after the word.
+		inst.pc               = pc;
+		inst.family           = Family::SOPP;
+		inst.opcode_id        = opcode;
+		inst.opcode           = Opcode::S_KYTY_CALL_STATE;
+		inst.offset           = simm >> 12u;
+		inst.secondary_offset = word_index + 1u;
+		inst.word_count       = 1u + (simm & 0xfffu);
+		inst.raw[0]           = word;
+		EXIT_IF(word_index + inst.word_count > code.size());
+		return;
+	}
+
 	inst.pc              = pc;
 	inst.family          = Family::SOPP;
 	inst.opcode_id       = opcode;

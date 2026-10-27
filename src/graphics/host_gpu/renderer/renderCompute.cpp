@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rtBvhDump.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -629,6 +630,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                               input_info);
 	// After MakeComputeInputInfo (it resets the info). Part of the program key (GETREG HW_ID2).
 	input_info.async_compute = async_compute;
+	// KYTY_SHADER_CALLS_SPLIT: each program of a split kernel's chain is looked up from this.
+	const auto pristine_info = input_info;
 	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	ShaderProgram compute_program;
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): the program a worker prepared from this dispatch's
@@ -653,8 +656,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                                                 m_compute_prep);
 	}
 	CpGaps::Phase(CpGaps::Cat::DispatchOp);
+	// KYTY_RT_DUMP_BVH (diagnostic): before any binding is prepared (its readbacks may flush the
+	// recording). Programs with BVH instructions only.
+	if (RtBvhDumpEnabled() && compute_program && input_info.stage.program->info.uses_bvh) {
+		RtBvhDispatch dump {};
+		dump.shader_hash    = input_info.stage.program->shader_hash;
+		dump.shader_address = cs_regs.cs_regs.data_addr;
+		dump.user_sgpr      = std::span<const uint32_t>(
+            cs_regs.cs_user_sgpr.value,
+            std::min<uint32_t>(cs_regs.cs_user_sgpr.count, HW::UserSgprInfo::SGPRS_MAX));
+		dump.groups = {thread_group_x, thread_group_y, thread_group_z};
+		dump.frame  = static_cast<int>(m_context.GetGpu().GetFrameNum());
+		RtBvhDumpOnDispatch(dump);
+	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		return;
+	}
+	if (auto split = PipelineCache::TakeCallSplitRun(); split != nullptr) {
+		// A kernel with call loops runs as its chain of dispatches (callSplitDispatch.cpp).
+		ResetBindings();
+		if (!use_thread_dimensions) {
+			buffer.EndRendering();
+			DispatchCallSplit(buffer, pristine_info, split, cs_regs, sh_regs, thread_group_x,
+			                  thread_group_y, thread_group_z);
+		}
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -994,6 +1020,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		return;
+	}
+	if (PipelineCache::TakeCallSplitRun() != nullptr) {
+		// KYTY_SHADER_CALLS_SPLIT: an indirect dispatch's wave count is GPU data; not split yet.
+		static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+		if (!logged.test_and_set()) {
+			Log::WriteToConsoleAndLog("KYTY_SHADER_CALLS_SPLIT: indirect dispatches of split kernels are skipped.\n");
+		}
+		ResetBindings();
 		return;
 	}
 	buffer.EndRendering();

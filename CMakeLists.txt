@@ -519,6 +519,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_dispatch_guard_header}")
 
+# Call splitting (shader/recompiler/CallSplit.h, renderer/callSplitDispatch.cpp): the bin pass.
+set(gpu_call_bin_source "${gpu_tiler_shader_dir}/gpu_call_bin.comp")
+set(gpu_call_bin_spv "${gpu_mesh_generated_dir}/gpu_call_bin.spv")
+set(gpu_call_bin_header "${gpu_mesh_generated_dir}/gpu_call_bin_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_call_bin_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_call_bin_spv}" "${gpu_call_bin_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_call_bin_spv} -DOUTPUT=${gpu_call_bin_header}
+	        -DSYMBOL=GPU_CALL_BIN_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_call_bin_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_call_bin_header}")
+
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
 # a program produces. src/codegen_version.cmake fails the build when one of them includes a
@@ -564,6 +580,11 @@ list(APPEND kyty_emulator_src "${kyty_codegen_header}")
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
+	# Psr BVH walkers and snapshots for KYTY_RT_DUMP_BVH; the rest of host_gpu/rt is test-only.
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/psrBvh.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/psrBvh.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/bvhDump.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/bvhDump.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
@@ -1198,6 +1219,44 @@ add_custom_command(
 target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
+# Optional hardware ray tracing (study): Psr BVH conversion and ray-query kernels, and their
+# standalone tests. Not linked into the emulator.
+set(rt_hw_headers)
+foreach(rt_hw_kernel IN ITEMS convert trace_sw trace_hw trace_hw_tri exact_test)
+	set(rt_hw_source "${rt_hw_kernel}")
+	set(rt_hw_flags)
+	if(rt_hw_kernel STREQUAL "trace_hw_tri")
+		set(rt_hw_source "trace_hw")
+		set(rt_hw_flags "-DTRIANGLES")
+	endif()
+	string(TOUPPER "RT_PSR_${rt_hw_kernel}_SPV" rt_hw_symbol)
+	set(rt_hw_spv "${gpu_test_generated_dir}/rt_psr_${rt_hw_kernel}.spv")
+	set(rt_hw_header "${gpu_test_generated_dir}/rt_psr_${rt_hw_kernel}_spv.h")
+	add_custom_command(
+		OUTPUT "${rt_hw_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${rt_hw_flags}
+		        "-I${gpu_tiler_shader_dir}" -o "${rt_hw_spv}"
+		        "${gpu_tiler_shader_dir}/rt_psr_${rt_hw_source}.comp"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_hw_spv} -DOUTPUT=${rt_hw_header}
+		        -DSYMBOL=${rt_hw_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${gpu_tiler_shader_dir}/rt_psr_${rt_hw_source}.comp"
+		        "${gpu_tiler_shader_dir}/rt_psr_common.inc"
+		VERBATIM
+	)
+	list(APPEND rt_hw_headers "${rt_hw_header}")
+endforeach()
+add_executable(rt_hardware_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RtHardwareTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/psrBvh.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/bvhDump.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/rt/rtAccel.cpp"
+	${rt_hw_headers}
+)
+target_link_libraries(rt_hardware_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(rt_hardware_tests PRIVATE ${inc_headers}
+	"${gpu_test_generated_dir}" "${KYTY_TESTS_DIR}")
+
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_kyty_full_emulator_test(repeat_trace_tests "${KYTY_TESTS_DIR}/RepeatTraceTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
@@ -1250,6 +1309,9 @@ if(BUILD_TESTING)
 	add_test(NAME registered_shader_code_off COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
 	set_tests_properties(registered_shader_code_off PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=0")
 	add_test(NAME registered_shader_code_cert COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	add_test(NAME call_split COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --call-split-only)
+	add_test(NAME rt_hardware_cpu COMMAND $<TARGET_FILE:rt_hardware_tests> --cpu-only)
+	add_test(NAME rt_hardware_gpu COMMAND $<TARGET_FILE:rt_hardware_tests>)
 	set_tests_properties(registered_shader_code_cert PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME lane_local COMMAND $<TARGET_FILE:lane_local_tests>)
@@ -2545,6 +2607,7 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		resource_tracking_tests
 		binding_path_tests
+		rt_hardware_tests
 		cp_recorder_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

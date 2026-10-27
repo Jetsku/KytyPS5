@@ -1207,6 +1207,42 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		return skipped;
 	}
 
+	// Call-split programs (CallSplit.h) start with their header marker.
+	std::optional<CallSplit::Translation> split;
+	struct SplitScope {
+		~SplitScope() { CallSplit::SetCurrent(nullptr); }
+	} split_scope;
+	if (!decoded.instructions.empty() &&
+	    decoded.instructions.front().opcode == Decoder::Opcode::S_KYTY_CALL_STATE &&
+	    decoded.instructions.front().offset == static_cast<uint32_t>(Decoder::CallStateOp::Header)) {
+		const auto& first = decoded.instructions.front();
+		split.emplace();
+		const bool parsed = CallSplit::DecodeHeader(
+		    std::span(code).subspan(first.secondary_offset, first.word_count - 1u), split->header);
+		for (const auto& inst: decoded.instructions) {
+			if (inst.opcode != Decoder::Opcode::S_KYTY_CALL_STATE) continue;
+			const auto op = static_cast<Decoder::CallStateOp>(inst.offset);
+			if ((op == Decoder::CallStateOp::Save || op == Decoder::CallStateOp::Probe) &&
+			    inst.word_count == 2u) {
+				split->site_at_pc[inst.pc] = code[inst.secondary_offset];
+			}
+		}
+		const bool planning =
+		    (split->header.flags & (CallSplit::FlagLiveness | CallSplit::FlagProbe)) != 0;
+		if ((split->header.flags & CallSplit::FlagProbe) == 0) {
+			split->recipe = CallSplit::FindRecipe(split->header.digest);
+		}
+		if (!parsed || options.stage != ShaderType::Compute || options.wave_size != 64u ||
+		    (!planning && split->recipe == nullptr)) {
+			NoteSkippedProgram(options, 0, parsed ? "is a call-split program without its plan"
+			                                      : "has a damaged call-split header");
+			TranslateResult skipped;
+			skipped.skip_dispatch = true;
+			return skipped;
+		}
+		CallSplit::SetCurrent(&*split);
+	}
+
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -1322,6 +1358,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		std::fputs(decoded_dump.c_str(), stdout);
 		std::fputs(MakeIrDump(CFG::GraphToString(cfg), ir).c_str(), stdout);
 		std::fflush(stdout);
+	}
+	if (split && (split->header.flags & (CallSplit::FlagLiveness | CallSplit::FlagProbe)) != 0) {
+		auto report = std::make_shared<CallSplit::Report>();
+		CallSplit::CollectReport(*split, ir, *report);
+		TranslateResult planned;
+		planned.skip_dispatch = true;
+		planned.call_split    = std::move(report);
+		return planned;
 	}
 	const bool variant_reads = GetCodegenOptions().srt_variant_reads;
 	IR::BuildSrtPlan(ir, variant_reads);

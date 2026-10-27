@@ -95,6 +95,9 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::StoreCompletion:
 		case ValueOpcode::DataCacheInvalidate:
+		case ValueOpcode::CallStateStore:
+		case ValueOpcode::CallStateStoreChanged:
+		case ValueOpcode::CallStateProbe:
 		case ValueOpcode::Barrier:
 		case ValueOpcode::SharedMemoryBarrier: return true;
 		default: return false;
