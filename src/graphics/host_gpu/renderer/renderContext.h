@@ -141,6 +141,14 @@ public:
 	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN, adapted from usa-ratt/KytyPS5-GT7
+	// 21246d78a and 41848bb9a). A game thread's write fault: whether its store may be done in place
+	// (a cheap hint; the GPU thread decides).
+	[[nodiscard]] bool IsStoreInPlaceCandidate(uint64_t fault_vaddr) noexcept;
+	// The store at `pc` that faulted at fault_vaddr: [vaddr, vaddr + size) written to both copies
+	// by the GPU thread (BufferCache::StoreInPlace), the page left protected. False to decline.
+	[[nodiscard]] bool TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+	                                   const void* data, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// A host write of the whole of [vaddr, vaddr + size) is about to happen (an APR file read):
 	// when resource tracking watches any of its pages, one invalidation of the range (as the

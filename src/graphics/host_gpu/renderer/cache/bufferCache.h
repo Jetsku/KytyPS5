@@ -136,6 +136,18 @@ public:
 	// (KYTY_READBACK_SIDE_WRITES may then leave the page clean for that second fault).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  bool retried_write = false);
+	// GPU thread (adapted from usa-ratt/KytyPS5-GT7 21246d78a and 41848bb9a, BufferCache::
+	// WriteClean): a game thread's faulting store of [vaddr, vaddr + size), done in place on both
+	// copies: guest memory through the backing store, the cached buffer in the command stream
+	// after the GPU's earlier writes. The page stays protected. `gpu_written`
+	// (KYTY_STORE_IN_PLACE): pages protected because the GPU wrote them, which then need no
+	// download first; `clean` (KYTY_STORE_CLEAN): CPU-clean pages watched for CPU writes, which
+	// then stay clean and protected instead of becoming CPU-dirty for the next sync to upload and
+	// protect again. False to decline (nothing to save, a readback or publication of these bytes
+	// is still to land, an image holds GPU-written bytes there, no cached buffer holds them): the
+	// fault then takes the normal path.
+	[[nodiscard]] bool     StoreInPlace(uint64_t vaddr, const void* data, uint64_t size,
+	                                    bool gpu_written, bool clean);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
 	// Returns how many of them were eager copies.

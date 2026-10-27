@@ -17,12 +17,15 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 
@@ -259,6 +262,130 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		record.write       = access == PageFaultAccess::Write;
 		record.found_dirty = found_dirty;
 		FaultCost::MapFault(record);
+	}
+	return true;
+}
+
+namespace {
+
+// KYTY_STORE_IN_PLACE=1: stores to pages protected because the GPU wrote them; KYTY_STORE_CLEAN=1:
+// stores to CPU-clean pages watched for CPU writes (both default off).
+bool StoreInPlaceGpuWritten() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STORE_IN_PLACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool StoreInPlaceClean() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STORE_CLEAN");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Stores done in place: each is a round trip to the GPU thread that leaves the page protected. A
+// page the CPU writes over many times (a structure filled field by field) costs more that way than
+// the normal path, after which it is writable: after PageBudget of them within WindowMs, the page's
+// next store takes the normal path. A store site that spends the budget of BulkPages pages within
+// a second is copying in bulk: it takes the normal path for BulkMs (the fork's budgets).
+constexpr uint32_t StorePageBudget = 8;
+constexpr uint64_t StoreWindowMs   = 100;
+constexpr uint32_t StoreBulkPages  = 2;
+constexpr uint64_t StoreBulkMs     = 2000;
+
+bool TakeStoreBudget(uint64_t pc, uint64_t page) {
+	struct PageEntry {
+		uint64_t page     = UINT64_MAX;
+		uint64_t since_ms = 0;
+		uint32_t count    = 0;
+	};
+	struct SiteEntry {
+		uint64_t pc            = 0;
+		uint64_t since_ms      = 0;
+		uint32_t spent         = 0; // pages whose budget it spent since since_ms
+		uint64_t bulk_until_ms = 0;
+	};
+	static std::array<PageEntry, 1024> pages {};
+	static std::array<SiteEntry, 256>  sites {};
+	static std::mutex                  mutex;
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	std::scoped_lock lock(mutex);
+	auto&            site = sites[(pc ^ (pc >> 8u)) % sites.size()];
+	if (site.pc != pc) {
+		site = {pc, now, 0, 0};
+	}
+	if (now < site.bulk_until_ms) {
+		return false;
+	}
+	auto& entry = pages[(page / TRACKER_PAGE_SIZE) % pages.size()];
+	if (entry.page != page || now - entry.since_ms >= StoreWindowMs) {
+		entry = {page, now, 0};
+	}
+	if (entry.count >= StorePageBudget) {
+		// This store takes the normal path, which leaves the page writable.
+		if (now - site.since_ms >= 1000) {
+			site.since_ms = now;
+			site.spent    = 0;
+		}
+		if (++site.spent >= StoreBulkPages) {
+			site.bulk_until_ms = now + StoreBulkMs;
+			site.spent         = 0;
+		}
+		return false;
+	}
+	entry.count++;
+	return true;
+}
+
+std::atomic<uint64_t> g_stores_in_place {0};
+std::atomic<uint64_t> g_stores_declined {0};
+
+} // namespace
+
+bool RenderContext::IsStoreInPlaceCandidate(uint64_t fault_vaddr) noexcept {
+	const bool gpu_written = StoreInPlaceGpuWritten();
+	const bool clean       = StoreInPlaceClean();
+	if ((!gpu_written && !clean) || GuestGpu::IsGpuThread() || !IsMapped(fault_vaddr, 1)) {
+		return false;
+	}
+	if (clean) {
+		return true;
+	}
+	const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+	return m_buffer_cache.IsRegionGpuModifiedRelaxed(page, TRACKER_PAGE_SIZE);
+}
+
+bool RenderContext::TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+                                    const void* data, uint64_t size) noexcept {
+	if (m_gpu == nullptr || GuestGpu::IsGpuThread() || size == 0 || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+	if (!TakeStoreBudget(pc, page)) {
+		g_stores_declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	const bool gpu_written = StoreInPlaceGpuWritten();
+	const bool clean       = StoreInPlaceClean();
+	bool       written     = false;
+	m_gpu->SendCommandSync([this, vaddr, data, size, gpu_written, clean, &written] {
+		written = m_buffer_cache.StoreInPlace(vaddr, data, size, gpu_written, clean);
+	});
+	if (!written) {
+		g_stores_declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	m_bindless_table.OnCpuWrite(vaddr, size);
+	if (const auto n = g_stores_in_place.fetch_add(1, std::memory_order_relaxed) + 1;
+	    (n & (n - 1)) == 0 && n >= 64) {
+		LOGF("Store in place: %" PRIu64 " game-thread stores done on both copies, %" PRIu64
+		     " declined (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN)\n",
+		     n, g_stores_declined.load(std::memory_order_relaxed));
 	}
 	return true;
 }

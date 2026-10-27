@@ -219,6 +219,12 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 bool                   PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN; RenderContext::TryStoreInPlace): whether a
+// game thread's write fault at fault_vaddr may be completed by writing the store's bytes to both
+// copies, and that write (false to decline: the fault then takes the normal path).
+[[nodiscard]] bool IsStoreInPlaceCandidate(uint64_t fault_vaddr) noexcept;
+[[nodiscard]] bool TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                                   uint64_t size) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

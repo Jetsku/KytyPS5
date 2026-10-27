@@ -2287,6 +2287,61 @@ uint64_t BufferCache::ReadbackSideWriteCopies() noexcept {
 	return g_readback_side_writes_copies.load(std::memory_order_relaxed);
 }
 
+bool BufferCache::StoreInPlace(uint64_t vaddr, const void* data, uint64_t size, bool gpu_written,
+                               bool clean) {
+	if (!GuestGpu::IsGpuThread() || size == 0 || data == nullptr || !GuestRange {vaddr, size}.Valid() ||
+	    CommandScheduler::InDeferredOperation() || !m_scheduler.Active() ||
+	    m_scheduler.Current().IsInvalid()) {
+		return false; // the buffer's copy needs a recording to go into
+	}
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+		// A page with no GPU-written bytes left only has its protection lifted on the normal
+		// path, without a download: the stores after this one are then free, where done in place
+		// each would fault again.
+		if (!gpu_written || !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+			return false;
+		}
+	} else if (!clean || m_memory_tracker.IsRegionCpuModified(page_begin, page_end - page_begin)) {
+		// CPU-dirty pages are writable: the fault was for another watcher (an image).
+		return false;
+	}
+	// A readback or publication still to land would put older bytes over the store.
+	if (HasPendingBackingPublication(vaddr, size) || OverlapsPendingSideReadback(page_begin, page_end) ||
+	    (!m_early_released.empty() && OverlapsUnpublished(vaddr, size)) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (!buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	// A queued host copy or deferred stream copy that still reads these bytes is made first, as
+	// for a command-processor write.
+	StreamCopyDefer::NoteGuestWrite(vaddr, size);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	WriteDataBuffer(buffer, vaddr, data, size);
+	buffer.MarkContentWritten();
+	ForgetKnownFills(vaddr, size);
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		// Overwritten: guest memory holds the value the GPU copy will have.
+		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtySubtract);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
+	// What a CPU store over these bytes tells the rest: draw-preparation certificates, images
+	// over them (made CPU-modified, as a write fault does).
+	Coherence::NoteContentWrite(vaddr, size, Coherence::Source::CpWrite);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 bool BufferCache::FaultPagesCurrent(uint64_t page_begin, uint64_t page_end) {
 	static const bool enabled = ParseEnvU64("KYTY_CLEAN_PAGE", 0) != 0;
 	if (!enabled || page_end <= page_begin) {

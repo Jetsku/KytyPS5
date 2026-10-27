@@ -1900,6 +1900,16 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
+bool IsStoreInPlaceCandidate(uint64_t fault_vaddr) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsStoreInPlaceCandidate(fault_vaddr);
+}
+
+bool TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                     uint64_t size) noexcept {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->TryStoreInPlace(pc, fault_vaddr, vaddr, data, size);
+}
+
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }

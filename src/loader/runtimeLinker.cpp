@@ -797,6 +797,37 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 	}
 #endif
 	const GuestLoad::FaultScope guest_load(guest_code ? info->native_context : nullptr);
+	// Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN, adapted from usa-ratt/KytyPS5-GT7
+	// 21246d78a and 41848bb9a): a game thread's plain store to a page protected because the GPU
+	// wrote it (or a CPU-clean page watched for CPU writes) is done on both copies by the GPU
+	// thread, which leaves the page protected, instead of downloading the page first and waiting
+	// for the GPU (or releasing the page for the next sync to upload and protect again). Guest
+	// code only; anything the GPU thread declines takes the normal path below.
+	if (access == GpuAccess::Write &&
+	    Libs::LibKernel::Memory::IsStoreInPlaceCandidate(info->access_violation_vaddr)) {
+		bool store_guest_code = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		HMODULE module   = nullptr;
+		store_guest_code = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                                      reinterpret_cast<LPCWSTR>(info->exception_address),
+		                                      &module) == 0;
+#endif
+		if (store_guest_code &&
+		    Loader::X64InstructionEmulator::TryEmulateStore(
+		        info->native_context, info->access_violation_vaddr,
+		        [](uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+		           uint64_t size) {
+			        return Libs::LibKernel::Memory::TryStoreInPlace(pc, fault_vaddr, vaddr, data,
+			                                                        size);
+		        })) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			if (HangTrace::Enabled()) {
+				HangTrace::ClearFaultContext();
+			}
+			return true;
+		}
+	}
 	bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
 	// KYTY_FAULT_AMM_WAIT_MS=N (default 5000; 0 off; after IDXTRI's Wolverine fix): an access to
 	// memory that a queued AMM map command will map waits for that map, up to N ms, and then runs
