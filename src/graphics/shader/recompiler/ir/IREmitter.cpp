@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
