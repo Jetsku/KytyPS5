@@ -427,7 +427,27 @@ struct CodegenOptions {
 	// KYTY_CLIP_GUARD=0 (AMD test 3 diagnostic, default on): vertex shaders do not reserve a clip
 	// plane for the zero-position cull (the "emitted zero-position clip guard").
 	bool clip_guard = true;
+	// KYTY_LDS_SLOTS=1 (default off; strxno/KytyPS5-GT7 220abc01c, adapted): a non-compute stage
+	// keeps its LDS in a function-scope array of its own invocation, which the driver puts in local
+	// memory because it is indexed dynamically. When every LDS access of the program is a dword
+	// LoadSharedU32/WriteSharedU32 at (LaneId << 2) + a constant offset (the guest compiler's
+	// per-lane VGPR spill area), lane l always reaches element l + offset / 4 of its own array: each
+	// distinct offset becomes one Function variable (a register) instead (StaticLdsSlot). Inactive
+	// lanes read zero and write nothing, as the array's accesses do. KYTY_LDS_SLOTS_LOG=1 prints the
+	// verdict per program.
+	bool lds_slots = false;
+	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
+	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
+	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,
+	// tessellation) programs. Our MADs never flush; the remaining flushes are the inputs of
+	// rcp/rsq/sqrt/exp/log, compute float compares with FLOAT_MODE denormal inputs off, and f32<->f64
+	// conversions. Off, a denormal there stays denormal instead of reading as a signed zero
+	// (rcp(denormal) is then a large finite value, not an infinity). Bits: DenormFlushSkip*.
+	uint8_t denorm_flush_skip = 0;
 };
+inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
+inline constexpr uint8_t DenormFlushSkipCompute  = 2u;
+inline constexpr uint8_t DenormFlushSkipGeometry = 4u;
 
 // How a compute shader's LDS allocation is placed on this host (KYTY_LDS_DEVICE_BUFFER,
 // KYTY_LDS_LIMIT_OVERRIDE). dwords: the size the program declares and bounds its accesses by;

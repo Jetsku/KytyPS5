@@ -144,6 +144,17 @@ CodegenOptions FromEnvironment() {
 	}
 	options.ps_per_vertex = EnvFlag("KYTY_PS_PER_VERTEX", options.ps_per_vertex);
 	options.clip_guard    = EnvFlag("KYTY_CLIP_GUARD", options.clip_guard);
+	options.lds_slots     = EnvFlag("KYTY_LDS_SLOTS", options.lds_slots);
+	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
+	// else keeps them.
+	const auto flush_off = [](const char* name) {
+		const auto* value = std::getenv(name);
+		return value != nullptr && (std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0);
+	};
+	options.denorm_flush_skip =
+	    static_cast<uint8_t>((flush_off("KYTY_PS_FLUSH") ? DenormFlushSkipPixel : 0u) |
+	                         (flush_off("KYTY_CS_FLUSH") ? DenormFlushSkipCompute : 0u) |
+	                         (flush_off("KYTY_VS_FLUSH") ? DenormFlushSkipGeometry : 0u));
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

@@ -532,9 +532,10 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const uint32_t                                   element_index = slot % BytesPerElementCount;
 	const uint32_t                   direction_index = slot / (FamilyCount * BytesPerElementCount);
 	const uint32_t                   family_index    = (slot / BytesPerElementCount) % FamilyCount;
-	const uint32_t                   values[] {1u << element_index, direction_index};
-	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
-	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
+	const uint32_t                   values[] {1u << element_index, direction_index,
+                                               SubwordCas() ? 1u : 0u};
+	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+	const vk::SpecializationInfo     specialization {3, entries, sizeof(values), values};
 	const auto module =
 	    CompileSPV({shaders[family_index].code, shaders[family_index].words}, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
@@ -696,6 +697,19 @@ bool TileManager::ImageDirectEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_TILER_IMAGE_DIRECT");
 		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool TileManager::SubwordCas() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TILER_CAS");
+		const bool  on    = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		if (on) {
+			std::printf("Kyty tiler: 8/16-bit elements merged with one compare-and-swap loop "
+			            "(KYTY_TILER_CAS)\n");
+		}
+		return on;
 	}();
 	return enabled;
 }
@@ -992,9 +1006,10 @@ vk::Pipeline TileManager::GetImagePipeline(bool load, TileBlockFamily family,
 			break;
 		default: EXIT("TileManager: no image variant for tile family %u\n", family_index);
 	}
-	const uint32_t                   values[] {bytes_per_element, load ? 1u : 0u};
-	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
-	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
+	const uint32_t                   values[] {bytes_per_element, load ? 1u : 0u,
+                                               SubwordCas() ? 1u : 0u};
+	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+	const vk::SpecializationInfo     specialization {3, entries, sizeof(values), values};
 	const auto module = CompileSPV({shader.code, shader.words}, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;
@@ -1313,9 +1328,10 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	}
 	auto& pipeline = *pipeline_pointer;
 	if (pipeline == nullptr) {
-		const uint32_t                   value = d32 ? 1u : 0u;
-		const vk::SpecializationMapEntry entry {0, 0, sizeof(value)};
-		const vk::SpecializationInfo     specialization {1, &entry, sizeof(value), &value};
+		// Constant 1 (SUBWORD_CAS) only exists in the demote shader; promote ignores it.
+		const uint32_t                   values[] {d32 ? 1u : 0u, SubwordCas() ? 1u : 0u};
+		const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
+		const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
 		const uint32_t*                  code  = nullptr;
 		size_t                           words = 0;
 		if (direction == D16Direction::Promote) {

@@ -164,6 +164,13 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (IR::BindlessImagesEnabled()) {
 		b.Text("bindless_images");
 	}
+	if (options.lds_slots) {
+		b.Text("lds_slots");
+	}
+	if (options.denorm_flush_skip != 0u) {
+		b.Text("denorm_flush_skip");
+		b.U8(options.denorm_flush_skip);
+	}
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();

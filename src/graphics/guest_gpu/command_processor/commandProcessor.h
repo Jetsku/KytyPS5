@@ -143,7 +143,13 @@ public:
 	void            BufferWait();
 	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
 	// recording a draw or dispatch, at a packet boundary.
-	void            MaybeFlushIdleGpu();
+	// After each recorded draw (dispatch: a dispatch): an early submit when the GPU is idle
+	// (KYTY_IDLE_FLUSH_DRAWS) or every KYTY_DRAW_FLUSH_INTERVAL draws / KYTY_DISPATCH_FLUSH_INTERVAL
+	// dispatches of one recording.
+	void            MaybeFlushIdleGpu(bool dispatch = false);
+	// The periodic part (KYTY_DRAW_FLUSH_INTERVAL / KYTY_DISPATCH_FLUSH_INTERVAL): true when it
+	// submitted.
+	bool            MaybeFlushPeriodic(bool dispatch);
 	// Graphics queue: after KYTY_GFX_SLICE_DRAWS draws in a slice, end the slice after the
 	// current packet when another queue has runnable work. Call after recording a draw.
 	void            MaybeYieldSlice();
@@ -495,6 +501,10 @@ private:
 	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
 	uint64_t  m_idle_flush_tick             = 0;
 	uint32_t  m_idle_flush_draws            = 0;
+	// MaybeFlushIdleGpu's periodic submits: recording tick being counted, its draws and dispatches.
+	uint64_t  m_periodic_flush_tick         = 0;
+	uint32_t  m_periodic_flush_draws        = 0;
+	uint32_t  m_periodic_flush_dispatches   = 0;
 	// Draws recorded in the current graphics slice (MaybeYieldSlice).
 	uint32_t  m_slice_draws                 = 0;
 

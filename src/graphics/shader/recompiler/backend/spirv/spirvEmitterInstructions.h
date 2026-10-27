@@ -131,7 +131,8 @@ EMIT_NATIVE(LogicalNot, OpLogicalNot, U1, uint32_t)
 template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
-	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
+	const bool flush =
+	    inst.Flags<IR::FPCompareFlags>().flush_input_denorms && !DenormFlushSkipped(ctx.state);
 	const auto operand = [&](size_t index) {
 		const auto value = inst.Arg(index);
 		if (flush && value.IsImmediate()) {

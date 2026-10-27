@@ -1,6 +1,8 @@
 #version 450
 
 layout(constant_id = 0) const uint D32 = 0u;
+// KYTY_TILER_CAS: one compare-and-swap loop per 16-bit element (see gpu_tiler_common.inc).
+layout(constant_id = 1) const uint SUBWORD_CAS = 0u;
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
@@ -40,6 +42,16 @@ void main() {
 	uint shift = (dst & 2u) * 8u;
 	uint mask = 0xffffu << shift;
 	uint word = dst >> 2u;
-	atomicAnd(output_buffer.data[word], ~mask);
-	atomicOr(output_buffer.data[word], decode(input_buffer.data[src >> 2u]) << shift);
+	uint value = decode(input_buffer.data[src >> 2u]) << shift;
+	if (SUBWORD_CAS != 0u) {
+		uint old = output_buffer.data[word];
+		for (;;) {
+			uint seen = atomicCompSwap(output_buffer.data[word], old, (old & ~mask) | value);
+			if (seen == old) break;
+			old = seen;
+		}
+	} else {
+		atomicAnd(output_buffer.data[word], ~mask);
+		atomicOr(output_buffer.data[word], value);
+	}
 }

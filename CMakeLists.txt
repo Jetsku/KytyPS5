@@ -1571,6 +1571,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	# KYTY_TILER_CAS: the same GPU/CPU tiler parity with 8- and 16-bit elements merged by a
+	# compare-and-swap loop instead of atomicAnd + atomicOr.
+	add_test(NAME gpu_tiler_cas
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	set_tests_properties(gpu_tiler_cas PROPERTIES ENVIRONMENT "KYTY_TILER_CAS=1")
 	add_test(NAME tiler_scratch_hold
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tiler-scratch-hold-only)
 	add_test(NAME tile_layout

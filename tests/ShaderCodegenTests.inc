@@ -1412,6 +1412,108 @@ void CheckInterpolationModes() {
   std::printf("[codegen] %-32s ok\n", name);
 }
 
+// KYTY_LDS_SLOTS: a pixel shader whose LDS accesses are all dwords at (LaneId << 2) + c (the
+// guest compiler's per-lane VGPR spill) keeps one Function variable per element offset instead of
+// the dynamically indexed function-scope array; any other access keeps the array.
+void CheckLdsSlots() {
+  constexpr const char *name = "CodegenLdsSlots";
+  const auto build = [](bool foreign_address) {
+    std::vector<u32> code;
+    code.push_back(EncodeVop1(0x01, 4, InlineU32(0)));       // v_mov_b32 v4, 0
+    code.push_back(EncodeVop2(0x23, 5, 193u, 4));            // v_mbcnt_lo_u32_b32 v5, -1, v4
+    code.push_back(EncodeVop2(0x24, 6, 193u, 5));            // v_mbcnt_hi_u32_b32 v6, -1, v5
+    code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));    // v_lshlrev_b32 v7, 2, v6
+    code.push_back(EncodeDs0(0x0d, 0));                      // ds_write_b32 v7, v0
+    code.push_back(EncodeDs1(0, 0, 7));
+    code.push_back(EncodeDs0(0x0d, 256));                    // ds_write_b32 v7, v1 offset:256
+    code.push_back(EncodeDs1(0, 1, 7));
+    if (foreign_address) {
+      // An address that is not the lane's own: ds_write_b32 v4(=0), v1.
+      code.push_back(EncodeDs0(0x0d, 0));
+      code.push_back(EncodeDs1(0, 1, 4));
+    }
+    code.push_back(EncodeVop2(0x03, 0, Vgpr(0), 1));         // v_add_f32 v0, v0, v1
+    code.push_back(EncodeDs0(0x36, 256));                    // ds_read_b32 v10, v7 offset:256
+    code.push_back(EncodeDs1(10, 0, 7));
+    code.push_back(EncodeDs0(0x36, 0));                      // ds_read_b32 v11, v7
+    code.push_back(EncodeDs1(11, 0, 7));
+    code.push_back(EncodeVop1(0x01, 12, InlineU32(0)));
+    code.push_back(EncodeVop1(0x01, 13, InlineU32(0)));
+    code.push_back(EncodeExp0(0, 0xf, true, false, true));
+    code.push_back(EncodeExp1(10, 11, 12, 13));
+    AppendEnd(&code);
+    return code;
+  };
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 1;
+  pixel.interpolator_settings[0] = 0;
+  pixel.ps_perspective_center_vgpr = 0;
+  pixel.ps_system_input_base = 2;
+  pixel.lds_size_dwords = 1024;
+  struct Counts {
+    size_t slots, array;
+  };
+  const auto compile = [&](bool slots, bool foreign) {
+    CodegenOptions options = GetCodegenOptions();
+    options.lds_slots = slots;
+    ScopedCodegenOptions scope(options);
+    const auto spirv = CompilePixelShader(name, build(foreign), pixel);
+    return Counts{CountSpirv(spirv, "\"lds_slot_"), CountSpirv(spirv, "\"lds_dwords\"")};
+  };
+  const auto on = compile(true, false);
+  const auto off = compile(false, false);
+  const auto foreign = compile(true, true);
+  Require(name, "own-lane accesses take the slots", on.slots == 2u && on.array == 0u,
+          "slots " + std::to_string(on.slots) + ", array " + std::to_string(on.array));
+  Require(name, "switch off keeps the array", off.slots == 0u && off.array == 1u,
+          "slots " + std::to_string(off.slots) + ", array " + std::to_string(off.array));
+  Require(name, "a foreign address keeps the array", foreign.slots == 0u && foreign.array == 1u,
+          "slots " + std::to_string(foreign.slots) + ", array " + std::to_string(foreign.array));
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
+// KYTY_PS_FLUSH=off: a pixel shader's transcendental inputs are not flushed in the shader (no
+// flush sequence emitted); the default keeps them.
+void CheckDenormFlushSkip() {
+  constexpr const char *name = "CodegenDenormFlushSkip";
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x2a, 10, Vgpr(0)));             // v_rcp_f32 v10, v0
+  code.push_back(EncodeVop1(0x2e, 11, Vgpr(0)));             // v_rsq_f32 v11, v0
+  code.push_back(EncodeVop1(0x01, 12, InlineU32(0)));
+  code.push_back(EncodeVop1(0x01, 13, InlineU32(0)));
+  code.push_back(EncodeExp0(0, 0xf, true, false, true));
+  code.push_back(EncodeExp1(10, 11, 12, 13));
+  AppendEnd(&code);
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 1;
+  pixel.interpolator_settings[0] = 0;
+  pixel.ps_perspective_center_vgpr = 0;
+  pixel.ps_system_input_base = 2;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  auto controls = saved;
+  controls.denorm_flush_f32 = false;
+  ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+  const auto flushes = [&](uint8_t skip) {
+    CodegenOptions options = GetCodegenOptions();
+    options.denorm_flush_skip = skip;
+    options.host_ftz_inputs = false;
+    ScopedCodegenOptions scope(options);
+    const auto before = ShaderRecompiler::Spirv::EmittedDenormFlushes(0);
+    (void)CompilePixelShader(name, code, pixel);
+    return ShaderRecompiler::Spirv::EmittedDenormFlushes(0) - before;
+  };
+  const auto exact = flushes(0);
+  const auto skipped = flushes(ShaderRecompiler::DenormFlushSkipPixel);
+  const auto compute_only = flushes(ShaderRecompiler::DenormFlushSkipCompute);
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  Require(name, "default flushes", exact >= 2u, "flushes " + std::to_string(exact));
+  Require(name, "KYTY_PS_FLUSH=off", skipped == 0u, "flushes " + std::to_string(skipped));
+  Require(name, "KYTY_CS_FLUSH=off leaves pixel shaders", compute_only == exact,
+          "flushes " + std::to_string(compute_only) + " vs " + std::to_string(exact));
+  std::printf("[codegen] %-32s ok (%llu flushes by default)\n", name,
+              static_cast<unsigned long long>(exact));
+}
+
 // V_RCP/RSQ/SQRT/EXP/LOG_F32 flush denormal inputs to zeros of the same sign ("denormals are
 // flushed"; rcp(-0) = -INF, sqrt(-0) = -0). With DenormFlushToZero 32 declared, the shader-side
 // flush is left to the host (KYTY_HOST_FTZ_INPUTS); both variants must agree bit for bit, and
@@ -2101,6 +2203,8 @@ void RunAll(VulkanHarness *vulkan) {
   CheckTranscendentalDenormInputs(vulkan);
   CheckExecSelects(vulkan);
   CheckInterpolationModes();
+  CheckLdsSlots();
+  CheckDenormFlushSkip();
   CheckMadPositionSlice();
   CheckMadModes(vulkan);
   CheckLodStatsGate();

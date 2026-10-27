@@ -901,7 +901,13 @@ void DefineModule(EmitterState& state) {
 		state.wave_exchange_parity = state.builder.AllocateId();
 	}
 	if (state.requirements.function_lds) {
-		state.lds_variable = state.builder.AllocateId();
+		if (state.lds_slot_plan) {
+			for (const auto key: state.requirements.lds_slot_keys) {
+				state.lds_slot_variables[key] = state.builder.AllocateId();
+			}
+		} else {
+			state.lds_variable = state.builder.AllocateId();
+		}
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -1093,7 +1099,13 @@ void DefineModule(EmitterState& state) {
 	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.requirements.function_lds) {
-		state.builder.AddName(state.lds_variable, "lds_dwords");
+		if (state.lds_slot_plan) {
+			for (const auto& [key, variable]: state.lds_slot_variables) {
+				state.builder.AddName(variable, ("lds_slot_" + std::to_string(key)).c_str());
+			}
+		} else {
+			state.builder.AddName(state.lds_variable, "lds_dwords");
+		}
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {

@@ -288,6 +288,8 @@ int JournalCompile(const char *path, uint32_t threads) {
   const auto begin = std::chrono::steady_clock::now();
   std::vector<std::unique_ptr<Job>> jobs;
   size_t skipped = 0;
+  size_t skip_reasons[3][4] = {};
+  size_t compiled_kinds[3] = {};
   size_t dead_compiled = 0;
   for (const auto &entry : journal.Entries()) {
     if (entry.source >= journal.Sources().size()) {
@@ -326,15 +328,44 @@ int JournalCompile(const char *path, uint32_t threads) {
         break;
     }
     job->push_data_cursor = entry.push_data_cursor;
-    if (job->code.empty() || !loaded ||
-        !ShaderRecompiler::IR::DecodeSpecialization(entry.specialization, job->specialization) ||
-        !Finish(*job, false, &dead_compiled)) {
+    // Why a permutation is skipped, by kind (0 vertex, 1 pixel, 2 compute): empty code, stored
+    // input info of another size, undecodable specialization, translation declined.
+    const auto kind = std::min<size_t>(static_cast<size_t>(source.kind), 2u);
+    size_t reason = 4;
+    if (job->code.empty()) {
+      reason = 0;
+    } else if (!loaded) {
+      reason = 1;
+    } else if (!ShaderRecompiler::IR::DecodeSpecialization(entry.specialization,
+                                                           job->specialization)) {
+      reason = 2;
+    } else if (!Finish(*job, false, &dead_compiled)) {
+      reason = 3;
+    }
+    if (reason != 4) {
+      skip_reasons[kind][reason]++;
       skipped++;
       continue;
     }
+    compiled_kinds[kind]++;
     jobs.push_back(std::move(job));
   }
   const auto reference_end = std::chrono::steady_clock::now();
+  for (size_t kind = 0; kind < 3; kind++) {
+    std::printf("%s: kind %zu (0 vs, 1 ps, 2 cs): %zu compiled; skipped: empty %zu, input size %zu, "
+                "specialization %zu, translation %zu\n",
+                path, kind, compiled_kinds[kind], skip_reasons[kind][0], skip_reasons[kind][1],
+                skip_reasons[kind][2], skip_reasons[kind][3]);
+  }
+  // Emitter statistics of the reference compiles (KYTY_PS/CS/VS_FLUSH, KYTY_LDS_SLOTS).
+  std::printf("%s: denormal flushes emitted: pixel %llu, compute %llu, geometry %llu; function LDS "
+              "programs: %llu with slots, %llu with the array\n",
+              path,
+              static_cast<unsigned long long>(ShaderRecompiler::Spirv::EmittedDenormFlushes(0)),
+              static_cast<unsigned long long>(ShaderRecompiler::Spirv::EmittedDenormFlushes(1)),
+              static_cast<unsigned long long>(ShaderRecompiler::Spirv::EmittedDenormFlushes(2)),
+              static_cast<unsigned long long>(ShaderRecompiler::Spirv::LdsSlotVerdicts(0)),
+              static_cast<unsigned long long>(ShaderRecompiler::Spirv::LdsSlotVerdicts(1)));
   size_t dead = 0;
   for (const auto &job : jobs) {
     dead += DeadReferencesAfterSpecialization(*job) != 0 ? 1u : 0u;

@@ -2197,7 +2197,145 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	           }));
 }
 
+namespace {
+
+// The value of a lane-only expression (immediates and LaneId under pure 32-bit integer and
+// boolean operations) for one lane, or none for anything else. Booleans are 0 or 1.
+std::optional<uint32_t> EvaluateForLane(const IR::Value& value, uint32_t lane, uint32_t depth,
+                                        uint32_t& budget) {
+	if (budget == 0u) {
+		return std::nullopt;
+	}
+	budget--;
+	const auto resolved = value.Resolve();
+	if (resolved.IsImmediate()) {
+		if (resolved.GetType() == IR::Type::U1) {
+			return resolved.U1() ? 1u : 0u;
+		}
+		if (resolved.GetType() == IR::Type::U32) {
+			return resolved.U32();
+		}
+		return std::nullopt;
+	}
+	const auto* inst = resolved.TryInstruction();
+	if (inst == nullptr || depth > 24u) {
+		return std::nullopt;
+	}
+	using Op = IR::ValueOpcode;
+	if (inst->GetOpcode() == Op::LaneId) {
+		return lane;
+	}
+	std::array<uint32_t, 3> a {};
+	const auto              count = inst->NumArgs();
+	if (count == 0u || count > a.size()) {
+		return std::nullopt;
+	}
+	for (size_t index = 0; index < count; index++) {
+		const auto arg = EvaluateForLane(inst->Arg(index), lane, depth + 1u, budget);
+		if (!arg.has_value()) {
+			return std::nullopt;
+		}
+		a[index] = *arg;
+	}
+	switch (inst->GetOpcode()) {
+		case Op::IAdd32: return a[0] + a[1];
+		case Op::ISub32: return a[0] - a[1];
+		case Op::IMul32: return a[0] * a[1];
+		case Op::ShiftLeftLogical32: return a[1] < 32u ? a[0] << a[1] : 0u;
+		case Op::ShiftRightLogical32: return a[1] < 32u ? a[0] >> a[1] : 0u;
+		case Op::BitwiseAnd32: return a[0] & a[1];
+		case Op::BitwiseOr32: return a[0] | a[1];
+		case Op::BitwiseXor32: return a[0] ^ a[1];
+		case Op::BitwiseNot32: return ~a[0];
+		case Op::BitCount32: return static_cast<uint32_t>(std::popcount(a[0]));
+		case Op::SelectU32:
+		case Op::SelectU1: return a[0] != 0u ? a[1] : a[2];
+		case Op::ULessThan32: return a[0] < a[1] ? 1u : 0u;
+		case Op::ULessThanEqual32: return a[0] <= a[1] ? 1u : 0u;
+		case Op::UGreaterThan32: return a[0] > a[1] ? 1u : 0u;
+		case Op::UGreaterThanEqual32: return a[0] >= a[1] ? 1u : 0u;
+		case Op::IEqual32: return a[0] == a[1] ? 1u : 0u;
+		case Op::INotEqual32: return a[0] != a[1] ? 1u : 0u;
+		case Op::LogicalAnd: return a[0] & a[1];
+		case Op::LogicalOr: return a[0] | a[1];
+		case Op::LogicalNot: return a[0] ^ 1u;
+		default: return std::nullopt;
+	}
+}
+
+} // namespace
+
+// KYTY_LDS_SLOTS (CodegenOptions::lds_slots, strxno/KytyPS5-GT7 220abc01c adapted). The guest
+// compiler spills VGPRs of non-compute stages to LDS at (LaneId << 2) + c bytes, LaneId built
+// with V_MBCNT (folded to LaneId or not): lane l then reads and writes only dword l + (c >> 2) of
+// the invocation's own function-scope array, never another lane's, and one variable per distinct
+// c >> 2 holds exactly what the array would. The address must depend on nothing but the lane, and
+// is evaluated for every lane of the wave: it must be 4 * lane + c (plus the DS offset) for all.
+std::optional<uint32_t> StaticLdsSlot(const IR::Program& program, const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::LoadSharedU32 &&
+	    inst.GetOpcode() != IR::ValueOpcode::WriteSharedU32) {
+		return std::nullopt;
+	}
+	const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+	if (memory_index >= program.memory_info.size() ||
+	    program.memory_info[memory_index].kind != IR::ResourceKind::Lds) {
+		return std::nullopt;
+	}
+	const auto lanes  = std::max<uint32_t>(program.wave_size, 1u);
+	uint32_t   budget = 1024u; // instruction visits per lane (the walk does not share subtrees)
+	const auto base   = EvaluateForLane(inst.Arg(0), 0u, 0u, budget);
+	if (!base.has_value()) {
+		return std::nullopt;
+	}
+	for (uint32_t lane = 1; lane < lanes; lane++) {
+		budget             = 1024u;
+		const auto address = EvaluateForLane(inst.Arg(0), lane, 0u, budget);
+		if (!address.has_value() || *address != *base + lane * 4u) {
+			return std::nullopt;
+		}
+	}
+	// The emitter adds the DS offset in 32 bits (ByteAddress); keep far from any wrap (the plan
+	// also bounds every key by the array size).
+	const uint64_t constant = static_cast<uint64_t>(*base) + program.memory_info[memory_index].offset;
+	if (constant >= (1ull << 24u)) {
+		return std::nullopt;
+	}
+	return static_cast<uint32_t>(constant >> 2u);
+}
+
+static uint32_t LdsSlotVariable(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto key = StaticLdsSlot(ctx.state.program, inst);
+	EXIT_IF(!key.has_value());
+	const auto found = ctx.state.lds_slot_variables.find(*key);
+	EXIT_IF(found == ctx.state.lds_slot_variables.end());
+	return found->second;
+}
+
+// Read as zero (and written not at all) while the lane is inactive, as the array's accesses are.
+static uint32_t LoadLdsSlot(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state    = ctx.state;
+	const auto variable = LdsSlotVariable(ctx, inst);
+	const auto value    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+	return Select(state, TypeU32(state), ctx.Arg(inst, inst.NumArgs() - 1), value,
+	              ConstantU32(state, 0));
+}
+
+static void StoreLdsSlot(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state    = ctx.state;
+	const auto variable = LdsSlotVariable(ctx, inst);
+	const auto before   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), before, variable);
+	state.builder.AddFunction(spv::OpStore, variable,
+	                          Select(state, TypeU32(state), ctx.Arg(inst, inst.NumArgs() - 1),
+	                                 ctx.Arg(inst, inst.NumArgs() - 2), before));
+}
+
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.state.lds_slot_plan && ctx.Memory(inst).kind == IR::ResourceKind::Lds) {
+		ctx.Define(inst, LoadLdsSlot(ctx, inst));
+		return;
+	}
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
 	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
@@ -2237,6 +2375,10 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.state.lds_slot_plan && ctx.Memory(inst).kind == IR::ResourceKind::Lds) {
+		StoreLdsSlot(ctx, inst);
+		return;
+	}
 	const auto  op                = inst.GetOpcode();
 	const auto& mem               = ctx.Memory(inst);
 	const auto  buffer_components = IR::BufferComponentCount(op);

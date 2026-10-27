@@ -21,6 +21,12 @@ struct HostFloatControls {
 void              SetHostFloatControls(const HostFloatControls& controls);
 HostFloatControls GetHostFloatControls();
 
+// Emitter statistics since process start (offline comparisons, --journal-compile): shader-side
+// f32 denormal flushes emitted by stage (0 pixel, 1 compute, 2 geometry), and non-compute
+// programs with function-scope LDS by KYTY_LDS_SLOTS verdict (0 slots, 1 array kept).
+uint64_t EmittedDenormFlushes(uint32_t stage_index);
+uint64_t LdsSlotVerdicts(uint32_t verdict);
+
 // Storage-buffer robustness the device guarantees. With robustBufferAccess2 enabled and
 // robustStorageBufferAccessSizeAlignment == 1, a 32-bit load from a storage-buffer descriptor
 // returns 0 exactly when some byte of it lies outside the descriptor range, which is the

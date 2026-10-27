@@ -44,6 +44,12 @@ layout(set = 0, binding = 2, std140) uniform Push {
 	uint image_layer;
 } params;
 
+// KYTY_TILER_CAS (spec constant 2, TileManager::SubwordCas): an 8- or 16-bit element is merged
+// into its word with one compare-and-swap loop instead of an atomicAnd and an atomicOr
+// (strxno/KytyPS5-GT7 c0afe8d27: detiling 43 -> 18 us a call on an RTX 4090). Both keep the
+// neighbours a concurrent invocation writes into the same word; the CAS loop changes the word once.
+layout(constant_id = 2) const uint SUBWORD_CAS = 0u;
+
 #ifdef TILER_IMAGE
 #ifdef TILER_IMAGE_LOAD
 // Tiled bytes of one element from the image texel at coord.
@@ -61,8 +67,17 @@ void load_element(ivec3 coord, uint dst) {
 	} else {
 		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
 		uint shift = (dst & 3u) * 8u;
-		atomicAnd(tiled_buffer.data[dst >> 2], ~(mask << shift));
-		atomicOr(tiled_buffer.data[dst >> 2], (value.x & mask) << shift);
+		if (SUBWORD_CAS != 0u) {
+			uint old = tiled_buffer.data[dst >> 2];
+			for (;;) {
+				uint seen = atomicCompSwap(tiled_buffer.data[dst >> 2], old, (old & ~(mask << shift)) | ((value.x & mask) << shift));
+				if (seen == old) break;
+				old = seen;
+			}
+		} else {
+			atomicAnd(tiled_buffer.data[dst >> 2], ~(mask << shift));
+			atomicOr(tiled_buffer.data[dst >> 2], ((value.x & mask) << shift));
+		}
 	}
 }
 #else
@@ -103,8 +118,17 @@ void copy_element(uint src, uint dst) {
 		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
 		uint value = (input_buffer.data[src >> 2] >> ((src & 3u) * 8u)) & mask;
 		uint shift = (dst & 3u) * 8u;
-		atomicAnd(output_buffer.data[dst >> 2], ~(mask << shift));
-		atomicOr(output_buffer.data[dst >> 2], value << shift);
+		if (SUBWORD_CAS != 0u) {
+			uint old = output_buffer.data[dst >> 2];
+			for (;;) {
+				uint seen = atomicCompSwap(output_buffer.data[dst >> 2], old, (old & ~(mask << shift)) | (value << shift));
+				if (seen == old) break;
+				old = seen;
+			}
+		} else {
+			atomicAnd(output_buffer.data[dst >> 2], ~(mask << shift));
+			atomicOr(output_buffer.data[dst >> 2], (value << shift));
+		}
 	}
 }
 #endif
