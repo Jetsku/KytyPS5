@@ -450,14 +450,60 @@ void BindlessTable::TakeWrittenRanges(std::vector<std::pair<uint64_t, uint64_t>>
 	}
 }
 
+// KYTY_BINDLESS_HEAP_GROW=1 (default 0; on in the PPSA03671 preset; the idea of upstream
+// 4db225008, which resizes image heap tables in place): a heap whose descriptor grows keeps its
+// translation region when it is the last one allocated (it is extended where it is), and a heap
+// above 64 Ki keys gets room to grow by half. Off, every growth moves the heap to a new region,
+// and one above 64 Ki keys has no headroom: a heap that grows a little on most frames leaks its
+// old region each time and fills the 1 Mi-entry translation buffer within a few frames, after
+// which no new heap gets a region (its keys sample the placeholder).
+static bool BindlessHeapGrowEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_HEAP_GROW");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	// Headroom so a growing heap rarely moves; a move re-writes the keys resolved so far.
-	const auto capacity = std::max(entries, std::min<uint32_t>(entries * 2u, 1u << 16u));
+	const bool grow = BindlessHeapGrowEnabled();
+	// With the switch, room to double up to 64 Ki keys and by half above; without, room up to a
+	// total of 64 Ki keys and none above.
+	const auto capacity =
+	    grow ? static_cast<uint32_t>(std::min<uint64_t>(
+	               uint64_t {entries} + std::max<uint32_t>(std::min(entries, 1u << 16u), entries / 2u),
+	               TranslationEntries))
+	         : std::max(entries, std::min<uint32_t>(entries * 2u, 1u << 16u));
+	const auto old_region  = heap.region;
+	const auto old_entries = heap.entries;
+	if (grow && old_entries != 0 && old_region + old_entries == m_next_region &&
+	    capacity > old_entries && capacity - old_entries <= TranslationEntries - m_next_region) {
+		// The last region: extend it in place. Keys below old_entries keep their entries and
+		// feedback flags; frames in flight read only those.
+		m_next_region = old_region + capacity;
+		heap.entries  = capacity;
+		heap.slots.resize(capacity, 0u);
+		heap.settled.resize(capacity, 0u);
+		heap.descriptors.resize(capacity);
+		heap.images.resize(capacity);
+		auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+		auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+		for (uint32_t key = old_entries; key < capacity; key++) {
+			translation[heap.region + key] = ShaderRecompiler::IR::BindlessPending;
+			feedback[heap.region + key]    = 0;
+		}
+		const auto added = capacity - old_entries;
+		m_translation->Flush((heap.region + old_entries) * sizeof(uint32_t), added * sizeof(uint32_t));
+		m_feedback->Flush((heap.region + old_entries) * sizeof(uint32_t), added * sizeof(uint32_t));
+		LOGF("Bindless heap region: base=0x%016" PRIx64 " binding=%u region=%u entries=%u (was %u, "
+		     "extended in place)\n",
+		     heap.base, heap.binding, heap.region, capacity, old_entries);
+		return true;
+	}
 	if (capacity > TranslationEntries - m_next_region) {
 		return false;
 	}
-	const auto old_region  = heap.region;
-	const auto old_entries = heap.entries;
 	heap.region            = m_next_region;
 	heap.entries           = capacity;
 	m_next_region += capacity;
