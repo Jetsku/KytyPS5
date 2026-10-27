@@ -307,7 +307,7 @@ bool PacketHookActive() {
 	return passive && tracy::ProfilerAvailable() && TracyIsConnected;
 }
 
-static bool ReadsUntouched(const PreparedDraw& prepared);
+static bool ReadsUntouched(PreparedDraw& prepared);
 
 void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool eligible,
              bool exact, PreparedDraw& prepared) {
@@ -321,6 +321,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.certificate.clear();
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
+	prepared.touched_valid     = false;
 	if (!eligible) {
 		prepared.failure = Failure::Ineligible;
 		return;
@@ -432,24 +433,294 @@ int UntouchedMode() {
 	return static_cast<int>(g_clean_untouched.Get());
 }
 
+// KYTY_CLEAN_UNTOUCHED_FINE (live, default 0): the clean-untouched verdicts (here and in
+// kernel/memory.cpp) use the 1 KiB marks instead of the 4 KiB ones (gpuTouchedPages.h). Both maps
+// are maintained from the start, so it can change at any time; both verdicts are exact.
+static Live::Switch g_clean_untouched_fine("KYTY_CLEAN_UNTOUCHED_FINE", Live::ParseDefaultOff);
+
+bool UntouchedFine() {
+	return g_clean_untouched_fine.On();
+}
+
 static bool RangesUntouched(std::span<const Coherence::Range> ranges) {
+	const bool fine = g_clean_untouched_fine.On();
 	for (const auto& range: ranges) {
-		if (GpuTouched::g_pages.AnyTouched(range.begin, range.end)) {
+		if (GpuTouched::AnyTouched(fine, range.begin, range.end)) {
 			return false;
 		}
 	}
 	return true;
 }
 
+// KYTY_CLEAN_UNTOUCHED_DIAG=1 (gpuTouchedPages.h): per touched certificate, the set of marking
+// sources whose pages it touches, whether 1 KiB marks would have called it untouched, and the
+// pages hit most often (first touched page of each touched certificate). Racy counters, console
+// line every 2^18 certificates.
+namespace UntouchedDiag {
+struct HotPage {
+	std::atomic<uint64_t> page {0};
+	std::atomic<uint64_t> hits {0};
+	std::atomic<uint32_t> mask {0};
+	std::atomic<uint64_t> bytes {0};
+};
+static std::atomic<uint64_t>                 g_certs {0};
+static std::atomic<uint64_t>                 g_untouched {0};
+static std::atomic<uint64_t>                 g_fine_untouched {0};
+static std::array<std::atomic<uint64_t>, 16> g_masks {};
+static std::atomic<uint64_t>                 g_ranges {0};
+static std::atomic<uint64_t>                 g_touched_ranges {0};
+static std::array<HotPage, 512>              g_hot {};
+
+static uint32_t SourceMask(uint64_t begin, uint64_t end) {
+	uint32_t mask = 0;
+	for (uint32_t s = 0; s < static_cast<uint32_t>(GpuTouched::DiagSource::Count); s++) {
+		if (GpuTouched::g_diag_pages[s].AnyTouched(begin, end)) {
+			mask |= 1u << s;
+		}
+	}
+	return mask;
+}
+
+static void NoteHot(uint64_t page, uint32_t mask, uint64_t bytes) {
+	for (uint64_t probe = 0; probe < 8; probe++) {
+		auto&    slot = g_hot[(page * 0x9E3779B97F4A7C15ull >> 55u) + probe & (g_hot.size() - 1u)];
+		uint64_t key  = slot.page.load(std::memory_order_relaxed);
+		if (key == 0 && slot.page.compare_exchange_strong(key, page, std::memory_order_relaxed)) {
+			key = page;
+		}
+		if (key == page) {
+			slot.hits.fetch_add(1, std::memory_order_relaxed);
+			slot.mask.fetch_or(mask, std::memory_order_relaxed);
+			slot.bytes.fetch_add(bytes, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+
+// Commit side (the CP thread only): log entries walked per certificate check, and how many checks
+// came from untouched preparations and found the log clean.
+static uint64_t g_commit_checks  = 0;
+static uint64_t g_commit_entries = 0;
+static uint64_t g_commit_untouched_clean = 0;
+static uint64_t g_commit_log_conflicts   = 0;
+static std::array<uint64_t, 8> g_commit_entry_hist {}; // 0, 1-15, 16-63, 64-255, 256-1023, 1K-4K, 4K-16K, more
+
+static void NoteCommit(uint64_t entries, bool untouched, bool clean) {
+	g_commit_checks++;
+	g_commit_entries += entries;
+	g_commit_untouched_clean += (untouched && clean) ? 1u : 0u;
+	g_commit_log_conflicts += clean ? 0u : 1u;
+	const size_t bucket = entries == 0      ? 0
+	                      : entries < 16    ? 1
+	                      : entries < 64    ? 2
+	                      : entries < 256   ? 3
+	                      : entries < 1024  ? 4
+	                      : entries < 4096  ? 5
+	                      : entries < 16384 ? 6
+	                                        : 7;
+	g_commit_entry_hist[bucket]++;
+	if ((g_commit_checks & 0x3ffffu) == 0) {
+		const double c = static_cast<double>(g_commit_checks) / 100.0;
+		std::printf("CleanUntouchedDiag commits: %" PRIu64 " checks, %.1f log entries/check, untouched+clean "
+		            "%.1f%%, log not clean %.2f%%; entries hist [0 1-15 16-63 64-255 256-1K 1K-4K 4K-16K "
+		            ">16K] %%: %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f\n",
+		            g_commit_checks, static_cast<double>(g_commit_entries) / static_cast<double>(g_commit_checks),
+		            static_cast<double>(g_commit_untouched_clean) / c,
+		            static_cast<double>(g_commit_log_conflicts) / c, g_commit_entry_hist[0] / c,
+		            g_commit_entry_hist[1] / c, g_commit_entry_hist[2] / c, g_commit_entry_hist[3] / c,
+		            g_commit_entry_hist[4] / c, g_commit_entry_hist[5] / c, g_commit_entry_hist[6] / c,
+		            g_commit_entry_hist[7] / c);
+		std::fflush(stdout);
+	}
+}
+
+static void Print(uint64_t certs) {
+	const double c = static_cast<double>(certs) / 100.0;
+	std::printf("CleanUntouchedDiag: %" PRIu64 " certs, untouched %.1f%%, 1KiB-untouched %.1f%% (of all), "
+	            "ranges touched %.1f%%; touched by source mask [buf trk img pub]:",
+	            certs, static_cast<double>(g_untouched.load()) / c,
+	            static_cast<double>(g_fine_untouched.load()) / c,
+	            100.0 * static_cast<double>(g_touched_ranges.load()) /
+	                static_cast<double>(std::max<uint64_t>(1, g_ranges.load())));
+	for (uint32_t m = 0; m < 16; m++) {
+		if (const auto n = g_masks[m].load(); n != 0) {
+			std::printf(" %c%c%c%c=%.1f%%", (m & 1u) ? 'b' : '-', (m & 2u) ? 't' : '-', (m & 4u) ? 'i' : '-',
+			            (m & 8u) ? 'p' : '-', static_cast<double>(n) / c);
+		}
+	}
+	std::printf("\n");
+	std::array<std::pair<uint64_t, size_t>, 512> order {};
+	for (size_t i = 0; i < g_hot.size(); i++) {
+		order[i] = {g_hot[i].hits.load(), i};
+	}
+	std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	for (size_t i = 0; i < 12 && order[i].first != 0; i++) {
+		const auto& slot = g_hot[order[i].second];
+		const auto  m    = slot.mask.load();
+		std::printf("CleanUntouchedDiag:   page 0x%" PRIx64 " %.1f%% of certs, mask %c%c%c%c, avg range %" PRIu64
+		            " B\n",
+		            slot.page.load() << 12u, static_cast<double>(order[i].first) / c, (m & 1u) ? 'b' : '-',
+		            (m & 2u) ? 't' : '-', (m & 4u) ? 'i' : '-', (m & 8u) ? 'p' : '-',
+		            slot.bytes.load() / std::max<uint64_t>(1, order[i].first));
+	}
+	std::fflush(stdout);
+}
+
+static void Note(std::span<const Coherence::Range> a, std::span<const Coherence::Range> b, bool untouched) {
+	const auto certs = g_certs.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (untouched) {
+		g_untouched.fetch_add(1, std::memory_order_relaxed);
+		g_fine_untouched.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		uint32_t mask     = 0;
+		bool     fine     = true;
+		bool     first    = true;
+		uint64_t ranges   = 0;
+		uint64_t touched  = 0;
+		for (const auto list: {a, b}) {
+			for (const auto& range: list) {
+				ranges++;
+				if (!GpuTouched::g_pages.AnyTouched(range.begin, range.end)) {
+					continue;
+				}
+				touched++;
+				const auto m = SourceMask(range.begin, range.end);
+				mask |= m;
+				fine = fine && !GpuTouched::g_fine_pages.AnyTouched(range.begin, range.end);
+				if (first) {
+					// The first touched page of this range.
+					for (auto page = range.begin >> 12u; page <= (range.end - 1u) >> 12u; page++) {
+						if (GpuTouched::g_pages.AnyTouched(page << 12u, (page + 1u) << 12u)) {
+							NoteHot(page, m, range.end - range.begin);
+							break;
+						}
+					}
+					first = false;
+				}
+			}
+		}
+		g_ranges.fetch_add(ranges, std::memory_order_relaxed);
+		g_touched_ranges.fetch_add(touched, std::memory_order_relaxed);
+		g_masks[mask & 15u].fetch_add(1, std::memory_order_relaxed);
+		if (fine) {
+			g_fine_untouched.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if ((certs & 0x3ffffu) == 0) {
+		Print(certs);
+	}
+}
+} // namespace UntouchedDiag
+
+// KYTY_CLEAN_UNTOUCHED_RANGES (live, default 0; with KYTY_CLEAN_UNTOUCHED=1): a preparation whose
+// ranges were not all untouched records the touched ones (touched_reads), and a commit whose log
+// check found no transition touching the certificate since the preparation began runs the clean
+// predicate on those only. The reads_untouched argument holds per range: an untouched range turned
+// unclean only by a transition after the generation the preparation loaded (the log check would
+// have seen it) or before it (the preparing thread's check, made after that load, would have seen
+// its mark). At the pirate island about half the certificates touch a few GPU-written pages (4-byte
+// reads of buffers written by the GPU and published back), and 79% of their ranges are untouched.
+// 2 (verify): the full pass decides; a touched-only "clean" the full pass refuses is counted.
+static Live::Switch g_clean_untouched_ranges("KYTY_CLEAN_UNTOUCHED_RANGES", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "verify") == 0 || std::strcmp(value, "2") == 0 ? 2 : 1;
+});
+
+static void CollectTouched(PreparedDraw& prepared) {
+	const bool fine = g_clean_untouched_fine.On();
+	prepared.touched_reads.clear();
+	for (const auto list: {prepared.reads.Ranges(), prepared.reads.DigestRanges()}) {
+		for (const auto& range: list) {
+			if (GpuTouched::AnyTouched(fine, range.begin, range.end)) {
+				prepared.touched_reads.push_back(range);
+			}
+		}
+	}
+	prepared.touched_valid = true;
+}
+
 // The preparing thread, after the read set is final (and its certificate built, if any).
-static bool ReadsUntouched(const PreparedDraw& prepared) {
+static bool ReadsUntouched(PreparedDraw& prepared) {
+	prepared.touched_valid = false;
 	if (g_clean_untouched.Get() == 0 || !GpuTouched::Enabled()) {
 		return false;
 	}
-	if (prepared.certificate_built) {
-		return RangesUntouched(prepared.certificate);
+	if (g_clean_untouched_ranges.Get() != 0) {
+		CollectTouched(prepared);
+		const bool untouched = prepared.touched_reads.empty();
+		if (GpuTouched::DiagEnabled()) [[unlikely]] {
+			UntouchedDiag::Note(prepared.reads.Ranges(), prepared.reads.DigestRanges(), untouched);
+		}
+		return untouched;
 	}
-	return RangesUntouched(prepared.reads.Ranges()) && RangesUntouched(prepared.reads.DigestRanges());
+	bool untouched = false;
+	if (prepared.certificate_built) {
+		untouched = RangesUntouched(prepared.certificate);
+	} else {
+		untouched = RangesUntouched(prepared.reads.Ranges()) && RangesUntouched(prepared.reads.DigestRanges());
+	}
+	if (GpuTouched::DiagEnabled()) [[unlikely]] {
+		if (prepared.certificate_built) {
+			UntouchedDiag::Note(prepared.certificate, {}, untouched);
+		} else {
+			UntouchedDiag::Note(prepared.reads.Ranges(), prepared.reads.DigestRanges(), untouched);
+		}
+	}
+	return untouched;
+}
+
+// KYTY_CERT_PREFETCH (live, default 0): when the commit thread has the head ready, it issues cache
+// prefetches for the next position's certificate (the PreparedDraw line holding the generation,
+// the certificate vector and the untouched flag, then the certificate ranges; 2 also the read and
+// digest range lists the exact clean pass walks), if that preparation is already done. Those lines
+// were written by a worker on another core, so the commit's log check otherwise starts with
+// cross-core misses. A hint only: nothing is decided from it.
+static Live::Switch g_cert_prefetch("KYTY_CERT_PREFETCH", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "2") == 0 ? 2 : 1;
+});
+
+static inline void PrefetchLine(const void* address) {
+#if defined(__clang__) || defined(__GNUC__)
+	__builtin_prefetch(address, 0, 3);
+#elif defined(_M_X64) || defined(_M_IX86)
+	_mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#endif
+}
+
+template <typename T>
+static void PrefetchSpan(std::span<const T> items, size_t max_lines) {
+	const auto* begin = reinterpret_cast<const uint8_t*>(items.data());
+	const auto  bytes = items.size_bytes();
+	for (size_t offset = 0, lines = 0; offset < bytes && lines < max_lines; offset += 64, lines++) {
+		PrefetchLine(begin + offset);
+	}
+}
+
+// The PreparedDraw lines a commit's certificate check reads first (no dependent loads).
+static void PrefetchHeader(const PreparedDraw& prepared, int64_t mode) {
+	PrefetchLine(&prepared.coherence_generation);
+	PrefetchLine(&prepared.reads_untouched);
+	if (mode == 2) {
+		PrefetchLine(&prepared.reads);
+		PrefetchLine(reinterpret_cast<const uint8_t*>(&prepared.reads) + 128);
+	}
+}
+
+// The range lists (reads the header lines, prefetched one commit earlier).
+static void PrefetchCertificate(const PreparedDraw& prepared, int64_t mode) {
+	if (prepared.certificate_built) {
+		PrefetchSpan(std::span<const Coherence::Range>(prepared.certificate), 8);
+	}
+	if (mode == 2 || !prepared.reads_untouched) {
+		PrefetchLine(&prepared.reads);
+		PrefetchSpan(prepared.reads.Ranges(), 8);
+		PrefetchSpan(prepared.reads.DigestRanges(), 4);
+	}
 }
 
 // Live (common/liveSwitch.h): the sequencer reads it per dispatch it parses; the op carries the
@@ -494,6 +765,7 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	prepared.certificate.clear();
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
+	prepared.touched_valid     = false;
 	if (!eligible) {
 		prepared.failure = Failure::Ineligible;
 		return;
@@ -645,12 +917,49 @@ static std::atomic<uint64_t> g_clean_since_mismatches {0};
 static std::atomic<uint64_t> g_untouched_checks {0};
 static std::atomic<uint64_t> g_untouched_hits {0};
 static std::atomic<uint64_t> g_untouched_mismatches {0};
+static std::atomic<uint64_t> g_untouched_ranges_checks {0};
+static std::atomic<uint64_t> g_untouched_ranges_mismatches {0};
 
 static bool AllCleanAfterLog(const PreparedDraw& prepared) {
 	if (const auto untouched = g_clean_untouched.Get(); untouched != 0) {
 		if (untouched == 1) {
 			if (prepared.reads_untouched) {
 				return true;
+			}
+			if (prepared.touched_valid) {
+				// KYTY_CLEAN_UNTOUCHED_RANGES: only the ranges that were touched.
+				const auto since    = prepared.coherence_generation;
+				const bool shortcut = g_clean_since.Get() == 1;
+				const auto is_clean = [&](uint64_t address, uint64_t size) {
+					return shortcut ? LibKernel::Memory::IsGpuCleanForReadSince(address, size, since)
+					                : LibKernel::Memory::IsGpuCleanForRead(address, size);
+				};
+				bool touched_clean = true;
+				for (const auto& range: prepared.touched_reads) {
+					if (!is_clean(range.begin, range.end - range.begin)) {
+						touched_clean = false;
+						break;
+					}
+				}
+				if (g_clean_untouched_ranges.Get() != 2) {
+					return touched_clean;
+				}
+				const bool exact = prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead);
+				const auto checks = g_untouched_ranges_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (touched_clean && !exact) {
+					const auto count = g_untouched_ranges_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (count <= 16) {
+						std::printf("CleanUntouchedRanges: the touched ranges are clean but not all ranges "
+						            "(%zu ranges, %zu touched)\n",
+						            prepared.reads.Ranges().size(), prepared.touched_reads.size());
+					}
+				}
+				if ((checks & 0x3ffffu) == 0) {
+					std::printf("CleanUntouchedRanges verify: %" PRIu64 " checks, %" PRIu64 " mismatches\n",
+					            checks, g_untouched_ranges_mismatches.load(std::memory_order_relaxed));
+					std::fflush(stdout);
+				}
+				return exact;
 			}
 		} else {
 			// verify: the exact pass decides; count how often the shortcut applies and errs.
@@ -712,6 +1021,61 @@ static bool AllCleanAfterLog(const PreparedDraw& prepared) {
 	return exact;
 }
 
+// KYTY_CERT_LOG_SUMMARY (live, default 0): the log-mode certificate first asks the commit thread's
+// Coherence::Summary (every log entry ingested once into newest-generation-per-64-KiB-block),
+// and walks the log (Coherence::Log::Check) only when the summary cannot vouch for the interval.
+// The walk read every transition since the preparation began, for every commit: with a deep
+// preparation window most entries were read by many commits (about 1.6% of the pirate island CP).
+// 2 (verify): both run; the walk decides, and a summary "clean" the walk does not confirm is
+// counted and logged.
+static Live::Switch g_cert_log_summary("KYTY_CERT_LOG_SUMMARY", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "verify") == 0 || std::strcmp(value, "2") == 0 ? 2 : 1;
+});
+static std::atomic<uint64_t> g_summary_checks {0};
+static std::atomic<uint64_t> g_summary_clean {0};
+static std::atomic<uint64_t> g_summary_mismatches {0};
+
+static Coherence::CheckOutcome SummaryCheck(uint64_t from, std::span<const Coherence::Range> ranges,
+                                            int64_t mode) {
+	// Commits run on the GPU thread only (Validate, ValidateDispatch).
+	static Coherence::Summary summary(Coherence::g_log);
+	const auto                to = Coherence::Generation();
+	if (!GuestGpu::IsGpuThread()) {
+		return Coherence::g_log.Check(from, to, ranges, true);
+	}
+	const bool clean = summary.Clean(from, to, ranges);
+	const auto checks = g_summary_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (clean) {
+		g_summary_clean.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (mode == 1) {
+		if (clean) {
+			return {};
+		}
+		return Coherence::g_log.Check(from, to, ranges, true);
+	}
+	const auto exact = Coherence::g_log.Check(from, to, ranges, true);
+	if (clean && exact.result == Coherence::CheckResult::Conflict) {
+		const auto count = g_summary_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 16) {
+			std::printf("CertLogSummary: the summary called an interval clean that conflicts (from %" PRIu64
+			            " to %" PRIu64 ", %zu ranges)\n",
+			            from, to, ranges.size());
+		}
+	}
+	if ((checks & 0x3ffffu) == 0) {
+		std::printf("CertLogSummary verify: %" PRIu64 " checks, %" PRIu64 " clean by summary, %" PRIu64
+		            " mismatches\n",
+		            checks, g_summary_clean.load(std::memory_order_relaxed),
+		            g_summary_mismatches.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+	return exact;
+}
+
 // The certificate part of Validate (draws) and ValidateDispatch: the shader map, then the log or
 // value check of every read. False with `failure` set when it does not hold.
 static bool CertificateHolds(PreparedDraw& prepared, Failure& failure) {
@@ -727,13 +1091,21 @@ static bool CertificateHolds(PreparedDraw& prepared, Failure& failure) {
 	if (GetCertMode() == CertMode::Log) {
 		const auto stats_start = CommitStats::StepsEnabled() ? CommitStats::Now() : 0;
 		const auto cert_ranges = CommitCertificateRanges(prepared, log_scratch);
-		const auto outcome =
-		    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
-		                           cert_ranges, g_clean_untouched.Get() != 0);
+		Coherence::CheckOutcome outcome;
+		if (const auto summary = g_cert_log_summary.Get(); summary != 0) {
+			outcome = SummaryCheck(prepared.coherence_generation, cert_ranges, summary);
+		} else {
+			outcome = Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
+			                                 cert_ranges, g_clean_untouched.Get() != 0);
+		}
 		if (stats_start != 0) {
 			CommitStats::AddSub(CommitStats::Sub::ValLog, CommitStats::Now() - stats_start);
 			CommitStats::AddItems(CommitStats::Item::LogEntries, outcome.entries);
 			CommitStats::AddItems(CommitStats::Item::CertRanges, cert_ranges.size());
+		}
+		if (GpuTouched::DiagEnabled()) [[unlikely]] {
+			UntouchedDiag::NoteCommit(outcome.entries, prepared.reads_untouched,
+			                          outcome.result == Coherence::CheckResult::Clean);
 		}
 		// The walk's length grows with the preparation-to-commit interval (KYTY_CP_SEQ=1).
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogChecks);
@@ -790,7 +1162,16 @@ static bool CertificateHolds(PreparedDraw& prepared, Failure& failure) {
 	return true;
 }
 
+// KYTY_CERT_COUNT_LAZY (live, default 0): CountCertificate walks the read and digest range lists
+// only when frame events are counted at all (Profiler::FrameEventsOn). Otherwise its sums are
+// thrown away, and for an untouched certificate (KYTY_CLEAN_UNTOUCHED) that walk was the commit's
+// only touch of those lists, cross-core misses included (about 0.8% of the Sky Garden CP).
+static Live::Switch g_cert_count_lazy("KYTY_CERT_COUNT_LAZY", Live::ParseDefaultOff);
+
 static void CountCertificate(const PreparedDraw& prepared) {
+	if (g_cert_count_lazy.On() && !Profiler::FrameEventsOn()) {
+		return;
+	}
 	const auto ranges = prepared.reads.Ranges();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertRanges, ranges.size());
 	uint64_t bytes = 0;
@@ -1574,6 +1955,20 @@ Engine::Slot& Engine::ReadyHead() {
 		}
 	}
 	CommitStats::StepMark(CommitStats::Step::GapHead);
+	if (const auto mode = g_cert_prefetch.Get(); mode != 0) {
+		// KYTY_CERT_PREFETCH, a two-step pipeline: the position after next gets its state word and
+		// certificate header lines prefetched; the next one (whose lines the previous commit
+		// prefetched), when its preparation is done, gets its range lists prefetched.
+		const auto head = window.Head();
+		const auto tail = window.Tail();
+		if (head + 2u < tail) {
+			PrefetchLine(window.StateAddress(head + 2u));
+			PrefetchHeader(window.PayloadAt(head + 2u).prepared, mode);
+		}
+		if (head + 1u < tail && window.DoneAt(head + 1u)) {
+			PrefetchCertificate(window.PayloadAt(head + 1u).prepared, mode);
+		}
+	}
 	return slot;
 }
 

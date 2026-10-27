@@ -343,6 +343,8 @@ inline thread_local Recorder* t_recorder = nullptr;
 [[nodiscard]] bool DirectReadsEnabled();
 // KYTY_CLEAN_UNTOUCHED (drawPrep.cpp, kernel/memory.cpp): 0 off, 1 on, 2 verify, 3 exit.
 [[nodiscard]] int UntouchedMode();
+// KYTY_CLEAN_UNTOUCHED_FINE (drawPrep.cpp): the verdicts use the 1 KiB GPU-touched marks.
+[[nodiscard]] bool UntouchedFine();
 
 // Set on DrawPrep worker threads, which must never reach the scheduler or the caches
 // (CommandScheduler::CheckActive stops the emulator if one does).

@@ -1199,7 +1199,7 @@ static bool IsGpuRangeCleanForBackingRead(uint64_t vaddr, uint64_t size) {
 // marks its pages before its change becomes observable.
 static bool NeverGpuTouched(uint64_t vaddr, uint64_t size) {
 	return Graphics::GpuTouched::Enabled() && size != 0 && vaddr <= UINT64_MAX - size &&
-	       !Graphics::GpuTouched::g_pages.AnyTouched(vaddr, vaddr + size);
+	       !Graphics::GpuTouched::AnyTouched(Graphics::DrawPrep::UntouchedFine(), vaddr, vaddr + size);
 }
 
 static std::atomic<uint64_t> g_untouched_verdict_checks {0};

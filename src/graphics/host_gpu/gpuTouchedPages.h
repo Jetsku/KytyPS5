@@ -27,19 +27,23 @@ namespace Libs::Graphics::GpuTouched {
 inline constexpr uint32_t PageShift     = 12u;
 inline constexpr uint32_t LeafShift     = 36u; // 64 GiB per leaf
 inline constexpr uint32_t LeafCount     = 1u << (48u - LeafShift);
-inline constexpr uint64_t PagesPerLeaf  = uint64_t {1} << (LeafShift - PageShift);
-inline constexpr uint64_t WordsPerLeaf  = PagesPerLeaf / 64u;
 
-class Pages {
+// One bit per 2^Shift bytes (Pages: 4 KiB; the KYTY_CLEAN_UNTOUCHED_DIAG fine map: 1 KiB).
+template <uint32_t Shift>
+class PagesT {
+	static constexpr uint32_t PageShift    = Shift;
+	static constexpr uint64_t PagesPerLeaf = uint64_t {1} << (LeafShift - PageShift);
+	static constexpr uint64_t WordsPerLeaf = PagesPerLeaf / 64u;
+
 public:
-	Pages() = default;
-	~Pages() {
+	PagesT() = default;
+	~PagesT() {
 		for (auto& leaf: m_leaves) {
 			delete[] leaf.load(std::memory_order_relaxed);
 		}
 	}
-	Pages(const Pages&)            = delete;
-	Pages& operator=(const Pages&) = delete;
+	PagesT(const PagesT&)            = delete;
+	PagesT& operator=(const PagesT&) = delete;
 
 	// Marks every page of [begin, end). end = UINT64_MAX or a range beyond 48 bits: universe.
 	void Mark(uint64_t begin, uint64_t end) noexcept {
@@ -153,8 +157,33 @@ private:
 	std::atomic<bool>                        m_universe {false};
 };
 
+using Pages = PagesT<PageShift>;
+
 // The process-wide bitmap.
 inline Pages g_pages;
+
+// KYTY_CLEAN_UNTOUCHED_DIAG=1 (diagnostic, default off, read once): which source touched the pages
+// that make a certificate "touched" (one 4 KiB map per marking source), and whether a 1 KiB map
+// would have called it untouched. Nothing is allocated unless it is on.
+enum class DiagSource : uint32_t { BufferDirtyAdd, TrackerGpuMark, ImageGpuModified, PublicationBegin, Count };
+[[nodiscard]] inline bool DiagEnabled() noexcept {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLEAN_UNTOUCHED_DIAG");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+inline std::array<Pages, static_cast<size_t>(DiagSource::Count)> g_diag_pages;
+
+// KYTY_CLEAN_UNTOUCHED_FINE (drawPrep.cpp, live): the same sticky marks at 1 KiB, maintained
+// alongside g_pages from the first transition on (marks are rare next to queries), so the
+// clean-untouched verdicts can switch between the two maps at any time. Both are exact.
+inline PagesT<10> g_fine_pages;
+
+// The clean-untouched verdict's map: 1 KiB marks when `fine`, else 4 KiB.
+[[nodiscard]] inline bool AnyTouched(bool fine, uint64_t begin, uint64_t end) noexcept {
+	return fine ? g_fine_pages.AnyTouched(begin, end) : g_pages.AnyTouched(begin, end);
+}
 
 // Maintained from the first transition on when the sequencer thread is configured
 // (KYTY_CP_SEQ=1, read once here so that no mark before the sequencer starts is missed).
@@ -167,9 +196,14 @@ inline Pages g_pages;
 }
 
 // Coherence::Log::Append: the sources whose transitions can make a range unclean.
-inline void NoteTransition(uint64_t begin, uint64_t end, bool unclean_source) noexcept {
-	if (unclean_source && Enabled()) {
+// `source`: the DiagSource of an unclean source, or DiagSource::Count for the others.
+inline void NoteTransition(uint64_t begin, uint64_t end, DiagSource source) noexcept {
+	if (source != DiagSource::Count && Enabled()) {
 		g_pages.Mark(begin, end);
+		g_fine_pages.Mark(begin, end);
+		if (DiagEnabled()) {
+			g_diag_pages[static_cast<size_t>(source)].Mark(begin, end);
+		}
 	}
 }
 

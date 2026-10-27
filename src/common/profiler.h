@@ -1440,6 +1440,11 @@ void CountFrameWorkShared(FrameWork kind) noexcept;
 // shared atomics). Diagnostics and tests.
 [[nodiscard]] uint64_t FrameEventTotal(FrameEvent kind);
 
+// Whether CountFrameEvent counts anything now (callers may skip computing amounts otherwise).
+[[nodiscard]] inline bool FrameEventsOn() noexcept {
+	return Detail::g_event_sink.load(std::memory_order_relaxed) != Detail::CounterSink::Off;
+}
+
 inline void CountFrameEvent(FrameEvent kind, uint64_t amount) {
 	const auto sink = Detail::g_event_sink.load(std::memory_order_relaxed);
 	if (sink == Detail::CounterSink::Off) [[likely]] {

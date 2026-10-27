@@ -516,6 +516,9 @@ private:
 		uint64_t        vaddr     = 0;
 		uint32_t        size      = 0;
 		BindingMemoKind kind      = BindingMemoKind::Empty;
+		// KYTY_BINDING_CROSS_SETTLED: a cross-epoch check (relaxed and locked CPU-dirty queries)
+		// passed under `signature`.
+		bool            settled   = false;
 		uint64_t        epoch     = 0;
 		uint64_t        signature = 0;
 		uint64_t        guard     = 0; // stream: tick; cached: buffer structure epoch
@@ -824,6 +827,11 @@ private:
 	uint32_t                                          m_binding_memo_shift = 53; // 64 - log2(slots)
 	int                                               m_binding_memo_verify = 0;
 	bool                                              m_binding_memo_cross  = false;
+	// KYTY_BINDING_CROSS_SETTLED (ObtainReadBindingMemo) outcomes.
+	struct CrossEpochTotals {
+		uint64_t fast = 0, verify_checks = 0, verify_mismatches = 0;
+	};
+	CrossEpochTotals                                  m_cross_epoch_totals;
 	struct BindingMemoTotals {
 		uint64_t hot_hits          = 0; // successful hits through the optional front tier
 		uint64_t stream_hits       = 0;

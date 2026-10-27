@@ -270,6 +270,17 @@ void TestTouchedPages() {
 	Check(!pages->Universe() && !pages->AnyTouched(base, base + 0x1000000),
 	      "reset for the next check");
 
+	// KYTY_CLEAN_UNTOUCHED_FINE: the 1 KiB map marks only the 1 KiB blocks a range covers.
+	auto fine = std::make_unique<GpuTouched::PagesT<10>>();
+	fine->Mark(base + 0x1234, base + 0x1238);
+	Check(fine->AnyTouched(base + 0x1000, base + 0x1001) && fine->AnyTouched(base + 0x13ff, base + 0x1400) &&
+	          !fine->AnyTouched(base + 0x1400, base + 0x2000) && !fine->AnyTouched(base + 0x0c00, base + 0x1000),
+	      "a fine mark covers its whole 1 KiB block and nothing else");
+	fine->Mark(base + 0x10000, base + 0x10000 + 65u * 0x400u);
+	Check(fine->AnyTouched(base + 0x10000 + 64u * 0x400u, base + 0x10000 + 65u * 0x400u) &&
+	          !fine->AnyTouched(base + 0x10000 + 65u * 0x400u, base + 0x10000 + 66u * 0x400u),
+	      "a fine multi-word range marks exactly its blocks");
+
 	// Two threads: one marks pages in order and publishes how far it got; the other checks that
 	// every page published as marked reads as touched.
 	std::atomic<uint64_t> published {0};

@@ -125,6 +125,8 @@ int64_t ParseOnVerifyExit(const char* value) {
 Live::Switch g_binding_memo_touch("KYTY_BINDING_MEMO_TOUCH", Live::ParseDefaultOff);
 // KYTY_BINDING_LEAN_MISS (BufferCache::TryLeanReadMiss): 0 (default) off, 1 on, verify (2), exit (3).
 Live::Switch g_binding_lean_miss("KYTY_BINDING_LEAN_MISS", ParseOnVerifyExit);
+// KYTY_BINDING_CROSS_SETTLED (ObtainReadBindingMemo): 0 (default) off, 1 on, verify (2).
+Live::Switch g_binding_cross_settled("KYTY_BINDING_CROSS_SETTLED", ParseOnVerifyExit);
 
 // KYTY_FAULT_AHEAD_ADAPT (live): the fault-ahead window of write faults
 // (MemoryTracker::SetFaultAheadOverride, applied at every guest flip).
@@ -4017,10 +4019,46 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingMemo(uint64_t vaddr, 
 			// changed its bits yet.
 			MemoryTracker::DirtyState relaxed;
 			bool                     cpu_only = false;
-			cross = !stream && m_binding_memo_cross &&
-			        QueryUploadSnapshot(m_memory_tracker, vaddr, size, relaxed, cpu_only) &&
-			        !relaxed.cpu && !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
-			        m_memory_tracker.RangeSignature(vaddr, size) == before;
+			// KYTY_BINDING_CROSS_SETTLED (live, default 0): a memo whose cross-epoch check already
+			// passed under the signature it still has skips the two CPU-dirty queries. Every change
+			// of a region's dirty bits advances its serial first, under the region lock, and that
+			// check ended with the locked query and an unchanged signature: no transition was in
+			// progress then, and an unchanged signature means none started since. The final
+			// signature comparison still runs. 2 (verify) runs the queries too and counts the
+			// checks where they would reject.
+			const auto settled_mode = g_binding_cross_settled.Get();
+			const bool settled      = settled_mode != 0 && !stream && m_binding_memo_cross && memo.settled;
+			if (settled && settled_mode == 1) {
+				m_cross_epoch_totals.fast++;
+				cross = m_memory_tracker.RangeSignature(vaddr, size) == before;
+			} else {
+				cross = !stream && m_binding_memo_cross &&
+				        QueryUploadSnapshot(m_memory_tracker, vaddr, size, relaxed, cpu_only) &&
+				        !relaxed.cpu && !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+				        m_memory_tracker.RangeSignature(vaddr, size) == before;
+				if (settled) {
+					m_cross_epoch_totals.verify_checks++;
+					if (!cross && m_memory_tracker.RangeSignature(vaddr, size) == before) {
+						const auto count = ++m_cross_epoch_totals.verify_mismatches;
+						if (count <= 16) {
+							std::fprintf(stderr,
+							             "BindingCrossSettled: a settled memo is CPU-dirty with its "
+							             "signature unchanged: addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+							             vaddr, size);
+						}
+					}
+					if ((m_cross_epoch_totals.verify_checks & 0xfffffu) == 0) {
+						std::printf("BindingCrossSettled verify: %" PRIu64 " checks, %" PRIu64
+						            " mismatches\n",
+						            m_cross_epoch_totals.verify_checks,
+						            m_cross_epoch_totals.verify_mismatches);
+						std::fflush(stdout);
+					}
+				}
+			}
+			if (cross) {
+				memo.settled = true;
+			}
 			if (!cross) {
 				if (stats != nullptr) {
 					stats->epoch++;

@@ -163,6 +163,10 @@ struct PreparedDraw {
 	// KYTY_CLEAN_UNTOUCHED: no page of a read or digest range had ever been touched by a GPU-side
 	// transition when the preparation finished (GpuTouched, checked by the preparing thread).
 	bool reads_untouched = false;
+	// KYTY_CLEAN_UNTOUCHED_RANGES: when not all were untouched, the read and digest ranges
+	// (reads.Ranges(), reads.DigestRanges()) that were touched, in that order (touched_valid).
+	std::vector<Coherence::Range> touched_reads;
+	bool                          touched_valid = false;
 	// KYTY_DRAW_PREP_DISPATCH: a dispatch slot's preparation (GetComputeProgram's outputs).
 	ShaderComputeInputInfo   compute_info;
 	PipelineCache::StagePrep compute_prep;
