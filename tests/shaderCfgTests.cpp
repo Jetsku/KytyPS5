@@ -13606,6 +13606,16 @@ void TestRenderTargetReverseExportMapping() {
             standard_1555.export_mapping == Prospero::ColorMappingAbgr,
         "1:5:5:5 render target did not preserve its low one-bit component");
 
+  // KYTY_10_11_11_RED (usa-ratt/KytyPS5-GT7 473c43a3d): guest 10_11_11 words convert to the
+  // host's B10G11R11 component by component. 0x883005e1: red 1.03125 (0x1e1), green 2.03125
+  // (0x401), blue 4.0625 (0x441, its lowest mantissa bit dropped in the host's 10-bit blue).
+  Check(Guest10_11_11ToHost(0x883005e1u) == (0x3c2u | (0x401u << 11u) | (0x220u << 22u)) &&
+            Host10_11_11ToGuest(0x3c2u | (0x401u << 11u) | (0x220u << 22u)) == 0x881005e1u &&
+            Host10_11_11ToGuest(Guest10_11_11ToHost(0x7c0e81c0u)) == 0x7c0e81c0u &&
+            NarrowSmallFloat(0x7c1u, 6) == 0x3e1u && NarrowSmallFloat(0x7c0u, 6) == 0x3e0u &&
+            GuestColorWordToHost(0x883005e1u, ColorTransform::Reverse10_11_11) == 0x883005e1u,
+        "10_11_11 guest words were not converted component by component");
+
   const auto argb = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kAltReversed);

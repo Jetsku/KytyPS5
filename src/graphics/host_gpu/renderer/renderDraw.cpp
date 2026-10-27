@@ -543,17 +543,27 @@ static vk::Viewport MakeDynamicViewport(const HW::Context& ctx, const vk::Physic
                                         uint32_t i) {
 	const auto&  guest = ctx.GetScreenViewport().viewports[i];
 	vk::Viewport viewport {};
+	// KYTY_VTE_CNTL: the scales and offsets PA_CL_VTE_CNTL disables are 1 and 0.
+	const uint32_t control = ShaderRecompiler::GetCodegenOptions().vte_cntl
+	                             ? ctx.GetScreenViewport().transform_control
+	                             : ViewportTransform::DefaultControl;
+	const float xscale  = ViewportTransform::Scale<0>(control, guest.xscale);
+	const float yscale  = ViewportTransform::Scale<1>(control, guest.yscale);
+	const float zscale  = ViewportTransform::Scale<2>(control, guest.zscale);
+	const float xoffset = ViewportTransform::Offset<0>(control, guest.xoffset);
+	const float yoffset = ViewportTransform::Offset<1>(control, guest.yoffset);
+	const float zoffset = ViewportTransform::Offset<2>(control, guest.zoffset);
 	if (ctx.GetClipControl().clip_disable) {
 		viewport.width  = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
 		viewport.height = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
 	} else {
-		viewport.x      = guest.xoffset - guest.xscale;
-		viewport.y      = guest.yoffset - guest.yscale;
-		viewport.width  = guest.xscale * 2.0f;
-		viewport.height = guest.yscale * 2.0f;
+		viewport.x      = xoffset - xscale;
+		viewport.y      = yoffset - yscale;
+		viewport.width  = xscale * 2.0f;
+		viewport.height = yscale * 2.0f;
 	}
-	viewport.minDepth = guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
-	viewport.maxDepth = guest.zscale + guest.zoffset;
+	viewport.minDepth = zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : zscale);
+	viewport.maxDepth = zscale + zoffset;
 	return viewport;
 }
 
@@ -4217,6 +4227,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareBindings");
 		// KYTY_DRAW_RUN continuation: the stages keep the previous draw's textures and samplers.
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			// KYTY_UNNORMALIZED_FIX: a hull shader's normalized-LOD copy binds normalized samplers.
+			bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i],
 			                plan_stages ? &plan->vertex : nullptr, m_run_active);
 			descriptor_stages[stage_count++] = &bindings.vertex[i];
@@ -4308,6 +4320,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
 		// No plan: its shader data was taken by the first preparation above.
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i], nullptr);
 		}
 		if (state.ps_active) {

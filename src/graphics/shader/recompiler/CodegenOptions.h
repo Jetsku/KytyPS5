@@ -436,6 +436,27 @@ struct CodegenOptions {
 	// lanes read zero and write nothing, as the array's accesses do. KYTY_LDS_SLOTS_LOG=1 prints the
 	// verdict per program.
 	bool lds_slots = false;
+	// KYTY_FLOAT_STORE_CLAMP=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 cfa8a479e): the
+	// guest GPU converts a float to a 16-bit float the D3D way, rounding toward zero, so a finite
+	// value beyond the half range is stored as the largest half (65504) of its sign; the host's
+	// conversion gives infinity, which one bright pixel spreads over the frame through bloom and
+	// exposure. Stores into 16-bit float storage images, 32-bit exports to 16-bit float render
+	// targets (ShaderPixelInputInfo::target_half_float_mask) and formatted 16-bit float buffer
+	// stores clamp first; formatted 11/10-bit float stores give the largest finite value instead of
+	// infinity for finite overflow.
+	bool float_store_clamp = false;
+	// KYTY_VTE_CNTL=1 (default off; the GT7 preset; masterzhang233/KytyPS5-GT7 df7fc6108): honour
+	// PA_CL_VTE_CNTL (guest_gpu/viewportTransform.h). Position exports of a pre-divided or 1/W
+	// format are made homogeneous again (ShaderClipSpaceTransform::vte_format), the viewport drops
+	// the scales and offsets VTE disables, and the CLIP_DISABLE emulation's affine offset is
+	// homogeneous (offset * W, minus W), which only matched before for W == 1.
+	bool vte_cntl = false;
+	// KYTY_SNAPSHOT_WRITTEN_GUARD=1 (default off; the GT7 preset; Senaxx/KytyPS5-GT7 2e002fb55):
+	// the SRT plan's CPU snapshot of scalar loads through CPU-evaluable pointers (PlanBuilder, the
+	// fork's 8d77c9242, which our line already has) leaves out a load whose pointer base is also the
+	// base of a buffer or address the shader writes or updates atomically: its waves must see those
+	// writes, which a snapshot taken before the dispatch does not.
+	bool snapshot_written_guard = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,

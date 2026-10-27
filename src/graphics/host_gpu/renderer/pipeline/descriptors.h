@@ -44,6 +44,9 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// KYTY_UNNORMALIZED_FIX: the stage runs a hull shader's normalized-LOD copy
+	// (ShaderProgram::normalized_samplers); its samplers are bound with FORCE_UNNORMALIZED cleared.
+	bool normalize_unnormalized = false;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
@@ -119,6 +122,13 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
 [[nodiscard]] TextureCache::ImageDesc
 NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                 TextureCache::BindingType binding);
+
+// KYTY_DMA_PREFAULT_KB=<n> (default 0, off; usa-ratt/KytyPS5-GT7 d3260d78e): before a shader
+// that reads guest memory through its page table (DMA) runs, the first n KiB its user-data
+// pointers point at are made resident (BufferCache::MakeResident). GT7's light-probe bake reads
+// its per-probe constants that way, a new page per probe; pages it read as zeros wrote whole cubes
+// of NaN (black or tinted lighting, different from load to load).
+void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage);
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);

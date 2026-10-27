@@ -160,6 +160,11 @@ public:
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// KYTY_DMA_PREFAULT_KB (GPU thread): a shader that reads guest memory through its page table
+	// (DMA) reads a page no cached buffer covers as zeros and only records the fault. The
+	// committed pages of [vaddr, vaddr + size) without a cached buffer get one, filled from guest
+	// memory; those with one are kept fresh in the LRU. Returns how many pages had none.
+	uint32_t MakeResident(uint64_t vaddr, uint64_t size);
 	// KYTY_BDA_HEAPS: a BDA access faulted at [vaddr, vaddr + size): the GPU-mapped allocation holding it
 	// becomes resident now and before every later BDA-writing dispatch (its other pages are the
 	// destinations of that and the next dispatches, which would drop their stores and atomics).

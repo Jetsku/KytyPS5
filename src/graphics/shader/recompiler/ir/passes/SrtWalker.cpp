@@ -4,6 +4,7 @@
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -461,10 +462,41 @@ public:
 				}
 			}
 		}
+		// KYTY_SNAPSHOT_WRITTEN_GUARD (Senaxx/KytyPS5-GT7 2e002fb55): memory the shader itself
+		// writes is not snapshotted; a pointer whose base is also the base of a written or
+		// atomically updated buffer or address stays in the shader.
+		std::vector<Value> written_bases;
+		const bool         guard = GetCodegenOptions().snapshot_written_guard;
+		if (guard) {
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					const auto op     = inst.GetOpcode();
+					const auto buffer = BufferAccessOf(op);
+					if ((buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+					     AddressOpcodeInfoOf(op).access == AddressAccess::Write) &&
+					    inst.NumArgs() != 0) {
+						if (const auto* handle = inst.Arg(0).ResolveInstruction();
+						    handle != nullptr && handle->NumArgs() != 0) {
+							written_bases.push_back(handle->Arg(0));
+						}
+					}
+				}
+			}
+		}
+		const auto written = [&](const Inst& load) {
+			if (!guard) {
+				return false;
+			}
+			const auto* handle = load.Arg(0).ResolveInstruction();
+			return handle == nullptr || handle->NumArgs() == 0 ||
+			       std::ranges::any_of(written_bases, [&](const Value& base) {
+				       return EquivalentValue(m_program, base, handle->Arg(0));
+			       });
+		};
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
-				    inst.Arg(1).Resolve().IsImmediate() &&
+				    inst.Arg(1).Resolve().IsImmediate() && !written(inst) &&
 				    ValidateRuntimeValue(m_program, Value(&inst))) {
 					Collect(Value(&inst), inst.Flags<MemoryFlags>().pc);
 				}

@@ -938,6 +938,31 @@ static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
 static bool     g_test_fail_next_fixed_reserve_range_add     = false;
 #endif
 
+// KYTY_DMEM_OVERFLOW_MB=<MiB> (default 0, off; the GT7 preset sets 16384; usa-ratt/KytyPS5-GT7
+// 094ad2a1e, e1134351f, 8b7d34444): room past the guest's direct and flexible memory for direct
+// allocations that do not fit in the direct memory. The game asks only within the size it is
+// told, and some loads of the same GT7 race took it past that: it held one or two 2.3 GB blocks
+// (and a 1.6 GB one) that other loads did without, its 5.3 GB race pool did not fit, and it
+// crashed on the null pointer a failed allocation returned or its loading screen never ended.
+// Such an allocation (a search up to the end of the direct memory that found no room) is given
+// room here instead, logged; the size the game is told does not change. The guest backing grows
+// by the room: reserved only where used with KYTY_GUEST_BACKING_LAZY_COMMIT=1, committed with the
+// rest otherwise (the default backing commits it all at boot).
+static uint64_t DirectMemoryOverflowSize() {
+	static const uint64_t size = [] {
+		uint64_t mb = 0;
+		// Decimal MiB only (anything else keeps it off).
+		if (const char* value = std::getenv("KYTY_DMEM_OVERFLOW_MB");
+		    value != nullptr && value[0] != '\0' &&
+		    std::strspn(value, "0123456789") == std::strlen(value) && std::strlen(value) <= 6) {
+			mb = std::strtoull(value, nullptr, 10);
+		}
+		// Whole 2 MiB pages (rounded up), at most 64 GiB.
+		return ((std::min<uint64_t>(mb, 65536u) + 1u) & ~uint64_t {1}) << 20u;
+	}();
+	return size;
+}
+
 class PhysicalMemory {
 public:
 	struct AllocatedBlock {
@@ -958,6 +983,11 @@ public:
 	PhysicalMemory() {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		m_free.emplace(0, Size());
+		// KYTY_DMEM_OVERFLOW_MB: the room, past the flexible memory. Searches of the direct memory
+		// stop at Size(), so only Alloc's overflow search reaches it.
+		if (DirectMemoryOverflowSize() != 0) {
+			m_free.emplace(TotalSize(), DirectMemoryOverflowSize());
+		}
 	}
 	virtual ~PhysicalMemory() = default;
 
@@ -1005,6 +1035,8 @@ private:
 	std::map<uint64_t, uint64_t>       m_free;
 	std::vector<AllocatedBlock>        m_mappings;
 	Common::Mutex                      m_mutex;
+	// Direct allocations given room past the direct memory (DirectMemoryOverflowSize).
+	uint64_t                           m_overflow_allocations = 0;
 };
 
 class FlexibleMemory {
@@ -1958,7 +1990,13 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
-	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize() +
+	                                                            DirectMemoryOverflowSize());
+	if (DirectMemoryOverflowSize() != 0) {
+		LOGF("Direct memory: %" PRIu64 " MiB of room past the direct memory for allocations that "
+		     "do not fit in it (KYTY_DMEM_OVERFLOW_MB)\n",
+		     DirectMemoryOverflowSize() >> 20u);
+	}
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	const auto backing = g_guest_address_space->GetBackingBase();
@@ -2047,25 +2085,58 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 
 	Common::LockGuard lock(m_mutex);
 
-	search_end = std::min<uint64_t>(search_end, Size());
+	const auto requested_end = search_end;
+	search_end               = std::min<uint64_t>(search_end, Size());
 	if (search_start >= search_end) {
 		return false;
 	}
 
-	auto range = m_free.upper_bound(search_start);
-	if (range != m_free.begin()) {
-		range--;
-	}
-	for (; range != m_free.end() && range->first < search_end; ++range) {
-		const auto range_end   = std::min<uint64_t>(range->first + range->second, search_end);
-		const auto lower_bound = std::max(range->first, search_start);
-		const auto aligned     = GetAlignedPos(lower_bound, alignment);
-		const auto free_pos    = aligned.value;
-		if (!aligned.valid || free_pos < lower_bound || free_pos > range_end ||
-		    len > range_end - free_pos) {
-			continue;
+	// The first free range holding `len` in [first, last), or m_free.end() (`position` its place).
+	const auto find = [&](uint64_t first, uint64_t last, uint64_t& position) {
+		auto range = m_free.upper_bound(first);
+		if (range != m_free.begin()) {
+			range--;
 		}
-
+		for (; range != m_free.end() && range->first < last; ++range) {
+			const auto range_end   = std::min<uint64_t>(range->first + range->second, last);
+			const auto lower_bound = std::max(range->first, first);
+			const auto aligned     = GetAlignedPos(lower_bound, alignment);
+			const auto free_pos    = aligned.value;
+			if (!aligned.valid || free_pos < lower_bound || free_pos > range_end ||
+			    len > range_end - free_pos) {
+				continue;
+			}
+			position = free_pos;
+			return range;
+		}
+		return m_free.end();
+	};
+	uint64_t free_pos = 0;
+	auto     range    = find(search_start, search_end, free_pos);
+	if (range == m_free.end() && !pool_expansion && DirectMemoryOverflowSize() != 0 &&
+	    requested_end >= Size()) {
+		// KYTY_DMEM_OVERFLOW_MB: a direct search up to the end of the direct memory that found
+		// no room there takes the room past it.
+		range = find(TotalSize(), TotalSize() + DirectMemoryOverflowSize(), free_pos);
+		if (range != m_free.end()) {
+			const auto n = ++m_overflow_allocations;
+			if (n <= 16 || std::has_single_bit(n)) {
+				uint64_t in_overflow = 0;
+				for (const auto& [start, block]: m_physical) {
+					if (start >= TotalSize()) {
+						in_overflow += block.size;
+					}
+				}
+				LOGF("Direct memory: 0x%" PRIx64 " bytes did not fit in the game's %" PRIu64
+				     " MiB: given room past it at 0x%" PRIx64 " (%" PRIu64 " MiB of the %" PRIu64
+				     " MiB there in use before it; %" PRIu64
+				     " such allocations so far; KYTY_DMEM_OVERFLOW_MB)\n",
+				     static_cast<uint64_t>(len), Size() >> 20u, free_pos, in_overflow >> 20u,
+				     DirectMemoryOverflowSize() >> 20u, n);
+			}
+		}
+	}
+	if (range != m_free.end()) {
 		AllocatedBlock b {};
 		b.size           = len;
 		b.start_addr     = free_pos;
@@ -3678,7 +3749,12 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 				current = previous;
 			}
 		}
-		if (current == blocks.end() ||
+		// KYTY_DMEM_OVERFLOW_MB: a walk of the direct memory (flags 1) from inside it ends at its
+		// end; the blocks given room past it answer only queries of their own addresses.
+		const bool past_end = flags == 1 && current != blocks.end() &&
+		                      static_cast<uint64_t>(offset) < PhysicalMemory::Size() &&
+		                      current->second.start_addr >= PhysicalMemory::Size();
+		if (current == blocks.end() || past_end ||
 		    (flags == 0 && (static_cast<uint64_t>(offset) < current->second.start_addr ||
 		                    static_cast<uint64_t>(offset) >=
 		                        current->second.start_addr + current->second.size))) {

@@ -8,6 +8,7 @@
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -889,6 +890,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
+			image.clamp_half_float =
+			    GetCodegenOptions().float_store_clamp && base.written && !base.atomic &&
+			    image.numeric_class == Prospero::TextureNumericClass::Float &&
+			    (format == Prospero::BufferFormat::k16Float ||
+			     format == Prospero::BufferFormat::k16_16Float ||
+			     format == Prospero::BufferFormat::k16_16_16_16Float);
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported &&
 		           !base.depth_compare && !image.fmask) {
 			// A sampled texture in a format the host cannot represent: the specialization treats
@@ -1898,6 +1905,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
 		image.bindless                   = source.bindless;
+		image.clamp_half_float           = source.clamp_half_float;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

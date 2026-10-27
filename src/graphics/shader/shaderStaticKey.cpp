@@ -47,6 +47,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 			}
 		}
 	}
+	if (info.clip_space.vte_format != 0) {
+		// KYTY_VTE_CNTL: only when set, so other keys stay as they were.
+		key.push_back(0x7E7E0000u | info.clip_space.vte_format);
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -125,6 +129,10 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	if (info.target_half_float_mask != 0) {
+		// KYTY_FLOAT_STORE_CLAMP: only when set, so other keys stay as they were.
+		key.push_back(0x48460000u | info.target_half_float_mask);
+	}
 	if (const auto mask = info.target_shader_mask; mask != UINT32_MAX) {
 		// KYTY_CB_SHADER_MASK_EXPORTS: which targets are written decides export locations.
 		key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);

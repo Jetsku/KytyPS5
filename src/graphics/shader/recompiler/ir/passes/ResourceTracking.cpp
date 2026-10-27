@@ -1146,7 +1146,10 @@ private:
 		const Inst* reference_table = nullptr;
 		if (GetCodegenOptions().heap_key_mask) {
 			for (uint32_t dword = 0; dword < plan.reads.size() && reference_table == nullptr; ++dword) {
-				const auto* plain = handle.Arg(dword).Resolve().TryInstruction();
+				// A plain word may itself be carried through a Phi web whose inputs agree
+				// (Senaxx/KytyPS5-GT7 5ebc89daa resolves it the same way).
+				const auto* plain =
+				    ResolveInvariantPhi(m_program, handle.Arg(dword)).TryInstruction();
 				uint32_t    memory_index = 0;
 				if (plain != nullptr && plain->GetOpcode() != ValueOpcode::Phi &&
 				    ScalarReadMemory(*plain, memory_index) != nullptr) {
@@ -1156,7 +1159,10 @@ private:
 		}
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
-			if (read != nullptr && read->GetOpcode() == ValueOpcode::Phi && reference_table != nullptr) {
+			// KYTY_HEAP_KEY_MASK: a Phi web whose inputs agree resolves even when no word is plain
+			// (ResolveDescriptorPhi then needs no reference table).
+			if (read != nullptr && read->GetOpcode() == ValueOpcode::Phi &&
+			    GetCodegenOptions().heap_key_mask) {
 				read = ResolveDescriptorPhi(Value(read), reference_table).TryInstruction();
 			}
 			if (read == nullptr) {

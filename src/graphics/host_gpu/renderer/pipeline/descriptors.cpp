@@ -211,6 +211,21 @@ static uint64_t StorageRangeCap(const GraphicContext& graphics) {
 	return on ? uint64_t {0x7ffffffc} : std::numeric_limits<uint64_t>::max();
 }
 
+// KYTY_READ_BUFFER_TAIL=1 (default off; usa-ratt/KytyPS5-GT7 d875ff10f, round 84): a read-only
+// storage binding's range, which the shaders' bounds checks floor to whole dwords, is rounded up to
+// whole dwords instead of down. Byte and halfword reads index up to four and two times that
+// length, so a range ending inside a dword hid its last bytes: GT7's car glass reads a
+// 17,370-byte table (one byte per control point of its 965 patches), its last patch read the last
+// two bytes as zero and one corner rose half a metre above the roof (the roof spike). A written
+// binding keeps the rounding down, so a dword store cannot reach past its range.
+static bool ReadBufferTail() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READ_BUFFER_TAIL");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
@@ -268,10 +283,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
 	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
 	// no-op for every shader-side check, and it makes the device check match them.
-	const auto range =
+	auto range =
 	    std::min(size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
 	                                     : size + adjustment,
 	             StorageRangeCap(graphics));
+	// KYTY_READ_BUFFER_TAIL: a read-only binding is rounded up to whole dwords instead, so byte
+	// and halfword reads of the last partial dword are not hidden by the dword bounds checks.
+	if (ReadBufferTail() && !resource.written && (size + adjustment) % 4u != 0) {
+		const auto whole = Common::AlignUp(size + adjustment, uint64_t {4});
+		if (aligned_offset + whole <= buffer->Size()) {
+			range = std::min(whole, StorageRangeCap(graphics));
+		}
+	}
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	if (size > 0x7ffffffcu) {
 		// Bindings of 2 GiB or more (KYTY_STORAGE_RANGE_CAP / KYTY_STORAGE_LENGTH_ZERO): each guest
@@ -1391,8 +1414,15 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
 
 vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                           uint32_t                                        index,
-                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
-	auto       descriptor     = NativeSamplerDescriptor(program, index, value);
+                                          const ShaderRecompiler::IR::DescriptorValue&    value,
+                                          bool normalize_unnormalized) {
+	auto descriptor = NativeSamplerDescriptor(program, index, value);
+	if (normalize_unnormalized) {
+		// KYTY_UNNORMALIZED_FIX: the hull shader's copy divides its coordinates by the mip's size
+		// (SpirvNormalizedExplicitLod), so FORCE_UNNORMALIZED (word 0 bit 15) goes, and the S#'s
+		// LOD range and clamps apply as they are.
+		descriptor.fields[0] &= ~(1u << 15u);
+	}
 	const bool integer_border = program.info.samplers[index].integer_border;
 	if (!SamplerMemoEnabled()) {
 		return m_context.GetSamplerCache().GetSampler(descriptor, integer_border);
@@ -2713,12 +2743,28 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
+		if (program.stage == ShaderType::Pixel && TextureCache::LightGridCapEnabled()) {
+			// KYTY_LIGHT_GRID_CAP (usa-ratt/KytyPS5-GT7 ecef51e59): a pixel shader's light grid
+			// has its later uploads checked (TextureCache::NoteLightGridShape).
+			for (uint32_t i = 0; i < count; i++) {
+				const auto& resource = program.info.images[i];
+				const auto& binding  = prepared.images[i];
+				const auto& info     = binding.desc.info;
+				if (!resource.written && binding.image_id &&
+				    info.pixel_format == vk::Format::eR32G32Uint && info.resources.layers > 1 &&
+				    (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+				     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D)) {
+					TextureCache::NoteLightGridShape(info);
+				}
+			}
+		}
 	}
 	texture_scope.Stop();
 	CommitStats::SubScope sampler_scope(CommitStats::Sub::Samplers);
 	// KYTY_DRAW_PREP_BINDINGS samplers: the handles the worker found (never evicted); a null one is
 	// resolved here as before.
 	const bool plan_samplers = plan != nullptr && plan->samplers_valid &&
+	                           !prepared.normalize_unnormalized &&
 	                           plan->samplers.size() == program.info.samplers.size();
 	if (!keep_images) {
 		prepared.samplers.reserve(program.info.samplers.size());
@@ -2729,8 +2775,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		planned_samplers += sampler != nullptr ? 1u : 0u;
 		if (sampler == nullptr || verify) {
 			// Native filtering/border variants share their source sampler's snapshot entry.
-			const auto serial = NativeSampler(
-			    program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]);
+			const auto serial =
+			    NativeSampler(program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
+			                  prepared.normalize_unnormalized);
 			if (sampler != nullptr) {
 				DrawPrep::CountBindingVerifyCheck();
 				if (sampler != serial) {
@@ -3478,10 +3525,51 @@ void NoteRebindAfterJoin(const char* kind, const char* name) {
 	}
 }
 
+void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) {
+	static const uint64_t span = [] {
+		const char* value = std::getenv("KYTY_DMA_PREFAULT_KB");
+		return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 0ull)
+		       << 10u;
+	}();
+	if (span == 0 || stage.program == nullptr || stage.resources == nullptr) {
+		return;
+	}
+	const auto& program = *stage.program;
+	const auto& user    = stage.resources->user_data;
+	// A 64-bit SGPR pair starts at an even register; a pointer a scalar load reads through is
+	// 4-byte aligned. Pages that are not committed are left alone (MakeResident).
+	for (size_t reg = program.user_data_base % 2u; reg + 1u < user.size(); reg += 2u) {
+		const uint32_t low  = user[reg];
+		const uint32_t high = user[reg + 1u];
+		if ((low & 3u) != 0 || high == 0 || high > 0xffffu) {
+			continue;
+		}
+		const uint64_t address = low | (uint64_t {high} << 32u);
+		const auto     made    = buffers.MakeResident(address, span);
+		if (made == 0) {
+			continue;
+		}
+		static std::atomic<uint64_t> total {0};
+		const auto count = total.fetch_add(made, std::memory_order_relaxed) + made;
+		if (count <= 32 || (count & (count - 1u)) == 0) {
+			LOGF("BufferCache: %u pages shader %016" PRIx64 " reads through user data s[%zu:%zu] "
+			     "0x%012" PRIx64 " had no cached buffer: cached before it runs (%" PRIu64
+			     " so far; KYTY_DMA_PREFAULT_KB)\n",
+			     made, program.shader_hash, program.user_data_base + reg,
+			     program.user_data_base + reg + 1u, address, count);
+		}
+	}
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors, bool keep_images) {
 	bool uses_dma = false;
 	bool uses_bvh = false;
+	for (auto* stage: stages) {
+		if (stage->runtime->program->info.uses_dma) {
+			PrefaultDmaPointers(m_context.GetBufferCache(), *stage->runtime);
+		}
+	}
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;

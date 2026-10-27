@@ -42,6 +42,33 @@ void   Forget(vk::Device device, uint64_t program_id);
 
 } // namespace PixelRate
 
+// KYTY_UNNORMALIZED_FIX (default off; adapted from usa-ratt/KytyPS5-GT7 45ac971cc). The guest GPU
+// samples a FORCE_UNNORMALIZED sampler at the LOD the shader names, with coordinates in that mip's
+// texels. Vulkan allows unnormalized coordinates only at LOD 0 (samplerCache forces min/maxLod 0),
+// so GT7's hull shaders, which cull car-body patches against a depth pyramid read this way at a
+// level picked from the patch's size, read the wrong level. Hull shaders that sample get a copy
+// whose explicit-LOD samples divide their coordinates by the size of the mip the LOD names; a draw
+// whose HS samplers are all unnormalized runs that copy (with an id of its own) and binds its
+// samplers as normalized ones (the S#'s LOD range and clamps as they are).
+[[nodiscard]] bool UnnormalizedSamplingFix();
+// The SPIR-V of a stage whose explicit-LOD samples (OpImageSampleExplicitLod with a Lod and
+// nothing but offsets) take their coordinates divided by the size of the mip the LOD names, the
+// nearest within the image (an array layer as it is); empty when it has none, or uses a sampler
+// any other way (all or nothing: the copy's samplers are all made normalized).
+[[nodiscard]] std::vector<uint32_t> SpirvNormalizedExplicitLod(std::span<const uint32_t> spirv);
+
+namespace NormalizedLod {
+
+struct Lookup {
+	vk::ShaderModule module     = nullptr; // the SpirvNormalizedExplicitLod copy, null if none
+	uint64_t         variant_id = 0;       // its program id (its pipelines differ)
+};
+void   Register(uint64_t program_id, vk::ShaderModule module, uint64_t variant_id);
+void   Forget(vk::Device device, uint64_t program_id);
+[[nodiscard]] Lookup Find(uint64_t program_id);
+
+} // namespace NormalizedLod
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_PIXELRATEVARIANT_H_

@@ -225,6 +225,9 @@ struct ImageResource {
 	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
 	// table gives for the handle's key; the mapping offset locates the heap's region and size.
 	bool                          bindless          = false;
+	// KYTY_FLOAT_STORE_CLAMP: a storage image of a 16-bit float format whose float stores clamp
+	// finite values beyond the half range to the largest half, as the guest GPU's conversion.
+	bool                          clamp_half_float  = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;

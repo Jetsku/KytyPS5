@@ -2407,6 +2407,15 @@ struct PipelineCache::ProgramCache {
 			shades_per_sample = true;
 			pixel_rate_module = CompilePixelRateVariant(options, emitted.spirv);
 		}
+		// KYTY_UNNORMALIZED_FIX: a hull shader that samples gets a copy whose explicit-LOD samples
+		// take normalized coordinates (pixelRateVariant.h), registered under its id below with an
+		// id of its own; GetGraphicsPrograms runs it where the draw's HS samplers are all
+		// unnormalized.
+		vk::ShaderModule normalized_module = nullptr;
+		if (options.stage == ShaderType::TessellationControl && UnnormalizedSamplingFix() &&
+		    !emitted.info.info.sampled_pairs.empty()) {
+			normalized_module = CompileNormalizedVariant(options, emitted.spirv);
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(emitted.spirv.size()), options.wave_size);
@@ -2419,6 +2428,11 @@ struct PipelineCache::ProgramCache {
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
 		if (shades_per_sample) {
 			PixelRate::Register(id, true, pixel_rate_module);
+		}
+		if (normalized_module != nullptr) {
+			const auto variant_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+			GpuOpProfiler::RegisterShader(variant_id, stage_name, options.shader_hash);
+			NormalizedLod::Register(id, normalized_module, variant_id);
 		}
 		ShaderProgram plain {};
 		if (!emitted.spirv_plain.empty()) {
@@ -2494,6 +2508,45 @@ struct PipelineCache::ProgramCache {
 		}
 		return variant_module;
 	}
+
+	// The copy of a hull shader whose explicit-LOD samples take normalized coordinates
+	// (SpirvNormalizedExplicitLod), or null. The first copies and every one after a failure are
+	// validated; one that fails is not used (its draws sample as before).
+	vk::ShaderModule CompileNormalizedVariant(const ShaderRecompiler::CompileOptions& options,
+	                                          const std::vector<uint32_t>&            spirv) {
+		constexpr uint32_t MaxFailures = 8;
+		if (normalized_failures.load(std::memory_order_relaxed) >= MaxFailures) {
+			return nullptr;
+		}
+		const auto variant = SpirvNormalizedExplicitLod(spirv);
+		if (variant.empty()) {
+			return nullptr;
+		}
+		constexpr uint32_t CheckedCopies = 32;
+		if (normalized_copies.load(std::memory_order_relaxed) < CheckedCopies ||
+		    normalized_failures.load(std::memory_order_relaxed) > 0 ||
+		    Config::ShaderValidationEnabled()) {
+			if (!ValidatePixelRateSpirv(options.shader_hash, variant)) {
+				const auto failures =
+				    normalized_failures.fetch_add(1, std::memory_order_relaxed) + 1u;
+				LOGF("Pipeline: the normalized-LOD copy of hull shader 0x%016" PRIx64
+				     " is not valid SPIR-V; its draws sample as before (%u such so far)\n",
+				     options.shader_hash, failures);
+				return nullptr;
+			}
+		}
+		const auto module = CompileSPV(variant, device);
+		if (module != nullptr && normalized_copies.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Pipeline: hull shader 0x%016" PRIx64
+			     " samples at an explicit LOD: a copy with normalized coordinates is used where "
+			     "its samplers are unnormalized (KYTY_UNNORMALIZED_FIX)\n",
+			     options.shader_hash);
+		}
+		return module;
+	}
+
+	std::atomic<uint32_t> normalized_copies {0};
+	std::atomic<uint32_t> normalized_failures {0};
 
 	// KYTY_EQAA_MIXED with NV mixed samples (and not KYTY_EQAA_PER_SAMPLE=1): per-pixel copies.
 	bool                  pixel_rate_variants = false;
@@ -3707,6 +3760,7 @@ struct PipelineCache::ProgramCache {
 			// NoStart): keep permutations unique and drop this equal copy.
 			PixelRate::Forget(device, compiled->handle.id);
 			PixelRate::Forget(device, compiled->plain.id);
+			NormalizedLod::Forget(device, compiled->handle.id);
 			g_shader_modules.Destroy(device, compiled->handle.module);
 			if (compiled->plain.module != nullptr) {
 				g_shader_modules.Destroy(device, compiled->plain.module);
@@ -4338,6 +4392,7 @@ struct PipelineCache::ProgramCache {
 			entry.permutations.ForEach([&](const Permutation& permutation) {
 				PixelRate::Forget(device, permutation.handle.id);
 				PixelRate::Forget(device, permutation.plain.id);
+				NormalizedLod::Forget(device, permutation.handle.id);
 				g_shader_modules.Destroy(device, permutation.handle.module);
 				if (permutation.plain.module != nullptr) {
 					g_shader_modules.Destroy(device, permutation.plain.module);
@@ -7414,10 +7469,45 @@ void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& p
 	}
 }
 
+// KYTY_FLOAT_STORE_CLAMP (usa-ratt/KytyPS5-GT7 cfa8a479e): the MRTs that go to a 16-bit float
+// render target, whose 32-bit exports then clamp to the half range as the guest GPU stores them.
+// Only with the default export routing (no KYTY_CB_SHADER_MASK_EXPORTS remap).
+static void ApplyHalfFloatTargets(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
+	pixel_info.target_half_float_mask = 0;
+	if (!ShaderRecompiler::GetCodegenOptions().float_store_clamp ||
+	    pixel_info.target_shader_mask != UINT32_MAX) {
+		return;
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX && slot < 8u; slot++) {
+		if (pixel_info.target_output_mode[slot] == 0) {
+			continue;
+		}
+		const auto& rt = context.GetRenderTarget(slot);
+		if (rt.base.addr != 0 && rt.info.channel_type == Prospero::ChannelType::kFloat &&
+		    (rt.info.format == Prospero::ChannelLayout::k16 ||
+		     rt.info.format == Prospero::ChannelLayout::k16_16 ||
+		     rt.info.format == Prospero::ChannelLayout::k16_16_16_16)) {
+			pixel_info.target_half_float_mask |= static_cast<uint8_t>(1u << slot);
+		}
+	}
+	if (pixel_info.dual_source_blending) {
+		// MRT1 is the second blend source of target 0.
+		pixel_info.target_half_float_mask =
+		    static_cast<uint8_t>((pixel_info.target_half_float_mask & ~2u) |
+		                         ((pixel_info.target_half_float_mask & 1u) << 1u));
+	}
+}
+
 void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
                     ShaderVertexInputInfo& last_vertex_stage, bool tess_active = false,
                     bool rect_list = false) {
 	const auto& clip_control = context.GetClipControl();
+	// KYTY_VTE_CNTL: the position format belongs to the last pre-rasterization stage (the TES
+	// in a tessellated pipeline).
+	const bool     vte_cntl    = ShaderRecompiler::GetCodegenOptions().vte_cntl;
+	const uint32_t vte_control = vte_cntl ? context.GetScreenViewport().transform_control
+	                                      : ViewportTransform::DefaultControl;
+	last_vertex_stage.clip_space.vte_format = ViewportTransform::PackPositionFormat(vte_control);
 	if (!clip_control.clip_disable) {
 		if (clip_control.user_clip_planes != 0) {
 			// Upstream feed075a9. CLIP_DISABLE also disables user planes. How they combine with
@@ -7446,10 +7536,10 @@ void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
 	const auto& viewport = context.GetScreenViewport().viewports[0];
 	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
 	auto&       clip     = last_vertex_stage.clip_space;
-	clip.scale[0]        = viewport.xscale;
-	clip.scale[1]        = viewport.yscale;
-	clip.offset[0]       = viewport.xoffset;
-	clip.offset[1]       = viewport.yoffset;
+	clip.scale[0]        = ViewportTransform::Scale<0>(vte_control, viewport.xscale);
+	clip.scale[1]        = ViewportTransform::Scale<1>(vte_control, viewport.yscale);
+	clip.offset[0]       = ViewportTransform::Offset<0>(vte_control, viewport.xoffset);
+	clip.offset[1]       = ViewportTransform::Offset<1>(vte_control, viewport.yoffset);
 	clip.half_extent[0] = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
 	clip.half_extent[1] = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 	clip.enabled        = true;
@@ -7472,6 +7562,49 @@ static PipelineCache::GraphicsPrograms SkipUnmaterializable(const char* why) {
 	}
 	std::printf("Warning: %s; it is skipped (KYTY_SKIP_INVALID, logged once)\n", why);
 	return {};
+}
+
+// KYTY_UNNORMALIZED_FIX (usa-ratt/KytyPS5-GT7 45ac971cc): whether every sampler the stage samples
+// through has FORCE_UNNORMALIZED set (S# word 0 bit 15) in this draw's snapshot.
+static bool StageSamplersAllUnnormalized(const ShaderStageRuntime& stage) {
+	if (!stage || stage.program->info.sampled_pairs.empty()) {
+		return false;
+	}
+	const auto& info = stage.program->info;
+	for (const auto& pair: info.sampled_pairs) {
+		if (pair.sampler >= info.samplers.size()) {
+			return false;
+		}
+		const auto index = info.samplers[pair.sampler].snapshot_index;
+		if (index >= stage.resources->samplers.size()) {
+			return false;
+		}
+		const auto& value = stage.resources->samplers[index];
+		if (value.dword_count == 0 || ((value.dwords[0] >> 15u) & 1u) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// A hull shader sampling through unnormalized samplers only runs its copy with normalized
+// coordinates (pixelRateVariant.h), under an id of its own (its pipelines differ); its samplers are
+// made normalized when the draw binds them (ShaderProgram::normalized_samplers).
+static void ApplyNormalizedLod(PipelineCache::GraphicsPrograms&      programs,
+                               std::array<ShaderVertexInputInfo, 3>& vertex_info) {
+	for (uint32_t i = 0; i < 3; i++) {
+		auto& program = programs.vertex[i];
+		if (!program || vertex_info[i].logical_stage != ShaderType::TessellationControl) {
+			continue;
+		}
+		const auto variant = NormalizedLod::Find(program.id);
+		if (variant.module == nullptr || !StageSamplersAllUnnormalized(vertex_info[i].stage)) {
+			continue;
+		}
+		program.module              = variant.module;
+		program.id                  = variant.variant_id;
+		program.normalized_samplers = true;
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -7514,6 +7647,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		ApplyPixelParameterMode(context, user_config, mesh_active, tess_active, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
+		ApplyHalfFloatTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, vertex_info[tess_active ? 2u : 0u], tess_active,
 	               Prospero::IsRectList(user_config.GetPrimType()));
@@ -7547,7 +7681,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				    m_program_cache->Get(vertex_params[i], vertex_inputs[i], preps.vertex[i],
 				                         push_data_cursor, read_attempt, scratch, evaluation);
 			}
-			if (!read_attempt.materialization_failed) return result;
+			if (!read_attempt.materialization_failed) {
+				if (tess_active && UnnormalizedSamplingFix()) {
+					ApplyNormalizedLod(result, vertex_inputs);
+				}
+				return result;
+			}
 			// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
 			// Restart all stages before final bindings/uploads, including their SRT refresh.
 			if (!read_attempt.Synchronize()) {
@@ -7610,6 +7749,7 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 		ApplyPixelParameterMode(context, user_config, vertex_info.logical_stage == ShaderType::Mesh,
 		                        false, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
+		ApplyHalfFloatTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, vertex_info, false,
 	               Prospero::IsRectList(user_config.GetPrimType()));

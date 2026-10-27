@@ -248,6 +248,15 @@ public:
 	// The image keeps all its pixels. Any other request (or the switch off): `id`. GPU thread.
 	[[nodiscard]] static bool SubExtentCopyEnabled();
 	[[nodiscard]] ImageId SubExtentCopy(ImageId id, const ImageInfo& requested);
+	// KYTY_LIGHT_GRID_CAP=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 ecef51e59): a pixel
+	// shader's light grid (R32G32_UINT linear array of two or more layers, read-only;
+	// descriptors.cpp) has its shape remembered here, and uploads of linear R32G32_UINT arrays of
+	// a shape seen are checked for cells whose packed count asks for more than 1024 lights, which
+	// game data never does: the shader then loops over up to 65535 lights a pixel, tens of
+	// milliseconds a draw (GT7's reflection freezes). Such cells are uploaded empty when the upload
+	// comes from guest bytes (not from a GPU-written cache buffer). Any thread.
+	[[nodiscard]] static bool LightGridCapEnabled();
+	static void NoteLightGridShape(const ImageInfo& info);
 	void RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
@@ -457,6 +466,8 @@ private:
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
 	    bool cmask);
+	// KYTY_LIGHT_GRID_CAP: a light grid's staged upload bytes, repaired before the copy is recorded.
+	void RepairLightGridUpload(const Image& image, Buffer& source, uint64_t source_offset);
 	void                        InitializeImage(ImageId id,
 	                                            RefreshIntent intent = RefreshIntent::Read);
 	// KYTY_ALIAS_BYTES. Moves the bytes of `range` that GPU-modified images own into the buffer

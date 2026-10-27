@@ -32,6 +32,8 @@ struct ResourceSpecialization {
 		// the format has fewer fragments than coverage samples, so samples share fragments; 0
 		// otherwise (the identity map).
 		uint8_t                       fmask_fragments            = 0;
+		// KYTY_FLOAT_STORE_CLAMP (ImageResource::clamp_half_float).
+		bool                          clamp_half_float           = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

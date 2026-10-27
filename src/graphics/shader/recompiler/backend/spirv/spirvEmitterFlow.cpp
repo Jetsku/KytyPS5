@@ -553,6 +553,26 @@ uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float s
 	return ndc;
 }
 
+// KYTY_VTE_CNTL: the CLIP_DISABLE emulation's mapping in homogeneous form (the offset scaled by W,
+// W subtracted); for W == 1 the same as ConvertClipCoordinate. Vulkan divides the result by W.
+uint32_t ConvertClipCoordinateHomogeneous(EmitterState& state, uint32_t coordinate, uint32_t w,
+                                          float scale, float offset, float half_extent) {
+	const auto window   = state.builder.AllocateId();
+	const auto offset_w = state.builder.AllocateId();
+	const auto biased   = state.builder.AllocateId();
+	const auto divided  = state.builder.AllocateId();
+	const auto ndc      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFMul, TypeF32(state), window, coordinate,
+	                          ConstantF32Value(state, scale));
+	state.builder.AddFunction(spv::OpFMul, TypeF32(state), offset_w, w,
+	                          ConstantF32Value(state, offset));
+	state.builder.AddFunction(spv::OpFAdd, TypeF32(state), biased, window, offset_w);
+	state.builder.AddFunction(spv::OpFDiv, TypeF32(state), divided, biased,
+	                          ConstantF32Value(state, half_extent));
+	state.builder.AddFunction(spv::OpFSub, TypeF32(state), ndc, divided, w);
+	return ndc;
+}
+
 uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 	const auto& transform = state.input_info.vertex->clip_space;
 	uint32_t    components[4] {};
@@ -561,10 +581,42 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), components[i], position,
 		                          i);
 	}
-	components[0] = ConvertClipCoordinate(state, components[0], transform.scale[0],
-	                                      transform.offset[0], transform.half_extent[0]);
-	components[1] = ConvertClipCoordinate(state, components[1], transform.scale[1],
-	                                      transform.offset[1], transform.half_extent[1]);
+	if (GetCodegenOptions().vte_cntl) {
+		// KYTY_VTE_CNTL (masterzhang233/KytyPS5-GT7 df7fc6108): a 1/W or pre-divided position is
+		// made a plain clip position again.
+		const auto format = ViewportTransform::UnpackPositionFormat(transform.vte_format);
+		if ((format & ViewportTransform::IncomingW) == 0) {
+			const auto w = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFDiv, TypeF32(state), w, ConstantF32Value(state, 1.0f),
+			                          components[3]);
+			components[3] = w;
+		}
+		for (uint32_t i = 0; i < 3; ++i) {
+			const auto predivided =
+			    i < 2 ? ViewportTransform::PredividedXY : ViewportTransform::PredividedZ;
+			if ((format & predivided) != 0) {
+				const auto homogeneous = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpFMul, TypeF32(state), homogeneous, components[i],
+				                          components[3]);
+				components[i] = homogeneous;
+			}
+		}
+		if (transform.enabled) {
+			components[0] =
+			    ConvertClipCoordinateHomogeneous(state, components[0], components[3],
+			                                     transform.scale[0], transform.offset[0],
+			                                     transform.half_extent[0]);
+			components[1] =
+			    ConvertClipCoordinateHomogeneous(state, components[1], components[3],
+			                                     transform.scale[1], transform.offset[1],
+			                                     transform.half_extent[1]);
+		}
+	} else {
+		components[0] = ConvertClipCoordinate(state, components[0], transform.scale[0],
+		                                      transform.offset[0], transform.half_extent[0]);
+		components[1] = ConvertClipCoordinate(state, components[1], transform.scale[1],
+		                                      transform.offset[1], transform.half_extent[1]);
+	}
 	const auto converted = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), converted,
 	                          components[0], components[1], components[2], components[3]);
@@ -653,6 +705,24 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    !uint_output && !exp.compr && exp.index < 8u &&
+		    (state.input_info.pixel->target_half_float_mask & (1u << exp.index)) != 0u) {
+			// KYTY_FLOAT_STORE_CLAMP: a 32-bit export to a 16-bit float target keeps the guest's
+			// range (the largest half, not the host's infinity). Packed half exports are in range.
+			uint32_t components[4] {};
+			for (uint32_t component = 0; component < 4u; component++) {
+				const auto bits = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits,
+				                          Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value),
+				                          component);
+				components[component] = Unary(state, spv::OpBitcast, TypeF32(state),
+				                              EmitClampToHalfRangeBits(state, bits));
+			}
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, value, components[0],
+			                          components[1], components[2], components[3]);
+		}
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && !uint_output &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
@@ -712,7 +782,8 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 		}
 		if (exp.kind == IR::ExportTargetKind::Position &&
-		    state.input_info.vertex->clip_space.enabled) {
+		    (state.input_info.vertex->clip_space.enabled ||
+		     state.input_info.vertex->clip_space.vte_format != 0)) {
 			value = ConvertPositionToClipSpace(state, value);
 		}
 		if (exp.kind == IR::ExportTargetKind::Position && state.user_clip_planes != 0) {
