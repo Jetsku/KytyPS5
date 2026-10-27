@@ -659,6 +659,17 @@ void CallTablesTracedWave32() {
   const auto wave64 = ShaderRecompiler::TranslateProgram(code, options);
   Require(name, "wave64", wave64.call_tables.empty(),
           "a wave64 V_CMP pair over s12 was ignored");
+  // Upstream 7524e8f79's case: a lane read writes one SGPR in wave64 too, so V_READLANE_B32 s11
+  // does not define s12 (WritesSgpr takes the width from the _B32 name).
+  {
+    auto lane_read = code;
+    lane_read[0] = EncodeVop3Word0(0x360u, 11); // v_readlane_b32 s11, v0, s1
+    lane_read[1] = EncodeVop3Word1(Vgpr(0), 1);
+    const auto traced = ShaderRecompiler::TranslateProgram(lane_read, options);
+    Require(name, "wave64 lane read",
+            traced.call_tables.size() == 1u && traced.call_tables[0].user_sgpr == 12u,
+            "a V_READLANE_B32 of s11 was taken as a write of s12");
+  }
   // The table V# in user data itself (0xfc0537b7278db60c: s[8:11]): no load step.
   options.wave_size = 32;
   {
