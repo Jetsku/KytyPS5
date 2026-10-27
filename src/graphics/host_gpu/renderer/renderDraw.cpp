@@ -64,6 +64,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <set>
 #include <optional>
 #include <span>
@@ -2563,6 +2564,41 @@ static bool SkipExemptDraw(const DrawRenderState& state) {
 	return true; // a G-buffer pass
 }
 
+static bool SkipStatsEnabled();
+// KYTY_PIPELINE_SKIP_STATS: why a program keeps its draws from being skipped, once per shader.
+static void NoteProgramRefusal(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	if (!SkipStatsEnabled()) return;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> noted;
+	{
+		std::scoped_lock lock(mutex);
+		if (noted.size() > 512 || !noted.insert(program.shader_hash).second) return;
+	}
+	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+	std::string why;
+	if (program.has_address_writes) why += " address-writes";
+	for (const auto& resource: program.info.buffers) {
+		if (resource.written || resource.atomic) {
+			why += resource.atomic ? " buffer-atomic" : " buffer-write";
+			break;
+		}
+	}
+	for (const auto& resource: program.info.images) {
+		if (resource.written || resource.atomic) {
+			why += resource.atomic ? " image-atomic" : " image-write";
+			break;
+		}
+	}
+	for (const auto& binding: program.bindings.descriptors) {
+		if (binding.kind == Kind::Gds || binding.kind == Kind::FaultBuffer) {
+			why += binding.kind == Kind::Gds ? " gds" : " fault-buffer";
+			break;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format("Pipeline skip: shader 0x{:016x} refuses skipping:{}\n",
+	                                      program.shader_hash, why));
+}
+
 // Why a draw may not be skipped while its pipeline builds (0: it may), for KYTY_PIPELINE_SKIP_STATS.
 enum class SkipRefusal : uint8_t { None, Stages, Occlusion, NotRecurrent, Program, LinearTarget, DepthClear, Count };
 constexpr const char* SkipRefusalNames[] = {"skippable", "stages", "occlusion", "not-recurrent",
@@ -2586,11 +2622,13 @@ static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState
 	}
 	for (const auto& stage: vertex_stages) {
 		if (stage.stage.program == nullptr || !DrawRunProgramEligible(*stage.stage.program)) {
+			if (stage.stage.program != nullptr) NoteProgramRefusal(*stage.stage.program);
 			return SkipRefusal::Program;
 		}
 	}
 	if (state.ps_active && (state.ps_input_info.stage.program == nullptr ||
 	                        !DrawRunProgramEligible(*state.ps_input_info.stage.program))) {
+		if (state.ps_input_info.stage.program != nullptr) NoteProgramRefusal(*state.ps_input_info.stage.program);
 		return SkipRefusal::Program;
 	}
 	for (uint32_t i = 0; i < state.color_count; i++) {
