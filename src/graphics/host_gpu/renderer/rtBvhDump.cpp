@@ -10,6 +10,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fmt/format.h>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -77,6 +79,110 @@ std::string Hex(uint64_t value) {
 // Candidate SRT offsets of the TLAS pointer: the lighting shaders load it from +0, the GI shaders
 // from TraceRayDescriptor::m_bvh at +40; the rest of the first 256 bytes are a fallback.
 constexpr uint32_t SrtBytes = 256;
+
+// KYTY_RT_PROBE_TLAS=<user sgpr>:<V# offset>:<qword offset> (diagnostic, with KYTY_RT_DUMP_BVH's
+// ordinals): the TLAS header address is read along a path the guest kernel uses (Miles Morales'
+// RT kernels: s[12:13] is the SRT, the V# at SRT+512 names a buffer whose qword at +80 is the TLAS
+// header), and its header dwords and root box (box32 at +256) are logged with whether those pages
+// were GPU-written. It tells whether the BVH the kernel traverses holds anything.
+bool ProbeNow(const RtBvhDispatch& d, uint64_t ordinal, const char* spec) {
+	// Several paths may be given, separated by '+' (the kernels differ: 0x6d9e... reads the V# at
+	// SRT+544, 0x208e... at SRT+512); the first whose TLAS header is readable is reported.
+	Rt::GuestSnapshot probe(FetchCoherent, 64ull << 20u);
+	probe.AllowWindow(0, ~0ull);
+	uint64_t   srt = 0, buffer = 0, tlas = 0;
+	uint32_t   header[32] = {};
+	uint8_t    root[Rt::Psr::Box32Bytes] = {};
+	bool       header_ok = false, root_ok = false;
+	std::string paths;
+	for (const char* at = spec; at != nullptr && *at != '\0';) {
+		unsigned sgpr = 0, vsharp = 0, qword = 0;
+		const char* next = std::strchr(at, '+');
+		if (std::sscanf(at, "%u:%u:%u", &sgpr, &vsharp, &qword) == 3 && sgpr + 1u < d.user_sgpr.size()) {
+			srt = d.user_sgpr[sgpr] | static_cast<uint64_t>(d.user_sgpr[sgpr + 1u]) << 32u;
+			uint32_t v[4] = {};
+			buffer = 0;
+			tlas   = 0;
+			if (probe.Read(srt + vsharp, v, sizeof(v))) {
+				buffer = v[0] | (static_cast<uint64_t>(v[1] & 0xffffu) << 32u);
+				if (probe.Read(buffer + qword, &tlas, sizeof(tlas))) {
+					tlas &= 0x0000ffffffffffffull;
+				}
+			}
+			paths += fmt::format(" s{}:+{}:+{} -> 0x{:x}", sgpr, vsharp, qword, tlas);
+			header_ok = tlas != 0 && probe.Read(tlas, header, sizeof(header));
+			root_ok   = tlas != 0 && probe.Read(tlas + Rt::Psr::RootNodeOffset, root, sizeof(root));
+			if (header_ok) break;
+		}
+		at = next != nullptr ? next + 1 : nullptr;
+	}
+	if (paths.empty()) {
+		LOGF("RtBvhDump: KYTY_RT_PROBE_TLAS=%s does not fit this dispatch (%zu user SGPRs)\n", spec,
+		     d.user_sgpr.size());
+		return false;
+	}
+	LOGF("RtBvhDump: probe paths:%s\n", paths.c_str());
+	std::string text;
+	for (uint32_t i = 0; header_ok && i < 32u; i++) {
+		text += (i % 8u == 0u ? "\n  " : " ") + Hex(header[i]);
+	}
+	std::string node;
+	if (root_ok) {
+		Rt::BoxNode box {};
+		Rt::DecodeBox(Rt::Psr::NodeType::Box32, std::span<const uint8_t>(root, sizeof(root)), box);
+		for (uint32_t c = 0; c < 4; c++) {
+			const auto& b = box.bounds[c];
+			char        line[200];
+			std::snprintf(line, sizeof(line), "\n  child %u: 0x%08x [%g %g %g]..[%g %g %g]", c, box.children[c],
+			              b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2]);
+			node += line;
+		}
+	}
+	// The node region (up to the instance array, at most 4 MiB): how many 64-byte blocks hold
+	// anything, the first few non-empty offsets, and whether any of it was GPU-written.
+	std::string scan;
+	if (header_ok) {
+		const uint64_t instances = static_cast<uint64_t>(header[10]) | static_cast<uint64_t>(header[11]) << 32u;
+		const uint64_t limit     = std::min<uint64_t>(instances != 0 ? instances : (4u << 20u), 4u << 20u);
+		std::vector<uint32_t> block(16);
+		uint64_t              filled = 0, total = 0;
+		std::string           first;
+		for (uint64_t at = Rt::Psr::RootNodeOffset; at + 64u <= limit; at += 64u) {
+			if (!probe.Read(tlas + at, block.data(), 64u)) break;
+			total++;
+			bool empty = true;
+			for (uint32_t w = 0; w < 16u; w++) {
+				// An empty box (pointers 0xffffffff, bounds +inf/-inf) or zeros counts as nothing.
+				empty &= block[w] == 0u || block[w] == 0xffffffffu || block[w] == 0x7f800000u || block[w] == 0xff800000u;
+			}
+			if (!empty) {
+				if (filled < 4u) first += fmt::format(" +0x{:x}:{:08x}/{:08x}", at, block[0], block[4]);
+				filled++;
+			}
+		}
+		uint32_t inst_nonzero = 0;
+		for (uint32_t i = 0; instances != 0 && i < 64u; i++) {
+			uint32_t rec[32] = {};
+			if (!probe.Read(tlas + instances + i * 128u, rec, sizeof(rec))) break;
+			bool any = false;
+			for (const auto w: rec) any |= w != 0u;
+			inst_nonzero += any ? 1u : 0u;
+		}
+		scan = fmt::format("\n  node region: {} of {} 64-byte blocks hold data{}; first 64 instance records: {} non-zero",
+		                   filled, total, first, inst_nonzero);
+	}
+	uint32_t gpu_pages = 0;
+	for (const auto& [number, page]: probe.Pages()) {
+		gpu_pages += (page.flags & Rt::GuestSnapshot::GpuWritten) != 0u ? 1u : 0u;
+	}
+	LOGF("RtBvhDump: probe at dispatch %" PRIu64 " frame %d shader 0x%016" PRIx64 ": SRT 0x%" PRIx64
+	     ", V# base 0x%" PRIx64 ", TLAS header 0x%" PRIx64 " (%s), %zu pages read, %u GPU-written;"
+	     " header dwords:%s\n  root box32 at +256 (%s):%s%s\n",
+	     ordinal, d.frame, d.shader_hash, srt, buffer, tlas, header_ok ? "readable" : "NOT readable",
+	     probe.Pages().size(), gpu_pages, text.c_str(), root_ok ? "readable" : "NOT readable", node.c_str(),
+	     scan.c_str());
+	return true;
+}
 
 bool DumpNow(const RtBvhDispatch& d, uint64_t ordinal, uint32_t sequence) {
 	if (d.user_sgpr.size() < 2) {
@@ -221,7 +327,9 @@ void RtBvhDumpOnDispatch(const RtBvhDispatch& dispatch) {
 	if (DrawPrep::ActiveRecorder() != nullptr) {
 		return; // never inside a draw preparation; the next BVH dispatch retries
 	}
-	const bool done = DumpNow(dispatch, ordinal, written);
+	const char* probe = std::getenv("KYTY_RT_PROBE_TLAS");
+	const bool  done  = probe != nullptr && *probe != '\0' ? ProbeNow(dispatch, ordinal, probe)
+	                                                       : DumpNow(dispatch, ordinal, written);
 	written += done ? 1u : 0u;
 	if (done || ++attempts >= 64u) {
 		if (!done) {

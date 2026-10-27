@@ -118,10 +118,10 @@ bool StatsEnabled() {
 
 // KYTY_SHADER_CALLS_SPLIT_SPARSE (default on): a callee pass is recorded only when the latest
 // completed bin pass of the same kernel and site gave its slot waves (read back after completion,
-// so a few frames late; slots not seen yet are always recorded). Each callee pass costs a program
-// lookup and its bindings on the command processor, and a site names about a hundred callees of
-// which a frame uses a few. A material that appears for the first time is shaded from the frame
-// its waves were counted on.
+// so a few frames late; slots not seen yet are always recorded) or any earlier one did (sticky).
+// Each callee pass costs a program lookup and its bindings on the command processor, and a site
+// names about 140 callees of which a scene uses a few. The first frame a material appears in after
+// its slot was seen empty, its lanes resume unshaded; from the next counts on it is recorded.
 bool SparseEnabled() {
 	static const bool enabled = EnvOn("KYTY_SHADER_CALLS_SPLIT_SPARSE", true);
 	return enabled;
@@ -211,7 +211,11 @@ struct RenderExecutor::CallSplitState {
 		std::scoped_lock lock(present_mutex);
 		auto&            sites = present[kernel];
 		if (sites.size() <= site) sites.resize(site + 1u);
-		sites[site] = std::move(bits);
+		// Sticky: a slot that had waves once stays recorded (a material seen in one frame is often
+		// seen again a few frames later, when the latest counts may not show it).
+		auto& known = sites[site];
+		if (known.size() < bits.size()) known.resize(bits.size(), 0u);
+		for (size_t t = 0; t < bits.size(); t++) known[t] |= bits[t];
 	}
 	std::vector<std::vector<uint8_t>> Present(uint64_t kernel) {
 		std::scoped_lock lock(present_mutex);
@@ -524,9 +528,10 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			    g_totals.held.load()));
 			if (const auto sites = g_totals.stat_sites.load(); sites != 0) {
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "KYTY_SHADER_CALLS_SPLIT: stats over {} site passes: {:.1f}% of waves suspend, {:.1f} callee "
+				    "KYTY_SHADER_CALLS_SPLIT: stats over {} site passes: {} of {} waves suspended ({:.3f}%), {:.1f} callee "
 				    "waves per suspended wave, {:.1f} of {:.1f} callee slots have waves\n",
-				    sites, 100.0 * static_cast<double>(g_totals.stat_suspended.load()) /
+				    sites, g_totals.stat_suspended.load(), g_totals.stat_waves.load(),
+				    100.0 * static_cast<double>(g_totals.stat_suspended.load()) /
 				               static_cast<double>(std::max<uint64_t>(g_totals.stat_waves.load(), 1u)),
 				    static_cast<double>(g_totals.stat_callee_waves.load()) /
 				        static_cast<double>(std::max<uint64_t>(g_totals.stat_suspended.load(), 1u)),
