@@ -97,6 +97,8 @@ LIB_DEFINE(InitLibKernel_1);
 LIB_DEFINE(InitNet_1);
 LIB_DEFINE(InitPad_1);
 LIB_DEFINE(InitPlayGo_1);
+LIB_DEFINE(InitJpegDec_1);
+LIB_DEFINE(InitJpegEnc_1);
 LIB_DEFINE(InitPngDec_1);
 LIB_DEFINE(InitPngEnc_1);
 LIB_DEFINE(InitPlatform_1);
@@ -141,6 +143,8 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitPad_1(s);
 	InitPlayGo_1(s);
 	LibPsml::InitPsml_1(s);
+	InitJpegDec_1(s);
+	InitJpegEnc_1(s);
 	InitPngDec_1(s);
 	InitPngEnc_1(s);
 	InitPlatform_1(s);

@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -587,9 +588,24 @@ struct ReadyFrame {
 	uint64_t                    timestamp_offset = 0;
 };
 
+// KYTY_AVPLAYER_GUEST_READ=1 (default off): with file replacement callbacks, the game's
+// read_offset callback reads into a 64 KB buffer from the game's own memory_replacement allocator,
+// and the bytes are copied to FFmpeg; before (and by default) it gets FFmpeg's host-heap buffer.
+// A callback that reads through AMPR accepts only guest memory: Astro Bot's PlayStation Studios
+// intro failed with EFAULT that way in usa-ratt/KytyPS5-GT7 (Senaxx 3ce5a5da6).
+static bool GuestReadEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AVPLAYER_GUEST_READ");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 class FileStreamer {
 public:
-	explicit FileStreamer(AvPlayerFileReplacement f): file(f) {}
+	explicit FileStreamer(AvPlayerFileReplacement f, AvPlayerMemAllocator m = {},
+	                      bool guest = GuestReadEnabled())
+	    : file(f), mem(m), guest_read_enabled(guest) {}
 	~FileStreamer() {
 		if (ctx != nullptr) {
 			av_freep(&ctx->buffer);
@@ -618,7 +634,13 @@ public:
 			return false;
 		}
 		constexpr int buffer_size = 64 * 1024;
-		auto*         buf         = static_cast<uint8_t*>(av_malloc(buffer_size));
+		if (opened && guest_read_enabled && mem.allocate != nullptr && mem.deallocate != nullptr) {
+			guest_read = GuestBuffer(mem, 64, buffer_size, false);
+			if (!guest_read.Valid()) {
+				return false;
+			}
+		}
+		auto* buf = static_cast<uint8_t*>(av_malloc(buffer_size));
 		if (buf == nullptr) {
 			return false;
 		}
@@ -638,7 +660,14 @@ private:
 		}
 		len      = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
 		int read = 0;
-		if (s->opened) {
+		if (s->opened && s->guest_read.Valid()) {
+			len  = std::min<int>(len, static_cast<int>(s->guest_read.Size()));
+			read = s->file.read_offset(s->file.object_pointer, s->guest_read.Get(), s->pos,
+			                           static_cast<uint32_t>(len));
+			if (read > 0 && read <= len) {
+				std::memcpy(buf, s->guest_read.Get(), static_cast<size_t>(read));
+			}
+		} else if (s->opened) {
 			read = s->file.read_offset(s->file.object_pointer, buf, s->pos,
 			                           static_cast<uint32_t>(len));
 		} else {
@@ -679,6 +708,9 @@ private:
 		return static_cast<int64_t>(position);
 	}
 	AvPlayerFileReplacement file;
+	AvPlayerMemAllocator    mem;
+	bool                    guest_read_enabled = false;
+	GuestBuffer             guest_read;
 	Common::File            local_file;
 	bool                    opened = false;
 	uint64_t                pos    = 0;
@@ -717,7 +749,7 @@ public:
 			return static_cast<Source*>(opaque)->interrupt_io.load() ? 1 : 0;
 		};
 		raw->interrupt_callback.opaque = this;
-		streamer                       = std::make_unique<FileStreamer>(file);
+		streamer                       = std::make_unique<FileStreamer>(file, mem);
 		if (!streamer->Init(path)) {
 			avformat_free_context(raw);
 			return AVPLAYER_ERROR_OPERATION_FAILED;

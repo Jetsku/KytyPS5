@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostInputTrace.h"
 #include "common/logging/log.h"
+#include "common/skipInvalid.h"
 #include "libs/controller.h"
 
 #include <algorithm>
@@ -220,6 +221,18 @@ bool Conflicts(const Binding& first, const Binding& second) {
 	       (first.mouse_button != 0 && first.mouse_button == second.mouse_button);
 }
 
+// An input mapping entry this build does not know (or one on a reserved key) is left out; the
+// first 16 are logged.
+void SkippedMapping(const std::string& value) {
+	static int logged = 0;
+	if (logged < 16) {
+		logged++;
+		LOGF("Input mapping: \"%s\" is not a mapping this build knows (or uses a reserved key); "
+		     "left out\n",
+		     value.c_str());
+	}
+}
+
 class InputMap {
 public:
 	InputMap() {
@@ -264,7 +277,14 @@ public:
 			                      binding.key == SDLK_F8 || binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
-				EXIT("Invalid input mapping: %s\n", value.c_str());
+				// The launcher keeps the mapping in settings every KytyPS5 build on the PC shares,
+				// and another build's launcher may write entries of its own there (GT7 users ended
+				// at start-up on one). With KYTY_SKIP_INVALID (default on) it is left out.
+				if (!Common::SkipInvalidEnabled()) {
+					EXIT("Invalid input mapping: %s\n", value.c_str());
+				}
+				SkippedMapping(value);
+				continue;
 			}
 			Add(binding);
 		}
@@ -324,12 +344,14 @@ private:
 		                                                     : INVALID_CONTROL;
 		const auto source  = split != std::string_view::npos ? SourceFromName(entry.substr(split + 1))
 		                                                     : INVALID_SOURCE;
-		if (control == INVALID_CONTROL || source == INVALID_SOURCE) {
-			EXIT("Invalid input mapping: %s\n", original.c_str());
-		}
-		const auto& info = CONTROL_INFO[control];
-		if (info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) {
-			EXIT("Invalid input mapping: %s\n", original.c_str());
+		if (control == INVALID_CONTROL || source == INVALID_SOURCE ||
+		    (CONTROL_INFO[control].button == 0 && !CONTROL_INFO[control].gyro &&
+		     CONTROL_INFO[control].axis != Controller::Axis::AxisMax)) {
+			if (!Common::SkipInvalidEnabled()) {
+				EXIT("Invalid input mapping: %s\n", original.c_str());
+			}
+			SkippedMapping(original);
+			return;
 		}
 		m_custom_pad = true;
 		AssignPad(control, source);

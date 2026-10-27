@@ -2259,6 +2259,20 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
+// KYTY_READBACK_SMALL_IMAGES_KB (default 0: off): GPU-written single-sample linear images up to
+// this size are copied back to guest memory after each submission, as --readback-linear-images
+// does for every linear image. Gran Turismo 7 draws a saved livery's picture into two 1920x540
+// linear targets (4 MB each) and encodes it on the CPU as JPEG and PNG: without a read-back the
+// encoders got the stale bytes of guest memory (noise). usa-ratt/KytyPS5-GT7 reads back up to
+// 32768 KB (rounds 118 and 126); a race writes no GPU linear image above 64 KB.
+static uint64_t SmallLinearReadbackBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_READBACK_SMALL_IMAGES_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
+	}();
+	return bytes;
+}
+
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	// Small tiled targets are written back too: games read GPU results such as reductions and
 	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
@@ -2266,8 +2280,10 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	const auto& info   = image.info;
 	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
 	                     info.extent.depth * info.resources.layers;
+	const bool small_linear = SmallLinearReadbackBytes() != 0 && info.samples == 1 &&
+	                          info.data.size <= SmallLinearReadbackBytes();
 	if (!info.data.Empty() && (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
-	                                         : m_readback_linear_images)) {
+	                                         : m_readback_linear_images || small_linear)) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -7942,7 +7958,7 @@ void TextureCache::ReportVram() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images && !m_readback_tiled_images) {
+	if (!m_readback_linear_images && !m_readback_tiled_images && SmallLinearReadbackBytes() == 0) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
