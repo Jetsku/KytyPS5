@@ -135,6 +135,9 @@ public:
 		bool                    uses_bindless         = false;
 		// Built by the start-up compute prewarm and not used by a dispatch yet (statistics only).
 		bool                    prewarmed             = false;
+		// KYTY_SKIP_INVALID: the driver could not build this compute pipeline (`pipeline` and its
+		// layout are null); its dispatches are skipped (TryGetComputePipeline returns null).
+		bool                    build_failed          = false;
 	};
 
 	struct GraphicsPrograms {

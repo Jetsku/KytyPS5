@@ -8428,8 +8428,37 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 			                                   pipeline, fast_result);
 		};
 	}
+	// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 ef6f66053, 7ecb6aec3): a compute pipeline the driver
+	// cannot build is kept as failed (build_failed) and its dispatches are skipped instead of
+	// ending the emulator (GT7 after several races). The log names the shader, the driver's answer
+	// and the device memory in use.
+	const bool tolerate_failure = Common::SkipInvalidEnabled();
+	vk::Result build_result     = vk::Result::eSuccess;
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
-	                       fast_hook ? &fast_hook : nullptr);
+	                       fast_hook ? &fast_hook : nullptr,
+	                       tolerate_failure ? &build_result : nullptr);
+	if (tolerate_failure && (build_result != vk::Result::eSuccess || cached->pipeline == nullptr)) {
+		static std::atomic<uint32_t> reported {0};
+		const auto                   count = reported.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 64u || std::has_single_bit(count)) {
+			const auto text = fmt::format(
+			    "Compute pipeline CS=0x{:016x}: the graphics driver could not build it "
+			    "(vkCreateComputePipelines returned {}; device memory in use: {} MB). Its dispatches "
+			    "are skipped from now on (KYTY_SKIP_INVALID; {} so far)\n",
+			    cs_hash, vk::to_string(build_result),
+			    m_graphics.CanReportMemoryUsage() ? m_graphics.GetDeviceMemoryUsage() >> 20u : 0,
+			    count);
+			LOGF("%s", text.c_str());
+			std::fprintf(stderr, "%s", text.c_str());
+		}
+		cached->pipeline        = nullptr;
+		cached->pipeline_layout = nullptr;
+		cached->build_failed    = true;
+		auto [failed, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+		EXIT_IF(!inserted);
+		FlushCompileStall();
+		return *failed->second;
+	}
 	GpuOpProfiler::RegisterComputePipeline(cached->pipeline, compute_program.id);
 	const auto created_pipeline = cached->pipeline;
 
@@ -8499,7 +8528,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
                                                               const ShaderProgram& compute_program) {
 	EXIT_IF(!compute_program || !input_info.stage);
 	if (!input_info.stage.program->info.uses_bvh) {
-		return &GetComputePipeline(input_info, compute_program);
+		auto& built = GetComputePipeline(input_info, compute_program);
+		return built.build_failed ? nullptr : &built; // KYTY_SKIP_INVALID: the dispatch is skipped
 	}
 	const auto id = compute_program.id;
 	auto&      rt = Rt();
