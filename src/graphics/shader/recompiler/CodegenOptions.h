@@ -445,6 +445,12 @@ struct CodegenOptions {
 	// stores clamp first; formatted 11/10-bit float stores give the largest finite value instead of
 	// infinity for finite overflow.
 	bool float_store_clamp = false;
+	// KYTY_VTE_CNTL=1 (default off; the GT7 preset; masterzhang233/KytyPS5-GT7 df7fc6108): honour
+	// PA_CL_VTE_CNTL (guest_gpu/viewportTransform.h). Position exports of a pre-divided or 1/W
+	// format are made homogeneous again (ShaderClipSpaceTransform::vte_format), the viewport drops
+	// the scales and offsets VTE disables, and the CLIP_DISABLE emulation's affine offset is
+	// homogeneous (offset * W, minus W), which only matched before for W == 1.
+	bool vte_cntl = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,

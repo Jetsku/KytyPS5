@@ -7502,6 +7502,12 @@ void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
                     ShaderVertexInputInfo& last_vertex_stage, bool tess_active = false,
                     bool rect_list = false) {
 	const auto& clip_control = context.GetClipControl();
+	// KYTY_VTE_CNTL: the position format belongs to the last pre-rasterization stage (the TES
+	// in a tessellated pipeline).
+	const bool     vte_cntl    = ShaderRecompiler::GetCodegenOptions().vte_cntl;
+	const uint32_t vte_control = vte_cntl ? context.GetScreenViewport().transform_control
+	                                      : ViewportTransform::DefaultControl;
+	last_vertex_stage.clip_space.vte_format = ViewportTransform::PackPositionFormat(vte_control);
 	if (!clip_control.clip_disable) {
 		if (clip_control.user_clip_planes != 0) {
 			// Upstream feed075a9. CLIP_DISABLE also disables user planes. How they combine with
@@ -7530,10 +7536,10 @@ void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
 	const auto& viewport = context.GetScreenViewport().viewports[0];
 	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
 	auto&       clip     = last_vertex_stage.clip_space;
-	clip.scale[0]        = viewport.xscale;
-	clip.scale[1]        = viewport.yscale;
-	clip.offset[0]       = viewport.xoffset;
-	clip.offset[1]       = viewport.yoffset;
+	clip.scale[0]        = ViewportTransform::Scale<0>(vte_control, viewport.xscale);
+	clip.scale[1]        = ViewportTransform::Scale<1>(vte_control, viewport.yscale);
+	clip.offset[0]       = ViewportTransform::Offset<0>(vte_control, viewport.xoffset);
+	clip.offset[1]       = ViewportTransform::Offset<1>(vte_control, viewport.yoffset);
 	clip.half_extent[0] = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
 	clip.half_extent[1] = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 	clip.enabled        = true;

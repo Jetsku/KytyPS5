@@ -47,6 +47,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 			}
 		}
 	}
+	if (info.clip_space.vte_format != 0) {
+		// KYTY_VTE_CNTL: only when set, so other keys stay as they were.
+		key.push_back(0x7E7E0000u | info.clip_space.vte_format);
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {

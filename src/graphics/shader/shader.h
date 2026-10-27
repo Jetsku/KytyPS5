@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/viewportTransform.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -86,6 +87,10 @@ struct ShaderClipSpaceTransform {
 	float offset[2]      = {};
 	float half_extent[2] = {};
 	bool  enabled        = false;
+	// KYTY_VTE_CNTL: PA_CL_VTE_CNTL's position format (ViewportTransform::PackPositionFormat; 0 is
+	// the default clip position). In padding: the struct keeps its size, and stored journals and
+	// pipeline lists read it as zero (ShaderSanitizeStoredInputInfo).
+	uint8_t vte_format = 0;
 };
 
 struct ShaderWorkgroupInputInfo {
@@ -305,6 +310,9 @@ inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
 		info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	}
 	info.target_half_float_mask = 0;
+}
+inline void ShaderSanitizeStoredInputInfo(ShaderVertexInputInfo& info) {
+	info.clip_space.vte_format = 0;
 }
 inline void ShaderSanitizeStoredInputInfo(ShaderComputeInputInfo& info) {
 	uint8_t async = 0;
