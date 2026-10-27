@@ -320,6 +320,16 @@ Live::Switch g_readback_merge_gap("KYTY_READBACK_MERGE_GAP_KB", [](const char* v
 // command processor no longer waits for the GPU to finish everything queued before it serves the
 // next op.
 Live::Switch g_readback_flush_side("KYTY_READBACK_FLUSH_SIDE", Live::ParseDefaultOff);
+
+// KYTY_READBACK_SPAN (live, default 0; =1 on; chenxiao07/KytyPS5 0a0f59ac6, adapted): a side
+// readback's aligned window also takes the registered host buffers next to the faulting one, up to
+// the aligned window (KYTY_READBACK_SIDE_COPY_WINDOW_KB), instead of stopping at the faulting
+// buffer's ends. Where the guest reads back a region made of many small (16 KiB caching page)
+// buffers, each buffer otherwise costs its own fault, side copy and wait. The copies are split at
+// buffer ends, a barrier and a copy command per source buffer. chenxiao measured Demon's Souls'
+// Boletaria walk -0.76 ms a frame (guest readbacks 51 -> 19 a frame, read faults 120 -> 89).
+Live::Switch g_readback_span("KYTY_READBACK_SPAN", Live::ParseDefaultOff);
+std::atomic<uint64_t> g_readback_span_copies {0};
 std::atomic<uint64_t> g_readback_flush_side_copies {0};
 
 // KYTY_READBACK_SIDE_WRITES (live, default on; =0 drains as before): a write fault on a GPU-owned
@@ -2379,10 +2389,44 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	const auto live_window = static_cast<uint64_t>(g_side_window_live.Get());
 	const auto window = live_window != 0 ? std::min(live_window, side.window) : side.window;
 	const auto aligned  = Common::AlignDown(vaddr, window);
-	const auto window_begin = std::max(aligned, buffer_begin);
-	const auto window_end   = std::min(aligned + window, buffer_end);
+	auto       window_begin = std::max(aligned, buffer_begin);
+	auto       window_end   = std::min(aligned + window, buffer_end);
 	if (((page_begin | page_end | window_begin | window_end) % TRACKER_PAGE_SIZE) != 0) {
 		return other(Profiler::FrameEvent::ReadbackSideOtherAlignment);
+	}
+	// KYTY_READBACK_SPAN: the registered buffers next to this one, within the aligned window.
+	const auto owner_at = [&](uint64_t at) -> Buffer* {
+		const auto* next = m_page_table.Find(at >> PageTable::kPageBits);
+		if (next == nullptr || !*next || IsBufferInvalid(*next)) {
+			return nullptr;
+		}
+		auto& found = m_slot_buffers[*next];
+		return found.IsInBounds(at, 1) ? &found : nullptr;
+	};
+	bool spans = false;
+	if (g_readback_span.On()) {
+		auto wide_begin = window_begin;
+		auto wide_end   = window_end;
+		while (wide_begin > aligned) {
+			const auto* next = owner_at(wide_begin - 1);
+			if (next == nullptr) {
+				break;
+			}
+			wide_begin = std::max(aligned, next->CpuAddress());
+		}
+		while (wide_end < aligned + side.window) {
+			const auto* next = owner_at(wide_end);
+			if (next == nullptr) {
+				break;
+			}
+			wide_end = std::min(aligned + side.window, next->CpuAddress() + next->Size());
+		}
+		if ((wide_begin != window_begin || wide_end != window_end) &&
+		    ((wide_begin | wide_end) % TRACKER_PAGE_SIZE) == 0) {
+			window_begin = wide_begin;
+			window_end   = wide_end;
+			spans        = true;
+		}
 	}
 
 	// Prefer the aligned window (neighbouring polled values share one copy); fall back to the
@@ -2467,10 +2511,55 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	std::vector<vk::BufferCopy> copies;
 	copies.reserve(dirty.size());
 	uint64_t bytes = 0;
+	// KYTY_READBACK_SPAN: the copies per source buffer (the window's buffers are all registered).
+	struct SpanGroup {
+		Buffer*                     source = nullptr;
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    lo = UINT64_MAX;
+		uint64_t                    hi = 0;
+	};
+	std::vector<SpanGroup> groups;
 	for (const auto& range: dirty) {
-		copies.emplace_back(buffer.Offset(range.address),
-		                    staging_base + (range.address - chosen->begin), range.size);
 		bytes += range.size;
+		if (!spans) {
+			copies.emplace_back(buffer.Offset(range.address),
+			                    staging_base + (range.address - chosen->begin), range.size);
+			continue;
+		}
+		for (uint64_t at = range.address, range_end = range.address + range.size; at < range_end;) {
+			auto* source = buffer.IsInBounds(at, 1) ? &buffer : owner_at(at);
+			EXIT_IF(source == nullptr);
+			const auto next  = std::min(range_end, source->CpuAddress() + source->Size());
+			auto       group = std::find_if(groups.begin(), groups.end(),
+			                                [&](const SpanGroup& g) { return g.source == source; });
+			if (group == groups.end()) {
+				groups.push_back({source, {}, UINT64_MAX, 0});
+				group = std::prev(groups.end());
+			}
+			group->copies.emplace_back(source->Offset(at), staging_base + (at - chosen->begin),
+			                           next - at);
+			group->lo = std::min(group->lo, at);
+			group->hi = std::max(group->hi, next);
+			at        = next;
+		}
+	}
+	if (spans && groups.size() == 1 && groups.front().source == &buffer) {
+		// Only the faulting buffer's bytes are dirty: the plain recording below.
+		copies.swap(groups.front().copies);
+		groups.clear();
+		spans = false;
+	}
+	if (spans) {
+		for (const auto& group: groups) {
+			copies.insert(copies.end(), group.copies.begin(), group.copies.end());
+		}
+		const auto count = g_readback_span_copies.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((count & (count - 1)) == 0 && count <= 4096) {
+			std::printf("Readback span: %" PRIu64 " side readbacks copied from more than the faulting "
+			            "buffer (KYTY_READBACK_SPAN)\n",
+			            count);
+			std::fflush(stdout);
+		}
 	}
 
 	// Ownership of the exact dirty bytes moves to the publication registered below, exactly as
@@ -2507,19 +2596,37 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
 	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.buffer              = buffer.Handle();
-	before.offset              = buffer.Offset(chosen->begin);
-	before.size                = chosen->end - chosen->begin;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                        nullptr);
-	// Nearby dirty ranges share one region (KYTY_READBACK_MERGE_GAP_KB): the staging window mirrors
-	// the guest window, and completion writes back only readback->ranges.
-	const auto regions =
-	    MergeLinearCopies(copies, static_cast<uint64_t>(g_readback_merge_gap.Get()));
-	RecordReadbackRegions(copies, regions);
-	command.copyBuffer(buffer.Handle(), side.staging->Handle(), static_cast<uint32_t>(regions.size()),
-	                   regions.data());
+	if (!spans) {
+		before.buffer = buffer.Handle();
+		before.offset = buffer.Offset(chosen->begin);
+		before.size   = chosen->end - chosen->begin;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+		                        nullptr);
+		// Nearby dirty ranges share one region (KYTY_READBACK_MERGE_GAP_KB): the staging window
+		// mirrors the guest window, and completion writes back only readback->ranges.
+		const auto regions =
+		    MergeLinearCopies(copies, static_cast<uint64_t>(g_readback_merge_gap.Get()));
+		RecordReadbackRegions(copies, regions);
+		command.copyBuffer(buffer.Handle(), side.staging->Handle(),
+		                   static_cast<uint32_t>(regions.size()), regions.data());
+	} else {
+		// KYTY_READBACK_SPAN: a barrier and a copy command per source buffer.
+		for (const auto& group: groups) {
+			vk::BufferMemoryBarrier source_barrier = before;
+			source_barrier.buffer                  = group.source->Handle();
+			source_barrier.offset                  = group.source->Offset(group.lo);
+			source_barrier.size                    = group.hi - group.lo;
+			command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+			                        &source_barrier, 0, nullptr);
+			const auto regions = MergeLinearCopies(
+			    group.copies, static_cast<uint64_t>(g_readback_merge_gap.Get()));
+			RecordReadbackRegions(group.copies, regions);
+			command.copyBuffer(group.source->Handle(), side.staging->Handle(),
+			                   static_cast<uint32_t>(regions.size()), regions.data());
+		}
+	}
 	vk::BufferMemoryBarrier after = before;
 	after.srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask           = vk::AccessFlagBits::eHostRead;
@@ -4234,6 +4341,13 @@ void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
 		(void)dma->DrainHostCopies(address, size, false);
 	}
 	NoteGuestWriteStream(address, size);
+}
+
+void StreamCopyDefer::NoteFrameBoundary() {
+	if (auto* dma = g_write_drain_dma; dma != nullptr && UploadDmaWriteDrainEnabled() &&
+	                                   GuestGpu::IsGpuThread()) {
+		(void)dma->DrainHostCopies(0, 1, true, true);
+	}
 }
 
 void StreamCopyDefer::NoteGuestWrite(uint64_t address, uint64_t size) {

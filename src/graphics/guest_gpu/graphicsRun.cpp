@@ -4298,6 +4298,7 @@ bool CommandProcessor::DeferFlipLabel(void* dst, uint32_t value, bool interrupt)
 }
 
 void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
+	StreamCopyDefer::NoteFrameBoundary(); // KYTY_UPLOAD_DMA_WRITE_DRAIN=frame
 	g_gpu_timestamp_anchor.store(Sync::ReadReferenceClock(), std::memory_order_relaxed);
 	const FlipInfo flip {.handle    = op.handle,
 	                     .index     = op.index,
@@ -4407,6 +4408,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		~ProcessorScope() { g_current_processor = nullptr; }
 	};
 	ProcessorScope processor_scope(*this);
+	StreamCopyDefer::NoteFrameBoundary(); // KYTY_UPLOAD_DMA_WRITE_DRAIN=frame
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(

@@ -1610,6 +1610,20 @@ static void LogStabilitySwitches(const GraphicContext& graphics) {
 	    targets_text, DrawRun::PipeSwapEnabled() ? 1 : 0, vcache_text));
 }
 
+#if defined(_WIN32)
+// KYTY_FULLSCREEN_EXCLUSIVE=0|1 (default unset; chenxiao07/KytyPS5 507d5b6e5): exclusive
+// fullscreen disallowed (0) or allowed (1) through VK_EXT_full_screen_exclusive; unset leaves the
+// choice to the driver, as before. On an RX 9060 XT fullscreen ran ~8-10% slower than a window
+// while AMD's driver took its own exclusive path; =0 made it as fast as the window.
+static int FullscreenExclusiveRequest() {
+	static const int request = [] {
+		const char* value = std::getenv("KYTY_FULLSCREEN_EXCLUSIVE");
+		return value == nullptr || *value == '\0' ? -1 : value[0] == '0' ? 0 : 1;
+	}();
+	return request;
+}
+#endif
+
 static void VulkanGetExtensions(VulkanExtensions& r) {
 	uint32_t required_extensions_count = 0;
 
@@ -1631,6 +1645,15 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	    !HasExtension(r.required_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
 	}
+
+#if defined(_WIN32)
+	// KYTY_FULLSCREEN_EXCLUSIVE: VK_EXT_full_screen_exclusive needs this instance extension.
+	if (FullscreenExclusiveRequest() >= 0 &&
+	    HasExtension(r.available_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+	    !HasExtension(r.required_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+		r.required_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+	}
+#endif
 
 	if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -2065,6 +2088,23 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+#if defined(_WIN32)
+		// KYTY_FULLSCREEN_EXCLUSIVE: the swapchain then tells the driver whether exclusive
+		// fullscreen may be used (Swapchain::Create). The instance extension it needs was enabled
+		// where available (VulkanGetExtensions).
+		if (const int request = FullscreenExclusiveRequest(); request >= 0) {
+			if (HasExtension(available_extensions, "VK_EXT_full_screen_exclusive") &&
+			    HasExtension(r.required_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+				device_extensions.push_back("VK_EXT_full_screen_exclusive");
+				graphic_ctx.full_screen_exclusive = request;
+				std::printf("Fullscreen: exclusive fullscreen %s (KYTY_FULLSCREEN_EXCLUSIVE=%d)\n",
+				            request == 0 ? "disallowed" : "allowed", request);
+			} else {
+				std::printf("Fullscreen: KYTY_FULLSCREEN_EXCLUSIVE ignored: the driver lacks "
+				            "VK_EXT_full_screen_exclusive\n");
+			}
+		}
+#endif
 		// S_MEMREALTIME reads a shader clock (KYTY_REALTIME_CLOCK, default on; VulkanCreateDevice).
 		if (ShaderRecompiler::GetCodegenOptions().realtime_clock &&
 		    HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {

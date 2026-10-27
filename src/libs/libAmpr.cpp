@@ -2571,6 +2571,11 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 // KYTY_APR_PREPARE_WRITE=1 (default off; chenxiao07/KytyPS5 23011e4c5 and d635d6d70): before the
 // bytes are copied in, a destination resource tracking watches is invalidated once (as the
 // kernel's file reads do) instead of taking a write fault per 4 KiB page.
+// KYTY_APR_IDLE_CLOSE=<seconds> (with KYTY_APR_KEEP_FILES; default 10, 0: never; chenxiao07/KytyPS5
+// 88f8b5a05): a kept file closes once no read has used it for that long. While a file is open,
+// Windows keeps the file cache's view of what was read through it in the system working set:
+// memory in use, not available, given back only at exit (6.6-8 GB after a long Demon's Souls
+// session there). Closed, its pages go to the standby list: still cached, but available.
 static bool AprEnvOn(const char* name) {
 	const auto* value = std::getenv(name);
 	return value != nullptr && std::strcmp(value, "1") == 0;
@@ -2588,15 +2593,47 @@ struct KeptAprFile {
 	std::mutex   mutex; // one positioned read at a time on the shared handle
 	Common::File file;
 	uint64_t     size = 0;
+	std::atomic<int64_t> last_use_ms {0}; // KYTY_APR_IDLE_CLOSE: when a read last ended
 };
+
+static int64_t AprNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+static int64_t AprIdleCloseMs() {
+	static const int64_t ms = [] {
+		const auto* value = std::getenv("KYTY_APR_IDLE_CLOSE");
+		return value != nullptr && *value != '\0' ? std::strtoll(value, nullptr, 10) * 1000 : int64_t {10000};
+	}();
+	return ms;
+}
 
 static std::shared_ptr<KeptAprFile> OpenKeptAprFile(const std::filesystem::path& host_path) {
 	static std::mutex                                                   table_mutex;
 	static std::unordered_map<std::string, std::shared_ptr<KeptAprFile>> table;
 	constexpr size_t MaxKeptFiles = 16384;
+	static int64_t last_sweep_ms = 0;
 	auto key = Common::PathToString(host_path);
 	{
 		std::lock_guard lock(table_mutex);
+		// KYTY_APR_IDLE_CLOSE: at most once a second, files no read holds (only the table's
+		// reference) and none has used for the idle time are let go (closed with that reference).
+		if (const auto idle = AprIdleCloseMs(); idle > 0) {
+			const auto now = AprNowMs();
+			if (now - last_sweep_ms >= 1000) {
+				last_sweep_ms = now;
+				for (auto it = table.begin(); it != table.end();) {
+					if (it->second.use_count() == 1 &&
+					    now - it->second->last_use_ms.load(std::memory_order_relaxed) >= idle) {
+						it = table.erase(it);
+					} else {
+						++it;
+					}
+				}
+			}
+		}
 		if (auto it = table.find(key); it != table.end()) {
 			return it->second;
 		}
@@ -2606,6 +2643,7 @@ static std::shared_ptr<KeptAprFile> OpenKeptAprFile(const std::filesystem::path&
 		return nullptr;
 	}
 	kept->size = kept->file.Size();
+	kept->last_use_ms.store(AprNowMs(), std::memory_order_relaxed);
 	std::lock_guard lock(table_mutex);
 	if (table.size() >= MaxKeptFiles) {
 		// Readers holding an entry keep it alive; the others close with the table's references.
@@ -2758,6 +2796,9 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 
 	close();
+	if (kept != nullptr) {
+		kept->last_use_ms.store(AprNowMs(), std::memory_order_relaxed);
+	}
 	if (*bytes_read < size) {
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprShortReads);
 	}

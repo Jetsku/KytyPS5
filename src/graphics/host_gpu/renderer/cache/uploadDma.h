@@ -78,6 +78,10 @@ class Buffer;
 // (verify-all plus a 2 ms delayed worker, 0 of 5 instead of 4 of 6) but costs about 4% on Sky
 // Garden (as slow as KYTY_DEFER_PROTECTS=0). =all (diagnostic) does that for every write. KYTY_UPLOAD_DMA_WRITE_DRAIN_LOG=1 logs the
 // first drains and a running count.
+// =frame (chenxiao07/KytyPS5 5c6f80faf, adapted): as =1, and a flip (the frame boundary) also makes
+// every queued host copy first. Once a frame's submissions are consumed the guest may rewrite what
+// that frame's work read (the frame after next, double buffered), and a copy still queued then
+// would take those bytes. A frame's drain costs little: the worker has usually caught up by then.
 [[nodiscard]] bool UploadDmaWriteDrainEnabled();
 // KYTY_UPLOAD_DMA_LATE_AUDIT=1 (diagnostic, default off): hashes each host copy's guest bytes when
 // it is staged and again just before the worker copies them; a difference is a write that landed
@@ -126,7 +130,8 @@ public:
 	// `all`: the write may be observed by the guest (a label), which may then rewrite memory any
 	// queued host copy still reads: makes every queued host copy (KYTY_UPLOAD_DMA_WRITE_DRAIN=labels;
 	// =1 only the overlapping ones; =all every one always). Copies are taken from the worker.
-	bool DrainHostCopies(uint64_t address, uint64_t size, bool all = false);
+	// `frame`: a frame boundary (a flip); =frame then makes every queued host copy.
+	bool DrainHostCopies(uint64_t address, uint64_t size, bool all = false, bool frame = false);
 	struct DrainStats {
 		uint64_t checks = 0; // writes that overlapped the queued host-copy bounds
 		uint64_t waits  = 0; // writes that made (or waited for) queued host copies first
