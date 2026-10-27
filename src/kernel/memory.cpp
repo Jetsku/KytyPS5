@@ -450,12 +450,13 @@ public:
 		Common::LockGuard lock(m_mutex);
 		BumpGenerationUnlocked(true);
 
-		for (size_t index = 0; index < m_ranges.size(); index++) {
-			auto& r = m_ranges[index];
-			if (r.start == start && r.size == size && IsReservedRangeType(r.type)) {
-				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index));
-				return true;
-			}
+		// Starts are unique (the ranges never overlap and are never empty), so the range that
+		// starts at `start` is the only candidate (adapted from usa-ratt/KytyPS5-GT7 bab2ca8f7:
+		// no walk from the first range).
+		auto position = LowerBound(start);
+		if (position != m_ranges.end() && position->start == start && position->size == size &&
+		    IsReservedRangeType(position->type)) {
+			m_ranges.erase(position);
 		}
 		return true;
 	}
@@ -473,12 +474,17 @@ public:
 		auto current = start;
 		const auto end = start + size;
 		while (current < end) {
+			// The one range that can contain `current` (the ranges are sorted and never overlap):
+			// a binary search instead of a walk from the first range for every piece (adapted
+			// from usa-ratt/KytyPS5-GT7 bab2ca8f7).
 			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == expected_type && current >= r.start &&
-				    current < End(r.start, r.size)) {
+			auto         next      = std::upper_bound(
+                m_ranges.begin(), m_ranges.end(), current,
+                [](uint64_t value, const Range& range) { return value < range.start; });
+			if (next != m_ranges.begin()) {
+				const auto& r = *std::prev(next);
+				if (r.type == expected_type && current >= r.start && current < End(r.start, r.size)) {
 					candidate = &r;
-					break;
 				}
 			}
 			if (candidate == nullptr) {
@@ -564,8 +570,18 @@ public:
 
 		const auto end     = start + size;
 		auto       current = start;
-		for (const auto& range: m_ranges) {
-			const auto range_end = End(range.start, range.size);
+		// From the range that can contain `start` (every earlier one ends at or before it): a
+		// binary search instead of a walk from the first range (adapted from usa-ratt/KytyPS5-GT7
+		// bab2ca8f7).
+		auto first = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), start,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (first != m_ranges.begin()) {
+			--first;
+		}
+		for (auto it = first; it != m_ranges.end(); ++it) {
+			const auto& range     = *it;
+			const auto  range_end = End(range.start, range.size);
 			if (range_end <= current) {
 				continue;
 			}
@@ -860,10 +876,21 @@ private:
 	// neighbours (what MergeUnlocked would do there; the rest is already merged).
 	void RewriteSpanUnlocked(size_t first, size_t last, const std::vector<Range>& pieces,
 	                         bool merge) {
-		m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(first),
-		               m_ranges.begin() + static_cast<std::ptrdiff_t>(last));
-		m_ranges.insert(m_ranges.begin() + static_cast<std::ptrdiff_t>(first), pieces.begin(),
-		                pieces.end());
+		// The pieces overwrite the span in place and only the difference is inserted or erased:
+		// one move of the vector's tail at most (none when the count is unchanged), where an erase
+		// and an insert moved it twice (tens of thousands of ranges while GT7 streams; adapted
+		// from usa-ratt/KytyPS5-GT7 bab2ca8f7).
+		const size_t old_count = last - first;
+		const size_t common    = std::min(old_count, pieces.size());
+		std::copy(pieces.begin(), pieces.begin() + static_cast<std::ptrdiff_t>(common),
+		          m_ranges.begin() + static_cast<std::ptrdiff_t>(first));
+		if (pieces.size() > old_count) {
+			m_ranges.insert(m_ranges.begin() + static_cast<std::ptrdiff_t>(first + common),
+			                pieces.begin() + static_cast<std::ptrdiff_t>(common), pieces.end());
+		} else if (old_count > pieces.size()) {
+			m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(first + common),
+			               m_ranges.begin() + static_cast<std::ptrdiff_t>(last));
+		}
 		if (!merge || m_ranges.size() < 2) {
 			return;
 		}
