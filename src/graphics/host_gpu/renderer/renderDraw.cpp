@@ -68,6 +68,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <xxhash.h>
 
@@ -2253,6 +2254,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 
+	if (std::exchange(m_depth_unsupported, false)) {
+		// A depth or stencil state the host cannot draw with (logged by ResolveRenderDepthTarget).
+		return false;
+	}
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
