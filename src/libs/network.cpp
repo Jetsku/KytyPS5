@@ -42,6 +42,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -841,9 +842,27 @@ bool Network::HttpSetAuthEnabled(Id id, int enable) {
 	return false;
 }
 
+namespace NetCtl {
+static bool NetCtlConnected();
+} // namespace NetCtl
+
 namespace Net {
 
 LIB_NAME("Net", "Net");
+
+// KYTY_RESOLVER_OFFLINE=1 (default off): a resolver may be made without a name (the console makes
+// one; a game that passes none looked every host name up with the EINVAL as its resolver id, and
+// each lookup failed as a bad resolver), and while NetCtl says the network is off its host name
+// lookups fail as on a console without a connection (RESOLVER_ENODNS) instead of reaching the
+// host's DNS; a numeric address is still converted. Gran Turismo 7's online requests then fail
+// the way they do on a PS5 with no internet.
+static bool ResolverOffline() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RESOLVER_OFFLINE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
 
 #if defined(_WIN32)
 using NativeSocket                                  = SOCKET;
@@ -1450,13 +1469,13 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	     "\t flags = %d\n",
 	     name != nullptr ? name : "<null>", memid, flags);
 
-	if (name == nullptr || flags != 0) {
+	if (flags != 0 || (name == nullptr && !ResolverOffline())) {
 		return NET_ERROR_EINVAL;
 	}
 
 	EXIT_IF(g_net == nullptr);
 
-	const int id = g_net->ResolverCreate(name, memid);
+	const int id = g_net->ResolverCreate(name != nullptr ? name : "", memid);
 	if (id < 0) {
 		return NET_ERROR_RESOLVER_ENOSPACE;
 	}
@@ -1508,6 +1527,16 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 
 	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, addr) == 1) {
 		return OK;
+	}
+
+	if (ResolverOffline() && !NetCtl::NetCtlConnected()) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			LOGF("Net lookup: %s and the others fail as with no DNS server: the network is off "
+			     "(KYTY_RESOLVER_OFFLINE)\n",
+			     hostname);
+		}
+		return NET_ERROR_RESOLVER_ENODNS;
 	}
 
 	if (!EnsureSocketBackend()) {
