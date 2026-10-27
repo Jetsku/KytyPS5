@@ -1022,6 +1022,9 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
   std::unordered_map<uint32_t, uint32_t> constants;
   std::unordered_map<uint32_t, std::vector<uint32_t>> operations;
   std::unordered_map<uint32_t, uint32_t> stores;
+  // A layer index may go through the KYTY_LAYER_CLAMP select first (OpSelect(in range, index,
+  // 0)), which this looks through (usa-ratt/KytyPS5-GT7 0a95b40ed).
+  std::unordered_map<uint32_t, uint32_t> selects;
   for (size_t i = 5; i < binary.size();) {
     const uint32_t opcode = binary[i] & 0xffffu;
     const uint32_t count = binary[i] >> 16u;
@@ -1037,6 +1040,8 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
       operations[binary[i + 2]] = {binary.begin() + i + 4, binary.begin() + i + count};
     } else if (opcode == 62u && count >= 3u) {
       stores[binary[i + 1]] = binary[i + 2];
+    } else if (opcode == 169u && count == 6u) {
+      selects[binary[i + 2]] = binary[i + 4];
     }
     i += count;
   }
@@ -1045,7 +1050,11 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
     if (store == stores.end()) {
       continue;
     }
-    const auto value = operations.find(store->second);
+    auto stored = store->second;
+    if (const auto select = selects.find(stored); select != selects.end()) {
+      stored = select->second;
+    }
+    const auto value = operations.find(stored);
     if (value == operations.end()) {
       continue;
     }
@@ -11799,6 +11808,37 @@ void TestNewShaderRecompilerClipDisabledPosition() {
         "clip-disabled viewport transform is absent from the shader cache key");
 }
 
+// KYTY_LAYER_CLAMP (usa-ratt/KytyPS5-GT7 8c71f0a6a): the exported layer index is clamped with a
+// specialization constant (SpecId 0x4c00); off, the SPIR-V has none.
+void TestLayerClampExport() {
+  const uint32_t layer_export[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x5, false), EncodeExp1(4, 5, 6, 7),
+      0xbf810000u,
+  };
+  const auto compile = [&](bool clamp) {
+    const auto saved = ShaderRecompiler::GetCodegenOptions();
+    auto codegen = saved;
+    codegen.layer_clamp = clamp;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    ShaderVertexInputInfo vertex{};
+    vertex.pa_cl_vs_out_cntl = 0x00e5aa55u;
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    auto result = RecompileForTest(layer_export, options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    return result;
+  };
+  const auto plain = compile(false);
+  const auto clamped = compile(true);
+  CheckSpirvBinaryValidates(clamped.spirv);
+  Check(!SpirvHasDecorationValue(plain.spirv, 1u, 0x4c00u) &&
+            SpirvHasDecorationValue(clamped.spirv, 1u, 0x4c00u),
+        "the layer clamp specialization constant is missing, or present with the clamp off");
+  Check(SpirvBuiltInStoreUsesOperation(clamped.spirv, 9u, 199u, {0x7ffu}),
+        "the clamped layer export lost the GFX10 layer mask");
+}
+
 void TestNewShaderRecompilerAuxPositionExports() {
   const auto compile = [](std::span<const uint32_t> shader, uint32_t control) {
     ShaderVertexInputInfo vertex{};
@@ -16139,6 +16179,7 @@ int main(int argc, char **argv) {
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
+  TestLayerClampExport();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();

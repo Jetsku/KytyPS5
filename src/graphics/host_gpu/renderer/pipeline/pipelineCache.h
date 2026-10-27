@@ -85,6 +85,9 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	// KYTY_LAYER_CLAMP: the bound layer count when a vertex-side stage exports the render target
+	// array index (ShaderRecompiler::IR::LayerLimitSpecId), else 0.
+	uint32_t                                             layer_limit    = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -265,6 +268,9 @@ public:
 		bool  depth_bounds_test_enable = false;
 		float depth_min_bounds         = 0.0f;
 		float depth_max_bounds         = 0.0f;
+		// KYTY_LAYER_CLAMP: the least layer count of the bound attachments (0: not known; draw-prep
+		// plans, which KYTY_LAYER_CLAMP leaves to the serial path for layer-exporting draws).
+		uint32_t layer_count = 0;
 	};
 	// Whether resolved targets are the ones `targets` describes (floats compared by their bits).
 	[[nodiscard]] static bool SamePipelineTargets(const PipelineTargets&           targets,
@@ -395,6 +401,9 @@ private:
 			}
 			Mix(hash, static_cast<uint32_t>(rendering.depth_format));
 			Mix(hash, static_cast<uint32_t>(rendering.stencil_format));
+			if (rendering.layer_limit != 0) {
+				Mix(hash, rendering.layer_limit);
+			}
 		}
 	};
 

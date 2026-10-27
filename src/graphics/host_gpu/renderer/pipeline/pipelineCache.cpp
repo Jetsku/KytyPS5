@@ -7615,6 +7615,29 @@ static void NoteExecOnNoop(const RenderDepthInfo& depth, const ShaderPixelInputI
 	}
 }
 
+// KYTY_LAYER_CLAMP: the least layer count of the bound attachments (0 without any).
+static uint32_t BoundLayerCount(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                                bool with_depth) {
+	if (!ShaderRecompiler::GetCodegenOptions().layer_clamp) {
+		return 0;
+	}
+	uint32_t layers = UINT32_MAX;
+	for (const auto& color: colors) {
+		layers = std::min(layers, color.desc.view_info.layer_count);
+	}
+	if (with_depth) {
+		layers = std::min(layers, depth.desc.view_info.layer_count);
+	}
+	return layers == UINT32_MAX ? 0u : std::max(layers, 1u);
+}
+
+// KYTY_LAYER_CLAMP: whether the vertex-side stage exports the render target array index.
+static bool ExportsLayer(const ShaderVertexInputInfo& info) {
+	return info.stage && std::ranges::any_of(info.stage.program->info.outputs, [](const auto& output) {
+		       return output.kind == ShaderRecompiler::IR::StageOutputKind::Layer;
+	       });
+}
+
 bool PipelineCache::SamePipelineTargets(const PipelineTargets&           targets,
                                         std::span<const RenderColorInfo> colors,
                                         const RenderDepthInfo&           depth) {
@@ -7678,6 +7701,10 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
+	rendering.layer_limit       = ShaderRecompiler::GetCodegenOptions().layer_clamp &&
+	                                      targets.layer_count != 0 && ExportsLayer(vs_input_info)
+	                                  ? targets.layer_count
+	                                  : 0u;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < targets.color_count; i++) {
 		const auto& color = targets.colors[i];
@@ -7994,6 +8021,7 @@ void PipelineCache::PrefetchGraphicsPipeline(std::span<const RenderColorInfo> co
 	targets.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	targets.depth_min_bounds         = depth.depth_min_bounds;
 	targets.depth_max_bounds         = depth.depth_max_bounds;
+	targets.layer_count              = BoundLayerCount(colors, depth, targets.with_depth);
 
 	PrefetchGraphicsPipeline(targets, command.GetRegisters(), command.GetUserConfig(),
 	    vertex_info.front(), pixel_info, topology, primitive_restart_enable, programs);
@@ -8060,6 +8088,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	targets.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	targets.depth_min_bounds         = depth.depth_min_bounds;
 	targets.depth_max_bounds         = depth.depth_max_bounds;
+	targets.layer_count              = BoundLayerCount(colors, depth, targets.with_depth);
 
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;

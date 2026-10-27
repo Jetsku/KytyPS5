@@ -481,9 +481,25 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 		if (output.layer || output.viewport) {
 			const auto raw = ExportRawComponent(ctx, data, component);
 			if (output.layer) {
-				const auto layer = state.builder.AllocateId();
+				auto layer = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), layer, raw,
 				                          ConstantU32(state, 0x7ffu));
+				if (GetCodegenOptions().layer_clamp) {
+					// KYTY_LAYER_CLAMP: an index past the bound layers (the pipeline's
+					// LayerLimitSpecId; 0 keeps the index) selects layer 0.
+					if (state.layer_limit_constant == 0) {
+						state.layer_limit_constant =
+						    state.builder.Constant(spv::OpSpecConstant, TypeU32(state), 0u);
+						state.builder.AddAnnotation(spv::OpDecorate, state.layer_limit_constant,
+						                            spv::DecorationSpecId, IR::LayerLimitSpecId);
+					}
+					const auto limit    = state.layer_limit_constant;
+					const auto in_range = Binary(
+					    state, spv::OpLogicalOr, TypeBool(state),
+					    Binary(state, spv::OpIEqual, TypeBool(state), limit, ConstantU32(state, 0)),
+					    Binary(state, spv::OpULessThan, TypeBool(state), layer, limit));
+					layer = Select(state, TypeU32(state), in_range, layer, ConstantU32(state, 0));
+				}
 				const auto pointer = state.program.stage == ShaderType::Mesh
 				                         ? MeshOutputPointer(state, IR::StageOutputKind::Layer)
 				                         : state.layer_variable;
