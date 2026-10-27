@@ -83,6 +83,8 @@ class Buffer;
 // that frame's work read (the frame after next, double buffered), and a copy still queued then
 // would take those bytes. A frame's drain costs little: the worker has usually caught up by then.
 [[nodiscard]] bool UploadDmaWriteDrainEnabled();
+// KYTY_UPLOAD_DMA_HELP=1 (default off): a lock-free waiter does a queued batch itself.
+[[nodiscard]] bool UploadDmaHelpEnabled();
 // KYTY_UPLOAD_DMA_LATE_AUDIT=1 (diagnostic, default off): hashes each host copy's guest bytes when
 // it is staged and again just before the worker copies them; a difference is a write that landed
 // in between (from a writer the drain does not order: guest CPU threads, other emulator threads).
@@ -204,6 +206,9 @@ private:
 
 	[[nodiscard]] std::optional<uint64_t> Allocate(uint64_t size);
 	void                                  Worker(std::stop_token stop);
+	// One batch taken from m_jobs: its deferred protections, host copies and transfer submission
+	// (the worker, or a waiter that helps: KYTY_UPLOAD_DMA_HELP). One at a time (m_processing).
+	void                                  ProcessJobs(std::vector<Job>& jobs);
 	void                                  SubmitBatch(std::vector<Job>& jobs);
 
 	GraphicContext&         m_graphics;
@@ -243,6 +248,8 @@ private:
 	std::vector<Job>        m_jobs;
 	bool                    m_stopping = false;
 	bool                    m_hold     = false; // HoldWorkerForTest
+	// KYTY_UPLOAD_DMA_HELP: a waiter is doing a batch (the worker leaves m_jobs alone meanwhile).
+	bool                    m_processing = false;
 	std::jthread            m_worker; // last: joined before the members it uses go away
 };
 

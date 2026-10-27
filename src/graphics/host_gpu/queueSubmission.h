@@ -51,6 +51,23 @@ public:
 	virtual void WaitHost(uint64_t value) = 0;
 };
 
+// KYTY_UPLOAD_DMA_HELP (adapted from usa-ratt/KytyPS5-GT7 3307e49f3): set on a thread that waits
+// for SubmitDependency work while it holds no lock (the submission broker's worker). Such a waiter
+// may do the dependency's queued batch itself, when its worker has not started it, instead of
+// waiting for the worker to wake up.
+class SubmitDependencyHelpScope final {
+public:
+	SubmitDependencyHelpScope() noexcept: m_previous(t_active) { t_active = true; }
+	~SubmitDependencyHelpScope() { t_active = m_previous; }
+	SubmitDependencyHelpScope(const SubmitDependencyHelpScope&)            = delete;
+	SubmitDependencyHelpScope& operator=(const SubmitDependencyHelpScope&) = delete;
+	[[nodiscard]] static bool Active() noexcept { return t_active; }
+
+private:
+	static inline thread_local bool t_active = false;
+	bool                            m_previous;
+};
+
 // KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1 (startup, default off): batches wait for SubmitDependency work
 // on the GPU only, as up to int7: the staging copier signals a timeline semaphore from the host and
 // batches may reach the queue before the upload DMA transfers they wait for. Comparisons only; it

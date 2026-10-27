@@ -179,6 +179,9 @@ void QueueSubmissionBroker::Worker() {
 			// Work the oldest record reads is still running or not submitted yet. Wait for it
 			// without queue_mutex: presentation and direct queue users go on meanwhile, and wait
 			// for it themselves only if they must submit that record first. It stays queued.
+			// No lock is held here: an upload DMA batch its worker has not started may be done by
+			// this thread (KYTY_UPLOAD_DMA_HELP).
+			const SubmitDependencyHelpScope help;
 			blocked.WaitHostDependencies();
 		}
 	}

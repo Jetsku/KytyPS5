@@ -82,6 +82,7 @@ uint64_t HashBytes(const uint8_t* data, uint64_t size) noexcept {
 }
 std::atomic<uint64_t> g_late_checks {0};
 std::atomic<uint64_t> g_late_changes {0};
+std::atomic<uint64_t> g_helped {0}; // KYTY_UPLOAD_DMA_HELP: batches a waiter did itself
 } // namespace
 
 bool UploadDmaLateAuditEnabled() {
@@ -91,6 +92,13 @@ bool UploadDmaLateAuditEnabled() {
 
 bool UploadDmaWriteDrainEnabled() {
 	return g_write_drain.On();
+}
+
+// KYTY_UPLOAD_DMA_HELP=1 (default off; adapted from usa-ratt/KytyPS5-GT7 3307e49f3): see
+// UploadDma::WaitSubmittable.
+bool UploadDmaHelpEnabled() {
+	static const bool enabled = EnvU64("KYTY_UPLOAD_DMA_HELP", 0) != 0;
+	return enabled;
 }
 
 std::unique_ptr<UploadDma> UploadDma::Create(GraphicContext& graphics, CommandScheduler& scheduler) {
@@ -410,7 +418,38 @@ void UploadDma::WaitSubmittable(uint64_t value) {
 	}
 	HangWatchdog::Scope wait_scope("upload-dma-submit", reinterpret_cast<uint64_t>(this), value,
 	                               submitted);
+	// KYTY_UPLOAD_DMA_HELP (adapted from usa-ratt/KytyPS5-GT7 3307e49f3): a waiter that holds no
+	// lock (SubmitDependencyHelpScope: the submission broker) does a queued batch the worker has
+	// not started itself instead of waiting for the worker to wake up and do it. One batch at a
+	// time (m_processing), so the transfer submissions keep their order.
+	const bool help = UploadDmaHelpEnabled() && SubmitDependencyHelpScope::Active();
 	while (submitted < value) {
+		if (help) {
+			std::vector<Job> jobs;
+			{
+				std::scoped_lock lock(m_mutex);
+				if (!m_processing && !m_hold && !m_stopping && !m_jobs.empty()) {
+					jobs.swap(m_jobs);
+					m_processing = true;
+				}
+			}
+			if (!jobs.empty()) {
+				ProcessJobs(jobs);
+				{
+					std::scoped_lock lock(m_mutex);
+					m_processing = false;
+				}
+				m_available.notify_all();
+				if (const auto n = g_helped.fetch_add(1, std::memory_order_relaxed) + 1;
+				    (n & (n - 1)) == 0 && n >= 16) {
+					LOGF("Upload DMA: %" PRIu64 " batches done by a waiting submission thread "
+					     "instead of the worker (KYTY_UPLOAD_DMA_HELP)\n",
+					     n);
+				}
+				submitted = m_submitted.load(std::memory_order_acquire);
+				continue;
+			}
+		}
 		m_submitted.wait(submitted, std::memory_order_acquire);
 		submitted = m_submitted.load(std::memory_order_acquire);
 	}
@@ -529,13 +568,22 @@ void UploadDma::Worker(std::stop_token stop) {
 	for (;;) {
 		{
 			std::unique_lock lock(m_mutex);
-			m_available.wait(lock,
-			                 [this] { return m_stopping || (!m_hold && !m_jobs.empty()); });
+			// Not while a waiter does a batch (KYTY_UPLOAD_DMA_HELP; it notifies when done).
+			m_available.wait(lock, [this] {
+				return !m_processing && (m_stopping || (!m_hold && !m_jobs.empty()));
+			});
 			if (m_jobs.empty()) {
 				return; // stopping and drained
 			}
 			jobs.swap(m_jobs);
 		}
+		ProcessJobs(jobs);
+		jobs.clear();
+	}
+}
+
+void UploadDma::ProcessJobs(std::vector<Job>& jobs) {
+	{
 		// KYTY_UPLOAD_DMA_HOST_COPY: the staged bytes the command processor left to this worker,
 		// written before the submission below makes them visible to the transfer.
 		// KYTY_DEFER_PROTECTS: the pages' write protections first, so a guest write landing before
@@ -572,7 +620,6 @@ void UploadDma::Worker(std::stop_token stop) {
 			}
 		}
 		SubmitBatch(jobs);
-		jobs.clear();
 	}
 }
 
