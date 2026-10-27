@@ -37,6 +37,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "loader/demonsSoulsTitle.h"
+
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
@@ -4353,11 +4355,43 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	return OK;
 }
 
+// KYTY_DIRECT_MEMORY_MB=<n> (default unset: all of it; chenxiao07/KytyPS5 1a7b17903, 01523253a):
+// the game is told it has at most n MiB of direct memory (sceKernelGetDirectMemorySize;
+// sceKernelAvailableDirectMemorySize and sceKernelAllocateMainDirectMemory search below it).
+// =ds: 12 GiB (a base PS5's) for Demon's Souls only, all of it for other games. Demon's Souls'
+// engine takes all it is told at start-up and its texture streamer fills it until ~400 MiB are
+// left: told 12 GiB instead of 12.5 it ended 0.46 GB lower in the PC's memory over a long tour.
+static uint64_t ReportedDirectMemorySize() {
+	static const uint64_t cap = [] {
+		const char* value = std::getenv("KYTY_DIRECT_MEMORY_MB");
+		if (value == nullptr || *value == '\0') {
+			return ~uint64_t {0};
+		}
+		uint64_t mib = 0;
+		if (std::strcmp(value, "ds") == 0) {
+			if (!Loader::DemonsSouls::IsSupportedGame()) {
+				return ~uint64_t {0};
+			}
+			mib = 12288;
+		} else {
+			mib = std::strtoull(value, nullptr, 10);
+		}
+		if (mib == 0) {
+			return ~uint64_t {0};
+		}
+		std::printf("Direct memory: at most %llu MiB told to the game (KYTY_DIRECT_MEMORY_MB=%s)\n",
+		            static_cast<unsigned long long>(mib), value);
+		std::fflush(stdout);
+		return mib << 20u;
+	}();
+	return std::min<uint64_t>(PhysicalMemory::Size(), cap);
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::DirectMemorySizeQueries);
 
-	return PhysicalMemory::Size();
+	return ReportedDirectMemorySize();
 }
 
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
@@ -4389,9 +4423,12 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 		return KERNEL_ERROR_ENOMEM;
 	}
 
+	// KYTY_DIRECT_MEMORY_MB: nothing past the size the game is told.
+	search_end = std::min<int64_t>(search_end, static_cast<int64_t>(ReportedDirectMemorySize()));
 	uint64_t phys_addr = 0;
 	uint64_t size      = 0;
-	if (!g_physical_memory->Available(static_cast<uint64_t>(search_start),
+	if (search_end <= search_start ||
+	    !g_physical_memory->Available(static_cast<uint64_t>(search_start),
 	                                  static_cast<uint64_t>(search_end), alignment, &phys_addr,
 	                                  &size)) {
 		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
@@ -4584,7 +4621,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 	     "\t memory_type  = %d\n",
 	     len, alignment, memory_type);
 
-	return KernelAllocateDirectMemory(0, static_cast<int64_t>(PhysicalMemory::Size()), len,
+	return KernelAllocateDirectMemory(0, static_cast<int64_t>(ReportedDirectMemorySize()), len,
 	                                  alignment, memory_type, phys_addr_out);
 }
 

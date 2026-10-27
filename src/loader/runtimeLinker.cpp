@@ -21,6 +21,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/demonsSoulsLoaderGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -1672,6 +1673,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (!m_programs.empty()) {
 		GamePatch::ApplyBuiltin(m_programs.front());
 	}
+	// Demon's Souls only (each finds its code by signature; other titles and builds untouched).
+	DemonsSoulsLoaderGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
 		Common::GuestProbe::Arm(m_programs.front()->base_vaddr, m_programs.front()->base_size);
 	}
