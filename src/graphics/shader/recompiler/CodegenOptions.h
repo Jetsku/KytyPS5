@@ -457,6 +457,14 @@ struct CodegenOptions {
 	// base of a buffer or address the shader writes or updates atomically: its waves must see those
 	// writes, which a snapshot taken before the dispatch does not.
 	bool snapshot_written_guard = false;
+	// KYTY_TESS_INDEXED=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 70341d775): the LS/HS
+	// stride analysis (Tessellation.cpp) also accepts HS LDS reads whose control point is a loaded
+	// index (a stencil table's) when their stride matches the LS one, folds scalar constants and
+	// masks, and the lowering lets the HS read its own control-point outputs and patch constants
+	// back (behind an inserted barrier), resolves addresses under conjunctions of its EXEC and
+	// folds the shifted patch ordinal; HS and TES share the patch-constant range the analysis
+	// found. Factor or patch-constant addresses that still do not fold skip the stage's draws.
+	bool tess_indexed = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,

@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
@@ -54,10 +55,19 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
-		const auto vertex =
-		    kind == Attribute::ControlOutput
-		        ? EmitLaneId(state)
-		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		const bool write = inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute;
+		auto       vertex =
+		    kind == Attribute::ControlOutput && (write || !GetCodegenOptions().tess_indexed)
+		              ? EmitLaneId(state)
+		              : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		if (GetCodegenOptions().tess_indexed && !(kind == Attribute::ControlOutput && write)) {
+			// KYTY_TESS_INDEXED (usa-ratt/KytyPS5-GT7 70341d775): an HS invocation writes its own
+			// control point and reads any of them back; a read's control point (a loaded index)
+			// is clamped to stay within the array.
+			const auto vertices = kind == Attribute::ControlInput ? tess.input_control_points
+			                                                      : tess.output_control_points;
+			vertex = EmitUMin32(state, vertex, ConstantU32(state, vertices - 1u));
+		}
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
 		                          component);
 	}
@@ -100,6 +110,14 @@ void DefineTessellationInterfaces(EmitterState& state) {
 		if (kind == Attribute::Factor) {
 			type = array(TypeF32(state), 4u);
 		} else if (kind == Attribute::PatchOutput) {
+			// KYTY_TESS_INDEXED: the range the analysis found the HS storing, so that the HS's
+			// patch outputs and the TES's inputs agree whatever each of them touches.
+			if (tess.patch_size != 0u) {
+				EXIT_NOT_IMPLEMENTED(patch_begin < tess.patch_base ||
+				                     patch_end > tess.patch_base + tess.patch_size);
+				patch_begin = tess.patch_base;
+				patch_end   = tess.patch_base + tess.patch_size;
+			}
 			state.tess_patch_base = patch_begin;
 			type = array(TypeU32Vector(state, 4), (patch_end - patch_begin + 15u) / 16u);
 		} else {
