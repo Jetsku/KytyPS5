@@ -65,6 +65,9 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// KYTY_ZERO_NEW_IMAGES=1 (default off): new images start cleared to zero (Image::ZeroFresh).
+[[nodiscard]] bool ZeroNewImagesEnabled() noexcept;
+
 class Image final {
 public:
 	// sparse_first_level > 0 (KYTY_TEXTURE_SPARSE_RESIDENCY, TextureCache::InsertImage): try a sparse
@@ -98,6 +101,11 @@ public:
 	// KYTY_IMAGE_TRANSIT_SKIP_VERIFY=1|exit runs GetBarriers after such a decision and records
 	// what it returns: a barrier there is a mismatch (counted, logged; exit stops). FrameEvents
 	// ImageTransitSkips, ImageTransitVerify{Checks,Mismatches}.
+	// KYTY_ZERO_NEW_IMAGES (ZeroNewImagesEnabled): clears a new image (undefined layout, one
+	// state) to zero through the scheduler's helper sink, before its first use (TextureCache::
+	// InsertImage). Left out: sparse, block-compressed, no transfer-destination usage, no active
+	// recording. Returns whether it cleared.
+	bool ZeroFresh();
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
 	             bool deferrable = false);

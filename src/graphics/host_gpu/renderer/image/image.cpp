@@ -12,6 +12,8 @@
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include <vulkan/vulkan_format_traits.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -425,6 +427,66 @@ bool Image::TransitIsNoOp(vk::ImageLayout                             destinatio
 	const auto& state = backing.state;
 	return state.layout == destination_layout && state.access_mask == destination_access &&
 	       !static_cast<bool>(state.access_mask & TransitWriteAccess);
+}
+
+// KYTY_ZERO_NEW_IMAGES=1 (default off; chenxiao07/KytyPS5 2f9d9604a, c0a4d2465, redone at image
+// creation): a new image's memory is the PS5's fresh memory, zeroed, not whatever the VRAM had.
+bool ZeroNewImagesEnabled() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_ZERO_NEW_IMAGES");
+		const bool  zero  = value != nullptr && value[0] == '1';
+		if (zero) {
+			std::printf("Zero new images: on (KYTY_ZERO_NEW_IMAGES=1)\n");
+		}
+		return zero;
+	}();
+	return on;
+}
+
+bool Image::ZeroFresh() {
+	if (!backing.image || backing.sparse || backing.state.layout != vk::ImageLayout::eUndefined ||
+	    !backing.subresource_states.empty() ||
+	    !(backing.usage & vk::ImageUsageFlagBits::eTransferDst) ||
+	    vk::blockExtent(backing.format)[0] != 1 || !m_scheduler.Active()) {
+		return false;
+	}
+	KYTY_GPU_OP_SITE("image.zero");
+	const auto aspect = FullAspectMask(backing.format);
+	vk::ImageSubresourceRange whole {};
+	whole.aspectMask = aspect;
+	whole.levelCount = VK_REMAINING_MIP_LEVELS;
+	whole.layerCount = VK_REMAINING_ARRAY_LAYERS;
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.oldLayout           = vk::ImageLayout::eUndefined;
+	barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = backing.image;
+	barrier.subresourceRange    = whole;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	// Recorded through the scheduler's helper sink (recorder-aware), outside rendering, before
+	// any use of the image: no caller holds a transition target for it yet.
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().HelperSink();
+	command.pipelineBarrier2(dependency);
+	if (!(aspect & vk::ImageAspectFlagBits::eColor)) {
+		const vk::ClearDepthStencilValue zero {0.0f, 0};
+		command.clearDepthStencilImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1,
+		                               &whole);
+	} else {
+		vk::ClearColorValue zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
+		command.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	}
+	backing.state = {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	                 vk::ImageLayout::eTransferDstOptimal};
+	NoteImageStateChange();
+	return true;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,

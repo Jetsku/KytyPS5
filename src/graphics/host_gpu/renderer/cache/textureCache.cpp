@@ -929,6 +929,11 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, uint32_t resident_first
 	                                  ? resident_first
 	                                  : 0u;
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, sparse_first);
+	if (ZeroNewImagesEnabled()) {
+		// KYTY_ZERO_NEW_IMAGES: fresh memory reads as zero, as on the PS5 (an upload after this
+		// replaces what it covers).
+		(void)m_slot_images[id].ZeroFresh();
+	}
 	if (VramStats::Enabled()) {
 		if (const auto bytes = m_graphics.NativeImageBytes(m_slot_images[id].backing); bytes != 0) {
 			m_vram_creates.first++;
