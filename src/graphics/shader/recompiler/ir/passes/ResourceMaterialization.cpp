@@ -542,7 +542,10 @@ bool MaterializeBindlessImage(const DescriptorSource::IndirectDescriptor& indire
 	                                   .table_offset   = indirect.table_offset,
 	                                   .image          = image_index,
 	                                   .mapping_offset = mapping_offset,
-	                                   .stride         = indirect.record_pointer != UINT32_MAX
+	                                   // KYTY_BINDLESS_STRIDE: a plain heap's T#s may sit in larger
+	                                   // records (table_stride > 32); otherwise 32 bytes apart.
+	                                   .stride         = indirect.record_pointer != UINT32_MAX ||
+	                                                             indirect.table_stride > 32u
 	                                                         ? indirect.table_stride
 	                                                         : 32u,
 	                                   .record_pointer = indirect.record_pointer,

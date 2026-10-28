@@ -391,7 +391,7 @@ void BindlessTable::WatchHeap(Heap& heap) {
 	const auto records  = heap.nested_keys != 0 ? heap.guest_entries / heap.nested_keys
 	                                            : heap.guest_entries;
 	const auto end      = Common::AlignUp(
-        table + uint64_t {records} * (pointers ? heap.stride : 32u), TRACKER_PAGE_SIZE);
+        table + uint64_t {records} * heap.stride, TRACKER_PAGE_SIZE);
 	if (end <= begin) {
 		return;
 	}

@@ -854,6 +854,164 @@ void CheckRuntimeImage() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 
+// KYTY_BINDLESS_STRIDE (adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): GT7's material shaders
+// select their T#s from 188-byte material records, key * 188 (S_MUL_I32) instead of key << 5. The
+// Miles waterfall with that multiply: without the switch the program is skipped; with it the heap
+// is a bindless heap whose keys are 188 bytes apart.
+std::vector<u32> StridedHeapSampleCode() {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u);
+  AppendVMovLiteral(&code, 4, 0x3f000000u);
+  AppendVMovLiteral(&code, 5, 0x00000000u);
+  code.push_back(EncodeSop1(0x04u, 20, 126)); // s_mov_b64 s[20:21], exec
+  const auto loop = code.size();
+  code.push_back(EncodeSop1(0x14u, 22, 20));   // s_ff1_i32_b64 s22, s[20:21]
+  code.push_back(EncodeVop3Word0(0x360u, 23)); // v_readlane_b32 s23, v1, s22
+  code.push_back(EncodeVop3Word1(Vgpr(1), 22));
+  code.push_back(EncodeVopc(0xc2u, 23, 1));    // v_cmp_eq_u32 vcc, s23, v1
+  code.push_back(EncodeSop1(0x24u, 24, 106));  // s_and_saveexec_b64 s[24:25], vcc
+  code.push_back(EncodeSop2(0x26u, 106, 23, 255u)); // s_mul_i32 vcc_lo, s23, 188
+  code.push_back(188u);
+  code.push_back(EncodeSmem0(0x0bu, 32, 2)); // s_buffer_load_dwordx8 s[32:39], s[4:7], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[8:11]
+  code.push_back(EncodeMimg1(2, 3, 32 / 4, 8 / 4));
+  code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec
+  code.push_back(EncodeSop1(0x04u, 126, 24));     // s_mov_b64 exec, s[24:25]
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1 loop
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckStridedHeap() {
+  constexpr const char *name = "BindlessStridedHeap";
+  const auto code = StridedHeapSampleCode();
+  const auto user_data = MilesHeapUserData();
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+  {
+    codegen.bindless_strided = false;
+    ScopedCodegenOptions scope(codegen);
+    Require(name, "switch off", ShaderRecompiler::TranslateProgram(code, options).skip_dispatch,
+            "the 188-byte heap record was planned without KYTY_BINDLESS_STRIDE");
+  }
+  codegen.bindless_strided = true;
+  ScopedCodegenOptions scope(codegen);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the 188-byte heap record was skipped with KYTY_BINDLESS_STRIDE");
+  const auto &images = translated.program.info.images;
+  Require(name, "bindless plan", images.size() == 1u, "expected one image");
+  const auto &source = translated.program.descriptor_sources.at(images[0].source);
+  Require(name, "bindless plan",
+          source.indirect_descriptor.has_value() && source.indirect_descriptor->bindless &&
+              source.indirect_descriptor->record_pointer == UINT32_MAX &&
+              source.indirect_descriptor->table_stride == 188u,
+          "the image is not a strided bindless heap");
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  std::vector<u32> memory(0x4000u, 0u);
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.bindless_heaps.size() == 1u && resources.bindless_heaps[0].stride == 188u &&
+              resources.bindless_heaps[0].record_pointer == UINT32_MAX,
+          "the strided heap did not materialize with its stride");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "bindless SPIR-V", CountSpirv(result.spirv, "\"bindless_translation\"") == 1u,
+          "the sample does not go through the bindless arrays");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
+// KYTY_CALL_TRACE_REACH (adapted from usa-ratt/KytyPS5-GT7 a6cd035f0; CPU only, so it lives with
+// the bindless cases): GT7's CS 0x2218a07ab01d4f46 loads its call table V# from the user-data
+// pointer s[12:13] after a branch, and writes s12 again only after the call, in a loop that does
+// not reach the load. Without the switch (and without KYTY_CALL_TRACE_WAVE32) s12 has no unique
+// definition; with it no writer reaches the load, so s[12:13] holds its entry value.
+void CheckCallTraceReach() {
+  constexpr const char *name = "CallTraceReach";
+  std::vector<u32> code;
+  code.push_back(EncodeSopp(0x04, 0));                    // s_cbranch_scc0 to the next block
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x02, 0, 6));                // s_load_dwordx4 s[0:3], s[12:13], 144
+  code.push_back(EncodeSmem1(144, 125));
+  code.push_back(EncodeSmem0(0x0a, 0, 0));                // s_buffer_load_dwordx4 s[0:3], s[0:3], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 0));
+  code.push_back(EncodeSMovB32(15, 1));
+  code.push_back(0xbe8e210eu);                            // s_swappc_b64 s[14:15], s[14:15]
+  const auto loop = code.size();
+  code.push_back(EncodeSop2(0x00, 12, 12, InlineU32(1))); // s_add_u32 s12, s12, 1
+  code.push_back(EncodeSmem0(0x03, 8, 6));                // s_load_dwordx8 s[8:15], s[12:13], 64
+  code.push_back(EncodeSmem1(64, 125));
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1 loop
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  codegen.shader_calls = false;
+  codegen.call_trace_wave32 = false;
+  codegen.call_trace_reach = false;
+  {
+    ScopedCodegenOptions scope(codegen);
+    const auto before = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "switch off", before.skip_dispatch && before.call_tables.empty(),
+            "the table was traced without KYTY_CALL_TRACE_REACH");
+  }
+  codegen.call_trace_reach = true;
+  {
+    ScopedCodegenOptions scope(codegen);
+    const auto result = ShaderRecompiler::TranslateProgram(code, options);
+    const auto &tables = result.call_tables;
+    Require(name, "table",
+            result.skip_dispatch && tables.size() == 1u && tables[0].user_sgpr == 12u &&
+                tables[0].steps.size() == 1u && !tables[0].steps[0].buffer &&
+                tables[0].steps[0].offset == 144,
+            "the call table was not traced by reachability (" + std::to_string(tables.size()) +
+                " found)");
+    // A loop back to the load (through the call) keeps the range unknown.
+    std::vector<u32> looping = code;
+    looping.pop_back(); // s_endpgm
+    const auto to_lshl = 1 - static_cast<int32_t>(looping.size() + 1u);
+    looping.push_back(EncodeSopp(0x04, static_cast<u32>(to_lshl) & 0xffffu)); // s_cbranch_scc0
+    AppendEnd(&looping);
+    const auto again = ShaderRecompiler::TranslateProgram(looping, options);
+    Require(name, "loop back", again.call_tables.empty(),
+            "a write that can loop back to the load was ignored");
+  }
+  std::printf("[bindless] %-32s ok\n", name);
+}
+
 void RunCodegen() {
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
@@ -862,6 +1020,8 @@ void RunCodegen() {
   CheckRecordHeap();
   CheckVolumeOverArray();
   CheckRuntimeImage();
+  CheckStridedHeap();
+  CheckCallTraceReach();
 }
 
 } // namespace BindlessTests

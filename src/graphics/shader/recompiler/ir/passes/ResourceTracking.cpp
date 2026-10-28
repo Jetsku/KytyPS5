@@ -635,11 +635,15 @@ private:
 	// was skipped before, and a key the SRT walk evaluates keeps its flat slot.
 	// The masked form: `masked` is the S_AND whose result the offset adds to, `key_mask` the mask
 	// to apply to the key (UINT32_MAX when the offset is a plain key << 5).
+	// stride (KYTY_BINDLESS_STRIDE, adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): when not null,
+	// key * stride (an immediate multiply, or a shift of 3 to 12) matches too, and the stride is
+	// returned (32 for the plain key << 5); without it only key << 5 matches.
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t* key_mask = nullptr,
-	                      Inst** masked = nullptr) const {
+	                      Inst** masked = nullptr, uint32_t* stride = nullptr) const {
 		offset = 0;
 		if (key_mask != nullptr) *key_mask = UINT32_MAX;
 		if (masked != nullptr) *masked = nullptr;
+		if (stride != nullptr) *stride = 32u;
 		for (;;) {
 			auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -650,6 +654,24 @@ private:
 			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
+			}
+			if (stride != nullptr && inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), immediate) && immediate >= 3u && immediate <= 12u) {
+				key     = inst->Arg(0).Resolve();
+				*stride = 1u << immediate;
+				return key.GetType() == Type::U32;
+			}
+			if (stride != nullptr && inst->GetOpcode() == ValueOpcode::IMul32) {
+				uint32_t factor = 0;
+				if (ImmediateU32(inst->Arg(0), factor)) {
+					key = inst->Arg(1).Resolve();
+				} else if (ImmediateU32(inst->Arg(1), factor)) {
+					key = inst->Arg(0).Resolve();
+				} else {
+					return false;
+				}
+				*stride = factor;
+				return factor != 0u && key.GetType() == Type::U32;
 			}
 			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && key_mask != nullptr &&
 			    masked != nullptr && GetCodegenOptions().heap_key_mask) {
@@ -1143,6 +1165,9 @@ private:
 		uint32_t key_mask     = UINT32_MAX;
 		Inst*    masked       = nullptr;
 		bool     word0_shared = false;
+		// KYTY_BINDLESS_STRIDE: bytes from one key's T# to the next (32 for a plain T# array).
+		const bool strided      = GetCodegenOptions().bindless_strided && BindlessImagesEnabled();
+		uint32_t   table_stride = 32u;
 		// KYTY_HEAP_KEY_MASK: the table of the descriptor's plain (non-Phi) words, for
 		// ResolveDescriptorPhi.
 		const Inst* reference_table = nullptr;
@@ -1181,6 +1206,7 @@ private:
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
 			uint32_t offset = 0;
+			uint32_t current_stride = 32u;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1188,7 +1214,8 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked,
+			                      strided ? &current_stride : nullptr) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
@@ -1198,7 +1225,9 @@ private:
 				table_offset = offset;
 				key_mask     = current_mask;
 				masked       = current_masked;
-			} else if (!EquivalentValue(m_program, key, current_key) || key_mask != current_mask ||
+				table_stride = current_stride;
+			} else if (current_stride != table_stride ||
+			           !EquivalentValue(m_program, key, current_key) || key_mask != current_mask ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
@@ -1323,17 +1352,21 @@ private:
 		};
 		// A masked key is a lane value (MatchTableOffset): no enumeration covers it. A shared
 		// word 0 has no planning read for the material selector either.
-		if (masked != nullptr || word0_shared || !enumerable()) {
+		// A strided key (KYTY_BINDLESS_STRIDE) is not enumerated: the enumeration reads 32-byte T#s.
+		if (masked != nullptr || word0_shared || table_stride != 32u || !enumerable()) {
 			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
 				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
 				       ImageResourceClass::Sampled;
 			});
-			if (!BindlessImagesEnabled() || !sampled_only || table_source.dword_count != 4u) {
+			// The host reads key k's T# at table_offset + k * table_stride: any 4-byte-aligned
+			// stride that holds a T# (GT7's 188-byte material records).
+			if (!BindlessImagesEnabled() || !sampled_only || table_source.dword_count != 4u ||
+			    table_stride < 32u || (table_stride & 3u) != 0u) {
 				return false;
 			}
 			indirect              = {};
 			indirect.table_offset = table_offset;
-			indirect.table_stride = 32u;
+			indirect.table_stride = table_stride;
 			indirect.bindless     = true;
 			material_source       = {};
 		}
