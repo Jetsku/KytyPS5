@@ -1725,7 +1725,7 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 // aligned, GetHostBufferPairAtomics); through a V# the shader computed, the host address of the
 // BDA page table (checked for 8-byte alignment at run time).
 bool BufferPairAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (!GetCodegenOptions().buffer_pair_atomic) {
+	if (!GetCodegenOptions().buffer_pair_atomic || !BufferPairAtomicProgram(ctx.state.program.shader_hash)) {
 		return false;
 	}
 	const auto& mem = ctx.Memory(inst);

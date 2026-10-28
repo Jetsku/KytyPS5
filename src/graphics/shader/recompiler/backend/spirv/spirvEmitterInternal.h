@@ -95,6 +95,9 @@ struct SpirvRequirements {
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+// KYTY_BUFFER_PAIR_ATOMIC_HASHES=<hex>[,<hex>...]: limits KYTY_BUFFER_PAIR_ATOMIC to those programs
+// (the large Miles RT kernels hit "Shader Instruction Error" device losses with it); unset = all.
+[[nodiscard]] bool BufferPairAtomicProgram(uint64_t shader_hash);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)

@@ -378,6 +378,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				// view of the buffer atomically.
 				if (memory.kind == IR::ResourceKind::Buffer &&
 				    GetCodegenOptions().buffer_pair_atomic && GetHostBufferPairAtomics() &&
+				    BufferPairAtomicProgram(program.shader_hash) &&
 				    memory.IsCoherentBufferPair(inst.GetOpcode())) {
 					requirements.buffer_int64_atomics = true;
 				}
@@ -590,6 +591,23 @@ void SetHostBufferPairAtomics(bool supported) {
 
 bool GetHostBufferPairAtomics() {
 	return g_buffer_pair_atomics.load(std::memory_order_relaxed);
+}
+
+bool BufferPairAtomicProgram(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_BUFFER_PAIR_ATOMIC_HASHES");
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			list.push_back(value);
+			if (*end != ',') break;
+			text = end + 1;
+		}
+		return list;
+	}();
+	return hashes.empty() || std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
 }
 
 void SetHostImageFeatures(const HostImageFeatures& features) {
