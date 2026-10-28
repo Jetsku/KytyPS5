@@ -111,6 +111,13 @@ private:
 	bool                                                       m_has_provoking_vertex = false;
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT m_provoking_vertex {};
 	vk::PipelineMultisampleStateCreateInfo                     m_multisample {};
+	// NV mixed samples (KYTY_EQAA_MIXED): the coverage reduction mode and the attachments' sample
+	// counts. Serialized as an optional block, so pipelines that use them keep a journal key.
+	bool                                                       m_has_reduction = false;
+	vk::PipelineCoverageReductionStateCreateInfoNV             m_reduction {};
+	bool                                                       m_has_sample_count = false;
+	vk::AttachmentSampleCountInfoAMD                           m_sample_count {};
+	std::vector<vk::SampleCountFlagBits>                       m_color_samples;
 	bool                                                       m_has_depth_stencil = false;
 	vk::PipelineDepthStencilStateCreateInfo                    m_depth_stencil {};
 	vk::PipelineColorBlendStateCreateInfo                      m_color_blend {};
