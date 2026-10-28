@@ -300,8 +300,13 @@ void Translator::EmitCallPartition(const Decoder::Instruction& inst) {
 	const auto exec   = ir.GetExec();
 	const auto lane   = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto first  = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {lane, exec}));
-	const auto leader = ir.LogicalAnd(exec, ir.IEqual(lane, first));
-	const auto base   = ir.ConstructU64(param(IR::CallPartitionParamReportLo), param(IR::CallPartitionParamReportHi));
+	const auto report_lo = param(IR::CallPartitionParamReportLo);
+	const auto report_hi = param(IR::CallPartitionParamReportHi);
+	// No report set (a dispatch that did not pass one): the lanes still leave, nothing is written.
+	const auto has_report =
+	    ir.LogicalNot(ir.IEqual(ir.BitwiseOr(report_lo, report_hi), IR::U32(IR::Value(0u))));
+	const auto leader = ir.LogicalAnd(ir.LogicalAnd(exec, ir.IEqual(lane, first)), has_report);
+	const auto base   = ir.ConstructU64(report_lo, report_hi);
 	ir.Emit(IR::ValueOpcode::CallStateReport, {base, IR::U32(ir.BitwiseOr(lo, IR::U32(IR::Value(1u)))), leader});
 	// The active lanes leave the wave: IREmitter::SetExec keeps them out of every later EXEC.
 	ir.SetGotoVariable(IR::PartitionDropVariable,

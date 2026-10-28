@@ -773,6 +773,16 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	auto& bindings = m_compute_bindings;
 	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
+	if (step != nullptr) {
+		// KYTY_CALL_PARTITIONS: the first steps, to see that the parameters reach the program.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_CALL_PARTITIONS: step of CS 0x{:016x}: call-state dword {}, report 0x{:x}, target 0x{:x}, bvh {}\n",
+			    input_info.stage.program->shader_hash, input_info.stage.program->bindings.call_state_dword,
+			    step->report, step->target, input_info.stage.program->info.uses_bvh ? 1 : 0));
+		}
+	}
 	if (step != nullptr && input_info.stage.program->bindings.call_state_dword !=
 	                         ShaderRecompiler::IR::PushData::NoStart) {
 		const auto dword = input_info.stage.program->bindings.call_state_dword;
@@ -1115,6 +1125,16 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	auto& bindings = m_compute_bindings;
 	CpGaps::Phase(CpGaps::Cat::DispatchBind);
 	PrepareBindings(input_info.stage, bindings);
+	if (step != nullptr) {
+		// KYTY_CALL_PARTITIONS: the first steps, to see that the parameters reach the program.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_CALL_PARTITIONS: step of CS 0x{:016x}: call-state dword {}, report 0x{:x}, target 0x{:x}, bvh {}\n",
+			    input_info.stage.program->shader_hash, input_info.stage.program->bindings.call_state_dword,
+			    step->report, step->target, input_info.stage.program->info.uses_bvh ? 1 : 0));
+		}
+	}
 	if (step != nullptr && input_info.stage.program->bindings.call_state_dword !=
 	                         ShaderRecompiler::IR::PushData::NoStart) {
 		const auto dword = input_info.stage.program->bindings.call_state_dword;
