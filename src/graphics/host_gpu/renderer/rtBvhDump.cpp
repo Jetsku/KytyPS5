@@ -381,6 +381,11 @@ void WatchReadOnDispatch(uint64_t shader_hash, std::span<const uint32_t> user_sg
 	auto& list  = WatchReadList();
 	auto  match = std::find_if(list.begin(), list.end(), [&](const auto& s) { return s.hash == shader_hash; });
 	if (match == list.end()) return;
+	static const int from_frame = [] {
+		const char* value = std::getenv("KYTY_WATCH_READ_FROM_FRAME");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (frame < from_frame) return;
 	static uint32_t ordinal = 0;
 	static const uint32_t max = [] {
 		const char* value = std::getenv("KYTY_WATCH_READ_MAX");
