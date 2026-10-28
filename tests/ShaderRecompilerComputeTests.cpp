@@ -2570,6 +2570,11 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
     }
     options.input_info.compute = &compute;
     options.wave_size = 64;
+    // KYTY_CORPUS_WAVE=32: a wave32 compute program (PPSA03671's material kernels).
+    if (const char *wave = std::getenv("KYTY_CORPUS_WAVE"); wave != nullptr && std::strcmp(wave, "32") == 0) {
+      options.wave_size = 32;
+      compute.wave_size = 32;
+    }
     // KYTY_CORPUS_DUMP_IR=1: the IR before resource tracking goes to stdout (with KYTY_DUMP_STDOUT=1),
     // also for a shader the tracker then rejects.
     if (const char *dump = std::getenv("KYTY_CORPUS_DUMP_IR"); dump != nullptr && *dump == '1') {
@@ -2686,6 +2691,13 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
     return "materialize";
   }
   *result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  // KYTY_CORPUS_SPV_OUT=<file>: the compiled SPIR-V, for spirv-val.
+  if (const char *out = std::getenv("KYTY_CORPUS_SPV_OUT"); out != nullptr && *out != 0) {
+    if (std::FILE *spv = std::fopen(out, "wb"); spv != nullptr) {
+      std::fwrite(result->spirv.data(), sizeof(u32), result->spirv.size(), spv);
+      std::fclose(spv);
+    }
+  }
   return "ok";
 }
 
