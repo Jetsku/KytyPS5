@@ -35,6 +35,7 @@
 #include <set>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -828,6 +829,102 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 		}
 		return Top;
 	};
+	// KYTY_CALL_TRACE_REACH: instruction-level successors (fallthrough and direct branch edges),
+	// built on first use; empty when an indirect branch makes them unknown.
+	std::vector<std::vector<size_t>> successors;
+	bool                             successors_built = false;
+	const auto                       build_successors = [&]() {
+		if (successors_built) {
+			return !successors.empty();
+		}
+		successors_built = true;
+		std::unordered_map<uint32_t, size_t> index_of_pc;
+		for (size_t i = 0; i < insts.size(); i++) {
+			if (insts[i].opcode == Decoder::Opcode::S_SETPC_B64) {
+				return false;
+			}
+			index_of_pc.emplace(insts[i].pc, i);
+		}
+		successors.resize(insts.size());
+		for (size_t i = 0; i < insts.size(); i++) {
+			const auto& inst = insts[i];
+			if (inst.opcode == Decoder::Opcode::S_ENDPGM) {
+				continue;
+			}
+			if (Decoder::IsDirectBranch(inst.opcode)) {
+				const auto target = index_of_pc.find(inst.branch_target);
+				if (target == index_of_pc.end()) {
+					successors.clear();
+					return false;
+				}
+				successors[i].push_back(target->second);
+				if (inst.opcode == Decoder::Opcode::S_BRANCH) {
+					continue;
+				}
+			}
+			if (i + 1 < insts.size()) {
+				successors[i].push_back(i + 1);
+			}
+		}
+		return true;
+	};
+	// Whether `to` is reachable from the successors of `from`, or (from == SIZE_MAX) from the
+	// entry, never passing `avoid`.
+	const auto reaches = [&](size_t from, size_t to, size_t avoid) {
+		std::vector<uint8_t> seen(insts.size(), 0u);
+		std::vector<size_t>  work;
+		if (from == SIZE_MAX) {
+			work.push_back(0);
+		} else {
+			work = successors[from];
+		}
+		while (!work.empty()) {
+			const auto node = work.back();
+			work.pop_back();
+			if (node == avoid || seen[node] != 0u) {
+				continue;
+			}
+			if (node == to) {
+				return true;
+			}
+			seen[node] = 1u;
+			work.insert(work.end(), successors[node].begin(), successors[node].end());
+		}
+		return false;
+	};
+	const auto reach_definition = [&](uint32_t reg, uint32_t count, size_t at) -> ptrdiff_t {
+		if (insts.empty() || !build_successors()) {
+			return Unknown;
+		}
+		ptrdiff_t writer = Unknown;
+		for (size_t i = 0; i < insts.size(); i++) {
+			bool writes = IsUnsupportedCall(insts[i]);
+			for (uint32_t r = reg; r < reg + count && !writes; r++) {
+				writes = WritesSgpr32(insts[i], r);
+			}
+			if (!writes || !reaches(i, at, SIZE_MAX)) {
+				continue;
+			}
+			if (writer != Unknown) {
+				return Unknown; // two writers reach `at`
+			}
+			writer = static_cast<ptrdiff_t>(i);
+		}
+		if (writer == Unknown) {
+			return Top; // nothing that writes the range reaches `at`: its entry value
+		}
+		const auto& inst = insts[static_cast<size_t>(writer)];
+		if (IsUnsupportedCall(inst)) {
+			return Unknown;
+		}
+		for (uint32_t r = reg; r < reg + count; r++) {
+			if (!WritesSgpr32(inst, r)) {
+				return Unknown;
+			}
+		}
+		// Every path from the entry to `at` passes the writer.
+		return reaches(SIZE_MAX, at, static_cast<size_t>(writer)) ? Unknown : writer;
+	};
 	// `also`: further identical writers when the definition crossed control flow.
 	const auto definition = [&](uint32_t reg, uint32_t count, size_t at,
 	                            std::vector<size_t>& also) -> ptrdiff_t {
@@ -908,6 +1005,16 @@ static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
 				if (entry) {
 					return Top;
 				}
+			}
+		}
+		// KYTY_CALL_TRACE_REACH (adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): the instruction-level
+		// control flow graph decides. The writers from which `at` can be reached: none, and the
+		// range holds its entry value; one that writes the whole range and that every path from
+		// the entry to `at` passes, and it is the definition. A call (its callee is not known
+		// here) counts as a writer, so a definition never crosses one that can reach `at`.
+		if (GetCodegenOptions().call_trace_reach) {
+			if (const auto reached = reach_definition(reg, count, at); reached != Unknown) {
+				return reached;
 			}
 		}
 		// Else every write of the range anywhere in the program must be the same

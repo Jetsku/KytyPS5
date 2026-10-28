@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -446,7 +447,8 @@ private:
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
 				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
 				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
-				    a.bindless != b.bindless || a.record_pointer != b.record_pointer ||
+				    a.bindless != b.bindless || a.runtime != b.runtime ||
+				    a.record_pointer != b.record_pointer ||
 				    a.nested_vsharp != b.nested_vsharp || a.nested_heap != b.nested_heap ||
 				    a.nested_keys != b.nested_keys ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
@@ -633,11 +635,15 @@ private:
 	// was skipped before, and a key the SRT walk evaluates keeps its flat slot.
 	// The masked form: `masked` is the S_AND whose result the offset adds to, `key_mask` the mask
 	// to apply to the key (UINT32_MAX when the offset is a plain key << 5).
+	// stride (KYTY_BINDLESS_STRIDE, adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): when not null,
+	// key * stride (an immediate multiply, or a shift of 3 to 12) matches too, and the stride is
+	// returned (32 for the plain key << 5); without it only key << 5 matches.
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t* key_mask = nullptr,
-	                      Inst** masked = nullptr) const {
+	                      Inst** masked = nullptr, uint32_t* stride = nullptr) const {
 		offset = 0;
 		if (key_mask != nullptr) *key_mask = UINT32_MAX;
 		if (masked != nullptr) *masked = nullptr;
+		if (stride != nullptr) *stride = 32u;
 		for (;;) {
 			auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -648,6 +654,24 @@ private:
 			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
+			}
+			if (stride != nullptr && inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), immediate) && immediate >= 3u && immediate <= 12u) {
+				key     = inst->Arg(0).Resolve();
+				*stride = 1u << immediate;
+				return key.GetType() == Type::U32;
+			}
+			if (stride != nullptr && inst->GetOpcode() == ValueOpcode::IMul32) {
+				uint32_t factor = 0;
+				if (ImmediateU32(inst->Arg(0), factor)) {
+					key = inst->Arg(1).Resolve();
+				} else if (ImmediateU32(inst->Arg(1), factor)) {
+					key = inst->Arg(0).Resolve();
+				} else {
+					return false;
+				}
+				*stride = factor;
+				return factor != 0u && key.GetType() == Type::U32;
 			}
 			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && key_mask != nullptr &&
 			    masked != nullptr && GetCodegenOptions().heap_key_mask) {
@@ -1141,6 +1165,9 @@ private:
 		uint32_t key_mask     = UINT32_MAX;
 		Inst*    masked       = nullptr;
 		bool     word0_shared = false;
+		// KYTY_BINDLESS_STRIDE: bytes from one key's T# to the next (32 for a plain T# array).
+		const bool strided      = GetCodegenOptions().bindless_strided && BindlessImagesEnabled();
+		uint32_t   table_stride = 32u;
 		// KYTY_HEAP_KEY_MASK: the table of the descriptor's plain (non-Phi) words, for
 		// ResolveDescriptorPhi.
 		const Inst* reference_table = nullptr;
@@ -1179,6 +1206,7 @@ private:
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
 			uint32_t offset = 0;
+			uint32_t current_stride = 32u;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1186,7 +1214,8 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked,
+			                      strided ? &current_stride : nullptr) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
@@ -1196,7 +1225,9 @@ private:
 				table_offset = offset;
 				key_mask     = current_mask;
 				masked       = current_masked;
-			} else if (!EquivalentValue(m_program, key, current_key) || key_mask != current_mask ||
+				table_stride = current_stride;
+			} else if (current_stride != table_stride ||
+			           !EquivalentValue(m_program, key, current_key) || key_mask != current_mask ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
@@ -1321,17 +1352,21 @@ private:
 		};
 		// A masked key is a lane value (MatchTableOffset): no enumeration covers it. A shared
 		// word 0 has no planning read for the material selector either.
-		if (masked != nullptr || word0_shared || !enumerable()) {
+		// A strided key (KYTY_BINDLESS_STRIDE) is not enumerated: the enumeration reads 32-byte T#s.
+		if (masked != nullptr || word0_shared || table_stride != 32u || !enumerable()) {
 			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
 				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
 				       ImageResourceClass::Sampled;
 			});
-			if (!BindlessImagesEnabled() || !sampled_only || table_source.dword_count != 4u) {
+			// The host reads key k's T# at table_offset + k * table_stride: any 4-byte-aligned
+			// stride that holds a T# (GT7's 188-byte material records).
+			if (!BindlessImagesEnabled() || !sampled_only || table_source.dword_count != 4u ||
+			    table_stride < 32u || (table_stride & 3u) != 0u) {
 				return false;
 			}
 			indirect              = {};
 			indirect.table_offset = table_offset;
-			indirect.table_stride = 32u;
+			indirect.table_stride = table_stride;
 			indirect.bindless     = true;
 			material_source       = {};
 		}
@@ -1953,6 +1988,12 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
+		if (const auto* descriptor = Source(source); descriptor != nullptr &&
+		                                             descriptor->indirect_descriptor.has_value() &&
+		                                             descriptor->indirect_descriptor->runtime) {
+			image.bindless = true;
+			image.runtime  = true;
+		}
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -2140,8 +2181,11 @@ private:
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
+		bool runtime = false;
 		if (indirect != nullptr) {
 			source = indirect->source;
+		} else if (handle != nullptr && TryRuntimeImage(*handle, memory, op, flags.pc, source)) {
+			runtime = true;
 		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle,
 		                      source)) {
 			return; // unresolved (KYTY_SRT_VARIANT_READS): the shader is skipped
@@ -2160,7 +2204,7 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			if (indirect != nullptr && IsBindlessPlan(*indirect)) {
+			if ((indirect != nullptr && IsBindlessPlan(*indirect)) || runtime) {
 				UseDefaultSamplerIfUnresolved(inst.Arg(1), sample_adjust, flags.pc);
 			}
 			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
@@ -2182,6 +2226,60 @@ private:
 
 	const DescriptorSource* Source(uint32_t source) const {
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
+	}
+
+	// KYTY_RUNTIME_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): a T# that is neither a
+	// value the host can evaluate nor a heap entry at a key, but eight dwords the shader loads at
+	// run time (GT7's material functions read theirs through the call record's data pointer). With
+	// bindless images, a handle only read by size queries, loads and samples becomes the shared
+	// runtime image (ImageResource::runtime): the shader looks its dwords up in the runtime image
+	// table, which the host fills as shaders request T#s.
+	bool TryRuntimeImage(Inst& handle, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                     uint32_t& source) {
+		if (!GetCodegenOptions().runtime_images || !BindlessImagesEnabled() ||
+		    handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    memory.image_r128) {
+			return false;
+		}
+		const auto readable = [](ValueOpcode opcode) {
+			const auto info = ImageOpcodeInfoOf(opcode);
+			return info.access == ImageAccess::Read &&
+			       info.resource_class == ImageResourceClass::Sampled;
+		};
+		if (!readable(op) || memory.image_dimension == Decoder::ImageDimension::Unknown ||
+		    memory.image_dimension == Decoder::ImageDimension::Dim2DMsaa ||
+		    memory.image_dimension == Decoder::ImageDimension::Dim2DMsaaArray) {
+			return false;
+		}
+		for (const auto& use: handle.Uses()) {
+			if (use.operand != 0u || !readable(use.user->GetOpcode())) {
+				return false;
+			}
+		}
+		DescriptorSource descriptor;
+		MakeSource(handle, 8u, false, false, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) {
+			return false; // the host evaluates it
+		}
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			if (handle.Arg(dword).Resolve().GetType() != Type::U32) {
+				return false;
+			}
+		}
+		DescriptorSource runtime;
+		runtime.dword_count = 8u;
+		runtime.dwords.fill(Value(0u));
+		runtime.indirect_descriptor.emplace();
+		runtime.indirect_descriptor->runtime = true;
+		source                               = InternSource(runtime);
+		if (!m_logged_runtime_image) {
+			m_logged_runtime_image = true;
+			LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x runtime image: the T# "
+			     "is loaded at run time and looked up in the runtime image table\n",
+			     m_program.shader_hash, pc);
+		}
+		return true;
 	}
 
 	void LinkImageAliases() {
@@ -2224,6 +2322,7 @@ private:
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	bool                                       m_logged_runtime_image = false;
 	bool                                       m_indirect_scalar_buffers = false;
 	bool                                       m_bda_writes              = false;
 	uint32_t                                   m_unresolved_pc = UINT32_MAX;

@@ -542,7 +542,10 @@ bool MaterializeBindlessImage(const DescriptorSource::IndirectDescriptor& indire
 	                                   .table_offset   = indirect.table_offset,
 	                                   .image          = image_index,
 	                                   .mapping_offset = mapping_offset,
-	                                   .stride         = indirect.record_pointer != UINT32_MAX
+	                                   // KYTY_BINDLESS_STRIDE: a plain heap's T#s may sit in larger
+	                                   // records (table_stride > 32); otherwise 32 bytes apart.
+	                                   .stride         = indirect.record_pointer != UINT32_MAX ||
+	                                                             indirect.table_stride > 32u
 	                                                         ? indirect.table_stride
 	                                                         : 32u,
 	                                   .record_pointer = indirect.record_pointer,
@@ -1548,6 +1551,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			continue;
 		}
 		const auto& indirect = *source->indirect_descriptor;
+		if (indirect.runtime) {
+			continue; // KYTY_RUNTIME_IMAGES: the T# is the shader's own value
+		}
 		if (indirect.bindless) {
 			// The host reads the heap's entries itself; the plan only needs the heap's V#.
 			MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
@@ -1735,6 +1741,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			    .indirect_search_iterations = image.indirect_search_iterations,
 			    .cube = image.cube,
 			    .bindless = image.bindless,
+			    .runtime = image.runtime,
 			};
 		};
 		if constexpr (Optimize) {
@@ -1761,6 +1768,16 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				const auto& indirect = *source->indirect_descriptor;
 				DescriptorValue material;
 				DescriptorValue table;
+				if (indirect.runtime) {
+					// KYTY_RUNTIME_IMAGES: bound to set 1 like a bindless image, through the runtime
+					// image heap of its binding (nothing to patch); set 0 sees a null descriptor.
+					auto& root         = specialization.images[i];
+					root.bindless      = true;
+					root.runtime       = true;
+					root.indirect_root = ImageResource::NoIndirectImage;
+					snapshot.bindless_heaps.push_back({.image = i, .runtime = true});
+					continue;
+				}
 				if (indirect.bindless) {
 					if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
 					    !MaterializeBindlessImage(indirect, table, i, snapshot, specialization)) {
@@ -1905,6 +1922,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
 		image.bindless                   = source.bindless;
+		image.runtime                    = source.runtime;
 		image.clamp_half_float           = source.clamp_half_float;
 		image.indirect_resources.clear();
 	}

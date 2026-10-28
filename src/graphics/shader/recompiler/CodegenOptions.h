@@ -386,8 +386,31 @@ struct CodegenOptions {
 	// 2D-array T# reads it as a 2D array (the GPU addresses by the T# type). The host resolves such
 	// a key into the 2D-array binding with BindlessSlotArrayFlag; the shader declares both views,
 	// samples both and selects by the flag. Off: such keys sample the placeholder, as before.
-	// (Declared here, where it fills padding: sizeof(CodegenOptions) stays 112.)
+	// (Declared here, where it filled padding; the three switches below took sizeof(CodegenOptions)
+	// to 120.)
 	bool bindless_3d_as_array = false;
+	// KYTY_RUNTIME_IMAGES=1 (default 0; on in the GT7 title preset; adapted from usa-ratt/KytyPS5-GT7
+	// 2fa6c6514): with bindless images, a sampled image whose T# the shader loads at run time (GT7's
+	// material functions read theirs through the call record's data pointer) and that is neither a
+	// value the host can evaluate nor a heap entry at a key, becomes a runtime image
+	// (ImageResource::runtime): the shader hashes the eight T# dwords and looks them up in the
+	// runtime image table (set 1, bindings 7 and 8); a T# the table lacks samples the pending
+	// placeholder and is requested, and the host resolves it like a heap key. Off: such a program
+	// is skipped ("descriptor computed at runtime without a BDA path"), as before.
+	bool runtime_images = false;
+	// KYTY_BINDLESS_STRIDE=1 (default 0; on in the GT7 title preset; adapted from
+	// usa-ratt/KytyPS5-GT7 a6cd035f0): a bindless heap T# selected as key * stride (an immediate
+	// multiply, or a shift other than 5) with a 4-byte-aligned stride of at least 32 bytes (GT7's
+	// 188-byte material records) is looked up like a plain heap; the host reads key k's T# at
+	// table_offset + k * stride. Off: only 32-byte T# arrays, as before.
+	bool bindless_strided = false;
+	// KYTY_CALL_TRACE_REACH=1 (default 0; on in the GT7 title preset; adapted from
+	// usa-ratt/KytyPS5-GT7 a6cd035f0): when the S_SWAPPC_B64 table trace finds no unique definition
+	// of a register range across control flow, it asks the instruction-level control flow graph:
+	// the writers from which the use can be reached; none (the range holds its entry value) or one
+	// that every path from the entry passes. Only programs whose trace failed change; not in the
+	// fingerprint (as KYTY_CALL_TRACE_WAVE32).
+	bool call_trace_reach = false;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the

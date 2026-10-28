@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -78,6 +79,12 @@ struct BindlessHeap {
 	// how many resolved images. Unchanged since, only the images resolved after need a look.
 	uint64_t checked_generation = 0;
 	size_t   checked_count      = 0;
+	// KYTY_RUNTIME_IMAGES: a runtime heap (BindlessTable::RuntimeHeap). Its keys are T#s shaders
+	// loaded at run time and asked for, kept here, not entries of a guest table; nothing of it is
+	// read from guest memory.
+	bool                                 runtime          = false;
+	uint32_t                             runtime_next_key = 0;
+	std::vector<std::array<uint32_t, 8>> runtime_dwords;
 };
 
 // Descriptor set 1 of every pipeline that samples bindless images: typed arrays of sampled
@@ -101,6 +108,11 @@ public:
 	              Images3D == ShaderRecompiler::IR::BindlessImages3D &&
 	              Translation == ShaderRecompiler::IR::BindlessTranslation &&
 	              Feedback == ShaderRecompiler::IR::BindlessFeedback);
+	// The runtime image bindings (BindlessBindings.h); the enum values above index nothing else.
+	static constexpr uint32_t RuntimeTableBinding    = ShaderRecompiler::IR::BindlessRuntimeTable;
+	static constexpr uint32_t RuntimeRequestsBinding = ShaderRecompiler::IR::BindlessRuntimeRequests;
+	// Keys of each binding's runtime heap (the T#s runtime images requested).
+	static constexpr uint32_t RuntimeKeys = 8192;
 	static constexpr uint32_t ImageArrays        = 4;
 	static constexpr uint32_t PlaceholderColors  = 3;
 	static_assert(ShaderRecompiler::IR::BindlessPendingSlot < PlaceholderColors);
@@ -209,7 +221,21 @@ public:
 	// now on (and the current recording, update-after-bind) samples. True when a slot held one.
 	bool ReleaseViews(std::span<const CachedImageView> views);
 
+	// KYTY_RUNTIME_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): whether set 1 has the
+	// runtime image table and request buffer (the switch with bindless images).
+	[[nodiscard]] static bool RuntimeImagesEnabled();
+	// The runtime heap of a set-1 image binding, created on first use with `resource` (the first
+	// runtime image that reads it); null when the switch is off or the translation buffer is full.
+	[[nodiscard]] Heap* RuntimeHeap(uint32_t binding, const ShaderRecompiler::IR::ImageResource* resource);
+	// The T#s (and bindings) shaders requested before the last snapshot; the request buffer is
+	// cleared for new requests.
+	void TakeRuntimeRequests(std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>>& requests);
+	// The key of a T# in its binding's runtime heap, added (pending) when new, and published in
+	// the runtime image table; UINT32_MAX when the heap is full.
+	[[nodiscard]] uint32_t RuntimeKey(Heap& heap, const std::array<uint32_t, 8>& dwords);
+
 private:
+	void PublishRuntimeEntry(const Heap& heap, uint32_t key, const std::array<uint32_t, 8>& dwords);
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
 	// Slots 0-2 of every image array: a 1x1 texture of that view type, sampled for keys outside a
 	// heap and while a texture is pending. Created and cleared once, in the current recording.
@@ -264,6 +290,11 @@ private:
 	std::unique_ptr<Buffer>                 m_translation;
 	std::unique_ptr<Buffer>                 m_feedback;
 	std::unique_ptr<Buffer>                 m_feedback_snapshot;
+	std::unique_ptr<Buffer>                 m_runtime_table;
+	std::unique_ptr<Buffer>                 m_runtime_requests;
+	std::unique_ptr<Buffer>                 m_runtime_requests_snapshot;
+	std::array<Heap*, ImageArrays>          m_runtime_heaps {};
+	std::map<std::pair<uint32_t, std::array<uint32_t, 8>>, uint32_t> m_runtime_keys;
 	uint64_t                                m_snapshot_tick = 0; // 0 = none recorded
 	// The view each image slot holds, and the slots each view is in (placeholders excluded).
 	std::array<std::vector<vk::ImageView>, ImageArrays>                          m_slot_views;

@@ -225,6 +225,10 @@ struct ImageResource {
 	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
 	// table gives for the handle's key; the mapping offset locates the heap's region and size.
 	bool                          bindless          = false;
+	// KYTY_RUNTIME_IMAGES, with bindless: the handle holds the eight T# dwords the shader loaded at
+	// run time (from a material record, say). The shader looks the T# up in the runtime image
+	// table (set 1) and decodes its size from the dwords; one resource serves every such T#.
+	bool                          runtime           = false;
 	// KYTY_FLOAT_STORE_CLAMP: a storage image of a 16-bit float format whose float stores clamp
 	// finite values beyond the half range to the largest half, as the guest GPU's conversion.
 	bool                          clamp_half_float  = false;
@@ -676,6 +680,9 @@ struct DescriptorSource {
 		bool     table_scalar = false;
 		// No enumeration: the shader looks the key up in the bindless translation table.
 		bool     bindless     = false;
+		// KYTY_RUNTIME_IMAGES: no table either; the T# is a value the shader loads
+		// (ImageResource::runtime).
+		bool     runtime      = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		// Bindless through a record pointer: the key selects a table_stride-byte record of the
 		// table, whose 64-bit word at this byte offset points at the T# (table_offset bytes past

@@ -28,6 +28,8 @@ struct ResourceSpecialization {
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          bindless                   = false;
+		// KYTY_RUNTIME_IMAGES (ImageResource::runtime).
+		bool                          runtime                    = false;
 		// KYTY_EQAA_MIXED, EQAA FMASK only: colour fragments stored per pixel (1, 2, 4 or 8) when
 		// the format has fewer fragments than coverage samples, so samples share fragments; 0
 		// otherwise (the identity map).
