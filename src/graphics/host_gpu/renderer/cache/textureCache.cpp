@@ -6061,6 +6061,16 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 	MarkImageGpuModified(image);
 }
 
+// KYTY_STENCIL_PLANE_FILL_CLEAR=1 (default off; GT7 preset): ClearImageFromBuffer also takes a fill
+// that covers exactly a depth target's stencil plane as a stencil clear of that target.
+static bool StencilPlaneFillClearEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STENCIL_PLANE_FILL_CLEAR");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
 	KYTY_GPU_OP_SITE("texcache.clear_from_buffer");
@@ -6094,6 +6104,12 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		           owner->info.data.size == size) {
 			candidate = owner->info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
 			                                  : vk::ImageAspectFlagBits::eColor;
+		} else if (StencilPlaneFillClearEnabled() && !owner->depth_id && owner->info.IsDepth() &&
+		           owner->info.HasStencil() && owner->backing.image != nullptr &&
+		           owner->info.stencil.address == address && owner->info.stencil.size == size) {
+			// KYTY_STENCIL_PLANE_FILL_CLEAR: a fill of exactly a depth target's stencil plane clears its
+			// stencil aspect (GT7's course-map preview: CS 0xfdc68063b0791828 every frame).
+			candidate = vk::ImageAspectFlagBits::eStencil;
 		}
 		if (!candidate) {
 			continue;
