@@ -338,12 +338,19 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 // metadata is not theirs, so the materialisation does nothing for them (reported a few times).
 // KYTY_CLEAR_TRACE=1 (diagnostic): one stderr line per metadata address and outcome of the DCC/CMASK
 // clear materialisation.
-bool CmaskAliasSupersededEnabled() {
-	static const bool enabled = [] {
+// 0 off, 1 the aliases no longer refuse the clear (decided from the CMASK bytes as usual), 2 the
+// target is cleared once per GC tick without reading or writing the CMASK bytes (the aliases are
+// live images sharing the memory within the frame; writing the bytes dirties them).
+int CmaskAliasSupersededMode() {
+	static const int mode = [] {
 		const auto* value = std::getenv("KYTY_CMASK_ALIAS_SUPERSEDED");
-		return value != nullptr && value[0] != '\0' && value[0] != '0';
+		return value != nullptr ? std::atoi(value) : 0;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool CmaskAliasSupersededEnabled() {
+	return CmaskAliasSupersededMode() != 0;
 }
 
 void ClearTrace(const char* site, const char* outcome, uint64_t metadata, uint64_t metadata_size,
@@ -4843,29 +4850,48 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 					superseded_only &= other.address < data_end && data_begin < other.address + other.size;
 				}
 			}
-			if (!aliases.empty() && !superseded_only) {
-				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
-				// KYTY_CLEAR_TRACE: which images cover the CMASK bytes (first time per metadata address).
+			{
+				// KYTY_CLEAR_TRACE: the images covering the CMASK bytes with their LRU ticks against the
+				// target's and the GC tick (first 60 decisions), to tell stale aliases from live ones.
 				static const bool trace = [] {
 					const auto* value = std::getenv("KYTY_CLEAR_TRACE");
 					return value != nullptr && value[0] != '\0' && value[0] != '0';
 				}();
-				static std::unordered_set<uint64_t> traced;
-				if (trace && traced.insert(metadata.address).second) {
+				static uint32_t traced = 0;
+				if (trace && !aliases.empty() && traced < 60) {
+					traced++;
+					std::fprintf(stderr, "ClearTrace: CMASK alias meta=0x%llx target tick %llu gc tick %llu superseded_only %d\n",
+					             static_cast<unsigned long long>(metadata.address),
+					             static_cast<unsigned long long>(m_slot_images[id].lru_tick),
+					             static_cast<unsigned long long>(m_gc_tick), superseded_only ? 1 : 0);
 					for (const auto alias: aliases) {
-						const auto& other = m_slot_images[alias].info;
+						const auto& image = m_slot_images[alias];
+						const auto& other = image.info;
 						std::fprintf(stderr,
-						             "ClearTrace: CMASK alias meta=0x%llx+0x%llx covered by image 0x%llx+0x%llx %ux%u "
-						             "samples %u layers %u levels %u\n",
-						             static_cast<unsigned long long>(metadata.address),
-						             static_cast<unsigned long long>(metadata.size),
+						             "ClearTrace:   covered by image 0x%llx+0x%llx %ux%u samples %u tick %llu\n",
 						             static_cast<unsigned long long>(other.data.address),
 						             static_cast<unsigned long long>(other.data.size), other.extent.width,
 						             other.extent.height, static_cast<unsigned>(other.samples),
-						             static_cast<unsigned>(other.TransferLayers()),
-						             static_cast<unsigned>(other.resources.levels));
+						             static_cast<unsigned long long>(image.lru_tick));
 					}
 				}
+			}
+			if (!aliases.empty() && superseded_only && CmaskAliasSupersededMode() == 2) {
+				static std::unordered_map<uint64_t, uint64_t> cleared_at;
+				auto& tick = cleared_at[metadata.address];
+				if (tick != m_gc_tick + 1u) {
+					tick = m_gc_tick + 1u;
+					ClearImage(m_scheduler.Current(), id, view.format,
+					           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+					            view.base_layer + slice, 1},
+					           clear, "cmask-alias-frame-clear");
+					ClearTrace("CMASK", "alias-frame-clear", metadata.address, metadata.size, desc.info.data.address,
+					           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
+				}
+				continue;
+			}
+			if (!aliases.empty() && !superseded_only) {
+				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
 				ClearTrace("CMASK", "aliased", metadata.address, metadata.size, desc.info.data.address,
 				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 				continue;
