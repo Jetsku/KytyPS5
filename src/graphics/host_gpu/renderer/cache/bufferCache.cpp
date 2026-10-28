@@ -1,5 +1,6 @@
 #include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/watchRange.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -4717,6 +4718,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 		// A range already contained is left as it is (the Add would change nothing).
 		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
 			CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtyAdd);
+			WatchRange::Note("GPU-modified range #1", vaddr, size);
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
 		NoteBufferContentWrite(vaddr, size);
@@ -4757,6 +4759,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 		PreserveImagesForGpuWrite(id, range.address, range.size);
 		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
 			CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::BufferDirtyAdd);
+			WatchRange::Note("GPU-modified range #2", range.address, range.size);
 			m_gpu_modified_ranges.Add(range.address, range.size);
 		}
 		NoteBufferContentWrite(range.address, range.size);
@@ -5102,6 +5105,7 @@ void BufferCache::CommitImageBytes(Buffer& buffer, const RangeSet& ranges) {
 		if (!m_gpu_modified_ranges.Contains(begin, size)) {
 			CleanVerdict::Invalidate(begin, size, Coherence::Source::BufferDirtyAdd);
 		}
+		WatchRange::Note("GPU-modified range #3", begin, size);
 		m_gpu_modified_ranges.Add(begin, size);
 		NoteBufferContentWrite(begin, size);
 		ForgetKnownFills(begin, size);
@@ -6432,6 +6436,7 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 		if (!m_gpu_modified_ranges.Contains(start, bytes)) {
 			CleanVerdict::Invalidate(start, bytes, Coherence::Source::BufferDirtyAdd);
 		}
+		WatchRange::Note("GPU-modified range #4", start, bytes);
 		m_gpu_modified_ranges.Add(start, bytes);
 		NoteBufferContentWrite(start, bytes);
 		ForgetKnownFills(start, bytes);

@@ -312,6 +312,7 @@ public:
 			}
 		});
 		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
+		if (is_written && WatchRange::Enabled()) WatchRange::Note("written binding takes GPU ownership", vaddr, size);
 		upload_func();
 		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the
 		// only writer (BufferCache::ObtainBuffer) bumps when it adds the exact dirty range.
@@ -370,6 +371,7 @@ public:
 				    late_range_func(address, range_bytes);
 			    });
 		});
+		if (WatchRange::Enabled()) WatchRange::Note("written binding takes GPU ownership (late copy)", vaddr, size);
 		late_upload_func();
 		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->template ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset,
