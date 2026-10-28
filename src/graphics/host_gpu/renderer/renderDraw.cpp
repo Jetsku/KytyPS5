@@ -2448,8 +2448,10 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 // later draw's structure depends on and needs no barrier against the next one. Its mip-statistics
 // counters (an emulator buffer, unordered atomics) are allowed.
 // buffer_writes (KYTY_DRAW_RUN_WRITES): V# buffer writes and atomics are allowed as well.
+// fault_buffer_ok (the pipeline-skip decision with KYTY_PIPELINE_SKIP_FAULT_BUFFER): the fault
+// buffer binding is allowed too.
 static bool DrawRunProgramEligible(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                   bool buffer_writes = false) {
+                                   bool buffer_writes = false, bool fault_buffer_ok = false) {
 	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
 	if (program.has_address_writes) {
 		return false;
@@ -2465,11 +2467,24 @@ static bool DrawRunProgramEligible(const ShaderRecompiler::IR::CompiledShaderInf
 		}
 	}
 	for (const auto& binding: program.bindings.descriptors) {
-		if (binding.kind == Kind::Gds || binding.kind == Kind::FaultBuffer) {
+		if (binding.kind == Kind::Gds || (binding.kind == Kind::FaultBuffer && !fault_buffer_ok)) {
 			return false;
 		}
 	}
 	return true;
+}
+
+// KYTY_PIPELINE_SKIP_FAULT_BUFFER=1 (default off; on in the GT7 preset): a program whose only
+// "write" is the fault buffer may have its draws skipped while their pipeline builds. Every program
+// that reads memory through BDA gets that binding (BindingLayout, info.uses_dma): it reports pages
+// that must be faulted in, and a skipped draw loses only that report (the next draw that runs
+// reports them again). Most of GT7's draws have it, so they all waited for their pipelines.
+static bool SkipFaultBufferEnabled() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_FAULT_BUFFER");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
 }
 
 // KYTY_PIPELINE_SKIP: whether a draw may be skipped while the driver builds its new pipeline
@@ -2621,13 +2636,15 @@ static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState
 		return SkipRefusal::NotRecurrent;
 	}
 	for (const auto& stage: vertex_stages) {
-		if (stage.stage.program == nullptr || !DrawRunProgramEligible(*stage.stage.program)) {
+		if (stage.stage.program == nullptr ||
+		    !DrawRunProgramEligible(*stage.stage.program, false, SkipFaultBufferEnabled())) {
 			if (stage.stage.program != nullptr) NoteProgramRefusal(*stage.stage.program);
 			return SkipRefusal::Program;
 		}
 	}
 	if (state.ps_active && (state.ps_input_info.stage.program == nullptr ||
-	                        !DrawRunProgramEligible(*state.ps_input_info.stage.program))) {
+	                        !DrawRunProgramEligible(*state.ps_input_info.stage.program, false,
+	                                                SkipFaultBufferEnabled()))) {
 		if (state.ps_input_info.stage.program != nullptr) NoteProgramRefusal(*state.ps_input_info.stage.program);
 		return SkipRefusal::Program;
 	}
