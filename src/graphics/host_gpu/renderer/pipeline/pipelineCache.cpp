@@ -527,14 +527,56 @@ struct GraphicsContent {
 	std::vector<std::pair<uint64_t, uint64_t>> identities;
 };
 
+// Why a graphics pipeline gets no journal key (logged once per reason): which part of its create
+// info GraphicsPipelineSnapshot::Capture or Serialize does not copy.
+void NoteUnkeyedPipeline(const vk::GraphicsPipelineCreateInfo& info, bool serialize_failed) {
+	std::string why;
+	const auto  chain = [](const void* next) {
+		std::string types;
+		for (const auto* base = static_cast<const vk::BaseInStructure*>(next); base != nullptr; base = base->pNext) {
+			types += fmt::format(" {}", static_cast<uint32_t>(base->sType));
+		}
+		return types;
+	};
+	if (serialize_failed) why += " module-without-hash";
+	if (info.pMultisampleState != nullptr && info.pMultisampleState->pNext != nullptr)
+		why += " multisample-pNext" + chain(info.pMultisampleState->pNext);
+	if (info.pMultisampleState != nullptr && info.pMultisampleState->pSampleMask != nullptr) why += " sample-mask";
+	if (info.pRasterizationState != nullptr && info.pRasterizationState->pNext != nullptr)
+		why += " raster-pNext" + chain(info.pRasterizationState->pNext);
+	if (info.pDepthStencilState != nullptr && info.pDepthStencilState->pNext != nullptr) why += " depth-pNext";
+	if (info.pColorBlendState != nullptr && info.pColorBlendState->pNext != nullptr)
+		why += " blend-pNext" + chain(info.pColorBlendState->pNext);
+	if (info.pViewportState != nullptr && info.pViewportState->pNext != nullptr)
+		why += " viewport-pNext" + chain(info.pViewportState->pNext);
+	if (info.pTessellationState != nullptr) why += " tessellation";
+	for (uint32_t i = 0; i < info.stageCount; i++) {
+		if (info.pStages[i].pSpecializationInfo != nullptr) why += " specialization";
+		if (info.pStages[i].pNext != nullptr) why += " stage-pNext" + chain(info.pStages[i].pNext);
+	}
+	why += " create-pNext" + chain(info.pNext);
+	if (info.flags != vk::PipelineCreateFlags {}) why += fmt::format(" flags=0x{:x}", static_cast<uint32_t>(info.flags));
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> noted;
+	{
+		std::scoped_lock lock(mutex);
+		if (noted.size() >= 32 || !noted.insert(why).second) return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format("Pipeline journal: a pipeline without a key:{}\n", why));
+}
+
 GraphicsContent DescribeGraphicsPipeline(const vk::GraphicsPipelineCreateInfo& info,
                                          std::span<const uint32_t>             layout_signature) {
 	GraphicsContent content;
 	content.snapshot = GraphicsPipelineSnapshot::Capture(info, true);
-	if (content.snapshot == nullptr) return content;
+	if (content.snapshot == nullptr) {
+		NoteUnkeyedPipeline(info, false);
+		return content;
+	}
 	if (!content.snapshot->Serialize(content.words,
 	                                 [](vk::ShaderModule module) { return g_shader_modules.HashOf(module); })) {
 		content.words.clear();
+		NoteUnkeyedPipeline(info, true);
 		return content;
 	}
 	content.snapshot_words = static_cast<uint32_t>(content.words.size());
@@ -2518,6 +2560,9 @@ struct PipelineCache::ProgramCache {
 			pixel_rate_checked.fetch_add(1, std::memory_order_relaxed);
 		}
 		const auto                   variant_module = CompileSPV(variant, device);
+		// Registered by content, so pipelines that use the copy keep a journal key (they had none:
+		// GT7 logged over 1024 "other pipelines created without a journal key").
+		if (variant_module != nullptr) g_shader_modules.Add(variant_module, variant);
 		static std::atomic<uint32_t> logged {0};
 		if (variant_module != nullptr && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 			LOGF("Pipeline: pixel shader 0x%016" PRIx64
@@ -2554,6 +2599,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		const auto module = CompileSPV(variant, device);
+		if (module != nullptr) g_shader_modules.Add(module, variant); // a journal key for its pipelines
 		if (module != nullptr && normalized_copies.fetch_add(1, std::memory_order_relaxed) < 8) {
 			LOGF("Pipeline: hull shader 0x%016" PRIx64
 			     " samples at an explicit LOD: a copy with normalized coordinates is used where "
