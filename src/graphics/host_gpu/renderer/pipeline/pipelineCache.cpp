@@ -2181,7 +2181,9 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		    : resource_plan(std::move(plan)),
+		      workgroup_counts(ShaderRecompiler::GetCodegenOptions().workgroup_images &&
+		                       ShaderRecompiler::IR::PlanReadsWorkgroupCounts(resource_plan)) {
 			if (!ResourceDependencyCacheEnabled()) return;
 			using namespace ShaderRecompiler::IR;
 			// ExtractResourcePlan clones every descriptor, flat read, branch condition,
@@ -2210,6 +2212,9 @@ struct PipelineCache::ProgramCache {
 
 		// Sealed at extraction; evaluation never writes to it.
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
+		// KYTY_WORKGROUP_IMAGES: the plan enumerates images over the dispatch's workgroup counts,
+		// which reuse's read certificates do not cover: such a source always refreshes.
+		bool                               workgroup_counts = false;
 		std::vector<uint32_t>              user_dependencies;
 		bool                               projected_key = false;
 		PermutationList                    permutations;
@@ -2790,8 +2795,9 @@ struct PipelineCache::ProgramCache {
 		read_attempt.count = 0;
 		read_attempt.materialization_failed = false;
 		read_attempt.overflow = false;
-		if (ResourceReuseEnabled() ? MaterializeReusing(source, runtime, evaluation, scratch, prep)
-		                           : MaterializeStage(source, runtime, evaluation, prep)) {
+		if (ResourceReuseEnabled() && !source.workgroup_counts
+		        ? MaterializeReusing(source, runtime, evaluation, scratch, prep)
+		        : MaterializeStage(source, runtime, evaluation, prep)) {
 			return true;
 		}
 		// A failed clean probe only declines speculative preparation; the ordered draw retries.

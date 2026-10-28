@@ -947,6 +947,109 @@ void CheckStridedHeap() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 
+// KYTY_WORKGROUP_IMAGES (adapted from upstream KytyPS5 0ee880090, nmzik; CPU only, so it lives with
+// the bindless cases): GT7's CS 0xe042c5de1f18d724 reads a storage T# per Z workgroup from
+// 148-byte records (S_MUL_I32 of the workgroup id, S_BUFFER_LOAD_DWORDX8) and stores to it. Without
+// the switch the program is skipped; with it the T# table is enumerated over the dispatch's Z
+// workgroups and each group stores to its own image.
+void CheckWorkgroupStorageImage() {
+  constexpr const char *name = "WorkgroupStorageImage";
+  std::vector<u32> code;
+  code.push_back(EncodeSop2(0x26u, 106, 12, 255u)); // s_mul_i32 vcc_lo, s12, 148
+  code.push_back(148u);
+  code.push_back(EncodeSmem0(0x0bu, 32, 2)); // s_buffer_load_dwordx8 s[32:39], s[4:7], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 2, 0u); // x
+  AppendVMovLiteral(&code, 3, 0u); // y
+  for (u32 component = 0; component < 4u; component++) {
+    AppendVMovLiteral(&code, 4 + component, 0x3f800000u);
+  }
+  // image_store v[4:7], v[2:3], s[32:39] dmask 0xf dim 2D
+  code.push_back(EncodeMimg0(0x08u, 0xfu, 0, false, 1));
+  code.push_back(EncodeMimg1(4, 2, 32 / 4, 0));
+  AppendEnd(&code);
+  // s[4:7]: the record table, 0x400 bytes from 0x4000 (eight user SGPRs; s12 is the group id).
+  std::array<u32, 8> user_data{};
+  user_data[4] = 0x4000u;
+  user_data[6] = 0x400u;
+  user_data[7] = 0x5204u;
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  compute_info.group_id[2] = true;
+  compute_info.workgroup_register = 12;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  {
+    codegen.workgroup_images = false;
+    ScopedCodegenOptions scope(codegen);
+    Require(name, "switch off", ShaderRecompiler::TranslateProgram(code, options).skip_dispatch,
+            "the workgroup-indexed T# was planned without KYTY_WORKGROUP_IMAGES");
+  }
+  codegen.workgroup_images = true;
+  ScopedCodegenOptions scope(codegen);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the workgroup-indexed T# was skipped with KYTY_WORKGROUP_IMAGES");
+  const auto &images = translated.program.info.images;
+  Require(name, "plan",
+          images.size() == 1u && images[0].written &&
+              images[0].resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage,
+          "expected one storage image");
+  const auto &source = translated.program.descriptor_sources.at(images[0].source);
+  Require(name, "plan",
+          source.indirect_descriptor.has_value() && !source.indirect_descriptor->bindless &&
+              source.indirect_descriptor->workgroup_axis == 2u &&
+              source.indirect_descriptor->table_stride == 148u &&
+              source.indirect_descriptor->table_offset == 0u,
+          "the image is not a table indexed by workgroup Z");
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  Require(name, "plan", ShaderRecompiler::IR::PlanReadsWorkgroupCounts(plan),
+          "the plan does not report that it reads the workgroup counts");
+  // Two Z groups, two images (32-bit float RGBA, 1x1) in records 148 bytes apart.
+  std::vector<u32> memory(0x4000u, 0u);
+  for (u32 group = 0; group < 2u; group++) {
+    auto *tsharp = memory.data() + (0x4000u + group * 148u) / 4u;
+    tsharp[0] = 0x100u * (group + 1u);
+    tsharp[1] = static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    tsharp[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+  }
+  const std::array<u32, 3> groups{1u, 1u, 2u};
+  ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  // No counts (an indirect dispatch whose arguments were not read): no materialization.
+  (void)ShaderRecompiler::IR::TakeWorkgroupCountsMissing();
+  Require(name, "no counts",
+          !ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              ShaderRecompiler::IR::TakeWorkgroupCountsMissing(),
+          "the table materialized without workgroup counts");
+  runtime.workgroup_counts = groups;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              specialization.images.size() == 2u && resources.images.size() == 2u &&
+              resources.images[0].dwords[0] == 0x100u && resources.images[1].dwords[0] == 0x200u &&
+              specialization.images[0].indirect_search_iterations != 0u &&
+              specialization.images[1].indirect_root == 0u,
+          "the two Z groups did not materialize one image each");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "SPIR-V", CountSpirv(result.spirv, "OpImageWrite") == 2u,
+          "the store does not write each group's image");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
 // KYTY_CALL_TRACE_REACH (adapted from usa-ratt/KytyPS5-GT7 a6cd035f0; CPU only, so it lives with
 // the bindless cases): GT7's CS 0x2218a07ab01d4f46 loads its call table V# from the user-data
 // pointer s[12:13] after a branch, and writes s12 again only after the call, in a loop that does
@@ -1021,6 +1124,7 @@ void RunCodegen() {
   CheckVolumeOverArray();
   CheckRuntimeImage();
   CheckStridedHeap();
+  CheckWorkgroupStorageImage();
   CheckCallTraceReach();
 }
 

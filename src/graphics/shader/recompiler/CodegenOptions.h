@@ -495,6 +495,14 @@ struct CodegenOptions {
 	// folds the shifted patch ordinal; HS and TES share the patch-constant range the analysis
 	// found. Factor or patch-constant addresses that still do not fold skip the stage's draws.
 	bool tess_indexed = false;
+	// KYTY_WORKGROUP_IMAGES=1 (default off; the GT7 preset; adapted from upstream KytyPS5 0ee880090
+	// and c23de6218, nmzik): a compute image whose T# is read from a table at
+	// workgroup_id[axis] * stride + offset (GT7's CS 0xe042c5de1f18d724: two storage T#s per Z group
+	// in 148-byte records) is enumerated per dispatch over that axis' workgroup count
+	// (SrtRuntime::workgroup_counts): the host binds one image per group and the shader selects its
+	// own group's image by the workgroup id. Off: such a program is skipped ("computes a descriptor
+	// at runtime that has no BDA path"), as before.
+	bool workgroup_images = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,

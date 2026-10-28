@@ -37,6 +37,10 @@ Live::Switch g_buffer_refresh_fusion("KYTY_BUFFER_REFRESH_FUSION", Live::ParseDe
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
 
+// KYTY_WORKGROUP_IMAGES: set when a materialization on this thread failed for want of workgroup
+// counts (TakeWorkgroupCountsMissing).
+thread_local bool t_workgroup_counts_missing = false;
+
 bool SpecializationFail(std::string_view message) {
 	// A draw whose descriptors cannot be specialized fails again on every frame; each distinct
 	// reason is reported once (the console write costs more than the failed materialization).
@@ -581,7 +585,31 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	}
 	auto& keys = scratch.material_keys;
 	keys.clear();
-	if (!indirect.selector) {
+	// KYTY_WORKGROUP_IMAGES: T#s at table_offset + k * table_stride.
+	uint32_t key_stride = 32u;
+	if (indirect.workgroup_axis != UINT32_MAX) {
+		// KYTY_WORKGROUP_IMAGES (adapted from upstream KytyPS5 0ee880090 and c23de6218): the key is
+		// the workgroup id, so the keys are the dispatch's workgroups along that axis.
+		uint32_t key_count = 0;
+		if (runtime.workgroup_counts.size() == 3u && indirect.workgroup_axis < 3u &&
+		    std::ranges::find(runtime.workgroup_counts, 0u) == runtime.workgroup_counts.end()) {
+			key_count = runtime.workgroup_counts[indirect.workgroup_axis];
+		}
+		if (key_count == 0u) {
+			// An indirect dispatch whose arguments the GPU writes: the renderer reads them and
+			// retries (TakeWorkgroupCountsMissing).
+			t_workgroup_counts_missing = true;
+			return false;
+		}
+		if (indirect.table_stride == 0u || key_count > MaxIndirectImageProbes ||
+		    uint64_t {indirect.table_offset} + uint64_t {key_count - 1u} * indirect.table_stride +
+		            32u > UINT32_MAX + 1ull) {
+			return false;
+		}
+		key_stride = indirect.table_stride;
+		keys.resize(key_count);
+		std::iota(keys.begin(), keys.end(), 0u);
+	} else if (!indirect.selector) {
 		uint32_t key_count = 0;
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
 		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
@@ -658,7 +686,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		const auto key = keys[entry];
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
-		const auto table_offset = (key << 5u) + indirect.table_offset;
+		const auto table_offset = key * key_stride + indirect.table_offset;
 		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
 			return false;
 		}
@@ -754,6 +782,18 @@ private:
 
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
+
+bool PlanReadsWorkgroupCounts(const ResourcePlan& program) {
+	return std::ranges::any_of(program.info.images, [&](const ImageResource& image) {
+		const auto* source = Source(program, image.source);
+		return source != nullptr && source->indirect_descriptor.has_value() &&
+		       source->indirect_descriptor->workgroup_axis != UINT32_MAX;
+	});
+}
+
+bool TakeWorkgroupCountsMissing() {
+	return std::exchange(t_workgroup_counts_missing, false);
+}
 
 void SetEqaaFmaskMapForTesting(bool enabled) {
 	g_eqaa_fmask_map.store(enabled ? 1 : 0, std::memory_order_relaxed);
@@ -2049,10 +2089,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			// Enumerated candidates only sample; a bindless image is loaded per instruction and
-			// may take any sampled operation.
+			// Enumerated candidates only sample, or are stored to (KYTY_WORKGROUP_IMAGES); a
+			// bindless image is loaded per instruction and may take any sampled operation.
 			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 		}
 	}
 	// Dead-code elimination can remove an image operation (an unused IMAGE_GET_LOD result) before

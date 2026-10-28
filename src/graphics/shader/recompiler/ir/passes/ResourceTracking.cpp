@@ -638,6 +638,20 @@ private:
 	// stride (KYTY_BINDLESS_STRIDE, adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): when not null,
 	// key * stride (an immediate multiply, or a shift of 3 to 12) matches too, and the stride is
 	// returned (32 for the plain key << 5); without it only key << 5 matches.
+	// KYTY_WORKGROUP_IMAGES (adapted from upstream KytyPS5 0ee880090, nmzik): the axis of a key that
+	// is a compute program's workgroup id, or UINT32_MAX.
+	uint32_t WorkgroupAxis(Value key) const {
+		const auto* builtin = key.Resolve().TryInstruction();
+		uint32_t    axis    = UINT32_MAX;
+		if (m_program.stage != ShaderType::Compute || builtin == nullptr ||
+		    builtin->GetOpcode() != ValueOpcode::GetBuiltin || builtin->NumArgs() != 2u ||
+		    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
+		    !ImmediateU32(builtin->Arg(1), axis) || axis >= 3u) {
+			return UINT32_MAX;
+		}
+		return axis;
+	}
+
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t* key_mask = nullptr,
 	                      Inst** masked = nullptr, uint32_t* stride = nullptr) const {
 		offset = 0;
@@ -1167,6 +1181,9 @@ private:
 		bool     word0_shared = false;
 		// KYTY_BINDLESS_STRIDE: bytes from one key's T# to the next (32 for a plain T# array).
 		const bool strided      = GetCodegenOptions().bindless_strided && BindlessImagesEnabled();
+		// KYTY_WORKGROUP_IMAGES: a key that is the workgroup id may select records of any stride.
+		const bool workgroup    = GetCodegenOptions().workgroup_images &&
+		                          m_program.stage == ShaderType::Compute;
 		uint32_t   table_stride = 32u;
 		// KYTY_HEAP_KEY_MASK: the table of the descriptor's plain (non-Phi) words, for
 		// ResolveDescriptorPhi.
@@ -1207,6 +1224,18 @@ private:
 			Value current_key;
 			uint32_t offset = 0;
 			uint32_t current_stride = 32u;
+			const auto match_offset = [&] {
+				if (MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked,
+				                     strided ? &current_stride : nullptr)) {
+					return true;
+				}
+				// KYTY_WORKGROUP_IMAGES: without KYTY_BINDLESS_STRIDE, a strided form only for a
+				// workgroup-id key (every other key is rejected as before).
+				return workgroup && !strided &&
+				       MatchTableOffset(read->Arg(1), current_key, offset, &current_mask,
+				                        &current_masked, &current_stride) &&
+				       current_masked == nullptr && WorkgroupAxis(current_key) != UINT32_MAX;
+			};
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1214,9 +1243,7 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, &current_mask, &current_masked,
-			                      strided ? &current_stride : nullptr) ||
-			    memory->offset > UINT32_MAX - offset) {
+			    !match_offset() || memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
 			offset += memory->offset;
@@ -1353,7 +1380,19 @@ private:
 		// A masked key is a lane value (MatchTableOffset): no enumeration covers it. A shared
 		// word 0 has no planning read for the material selector either.
 		// A strided key (KYTY_BINDLESS_STRIDE) is not enumerated: the enumeration reads 32-byte T#s.
-		if (masked != nullptr || word0_shared || table_stride != 32u || !enumerable()) {
+		// KYTY_WORKGROUP_IMAGES (adapted from upstream KytyPS5 0ee880090 and c23de6218): a key that is
+		// the workgroup id enumerates that axis' workgroup count at each dispatch, reading key k's
+		// T# at table_offset + k * table_stride (MaterializeIndirectImage); any user, storage
+		// images too. Words the shader also uses as values stay real reads (above).
+		const uint32_t workgroup_axis =
+		    workgroup && masked == nullptr && !word0_shared ? WorkgroupAxis(key) : UINT32_MAX;
+		if (workgroup_axis != UINT32_MAX) {
+			if (table_stride == 0u || (table_stride & 3u) != 0u || (table_offset & 3u) != 0u) {
+				return false;
+			}
+			indirect.table_stride   = table_stride;
+			indirect.workgroup_axis = workgroup_axis;
+		} else if (masked != nullptr || word0_shared || table_stride != 32u || !enumerable()) {
 			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
 				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
 				       ImageResourceClass::Sampled;

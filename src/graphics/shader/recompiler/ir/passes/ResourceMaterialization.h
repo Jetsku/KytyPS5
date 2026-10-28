@@ -58,6 +58,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// KYTY_WORKGROUP_IMAGES: whether the plan enumerates images over the dispatch's workgroup counts
+// (DescriptorSource::IndirectDescriptor::workgroup_axis). Such a plan's materialization depends on
+// SrtRuntime::workgroup_counts, which no read certificate covers.
+[[nodiscard]] bool PlanReadsWorkgroupCounts(const ResourcePlan& program);
+// Whether a materialization on this thread failed since the last call because the runtime had no
+// workgroup counts (an indirect dispatch whose arguments were not read); clears the flag.
+[[nodiscard]] bool TakeWorkgroupCountsMissing();
+
 // KYTY_SPEC_UNMAPPED_NULL: whether a V# base is inside a guest mapping (the binding's test; the V#
 // is nulled when not). Null: off. Set once by the renderer before draws.
 void SetUnmappedBufferProbe(SrtMappedRange probe);

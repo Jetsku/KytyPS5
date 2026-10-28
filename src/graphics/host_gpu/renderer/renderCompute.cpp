@@ -1093,8 +1093,46 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		input_info.stage.resources = &m_compute_prep.resources;
 		compute_program            = prepared->compute_program;
 	} else {
+		// KYTY_WORKGROUP_IMAGES: images enumerated per workgroup need the dispatch's counts. Read
+		// them from guest memory when no GPU write of them is pending; when one is (or they were
+		// not read), and the program asked for them, synchronize the arguments and retry once.
+		const bool workgroup_images = ShaderRecompiler::GetCodegenOptions().workgroup_images;
+		const auto read_counts = [&] {
+			vk::DispatchIndirectCommand args {};
+			if (m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) ||
+			    !LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
+				return false;
+			}
+			input_info.workgroup_counts[0] = args.x;
+			input_info.workgroup_counts[1] = args.y;
+			input_info.workgroup_counts[2] = args.z;
+			return true;
+		};
+		bool counts_read = false;
+		if (workgroup_images) {
+			counts_read = read_counts();
+			(void)ShaderRecompiler::IR::TakeWorkgroupCountsMissing();
+		}
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_compute_prep);
+		if (workgroup_images && !compute_program &&
+		    ShaderRecompiler::IR::TakeWorkgroupCountsMissing() && !counts_read &&
+		    m_context.SynchronizeGpuBackingForRead(args_addr, sizeof(vk::DispatchIndirectCommand)) &&
+		    read_counts()) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "KYTY_WORKGROUP_IMAGES: indirect dispatch of CS 0x{:x}: GPU-written arguments "
+				    "{}x{}x{} read back for its workgroup images\n",
+				    cs_regs.cs_regs.data_addr, input_info.workgroup_counts[0],
+				    input_info.workgroup_counts[1], input_info.workgroup_counts[2]));
+			}
+			// Zero groups: nothing to run (the program stays empty and the dispatch is dropped).
+			if (std::ranges::find(input_info.workgroup_counts, 0u) == std::end(input_info.workgroup_counts)) {
+				compute_program = m_context.GetPipelineCache().GetComputeProgram(
+				    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, m_compute_prep);
+			}
+		}
 	}
 	if (step != nullptr) {
 		PipelineCache::SelectCallSplitCode(nullptr);

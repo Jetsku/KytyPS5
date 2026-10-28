@@ -140,6 +140,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.bindless_strided) {
 		b.Text("bindless_strided");
 	}
+	if (options.workgroup_images) {
+		b.Text("workgroup_images");
+	}
 	if (options.wave64_warps) {
 		b.Text("wave64_warps");
 	}
