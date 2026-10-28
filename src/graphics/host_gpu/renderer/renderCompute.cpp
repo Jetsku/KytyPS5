@@ -723,6 +723,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 
 	const auto& program   = *input_info.stage.program;
 	WatchRange::SetCurrentOp("CS", program.shader_hash);
+	WatchRange::NoteDispatch(program.shader_hash, async_compute, thread_group_x, thread_group_y, thread_group_z, false);
 	const auto& resources = *input_info.stage.resources;
 	// A recorded metadata clear consumes the dispatch unless KYTY_COMPUTE_META_CLEAR_DISPATCH keeps
 	// its guest writes (upstream 01ce97388).
@@ -1152,6 +1153,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;
 	WatchRange::SetCurrentOp("CS", program.shader_hash);
+	WatchRange::NoteDispatch(program.shader_hash, async_compute, 0, 0, 0, true);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

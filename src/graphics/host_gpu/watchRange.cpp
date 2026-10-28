@@ -78,4 +78,32 @@ void Note(const char* what, uint64_t address, uint64_t size) {
 	}
 }
 
+void NoteDispatch(uint64_t shader_hash, bool async_compute, uint32_t groups_x, uint32_t groups_y,
+                  uint32_t groups_z, bool indirect) {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_WATCH_SHADERS");
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			list.push_back(value);
+			text = *end == ',' ? end + 1 : end;
+			if (*end != ',') break;
+		}
+		return list;
+	}();
+	if (shaders.empty()) return;
+	bool listed = false;
+	for (const auto hash: shaders) listed |= hash == shader_hash;
+	if (!listed) return;
+	static std::atomic<uint32_t> lines {0};
+	const auto line = lines.fetch_add(1, std::memory_order_relaxed);
+	if (line >= Get().lines) return;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "KYTY_WATCH_SHADERS: op #{} CS 0x{:016x} on the {} queue, {} groups {}x{}x{}\n",
+	    g_ops.load(std::memory_order_relaxed), shader_hash, async_compute ? "async compute" : "graphics",
+	    indirect ? "indirect" : "direct", groups_x, groups_y, groups_z));
+}
+
 } // namespace Libs::Graphics::WatchRange

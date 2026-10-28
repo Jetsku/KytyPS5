@@ -15,6 +15,10 @@ namespace Libs::Graphics::WatchRange {
 void Note(const char* what, uint64_t address, uint64_t size);
 // The GPU operation being recorded (GPU thread): kind ("CS", "draw") and the shader hash.
 void SetCurrentOp(const char* kind, uint64_t shader_hash) noexcept;
+// KYTY_WATCH_SHADERS=<hash>[,<hash>...] (hex): logs each dispatch of those compute shaders with its
+// queue, groups and the GPU-op ordinal (KYTY_WATCH_RANGE_LINES lines), to see their order.
+void NoteDispatch(uint64_t shader_hash, bool async_compute, uint32_t groups_x, uint32_t groups_y,
+                  uint32_t groups_z, bool indirect);
 
 } // namespace Libs::Graphics::WatchRange
 
