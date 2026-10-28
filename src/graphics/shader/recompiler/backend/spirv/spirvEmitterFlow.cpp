@@ -174,7 +174,9 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	if (row_shift) {
 		writable = Binary(state, spv::OpLogicalAnd, TypeBool(state), writable, target.valid);
 	}
-	if (!flags.fetch_inactive) {
+	// The EXEC-disabled source rule is KYTY_DPP_SKIP_INACTIVE's (EmitDppUpdateU32 applies it too); off,
+	// the legacy zero read stays.
+	if (!flags.fetch_inactive && GetCodegenOptions().dpp_skip_inactive) {
 		// Vacated lanes target outside their row; wrapping keeps the ballot index in range.
 		auto source = target.lane;
 		if (row_shift) {
