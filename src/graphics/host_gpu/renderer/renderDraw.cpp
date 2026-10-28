@@ -1006,13 +1006,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (metadata.kind == ImageMetadataKind::Htile && metadata.range.address == MetaTraceAddress() &&
 		    MetaTraceLine()) {
 			LOGF("MetaTrace: draw frame %d depth 0x%" PRIx64 " %ux%u samples %u layer %u meta_clear %d reg_clear %d "
-			     "(%g) test %d write %d func %u\n",
+			     "(%g) test %d write %d func %u stencil_compressed %d stencil_clear %d (%u)\n",
 			     static_cast<int>(m_context.GetGpu().GetFrameNum()), depth.desc.info.data.address,
 			     depth.desc.info.extent.width, depth.desc.info.extent.height,
 			     static_cast<unsigned>(depth.desc.info.samples), depth.desc.view_info.base_layer, meta_clear ? 1 : 0,
 			     depth.depth_clear_enable ? 1 : 0, static_cast<double>(depth.depth_clear_value),
 			     depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
-			     static_cast<unsigned>(depth.depth_compare_op));
+			     static_cast<unsigned>(depth.depth_compare_op), metadata.stencil_compressed ? 1 : 0,
+			     depth.stencil_clear_enable ? 1 : 0, static_cast<unsigned>(depth.stencil_clear_value));
 		}
 		depth.load_clear_aspects = {};
 		if (depth.depth_clear_enable || meta_clear)
@@ -4177,14 +4178,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (traced.fetch_add(1, std::memory_order_relaxed) < trace_depth.second) {
 			const auto& d = state.depth_info;
 			LOGF("DrawTraceDepth: frame %d VS 0x%016" PRIx64 " PS 0x%016" PRIx64
-			     " n=%u inst=%u colors=%u color0 0x%" PRIx64 " test %d write %d func %u stencil %d clear %d (%g)\n",
+			     " n=%u inst=%u colors=%u color0 0x%" PRIx64 " test %d write %d func %u stencil %d (func %u ref %u cmask 0x%x wmask 0x%x pass %u fail %u zfail %u) clear %d (%g) sclear %d (%u)\n",
 			     static_cast<int>(m_context.GetGpu().GetFrameNum()),
 			     state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
 			     state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0,
 			     draw.index_count, draw.instance_count, state.color_count,
 			     state.color_count > 0 ? state.color_info[0].desc.info.data.address : 0, d.depth_test_enable ? 1 : 0,
 			     d.depth_write_enable ? 1 : 0, static_cast<unsigned>(d.depth_compare_op), d.stencil_test_enable ? 1 : 0,
-			     d.depth_clear_enable ? 1 : 0, static_cast<double>(d.depth_clear_value));
+			     static_cast<unsigned>(d.stencil_front.compareOp), d.stencil_front.reference, d.stencil_front.compareMask,
+			     d.stencil_front.writeMask, static_cast<unsigned>(d.stencil_front.passOp),
+			     static_cast<unsigned>(d.stencil_front.failOp), static_cast<unsigned>(d.stencil_front.depthFailOp),
+			     d.depth_clear_enable ? 1 : 0, static_cast<double>(d.depth_clear_value), d.stencil_clear_enable ? 1 : 0,
+			     static_cast<unsigned>(d.stencil_clear_value));
 		}
 	}
 	// KYTY_DRAW_TRACE_PS=<hash>[:<sgpr>:<offset>] (diagnostic): logs the first 16 draws with this
