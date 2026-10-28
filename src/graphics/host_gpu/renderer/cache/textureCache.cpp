@@ -6130,6 +6130,29 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		aspect       = candidate;
 		subresources = candidate_subresources;
 	}
+	// KYTY_STENCIL_PLANE_FILL_CLEAR: a depth image's stencil plane is not on its registered pages; look
+	// for depth images up to 64 MiB below the fill whose stencil plane is exactly the filled range.
+	if (!selected && StencilPlaneFillClearEnabled() && address > 0x10000u) {
+		constexpr uint64_t Window = uint64_t {64} << 20u;
+		const uint64_t     begin  = address > Window ? address - Window : 0x10000u;
+		for (const auto id: FindImagesInRegion(begin, address - begin, false)) {
+			const auto* owner = m_slot_images.try_get(id);
+			if (owner == nullptr || owner->depth_id || !owner->info.IsDepth() || !owner->info.HasStencil() ||
+			    owner->backing.image == nullptr || owner->info.stencil.address != address ||
+			    owner->info.stencil.size != size) {
+				continue;
+			}
+			const ImageSubresourceRange candidate_subresources {0, owner->info.resources.levels, 0,
+			                                                    owner->info.TransferLayers()};
+			if (selected && (selected != id || subresources != candidate_subresources)) {
+				return false;
+			}
+			selected     = id;
+			stencil_id   = id;
+			aspect       = vk::ImageAspectFlagBits::eStencil;
+			subresources = candidate_subresources;
+		}
+	}
 	if (!selected) {
 		return false;
 	}
