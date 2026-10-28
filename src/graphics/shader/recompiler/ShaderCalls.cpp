@@ -390,11 +390,22 @@ uint32_t CallPartitionMaxParts() {
 
 // After usa-ratt/KytyPS5-GT7 PartitionUnsafe (round 99): an instruction outside the call that
 // would see lanes a partition dropped (they run in another dispatch of the shader).
-std::string CallPartitionUnsafe(std::span<const uint32_t> code) {
+std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc) {
 	Decoder::Program program;
 	Decoder::DecodeProgram(code, program, true);
 	using Decoder::Opcode;
+	// The first pc a dropped lane could be missing at: the start of the outermost loop around the
+	// call (a backward branch after it to a target at or before it), else the call itself.
+	uint32_t safe_before = call_pc == UINT32_MAX ? 0u : call_pc;
+	if (call_pc != UINT32_MAX) {
+		for (const auto& inst: program.instructions) {
+			if (Decoder::IsDirectBranch(inst.opcode) && inst.pc > call_pc && inst.branch_target <= call_pc) {
+				safe_before = std::min(safe_before, inst.branch_target);
+			}
+		}
+	}
 	for (const auto& inst: program.instructions) {
+		if (inst.pc < safe_before) continue;
 		const char* why = nullptr;
 		if (inst.src0.dpp) {
 			why = "DPP reads other lanes";
@@ -462,7 +473,7 @@ bool ShaderCallExpander::Partition(std::span<const uint32_t> code, uint64_t base
 		} else if (program.calls.front().trace.user_sgpr != UINT32_MAX || !program.calls.front().trace.table) {
 			why = "the call's target is user data, not a table";
 		} else {
-			why = CallPartitionUnsafe(code);
+			why = CallPartitionUnsafe(code, program.calls.front().trace.pc);
 		}
 		program.partition_state = why.empty() ? 1 : -1;
 		Log::WriteToConsoleAndLog(
