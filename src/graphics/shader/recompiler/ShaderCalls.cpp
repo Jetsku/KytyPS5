@@ -404,6 +404,17 @@ std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc
 			}
 		}
 	}
+	// LDS reads from the loop on are allowed while nothing writes LDS there (other than a lane's own
+	// ADDTID slot): every lane wrote what they read before any lane could leave (PPSA03671's
+	// material kernels gather a tile's data that way).
+	const auto is_lds_read = [](const Decoder::Instruction& inst) {
+		return magic_enum::enum_name(inst.opcode).starts_with("DS_READ");
+	};
+	bool lds_writes_late = false;
+	for (const auto& inst: program.instructions) {
+		lds_writes_late |= inst.pc >= safe_before && inst.family == Decoder::Family::DS &&
+		                   inst.opcode != Opcode::DS_WRITE_ADDTID_B32 && !is_lds_read(inst);
+	}
 	for (const auto& inst: program.instructions) {
 		if (inst.pc < safe_before) continue;
 		const char* why = nullptr;
@@ -412,7 +423,7 @@ std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc
 		} else if (inst.gds) {
 			why = "GDS is shared between dispatches";
 		} else if (inst.family == Decoder::Family::DS && inst.opcode != Opcode::DS_READ_ADDTID_B32 &&
-		           inst.opcode != Opcode::DS_WRITE_ADDTID_B32) {
+		           inst.opcode != Opcode::DS_WRITE_ADDTID_B32 && (lds_writes_late || !is_lds_read(inst))) {
 			why = "LDS shares data between lanes";
 		} else {
 			switch (inst.opcode) {
