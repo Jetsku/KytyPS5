@@ -1003,6 +1003,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+		if (metadata.kind == ImageMetadataKind::Htile && metadata.range.address == MetaTraceAddress() &&
+		    MetaTraceLine()) {
+			LOGF("MetaTrace: draw frame %d depth 0x%" PRIx64 " %ux%u samples %u layer %u meta_clear %d reg_clear %d "
+			     "(%g) test %d write %d func %u\n",
+			     static_cast<int>(m_context.GetGpu().GetFrameNum()), depth.desc.info.data.address,
+			     depth.desc.info.extent.width, depth.desc.info.extent.height,
+			     static_cast<unsigned>(depth.desc.info.samples), depth.desc.view_info.base_layer, meta_clear ? 1 : 0,
+			     depth.depth_clear_enable ? 1 : 0, static_cast<double>(depth.depth_clear_value),
+			     depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
+			     static_cast<unsigned>(depth.depth_compare_op));
+		}
 		depth.load_clear_aspects = {};
 		if (depth.depth_clear_enable || meta_clear)
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
