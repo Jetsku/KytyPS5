@@ -481,13 +481,27 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
-	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
-	                              size)) {
+	const bool resolved_fill =
+	    ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear, size);
+	// KYTY_META_TRACE: what became of a dispatch writing the traced address (fill or not, image clear).
+	const auto trace_fill = [&](const char* what) {
+		const auto traced = MetaTraceAddress();
+		if (traced == 0 || resources.buffers.empty()) return;
+		const auto first = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[0]);
+		if (first.Base48() != traced || !MetaTraceLine()) return;
+		LOGF("MetaTrace: CS 0x%016" PRIx64 " fill kind %u resolved %d size 0x%" PRIx64 " value 0x%08x mode 0x%x groups %u %u %u: %s\n",
+		     program.shader_hash, static_cast<unsigned>(fill.kind), resolved_fill ? 1 : 0, size, packed_clear, mode,
+		     group_x, group_y, group_z, what);
+	};
+	if (!resolved_fill) {
+		trace_fill("not a uniform buffer fill");
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
+		trace_fill("no image clear");
 		return false;
 	}
+	trace_fill("image clear");
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64

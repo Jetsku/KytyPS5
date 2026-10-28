@@ -6082,8 +6082,16 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	ImageId               stencil_id {};
 	vk::ImageAspectFlags  aspect {};
 	ImageSubresourceRange subresources;
+	const bool trace_images = address == MetaTraceAddress() && MetaTraceLine();
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
+		if (trace_images && owner != nullptr) {
+			LOGF("MetaTrace: clear-from-buffer 0x%" PRIx64 " sees image data 0x%" PRIx64 "+0x%" PRIx64 " stencil 0x%" PRIx64
+			     "+0x%" PRIx64 " depth %d depth_id %d has_stencil %d\n",
+			     address, owner->info.data.address, owner->info.data.size, owner->info.stencil.address,
+			     owner->info.stencil.size, owner->info.IsDepth() ? 1 : 0, owner->depth_id ? 1 : 0,
+			     owner->info.HasStencil() ? 1 : 0);
+		}
 		if (owner == nullptr) {
 			continue;
 		}
