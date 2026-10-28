@@ -1550,14 +1550,50 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageWrite) {
 		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
 		const auto dimension  = image.dimension;
+		// KYTY_WORKGROUP_IMAGES: a table of enumerated storage images (one per workgroup); the
+		// key in the handle selects the candidate, each case writes its own binding.
+		const bool indirect = image.indirect_root == mem.resource && !image.bindless &&
+		                      image.indirect_resources.size() >= 2u;
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			const auto mip_lod =
-			    ImageResourceAt(state, mem.resource).mip_mode == IR::ImageMipMode::Dynamic
-			        ? LodU32(ctx, mem, *address, dimension)
-			        : 0u;
+			if (!indirect) {
+				const auto mip_lod =
+				    ImageResourceAt(state, mem.resource).mip_mode == IR::ImageMipMode::Dynamic
+				        ? LodU32(ctx, mem, *address, dimension)
+				        : 0u;
+				const auto coord = CoordU32(ctx, mem, *address, dimension);
+				const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
+				EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
+				return;
+			}
+			const auto* handle = image_arg.ResolveInstruction();
+			if (handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0) {
+				ctx.Fail(inst, "has invalid indirect image key provenance");
+				return;
+			}
+			// Everything the cases share is defined before the switch, so it dominates them.
+			const auto key   = ctx.Def(handle->Arg(0));
 			const auto coord = CoordU32(ctx, mem, *address, dimension);
-			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
+			const auto data  = ctx.Arg(inst, 2);
+			const bool dynamic_mip =
+			    std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
+				    return ImageResourceAt(state, resource).mip_mode == IR::ImageMipMode::Dynamic;
+			    });
+			const auto lod = dynamic_mip ? LodU32(ctx, mem, *address, dimension) : 0u;
+			const auto selected = EmitIndirectResourceIndex(
+			    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+			const auto resources = image.indirect_resources;
+			EmitIndexSwitch(state, selected, static_cast<uint32_t>(resources.size()), 0u,
+			                [&](uint32_t ordinal) {
+				                auto target     = mem;
+				                target.resource = resources[ordinal];
+				                const auto mip_lod =
+				                    ImageResourceAt(state, target.resource).mip_mode ==
+				                            IR::ImageMipMode::Dynamic
+				                        ? lod
+				                        : 0u;
+				                const auto texel = StoreTexel(ctx, target, data, uint_image);
+				                EmitStorageImageWrite(state, target.resource, mip_lod, coord, texel);
+			                });
 		});
 		return;
 	}

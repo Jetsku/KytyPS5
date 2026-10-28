@@ -2675,7 +2675,7 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
   }
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
-  const ShaderRecompiler::IR::SrtRuntime runtime{
+  ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(code.data()),
       .read_memory = [](void *, uint64_t, std::span<u32> values) {
@@ -2687,6 +2687,16 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
         return true;
       },
   };
+  // KYTY_CORPUS_WORKGROUPS="x,y,z" (default 1,1,1): the dispatch's workgroup counts, which images
+  // enumerated per workgroup read (KYTY_WORKGROUP_IMAGES).
+  std::array<u32, 3> workgroup_counts{1u, 1u, 1u};
+  if (const char *groups = std::getenv("KYTY_CORPUS_WORKGROUPS"); groups != nullptr) {
+    unsigned g[3] = {};
+    if (std::sscanf(groups, "%u,%u,%u", &g[0], &g[1], &g[2]) == 3) {
+      workgroup_counts = {g[0], g[1], g[2]};
+    }
+  }
+  runtime.workgroup_counts = workgroup_counts;
   if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
     return "materialize";
   }
