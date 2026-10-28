@@ -1830,7 +1830,24 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 	EXIT_NOT_IMPLEMENTED(packet_size_dw != 3u && packet_size_dw != 5u);
 	EXIT_NOT_IMPLEMENTED(buffer[0] > static_cast<uint32_t>(ContextStateOperation::PushClear));
 
-	cp.ApplyContextStateOperation(static_cast<ContextStateOperation>(buffer[0]));
+	const auto operation = static_cast<ContextStateOperation>(buffer[0]);
+	cp.ApplyContextStateOperation(operation);
+	// KYTY_CONTEXT_CLEAR_DEFAULTS=1 (default off; adapted from superkeka/KytyPS5-bc250 08d150a2 and
+	// 72d4449e): libSceAgc's context-state clear loads its default context (SET_CONTEXT_REG_INDIRECT
+	// of the register defaults), not zeros. Registers the command processor does not model are
+	// skipped. (Dead Cells depth failures went from 2% to ~0 in the fork.)
+	static const bool clear_defaults = [] {
+		const char* value = std::getenv("KYTY_CONTEXT_CLEAR_DEFAULTS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (clear_defaults &&
+	    (operation == ContextStateOperation::Clear || operation == ContextStateOperation::PushClear)) {
+		for (const auto& [offset, value]: Gen5::AgcContextClearDefaults()) {
+			if (offset < Pm4::CX_NUM && g_hw_ctx_indirect_func[offset] != nullptr) {
+				g_hw_ctx_indirect_func[offset](cp, offset, value);
+			}
+		}
+	}
 
 	return packet_size_dw - 1u;
 }
@@ -2591,6 +2608,12 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	if (cmd_offset == Pm4::UC_NOP) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
+	// SQ_THREAD_TRACE_USERDATA_0..7 (0x340-0x347): profiler markers (titles and libSceAgcDriver
+	// write 0x342/0x343 around passes); without a thread trace running they do nothing (from
+	// superkeka/KytyPS5-bc250 894c3e4b; before, an unknown-register exit).
+	if (cmd_offset >= 0x340u && cmd_offset + (KYTY_PM4_LEN(cmd_id) - 2u) <= 0x348u) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	if (cmd_offset >= Pm4::UC_NUM) {
 		EXIT("unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), cmd_id = 0x%08" PRIx32 "\n",
@@ -2748,6 +2771,14 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+
+	// libSceAgcDriver's debug markers write the rest of their string to SQ_THREAD_TRACE_USERDATA_3
+	// (register 0xc343, DST_SEL 0 = register): thread-trace data, nothing to do (from
+	// superkeka/KytyPS5-bc250 de408a24).
+	if (((write_control >> 8u) & 0xfu) == 0u && (write_control >> 30u) == 0u && buffer[2] == 0u &&
+	    buffer[1] >= 0xc340u && buffer[1] <= 0xc347u) {
+		return 1 + dw_num;
+	}
 
 	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
 

@@ -230,8 +230,12 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	void Wait(VideoOutConfig& cfg, int index);
-	bool IsPending(VideoOutConfig& cfg, int index);
+	void     Wait(VideoOutConfig& cfg, int index, uint64_t before);
+	bool     IsPending(VideoOutConfig& cfg, int index, uint64_t before);
+	uint64_t NextRequestId() {
+		Common::LockGuard lock(m_mutex);
+		return m_next_request_id;
+	}
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -1321,11 +1325,16 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
-void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+// `before`: only requests older than this id count (KYTY_FLIP_WATERMARK; UINT64_MAX: all). The
+// adaptation of superkeka/KytyPS5-bc250 894c3e4b: a wait evaluated after the title has already
+// requested the next flip of the same buffer does not wait for that newer flip.
+void FlipQueue::Wait(VideoOutConfig& cfg, int index, uint64_t before) {
 	Common::LockGuard lock(m_mutex);
 
-	auto has_request = [this, &cfg, index] {
-		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	auto has_request = [this, &cfg, index, before] {
+		auto matches = [&cfg, index, before](const auto& r) {
+			return r.cfg == &cfg && r.index == index && r.id < before;
+		};
 		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
@@ -1334,9 +1343,11 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::IsPending(VideoOutConfig& cfg, int index) {
+bool FlipQueue::IsPending(VideoOutConfig& cfg, int index, uint64_t before) {
 	Common::LockGuard lock(m_mutex);
-	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	auto matches = [&cfg, index, before](const auto& r) {
+		return r.cfg == &cfg && r.index == index && r.id < before;
+	};
 	return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 }
@@ -1871,20 +1882,24 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-bool VideoOutDriver::IsFlipPending(int handle, int index) {
+bool VideoOutDriver::IsFlipPending(int handle, int index, uint64_t before) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	return m_impl->GetFlipQueue().IsPending(*ctx, index);
+	return m_impl->GetFlipQueue().IsPending(*ctx, index, before);
 }
 
-void VideoOutDriver::WaitFlipDone(int handle, int index) {
+void VideoOutDriver::WaitFlipDone(int handle, int index, uint64_t before) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	m_impl->GetFlipQueue().Wait(*ctx, index);
+	m_impl->GetFlipQueue().Wait(*ctx, index, before);
+}
+
+uint64_t VideoOutDriver::NextFlipRequestId() {
+	return m_impl->GetFlipQueue().NextRequestId();
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

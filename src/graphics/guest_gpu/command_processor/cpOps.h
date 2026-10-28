@@ -347,6 +347,7 @@ struct WaitRegMemOp {
 struct WaitFlipDoneOp {
 	uint32_t video_out_handle     = 0;
 	uint32_t display_buffer_index = 0;
+	uint64_t flip_watermark       = UINT64_MAX; // KYTY_FLIP_WATERMARK: the submission's
 };
 
 // DUMP_CONST_RAM: dw_num dwords of the front's constant RAM follow as inline data.

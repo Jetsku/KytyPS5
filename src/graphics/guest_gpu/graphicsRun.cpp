@@ -44,6 +44,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "kernel/syncOnAddress.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
@@ -584,6 +585,18 @@ bool GuestGpu::CpVisibleLabelValue(uint64_t address, uint32_t size, void* value)
 	return found;
 }
 
+// KYTY_FLIP_WATERMARK=1 (default off; adapted from superkeka/KytyPS5-bc250 894c3e4b/d6942024): a
+// WAIT_FLIP_DONE counts only the flip requests made before its command buffer was submitted. On
+// the PS5 the GPU passes the wait before the frame's own flip request exists; here the command
+// processor may evaluate it later, after the title requested the next flip of the same buffer.
+static bool FlipWatermarkEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FLIP_WATERMARK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands) {
 	if (draw_commands.empty()) {
@@ -596,6 +609,10 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
 	submission.reset_processor   = m_graphics_done;
+	if (FlipWatermarkEnabled()) {
+		// Flip requests the title makes after this point are newer than the buffer's waits.
+		submission.flip_watermark = m_renderer.GetVideoOut().NextFlipRequestId();
+	}
 	m_graphics_done              = false;
 	Enqueue(std::move(submission));
 }
@@ -1568,6 +1585,7 @@ void GuestGpu::Enqueue(Submission submission) {
 		intake.constant_commands = submission.constant_commands;
 		intake.graphics          = submission.type == SubmissionType::Graphics;
 		intake.reset_processor   = submission.reset_processor;
+		intake.flip_watermark    = submission.flip_watermark;
 		m_sequencer->Admit(intake);
 	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -1857,6 +1875,7 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		cp.SetFlipWatermark(submission.flip_watermark);
 		if (!submission.constant_commands.empty()) {
 			// KYTY_CP_SEQ_VERIFY: the constant engine's stream changes the front state (constant
 			// RAM, CE counter) between slices of the draw engine's, which a reference front
@@ -3290,6 +3309,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	CpSeq::WaitFlipDoneOp op;
 	op.video_out_handle     = video_out_handle;
 	op.display_buffer_index = display_buffer_index;
+	op.flip_watermark       = m_flip_watermark;
 	if (Submit(op).suspended) {
 		SuspendPm4();
 	}
@@ -3302,7 +3322,7 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 		BufferFlush();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitBlocking);
 		HangWatchdog::Scope wait("cp-flip-done", handle, index);
-		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
+		m_renderer.GetVideoOut().WaitFlipDone(handle, index, op.flip_watermark);
 		return {};
 	}
 	if (!m_flip_wait_suspended) {
@@ -3310,7 +3330,7 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 		// blocking form did); retries have nothing new to submit.
 		BufferFlush();
 	}
-	if (m_renderer.GetVideoOut().IsFlipPending(handle, index)) {
+	if (m_renderer.GetVideoOut().IsFlipPending(handle, index, op.flip_watermark)) {
 		if (!m_flip_wait_suspended) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
 		}
@@ -3430,6 +3450,18 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 		return false;
 	}
 	m_defer_next_label = false;
+	// KYTY_LABEL_REUSE_TRACE=1 (diagnostic; superkeka/KytyPS5-bc250 review, accuracy insight 1):
+	// the label's bytes at record time, compared when the deferred write lands. A difference means
+	// the guest wrote the word meanwhile (a reset for its next use, or reused memory such as a
+	// command buffer: Demon's Souls' "unknown op cmd_id 1" theory).
+	static const bool reuse_trace = [] {
+		const auto* value = std::getenv("KYTY_LABEL_REUSE_TRACE");
+		return value != nullptr && value[0] == '1';
+	}();
+	uint64_t prior = 0;
+	if (reuse_trace && (size == 4 || size == 8)) {
+		std::memcpy(&prior, dst, size);
+	}
 	auto&      scheduler = GetScheduler();
 	const auto tick      = scheduler.CurrentTick();
 	gpu.AddDeferredLabel(address, size, tick, value, LabelSplitMode());
@@ -3455,22 +3487,36 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	// the GPU thread may take the resulting fault/readback. The interrupt follows the write.
 	scheduler.DeferPriorityOperation(
 	    [renderer, &gpu, address, value, size, tick, interrupt, event_id, interrupt_context_id,
-	     trace_queue, timestamps, timestamp_slot] {
+	     trace_queue, timestamps, timestamp_slot, prior] {
 		    // The tick has completed, so a timestamp query's result is final.
 		    const uint64_t written =
 		        timestamps != nullptr ? timestamps->TakeDeferred(timestamp_slot, value) : value;
 		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, written, size, tick,
 		                                          interrupt, event_id, interrupt_context_id,
-		                                          trace_queue] {
+		                                          trace_queue, prior] {
 			    {
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
 				    HangWatchdog::Scope write("deferred-label-write", address, written, tick, size);
 				    HangWatchdog::DebugDelay("label", address);
 				    // KYTY_LABEL_MODE=split: a later CP write to the label (the CP passed a wait
 				    // on it at record time) stays; hardware would have written the label first.
+				    if (reuse_trace && (size == 4 || size == 8)) {
+					    static std::atomic<uint32_t> lines {0};
+					    uint64_t                     now = 0;
+					    std::memcpy(&now, reinterpret_cast<const void*>(address), size);
+					    if (now != prior && lines.fetch_add(1, std::memory_order_relaxed) < 200) {
+						    LOGF("KYTY_LABEL_REUSE_TRACE: deferred label 0x%" PRIx64 " (%u bytes, tick %" PRIu64
+						         ") held 0x%" PRIx64 " at record, 0x%" PRIx64 " at write; writes 0x%" PRIx64
+						         "%s\n",
+						         address, static_cast<unsigned>(size), tick, prior, now, written,
+						         gpu.DeferredLabelSuperseded(address, tick) ? " (superseded, skipped)" : "");
+					    }
+				    }
 				    if (!gpu.DeferredLabelSuperseded(address, tick)) {
 					    StreamCopyDefer::NoteGpuOnlyWrite(address, size); // after its tick completed
 					    std::memcpy(reinterpret_cast<void*>(address), &written, size);
+					    LibKernel::SyncOnAddress::WakeAfterEmulatorWrite(
+					        reinterpret_cast<volatile void*>(address), size);
 				    }
 			    }
 			    ReadFaultDiag::NoteLabel("label-deferred-write", address, written);
@@ -4891,6 +4937,8 @@ void NoteCpWrite(uint64_t address, uint64_t size) {
 	if (g_gpu_state != nullptr && address != 0 && size != 0) {
 		g_gpu_state->DropCpVisibleLabels(address, size);
 	}
+	// KYTY_LABEL_WAKE: a guest thread may sleep on the written word.
+	LibKernel::SyncOnAddress::WakeAfterEmulatorWrite(reinterpret_cast<volatile void*>(address), size);
 }
 
 void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
@@ -5328,6 +5376,7 @@ bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
 	}
 	ResetDeCe();
 	SetFlip({});
+	SetFlipWatermark(intake.flip_watermark);
 	m_ce_complete = intake.constant_commands.empty();
 
 	const bool handoff = intake.graphics && !intake.constant_commands.empty();

@@ -48,6 +48,25 @@ namespace {
 
 constexpr uint32_t SIGNAL_POLL_MICROS = 10000;
 
+// Sleepers per address bucket (HasWaiters). 8-byte granules, so a 64-bit wait and a store to
+// either of its words share a bucket.
+std::array<std::atomic<uint32_t>, 1024> g_waiters {};
+
+std::atomic<uint32_t>& WaiterCount(const volatile void* address) {
+	const auto granule = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(address) >> 3u);
+	return g_waiters[(granule * 0x9e3779b1u) >> 22u];
+}
+
+struct CountedWaiter {
+	std::atomic<uint32_t>& count;
+	explicit CountedWaiter(const volatile void* address): count(WaiterCount(address)) {
+		count.fetch_add(1, std::memory_order_seq_cst);
+	}
+	~CountedWaiter() { count.fetch_sub(1, std::memory_order_release); }
+	CountedWaiter(const CountedWaiter&)            = delete;
+	CountedWaiter& operator=(const CountedWaiter&) = delete;
+};
+
 using Clock = std::chrono::steady_clock;
 
 template <typename T>
@@ -572,7 +591,8 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 		MaybeReport();
 	}
 
-	int result = OK;
+	int                 result = OK;
+	const CountedWaiter counted(address);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 	result = WaitLinux(address, expected, deadline, signal_poll);
 #else
@@ -597,6 +617,44 @@ int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeou
 int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout,
            signal_poll_func_t signal_poll) {
 	return WaitImpl(address, expected, MakeDeadline(timeout), signal_poll);
+}
+
+bool HasWaiters(volatile void* address) {
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	return WaiterCount(address).load(std::memory_order_relaxed) != 0;
+}
+
+// KYTY_LABEL_WAKE=1 (default off; adapted from superkeka/KytyPS5-bc250 46006ac3/023bd419):
+// labels the command processor writes (end-of-pipe, WRITE_DATA, deferred labels) wake the guest
+// threads sleeping on them (sceKernel sync-on-address on the label word). Before, such a sleeper
+// saw the value only at its next poll, up to SIGNAL_POLL_MICROS (10 ms) later.
+static bool LabelWakeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LABEL_WAKE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void WakeAfterEmulatorWrite(volatile void* address, uint64_t size) {
+	if (!LabelWakeEnabled() || address == nullptr || size == 0 || size > 64) {
+		return;
+	}
+	auto       begin = reinterpret_cast<uintptr_t>(address) & ~uintptr_t {3};
+	const auto end   = reinterpret_cast<uintptr_t>(address) + size;
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	for (; begin < end; begin += 4) {
+		auto* word = reinterpret_cast<volatile void*>(begin);
+		if (WaiterCount(word).load(std::memory_order_relaxed) == 0) {
+			continue;
+		}
+		static std::atomic<bool> logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("KYTY_LABEL_WAKE: first emulator label write with a possible sleeper at 0x%" PRIx64 "\n",
+			     static_cast<uint64_t>(begin));
+		}
+		(void)Wake(word, INT_MAX);
+	}
 }
 
 int Wake(volatile void* address, int32_t count) {

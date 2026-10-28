@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "kernel/eventQueue.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 
 struct Shader;
@@ -35,6 +38,12 @@ namespace Gen5 {
 
 struct CommandBuffer;
 struct Label;
+
+// KYTY_CONTEXT_CLEAR_DEFAULTS: the context registers (offset from the context space, value) that
+// libSceAgc's context-state clear loads for the register defaults version the title passed to
+// AgcInit (public then internal defaults, the last value of an offset winning; empty before
+// AgcInit). From superkeka/KytyPS5-bc250 7053a76e/08d150a2.
+const std::vector<std::pair<uint32_t, uint32_t>>& AgcContextClearDefaults();
 
 int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);

@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -247,6 +248,37 @@ static RegisterDefaults* get_public_register_defaults(uint32_t ver) {
 	static RegisterDefaultsStorage storage[GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION + 1] = {};
 	const auto                     index = normalize_register_defaults_version(ver);
 	return get_register_defaults(g_agc_public_reg_defaults_by_version[index], &storage[index]);
+}
+
+static std::atomic<uint32_t> g_register_defaults_version {UINT32_MAX};
+
+const std::vector<std::pair<uint32_t, uint32_t>>& AgcContextClearDefaults() {
+	static std::mutex                                  mutex;
+	static std::vector<std::pair<uint32_t, uint32_t>> context;
+	static uint32_t                                    built_for = UINT32_MAX;
+	static const std::vector<std::pair<uint32_t, uint32_t>> none;
+	const uint32_t ver = g_register_defaults_version.load(std::memory_order_acquire);
+	if (ver == UINT32_MAX) {
+		return none;
+	}
+	std::lock_guard lock(mutex);
+	if (built_for != ver) {
+		const auto                     index   = normalize_register_defaults_version(ver);
+		const CompactRegisterDefaults* blobs[] = {g_agc_public_reg_defaults_by_version[index],
+		                                          g_agc_internal_reg_defaults_by_version[index]};
+		std::map<uint32_t, uint32_t>   values;
+		for (const auto* blob: blobs) {
+			for (uint32_t i = 0; blob != nullptr && blob->tbl0_regs != nullptr && i < blob->tbl0_register_count;
+			     i++) {
+				values[blob->tbl0_regs[i].offset] = blob->tbl0_regs[i].value;
+			}
+		}
+		context.assign(values.begin(), values.end());
+		built_for = ver;
+		LOGF("KYTY_CONTEXT_CLEAR_DEFAULTS: %zu context register defaults (version %u)\n", context.size(),
+		     index);
+	}
+	return context;
 }
 
 static RegisterDefaults* get_internal_register_defaults(uint32_t ver) {
@@ -531,6 +563,7 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	}
 
 	printf("version = %u\n", ver);
+	g_register_defaults_version.store(ver, std::memory_order_release);
 
 	return OK;
 }

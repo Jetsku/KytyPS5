@@ -95,6 +95,7 @@ struct Intake {
 	std::span<const uint32_t> constant_commands;
 	bool                      graphics        = true; // false: a CPU flip preparation
 	bool                      reset_processor = false;
+	uint64_t                  flip_watermark  = UINT64_MAX; // KYTY_FLIP_WATERMARK
 };
 
 class Sequencer {

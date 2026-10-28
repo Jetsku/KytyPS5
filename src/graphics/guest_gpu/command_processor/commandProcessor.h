@@ -239,6 +239,8 @@ public:
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
+	// KYTY_FLIP_WATERMARK: flip requests from this id on are newer than the buffer being processed.
+	void SetFlipWatermark(uint64_t watermark) { m_flip_watermark = watermark; }
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
@@ -490,6 +492,7 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
+	uint64_t  m_flip_watermark              = UINT64_MAX;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 	uint32_t  m_deferred_eop_flushes        = 0;

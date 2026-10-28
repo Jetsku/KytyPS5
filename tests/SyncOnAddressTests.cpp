@@ -287,6 +287,30 @@ void TestWakeZeroIsNoOp() {
 
 } // namespace
 
+// KYTY_LABEL_WAKE: HasWaiters sees a sleeper, and an emulator write wakes it.
+void TestHasWaitersAndEmulatorWake() {
+  using Libs::LibKernel::SyncOnAddress::HasWaiters;
+  using Libs::LibKernel::SyncOnAddress::WakeAfterEmulatorWrite;
+  alignas(8) static uint64_t label = 0;
+  Check(!HasWaiters(&label), "no waiter before the wait");
+  std::atomic<int> result{-1};
+  std::thread waiter([&] {
+    result.store(Wait64(&label, 0, nullptr), std::memory_order_release);
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!HasWaiters(reinterpret_cast<uint32_t *>(&label) + 1) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  Check(HasWaiters(&label), "the sleeper is counted (either word of its granule)");
+  Store(&label, uint64_t{1});
+  WakeAfterEmulatorWrite(&label, sizeof(label));
+  waiter.join();
+  Check(result.load(std::memory_order_acquire) == OK,
+        "the woken wait returns OK");
+  Check(!HasWaiters(&label), "no waiter after the wait");
+}
+
 int main() {
   TestInvalidAddress();
   TestMismatchReturnsImmediately();
@@ -297,6 +321,12 @@ int main() {
   TestAddressesAreIsolated();
   TestCompareRegisterWakeRace();
   TestWakeZeroIsNoOp();
+#if defined(_WIN32)
+  _putenv_s("KYTY_LABEL_WAKE", "1");
+#else
+  setenv("KYTY_LABEL_WAKE", "1", 1);
+#endif
+  TestHasWaitersAndEmulatorWake();
   std::printf("SyncOnAddressTests: all passed\n");
   return 0;
 }
