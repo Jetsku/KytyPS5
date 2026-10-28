@@ -4820,8 +4820,29 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		{
 			std::scoped_lock lock {m_lock};
 			// Bytes some image also covers are not proven to be this surface's CMASK.
-			if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
+			if (const auto aliases = FindImagesInRegion(metadata.address, metadata.size, false); !aliases.empty()) {
 				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
+				// KYTY_CLEAR_TRACE: which images cover the CMASK bytes (first time per metadata address).
+				static const bool trace = [] {
+					const auto* value = std::getenv("KYTY_CLEAR_TRACE");
+					return value != nullptr && value[0] != '\0' && value[0] != '0';
+				}();
+				static std::unordered_set<uint64_t> traced;
+				if (trace && traced.insert(metadata.address).second) {
+					for (const auto alias: aliases) {
+						const auto& other = m_slot_images[alias].info;
+						std::fprintf(stderr,
+						             "ClearTrace: CMASK alias meta=0x%llx+0x%llx covered by image 0x%llx+0x%llx %ux%u "
+						             "samples %u layers %u levels %u\n",
+						             static_cast<unsigned long long>(metadata.address),
+						             static_cast<unsigned long long>(metadata.size),
+						             static_cast<unsigned long long>(other.data.address),
+						             static_cast<unsigned long long>(other.data.size), other.extent.width,
+						             other.extent.height, static_cast<unsigned>(other.samples),
+						             static_cast<unsigned>(other.TransferLayers()),
+						             static_cast<unsigned>(other.resources.levels));
+					}
+				}
 				ClearTrace("CMASK", "aliased", metadata.address, metadata.size, desc.info.data.address,
 				           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, slice);
 				continue;
