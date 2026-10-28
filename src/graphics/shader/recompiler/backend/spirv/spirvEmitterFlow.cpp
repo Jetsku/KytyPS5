@@ -1265,7 +1265,6 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), index, shifted,
 	                          ConstantU32(state, 15));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
-<<<<<<< HEAD
 	// Permlane16 reads within the caller's 32-lane half, a split wave's host subgroup.
 	const auto read = [&](size_t argument) {
 		return state.split_wave
@@ -1274,22 +1273,14 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           : ctx.Shuffle(inst, argument, target);
 	};
 	const auto shuffled = read(0);
-	uint32_t   result   = shuffled;
-	if (!flags.fetch_inactive) {
-		const auto source_exec = read(3);
-		result                 = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
-		                          ConstantU32(state, 0));
-=======
-	const auto shuffled = ctx.Shuffle(inst, 0, target);
 	if (flags.fetch_inactive) {
 		return shuffled;
->>>>>>> 67c89e091 (shader: keep the old V_PERMLANE16 destination for inactive sources without BOUND_CTRL)
 	}
-	return Select(state, TypeU32(state), EmitSourceLaneActive(ctx, ctx.Arg(inst, 3), target),
-	              shuffled, ctx.Arg(inst, 4));
+	// Upstream 67c89e091: an inactive source lane without BOUND_CTRL keeps the old destination.
+	const auto source_active =
+	    state.split_wave ? read(3) : EmitSourceLaneActive(ctx, ctx.Arg(inst, 3), target);
+	return Select(state, TypeU32(state), source_active, shuffled, ctx.Arg(inst, 4));
 }
-
 uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitAttribute(ctx.state, inst.Arg(0).U32(), inst.Arg(1).U32(),
 	                     static_cast<IR::InterpolationMode>(inst.Flags<uint32_t>()));
