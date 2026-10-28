@@ -9,6 +9,9 @@
 
 namespace Libs::Graphics {
 
+bool                  SampleInterpolationDropped();
+std::vector<uint32_t> WithoutSampleInterpolation(std::span<const uint32_t> spirv);
+
 namespace {
 
 // What SpirvWithoutSampleId learns from parsing a module. SPIRV-Tools tells literal operands from
@@ -16,7 +19,8 @@ namespace {
 // classes, extended instruction numbers and memory operands.
 struct SampleIdScan {
 	uint32_t sample_id   = 0;
-	bool     per_sample  = false; // another per-sample input (SamplePosition, a Sample decoration)
+	bool     per_sample  = false; // another per-sample input (SamplePosition, a member decoration)
+	bool     sample_decorated = false; // an input decorated Sample (interpolated per sample)
 	bool     unsupported = false; // a form the rewrite does not handle (decoration groups, ...)
 	bool     other_use   = false; // the variable named other than by a load, decoration, name or
 	                              // the entry point's interface
@@ -41,7 +45,8 @@ spv_result_t ScanSampleIdDecorations(void* user_data, const spv_parsed_instructi
 	switch (static_cast<spv::Op>(inst->opcode)) {
 		case spv::OpDecorate:
 			if (inst->num_words >= 3 && words[2] == spv::DecorationSample) {
-				scan.per_sample = true;
+				scan.sample_decorated = true;
+				if (!SampleInterpolationDropped()) scan.per_sample = true;
 			}
 			if (inst->num_words >= 4 && words[2] == spv::DecorationBuiltIn) {
 				if (words[3] == spv::BuiltInSampleId) {
@@ -122,15 +127,55 @@ bool SpirvShadesPerSample(std::span<const uint32_t> spirv) {
 	return scan.sample_id != 0 || scan.per_sample;
 }
 
+// KYTY_EQAA_DROP_SAMPLE_INTERP=1 (default off; on in the GT7 preset): the per-pixel copy of a
+// pixel shader (KYTY_EQAA_MIXED) may also drop per-sample interpolation (Sample decorations), so
+// GT7's pixel shaders that only interpolate per sample get a copy and their EQAA draws run
+// instead of being skipped (mirrors and side windows drew garbage).
+bool SampleInterpolationDropped() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EQAA_DROP_SAMPLE_INTERP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The module without its Sample decorations and the SampleRateShading capability.
+std::vector<uint32_t> WithoutSampleInterpolation(std::span<const uint32_t> spirv) {
+	constexpr uint32_t    HeaderWords = 5;
+	std::vector<uint32_t> out(spirv.begin(), spirv.begin() + HeaderWords);
+	for (size_t offset = HeaderWords; offset < spirv.size();) {
+		const uint32_t count = spirv[offset] >> spv::WordCountShift;
+		if (count == 0 || offset + count > spirv.size()) {
+			return {};
+		}
+		const auto opcode = static_cast<spv::Op>(spirv[offset] & spv::OpCodeMask);
+		const bool drop =
+		    (opcode == spv::OpDecorate && count == 3 && spirv[offset + 2] == spv::DecorationSample) ||
+		    (opcode == spv::OpCapability && count == 2 && spirv[offset + 1] == spv::CapabilitySampleRateShading);
+		if (!drop) {
+			out.insert(out.end(), spirv.begin() + static_cast<ptrdiff_t>(offset),
+			           spirv.begin() + static_cast<ptrdiff_t>(offset + count));
+		}
+		offset += count;
+	}
+	return out;
+}
+
 std::vector<uint32_t> SpirvWithoutSampleId(std::span<const uint32_t> spirv) {
 	constexpr uint32_t HeaderWords = 5;
 	if (spirv.size() < HeaderWords || spirv[0] != spv::MagicNumber) {
 		return {};
 	}
 	SampleIdScan scan;
-	if (!ParseSpirv(spirv, scan, ScanSampleIdDecorations) || scan.sample_id == 0 ||
-	    scan.per_sample || scan.unsupported || !ParseSpirv(spirv, scan, ScanSampleIdUses) ||
-	    scan.other_use) {
+	if (!ParseSpirv(spirv, scan, ScanSampleIdDecorations) || scan.per_sample || scan.unsupported) {
+		return {};
+	}
+	// KYTY_EQAA_DROP_SAMPLE_INTERP: a shader that shades per sample only because inputs are
+	// interpolated per sample (no SampleId): the copy interpolates them at the pixel instead.
+	if (scan.sample_id == 0) {
+		return scan.sample_decorated ? WithoutSampleInterpolation(spirv) : std::vector<uint32_t> {};
+	}
+	if (!ParseSpirv(spirv, scan, ScanSampleIdUses) || scan.other_use) {
 		return {};
 	}
 	const uint32_t sample_id = scan.sample_id;
@@ -226,6 +271,9 @@ std::vector<uint32_t> SpirvWithoutSampleId(std::span<const uint32_t> spirv) {
 		const auto w = words(inst);
 		if (inst.opcode == spv::OpDecorate && w.size() >= 2 && w[1] == sample_id) {
 			continue; // BuiltIn, Flat
+		}
+		if (inst.opcode == spv::OpDecorate && w.size() == 3 && w[2] == spv::DecorationSample) {
+			continue; // KYTY_EQAA_DROP_SAMPLE_INTERP: interpolated at the pixel
 		}
 		if (inst.opcode == spv::OpCapability && w.size() == 2 &&
 		    w[1] == spv::CapabilitySampleRateShading) {
