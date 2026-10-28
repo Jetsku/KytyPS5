@@ -593,7 +593,7 @@ bool GetHostBufferPairAtomics() {
 	return g_buffer_pair_atomics.load(std::memory_order_relaxed);
 }
 
-bool BufferPairAtomicProgram(uint64_t shader_hash) {
+bool Emitter::BufferPairAtomicProgram(uint64_t shader_hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> list;
 		const char*           text = std::getenv("KYTY_BUFFER_PAIR_ATOMIC_HASHES");
