@@ -136,6 +136,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.indirect_format_inline) {
 		b.Text("indirect_format_inline");
 	}
+	if (options.indirect_format_fast) {
+		b.Text("indirect_format_fast");
+		if (const char* fast = std::getenv("KYTY_INDIRECT_FORMAT_FAST"); fast != nullptr) b.Text(fast);
+	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}

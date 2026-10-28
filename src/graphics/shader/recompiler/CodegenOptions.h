@@ -253,6 +253,11 @@ struct CodegenOptions {
 	// partitioned material kernels lost the device with InstructionPointerInvalid / Shader Instruction
 	// Error at the end of the SASS of modules holding the DontInline helper.
 	bool indirect_format_inline = false;
+	// KYTY_INDIRECT_FORMAT_FAST=1 or =<format>[,...] (default off): the loads call a small inlinable
+	// decoder of the common formats; only the other formats call the DontInline full decoder
+	// (spirvEmitterMemory.cpp IndirectFormatFastSet). Keeps KYTY_INDIRECT_FORMAT_INLINE's crash fix
+	// without inlining the whole format switch into every RT kernel (driver memory).
+	bool indirect_format_fast = false;
 	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
 	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
 	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared

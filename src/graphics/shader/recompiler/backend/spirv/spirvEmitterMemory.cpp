@@ -5,6 +5,9 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
 #include <bit>
 #include <utility>
 
@@ -1479,6 +1482,11 @@ static bool IndirectFormatDecoded(Prospero::BufferFormat format) {
 // each load a call instead of a copy of the format switch.
 // Parameters: V# dwords 0-3, the element index (ADD_TID applied), the byte offset (immediate
 // added), SOFFSET. Result: the four channels after the destination selects.
+static std::vector<uint32_t> IndirectFormatFastSet();
+static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t function_id, const char* name,
+                                             uint32_t function_control, uint32_t function_type,
+                                             std::span<const uint32_t> fast, uint32_t slow_function);
+
 void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	bool used = false;
 	for (const auto* block: state.program.blocks) {
@@ -1503,12 +1511,68 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	const std::array<uint32_t, 7> parameter_types {u32, u32, u32, u32, u32, u32, u32};
 	const auto function_type =
 	    state.builder.Type(spv::OpTypeFunction, result, std::span<const uint32_t>(parameter_types));
+	const auto& options = GetCodegenOptions();
+	// KYTY_INDIRECT_FORMAT_FAST: the full decoder stays a DontInline function for the rare formats;
+	// the loads call a small ordinary function (the driver inlines it) that decodes the common
+	// formats itself and calls the full one only for the others.
+	const auto fast_formats = IndirectFormatFastSet();
+	if (options.indirect_format_fast && !options.indirect_format_inline && !fast_formats.empty()) {
+		const auto slow = state.builder.AllocateId();
+		DefineIndirectFormatFunctionBody(state, slow, "indirect_formatted_load",
+		                                 spv::FunctionControlDontInlineMask, function_type, {}, 0u);
+		state.indirect_format_function = state.builder.AllocateId();
+		DefineIndirectFormatFunctionBody(state, state.indirect_format_function, "indirect_formatted_load_fast",
+		                                 spv::FunctionControlMaskNone, function_type, fast_formats, slow);
+		return;
+	}
 	state.indirect_format_function = state.builder.AllocateId();
-	state.builder.AddName(state.indirect_format_function, "indirect_formatted_load");
-	state.builder.AddFunction(spv::OpFunction, result, state.indirect_format_function,
-	                          GetCodegenOptions().indirect_format_inline ? spv::FunctionControlMaskNone
-	                                                                     : spv::FunctionControlDontInlineMask,
-	                          function_type);
+	DefineIndirectFormatFunctionBody(state, state.indirect_format_function, "indirect_formatted_load",
+	                                 options.indirect_format_inline ? spv::FunctionControlMaskNone
+	                                                                : spv::FunctionControlDontInlineMask,
+	                                 function_type, {}, 0u);
+}
+
+// KYTY_INDIRECT_FORMAT_FAST=1 (default formats) or =<format>[,<format>...] (decimal BufferFormat
+// values): the formats indirect_formatted_load_fast decodes inline.
+static std::vector<uint32_t> IndirectFormatFastSet() {
+	static const std::vector<uint32_t> formats = [] {
+		std::vector<uint32_t> parsed;
+		const char*           value = std::getenv("KYTY_INDIRECT_FORMAT_FAST");
+		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return parsed;
+		if (std::strcmp(value, "1") == 0) {
+			// 32, 32_32, 32_32_32, 32_32_32_32 (uint, float), 16_16 / 16_16_16_16 (float, unorm,
+			// snorm, uint), 8_8_8_8 (unorm, snorm, uint), 16 uint.
+			parsed = {11, 20, 22, 23, 24, 27, 29, 56, 57, 60, 62, 64, 65, 66, 69, 71, 72, 74, 75, 77};
+			return parsed;
+		}
+		std::string text(value);
+		size_t      start = 0;
+		while (start < text.size()) {
+			const auto end = text.find(',', start);
+			const auto item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			const auto number = std::strtoul(item.c_str(), nullptr, 10);
+			if (number > 0 && number <= static_cast<unsigned long>(Prospero::BufferFormat::k32_32_32_32Float)) {
+				parsed.push_back(static_cast<uint32_t>(number));
+			}
+			if (end == std::string::npos) break;
+			start = end + 1;
+		}
+		std::ranges::sort(parsed);
+		parsed.erase(std::unique(parsed.begin(), parsed.end()), parsed.end());
+		return parsed;
+	}();
+	return formats;
+}
+
+// One decoder function: all formats (fast empty) or only the fast ones, the others through a call
+// of slow_function with the same parameters.
+static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t function_id, const char* name,
+                                      uint32_t function_control, uint32_t function_type,
+                                      std::span<const uint32_t> fast, uint32_t slow_function) {
+	const auto u32    = TypeU32(state);
+	const auto result = TypeU32Vector(state, 4);
+	state.builder.AddName(function_id, name);
+	state.builder.AddFunction(spv::OpFunction, result, function_id, function_control, function_type);
 	std::array<uint32_t, 7> parameters {};
 	for (auto& id: parameters) {
 		id = state.builder.AllocateId();
@@ -1548,9 +1612,7 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	for (uint32_t channel = 0; channel < 4u; ++channel) {
 		selects[channel] = field(word3, 3u * channel, 3u);
 	}
-	const auto value = EmitIndexSwitch(
-	    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
-	    result, [&](uint32_t format) {
+	const auto decode_format = [&](uint32_t format) {
 		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
 		    if (info.type == Format::ComponentType::Unknown ||
 		        !IndirectFormatDecoded(static_cast<Prospero::BufferFormat>(format))) {
@@ -1602,7 +1664,43 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 			        picked, constant);
 		    }
 		    return ConstructU32Composite(state, 4, channels);
-	    });
+	    };
+	uint32_t value = 0;
+	if (fast.empty()) {
+		value = EmitIndexSwitch(state, buffer.format,
+		                        static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u, result,
+		                        decode_format);
+	} else {
+		// Sparse switch: the fast formats inline, the default calls the full decoder.
+		const auto            merge_label   = state.builder.AllocateId();
+		const auto            default_label = state.builder.AllocateId();
+		std::vector<uint32_t> labels(fast.size());
+		std::vector<uint32_t> words {spv::OpSwitch, buffer.format, default_label};
+		for (size_t item = 0; item < fast.size(); item++) {
+			labels[item] = state.builder.AllocateId();
+			words.push_back(fast[item]);
+			words.push_back(labels[item]);
+		}
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(words);
+		std::vector<uint32_t> phi {spv::OpPhi, result, state.builder.AllocateId()};
+		for (size_t item = 0; item < fast.size(); item++) {
+			EmitLabel(state, labels[item]);
+			phi.push_back(decode_format(fast[item]));
+			phi.push_back(state.current_label);
+			state.builder.AddFunction(spv::OpBranch, merge_label);
+		}
+		EmitLabel(state, default_label);
+		const auto called = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, result, called, slow_function,
+		                          std::span<const uint32_t>(parameters));
+		phi.push_back(called);
+		phi.push_back(state.current_label);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		EmitLabel(state, merge_label);
+		state.builder.AddFunction(phi);
+		value = phi[2];
+	}
 	state.builder.AddFunction(spv::OpReturnValue, value);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
