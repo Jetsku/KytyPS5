@@ -133,6 +133,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 			b.Text(hashes);
 		}
 	}
+	if (options.indirect_format_inline) {
+		b.Text("indirect_format_inline");
+	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}

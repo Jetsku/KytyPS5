@@ -247,6 +247,12 @@ struct CodegenOptions {
 	// pair keeps the dword path; so does every pair on a host without 8-byte aligned storage-buffer
 	// bindings (SetHostBufferPairAtomics).
 	bool buffer_pair_atomic = false;
+	// KYTY_INDIRECT_FORMAT_INLINE=1 (default 0; on in the PPSA01417 and PPSA03671 title presets): the
+	// runtime formatted-load helper (indirect_formatted_load) is an ordinary function the driver may
+	// inline instead of a DontInline one. Miles Morales' RT kernel 0x208e855cd52d25f9 and PPSA03671's
+	// partitioned material kernels lost the device with InstructionPointerInvalid / Shader Instruction
+	// Error at the end of the SASS of modules holding the DontInline helper.
+	bool indirect_format_inline = false;
 	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
 	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
 	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared

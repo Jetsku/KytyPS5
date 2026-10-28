@@ -66,6 +66,8 @@ CodegenOptions FromEnvironment() {
 	options.indirect_coherent = EnvFlag("KYTY_INDIRECT_COHERENT", options.indirect_coherent);
 	options.buffer_pair_atomic =
 	    EnvFlag("KYTY_BUFFER_PAIR_ATOMIC", options.buffer_pair_atomic);
+	options.indirect_format_inline =
+	    EnvFlag("KYTY_INDIRECT_FORMAT_INLINE", options.indirect_format_inline);
 	options.cfg_clone_exits   = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
 	options.heap_key_mask     = EnvFlag("KYTY_HEAP_KEY_MASK", options.heap_key_mask);
 	options.bindless_3d_as_array =

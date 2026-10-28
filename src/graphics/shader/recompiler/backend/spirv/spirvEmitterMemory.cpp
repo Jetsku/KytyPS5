@@ -1506,7 +1506,9 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	state.indirect_format_function = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "indirect_formatted_load");
 	state.builder.AddFunction(spv::OpFunction, result, state.indirect_format_function,
-	                          spv::FunctionControlDontInlineMask, function_type);
+	                          GetCodegenOptions().indirect_format_inline ? spv::FunctionControlMaskNone
+	                                                                     : spv::FunctionControlDontInlineMask,
+	                          function_type);
 	std::array<uint32_t, 7> parameters {};
 	for (auto& id: parameters) {
 		id = state.builder.AllocateId();
