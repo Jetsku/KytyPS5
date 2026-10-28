@@ -4144,6 +4144,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			     draw.index_count, draw.instance_count, state.color_count, d.desc.info.data.address,
 			     d.depth_test_enable ? 1 : 0, d.depth_write_enable ? 1 : 0, d.depth_clear_enable ? 1 : 0,
 			     static_cast<double>(d.depth_clear_value), static_cast<unsigned>(state.color_info[0].desc.info.samples));
+			const auto& meta = d.desc.info.metadata;
+			LOGF("DrawTraceTarget: depth metadata kind %u at 0x%" PRIx64 " size 0x%" PRIx64 "\n",
+			     static_cast<unsigned>(meta.kind), meta.range.address, meta.range.size);
+			if (meta.kind == ImageMetadataKind::Htile) SetMetaTraceAddressAuto(meta.range.address);
 		}
 	}
 	// KYTY_DRAW_TRACE_PS=<hash>[:<sgpr>:<offset>] (diagnostic): logs the first 16 draws with this

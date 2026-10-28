@@ -7885,6 +7885,63 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	return true;
 }
 
+// KYTY_META_CLEAR_COVER=1 (default off; GT7 course-map preview depth): a buffer clear (compute
+// fill or CP fill) whose range starts below a registered HTile but covers its first byte clears it
+// too. Without it only a clear that starts exactly at the HTile address counts.
+bool MetaClearCoverEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_META_CLEAR_COVER");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint32_t TextureCache::ClearMetaCovered(uint64_t address, uint64_t size) {
+	if (size == 0 || size > UINT64_MAX - address) return 0;
+	std::scoped_lock lock {m_lock};
+	uint32_t         cleared = 0;
+	for (auto it = m_surface_metas.upper_bound(address); it != m_surface_metas.end() && it->first < address + size;
+	     ++it) {
+		it->second.clear_mask.set();
+		cleared++;
+	}
+	if (cleared != 0) NoteSurfaceMetaChange();
+	return cleared;
+}
+
+// KYTY_META_TRACE=<hex address> (diagnostic): logs every compute buffer write and CP fill whose range
+// holds that metadata address, and the result. With KYTY_META_TRACE=auto, KYTY_DRAW_TRACE_TARGET
+// sets it to the HTile of the traced target's depth buffer.
+static std::atomic<uint64_t> g_meta_trace_address {[] {
+	const auto* value = std::getenv("KYTY_META_TRACE");
+	if (value == nullptr || std::strcmp(value, "auto") == 0) return uint64_t {0};
+	return static_cast<uint64_t>(std::strtoull(value, nullptr, 16));
+}()};
+
+uint64_t MetaTraceAddress() {
+	return g_meta_trace_address.load(std::memory_order_relaxed);
+}
+
+void SetMetaTraceAddressAuto(uint64_t address) {
+	static const bool automatic = [] {
+		const auto* value = std::getenv("KYTY_META_TRACE");
+		return value != nullptr && std::strcmp(value, "auto") == 0;
+	}();
+	if (!automatic || address == 0) return;
+	if (g_meta_trace_address.exchange(address, std::memory_order_relaxed) != address) {
+		LOGF("MetaTrace: tracing metadata address 0x%" PRIx64 "\n", address);
+	}
+}
+
+bool MetaTraceLine() {
+	static std::atomic<uint32_t> lines {0};
+	static const uint32_t        max = [] {
+		const auto* value = std::getenv("KYTY_META_TRACE_LINES");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 400u;
+	}();
+	return lines.fetch_add(1, std::memory_order_relaxed) < max;
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);

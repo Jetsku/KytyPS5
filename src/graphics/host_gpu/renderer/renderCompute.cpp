@@ -327,6 +327,22 @@ bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
+	// KYTY_META_TRACE: the buffers of this dispatch that hold the traced metadata address.
+	if (const auto traced = MetaTraceAddress(); traced != 0) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& resource   = program.info.buffers[i];
+			const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			const auto  base       = descriptor.Base48();
+			const auto  size       = descriptor.GetSize();
+			if (traced >= base && traced - base < std::max<uint64_t>(size, 1) && MetaTraceLine()) {
+				LOGF("MetaTrace: frame %d CS 0x%016" PRIx64 " buffer %u base 0x%" PRIx64 " size 0x%" PRIx64
+				     " written %d read %d xor %d base_is_meta %d exact %d\n",
+				     static_cast<int>(m_context.GetGpu().GetFrameNum()), program.shader_hash, i, base, size,
+				     resource.written ? 1 : 0, resource.read ? 1 : 0, program.info.has_bitwise_xor ? 1 : 0,
+				     cache.IsMeta(base) ? 1 : 0, base == traced ? 1 : 0);
+			}
+		}
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -344,6 +360,16 @@ bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				const bool meta_cleared = cache.ClearMeta(descriptor.Base48());
+				// KYTY_META_CLEAR_COVER: a write-only fill that starts below a metadata surface
+				// and covers it clears it too; the dispatch still runs (only an exact clear is
+				// consumed), so the bytes before the surface are written as before.
+				if (!resource.read && MetaClearCoverEnabled()) {
+					const auto covered = cache.ClearMetaCovered(descriptor.Base48(), descriptor.GetSize());
+					if (covered != 0 && MetaTraceAddress() != 0 && MetaTraceLine()) {
+						LOGF("MetaTrace: CS 0x%016" PRIx64 " buffer %u base 0x%" PRIx64 " covered %u metadata surfaces\n",
+						     program.shader_hash, i, descriptor.Base48(), covered);
+					}
+				}
 				cleared |= meta_cleared;
 				// KYTY_CMASK_MSAA (usa-ratt/KytyPS5-GT7 8a0b6058f): a colour target keeps its
 				// CMASK at the same address as this HTile: the fill still runs for it.

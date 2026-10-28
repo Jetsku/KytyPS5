@@ -38,6 +38,12 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class Buffer;
 class BufferCache;
+
+// KYTY_META_CLEAR_COVER / KYTY_META_TRACE (textureCache.cpp).
+[[nodiscard]] bool     MetaClearCoverEnabled();
+[[nodiscard]] uint64_t MetaTraceAddress();
+void                   SetMetaTraceAddressAuto(uint64_t address);
+[[nodiscard]] bool     MetaTraceLine();
 class CommandBuffer;
 class CommandScheduler;
 class DccClearHelper;
@@ -217,6 +223,9 @@ public:
 	// thread only (the depth-target resolution of draws).
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// KYTY_META_CLEAR_COVER: marks cleared every surface metadata entry that starts inside
+	// (address, address + size) (the exact start is ClearMeta's); returns how many.
+	[[nodiscard]] uint32_t ClearMetaCovered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);

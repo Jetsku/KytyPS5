@@ -4842,7 +4842,14 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	const bool exact_meta = m_texture_cache.ClearMeta(vaddr);
+	// KYTY_META_CLEAR_COVER: a fill that starts below a metadata surface and covers it clears it.
+	const uint32_t covered_meta = MetaClearCoverEnabled() ? m_texture_cache.ClearMetaCovered(vaddr, size) : 0u;
+	if (const auto traced = MetaTraceAddress();
+	    traced != 0 && traced >= vaddr && traced - vaddr < size && MetaTraceLine()) {
+		LOGF("MetaTrace: fill base 0x%" PRIx64 " size 0x%" PRIx64 " value 0x%08x exact %d covered %u\n", vaddr,
+		     size, value, exact_meta ? 1 : 0, covered_meta);
+	}
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
@@ -5022,6 +5029,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: invalid copy range, src=0x%016" PRIx64 " dst=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
+	}
+	if (const auto traced = MetaTraceAddress();
+	    traced != 0 && dst_memory && traced >= dst_vaddr && traced - dst_vaddr < size && MetaTraceLine()) {
+		LOGF("MetaTrace: copy dst 0x%" PRIx64 " src 0x%" PRIx64 " size 0x%" PRIx64 " (no metadata clear)\n",
+		     dst_vaddr, src_vaddr, size);
 	}
 	// KYTY_ALIAS_BYTES: bytes a GPU-modified image owns without starting at the source (or at the
 	// destination) are not in guest memory either; the GPU path moves them into the buffer.
