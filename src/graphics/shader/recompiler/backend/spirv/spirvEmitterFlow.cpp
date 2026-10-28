@@ -165,7 +165,8 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	// Only row shifts (0x101-0x10f, 0x111-0x11f) can vacate a lane; other controls always read one.
 	const bool row_shift = !flags.dpp8 && flags.control > 0x100u && flags.control < 0x120u &&
 	                       flags.control != 0x110u;
-	if (flags.bound_control || (flags.fetch_inactive && !row_shift)) {
+	// DPP8 has no BOUND_CTRL; an inactive source reads zero there (handled by the read), not a skipped write.
+	if (flags.dpp8 || flags.bound_control || (flags.fetch_inactive && !row_shift)) {
 		return writable;
 	}
 	// Without BOUND_CTRL, a vacated source or, without FI, an EXEC-disabled one disables the write.
