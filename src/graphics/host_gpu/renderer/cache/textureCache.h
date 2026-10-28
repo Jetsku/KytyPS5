@@ -41,6 +41,7 @@ class BufferCache;
 
 // KYTY_META_CLEAR_COVER / KYTY_META_TRACE (textureCache.cpp).
 [[nodiscard]] bool     MetaClearCoverEnabled();
+[[nodiscard]] bool     StencilPlaneFillClearEnabled();
 [[nodiscard]] uint64_t MetaTraceAddress();
 void                   SetMetaTraceAddressAuto(uint64_t address);
 void                   SetMetaTraceAddressStencil(uint64_t address);

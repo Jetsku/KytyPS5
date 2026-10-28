@@ -478,6 +478,24 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return cache.ClearImage(command, binding.image_id, image.backing.format, range, clear,
 		                        "compute-stencil-fill");
 	}
+	// KYTY_STENCIL_PLANE_FILL_CLEAR: GT7's pattern fill (CS 0xfdc68063b0791828: thread i < s8 stores
+	// s[4 + (i & 3)] with BUFFER_STORE_FORMAT_X) is a uniform fill when the four pattern words agree. Its
+	// waterfall loop keeps it out of AnalyzeUniformFill; it clears GT7's course-map depth and stencil.
+	if (StencilPlaneFillClearEnabled() && program.shader_hash == 0xfdc68063b0791828ull &&
+	    resources.buffers.size() == 1 && resources.user_data.size() >= 9 &&
+	    resources.user_data[4] == resources.user_data[5] && resources.user_data[4] == resources.user_data[6] &&
+	    resources.user_data[4] == resources.user_data[7] && resources.user_data[8] != 0) {
+		const auto pattern_buffer = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[0]);
+		const auto bytes          = uint64_t {resources.user_data[8]} * 4u;
+		if (pattern_buffer.Stride() == 4 && group_x * 64ull >= resources.user_data[8] &&
+		    cache.ClearImageFromBuffer(command, pattern_buffer.Base48(), bytes, resources.user_data[4])) {
+			if (MetaTraceAddress() == pattern_buffer.Base48() && MetaTraceLine()) {
+				LOGF("MetaTrace: pattern fill 0x%" PRIx64 " size 0x%" PRIx64 " value 0x%08x: image clear\n",
+				     pattern_buffer.Base48(), bytes, resources.user_data[4]);
+			}
+			return true;
+		}
+	}
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;

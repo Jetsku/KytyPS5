@@ -6063,7 +6063,7 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 
 // KYTY_STENCIL_PLANE_FILL_CLEAR=1 (default off; GT7 preset): ClearImageFromBuffer also takes a fill
 // that covers exactly a depth target's stencil plane as a stencil clear of that target.
-static bool StencilPlaneFillClearEnabled() {
+bool StencilPlaneFillClearEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_STENCIL_PLANE_FILL_CLEAR");
 		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
