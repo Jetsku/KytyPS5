@@ -43,6 +43,14 @@ struct HostBufferRobustness {
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 
+// KYTY_BUFFER_PAIR_ATOMIC: the device has 64-bit atomics on storage buffers and physical storage
+// buffers (shaderBufferInt64Atomics) and starts every storage-buffer binding 8-byte aligned
+// (minStorageBufferOffsetAlignment a multiple of 8), so the u64 view's element i of a binding is the
+// guest qword at binding byte 8i. Off: DWORDX2 pairs through bound V#s keep the dword path (pairs
+// through BDA check the host address itself). The device layer sets this once.
+void SetHostBufferPairAtomics(bool supported);
+bool GetHostBufferPairAtomics();
+
 // Derivatives in compute shaders (IMAGE_GET_LOD: OpImageQueryLod under DerivativeGroupQuads). The
 // device layer enables VK_KHR_compute_shader_derivatives, else VK_NV_compute_shader_derivatives
 // (the same capability and execution mode, declared with the NV SPIR-V extension). None: the device

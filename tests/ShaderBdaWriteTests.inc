@@ -14,8 +14,9 @@ using ShaderRecompiler::GetCodegenOptions;
 // Stores and atomics through V#s selected with GPU data (buffer load + readfirstlane), each on its
 // own 128-byte region: per-component range checks of DWORDX2/X4 stores, byte and short stores
 // that keep their neighbours, atomics with return (pre-op value), all-or-nothing 64-bit atomics
-// and out-of-range writes that change nothing.
-TestCase WritesThroughGpuSelectedDescriptors() {
+// and out-of-range writes that change nothing. pair_glc (KYTY_BUFFER_PAIR_ATOMIC): the DWORDX2
+// stores have GLC, so the in-range aligned one is a single 64-bit atomic store through BDA.
+TestCase WritesThroughGpuSelectedDescriptors(bool pair_glc = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000130000000ull;
   enum Op : u32 {
@@ -61,7 +62,8 @@ TestCase WritesThroughGpuSelectedDescriptors() {
   constexpr u32 DataDword = 2048;
   constexpr u32 RegionDwords = 32;
   TestCase test;
-  test.name = "WritesThroughGpuSelectedDescriptors";
+  test.name = pair_glc ? "WritesThroughGpuSelectedDescriptorsPairGlc"
+                       : "WritesThroughGpuSelectedDescriptors";
   test.initial.resize(4096);
   for (u32 i = 0; i < Count; ++i) {
     const u32 data_offset = (DataDword + i * RegionDwords) * 4u;
@@ -101,8 +103,15 @@ TestCase WritesThroughGpuSelectedDescriptors() {
       AppendVMovU32(&test.code, 4 + component, input.data[component]);
     }
     const bool atomic = input.op >= AtomicCmpSwap;
-    test.code.push_back(EncodeMubuf0(input.op, 0, input.idxen, true, atomic));
+    const bool glc = atomic || (pair_glc && input.op == StoreDwordX2);
+    test.code.push_back(EncodeMubuf0(input.op, 0, input.idxen, true, glc));
     test.code.push_back(EncodeMubuf1(4, 2, 2, 22)); // v[4..], s[8:11], v[2:3] or v2, s22
+    const bool load_back = pair_glc && input.op == StoreDwordX2;
+    if (load_back) {
+      // BUFFER_LOAD_DWORDX2 glc of the same pair: the stored values, or 0 out of range.
+      test.code.push_back(EncodeMubuf0(0x0du, 0, input.idxen, true, true));
+      test.code.push_back(EncodeMubuf1(4, 2, 2, 22));
+    }
     // Returned pre-op values (GLC) go to dwords 2i and 2i+1.
     AppendStoreVgpr(&test.code, 4, 2 * i);
     AppendStoreVgpr(&test.code, 5, 2 * i + 1);
@@ -167,6 +176,13 @@ TestCase WritesThroughGpuSelectedDescriptors() {
         }
       }
     }
+    if (load_back) {
+      for (u32 component = 0; component < 2u; ++component) {
+        const u32 offset = input.voffset + component * 4u;
+        returned[component] =
+            in_range(offset, 4u) ? memory[(input.soffset + record + offset) / 4u] : 0u;
+      }
+    }
     test.expected[2 * i] = returned[0];
     test.expected[2 * i + 1] = returned[1];
   }
@@ -179,6 +195,11 @@ TestCase WritesThroughGpuSelectedDescriptors() {
                   O::BUFFER_ATOMIC_ADD,   O::BUFFER_ATOMIC_OR,   O::BUFFER_ATOMIC_INC,
                   O::BUFFER_ATOMIC_SWAP_X2, O::BUFFER_ATOMIC_OR_X2, O::S_ENDPGM};
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "OpAtomicOr"};
+  if (pair_glc) {
+    test.opcodes.push_back(O::BUFFER_LOAD_DWORDX2);
+    test.required_spirv.push_back("OpAtomicStore");
+    test.required_spirv.push_back("OpAtomicLoad %ulong");
+  }
   return test;
 }
 
@@ -189,6 +210,9 @@ void RunAll(VulkanHarness *vulkan) {
     options.bda_writes = true;
     ScopedCodegenOptions scope(options);
     RunCase(vulkan, WritesThroughGpuSelectedDescriptors());
+    options.buffer_pair_atomic = true;
+    ScopedCodegenOptions pair_scope(options);
+    RunCase(vulkan, WritesThroughGpuSelectedDescriptors(true));
   }
   // The renderer's settle reads its mode from the environment (ctest bda_writes sets it).
   if (BdaWritesEnabled()) {
