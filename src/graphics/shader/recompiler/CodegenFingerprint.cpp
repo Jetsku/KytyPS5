@@ -21,12 +21,12 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 43 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
+// Members: 44 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
 // loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
 // lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 120,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 128,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -124,6 +124,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.indirect_coherent) {
 		b.Text("indirect_coherent");
+	}
+	if (options.buffer_pair_atomic) {
+		// The bound-V# pairs depend on the device (8-byte aligned bindings).
+		b.Text(Spirv::GetHostBufferPairAtomics() ? "buffer_pair_atomic" : "buffer_pair_atomic_bda");
 	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms

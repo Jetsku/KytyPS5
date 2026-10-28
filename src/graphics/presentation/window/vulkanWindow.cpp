@@ -1061,6 +1061,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
 		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
 	}
+	// KYTY_BUFFER_PAIR_ATOMIC: 64-bit buffer atomics (shaderBufferInt64Atomics, a required feature)
+	// on bindings that start 8-byte aligned.
+	{
+		const auto alignment = properties2.properties.limits.minStorageBufferOffsetAlignment;
+		const bool pairs     = supported_features12.shaderBufferInt64Atomics == VK_TRUE &&
+		                   alignment != 0u && alignment % 8u == 0u;
+		ShaderRecompiler::Spirv::SetHostBufferPairAtomics(pairs);
+		LOGF("Vulkan buffer pair atomics: %s (storage offset alignment %" PRIu64 ")\n",
+		     pairs ? "yes" : "no", static_cast<uint64_t>(alignment));
+	}
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =
 	    supported_features2.features.shaderResourceMinLod == VK_TRUE;

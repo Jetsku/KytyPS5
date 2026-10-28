@@ -237,6 +237,16 @@ struct CodegenOptions {
 	// a polling loop or serve from a non-coherent cache: a decoupled look-back scan (Ratchet &
 	// Clank's 0xba61d861c2b03285) spins forever on a partition flag another workgroup published.
 	bool indirect_coherent = false;
+	// KYTY_BUFFER_PAIR_ATOMIC=1 (default 0; on in the PPSA01417 title preset): a raw
+	// BUFFER_LOAD_DWORDX2 / BUFFER_STORE_DWORDX2 with GLC or DLC, through a bound V# or one the
+	// shader computed (BDA), whose two dwords are contiguous, in range and 8-byte aligned at run
+	// time, is one 64-bit atomic load or store (Device scope, acquire / release) instead of two
+	// dword accesses, as an aligned DWORDX2 is on the guest GPU. Miles Morales' TLAS builder
+	// 0x49d3e4dbb4dd1ac4 publishes {status, prefix} pairs of a decoupled look-back scan so; with two
+	// dword accesses a polling workgroup can read the new status with the old prefix. Any other
+	// pair keeps the dword path; so does every pair on a host without 8-byte aligned storage-buffer
+	// bindings (SetHostBufferPairAtomics).
+	bool buffer_pair_atomic = false;
 	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
 	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
 	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared

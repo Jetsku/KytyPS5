@@ -32,6 +32,7 @@ enum HostFloatControlBits : uint32_t {
 std::atomic_uint32_t g_host_float_controls {0};
 std::atomic_bool     g_storage_dword_loads_return_zero {false};
 std::atomic_bool     g_uniform_dword_loads_return_zero {false};
+std::atomic_bool     g_buffer_pair_atomics {false};
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
 std::atomic_uint8_t  g_shader_clock_scope {0};
@@ -373,6 +374,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
+				// KYTY_BUFFER_PAIR_ATOMIC: a DWORDX2 pair through a bound V# reads or writes the u64
+				// view of the buffer atomically.
+				if (memory.kind == IR::ResourceKind::Buffer &&
+				    GetCodegenOptions().buffer_pair_atomic && GetHostBufferPairAtomics() &&
+				    memory.IsCoherentBufferPair(inst.GetOpcode())) {
+					requirements.buffer_int64_atomics = true;
+				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					requirements.coherent_buffers |= memory.coherent;
 					if (memory.resource >= program.info.buffers.size()) {
@@ -574,6 +582,14 @@ HostBufferRobustness GetHostBufferRobustness() {
 	            g_storage_dword_loads_return_zero.load(std::memory_order_relaxed),
 	        .uniform_dword_loads_return_zero =
 	            g_uniform_dword_loads_return_zero.load(std::memory_order_relaxed)};
+}
+
+void SetHostBufferPairAtomics(bool supported) {
+	g_buffer_pair_atomics.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostBufferPairAtomics() {
+	return g_buffer_pair_atomics.load(std::memory_order_relaxed);
 }
 
 void SetHostImageFeatures(const HostImageFeatures& features) {

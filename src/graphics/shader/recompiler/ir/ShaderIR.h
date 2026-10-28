@@ -85,6 +85,14 @@ struct MemoryInfo {
 		       !typed && !formatted && data_bits == 32u;
 	}
 
+	// KYTY_BUFFER_PAIR_ATOMIC: a raw GLC/DLC BUFFER_LOAD_DWORDX2 or BUFFER_STORE_DWORDX2 through a
+	// bound V# or one the shader computed, which may run as one 64-bit access.
+	[[nodiscard]] bool IsCoherentBufferPair(ValueOpcode opcode) const {
+		return (kind == ResourceKind::Buffer || kind == ResourceKind::IndirectBuffer) &&
+		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::StoreBufferU32x2) &&
+		       coherent && !typed && !formatted && data_bits == 32u;
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1). A formatted
 		// X load decodes the V#'s format in the shader (upstream a55a28380, LoadIndirectFormattedX):

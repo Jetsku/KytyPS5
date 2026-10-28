@@ -2611,6 +2611,7 @@ const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResul
                                                  .denorm_preserve_f16 = true,
                                                  .denorm_preserve_f64 = false});
   ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = true});
+  ShaderRecompiler::Spirv::SetHostBufferPairAtomics(true);
   // KYTY_CORPUS_BINDLESS=1: as on a device with bindless images (ir/BindlessBindings.h).
   if (const char *bindless = std::getenv("KYTY_CORPUS_BINDLESS"); bindless != nullptr) {
     ShaderRecompiler::IR::SetBindlessImagesEnabled(*bindless == '1');
@@ -33038,6 +33039,9 @@ private:
               : 0u;
       ShaderRecompiler::Spirv::SetHostBufferRobustness(
           {.storage_dword_loads_return_zero = m_robust_storage_alignment == 1u});
+      // KYTY_BUFFER_PAIR_ATOMIC: shaderBufferInt64Atomics is required (RequiredVulkan12Features).
+      ShaderRecompiler::Spirv::SetHostBufferPairAtomics(
+          properties.properties.limits.minStorageBufferOffsetAlignment % 8u == 0u);
       ShaderRecompiler::Spirv::SetHostImageFeatures(
           {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
       namespace Spirv = ShaderRecompiler::Spirv;
@@ -46198,6 +46202,51 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
+  return test;
+}
+
+// KYTY_BUFFER_PAIR_ATOMIC: GLC DWORDX2 stores and loads through bound V#s. The 8-byte aligned pairs
+// (store at byte 16, load at byte 8) are one 64-bit atomic each with the switch on; the pairs at
+// 4 mod 8 (store at 28, load at 36) keep the dword path. The values are the same either way: `on`
+// only selects the SPIR-V the case requires (64-bit atomics) or forbids.
+TestCase BufferPairAtomicGlc(bool on) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = on ? "BufferPairAtomicGlcOn" : "BufferPairAtomicGlcOff";
+  auto &code = test.code;
+  const auto load_glc = [&](u32 dst, u32 address) {
+    code.push_back(EncodeMubuf0(0x0du, 0, false, true, true)); // BUFFER_LOAD_DWORDX2 glc
+    code.push_back(EncodeMubuf1(dst, 0, address));
+  };
+  AppendVMovU32(&code, 20, 16);
+  AppendVMovLiteral(&code, 0, 0x11111111u);
+  AppendVMovLiteral(&code, 1, 0x22222222u);
+  AppendBufferStoreOpcode(&code, 0x1d, 0, 20, true);
+  AppendVMovU32(&code, 21, 8);
+  load_glc(2, 21);
+  AppendVMovU32(&code, 22, 28);
+  AppendVMovLiteral(&code, 4, 0x33333333u);
+  AppendVMovLiteral(&code, 5, 0x44444444u);
+  AppendBufferStoreOpcode(&code, 0x1d, 4, 22, true);
+  AppendVMovU32(&code, 23, 36);
+  load_glc(6, 23);
+  AppendStoreVgpr(&code, 2, 0);
+  AppendStoreVgpr(&code, 3, 1);
+  AppendStoreVgpr(&code, 6, 11);
+  AppendStoreVgpr(&code, 7, 12);
+  AppendEnd(&code);
+  test.initial = {0, 0, 0xa0a0a0a0u, 0xb0b0b0b0u, 0, 0, 0, 0, 0, 0x90909090u, 0xa1a1a1a1u, 0, 0};
+  test.expected = {0xa0a0a0a0u, 0xb0b0b0b0u, 0xa0a0a0a0u, 0xb0b0b0b0u, 0x11111111u,
+                   0x22222222u, 0,           0x33333333u, 0x44444444u, 0x90909090u,
+                   0xa1a1a1a1u, 0x90909090u, 0xa1a1a1a1u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORDX2, O::BUFFER_LOAD_DWORDX2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"glc=1", 4}};
+  if (on) {
+    test.required_spirv = {"Int64Atomics", "OpAtomicStore", "OpAtomicLoad %ulong", "buffers_u64"};
+  } else {
+    test.forbidden_spirv = {"OpAtomicStore", "OpAtomicLoad %ulong"};
+  }
   return test;
 }
 
@@ -60859,6 +60908,23 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--srt-variant-only") == 0) {
     VulkanHarness vulkan;
     SrtVariantTests::RunAll(&vulkan);
+    return 0;
+  }
+  // KYTY_BUFFER_PAIR_ATOMIC: GLC DWORDX2 pairs as single 64-bit accesses, and without the switch.
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-pair-atomic-only") == 0) {
+    VulkanHarness vulkan;
+    {
+      auto options = ShaderRecompiler::GetCodegenOptions();
+      options.buffer_pair_atomic = true;
+      CodegenTests::ScopedCodegenOptions scope(options);
+      RunCase(&vulkan, BufferPairAtomicGlc(true));
+    }
+    {
+      auto options = ShaderRecompiler::GetCodegenOptions();
+      options.buffer_pair_atomic = false;
+      CodegenTests::ScopedCodegenOptions scope(options);
+      RunCase(&vulkan, BufferPairAtomicGlc(false));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-writes-only") == 0) {
