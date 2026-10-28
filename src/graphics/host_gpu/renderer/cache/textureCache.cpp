@@ -338,6 +338,14 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 // metadata is not theirs, so the materialisation does nothing for them (reported a few times).
 // KYTY_CLEAR_TRACE=1 (diagnostic): one stderr line per metadata address and outcome of the DCC/CMASK
 // clear materialisation.
+bool CmaskAliasSupersededEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CMASK_ALIAS_SUPERSEDED");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
 void ClearTrace(const char* site, const char* outcome, uint64_t metadata, uint64_t metadata_size,
                 uint64_t data, uint64_t data_size, uint32_t width, uint32_t height, uint32_t extra) {
 	static const bool enabled = [] {
@@ -4820,7 +4828,22 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		{
 			std::scoped_lock lock {m_lock};
 			// Bytes some image also covers are not proven to be this surface's CMASK.
-			if (const auto aliases = FindImagesInRegion(metadata.address, metadata.size, false); !aliases.empty()) {
+			const auto aliases = FindImagesInRegion(metadata.address, metadata.size, false);
+			bool       superseded_only = false;
+			// KYTY_CMASK_ALIAS_SUPERSEDED=1 (default off; on in the GT7 preset): an image that covers
+			// this target's own data as well as its CMASK is an older surface of the same reused
+			// memory (GT7's course-map preview over a stale 1920x1080 target), not an owner of the
+			// CMASK bytes; it no longer refuses the clear (the trails of the course-map markers).
+			if (CmaskAliasSupersededEnabled()) {
+				const auto data_begin = desc.info.data.address;
+				const auto data_end   = data_begin + desc.info.data.size;
+				superseded_only = true;
+				for (const auto alias: aliases) {
+					const auto& other = m_slot_images[alias].info.data;
+					superseded_only &= other.address < data_end && data_begin < other.address + other.size;
+				}
+			}
+			if (!aliases.empty() && !superseded_only) {
 				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
 				// KYTY_CLEAR_TRACE: which images cover the CMASK bytes (first time per metadata address).
 				static const bool trace = [] {
