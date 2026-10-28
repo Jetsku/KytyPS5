@@ -418,8 +418,9 @@ std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc
 			switch (inst.opcode) {
 				case Opcode::S_BARRIER: why = "a barrier waits for the other lanes"; break;
 				case Opcode::S_SENDMSG: why = "a message"; break;
-				case Opcode::V_READLANE_B32:
-				case Opcode::V_WRITELANE_B32:
+				// V_READLANE_B32 / V_WRITELANE_B32 are allowed (unlike the fork): compilers spill SGPRs
+				// into fixed lanes of a VGPR with them, and here a dropped lane keeps running with
+				// EXEC off, so V_WRITELANE (which ignores EXEC) still stores into it.
 				case Opcode::V_PERMLANE16_B32:
 				case Opcode::V_PERMLANEX16_B32: why = "a lane access reads other lanes"; break;
 				case Opcode::IMAGE_GET_LOD:
