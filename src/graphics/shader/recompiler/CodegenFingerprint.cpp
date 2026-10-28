@@ -128,6 +128,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.buffer_pair_atomic) {
 		// The bound-V# pairs depend on the device (8-byte aligned bindings).
 		b.Text(Spirv::GetHostBufferPairAtomics() ? "buffer_pair_atomic" : "buffer_pair_atomic_bda");
+		// KYTY_BUFFER_PAIR_ATOMIC_HASHES limits it to some programs.
+		if (const char* hashes = std::getenv("KYTY_BUFFER_PAIR_ATOMIC_HASHES"); hashes != nullptr) {
+			b.Text(hashes);
+		}
 	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
