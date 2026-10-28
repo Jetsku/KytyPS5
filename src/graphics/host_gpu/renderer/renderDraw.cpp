@@ -4190,6 +4190,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			     static_cast<unsigned>(d.stencil_front.failOp), static_cast<unsigned>(d.stencil_front.depthFailOp),
 			     d.depth_clear_enable ? 1 : 0, static_cast<double>(d.depth_clear_value), d.stencil_clear_enable ? 1 : 0,
 			     static_cast<unsigned>(d.stencil_clear_value));
+			LOGF("DrawTraceDepth: stencil plane 0x%" PRIx64 " size 0x%" PRIx64 "\n", d.desc.info.stencil.address,
+			     d.desc.info.stencil.size);
+			// KYTY_META_TRACE=stencil: trace the writers of this target's stencil plane.
+			if (const auto* mode = std::getenv("KYTY_META_TRACE"); mode != nullptr && std::strcmp(mode, "stencil") == 0) {
+				SetMetaTraceAddressStencil(d.desc.info.stencil.address);
+			}
 		}
 	}
 	// KYTY_DRAW_TRACE_PS=<hash>[:<sgpr>:<offset>] (diagnostic): logs the first 16 draws with this

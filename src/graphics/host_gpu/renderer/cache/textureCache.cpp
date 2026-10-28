@@ -7933,6 +7933,13 @@ void SetMetaTraceAddressAuto(uint64_t address) {
 	}
 }
 
+void SetMetaTraceAddressStencil(uint64_t address) {
+	if (address == 0) return;
+	if (g_meta_trace_address.exchange(address, std::memory_order_relaxed) != address) {
+		LOGF("MetaTrace: tracing stencil plane 0x%" PRIx64 "\n", address);
+	}
+}
+
 bool MetaTraceLine() {
 	static std::atomic<uint32_t> lines {0};
 	static const uint32_t        max = [] {

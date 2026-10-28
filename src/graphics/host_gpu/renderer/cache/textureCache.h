@@ -43,6 +43,7 @@ class BufferCache;
 [[nodiscard]] bool     MetaClearCoverEnabled();
 [[nodiscard]] uint64_t MetaTraceAddress();
 void                   SetMetaTraceAddressAuto(uint64_t address);
+void                   SetMetaTraceAddressStencil(uint64_t address);
 [[nodiscard]] bool     MetaTraceLine();
 class CommandBuffer;
 class CommandScheduler;
