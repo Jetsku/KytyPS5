@@ -399,6 +399,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.U32(v.indirect_mapping_offset);
 	w.U32(v.indirect_search_iterations);
 	w.Bool(v.bindless);
+	w.Bool(v.runtime);
 	w.Bool(v.clamp_half_float);
 	w.Words(v.indirect_resources);
 }
@@ -424,6 +425,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.indirect_mapping_offset    = r.U32();
 	v.indirect_search_iterations = r.U32();
 	v.bindless                   = r.Bool();
+	v.runtime                    = r.Bool();
 	v.clamp_half_float           = r.Bool();
 	v.indirect_resources         = r.Words();
 }
@@ -560,6 +562,7 @@ void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {
 	w.Bool(v.cube);
 	w.Bool(v.fmask);
 	w.Bool(v.bindless);
+	w.Bool(v.runtime);
 	w.U32(v.fmask_fragments);
 	w.Bool(v.clamp_half_float);
 }
@@ -576,6 +579,7 @@ void Read(CodecReader& r, ResourceSpecialization::Image& v) {
 	v.cube                       = r.Bool();
 	v.fmask                      = r.Bool();
 	v.bindless                   = r.Bool();
+	v.runtime                    = r.Bool();
 	v.fmask_fragments            = static_cast<uint8_t>(r.U32());
 	v.clamp_half_float           = r.Bool();
 }
@@ -763,6 +767,7 @@ public:
 				w.Bool(image.table_scalar);
 				w.U32(image.workgroup_axis);
 				w.Bool(image.bindless);
+				w.Bool(image.runtime);
 				w.U32(image.record_pointer);
 				w.U32(image.nested_vsharp);
 				w.U32(image.nested_heap);
@@ -1001,6 +1006,7 @@ public:
 				image.table_scalar       = r.Bool();
 				image.workgroup_axis     = r.U32();
 				image.bindless           = r.Bool();
+				image.runtime            = r.Bool();
 				image.record_pointer     = r.U32();
 				image.nested_vsharp      = r.U32();
 				image.nested_heap        = r.U32();

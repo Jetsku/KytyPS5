@@ -772,6 +772,88 @@ void CheckVolumeOverArray() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, on.size());
 }
 
+// KYTY_RUNTIME_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): GT7's material functions
+// load their T#s through the call record's data pointer, which no heap plan covers. Here the
+// pointer is a lane's buffer value (V_READFIRSTLANE_B32): s_load_dwordx8 s[32:39], s[40:41], 0
+// then IMAGE_SAMPLE_L. Without the switch the program is skipped; with it the image is the
+// runtime image, looked up by its T# dwords in the runtime image table.
+std::vector<u32> RuntimeImageCode() {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u);
+  AppendVMovLiteral(&code, 4, 0x3f000000u);
+  AppendVMovLiteral(&code, 5, 0x00000000u);
+  code.push_back(EncodeVop1(0x02, 40, Vgpr(1)));     // v_readfirstlane_b32 s40, v1
+  code.push_back(EncodeSop1(0x03u, 41, InlineU32(0))); // s_mov_b32 s41, 0
+  code.push_back(EncodeSmem0(0x03u, 32, 20));        // s_load_dwordx8 s[32:39], s[40:41], 0
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[8:11]
+  code.push_back(EncodeMimg1(2, 3, 32 / 4, 8 / 4));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckRuntimeImage() {
+  constexpr const char *name = "BindlessRuntimeImage";
+  const auto code = RuntimeImageCode();
+  const auto user_data = MilesHeapUserData();
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+  {
+    codegen.runtime_images = false;
+    ScopedCodegenOptions scope(codegen);
+    Require(name, "switch off", ShaderRecompiler::TranslateProgram(code, options).skip_dispatch,
+            "the runtime T# was planned without KYTY_RUNTIME_IMAGES");
+  }
+  codegen.runtime_images = true;
+  ScopedCodegenOptions scope(codegen);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the runtime T# was skipped with KYTY_RUNTIME_IMAGES");
+  const auto &images = translated.program.info.images;
+  Require(name, "runtime image",
+          images.size() == 1u && images[0].runtime && images[0].bindless,
+          "expected one runtime image");
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  std::vector<u32> memory(0x4000u, 0u);
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.bindless_heaps.size() == 1u && resources.bindless_heaps[0].runtime &&
+              specialization.images.size() == 1u && specialization.images[0].runtime,
+          "the runtime image did not materialize as a runtime heap use");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "runtime SPIR-V",
+          CountSpirv(result.spirv, "\"runtime_image_table\"") == 1u &&
+              CountSpirv(result.spirv, "\"runtime_image_requests\"") == 1u &&
+              CountSpirv(result.spirv, "OpAtomicIAdd") >= 1u,
+          "the sample does not look its T# up in the runtime image table");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
 void RunCodegen() {
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
@@ -779,6 +861,7 @@ void RunCodegen() {
   CheckMaskedHeapKey();
   CheckRecordHeap();
   CheckVolumeOverArray();
+  CheckRuntimeImage();
 }
 
 } // namespace BindlessTests

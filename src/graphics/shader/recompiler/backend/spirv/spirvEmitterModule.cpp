@@ -316,6 +316,30 @@ void DefineBindlessImages(EmitterState& state) {
 		                            IR::BindlessFeedback);
 		state.bindless_feedback_variable = feedback;
 	}
+	// KYTY_RUNTIME_IMAGES: the T# -> translation entry table (the host writes it) and the buffer
+	// where shaders request T#s the table lacks.
+	if (state.runtime_image_table_variable == 0 &&
+	    std::ranges::any_of(state.program.info.images, &IR::ImageResource::runtime)) {
+		const auto table = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(table, "runtime_image_table");
+		state.builder.AddAnnotation(spv::OpDecorate, table, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, table, spv::DecorationBinding,
+		                            IR::BindlessRuntimeTable);
+		state.builder.AddAnnotation(spv::OpDecorate, table, spv::DecorationNonWritable);
+		state.runtime_image_table_variable = table;
+		const auto requests                = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(requests, "runtime_image_requests");
+		state.builder.AddAnnotation(spv::OpDecorate, requests, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, requests, spv::DecorationBinding,
+		                            IR::BindlessRuntimeRequests);
+		state.runtime_image_requests_variable = requests;
+	}
 }
 
 void DefineDescriptors(EmitterState& state) {

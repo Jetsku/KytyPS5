@@ -184,6 +184,9 @@ struct EmitterState {
 	// KYTY_BINDLESS_3D_AS_ARRAY: the raw translation entry behind bindless_slot
 	// (BindlessSlotArrayFlag marks a 2D or 2D-array texture a 3D image instruction samples).
 	uint32_t                                         bindless_translation_raw      = 0;
+	// KYTY_RUNTIME_IMAGES: the runtime image table and request buffer (set 1, bindings 7 and 8).
+	uint32_t                                         runtime_image_table_variable    = 0;
+	uint32_t                                         runtime_image_requests_variable = 0;
 	// While image_override_index names a resource, ImageResourceAt() returns image_override for
 	// it: the same instruction emitted against another view type of its texture.
 	uint32_t                                         image_override_index          = UINT32_MAX;

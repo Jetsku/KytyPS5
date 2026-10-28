@@ -68,6 +68,9 @@ CodegenOptions FromEnvironment() {
 	options.heap_key_mask     = EnvFlag("KYTY_HEAP_KEY_MASK", options.heap_key_mask);
 	options.bindless_3d_as_array =
 	    EnvFlag("KYTY_BINDLESS_3D_AS_ARRAY", options.bindless_3d_as_array);
+	options.runtime_images   = EnvFlag("KYTY_RUNTIME_IMAGES", options.runtime_images);
+	options.bindless_strided = EnvFlag("KYTY_BINDLESS_STRIDE", options.bindless_strided);
+	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
 	options.storage_length_zero =
 	    EnvFlag("KYTY_STORAGE_LENGTH_ZERO", options.storage_length_zero);
 	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {

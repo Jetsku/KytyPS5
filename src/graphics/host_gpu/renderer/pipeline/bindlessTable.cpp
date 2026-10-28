@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
 #include <array>
@@ -56,7 +57,7 @@ vk::DescriptorSetLayout BindlessSetLayout(GraphicContext& graphics) {
 	                             vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
 	// The buffers are written once, at creation, so they need no update-after-bind.
 	constexpr auto buffer_flags = vk::DescriptorBindingFlags {};
-	const std::array<vk::DescriptorSetLayoutBinding, 6> bindings {{
+	std::vector<vk::DescriptorSetLayoutBinding> bindings {{
 	    {Binding::Images2D, vk::DescriptorType::eSampledImage, images_per_array,
 	     vk::ShaderStageFlagBits::eAll, nullptr},
 	    {Binding::Images2DArray, vk::DescriptorType::eSampledImage, images_per_array,
@@ -70,8 +71,16 @@ vk::DescriptorSetLayout BindlessSetLayout(GraphicContext& graphics) {
 	    {Binding::Feedback, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll,
 	     nullptr},
 	}};
-	const std::array<vk::DescriptorBindingFlags, 6> binding_flags {
+	std::vector<vk::DescriptorBindingFlags> binding_flags {
 	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags};
+	// KYTY_RUNTIME_IMAGES: the runtime image table and request buffer.
+	if (BindlessTable::RuntimeImagesEnabled()) {
+		for (const auto binding: {BindlessTable::RuntimeTableBinding, BindlessTable::RuntimeRequestsBinding}) {
+			bindings.push_back({binding, vk::DescriptorType::eStorageBuffer, 1,
+			                    vk::ShaderStageFlagBits::eAll, nullptr});
+			binding_flags.push_back(buffer_flags);
+		}
+	}
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
 	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
 	flags_info.pBindingFlags = binding_flags.data();
@@ -116,6 +125,9 @@ void BindlessTable::Destroy() {
 	m_translation.reset();
 	m_feedback.reset();
 	m_feedback_snapshot.reset();
+	m_runtime_table.reset();
+	m_runtime_requests.reset();
+	m_runtime_requests_snapshot.reset();
 	if (m_pool != nullptr) {
 		m_graphics.device.destroyDescriptorPool(m_pool, nullptr);
 		m_pool = nullptr;
@@ -144,7 +156,7 @@ bool BindlessTable::EnsureCreated() {
 
 	const std::array<vk::DescriptorPoolSize, 2> sizes {{
 	    {vk::DescriptorType::eSampledImage, m_images_per_array * ImageArrays},
-	    {vk::DescriptorType::eStorageBuffer, 2},
+	    {vk::DescriptorType::eStorageBuffer, RuntimeImagesEnabled() ? 4u : 2u},
 	}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
@@ -201,14 +213,50 @@ bool BindlessTable::EnsureCreated() {
 	SetVulkanObjectNameF(m_graphics.device, m_translation->Handle(), "Bindless Translation");
 	SetVulkanObjectNameF(m_graphics.device, m_feedback->Handle(), "Bindless Feedback");
 
-	const std::array<vk::DescriptorBufferInfo, 2> buffer_infos {{
+	std::vector<vk::DescriptorBufferInfo> buffer_infos {{
 	    {m_translation->Handle(), 0, VK_WHOLE_SIZE},
 	    {m_feedback->Handle(), 0, VK_WHOLE_SIZE},
 	}};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
+	std::vector<uint32_t> buffer_bindings {Translation, Feedback};
+	if (RuntimeImagesEnabled()) {
+		// KYTY_RUNTIME_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): the host writes the
+		// table; shaders write requests, which the host reads from a snapshot as it does the
+		// feedback flags.
+		using namespace ShaderRecompiler::IR;
+		constexpr vk::DeviceSize table_bytes =
+		    vk::DeviceSize {RuntimeImageEntries} * RuntimeImageEntryWords * sizeof(uint32_t);
+		constexpr vk::DeviceSize requests_bytes =
+		    vk::DeviceSize {RuntimeImageRequestBufferWords} * sizeof(uint32_t);
+		m_runtime_table    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+		                                              AllFlags, table_bytes);
+		m_runtime_requests = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream,
+		                                              0, AllFlags, requests_bytes);
+		m_runtime_requests_snapshot = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, requests_bytes);
+		if (m_runtime_table->Mapped().empty() || m_runtime_requests->Mapped().empty() ||
+		    m_runtime_requests_snapshot->Mapped().empty()) {
+			LOGF("Bindless table: the runtime image buffers are not host-visible\n");
+			Destroy();
+			m_creation_failed = true;
+			return false;
+		}
+		for (auto* buffer:
+		     {m_runtime_table.get(), m_runtime_requests.get(), m_runtime_requests_snapshot.get()}) {
+			std::fill(buffer->Mapped().begin(), buffer->Mapped().end(), uint8_t {0});
+			buffer->Flush(0, buffer->Size());
+		}
+		SetVulkanObjectNameF(m_graphics.device, m_runtime_table->Handle(), "Bindless Runtime Table");
+		SetVulkanObjectNameF(m_graphics.device, m_runtime_requests->Handle(),
+		                     "Bindless Runtime Requests");
+		buffer_infos.push_back({m_runtime_table->Handle(), 0, VK_WHOLE_SIZE});
+		buffer_infos.push_back({m_runtime_requests->Handle(), 0, VK_WHOLE_SIZE});
+		buffer_bindings.push_back(RuntimeTableBinding);
+		buffer_bindings.push_back(RuntimeRequestsBinding);
+	}
+	std::vector<vk::WriteDescriptorSet> writes(buffer_infos.size());
 	for (uint32_t i = 0; i < writes.size(); i++) {
 		writes[i].dstSet          = set;
-		writes[i].dstBinding      = Translation + i;
+		writes[i].dstBinding      = buffer_bindings[i];
 		writes[i].descriptorCount = 1;
 		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
 		writes[i].pBufferInfo     = &buffer_infos[i];
@@ -742,6 +790,23 @@ void BindlessTable::RecordFeedbackSnapshot() {
 	snapshot_written.buffer        = m_feedback_snapshot->Handle();
 	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
 	                     0, nullptr, 1, &snapshot_written, 0, nullptr);
+	if (m_runtime_requests != nullptr) {
+		// KYTY_RUNTIME_IMAGES: the request buffer, at the same point.
+		auto requests_written   = flags_written;
+		requests_written.buffer = m_runtime_requests->Handle();
+		requests_written.size   = VK_WHOLE_SIZE;
+		sink.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                     vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+		                     &requests_written, 0, nullptr);
+		const vk::BufferCopy requests_copy {0, 0, m_runtime_requests->Size()};
+		sink.copyBuffer(m_runtime_requests->Handle(), m_runtime_requests_snapshot->Handle(), 1,
+		                &requests_copy);
+		auto requests_snapshot          = snapshot_written;
+		requests_snapshot.buffer        = m_runtime_requests_snapshot->Handle();
+		requests_snapshot.size          = VK_WHOLE_SIZE;
+		sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+		                     {}, 0, nullptr, 1, &requests_snapshot, 0, nullptr);
+	}
 	m_snapshot_tick = m_scheduler.CurrentTick();
 }
 
@@ -838,6 +903,128 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		m_unregistered_keys++;
 	}
 	m_image_refs.erase(found);
+}
+
+bool BindlessTable::RuntimeImagesEnabled() {
+	return ShaderRecompiler::GetCodegenOptions().runtime_images;
+}
+
+BindlessTable::Heap* BindlessTable::RuntimeHeap(uint32_t binding,
+                                                const ShaderRecompiler::IR::ImageResource* resource) {
+	if (binding >= ImageArrays || m_runtime_table == nullptr || m_set == nullptr) {
+		return nullptr;
+	}
+	if (m_runtime_heaps[binding] != nullptr || resource == nullptr) {
+		return m_runtime_heaps[binding];
+	}
+	auto& heap          = m_heaps.emplace_back();
+	heap.base           = 0;
+	heap.table_offset   = 0xfffffff0u + binding; // no guest heap matches it
+	heap.binding        = binding;
+	heap.resource       = *resource;
+	heap.runtime        = true;
+	heap.guest_entries  = RuntimeKeys;
+	if (!AllocateRegion(heap, RuntimeKeys)) {
+		m_heaps.pop_back();
+		return nullptr;
+	}
+	heap.runtime_dwords.resize(heap.entries);
+	m_runtime_heaps[binding] = &heap;
+	LOGF("Bindless runtime images: binding %u heap at region %u (%u keys)\n", binding, heap.region,
+	     heap.entries);
+	return &heap;
+}
+
+void BindlessTable::TakeRuntimeRequests(
+    std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>>& requests) {
+	using namespace ShaderRecompiler::IR;
+	if (m_runtime_requests == nullptr) {
+		return;
+	}
+	const auto* snapshot =
+	    reinterpret_cast<const uint32_t*>(m_runtime_requests_snapshot->Mapped().data());
+	auto* live = reinterpret_cast<uint32_t*>(m_runtime_requests->Mapped().data());
+	m_runtime_requests_snapshot->Invalidate(0, m_runtime_requests_snapshot->Size());
+	if (snapshot[0] == 0u) {
+		return;
+	}
+	const auto count = std::min(snapshot[0], RuntimeImageRequests);
+	for (uint32_t index = 0; index < count; index++) {
+		const auto* record  = snapshot + RuntimeImageRingOffset + index * RuntimeImageRequestWords;
+		const auto  binding = record[8];
+		if (binding == 0u || binding > ImageArrays) {
+			continue; // not written yet when the snapshot was taken
+		}
+		std::array<uint32_t, 8> dwords {};
+		std::copy_n(record, 8, dwords.begin());
+		requests.emplace_back(dwords, binding - 1u);
+	}
+	// Cleared for the next requests. A request the GPU makes meanwhile may be lost; the T# is
+	// still missing from the table, so the shader asks again.
+	live[0] = 0;
+	std::fill_n(live + RuntimeImageBitsOffset, RuntimeImageEntries / 32u, 0u);
+	for (uint32_t index = 0; index < count; index++) {
+		live[RuntimeImageRingOffset + index * RuntimeImageRequestWords + 8u] = 0;
+	}
+	m_runtime_requests->Flush(0, m_runtime_requests->Size());
+}
+
+void BindlessTable::PublishRuntimeEntry(const Heap& heap, uint32_t key,
+                                        const std::array<uint32_t, 8>& dwords) {
+	using namespace ShaderRecompiler::IR;
+	auto*          table  = reinterpret_cast<uint32_t*>(m_runtime_table->Mapped().data());
+	const uint32_t target = heap.region + key + 1u;
+	const auto     home   = RuntimeImageHash(dwords.data(), heap.binding);
+	uint32_t       chosen = UINT32_MAX;
+	for (uint32_t probe = 0; probe < RuntimeImageProbes; probe++) {
+		const auto  entry = (home + probe) & (RuntimeImageEntries - 1u);
+		const auto* words = table + entry * RuntimeImageEntryWords;
+		if (words[8] == target && words[9] == heap.binding &&
+		    std::equal(dwords.begin(), dwords.end(), words)) {
+			return;
+		}
+		if (words[8] == 0u && chosen == UINT32_MAX) {
+			chosen = entry;
+		}
+	}
+	if (chosen == UINT32_MAX) {
+		// Every probe holds another T#: the last is evicted, and asks again when sampled.
+		chosen = (home + RuntimeImageProbes - 1u) & (RuntimeImageEntries - 1u);
+		static std::atomic<uint32_t> evicted = 0;
+		if (evicted.fetch_add(1) < 16) {
+			LOGF("Bindless runtime images: table entry %u evicted\n", chosen);
+		}
+	}
+	auto* words = table + chosen * RuntimeImageEntryWords;
+	words[8]    = 0; // a shader reading the entry meanwhile misses it
+	std::copy(dwords.begin(), dwords.end(), words);
+	words[9] = heap.binding;
+	words[8] = target;
+	m_runtime_table->Flush(vk::DeviceSize {chosen} * RuntimeImageEntryWords * sizeof(uint32_t),
+	                       RuntimeImageEntryWords * sizeof(uint32_t));
+}
+
+uint32_t BindlessTable::RuntimeKey(Heap& heap, const std::array<uint32_t, 8>& dwords) {
+	const auto map_key = std::pair {heap.binding, dwords};
+	if (const auto found = m_runtime_keys.find(map_key); found != m_runtime_keys.end()) {
+		PublishRuntimeEntry(heap, found->second, dwords); // evicted from the table meanwhile
+		return found->second;
+	}
+	if (heap.runtime_next_key >= heap.entries) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 4) {
+			LOGF("Bindless runtime images: binding %u holds %u T#s; further ones sample the "
+			     "placeholder\n",
+			     heap.binding, heap.entries);
+		}
+		return UINT32_MAX;
+	}
+	const auto key = heap.runtime_next_key++;
+	m_runtime_keys.emplace(map_key, key);
+	heap.runtime_dwords[key] = dwords;
+	SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+	PublishRuntimeEntry(heap, key, dwords);
+	return key;
 }
 
 } // namespace Libs::Graphics

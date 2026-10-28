@@ -57,6 +57,10 @@ struct BindlessHeapUse {
 	uint32_t nested_vsharp  = UINT32_MAX;
 	uint32_t nested_heap    = 0;
 	uint32_t nested_keys    = 0;
+	// KYTY_RUNTIME_IMAGES: not a guest heap but the runtime image heap of `image`'s binding (the
+	// T#s shaders loaded at run time and requested); nothing to patch, nothing read from guest
+	// memory.
+	bool     runtime        = false;
 
 	bool operator==(const BindlessHeapUse&) const = default;
 };
