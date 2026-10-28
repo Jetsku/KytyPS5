@@ -4120,6 +4120,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			     ps_addr, state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0);
 		}
 	}
+	// KYTY_DRAW_TRACE_TARGET=<hex address>[:<count>] (diagnostic): logs the executed draws whose colour
+	// target 0 starts at that guest address (default 200): frame, programs, counts, depth state.
+	static const auto trace_target = [] {
+		std::pair<uint64_t, uint32_t> parsed {0, 200};
+		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_TARGET"); value != nullptr) {
+			char* end    = nullptr;
+			parsed.first = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') parsed.second = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
+		}
+		return parsed;
+	}();
+	if (trace_target.first != 0 && state.color_count > 0 &&
+	    state.color_info[0].desc.info.data.address == trace_target.first) {
+		static std::atomic<uint32_t> traced {0};
+		if (traced.fetch_add(1, std::memory_order_relaxed) < trace_target.second) {
+			const auto& d = state.depth_info;
+			LOGF("DrawTraceTarget: frame %d VS 0x%016" PRIx64 " PS 0x%016" PRIx64
+			     " n=%u inst=%u colors=%u depth 0x%" PRIx64 " test %d write %d clear %d (%g) samples %u\n",
+			     static_cast<int>(m_context.GetGpu().GetFrameNum()),
+			     state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+			     state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0,
+			     draw.index_count, draw.instance_count, state.color_count, d.desc.info.data.address,
+			     d.depth_test_enable ? 1 : 0, d.depth_write_enable ? 1 : 0, d.depth_clear_enable ? 1 : 0,
+			     static_cast<double>(d.depth_clear_value), static_cast<unsigned>(state.color_info[0].desc.info.samples));
+		}
+	}
 	// KYTY_DRAW_TRACE_PS=<hash>[:<sgpr>:<offset>] (diagnostic): logs the first 16 draws with this
 	// pixel program: counts and user SGPRs; with <sgpr>:<offset> also the V# at that byte offset of
 	// the pointer in user SGPRs <sgpr>/<sgpr>+1 and the first 64 dwords of its buffer, from guest
