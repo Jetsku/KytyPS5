@@ -701,6 +701,13 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		dump.frame  = static_cast<int>(m_context.GetGpu().GetFrameNum());
 		RtBvhDumpOnDispatch(dump);
 	}
+	if (WatchReadEnabled() && compute_program) {
+		WatchReadOnDispatch(input_info.stage.program->shader_hash,
+		                    std::span<const uint32_t>(cs_regs.cs_user_sgpr.value,
+		                                              std::min<uint32_t>(cs_regs.cs_user_sgpr.count,
+		                                                                 HW::UserSgprInfo::SGPRS_MAX)),
+		                    static_cast<int>(m_context.GetGpu().GetFrameNum()));
+	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -1100,6 +1107,13 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	CpGaps::Phase(CpGaps::Cat::DispatchPipeline);
+	if (WatchReadEnabled() && compute_program) {
+		WatchReadOnDispatch(input_info.stage.program->shader_hash,
+		                    std::span<const uint32_t>(cs_regs.cs_user_sgpr.value,
+		                                              std::min<uint32_t>(cs_regs.cs_user_sgpr.count,
+		                                                                 HW::UserSgprInfo::SGPRS_MAX)),
+		                    static_cast<int>(m_context.GetGpu().GetFrameNum()));
+	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;

@@ -309,6 +309,113 @@ bool DumpNow(const RtBvhDispatch& d, uint64_t ordinal, uint32_t sequence) {
 
 } // namespace
 
+namespace {
+
+struct WatchReadRegion {
+	uint32_t sgpr  = 0;
+	uint32_t bytes = 0;
+	uint64_t last  = 0; // the base seen at the shader's last dispatch
+};
+
+struct WatchReadShader {
+	uint64_t                     hash = 0;
+	std::vector<WatchReadRegion> regions;
+};
+
+std::vector<WatchReadShader>& WatchReadList() {
+	static std::vector<WatchReadShader> list = [] {
+		std::vector<WatchReadShader> shaders;
+		const char*                  value = std::getenv("KYTY_WATCH_READ");
+		if (value == nullptr) return shaders;
+		const std::string text(value);
+		for (size_t at = 0; at < text.size();) {
+			const size_t end   = std::min(text.find(',', at), text.size());
+			const auto   token = text.substr(at, end - at);
+			at                 = end + 1;
+			WatchReadShader shader;
+			char*           rest = nullptr;
+			shader.hash          = std::strtoull(token.c_str(), &rest, 16);
+			while (rest != nullptr && (*rest == ':' || *rest == '+')) {
+				WatchReadRegion region;
+				region.sgpr = static_cast<uint32_t>(std::strtoul(rest + 1, &rest, 10));
+				if (rest == nullptr || *rest != ':') break;
+				region.bytes = static_cast<uint32_t>(std::strtoul(rest + 1, &rest, 0));
+				if (region.bytes != 0) shader.regions.push_back(region);
+			}
+			if (shader.hash != 0) shaders.push_back(shader);
+		}
+		return shaders;
+	}();
+	return list;
+}
+
+void WatchReadSave(const std::filesystem::path& folder, uint32_t ordinal, uint64_t at_hash, int frame,
+                   uint64_t owner, const WatchReadRegion& region, uint64_t base, const char* when) {
+	std::vector<uint8_t> data(region.bytes);
+	const bool ok = LibKernel::Memory::SynchronizeGpuBackingForRead(base, data.size()) &&
+	                LibKernel::Memory::TryReadGpuCleanBacking(base, data.data(), data.size());
+	std::string head;
+	for (size_t i = 0; ok && i + 4 <= data.size() && i < 32; i += 4) {
+		uint32_t v = 0;
+		std::memcpy(&v, data.data() + i, 4);
+		head += " " + Hex(v);
+	}
+	LOGF("KYTY_WATCH_READ: #%u frame %d at CS 0x%016" PRIx64 ": %s region of CS 0x%016" PRIx64
+	     " s%u 0x%" PRIx64 "+0x%x %s%s\n",
+	     ordinal, frame, at_hash, when, owner, region.sgpr, base, region.bytes, ok ? "" : "UNREADABLE",
+	     head.c_str());
+	if (!ok) return;
+	const auto name = fmt::format("{:03}_f{}_at{:016x}_{}_{:016x}_s{}.bin", ordinal, frame, at_hash, when,
+	                              owner, region.sgpr);
+	std::ofstream(folder / name, std::ios::binary)
+	    .write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+}
+
+} // namespace
+
+bool WatchReadEnabled() noexcept {
+	return !WatchReadList().empty();
+}
+
+void WatchReadOnDispatch(uint64_t shader_hash, std::span<const uint32_t> user_sgpr, int frame) {
+	auto& list  = WatchReadList();
+	auto  match = std::find_if(list.begin(), list.end(), [&](const auto& s) { return s.hash == shader_hash; });
+	if (match == list.end()) return;
+	static uint32_t ordinal = 0;
+	static const uint32_t max = [] {
+		const char* value = std::getenv("KYTY_WATCH_READ_MAX");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 48u;
+	}();
+	if (ordinal >= max) return;
+	const uint32_t n = ordinal++;
+	static const std::filesystem::path folder = [] {
+		const char* dir = std::getenv("KYTY_WATCH_READ_DIR");
+		auto path = dir != nullptr && *dir != '\0' ? std::filesystem::path(dir) : Config::GetShaderLogFolder() / "watch";
+		std::error_code error;
+		std::filesystem::create_directories(path, error);
+		return path;
+	}();
+	LOGF("KYTY_WATCH_READ: #%u frame %d CS 0x%016" PRIx64 " user data:%s\n", n, frame, shader_hash,
+	     [&] {
+		     std::string text;
+		     for (const auto v: user_sgpr) text += " " + Hex(v);
+		     return text;
+	     }()
+	         .c_str());
+	// What earlier listed dispatches left (their last bases), then this dispatch's inputs.
+	for (const auto& shader: list) {
+		for (const auto& region: shader.regions) {
+			if (region.last != 0) WatchReadSave(folder, n, shader_hash, frame, shader.hash, region, region.last, "seen");
+		}
+	}
+	for (auto& region: match->regions) {
+		if (region.sgpr + 1u >= user_sgpr.size()) continue;
+		const uint64_t base = user_sgpr[region.sgpr] | static_cast<uint64_t>(user_sgpr[region.sgpr + 1u] & 0xffffu) << 32u;
+		region.last         = base;
+		if (base != 0) WatchReadSave(folder, n, shader_hash, frame, shader_hash, region, base, "before");
+	}
+}
+
 bool RtBvhDumpEnabled() noexcept {
 	return !DumpOrdinals().empty();
 }

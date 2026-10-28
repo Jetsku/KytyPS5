@@ -32,6 +32,15 @@ struct RtBvhDispatch {
 // GPU thread, before the dispatch prepares its bindings: the readbacks may flush the recording.
 void RtBvhDumpOnDispatch(const RtBvhDispatch& dispatch);
 
+// KYTY_WATCH_READ=<hash>:<sgpr>:<bytes>[+<sgpr>:<bytes>...][,<hash>:...] (diagnostic): at each
+// dispatch of a listed compute shader, the buffers whose base address sits in user SGPRs
+// <sgpr>,<sgpr+1> (V# word 0 and the low 16 bits of word 1) are read coherently and saved; at the
+// same time the regions last seen for every listed shader are read again, so a later listed
+// dispatch shows what an earlier one wrote. Files go to KYTY_WATCH_READ_DIR (default
+// _Shaders/watch), at most KYTY_WATCH_READ_MAX (default 48) dispatches.
+[[nodiscard]] bool WatchReadEnabled() noexcept;
+void               WatchReadOnDispatch(uint64_t shader_hash, std::span<const uint32_t> user_sgpr, int frame);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RTBVHDUMP_H_ */
