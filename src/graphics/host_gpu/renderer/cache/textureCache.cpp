@@ -4963,6 +4963,12 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	                         ? TryMaterializeGpuMetadataClear(*helper, id, desc, range,
 	                                                          metadata_base_layer, values, 1u, true)
 	                         : Event::DccFallbackDisabled;
+	ClearTrace("CMASK", "clear-word0", range.address, range.size, desc.info.data.address,
+	           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, desc.cmask.clear_word0);
+	ClearTrace("CMASK", "clear-word1", range.address, range.size, desc.info.data.address,
+	           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, desc.cmask.clear_word1);
+	ClearTrace("CMASK", "view-format", range.address, range.size, desc.info.data.address,
+	           desc.info.data.size, desc.info.extent.width, desc.info.extent.height, static_cast<uint32_t>(view.format));
 	ClearTrace("CMASK", "native-outcome", range.address, range.size, desc.info.data.address,
 	           desc.info.data.size, desc.info.extent.width, desc.info.extent.height,
 	           static_cast<uint32_t>(outcome));
