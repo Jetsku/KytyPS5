@@ -118,6 +118,14 @@ private:
 	bool                                                       m_has_sample_count = false;
 	vk::AttachmentSampleCountInfoAMD                           m_sample_count {};
 	std::vector<vk::SampleCountFlagBits>                       m_color_samples;
+	// Per stage: specialization constants (journal keys only); empty map = none.
+	struct Specialization {
+		std::vector<vk::SpecializationMapEntry> entries;
+		std::vector<uint8_t>                    data;
+		vk::SpecializationInfo                  info {};
+	};
+	std::vector<Specialization>                                m_specializations;
+	bool                                                       m_has_specialization = false;
 	bool                                                       m_has_depth_stencil = false;
 	vk::PipelineDepthStencilStateCreateInfo                    m_depth_stencil {};
 	vk::PipelineColorBlendStateCreateInfo                      m_color_blend {};

@@ -84,9 +84,19 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 			               ->requiredSubgroupSize;
 		}
 		if (stage.flags != vk::PipelineShaderStageCreateFlags {} ||
-		    stage.pSpecializationInfo != nullptr || stage.module == nullptr ||
+		    (stage.pSpecializationInfo != nullptr && !allow_mesh) || stage.module == nullptr ||
 		    stage.pName == nullptr) {
 			return nullptr;
+		}
+		auto& specialization = s.m_specializations.emplace_back();
+		if (stage.pSpecializationInfo != nullptr) {
+			// Journal keys only: the constants travel with the snapshot.
+			const auto& spec = *stage.pSpecializationInfo;
+			if (spec.mapEntryCount > 256 || spec.dataSize > 4096) return nullptr;
+			specialization.entries.assign(spec.pMapEntries, spec.pMapEntries + spec.mapEntryCount);
+			const auto* bytes = static_cast<const uint8_t*>(spec.pData);
+			specialization.data.assign(bytes, bytes + spec.dataSize);
+			s.m_has_specialization = true;
 		}
 		s.m_stage_subgroups.push_back({.requiredSubgroupSize = subgroup});
 		if (stage.stage == first_stage && s.m_vertex_module == nullptr) {
@@ -237,6 +247,15 @@ void GraphicsPipelineSnapshot::Wire() {
 	for (size_t i = 0; i < m_stages.size(); ++i) {
 		m_stages[i].pName = m_stage_names[i].c_str();
 		m_stages[i].pNext = m_stage_subgroups[i].requiredSubgroupSize != 0 ? &m_stage_subgroups[i] : nullptr;
+		m_stages[i].pSpecializationInfo = nullptr;
+		if (i < m_specializations.size() && !m_specializations[i].entries.empty()) {
+			auto& spec              = m_specializations[i];
+			spec.info.mapEntryCount = static_cast<uint32_t>(spec.entries.size());
+			spec.info.pMapEntries   = spec.entries.data();
+			spec.info.dataSize      = spec.data.size();
+			spec.info.pData         = spec.data.data();
+			m_stages[i].pSpecializationInfo = &spec.info;
+		}
 	}
 	m_vertex_input.vertexBindingDescriptionCount   = static_cast<uint32_t>(m_bindings.size());
 	m_vertex_input.pVertexBindingDescriptions      = m_bindings.data();
@@ -285,6 +304,8 @@ constexpr uint32_t SnapshotMagic = 0x324e5350u; // "PSN2"
 constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3"
 // Optional block before SnapshotEnd: NV mixed samples (coverage reduction, attachment samples).
 constexpr uint32_t SnapshotMixedBlock = 0x584d5350u; // "PSMX"
+// Optional block before SnapshotEnd (after the mixed block): per-stage specialization constants.
+constexpr uint32_t SnapshotSpecBlock = 0x50535350u; // "PSSP"
 constexpr uint32_t SnapshotEnd   = 0x00444e45u; // "END"
 
 class WordWriter {
@@ -490,6 +511,27 @@ bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const Modul
 		w.U32(static_cast<uint32_t>(m_color_samples.size()));
 		for (const auto samples: m_color_samples) w.Enum(samples);
 	}
+	if (m_has_specialization) {
+		// The optional specialization block: per stage, its map entries and data words.
+		w.U32(SnapshotSpecBlock);
+		w.U32(static_cast<uint32_t>(m_specializations.size()));
+		for (const auto& spec: m_specializations) {
+			w.U32(static_cast<uint32_t>(spec.entries.size()));
+			for (const auto& e: spec.entries) {
+				w.U32(e.constantID);
+				w.U32(e.offset);
+				w.U32(static_cast<uint32_t>(e.size));
+			}
+			w.U32(static_cast<uint32_t>(spec.data.size()));
+			for (size_t at = 0; at < spec.data.size(); at += 4) {
+				uint32_t word = 0;
+				for (size_t b = 0; b < 4 && at + b < spec.data.size(); b++) {
+					word |= static_cast<uint32_t>(spec.data[at + b]) << (8u * b);
+				}
+				w.U32(word);
+			}
+		}
+	}
 	w.U32(SnapshotEnd);
 	return true;
 }
@@ -614,6 +656,29 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 		s.m_sample_count.depthStencilAttachmentSamples = r.Enum<vk::SampleCountFlagBits>();
 		for (auto n = r.Count(8); n != 0; --n) s.m_color_samples.push_back(r.Enum<vk::SampleCountFlagBits>());
 		tail = r.U32();
+	}
+	if (tail == SnapshotSpecBlock) {
+		const auto stages = r.Count(5);
+		if (stages != s.m_stages.size()) return nullptr;
+		s.m_specializations.assign(stages, {});
+		for (auto& spec: s.m_specializations) {
+			for (auto n = r.Count(256); n != 0; --n) {
+				vk::SpecializationMapEntry e {};
+				e.constantID = r.U32();
+				e.offset     = r.U32();
+				e.size       = r.U32();
+				spec.entries.push_back(e);
+			}
+			const auto bytes = r.Count(4096);
+			for (uint32_t at = 0; at < bytes; at += 4) {
+				const auto word = r.U32();
+				for (uint32_t b = 0; b < 4 && at + b < bytes; b++) {
+					spec.data.push_back(static_cast<uint8_t>(word >> (8u * b)));
+				}
+			}
+		}
+		s.m_has_specialization = true;
+		tail                   = r.U32();
 	}
 	if (tail != SnapshotEnd || r.Failed() || !r.AtEnd()) return nullptr;
 	s.m_create.layout = layout;
