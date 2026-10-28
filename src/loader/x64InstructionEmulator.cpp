@@ -1139,7 +1139,12 @@ bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter wri
 			uint64_t value = 0;
 			if (source.type == ZYDIS_OPERAND_TYPE_REGISTER) {
 				const auto reg_class = ZydisRegisterGetClass(source.reg.value);
-				const auto index     = ZydisRegisterGetId(source.reg.value);
+				// The 64-bit register that holds it: ZydisRegisterGetId numbers GPR8 as AL CL DL BL
+				// AH CH DH BH SPL BPL SIL DIL R8B.., so SIL (id 10) or R8B (id 12) would have read R10
+				// or R12 and stored the wrong bytes (GT7 crashed in guest code with this switch).
+				const auto enclosing =
+				    ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, source.reg.value);
+				const auto index = static_cast<int>(enclosing) - static_cast<int>(ZYDIS_REGISTER_RAX);
 				if ((reg_class != ZYDIS_REGCLASS_GPR8 && reg_class != ZYDIS_REGCLASS_GPR16 &&
 				     reg_class != ZYDIS_REGCLASS_GPR32 && reg_class != ZYDIS_REGCLASS_GPR64) ||
 				    index < 0 || index >= 16 || source.reg.value == ZYDIS_REGISTER_AH ||
