@@ -75,6 +75,12 @@ void CallTableTargets(const CallTableView& view, std::span<const uint32_t> words
 [[nodiscard]] bool     CallPartitionsEnabled();
 [[nodiscard]] uint32_t CallPartitionMinTargets();
 [[nodiscard]] uint32_t CallPartitionMaxParts();
+// KYTY_CALL_PARTITION_MEMORY=1 (default off; on in the GT7 / PPSA03671 presets): the targets each
+// partitioned shader (by hash) reported are remembered in a file (_PipelineCache/<title>.partitions,
+// "shader_hash target" in hex per line, appended as they are reported). The next start makes the
+// remembered targets that the shader's table still holds known at its first dispatch, so their
+// partitions (cached programs by then) run from the start instead of after a probe and readbacks.
+[[nodiscard]] bool CallPartitionMemoryEnabled();
 // Why the code outside the call keeps a program from being partitioned (empty when it does not).
 [[nodiscard]] std::string CallPartitionUnsafe(std::span<const uint32_t> code);
 
@@ -111,6 +117,9 @@ public:
 	               const Decoder::ShaderCodeReader& read, CallPartitionRun& run);
 	// The keys a partition's report set holds (target low word | 1): their targets become known.
 	void ReportPartitionKeys(uint64_t program, std::span<const uint32_t> keys);
+	// KYTY_CALL_PARTITION_MEMORY: loads the remembered targets from `path` (once) and appends new
+	// reports to it. An empty path or a disabled switch does nothing.
+	void SetPartitionMemory(const std::string& path);
 
 	uint32_t rescan_interval = 64;
 	// Once every call of a program reaches two targets, that expansion is kept for every table
@@ -146,6 +155,8 @@ private:
 		std::vector<uint64_t>                  partition_targets; // the table's, ascending
 		std::vector<uint64_t>                  partition_known;   // in the order they were reported
 		std::map<uint64_t, CallPartitionPart>  partition_parts;   // by target (0: the probe)
+		uint64_t                               shader_hash     = 0;
+		bool                                   memory_seeded   = false; // KYTY_CALL_PARTITION_MEMORY
 
 	};
 
@@ -156,6 +167,9 @@ private:
 	std::unordered_map<uint64_t, Program> m_programs; // by code address ^ hash
 	std::vector<uint32_t>                 m_table_words;
 	std::set<uint64_t>                    m_dropped; // guest addresses (48 bits)
+	// KYTY_CALL_PARTITION_MEMORY: remembered (shader hash, target) pairs and the file they go to.
+	std::set<std::pair<uint64_t, uint64_t>> m_memory;
+	std::string                             m_memory_path;
 	// Every expansion handed out stays alive: a compile may still read one that was replaced.
 	std::vector<std::shared_ptr<const std::vector<uint32_t>>> m_retained;
 };

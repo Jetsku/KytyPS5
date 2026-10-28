@@ -1305,6 +1305,7 @@ static void DumpRequestedProgram(const ShaderParams& params, ShaderType stage) {
 		}
 		return parsed;
 	}();
+	if (request.first.empty()) return;
 	// A listed 1 logs the guest address and hash of every program translated.
 	if (request.first.contains(1)) {
 		const auto line = fmt::format("ProgramAddr: stage={} base=0x{:016x} hash=0x{:016x} words={}\n",
@@ -1344,6 +1345,21 @@ static void DumpRequestedProgram(const ShaderParams& params, ShaderType stage) {
 }
 static ShaderRecompiler::ShaderCallExpander& CallExpander() {
 	static ShaderRecompiler::ShaderCallExpander expander;
+	// KYTY_CALL_PARTITION_MEMORY: _PipelineCache/<title>.partitions.
+	static const bool memory = [] {
+		if (ShaderRecompiler::CallPartitionMemoryEnabled()) {
+			std::string title_id;
+			if ((Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) ||
+			    (Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) && !title_id.empty())) {
+				std::error_code error;
+				std::filesystem::create_directories("_PipelineCache", error);
+				expander.SetPartitionMemory(
+				    (std::filesystem::path("_PipelineCache") / (title_id + ".partitions")).string());
+			}
+		}
+		return true;
+	}();
+	(void)memory;
 	return expander;
 }
 
@@ -4168,6 +4184,8 @@ struct PipelineCache::ProgramCache {
 			BuildKey(params, input_info, key);
 			source = FindSourceMemo(key, scratch);
 		}
+		// KYTY_DUMP_PROGRAMS: also programs the program cache already holds (once per name).
+		if (source != nullptr) DumpRequestedProgram(params, key.stage);
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
 			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
 			return {};

@@ -166,6 +166,15 @@ private:
 		    write_fault && ahead > policy.ahead_pages) {
 			policy.ahead_pages = ahead;
 		}
+		// KYTY_HOT_PAGE_MAX_LIVE / KYTY_HOT_PAGE_FRAMES_LIVE (SetHotOverride), hot pages on only.
+		if (write_fault && policy.hot_frames != 0) {
+			if (const auto max = s_hot_max_override.load(std::memory_order_relaxed); max != 0) {
+				policy.hot_max = max;
+			}
+			if (const auto frames = s_hot_frames_override.load(std::memory_order_relaxed); frames != 0) {
+				policy.hot_frames = frames;
+			}
+		}
 		// The pages this makes CPU-dirty become writable when the scope ends, after every region
 		// lock below is released (KYTY_DEFER_UNPROTECT): their bits, serials and mirrors change
 		// under the lock as before, only the host call leaves it.
@@ -227,6 +236,13 @@ public:
 	}
 	[[nodiscard]] static uint32_t FaultAheadOverride() noexcept {
 		return s_ahead_override.load(std::memory_order_relaxed);
+	}
+	// KYTY_HOT_PAGE_MAX_LIVE / KYTY_HOT_PAGE_FRAMES_LIVE (BufferCache, live): with hot pages on,
+	// write faults promote up to `max` hot pages after `frames` consecutive faulting frames instead
+	// of the policy's (0: the policy's). Any thread; a fault takes the values current when it starts.
+	static void SetHotOverride(uint32_t frames, uint32_t max) noexcept {
+		s_hot_frames_override.store(std::min<uint32_t>(frames, 255), std::memory_order_relaxed);
+		s_hot_max_override.store(std::min<uint32_t>(max, 65536), std::memory_order_relaxed);
 	}
 	// Diagnostics (KYTY_FAULT_MAP): whether a write fault on this thread since the last call found
 	// a faulting page CPU-dirty already (FaultResult::already_dirty). Resets the flag.
@@ -454,6 +470,8 @@ private:
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset, uint64_t bytes,
 	                                                               uint64_t ahead) noexcept;
 	inline static std::atomic_uint32_t s_ahead_override {0};
+	inline static std::atomic_uint32_t s_hot_max_override {0};
+	inline static std::atomic_uint32_t s_hot_frames_override {0};
 	inline static thread_local bool   t_fault_found_dirty = false;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;

@@ -186,6 +186,9 @@ constexpr int         SplitParts = static_cast<int>(Split::Count);
 thread_local uint64_t t_split_ns[SplitParts] {};
 thread_local uint32_t t_split_calls      = 0;
 thread_local uint32_t t_split_concurrent = 0;
+constexpr int         FlushKinds         = static_cast<int>(FlushKind::Count);
+thread_local int      t_flush_kind       = FlushKinds; // none noted
+thread_local uint64_t t_flush_wait_ns    = 0;
 std::atomic<uint32_t> g_faults_in_flight {0};
 
 enum ThreadClass : int { Cp = 0, Guest = 1, Host = 2, ThreadClasses = 3 };
@@ -225,6 +228,8 @@ struct BlockStats {
 	uint32_t frames     = 0; // frames with a fault here
 	uint32_t last_frame = UINT32_MAX;
 	uint64_t rip        = 0;
+	uint64_t flushes    = 0; // write faults that flushed GPU data (NoteFlushKind)
+	uint64_t flush_ns   = 0;
 	char     thread[24] {};
 };
 
@@ -254,6 +259,12 @@ struct MapWindow {
 	uint64_t split_calls[ThreadClasses] {};
 	uint64_t split_concurrent[ThreadClasses] {};
 	uint64_t split_concurrent_any[ThreadClasses] {};
+	// Write faults that flushed GPU data: count, flush time, publication waits, by kind (the
+	// last slot: no kind noted).
+	uint64_t flush_faults[ThreadClasses] {};
+	uint64_t flush_ns[ThreadClasses] {};
+	uint64_t flush_wait_ns[ThreadClasses] {};
+	uint64_t flush_kinds[ThreadClasses][FlushKinds + 1] {};
 	// Fault handler time by thread name (guest threads by their names).
 	std::unordered_map<std::string, std::array<uint64_t, 2>> by_thread; // faults, ns
 	// Read faults by guest rip: faults, ns, last address.
@@ -316,6 +327,16 @@ void DumpMap(const MapWindow& window, uint32_t frame, double seconds) {
 			            static_cast<double>(window.split_calls[c]) / w, us(static_cast<int>(Split::Flush)),
 			            std::max(0.0, handler - split), static_cast<double>(window.split_concurrent[c]) / w,
 			            100.0 * static_cast<double>(window.split_concurrent_any[c]) / w);
+		}
+		if (window.flush_faults[c] != 0) {
+			const auto f    = static_cast<double>(window.flush_faults[c]);
+			const auto kind = [&](int k) { return per(window.flush_kinds[c][k]); };
+			std::printf("FaultMap   %s flushes: %.1f/frame, %.1f us each (%.1f us of it waiting for a copy); "
+			            "current %.1f, pending %.1f, side %.1f, drain %.1f, other %.1f, unnoted %.1f (per frame)\n",
+			            kThreadNames[c], per(window.flush_faults[c]),
+			            static_cast<double>(window.flush_ns[c]) / f / 1e3,
+			            static_cast<double>(window.flush_wait_ns[c]) / f / 1e3, kind(0), kind(1), kind(2), kind(3),
+			            kind(4), kind(5));
 		}
 	}
 	std::printf("FaultMap   same page faulted again after: same frame %.1f, 1 frame %.1f, 2 %.1f, 3 %.1f, 4-7 %.1f, "
@@ -422,9 +443,11 @@ void DumpMap(const MapWindow& window, uint32_t frame, double seconds) {
 		const auto sum       = s->faults[0] + s->faults[1] + s->faults[2];
 		const bool emulator  = s->rip >= g_exe_begin && s->rip < g_exe_end;
 		std::printf("FaultMap   slow block 0x%010" PRIx64 ": %.2f faults/frame (guest %.2f), %.3f ms/frame, %.1f us/fault, "
-		            "last rip %s0x%" PRIx64 " thread '%s'\n",
+		            "%.2f flushes/frame %.1f us each, last rip %s0x%" PRIx64 " thread '%s'\n",
 		            key << 16u, per(sum), per(s->faults[1]), per(s->ns) / 1e6,
 		            static_cast<double>(s->ns) / std::max<double>(static_cast<double>(sum), 1.0) / 1e3,
+		            per(s->flushes),
+		            static_cast<double>(s->flush_ns) / std::max<double>(static_cast<double>(s->flushes), 1.0) / 1e3,
 		            emulator ? "kyty+" : "", emulator ? s->rip - g_exe_begin : s->rip, s->thread);
 	}
 	std::printf("FaultMap   %zu blocks, %zu regions with faults\n", window.blocks.size(), regions.size());
@@ -1267,6 +1290,8 @@ void MapInFault(bool inside) noexcept {
 			ns = 0;
 		}
 		t_split_calls      = 0;
+		t_flush_kind       = FlushKinds;
+		t_flush_wait_ns    = 0;
 		t_split_concurrent = g_faults_in_flight.fetch_add(1, std::memory_order_relaxed);
 	} else {
 		g_faults_in_flight.fetch_sub(1, std::memory_order_relaxed);
@@ -1285,6 +1310,14 @@ void SplitAdd(Split part, uint64_t ns) noexcept {
 	if (part == Split::HostCall) {
 		t_split_calls++;
 	}
+}
+
+void NoteFlushKind(FlushKind kind, uint64_t wait_ns) noexcept {
+	if (!g_map_enabled || !t_in_fault) {
+		return;
+	}
+	t_flush_kind = static_cast<int>(kind);
+	t_flush_wait_ns += wait_ns;
 }
 
 void MapFault(const FaultRecord& record) noexcept {
@@ -1319,6 +1352,12 @@ void MapFault(const FaultRecord& record) noexcept {
 		window.split_calls[thread] += t_split_calls;
 		window.split_concurrent[thread] += t_split_concurrent;
 		window.split_concurrent_any[thread] += t_split_concurrent != 0 ? 1u : 0u;
+		if (const auto flush = t_split_ns[static_cast<int>(Split::Flush)]; flush != 0) {
+			window.flush_faults[thread]++;
+			window.flush_ns[thread] += flush;
+			window.flush_wait_ns[thread] += t_flush_wait_ns;
+			window.flush_kinds[thread][std::clamp(t_flush_kind, 0, FlushKinds)]++;
+		}
 	}
 	if (t_fault_rip >= g_exe_begin && t_fault_rip < g_exe_end) {
 		window.emulator_rip++;
@@ -1351,6 +1390,12 @@ void MapFault(const FaultRecord& record) noexcept {
 		block.frames++;
 	}
 	block.rip = t_fault_rip;
+	if (record.write) {
+		if (const auto flush = t_split_ns[static_cast<int>(Split::Flush)]; flush != 0) {
+			block.flushes++;
+			block.flush_ns += flush;
+		}
+	}
 	std::memcpy(block.thread, name, sizeof(block.thread));
 }
 

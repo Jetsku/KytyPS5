@@ -160,6 +160,16 @@ Live::Switch g_fault_ahead_adapt("KYTY_FAULT_AHEAD_ADAPT", [](const char* value)
 	return kib;
 });
 
+// KYTY_HOT_PAGE_MAX_LIVE=<pages> / KYTY_HOT_PAGE_FRAMES_LIVE=<frames> (live, default 0 = the
+// startup KYTY_HOT_PAGE_MAX / KYTY_HOT_PAGE_FRAMES): see MemoryTracker::SetHotOverride. Applied
+// once per guest flip. GT7 races re-fault ~800 pages a frame in the frame they were uploaded.
+Live::Switch g_hot_max_live("KYTY_HOT_PAGE_MAX_LIVE", [](const char* value) -> int64_t {
+	return value == nullptr ? 0 : static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 65536));
+});
+Live::Switch g_hot_frames_live("KYTY_HOT_PAGE_FRAMES_LIVE", [](const char* value) -> int64_t {
+	return value == nullptr ? 0 : static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 255));
+});
+
 uint32_t FaultAheadOverridePages() {
 	const auto value = g_fault_ahead_adapt.Get();
 	if (value == 0) {
@@ -349,6 +359,15 @@ std::atomic<uint64_t> g_readback_flush_side_copies {0};
 // CPU-dirty transitions (emulator writes reported through InvalidateMemory, direct HandleFault
 // calls) still drain: nothing faults again after them.
 Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOn);
+
+// KYTY_READBACK_EAGER_WRITES (live, default off; =1 on): a guest write fault on GPU-owned bytes
+// makes its pages eager-hot as a read fault does (KYTY_READBACK_EAGER). The next recordings that
+// write them then end with a copy of their bytes, published when the recording completes, so a
+// later write fault finds the page clean (an ordinary write fault, no command-processor round
+// trip and no wait for the GPU) or waits only for that copy. GT7 race: per-frame arenas the GPU
+// writes and the job threads write a frame later (FaultMap "flushes"). With it, raise
+// KYTY_READBACK_EAGER_PAGES (default 64; up to 2048).
+Live::Switch g_readback_eager_writes("KYTY_READBACK_EAGER_WRITES", Live::ParseDefaultOff);
 std::atomic<uint64_t> g_readback_side_writes_copies {0};
 
 // KYTY_READ_FAULT_PUBLISHED (live, default off; =1 on, =verify): a guest thread's read fault on a
@@ -865,13 +884,13 @@ bool EagerReadbackEnabled() {
 	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
 }
 
-// KYTY_READBACK_EAGER_PAGES (hot pages kept, default 64, at most 256),
+// KYTY_READBACK_EAGER_PAGES (hot pages kept, default 64, at most 2048),
 // KYTY_READBACK_EAGER_IDLE_FRAMES (frames without a readback before a page stops being hot,
 // default 600) and KYTY_READBACK_EAGER_FRAME_BUDGET (copies per page and frame, default 4).
 EagerReadbackPages::Limits EagerReadbackLimits() {
 	EagerReadbackPages::Limits limits;
 	limits.capacity =
-	    static_cast<uint32_t>(std::min<uint64_t>(ParseEnvU64("KYTY_READBACK_EAGER_PAGES", 64), 256));
+	    static_cast<uint32_t>(std::min<uint64_t>(ParseEnvU64("KYTY_READBACK_EAGER_PAGES", 64), 2048));
 	limits.idle_frames = static_cast<uint32_t>(
 	    std::clamp<uint64_t>(ParseEnvU64("KYTY_READBACK_EAGER_IDLE_FRAMES", 600), 1, 1000000));
 	limits.frame_budget = static_cast<uint32_t>(
@@ -1726,6 +1745,8 @@ void BufferCache::AdvanceFrame() noexcept {
 	FaultCost::AdvanceFrame();
 	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	MemoryTracker::SetHotOverride(static_cast<uint32_t>(g_hot_frames_live.Get()),
+	                              static_cast<uint32_t>(g_hot_max_live.Get()));
 }
 
 void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
@@ -2091,6 +2112,23 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	auto&      gpu        = m_scheduler.Context().GetGpu();
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	// KYTY_FAULT_MAP: how this write fault's flush is served (FaultCost::NoteFlushKind).
+	struct FlushNote {
+		bool                 active  = false;
+		FaultCost::FlushKind kind    = FaultCost::FlushKind::Other;
+		uint64_t             wait_ns = 0;
+		uint64_t             start   = 0;
+		void Begin() {
+			if (active) start = FaultCost::NowNs();
+		}
+		void End() {
+			if (active && start != 0) wait_ns += FaultCost::NowNs() - start;
+			start = 0;
+		}
+		~FlushNote() {
+			if (active) FaultCost::NoteFlushKind(kind, wait_ns);
+		}
+	} flush_note {.active = is_write && FaultCost::SplitActive()};
 
 	// Writes need the CPU-dirty transition of the drain path (or, KYTY_READBACK_SIDE_WRITES, of
 	// a second fault). Guest-thread reads use side copies; GPU-thread reads do too
@@ -2109,8 +2147,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		uint32_t eager = 0;
 		{
 			Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
+			flush_note.Begin();
 			eager = CompleteSideReadbacks(page_begin, page_end - page_begin);
+			flush_note.End();
 		}
+		flush_note.kind = FaultCost::FlushKind::Pending;
 		if (eager != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackEagerWaits);
 		}
@@ -2135,9 +2176,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		}
 	}
 	if (!side_path) {
+		flush_note.kind = FaultCost::FlushKind::Drain;
 		diag_path("drain-nonside");
 		gpu.SendCommandSync([&, this, vaddr, size, is_write, gpu_thread] {
-			if (!is_write) {
+			if (!is_write || g_readback_eager_writes.On()) {
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
 			CpGaps::Note(is_write ? CpGaps::Event::DrainWrite : CpGaps::Event::DrainOther);
@@ -2188,7 +2230,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	const auto                    sync_mark = diag ? ReadFaultDiag::NowNs() : 0;
 	bool                          current   = false; // KYTY_CLEAN_PAGE
 	gpu.SendCommandSync([&, this, vaddr, size, is_write] {
-		if (!is_write) {
+		if (!is_write || g_readback_eager_writes.On()) {
 			NoteEagerRead(vaddr, size, false);
 		}
 		// KYTY_CLEAN_PAGE: another thread's read made the faulting pages current meanwhile; a
@@ -2226,6 +2268,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		}
 	});
 	if (current) {
+		flush_note.kind = FaultCost::FlushKind::Current;
 		diag_path("current");
 		record(std::nullopt);
 		return;
@@ -2243,9 +2286,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	switch (result) {
 		case SideIssueResult::Issued: {
 			// The GPU thread returned right after submitting; this guest thread waits.
+			flush_note.kind = FaultCost::FlushKind::Side;
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
+				flush_note.Begin();
 				CompleteSideReadback(*issued);
+				flush_note.End();
 			}
 			trace.begin      = issued->begin;
 			trace.size       = issued->end - issued->begin;
@@ -2257,9 +2303,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			// Another thread's side copy (or an eager copy) of the faulting page was issued after
 			// the check above.
 			uint32_t eager = 0;
+			flush_note.kind = FaultCost::FlushKind::Pending;
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
+				flush_note.Begin();
 				eager = CompleteSideReadbacks(page_begin, page_end - page_begin);
+				flush_note.End();
 			}
 			Profiler::CountFrameEvent(eager != 0 ? Profiler::FrameEvent::ReadbackEagerWaits
 			                                     : Profiler::FrameEvent::ReadbackSideDuplicateWaits);
@@ -2277,6 +2326,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackOther);
 			break;
 	}
+	flush_note.kind = FaultCost::FlushKind::Drain; // ReadMemoryDrain ran on the command processor
 	record(std::nullopt);
 }
 

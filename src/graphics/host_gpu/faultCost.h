@@ -185,6 +185,12 @@ enum class Split : uint8_t { TrackerLock = 0, HostLock, CountLock, HostCall, Flu
 // The calling thread resolves a write fault and the fault map is on.
 [[nodiscard]] bool SplitActive() noexcept;
 void               SplitAdd(Split part, uint64_t ns) noexcept;
+// How a write fault's GPU-data flush was served (BufferCache::ReadMemory, fault map on): the
+// pages were current already, another copy was pending (waited for), a side copy was issued and
+// waited for, the command processor drained, or something else; wait_ns = the faulting thread's
+// wait for a copy's publication. Printed as "FaultMap   <thread> flushes" and per block.
+enum class FlushKind : uint8_t { Current = 0, Pending, Side, Drain, Other, Count };
+void NoteFlushKind(FlushKind kind, uint64_t wait_ns) noexcept;
 // A contended wait for a page-manager host-call lock outside a write fault (fault map on): the
 // command processor's re-protections waiting behind guest threads' calls and the reverse.
 void NoteHostLockWait(uint64_t ns) noexcept;

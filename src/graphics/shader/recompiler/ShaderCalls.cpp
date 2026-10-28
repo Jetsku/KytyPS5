@@ -388,6 +388,33 @@ uint32_t CallPartitionMaxParts() {
 	return value;
 }
 
+bool CallPartitionMemoryEnabled() {
+	static const bool value = [] {
+		const char* text = std::getenv("KYTY_CALL_PARTITION_MEMORY");
+		return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+	}();
+	return value;
+}
+
+void ShaderCallExpander::SetPartitionMemory(const std::string& path) {
+	if (!CallPartitionMemoryEnabled() || path.empty()) return;
+	std::scoped_lock lock(m_mutex);
+	if (!m_memory_path.empty()) return;
+	m_memory_path = path;
+	std::ifstream file(path);
+	std::string   line;
+	while (std::getline(file, line)) {
+		char*      end    = nullptr;
+		const auto hash   = std::strtoull(line.c_str(), &end, 16);
+		const auto target = std::strtoull(end, nullptr, 16);
+		if (hash != 0 && target != 0) m_memory.emplace(hash, target);
+	}
+	if (!m_memory.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_CALL_PARTITION_MEMORY: {} remembered targets from {}.\n",
+		                                      m_memory.size(), path));
+	}
+}
+
 // After usa-ratt/KytyPS5-GT7 PartitionUnsafe (round 99): an instruction outside the call that
 // would see lanes a partition dropped (they run in another dispatch of the shader).
 std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc) {
@@ -519,6 +546,25 @@ bool ShaderCallExpander::Partition(std::span<const uint32_t> code, uint64_t base
 	const auto& targets = state->second.targets;
 	if (targets.size() < CallPartitionMinTargets()) return false;
 	program.partition_targets = targets;
+	program.shader_hash       = options.shader_hash;
+	// KYTY_CALL_PARTITION_MEMORY: the targets this shader reported in earlier starts.
+	if (!program.memory_seeded && !m_memory.empty()) {
+		program.memory_seeded = true;
+		uint32_t seeded       = 0;
+		for (auto it = m_memory.lower_bound({options.shader_hash, 0}); it != m_memory.end() && it->first == options.shader_hash;
+		     ++it) {
+			if (std::ranges::binary_search(targets, it->second) &&
+			    std::ranges::find(program.partition_known, it->second) == program.partition_known.end()) {
+				program.partition_known.push_back(it->second);
+				seeded++;
+			}
+		}
+		if (seeded != 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_CALL_PARTITION_MEMORY: CS shader 0x{:016x}: {} remembered targets known (of {} in the table).\n",
+			    options.shader_hash, seeded, targets.size()));
+		}
+	}
 	run.program               = key;
 	run.shader_hash           = options.shader_hash;
 	run.parts.clear();
@@ -572,6 +618,12 @@ void ShaderCallExpander::ReportPartitionKeys(uint64_t program_key, std::span<con
 		if (!reported.contains(static_cast<uint32_t>(target) | 1u)) continue;
 		if (std::ranges::find(program.partition_known, target) != program.partition_known.end()) continue;
 		program.partition_known.push_back(target);
+		if (!m_memory_path.empty() && program.shader_hash != 0 &&
+		    m_memory.emplace(program.shader_hash, target).second) {
+			if (std::ofstream file(m_memory_path, std::ios::app); file) {
+				file << fmt::format("{:016x} {:x}\n", program.shader_hash, target);
+			}
+		}
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "KYTY_CALL_PARTITIONS: program 0x{:016x}: target 0x{:x} reported ({} known of {} in the table).\n",
 		    program_key, target & AddressMask, program.partition_known.size(), program.partition_targets.size()));
