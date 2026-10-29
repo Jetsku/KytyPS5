@@ -1627,6 +1627,204 @@ private:
 	bool                                m_stop = false;
 };
 
+// KYTY_ASYNC_TRANSLATION=1 (default off, live; adapted from Senaxx's GT7 fork a3d1eba5c): a new
+// vertex or pixel shader of a draw that may be skipped (RenderExecutor's register-level version of
+// the KYTY_PIPELINE_SKIP refusals, plus the fork's rule that the depth test is on) is translated on
+// a worker thread while the draw is skipped, as a draw is skipped while its pipeline builds. The
+// translation is a function of the guest code and the ProgramKey (KYTY_TRANSLATION_CACHE relies on
+// the same), so the worker gets copies of the code, the user data and the stage input; the
+// materialization and the SPIR-V emission, which read guest memory, stay on the draw's thread at
+// the next draw of the shader, which takes the finished translation (CompileAndPublish).
+// KYTY_ASYNC_TRANSLATION_THREADS=<n> (default 2, 1..8, startup): the worker count.
+static Live::Switch g_async_translation("KYTY_ASYNC_TRANSLATION", Live::ParseDefaultOff); // live
+
+// Set by GetGraphicsPrograms around one draw's program lookups: whether its new VS/PS translations
+// may go to the workers (the draw is skipped until they are ready).
+thread_local bool t_defer_translation = false;
+// Set by CompileAndPublish when it returned because a translation is on the workers, or when it
+// took a finished one.
+thread_local bool t_translation_pending = false;
+thread_local bool t_translation_taken   = false;
+// PipelineCache::AllowDeferredTranslation: the request for the next GetGraphicsPrograms.
+thread_local bool t_defer_requested = false;
+
+class GraphicsTranslations {
+public:
+	enum class Poll { Ready, Pending };
+
+	static GraphicsTranslations& Instance() {
+		static GraphicsTranslations instance;
+		return instance;
+	}
+
+	struct Job {
+		uint64_t                          id   = 0;
+		uint64_t                          hash = 0;
+		ShaderType                        stage = ShaderType::Vertex;
+		std::vector<uint32_t>             code;
+		std::vector<uint32_t>             back_code;
+		std::vector<uint32_t>             user_data;
+		ShaderVertexInputInfo             vertex {};
+		ShaderPixelInputInfo              pixel {};
+		ShaderRecompiler::CompileOptions  options;
+		uint64_t                          queued_ns = 0;
+	};
+
+	[[nodiscard]] bool Empty() const { return m_count.load(std::memory_order_relaxed) == 0; }
+
+	// The finished translation of `id` (taken once), or nothing: `pending` tells whether it is
+	// still on the workers. With `make` (a draw that may wait by being skipped), a missing one is
+	// queued and reported pending.
+	std::optional<ShaderRecompiler::TranslateResult> TakeOrQueue(uint64_t id, bool& pending,
+	                                                            const std::function<std::unique_ptr<Job>()>* make) {
+		pending = false;
+		std::unique_lock lock(m_mutex);
+		if (const auto entry = m_entries.find(id); entry != m_entries.end()) {
+			if (!entry->second.done) {
+				if (make != nullptr) entry->second.discard = false; // wanted again
+				pending = true;
+				return std::nullopt;
+			}
+			auto result = std::move(entry->second.result);
+			const auto waited_ms = static_cast<double>(NowNs() - entry->second.queued_ns) / 1e6;
+			const auto hash      = entry->second.hash;
+			const auto stage     = entry->second.stage;
+			m_entries.erase(entry);
+			m_count.store(m_entries.size(), std::memory_order_relaxed);
+			const auto taken = ++m_taken;
+			const auto skips = m_skips.load(std::memory_order_relaxed);
+			lock.unlock();
+			if (taken <= 32) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Async translation: {} 0x{:016x} ready after {:.0f} ms ({} draws skipped so far "
+				    "while translating)\n",
+				    stage == ShaderType::Pixel ? "PS" : "VS", hash, waited_ms, skips));
+			}
+			return result;
+		}
+		if (make == nullptr) return std::nullopt;
+		auto job = (*make)();
+		if (job == nullptr) return std::nullopt;
+		job->id        = id;
+		job->queued_ns = NowNs();
+		auto& entry     = m_entries[id];
+		entry.hash      = job->hash;
+		entry.stage     = job->stage;
+		entry.queued_ns = job->queued_ns;
+		m_count.store(m_entries.size(), std::memory_order_relaxed);
+		m_jobs.push_back(std::move(job));
+		static const size_t threads = std::clamp<size_t>(EnvU64Local("KYTY_ASYNC_TRANSLATION_THREADS", 2), 1u, 8u);
+		if (m_threads.size() < threads) {
+			if (m_threads.empty()) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Async translation: new VS/PS of skippable draws translate on up to {} worker "
+				    "threads (KYTY_ASYNC_TRANSLATION_THREADS)\n", threads));
+			}
+			m_threads.emplace_back([this] { Run(); });
+		}
+		lock.unlock();
+		m_wake.notify_one();
+		pending = true;
+		return std::nullopt;
+	}
+
+	// A draw that may not wait translated the source itself: the worker's copy is not needed.
+	void Drop(uint64_t id) {
+		std::scoped_lock lock(m_mutex);
+		if (const auto entry = m_entries.find(id); entry != m_entries.end()) {
+			if (entry->second.done) {
+				m_entries.erase(entry);
+				m_count.store(m_entries.size(), std::memory_order_relaxed);
+			} else {
+				entry->second.discard = true;
+			}
+		}
+	}
+
+	void NoteSkip() { m_skips.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t Skips() const { return m_skips.load(std::memory_order_relaxed); }
+
+	// Shaders whose programs refuse skipping (PipelineCache::NoteAsyncTranslationRefused).
+	void Refuse(uint64_t hash) {
+		std::scoped_lock lock(m_mutex);
+		if (m_refused.size() < 65536u && m_refused.insert(hash).second && m_refused.size() <= 8u) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Async translation: shader 0x{:016x} refuses skipping; its draws translate at once\n", hash));
+		}
+	}
+	[[nodiscard]] bool Refused(uint64_t hash) {
+		std::scoped_lock lock(m_mutex);
+		return m_refused.contains(hash);
+	}
+
+	~GraphicsTranslations() {
+		{
+			std::scoped_lock lock(m_mutex);
+			m_stop = true;
+			m_jobs.clear();
+		}
+		m_wake.notify_all();
+		for (auto& thread: m_threads) {
+			if (thread.joinable()) thread.join();
+		}
+	}
+
+private:
+	struct Entry {
+		bool                                             done = false;
+		bool                                             discard = false;
+		uint64_t                                         hash = 0;
+		ShaderType                                       stage = ShaderType::Vertex;
+		uint64_t                                         queued_ns = 0;
+		std::optional<ShaderRecompiler::TranslateResult> result;
+	};
+
+	static uint64_t NowNs() {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now().time_since_epoch())
+		                                 .count());
+	}
+	static uint64_t EnvU64Local(const char* name, uint64_t fallback) {
+		const char* value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : fallback;
+	}
+
+	void Run() {
+		for (;;) {
+			std::unique_ptr<Job> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_wake.wait(lock, [&] { return m_stop || !m_jobs.empty(); });
+				if (m_stop) return;
+				job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+			}
+			auto result = ShaderRecompiler::TranslateProgram(job->code, job->options);
+			std::scoped_lock lock(m_mutex);
+			if (const auto entry = m_entries.find(job->id); entry != m_entries.end()) {
+				if (entry->second.discard) {
+					m_entries.erase(entry);
+					m_count.store(m_entries.size(), std::memory_order_relaxed);
+				} else {
+					entry->second.done   = true;
+					entry->second.result = std::move(result);
+				}
+			}
+		}
+	}
+
+	std::mutex                          m_mutex;
+	std::condition_variable             m_wake;
+	std::deque<std::unique_ptr<Job>>    m_jobs;
+	std::unordered_map<uint64_t, Entry> m_entries;
+	std::atomic<size_t>                 m_count {0};
+	std::atomic<uint64_t>               m_skips {0};
+	uint64_t                            m_taken = 0;
+	std::unordered_set<uint64_t>        m_refused;
+	std::vector<std::thread>            m_threads;
+	bool                                m_stop = false;
+};
+
 // KYTY_DUMP_SPIRV_MIN_WORDS=<words>;<folder> (diagnostics, local files only): the emitted SPIR-V of
 // every permutation of at least <words> words, as <folder>/<stage>_<hash>_<words>.spv (what makes the
 // slow driver compiles large).
@@ -3566,6 +3764,8 @@ struct PipelineCache::ProgramCache {
 		// (KYTY_TRANSLATION_CACHE), taken before anything reads or changes the program.
 		std::shared_ptr<KeptTranslation> keep;
 		bool                             had_kept = false;
+		// KYTY_ASYNC_TRANSLATION: a worker's finished translation of this source (defer_translation).
+		std::optional<ShaderRecompiler::TranslateResult> async_ready;
 		const auto translate_now = [&] {
 			const auto translate_begin = CompileClockNs();
 			{
@@ -3574,7 +3774,8 @@ struct PipelineCache::ProgramCache {
 				auto ready = params.call_expansion != 0
 				                 ? CallTranslations::Instance().Take(CallTranslations::Id(
 				                       key.hash, key.user_data_count, key.static_state))
-				                 : std::nullopt;
+				                 : std::move(async_ready);
+				async_ready.reset();
 				translated = ready ? std::move(*ready)
 				                   : ShaderRecompiler::TranslateProgram(translation_code, options);
 			}
@@ -3626,6 +3827,66 @@ struct PipelineCache::ProgramCache {
 			kept.reset();
 			if (!times.reused) {
 				translate_now();
+			}
+		};
+		// KYTY_ASYNC_TRANSLATION: true when the translation this compile needs is on the workers and
+		// the draw is skipped (t_translation_pending); a finished one is left in async_ready for
+		// translate_now. A draw that may not be skipped translates here and drops a worker's copy.
+		const auto defer_translation = [&]() -> bool {
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				return false;
+			} else {
+				if (speculative || replay || params.call_expansion != 0 || stage == ShaderType::Mesh) {
+					return false;
+				}
+				auto&      workers = GraphicsTranslations::Instance();
+				const bool allow   = t_defer_translation && g_async_translation.On() && !SyncVerify() &&
+				                   Config::GetShaderLogDirection() == Config::LogDirection::Silent &&
+				                   !Config::GraphicsDebugDumpEnabled() && !workers.Refused(params.hash);
+				if (!allow && workers.Empty()) return false;
+				const uint64_t id = XXH3_64bits_withSeed(
+				    key.static_state.data(), key.static_state.size() * sizeof(uint32_t),
+				    key.hash ^ (uint64_t {key.user_data_count} << 56u) ^ (uint64_t {key.code_size} << 24u) ^
+				        (static_cast<uint64_t>(stage) << 8u));
+				const std::function<std::unique_ptr<GraphicsTranslations::Job>()> make = [&] {
+					auto job   = std::make_unique<GraphicsTranslations::Job>();
+					job->hash  = params.hash;
+					job->stage = stage;
+					job->code.assign(translation_code.begin(), translation_code.end());
+					job->back_code.assign(params.back_code.begin(), params.back_code.end());
+					job->user_data.assign(options.user_data.begin(), options.user_data.end());
+					job->options            = options;
+					job->options.user_data  = job->user_data;
+					job->options.back_code  = job->back_code;
+					job->options.dump_ir    = false;
+					job->options.early_dump = false;
+					ShaderStageInputInfo job_input {};
+					if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+						job->vertex       = input_info;
+						job->vertex.stage = {};
+						job_input.vertex  = &job->vertex;
+					} else {
+						job->pixel       = input_info;
+						job->pixel.stage = {};
+						job_input.pixel  = &job->pixel;
+					}
+					job->options.input_info = job_input;
+					return job;
+				};
+				bool pending = false;
+				auto ready   = workers.TakeOrQueue(id, pending, allow ? &make : nullptr);
+				if (ready.has_value()) {
+					async_ready         = std::move(ready);
+					t_translation_taken = true;
+					return false;
+				}
+				if (pending && allow) {
+					workers.NoteSkip();
+					t_translation_pending = true;
+					return true;
+				}
+				if (pending) workers.Drop(id);
+				return false;
 			}
 		};
 
@@ -3697,6 +3958,7 @@ struct PipelineCache::ProgramCache {
 		}
 		if (source == nullptr) {
 			if (!translated_now) {
+				if (defer_translation()) return nullptr; // KYTY_ASYNC_TRANSLATION: skipped meanwhile
 				translate_now();
 			}
 			if (translated.skip_dispatch) {
@@ -3820,6 +4082,16 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (!compiled.has_value()) {
+			// KYTY_ASYNC_TRANSLATION: a new permutation of a source without a kept translation.
+			if (!translated_now && (t_defer_translation || !GraphicsTranslations::Instance().Empty())) {
+				bool has_kept = false;
+				if (TranslationCacheEnabled()) {
+					lock.lock();
+					has_kept = source->kept_translation != nullptr;
+					lock.unlock();
+				}
+				if (!has_kept && defer_translation()) return nullptr;
+			}
 			obtain_translation();
 			if (disk_on && translated_now && source->disk_record != UINT32_MAX && !plan_checked) {
 				// A source reloaded from disk needed a translation after all (a permutation that
@@ -7741,6 +8013,18 @@ static void ApplyNormalizedLod(PipelineCache::GraphicsPrograms&      programs,
 	}
 }
 
+bool PipelineCache::AsyncTranslationEnabled() noexcept {
+	return g_async_translation.On();
+}
+
+void PipelineCache::AllowDeferredTranslation(bool allow) noexcept {
+	t_defer_requested = allow;
+}
+
+void PipelineCache::NoteAsyncTranslationRefused(uint64_t shader_hash) {
+	GraphicsTranslations::Instance().Refuse(shader_hash);
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -7749,6 +8033,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     GraphicsStagePreps& stage_preps) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	const bool tess_active = TessellationActive(user_config);
+	// KYTY_ASYNC_TRANSLATION: the caller's request holds for this lookup only.
+	bool defer_translation = std::exchange(t_defer_requested, false) && g_async_translation.On();
 	std::array<ShaderParams, 3> vertex_params;
 	// Static stage information (shader map, headers, vertex tables); ended before
 	// materialization.
@@ -7794,6 +8080,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	                      vertex_info[0].mesh.split_groups != 0)
 	                : 0,
 	    vertex_info[tess_active ? 2u : 0u].user_clip_planes);
+	// KYTY_ASYNC_TRANSLATION: no mesh draws, and tessellated ones only with KYTY_PIPELINE_SKIP_TESS
+	// (the pipeline-skip stage refusal).
+	if (mesh_active || (tess_active && !SkipTessellatedEnabled())) defer_translation = false;
+	struct DeferScope {
+		explicit DeferScope(bool on) {
+			t_defer_translation   = on;
+			t_translation_pending = false;
+			t_translation_taken   = false;
+		}
+		~DeferScope() { t_defer_translation = false; }
+		DeferScope(const DeferScope&)            = delete;
+		DeferScope& operator=(const DeferScope&) = delete;
+	} defer_scope(defer_translation);
 	const auto serial = [&](std::array<ShaderVertexInputInfo, 3>& vertex_inputs,
 	                        ShaderPixelInputInfo& pixel_input,
 	                        GraphicsStagePreps& preps) -> GraphicsPrograms {
@@ -7801,21 +8100,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			ShaderReadAttempt read_attempt;
 			uint32_t          push_data_cursor = push_data_start;
 			GraphicsPrograms  result;
+			t_translation_pending = false;
 			if (pixel_active) {
 				result.pixel = m_program_cache->Get(pixel_params, pixel_input, preps.pixel,
 				                                   push_data_cursor, read_attempt, scratch,
 				                                   evaluation);
 			}
-			LinkPixelParameters(pixel_active && !tess_active && !mesh_active &&
-			                        !Prospero::IsRectList(user_config.GetPrimType()),
-			                    vertex_inputs[0], pixel_input);
+			const bool link = pixel_active && !tess_active && !mesh_active &&
+			                  !Prospero::IsRectList(user_config.GetPrimType());
+			LinkPixelParameters(link, vertex_inputs[0], pixel_input);
+			// A pending pixel translation leaves the vertex outputs unlinked: when the pixel inputs
+			// may be relocated, the vertex key is not the one the draw will have, so the vertex
+			// stage waits for the next draw.
+			const bool vertex_waits = t_translation_pending && link && MayRelocatePixelParameters(pixel_input);
 			for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
-			                     !read_attempt.materialization_failed; ++i) {
+			                     !read_attempt.materialization_failed && !vertex_waits; ++i) {
 				result.vertex[i] =
 				    m_program_cache->Get(vertex_params[i], vertex_inputs[i], preps.vertex[i],
 				                         push_data_cursor, read_attempt, scratch, evaluation);
 			}
-			if (!read_attempt.materialization_failed) {
+			result.translation_pending = t_translation_pending;
+			result.translation_taken   = t_translation_taken;
+			if (!read_attempt.materialization_failed || result.translation_pending) {
 				if (tess_active && UnnormalizedSamplingFix()) {
 					ApplyNormalizedLod(result, vertex_inputs);
 				}

@@ -155,6 +155,11 @@ public:
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
 
+		// KYTY_ASYNC_TRANSLATION: a stage's translation is on the workers (the draw is skipped, as
+		// for a pipeline that builds), or this lookup took a finished one.
+		bool translation_pending = false;
+		bool translation_taken   = false;
+
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
 
@@ -250,6 +255,14 @@ public:
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                                 const GraphicsPrograms& programs, bool skippable);
 	[[nodiscard]] bool PipelineSkipEnabled() const noexcept { return m_skip != nullptr; }
+	// KYTY_ASYNC_TRANSLATION=1 (default off, live): whether the next GetGraphicsPrograms of this
+	// thread may translate new VS/PS on the workers and report translation_pending instead
+	// (RefreshShaders decides from the draw's registers; GetGraphicsPrograms resets it).
+	[[nodiscard]] static bool AsyncTranslationEnabled() noexcept;
+	static void AllowDeferredTranslation(bool allow) noexcept;
+	// A shader whose program refuses skipping (DrawRunProgramEligible): its later sources translate
+	// at once.
+	static void NoteAsyncTranslationRefused(uint64_t shader_hash);
 	// KYTY_PIPELINE_SKIP_TESS: tessellated draws may be skipped / built in the background too.
 	[[nodiscard]] static bool SkipTessellatedEnabled();
 	// KYTY_PIPELINE_SKIP_FRAME_BUDGET_US: the frame the next skippable draws belong to (CP thread).

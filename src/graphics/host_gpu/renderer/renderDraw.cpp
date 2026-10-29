@@ -2080,6 +2080,9 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 	}
 }
 
+static bool AsyncTranslationDrawAllowed(CommandBuffer& buffer);
+static void NoteAsyncTranslationRefusals(const DrawRenderState& state);
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -2164,10 +2167,18 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (reset_fast) {
 		state.ps_input_info = {};
 	}
+	// KYTY_ASYNC_TRANSLATION: new VS/PS of a draw that may be skipped translate on workers.
+	const bool async_translation = PipelineCache::AsyncTranslationEnabled();
+	if (async_translation) {
+		PipelineCache::AllowDeferredTranslation(AsyncTranslationDrawAllowed(buffer));
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
 	    state.stage_preps);
+	if (async_translation && state.programs.translation_taken) {
+		NoteAsyncTranslationRefusals(state);
+	}
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -2181,6 +2192,19 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		RefreshShaders(buffer, draw, state);
 	}
 	CommitStats::Mark(CommitStats::Phase::Programs);
+	if (state.programs.translation_pending) {
+		// KYTY_ASYNC_TRANSLATION: skipped while a stage translates, as a draw is skipped while its
+		// pipeline builds (counted for KYTY_HOLD_SKIPPED_DRAWS); no draw-run record may be continued
+		// or recalled across it.
+		g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
+		m_run.valid        = false;
+		m_run_active       = false;
+		m_run_targets_kept = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
+		return false;
+	}
 	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
 	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw. A tessellated draw needs
 	// all three vertex stages (one without a runtime made PrepareBindings exit: Wolverine
@@ -2672,6 +2696,70 @@ static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState
 		return SkipRefusal::DepthClear;
 	}
 	return SkipRefusal::None;
+}
+
+// KYTY_ASYNC_TRANSLATION (pipelineCache.cpp; adapted from Senaxx's GT7 fork a3d1eba5c): whether a
+// draw may be skipped while a new VS/PS of it translates on a worker. The programs, and so the
+// resolved targets, do not exist yet, so this is DrawSkipRefusal from the draw's registers (the
+// stage rule is GetGraphicsPrograms'), plus the fork's rule: the depth test is on (UI and layer
+// draws, which a game may draw once, translate at once). The target recurrence uses the targets'
+// guest addresses, noted here for the draws it is asked about. The program rule (no stage writes
+// memory) can only be checked once the translation is ready: a shader whose program refuses is
+// remembered (NoteAsyncTranslationRefusals), and its later sources translate at once.
+static bool AsyncTranslationDrawAllowed(CommandBuffer& buffer) {
+	auto&       ctx   = buffer.GetRegisters();
+	auto&       rc    = buffer.GetContext();
+	const auto& depth = ctx.GetDepthControl();
+	if (!depth.z_enable || rc.GetOcclusionCounter().Active()) return false;
+	const auto& render = ctx.GetRenderControl();
+	if (render.depth_clear_enable || render.stencil_clear_enable) return false;
+	struct Seen {
+		uint64_t frame  = 0;
+		uint32_t frames = 0;
+	};
+	thread_local std::unordered_map<uint64_t, Seen> seen;
+	if (seen.size() > 8192u) seen.clear();
+	const auto frame     = rc.GetTextureCache().Frame() + 1u;
+	bool       recurrent = true;
+	const auto note      = [&](uint64_t address) {
+		auto& entry = seen[address];
+		if (entry.frame != frame) {
+			entry.frame  = frame;
+			entry.frames = std::min<uint32_t>(entry.frames + 1u, 1000u);
+		}
+		recurrent &= entry.frames - 1u >= 2u; // earlier frames only
+	};
+	uint32_t colors      = 0;
+	bool     small_color = false;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = ctx.GetRenderTarget(slot);
+		if (!render_target_bound(rt) || render_target_mask_slot(ctx.GetRenderTargetMask(), slot) == 0) {
+			continue;
+		}
+		if (RenderIsColorTileModeLinear(rt.attrib3.tile_mode)) return false; // the CPU reads it back
+		colors++;
+		small_color |= rt.attrib2.width < 256u || rt.attrib2.height < 256u;
+		note(rt.base.addr);
+	}
+	const auto& z         = ctx.GetDepthRenderTarget();
+	const bool  has_depth = z.z_info.format != Prospero::DepthFormat::kInvalid && z.z_write_base_addr != 0;
+	if (has_depth) note(z.z_write_base_addr);
+	if (recurrent || !SkipRecurrentTargetsOnly()) return true;
+	// KYTY_SKIP_EXEMPT's G-buffer pass from the registers (its cube rule needs the resolved image).
+	return SkipExemptEnabled() && colors >= 2u && !small_color && has_depth && depth.z_write_enable &&
+	       static_cast<vk::CompareOp>(depth.zfunc) != vk::CompareOp::eAlways;
+}
+
+static void NoteAsyncTranslationRefusals(const DrawRenderState& state) {
+	const auto check = [](const ShaderStageRuntime& stage) {
+		if (stage.program != nullptr && !DrawRunProgramEligible(*stage.program, false, SkipFaultBufferEnabled())) {
+			PipelineCache::NoteAsyncTranslationRefused(stage.program->shader_hash);
+		}
+	};
+	for (uint32_t i = 0; i < state.vertex_stages_written && i < state.vertex_info.size(); i++) {
+		check(state.vertex_info[i].stage);
+	}
+	if (state.ps_active) check(state.ps_input_info.stage);
 }
 
 // KYTY_PIPELINE_SKIP_STATS=1 (diagnostics): the time draws spent in the pipeline lookup by why they
