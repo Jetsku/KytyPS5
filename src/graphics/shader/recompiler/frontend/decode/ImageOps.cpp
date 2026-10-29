@@ -14,12 +14,6 @@ struct MimgSampleInfo {
 	uint32_t    flags    = 0;
 };
 
-struct MimgGatherInfo {
-	uint32_t encoding = 0;
-	Opcode   decoded  = Opcode::UNSUPPORTED;
-	uint32_t flags    = 0;
-};
-
 struct MimgAtomicInfo {
 	uint32_t encoding    = 0;
 	Opcode   decoded     = Opcode::UNSUPPORTED;
@@ -185,23 +179,72 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
          ImageSampleFlagOffset | ImageSampleFlagAdjust},
 };
 
-constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
-    {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
-    {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
-    {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
-    {0x4cu, Opcode::IMAGE_GATHER4_C_L, ImageSampleFlagCompare | ImageSampleFlagLod},
-    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
-     ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x58u, Opcode::IMAGE_GATHER4_C_O,
-     ImageSampleFlagCompare | ImageSampleFlagOffset},
-    {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
+constexpr MimgSampleInfo MIMG_GATHER_OPCODE_LIST[] = {
+    {0x40u, "image_gather4", 0},
+    {0x41u, "image_gather4_cl", ImageSampleFlagLodClamp},
+    {0x44u, "image_gather4_l", ImageSampleFlagLod},
+    {0x45u, "image_gather4_b", ImageSampleFlagBias},
+    {0x46u, "image_gather4_b_cl", ImageSampleFlagBias | ImageSampleFlagLodClamp},
+    {0x47u, "image_gather4_lz", ImageSampleFlagLevelZero},
+    {0x48u, "image_gather4_c", ImageSampleFlagCompare},
+    {0x49u, "image_gather4_c_cl", ImageSampleFlagCompare | ImageSampleFlagLodClamp},
+    {0x4cu, "image_gather4_c_l", ImageSampleFlagCompare | ImageSampleFlagLod},
+    {0x4du, "image_gather4_c_b", ImageSampleFlagCompare | ImageSampleFlagBias},
+    {0x4eu, "image_gather4_c_b_cl",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp},
+    {0x4fu, "image_gather4_c_lz", ImageSampleFlagCompare | ImageSampleFlagLevelZero},
+    {0x50u, "image_gather4_o", ImageSampleFlagOffset},
+    {0x51u, "image_gather4_cl_o", ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x54u, "image_gather4_l_o", ImageSampleFlagLod | ImageSampleFlagOffset},
+    {0x55u, "image_gather4_b_o", ImageSampleFlagBias | ImageSampleFlagOffset},
+    {0x56u, "image_gather4_b_cl_o",
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x57u, "image_gather4_lz_o", ImageSampleFlagLevelZero | ImageSampleFlagOffset},
+    {0x58u, "image_gather4_c_o", ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x59u, "image_gather4_c_cl_o",
+     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x5cu, "image_gather4_c_l_o",
+     ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset},
+    {0x5du, "image_gather4_c_b_o",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset},
+    {0x5eu, "image_gather4_c_b_cl_o",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset},
+    {0x5fu, "image_gather4_c_lz_o",
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
-    {0xc8u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare | ImageSampleFlagAdjust},
-    {0xd8u, Opcode::IMAGE_GATHER4_C_O,
+    {0x61u, "image_gather4h", ImageSampleFlagGatherHorizontal},
+    {0xc0u, "image_gather4_a", ImageSampleFlagAdjust},
+    {0xc1u, "image_gather4_cl_a", ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xc5u, "image_gather4_b_a", ImageSampleFlagBias | ImageSampleFlagAdjust},
+    {0xc6u, "image_gather4_b_cl_a",
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xc8u, "image_gather4_c_a", ImageSampleFlagCompare | ImageSampleFlagAdjust},
+    {0xc9u, "image_gather4_c_cl_a",
+     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xcdu, "image_gather4_c_b_a",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagAdjust},
+    {0xceu, "image_gather4_c_b_cl_a",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+         ImageSampleFlagAdjust},
+    {0xd0u, "image_gather4_o_a", ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xd1u, "image_gather4_cl_o_a",
+     ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xd5u, "image_gather4_b_o_a",
+     ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xd6u, "image_gather4_b_cl_o_a",
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xd8u, "image_gather4_c_o_a",
      ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xd9u, "image_gather4_c_cl_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xddu, "image_gather4_c_b_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xdeu, "image_gather4_c_b_cl_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
@@ -226,13 +269,13 @@ constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCO
 constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCODE_LIST);
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
 
-Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
+Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgSampleInfo* gather,
                         const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
 	if (gather != nullptr) {
-		return gather->decoded;
+		return Opcode::IMAGE_GATHER4;
 	}
 	if (atomic != nullptr) {
 		return atomic->decoded;
@@ -251,24 +294,10 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 	}
 }
 
-uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInfo* gather) {
-	if (sample != nullptr) {
-		return sample->flags;
-	}
-	if (gather != nullptr) {
-		return gather->flags;
-	}
-	return 0;
-}
-
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
-                                     const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const MimgAtomicInfo* atomic) {
-	if (sample != nullptr) {
-		return ImageSampleAddressComponents(sample->flags, dimension);
-	}
-	if (gather != nullptr) {
-		return ImageSampleAddressComponents(gather->flags, dimension);
+                                     const MimgSampleInfo* sampled, const MimgAtomicInfo* atomic) {
+	if (sampled != nullptr) {
+		return ImageSampleAddressComponents(sampled->flags, dimension);
 	}
 	if (atomic != nullptr) {
 		return ImageCoordComponents(dimension);
@@ -341,16 +370,17 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const auto     dimension  = DecodeImageDimension((word0 >> 3u) & 0x7u);
 	const uint32_t word_count = 2u + nsa_dwords;
 
-	const uint32_t vdata  = (word1 >> 8u) & 0xffu;
-	const uint32_t vaddr  = word1 & 0xffu;
-	const uint32_t srsrc  = (word1 >> 16u) & 0x1fu;
-	const uint32_t ssamp  = (word1 >> 21u) & 0x1fu;
-	const bool     r128   = ((word0 >> 15u) & 0x1u) != 0u;
-	const bool     a16    = ((word1 >> 30u) & 0x1u) != 0u;
-	const bool     d16    = ((word1 >> 31u) & 0x1u) != 0u;
-	const auto*    sample = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
-	const auto*    gather = Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
-	const auto*    atomic = Detail::FindOpcode(MIMG_ATOMIC_OPS, opcode);
+	const uint32_t vdata   = (word1 >> 8u) & 0xffu;
+	const uint32_t vaddr   = word1 & 0xffu;
+	const uint32_t srsrc   = (word1 >> 16u) & 0x1fu;
+	const uint32_t ssamp   = (word1 >> 21u) & 0x1fu;
+	const bool     r128    = ((word0 >> 15u) & 0x1u) != 0u;
+	const bool     a16     = ((word1 >> 30u) & 0x1u) != 0u;
+	const bool     d16     = ((word1 >> 31u) & 0x1u) != 0u;
+	const auto*    sample  = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
+	const auto*    gather  = Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
+	const auto*    atomic  = Detail::FindOpcode(MIMG_ATOMIC_OPS, opcode);
+	const auto*    sampled = sample != nullptr ? sample : gather;
 
 	inst.pc                 = pc;
 	inst.word_count         = word_count;
@@ -365,7 +395,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
 	inst.tfe                = ((word0 >> 16u) & 1u) != 0;
 	inst.lwe                = ((word0 >> 17u) & 1u) != 0;
-	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
+	inst.image_sample_flags = sampled != nullptr ? sampled->flags : 0u;
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;
 	}
@@ -375,8 +405,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	for (uint32_t i = 0; i < nsa_dwords * 4u; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
-	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	inst.image_address_components = DecodeMimgAddressComponents(opcode, dimension, sampled, atomic);
 	SetRawWords(inst, code, word_index, word_count);
 
 	const bool bvh = inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
@@ -416,8 +445,8 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			}
 		}
 	}
-	const bool supports_d16 = sample != nullptr || gather != nullptr || opcode == 0x00u ||
-	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
+	const bool supports_d16 = sampled != nullptr || opcode == 0x00u || opcode == 0x01u ||
+	                          opcode == 0x08u || opcode == 0x09u;
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
@@ -429,9 +458,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.src_count = 3;
 }
 
-const char* MimgSampleOpcodeName(uint32_t opcode) {
-	const auto* sample = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
-	return sample != nullptr ? sample->name : nullptr;
+const char* MimgSampledOpcodeName(uint32_t opcode) {
+	const auto* sample  = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
+	const auto* sampled = sample != nullptr ? sample : Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
+	return sampled != nullptr ? sampled->name : nullptr;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

@@ -4623,6 +4623,73 @@ void TestImageAtomicWidthDecoder() {
   }
 }
 
+void TestImageGatherDecoder() {
+  using namespace ShaderRecompiler::Decoder;
+  struct Gather {
+    uint32_t opcode;
+    const char *name;
+    uint32_t address_vgprs;
+  };
+  // Every PS5 image_gather4 encoding, with the vaddr VGPR count of its 2D full-float form.
+  constexpr Gather gathers[] = {
+      {0x40, "image_gather4", 2},           {0x41, "image_gather4_cl", 3},
+      {0x44, "image_gather4_l", 3},         {0x45, "image_gather4_b", 3},
+      {0x46, "image_gather4_b_cl", 4},      {0x47, "image_gather4_lz", 2},
+      {0x48, "image_gather4_c", 3},         {0x49, "image_gather4_c_cl", 4},
+      {0x4c, "image_gather4_c_l", 4},       {0x4d, "image_gather4_c_b", 4},
+      {0x4e, "image_gather4_c_b_cl", 5},    {0x4f, "image_gather4_c_lz", 3},
+      {0x50, "image_gather4_o", 3},         {0x51, "image_gather4_cl_o", 4},
+      {0x54, "image_gather4_l_o", 4},       {0x55, "image_gather4_b_o", 4},
+      {0x56, "image_gather4_b_cl_o", 5},    {0x57, "image_gather4_lz_o", 3},
+      {0x58, "image_gather4_c_o", 4},       {0x59, "image_gather4_c_cl_o", 5},
+      {0x5c, "image_gather4_c_l_o", 5},     {0x5d, "image_gather4_c_b_o", 5},
+      {0x5e, "image_gather4_c_b_cl_o", 6},  {0x5f, "image_gather4_c_lz_o", 4},
+      {0x61, "image_gather4h", 2},          {0xc0, "image_gather4_a", 2},
+      {0xc1, "image_gather4_cl_a", 3},      {0xc5, "image_gather4_b_a", 3},
+      {0xc6, "image_gather4_b_cl_a", 4},    {0xc8, "image_gather4_c_a", 3},
+      {0xc9, "image_gather4_c_cl_a", 4},    {0xcd, "image_gather4_c_b_a", 4},
+      {0xce, "image_gather4_c_b_cl_a", 5},  {0xd0, "image_gather4_o_a", 3},
+      {0xd1, "image_gather4_cl_o_a", 4},    {0xd5, "image_gather4_b_o_a", 4},
+      {0xd6, "image_gather4_b_cl_o_a", 5},  {0xd8, "image_gather4_c_o_a", 4},
+      {0xd9, "image_gather4_c_cl_o_a", 5},  {0xdd, "image_gather4_c_b_o_a", 5},
+      {0xde, "image_gather4_c_b_cl_o_a", 6},
+  };
+  const auto expected_flags = [](std::string_view name) {
+    if (name == "image_gather4h") return uint32_t{ImageSampleFlagGatherHorizontal};
+    uint32_t flags = 0;
+    for (size_t at = name.find('_', 6); at != std::string_view::npos;) {
+      const auto end = name.find('_', at + 1);
+      const auto modifier = name.substr(at + 1, end - at - 1);
+      if (modifier == "c") flags |= ImageSampleFlagCompare;
+      if (modifier == "b") flags |= ImageSampleFlagBias;
+      if (modifier == "cl") flags |= ImageSampleFlagLodClamp;
+      if (modifier == "l") flags |= ImageSampleFlagLod;
+      if (modifier == "lz") flags |= ImageSampleFlagLevelZero;
+      if (modifier == "o") flags |= ImageSampleFlagOffset;
+      if (modifier == "a") flags |= ImageSampleFlagAdjust;
+      at = end;
+    }
+    return flags;
+  };
+  for (uint32_t opcode = 0; opcode < 0x100u; ++opcode) {
+    const auto *gather = std::ranges::find(gathers, opcode, &Gather::opcode);
+    const uint32_t words[] = {EncodeMimg0(opcode, 0x1), EncodeMimg1(8, 0, 1, 0)};
+    Instruction decoded;
+    DecodeInstruction(words, 0, decoded);
+    if (gather == std::end(gathers)) {
+      Check(decoded.opcode != Opcode::IMAGE_GATHER4,
+            "a non-gather MIMG encoding decoded as image_gather4");
+      continue;
+    }
+    Check(decoded.opcode == Opcode::IMAGE_GATHER4 && decoded.data_components == 4u &&
+              decoded.image_sample_flags == expected_flags(gather->name) &&
+              decoded.image_address_components == gather->address_vgprs &&
+              InstructionToString(decoded).find(std::string(gather->name) + " ") !=
+                  std::string::npos,
+          "a PS5 gather encoding lost its opcode, name, modifiers or address count");
+  }
+}
+
 void TestNewShaderDecoderArchitecture() {
   using namespace ShaderRecompiler::Decoder;
 
@@ -5627,7 +5694,7 @@ void TestImageAddressOperands() {
   const uint32_t captured[] = {0xf130010au, 0x00a30013u, 0x00161a19u};
   Decoder::Instruction gather;
   Decoder::DecodeInstruction(captured, 0, gather);
-  Check(gather.opcode == Decoder::Opcode::IMAGE_GATHER4_C_L &&
+  Check(gather.opcode == Decoder::Opcode::IMAGE_GATHER4 &&
             gather.opcode_id == 0x4cu && gather.word_count == 3u &&
             gather.image_dimension == Decoder::ImageDimension::Dim2D &&
             gather.dmask == 1u && gather.data_components == 4u &&
@@ -5641,7 +5708,7 @@ void TestImageAddressOperands() {
             gather.image_nsa_addr[2] == 22u && !gather.glc && !gather.slc &&
             !gather.image_r128,
         "captured IMAGE_GATHER4_C_L lost compare/LOD, NSA, or result metadata");
-  Check(Decoder::InstructionToString(gather).find("IMAGE_GATHER4_C_L") != std::string::npos,
+  Check(Decoder::InstructionToString(gather).find("image_gather4_c_l") != std::string::npos,
         "captured IMAGE_GATHER4_C_L is missing from the decoded dump");
   struct Case {
     uint32_t opcode;
@@ -16376,6 +16443,7 @@ int main(int argc, char **argv) {
   // here.
   TestScalarAshrI64Decoder();
   TestImageAtomicWidthDecoder();
+  TestImageGatherDecoder();
   TestDsReturningAtomic64Decoder();
   TestDsFloatMinMaxDecoder();
   TestNewShaderDecoderArchitecture();
