@@ -134,6 +134,7 @@ private:
 	                                 float safe_upper, uint32_t lower_result,
 	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
+	IR::U32 Saturate16(IR::U32 value, bool signed_value);
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
@@ -161,6 +162,7 @@ private:
 	void V_CVT_PKRTZ_F16_F32(const Decoder::Instruction& inst);
 	void V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
+	void V_CVT_PK_16_32(const Decoder::Instruction& inst, bool signed_value);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
@@ -171,6 +173,7 @@ private:
 	void Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                    bool mix);
 	void FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	void V_FRACT(const Decoder::Instruction& inst, IR::Type type);
 	void FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse);
 	void FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                  bool mix);

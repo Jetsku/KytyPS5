@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <bit>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -59,6 +60,38 @@ void Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	Write16Bits(DestinationOperand(inst), ir.Select(negative, invalid, bits));
+}
+
+// KYTY_FRACT_CLAMP (upstream e864cb20b): x - floor(x) rounds to 1.0 for a tiny negative x; v_fract
+// returns the largest value below one instead. The ordered compare lets NaN through.
+void Translator::V_FRACT(const Decoder::Instruction& inst, IR::Type type) {
+	const auto destination = DestinationOperand(inst);
+	if (type == IR::Type::F64) {
+		const auto result = ir.Emit(IR::ValueOpcode::FPFract64, {ReadOperand(inst.src0, type)});
+		const auto below_one =
+		    ir.Emit(IR::ValueOpcode::BitCastF64U64, {IR::Value(uint64_t {0x3fefffffffffffffull})});
+		const auto above = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan64, {result, below_one}));
+		// No 64-bit select: select the words of the bits.
+		const auto words = ExtractU64(IR::U64(ir.Emit(IR::ValueOpcode::BitCastU64F64, {result})));
+		const auto low   = ir.Select(above, IR::U32(IR::Value(0xffffffffu)), words[0]);
+		const auto high  = ir.Select(above, IR::U32(IR::Value(0x3fefffffu)), words[1]);
+		WriteOperand(destination,
+		             ir.Emit(IR::ValueOpcode::BitCastF64U64, {ir.ConstructU64(low, high)}));
+		return;
+	}
+	const bool half   = type == IR::Type::F16;
+	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, type));
+	const auto result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
+	// Clamp in the destination precision: 0x3f7fe000 is the half 0x3bff.
+	const auto below_one =
+	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
+	const auto above   = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, below_one}));
+	const auto clamped = SelectF32(above, below_one, result);
+	if (half) {
+		WriteF16(destination, clamped);
+	} else {
+		WriteOperand(destination, clamped);
+	}
 }
 
 void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {

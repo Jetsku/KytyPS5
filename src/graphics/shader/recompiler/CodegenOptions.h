@@ -539,6 +539,14 @@ struct CodegenOptions {
 	// folds the shifted patch ordinal; HS and TES share the patch-constant range the analysis
 	// found. Factor or patch-constant addresses that still do not fold skip the stage's draws.
 	bool tess_indexed = false;
+	// KYTY_FRACT_CLAMP=1 (default off; upstream e864cb20b, TheCruZ): V_FRACT_F16/F32/F64 return the
+	// largest value below one (as the guest GPU) where x - floor(x) rounds up to 1.0 for a tiny
+	// negative x. NaN passes through. Off: the host fract result, as before.
+	bool fract_clamp = false;
+	// KYTY_CVT_PK_SATURATE=1 (default off; upstream 9210264d4, TheCruZ): V_CVT_PK_U16_U32 and
+	// V_CVT_PK_I16_I32 saturate each 32-bit source to the 16-bit range (unsigned / signed), as the
+	// guest GPU; off, the low 16 bits are packed, as before.
+	bool cvt_pk_saturate = false;
 	// KYTY_WORKGROUP_IMAGES=1 (default off; the GT7 preset; adapted from upstream KytyPS5 0ee880090
 	// and c23de6218, nmzik): a compute image whose T# is read from a table at
 	// workgroup_id[axis] * stride + offset (GT7's CS 0xe042c5de1f18d724: two storage T#s per Z group

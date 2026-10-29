@@ -222,6 +222,12 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.tess_indexed) {
 		b.Text("tess_indexed");
 	}
+	if (options.fract_clamp) {
+		b.Text("fract_clamp");
+	}
+	if (options.cvt_pk_saturate) {
+		b.Text("cvt_pk_saturate");
+	}
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");
 		b.U8(options.denorm_flush_skip);
