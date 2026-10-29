@@ -38587,6 +38587,28 @@ TestCase VectorMadU64U32UnsignedCarryOut() {
   return test;
 }
 
+// Like every VOP3B carry-out, the mask has zero bits for lanes outside EXEC.
+TestCase VectorMadU64U32CarryMasksInactiveLanes() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorMadU64U32CarryMasksInactiveLanes";
+  test.code = {EncodeVop2(0x1b, 3, InlineU32(1), 0), EncodeSop1(0x04, 40, 126),
+               EncodeVopc(0xd5, InlineU32(0), 3)};
+  AppendVop3B(&test.code, 0x176u, 10, 20, 193, 193, 193);
+  test.code.push_back(EncodeSop1(0x04, 126, 40));
+  AppendStoreSgpr(&test.code, 20, 0);
+  AppendEnd(&test.code);
+  test.initial = {0};
+  test.expected = {0xaaaaaaaau};
+  test.opcodes = {O::V_AND_B32, O::S_MOV_B64, O::V_CMPX_NE_U32, O::V_MAD_U64_U32,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorLaneAndPackedOps() {
   using O = ShaderOpcode;
 
@@ -52358,6 +52380,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BCarryOutUsesEncodedSdst);
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
+  AddCase(VectorMadU64U32CarryMasksInactiveLanes);
   AddCase(VectorLaneAndPackedOps);
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
@@ -60301,6 +60324,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarAshrI64Edges(true));
     RunCase(&vulkan, VectorCompareInteger64Edges());
     RunCase(&vulkan, VectorMadU64U32UnsignedCarryOut());
+    RunCase(&vulkan, VectorMadU64U32CarryMasksInactiveLanes());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
     RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
     return 0;
