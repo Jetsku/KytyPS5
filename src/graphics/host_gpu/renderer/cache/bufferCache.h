@@ -693,6 +693,13 @@ private:
 	// without a download, and true is returned. Without it the fault copies the window's other
 	// GPU-written ranges and waits for their writer.
 	[[nodiscard]] bool TryLiftFaultPages(uint64_t page_begin, uint64_t page_end);
+	// KYTY_CLEAN_READ=1 (default off; adapted from usa-ratt/KytyPS5-GT7 19b6c5cfb), GPU thread: a
+	// guest load of [vaddr, vaddr + size) faulted on a page protected because the GPU wrote other
+	// bytes of it. When none of these bytes is GPU-written, on its way back from the GPU (pending
+	// publication, early release), in a GPU-written image, or within reach of a running address-
+	// writing shader, copies them from guest memory into `data` and returns true: the fault
+	// handler completes the load with them and the page stays protected.
+	[[nodiscard]] bool TryReadCleanBytes(uint64_t vaddr, uint64_t size, void* data);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that

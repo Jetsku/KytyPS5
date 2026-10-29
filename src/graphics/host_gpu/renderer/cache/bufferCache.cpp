@@ -2253,7 +2253,34 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 	auto                          result    = SideIssueResult::Other;
 	const auto                    sync_mark = diag ? ReadFaultDiag::NowNs() : 0;
 	bool                          current   = false; // KYTY_CLEAN_PAGE
-	gpu.SendCommandSync([&, this, vaddr, size, is_write] {
+	// KYTY_CLEAN_READ (default 0; 1 on, read once; adapted from usa-ratt/KytyPS5-GT7 19b6c5cfb): a
+	// guest code's plain load (common/guestLoad.h) of bytes the GPU has not written, on a page
+	// protected because the GPU wrote other bytes of it, is completed here with the bytes from
+	// guest memory (TryReadCleanBytes decides on the GPU thread). The page stays protected; no
+	// side copy, download or GPU wait. After 16 such loads of one page within 1 ms on a thread
+	// (a copy loop), the normal path makes the page current instead.
+	static const bool clean_read = ParseEnvU64("KYTY_CLEAN_READ", 0) != 0;
+	GuestLoad::Load   clean_load;
+	uint8_t           clean_bytes[16] {};
+	bool              clean_candidate = false;
+	bool              clean_served    = false;
+	if (clean_read && !is_write && GuestLoad::t_native_context != nullptr) {
+		thread_local uint64_t burst_page  = 0;
+		thread_local uint64_t burst_ns    = 0;
+		thread_local uint32_t burst_count = 0;
+		const auto            now_ns      = ReadFaultDiag::NowNs();
+		burst_count = burst_page == page_begin && now_ns - burst_ns < 1'000'000 ? burst_count + 1 : 0;
+		burst_page  = page_begin;
+		burst_ns    = now_ns;
+		clean_candidate = burst_count < 16 && GuestLoad::Decode(vaddr, clean_load) &&
+		                  clean_load.size != 0 && clean_load.size <= sizeof(clean_bytes);
+	}
+	const auto issue = [&, this, vaddr, size, is_write] {
+		if (clean_candidate && TryReadCleanBytes(clean_load.address, clean_load.size, clean_bytes)) {
+			clean_served = true;
+			return;
+		}
+		clean_served = false;
 		if (!is_write || g_readback_eager_writes.On()) {
 			NoteEagerRead(vaddr, size, false);
 		}
@@ -2290,7 +2317,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			                                                        : CpGaps::Event::DrainOther);
 			ReadMemoryDrain(vaddr, size, is_write, trace);
 		}
-	});
+	};
+	gpu.SendCommandSync([&issue] { issue(); });
+	if (clean_served) {
+		static std::atomic<uint64_t> served {0};
+		if (GuestLoad::Apply(clean_load, clean_bytes)) {
+			if (const auto n = served.fetch_add(1, std::memory_order_relaxed) + 1;
+			    (n & (n - 1)) == 0 && n >= 64) {
+				LOGF("ReadMemory: %" PRIu64 " guest loads of bytes the GPU has not written served "
+				     "from guest memory without a GPU wait (KYTY_CLEAN_READ)\n",
+				     n);
+			}
+			diag_path("clean-read");
+			record(std::nullopt);
+			return;
+		}
+		// Not applied (the context stays untouched): take the normal path.
+		clean_candidate = false;
+		gpu.SendCommandSync([&issue] { issue(); });
+	}
 	if (current) {
 		flush_note.kind = FaultCost::FlushKind::Current;
 		diag_path("current");
@@ -2439,6 +2484,30 @@ bool BufferCache::TryLiftFaultPages(uint64_t page_begin, uint64_t page_end) {
 		     n);
 	}
 	return true;
+}
+
+bool BufferCache::TryReadCleanBytes(uint64_t vaddr, uint64_t size, void* data) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	if (size == 0 || data == nullptr || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	// Only pages the buffer tracker protects as GPU-written; other faults take their own path.
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (!m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+		return false;
+	}
+	// None of the bytes may be GPU-written, early released or waiting for a publication, nor in
+	// a GPU-written image whose contents are not in guest memory.
+	if (HasGpuDirtyBytes(vaddr, size) || HasPendingBackingPublication(vaddr, size) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	// An address-writing shader still running may write any buffer byte nobody tracks yet.
+	if (m_unbounded_write_tick != 0 && !m_scheduler.IsFree(m_unbounded_write_tick)) {
+		return false;
+	}
+	return LibKernel::Memory::TryReadBacking(vaddr, data, size);
 }
 
 bool BufferCache::FaultPagesCurrent(uint64_t page_begin, uint64_t page_end) {
