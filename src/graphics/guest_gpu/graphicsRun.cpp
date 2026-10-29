@@ -5273,6 +5273,15 @@ bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* 
 	if (CpGaps::Enabled() && !GpuTouched::g_fine_pages.AnyTouched(address, address + size)) {
 		CpGaps::NoteStop(CpGaps::Stop::RegisterReadFineClean);
 	}
+	if (CpGaps::Enabled() && GpuTouched::DiagEnabled()) {
+		// KYTY_CLEAN_UNTOUCHED_DIAG: which marking source touched the pages of this read.
+		for (uint32_t source = 0; source < static_cast<uint32_t>(GpuTouched::DiagSource::Count); source++) {
+			if (GpuTouched::g_diag_pages[source].AnyTouched(address, address + size)) {
+				CpGaps::NoteStop(static_cast<CpGaps::Stop>(
+				    static_cast<uint32_t>(CpGaps::Stop::RegisterReadByBufferDirty) + source));
+			}
+		}
+	}
 	CpSeq::LockstepReadOp op;
 	op.address     = address;
 	op.size        = size;

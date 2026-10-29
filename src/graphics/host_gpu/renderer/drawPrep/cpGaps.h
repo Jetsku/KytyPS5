@@ -357,6 +357,11 @@ enum class Stop : uint8_t {
 	CommandBytes,  // LockstepRead of command bytes
 	PendingWrite,  // a front read under a pending CP write
 	RegisterReadFineClean, // diagnostic: a RegisterRead the 1 KiB marks call untouched
+	// KYTY_CLEAN_UNTOUCHED_DIAG: the marking sources of a RegisterRead's pages (GpuTouched::DiagSource order)
+	RegisterReadByBufferDirty,
+	RegisterReadByTrackerGpu,
+	RegisterReadByImageGpu,
+	RegisterReadByPublication,
 	Count
 };
 constexpr size_t StopCount = static_cast<size_t>(Stop::Count);

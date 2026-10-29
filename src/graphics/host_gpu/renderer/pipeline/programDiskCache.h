@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -38,10 +39,11 @@ namespace Libs::Graphics {
 //   it with this run's records (so a build or switch change costs one cold run).
 //
 // File: header (magic, format, identity, checksum), then records (magic, kind, size, XXH3-64 of
-// the payload, payload). A packed permutation (KYTY_PROGRAM_CACHE_COMPRESS) keeps its lookup key
-// (source digest, cursor, specialization) plain and its info and SPIR-V as one zstd frame, which
-// is expanded on its first hit (and kept expanded for the cache's lifetime); the size cap counts
-// stored bytes, so about four times as many programs fit. Loading rejects the whole file on any header mismatch and keeps records
+// the payload, payload). Packed records (KYTY_PROGRAM_CACHE_COMPRESS) keep their lookup keys plain and the
+// rest as one checksummed zstd frame: a packed permutation's info and SPIR-V are expanded on every
+// hit into a buffer the returned record owns (nothing stays expanded in the cache); a packed
+// source's plan is expanded on its first hit and kept (plans are referenced for the run). The
+// size cap counts stored bytes, so about four times as many programs fit. Loading rejects the whole file on any header mismatch and keeps records
 // up to the first damaged one (bad magic, size or checksum: a truncated or corrupt tail).
 //
 // Threads: the file is read and indexed on a loader thread started by the constructor; lookups
@@ -108,6 +110,8 @@ public:
 		std::span<const uint8_t> info;
 		std::span<const uint8_t> spirv;       // words, little-endian, not necessarily aligned
 		std::span<const uint8_t> spirv_plain; // empty when the program has no plain variant
+		// A packed record's expanded body: the spans above point into it (null: into the cache).
+		std::shared_ptr<const std::vector<uint8_t>> body;
 	};
 
 	struct Stats {
@@ -149,7 +153,8 @@ public:
 	ProgramDiskCache(const ProgramDiskCache&)            = delete;
 	ProgramDiskCache& operator=(const ProgramDiskCache&) = delete;
 
-	// Both wait for the loader. The returned spans stay valid for the cache's lifetime.
+	// Both wait for the loader. The returned spans stay valid for the cache's lifetime (a packed
+	// permutation's: while its record's `body` lives).
 	// note_use=false (a precompile replay of the journal): the hit does not count as a use for
 	// evict_unused, so the journal alone does not pin every record.
 	[[nodiscard]] std::optional<SourceRecord> FindSource(const SourceKey& key, bool note_use = true);
@@ -181,6 +186,7 @@ public:
 	static constexpr uint32_t RecordSource      = 1;
 	static constexpr uint32_t RecordPermutation = 2;
 	static constexpr uint32_t RecordPermutationPacked = 3;
+	static constexpr uint32_t RecordSourcePacked      = 4;
 	static constexpr size_t   RecordHeaderBytes = 4 + 4 + 8 + 8;
 
 private:
@@ -201,8 +207,8 @@ private:
 		std::span<const uint8_t> info;
 		std::span<const uint8_t> spirv;
 		std::span<const uint8_t> spirv_plain;
-		// Packed permutations: the zstd frame of info + SPIR-V; info and spirv are empty until
-		// Expand fills them (expanded).
+		// Packed records: the zstd frame (permutations: info + SPIR-V, never kept expanded;
+		// sources: the plan, which ExpandSource fills in once).
 		std::span<const uint8_t> packed;
 		uint32_t                 raw_size = 0;
 		bool                     expanded = true;
@@ -217,9 +223,19 @@ private:
 	bool ParseRecord(std::span<const uint8_t> bytes, Record& record) const;
 	// Parses the expanded body of a packed permutation (info, SPIR-V, plain SPIR-V).
 	static bool ParseBody(std::span<const uint8_t> body, Record& record);
-	// Takes and returns `lock` (on m_mutex): expands the packed record `id`, unlocked while
+	// Decompresses a packed record's frame (no lock needed: the stored bytes are immutable).
+	static std::shared_ptr<std::vector<uint8_t>> Unpack(std::span<const uint8_t> packed,
+	                                                    uint32_t raw_size);
+	// Packs `body` at m_settings.compress_level; empty when packing fails or does not pay.
+	std::vector<uint8_t> Pack(std::span<const uint8_t> body) const;
+	// Takes and returns `lock` (on m_mutex): expands the packed source `id`'s plan, unlocked while
 	// decompressing. False when the frame is damaged (the record is then invalidated).
-	bool Expand(uint32_t id, std::unique_lock<std::mutex>& lock);
+	bool ExpandSource(uint32_t id, std::unique_lock<std::mutex>& lock);
+	// Requires m_mutex.
+	void InvalidateLocked(uint32_t id);
+	[[nodiscard]] static bool IsSourceKind(uint32_t kind) {
+		return kind == RecordSource || kind == RecordSourcePacked;
+	}
 	// Requires m_mutex. Adds a parsed record to the index; false when it was a duplicate or made
 	// its digest ambiguous (the record is then not indexed).
 	bool IndexRecord(uint32_t id);
@@ -239,7 +255,7 @@ private:
 	bool                    m_loaded = false;
 	std::vector<uint8_t>    m_file;           // loaded file contents (records point into it)
 	std::deque<std::vector<uint8_t>> m_added; // records added by this run (stable storage)
-	std::deque<std::vector<uint8_t>> m_expanded; // bodies of expanded packed records
+	std::deque<std::vector<uint8_t>> m_expanded; // plans of expanded packed sources
 	std::vector<Record>     m_records;
 	uint32_t                m_loaded_count = 0; // records [0, m_loaded_count) came from the file
 	bool                    m_order_dirty  = false; // evict_unused: use order changed since the last save

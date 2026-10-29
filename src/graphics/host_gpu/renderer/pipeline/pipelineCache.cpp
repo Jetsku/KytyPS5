@@ -3294,6 +3294,8 @@ struct PipelineCache::ProgramCache {
 		std::span<const uint8_t>                     stored_info;
 		std::span<const uint8_t>                     stored_spirv;
 		std::span<const uint8_t>                     stored_spirv_plain;
+		// A packed record's expanded body (the stored spans point into it).
+		std::shared_ptr<const std::vector<uint8_t>>  stored_body;
 	};
 
 	// The background thread of KYTY_PROGRAM_CACHE_VERIFY=background (started on first use).
@@ -4207,6 +4209,7 @@ struct PipelineCache::ProgramCache {
 			check.stored_info        = reloaded->info;
 			check.stored_spirv       = reloaded->spirv;
 			check.stored_spirv_plain = reloaded->spirv_plain;
+			check.stored_body        = reloaded->body;
 			SubmitBackgroundCheck(std::move(check));
 		}
 		scratch.published_new = true;

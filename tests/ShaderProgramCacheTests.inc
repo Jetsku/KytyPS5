@@ -688,14 +688,24 @@ void CheckCacheFile() {
     // Repetitive SPIR-V (packs well, like real modules).
     std::vector<u32> big_spirv;
     for (u32 i = 0; i < 4096; i++) big_spirv.push_back(first.spirv[i % first.spirv.size()]);
+    std::vector<uint8_t> big_plan;
+    for (u32 i = 0; i < 8192; i++) big_plan.push_back(static_cast<uint8_t>((i % 61u) * 3u));
+    ProgramDiskCache::SourceKey big_key;
+    const std::vector<u32> big_code{9, 8, 7, 6};
+    ProgramDiskCache::BuildSourceKey({.stage = 2, .hash = 11, .code = big_code}, big_key);
     WriteFileBytes(path, file);
     {
       auto packing = settings(identity_a);
       packing.compress_level = 3;
       ProgramDiskCache cache(packing);
       check_complete(cache); // plain records of the old file
+      cache.AddSource(big_key, false, big_plan); // a packed plan (added first: the permutation
+                                                 // stays the file's last record)
       cache.AddPermutation(first.key.digest, 12, first.specialization, first.info, big_spirv,
                            first.spirv);
+      const auto source = cache.FindSource(big_key);
+      Require(name, "pack", source.has_value() && SameBytes(source->plan, big_plan),
+              "the packed plan did not come back in its run");
       const auto stats = cache.GetStats();
       Require(name, "pack", stats.packed_added == 1 && stats.packed_bytes < stats.packed_raw_bytes,
               "the new permutation was not stored packed");
@@ -719,19 +729,31 @@ void CheckCacheFile() {
                   SameBytes(packed->spirv, WordBytes(big_spirv)) &&
                   SameBytes(packed->spirv_plain, WordBytes(first.spirv)),
               "the packed permutation did not come back in the next run");
+      // Each hit expands into its own buffer (nothing stays expanded in the cache).
       const auto repeat = cache.FindPermutation(first.key.digest, 12, first.specialization);
-      const auto stats  = cache.GetStats();
       Require(name, "unpack",
-              repeat.has_value() && repeat->spirv.data() == packed->spirv.data() &&
-                  stats.expanded == 1 && stats.loaded_permutations == 4,
-              "a packed record was expanded more than once");
+              repeat.has_value() && repeat->body != nullptr && repeat->body != packed->body &&
+                  SameBytes(repeat->spirv, WordBytes(big_spirv)),
+              "a repeated hit did not expand its own body");
+      // A packed plan is expanded once and kept.
+      const auto source_a = cache.FindSource(big_key);
+      const auto source_b = cache.FindSource(big_key);
+      const auto stats    = cache.GetStats();
+      Require(name, "unpack",
+              source_a.has_value() && source_b.has_value() && SameBytes(source_a->plan, big_plan) &&
+                  source_a->plan.data() == source_b->plan.data() && stats.expanded == 3 &&
+                  stats.loaded_permutations == 4 && stats.loaded_sources == 4,
+              "the packed plan did not come back once-expanded in the next run");
     }
     // Damage inside the zstd frame of the packed record (the last one), with its checksum fixed:
     // loading keeps it (the frame header is intact), the first hit drops it, the others stay.
     {
       auto damaged = packed_file;
+      // After the old file's records: the packed source, then the packed permutation.
       size_t offset = ends.back();
       uint64_t size = 0;
+      std::memcpy(&size, damaged.data() + offset + 8, sizeof(size));
+      offset += ProgramDiskCache::RecordHeaderBytes + size;
       std::memcpy(&size, damaged.data() + offset + 8, sizeof(size));
       Require(name, "damaged frame", offset + ProgramDiskCache::RecordHeaderBytes + size == damaged.size(),
               "unexpected packed layout");

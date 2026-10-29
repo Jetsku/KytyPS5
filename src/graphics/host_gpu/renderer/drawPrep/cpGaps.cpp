@@ -127,7 +127,9 @@ void Print(ThreadState& state, Report& report, uint64_t now_ns, uint64_t now_tsc
 	state.events = {};
 	static constexpr const char* stop_names[] = {"wait-self", "wait-other", "flip-wait", "predication",
 	                                             "cond-exec", "branch",     "reg-read",  "cmd-bytes",
-	                                             "pending-write", "reg-read-fine-clean"};
+	                                             "pending-write", "reg-read-fine-clean",
+	                                             "by-buffer-dirty", "by-tracker-gpu", "by-image-gpu",
+	                                             "by-publication"};
 	static_assert(sizeof(stop_names) / sizeof(stop_names[0]) == StopCount, "one name per stop");
 	line += " | stops/f:";
 	for (size_t i = 0; i < StopCount; i++) {
