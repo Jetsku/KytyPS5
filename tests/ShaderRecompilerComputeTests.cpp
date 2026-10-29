@@ -37830,6 +37830,71 @@ TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   return test;
 }
 
+TestCase Vop3Integer16Ternary(u32 wave_size) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  struct Operation { u32 encoding; O opcode; bool sign; u32 sorted_index; };
+  constexpr std::array operations{
+      Operation{0x352, O::V_MIN3_I16, true, 0},
+      Operation{0x355, O::V_MAX3_I16, true, 2},
+      Operation{0x356, O::V_MAX3_U16, false, 2},
+      Operation{0x359, O::V_MED3_U16, false, 1}};
+  constexpr std::array<std::array<u32, 3>, 4> inputs{{
+      {0x80007fffu, 0xffff0000u, 0x0001ffffu},
+      {0x00098000u, 0xffff0007u, 0x7fff0005u},
+      {0xffff8000u, 0xffff8000u, 0x00008000u},
+      {0x00000000u, 0x7fff7fffu, 0x7fff7fffu}}};
+  TestCase test;
+  test.name = wave_size == 32 ? "Vop3Integer16TernaryWave32" : "Vop3Integer16TernaryWave64";
+  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (const auto &operation : operations) {
+    // Integer ternaries accept half selectors, but no floating-point modifiers.
+    for (u32 modifier = 0; modifier < 9; ++modifier) {
+      const u32 words[] = {
+          EncodeVop3Word0(operation.encoding, 9, modifier < 3 ? 1u << modifier : 0),
+          EncodeVop3Word1(Vgpr(2), Vgpr(3), Vgpr(4),
+                          modifier >= 6 ? modifier - 5 : 0,
+                          modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
+      D::Instruction decoded;
+      D::DecodeInstruction(words, 0, decoded);
+      Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
+              "16-bit integer ternary accepted a floating-point modifier");
+    }
+    for (u32 i = 0; i < inputs.size(); ++i) {
+      for (u32 variant = 0; variant < 32; ++variant) {
+        const u32 selectors = variant & 15u;
+        std::array<int32_t, 3> selected{};
+        for (u32 operand = 0; operand < 3; ++operand) {
+          AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
+          AppendBufferLoadDword(&code, 2 + operand, 30);
+          const u32 half = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
+          selected[operand] = operation.sign && half >= 0x8000u
+                                  ? static_cast<int32_t>(half) - 0x10000 : static_cast<int32_t>(half);
+        }
+        code.push_back(EncodeVop1(0x02, 12, Vgpr(3))); // Broadcast source 1 from an SGPR.
+        const u32 dst = selectors & 1u ? 2u : 9u; // Also cover source/destination aliasing.
+        AppendVMovLiteral(&code, 9, 0xa5a5beefu);
+        AppendVop3(&code, operation.encoding, dst, Vgpr(2), 12, Vgpr(4), 0, selectors, variant >= 16);
+        AppendStoreVgpr(&code, dst, static_cast<u32>(test.expected.size()));
+        std::sort(selected.begin(), selected.end());
+        const u32 result = static_cast<u32>(selected[operation.sorted_index]) & 0xffffu;
+        const u32 old = dst == 2 ? inputs[i][0] : 0xa5a5beefu;
+        test.expected.push_back(selectors & 8u ? (old & 0xffffu) | (result << 16)
+                                                : (old & 0xffff0000u) | result);
+      }
+    }
+    test.opcodes.push_back(operation.opcode);
+  }
+  AppendEnd(&code);
+  test.opcodes.insert(test.opcodes.end(), {O::V_MOV_B32, O::V_READFIRSTLANE_B32,
+      O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop3Min3U16CapturedAndSelectors() {
   using O = ShaderOpcode;
   struct MinCase {
@@ -52555,6 +52620,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3F32ClampFlushesNaN);
+  cases.push_back(Vop3Integer16Ternary(32));
+  cases.push_back(Vop3Integer16Ternary(64));
   AddCase(Vop3Min3U16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
@@ -59240,6 +59307,15 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--integer16-ternary-only") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3Integer16Ternary(32));
+    RunCase(&vulkan, Vop3Integer16Ternary(64));
+    RunCase(&vulkan, Vop3Min3U16CapturedAndSelectors());
+    RunCase(&vulkan, Vop3Med3I16Captured());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--vop3-conversions-only") == 0) {
     EnsureConfigInitialized();
     VulkanHarness vulkan;
