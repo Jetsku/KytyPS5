@@ -447,6 +447,12 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	// KYTY_VIEW_PLACEMENT: where a binding the overlap loop found inside `result` lies in it
+	// (loop_own: the loop's last overlap placed the binding itself there, at view_mip/view_layer);
+	// clears `result` when it has no place there its view fits in (it gets an image of its own).
+	[[nodiscard]] static bool   ViewPlacementEnabled();
+	void                        PlaceBindingView(const ImageDesc& desc, ImageId& result, bool loop_own,
+	                                             int32_t& view_mip, int32_t& view_layer) const;
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id,
 	                                         RefreshIntent intent = RefreshIntent::Read);
