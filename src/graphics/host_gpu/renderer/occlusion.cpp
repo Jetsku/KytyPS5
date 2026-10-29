@@ -677,7 +677,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		         m_scopes_since_dump, m_last_scope.colors, m_last_scope.has_depth ? 1u : 0u, m_last_scope.width,
 		         m_last_scope.height, m_last_scope.depth_address, m_last_scope.depth_format);
 	}
-	auto publish = [this, address, slot_offset, batch, tag, debug_log] {
+	auto publish = [this, address, slot_offset, batch, tag, debug_log, bias = m_skip_bias] {
 		m_publish->Invalidate(slot_offset, batch ? PublishSlotSize : 248);
 		const auto* source = m_publish->Mapped().data() + slot_offset;
 		if (batch) {
@@ -729,6 +729,15 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		}
 		m_context.PrepareHostBackingWrite(address, 248, RenderContext::HostWriter::Occlusion);
 		for (uint32_t db = 0; db < 16u; db++) {
+			if (db == 0 && bias != 0) {
+				// KYTY_SKIP_OCCLUSION_VISIBLE: the samples of skipped draws so far, below the ready bit.
+				uint64_t value = 0;
+				std::memcpy(&value, source, sizeof(value));
+				constexpr uint64_t Ready = 1ull << 63u;
+				value = (value & Ready) | (((value & ~Ready) + bias) & ~Ready);
+				(void)LibKernel::Memory::TryWriteBacking(address, &value, sizeof(value));
+				continue;
+			}
 			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
 			                                         sizeof(uint64_t));
 		}
