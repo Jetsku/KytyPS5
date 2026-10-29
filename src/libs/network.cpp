@@ -467,7 +467,7 @@ Network::Id Network::HttpCreateTemplate(Id http_ctx_id, const char* user_agent, 
 		HttpTemplate tn {};
 		tn.used               = true;
 		tn.http_ver           = http_ver;
-		tn.user_agent         = std::string(user_agent);
+		tn.user_agent         = user_agent != nullptr ? user_agent : "";
 		tn.is_auto_proxy_conf = is_auto_proxy_conf;
 		tn.http_ctx_id        = http_ctx_id.GetId();
 		tn.nonblock           = false;
