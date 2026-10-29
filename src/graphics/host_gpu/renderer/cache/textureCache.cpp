@@ -2860,16 +2860,21 @@ void TextureCache::RefreshCopySource(ImageId id) {
 bool TextureCache::CopyD16(Image& destination, Image& source) {
 	// Scratch buffers from the tiler stay alive until this operation's last tick (tiler.h).
 	const TileManager::ScratchHold scratch_hold(m_tiler);
-	const bool source_depth      = source.info.IsDepth();
-	const bool destination_depth = destination.info.IsDepth();
-	if (source_depth == destination_depth) {
+	// Converts guest D16 between a four-byte host depth aspect (D24/D32, stenciled) and two-byte
+	// color or native D16 depth (upstream 0685bffb2: D16 <-> D24/D32 depth copies exited).
+	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
+	if (source_wide ==
+	    (DepthAspectTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
 		return false;
 	}
-	auto&      depth          = source_depth ? source : destination;
-	auto&      color          = source_depth ? destination : source;
-	const auto transfer_bytes = DepthAspectTransferBytes(depth.backing.format);
+	const bool source_depth   = source_wide;
+	auto&      depth          = source_wide ? source : destination;
+	auto&      color          = source_wide ? destination : source;
+	const auto transfer_bytes = sizeof(uint32_t);
+	const auto narrow_aspect  = color.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                                                 : vk::ImageAspectFlagBits::eColor;
 	if (depth.info.bytes_per_block != sizeof(uint16_t) ||
-	    color.info.bytes_per_block != sizeof(uint16_t) || transfer_bytes != sizeof(uint32_t)) {
+	    color.info.bytes_per_block != sizeof(uint16_t)) {
 		return false;
 	}
 	EXIT_IF(source.backing.samples != 1 || destination.backing.samples != 1 ||
@@ -2896,7 +2901,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 		color_copies[layer].bufferOffset      = color_slice * layer;
 		color_copies[layer].bufferRowLength   = color.info.pitch;
 		color_copies[layer].bufferImageHeight = color.info.extent.height;
-		color_copies[layer].imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, layer, 1};
+		color_copies[layer].imageSubresource  = {narrow_aspect, 0, layer, 1};
 		color_copies[layer].imageExtent       = color.info.extent;
 	}
 
