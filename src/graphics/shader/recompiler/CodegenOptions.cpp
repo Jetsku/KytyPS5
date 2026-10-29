@@ -169,6 +169,7 @@ CodegenOptions FromEnvironment() {
 	options.fract_clamp     = EnvFlag("KYTY_FRACT_CLAMP", options.fract_clamp);
 	options.cvt_pk_saturate = EnvFlag("KYTY_CVT_PK_SATURATE", options.cvt_pk_saturate);
 	options.ufloat_store_rtz = EnvFlag("KYTY_UFLOAT_STORE_RTZ", options.ufloat_store_rtz);
+	options.ls_active_lanes  = EnvFlag("KYTY_LS_ACTIVE_LANES", options.ls_active_lanes);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.
 	const auto flush_off = [](const char* name) {

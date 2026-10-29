@@ -554,6 +554,10 @@ struct CodegenOptions {
 	// even, NaN stays NaN and overflow is infinity (or the largest value with
 	// KYTY_FLOAT_STORE_CLAMP), as before.
 	bool ufloat_store_rtz = false;
+	// KYTY_LS_ACTIVE_LANES=1 (default off; upstream 63207739b, Çağatay Güçlü): a local (LS) shader's
+	// s3 starts as its wave's active lane count (the vertices it got) instead of 64, as the NGG
+	// vertex stage's ESVertCount already does.
+	bool ls_active_lanes = false;
 	// KYTY_WORKGROUP_IMAGES=1 (default off; the GT7 preset; adapted from upstream KytyPS5 0ee880090
 	// and c23de6218, nmzik): a compute image whose T# is read from a table at
 	// workgroup_id[axis] * stride + offset (GT7's CS 0xe042c5de1f18d724: two storage T#s per Z group

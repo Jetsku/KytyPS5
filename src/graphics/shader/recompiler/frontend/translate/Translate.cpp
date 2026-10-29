@@ -1418,7 +1418,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr), draw(2));
 			}
 		} else if (options.stage == ShaderType::Local) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			// KYTY_LS_ACTIVE_LANES (upstream 63207739b): s3 is the wave's vertex count, its active
+			// lanes; off: 64, as before.
+			if (GetCodegenOptions().ls_active_lanes) {
+				auto count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
+				if (options.wave_size == 64u) {
+					count = entry_ir.IAdd(
+					    count, IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_hi})));
+				}
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), count);
+			} else {
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			}
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
