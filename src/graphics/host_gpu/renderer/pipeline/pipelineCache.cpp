@@ -1478,6 +1478,39 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 	return true;
 }
 
+// Permutations whose specialization the program cannot take (IR::UnsupportedResourceSpecialization),
+// by source and specialization: skipped without translating again.
+struct UnsupportedPermutations {
+	static bool Contains(uint64_t key) {
+		auto&            state = Get();
+		std::scoped_lock lock(state.mutex);
+		return state.keys.contains(key);
+	}
+	static void Add(uint64_t key, const ShaderRecompiler::CompileOptions& options, const char* why) {
+		auto& state = Get();
+		{
+			std::scoped_lock lock(state.mutex);
+			if (state.keys.size() >= 65536u || !state.keys.insert(key).second) return;
+			if (state.logged.size() >= 256u || !state.logged.insert(options.shader_hash).second) return;
+		}
+		Log::WriteToConsoleAndLog(fmt::format("{} gave up hash=0x{:016x} for one specialization: {} (it is "
+		                                      "skipped with it)\n",
+		                                      options.dump_label != nullptr ? options.dump_label : "Shader",
+		                                      options.shader_hash, why));
+	}
+
+private:
+	struct State {
+		std::mutex                   mutex;
+		std::unordered_set<uint64_t> keys;
+		std::unordered_set<uint64_t> logged;
+	};
+	static State& Get() {
+		static State state;
+		return state;
+	}
+};
+
 // KYTY_SHADER_CALLS_ASYNC (default on): an expanded call program can be large (Miles Morales'
 // ray-tracing kernels: about 160K words) and its translation takes seconds, so it is translated on
 // a background thread and its dispatches are skipped until the translation is ready; the compile
@@ -4045,6 +4078,27 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		};
 
+		// A specialization the program cannot take (an enumerated material image read other than by a
+		// sample, IR::UnsupportedResourceSpecialization): that permutation is skipped, as a shader
+		// that gives up is, instead of ending the emulator; remembered so later draws skip it at once.
+		std::vector<uint8_t> unsupported_bytes;
+		ShaderRecompiler::IR::EncodeSpecialization(prep.specialization, unsupported_bytes);
+		const uint64_t unsupported_key =
+		    XXH3_64bits_withSeed(unsupported_bytes.data(), unsupported_bytes.size(),
+		                         reinterpret_cast<uintptr_t>(source) ^ (uint64_t {push_data_cursor} << 48u));
+		if (UnsupportedPermutations::Contains(unsupported_key)) {
+			lock.lock();
+			FinishInFlight(record);
+			return nullptr;
+		}
+		const auto unsupported_specialization = [&](const ShaderRecompiler::TranslateResult& from) -> bool {
+			const char* why =
+			    ShaderRecompiler::IR::UnsupportedResourceSpecialization(from.program, prep.specialization);
+			if (why == nullptr) return false;
+			UnsupportedPermutations::Add(unsupported_key, options, why);
+			return true;
+		};
+
 		// The permutation: stored, or emitted from a translation.
 		std::optional<Permutation>                         compiled;
 		std::optional<ProgramDiskCache::PermutationRecord> reloaded; // from_disk
@@ -4069,6 +4123,12 @@ struct PipelineCache::ProgramCache {
 				obtain_translation();
 				if (translated.skip_dispatch) {
 					return skip_after_all();
+				}
+				if (unsupported_specialization(translated)) {
+					translated_now = false;
+					lock.lock();
+					FinishInFlight(record);
+					return nullptr;
 				}
 				auto fresh = EmitPermutation(params, options, std::move(translated),
 				                             prep.specialization, push_data_cursor,
@@ -4122,6 +4182,11 @@ struct PipelineCache::ProgramCache {
 			}
 			if (translated.skip_dispatch) {
 				return skip_after_all();
+			}
+			if (unsupported_specialization(translated)) {
+				lock.lock();
+				FinishInFlight(record);
+				return nullptr;
 			}
 			auto emitted = EmitPermutation(params, options, std::move(translated),
 			                               prep.specialization, push_data_cursor, key.static_state,

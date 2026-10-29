@@ -1976,6 +1976,36 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	                            specialization);
 }
 
+const char* UnsupportedResourceSpecialization(const Program&                program,
+                                              const ResourceSpecialization& specialization) {
+	// ApplyResourceSpecialization's check, before it changes anything (adapted from
+	// usa-ratt/KytyPS5-GT7 c3d3e76e8 / b70de4ef9): enumerated candidates only sample, or are
+	// stored to (KYTY_WORKGROUP_IMAGES). A load or query through an enumerated material table
+	// ended the emulator in GT7's cafe; only that specialization is skipped instead.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (ImageOpcodeInfoOf(op).access == ImageAccess::None || op == ValueOpcode::ImageSampleRaw ||
+			    op == ValueOpcode::ImageWrite) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto resource = program.memory_info[index].resource;
+			if (resource >= specialization.images.size()) {
+				continue;
+			}
+			const auto& image = specialization.images[resource];
+			if (!image.fmask && !image.bindless && image.indirect_root == resource) {
+				return "an image of an enumerated material table is read other than by a sample";
+			}
+		}
+	}
+	return nullptr;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);

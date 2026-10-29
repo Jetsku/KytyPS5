@@ -92,6 +92,10 @@ void SetEqaaFmaskMapForTesting(bool enabled);
 // V#s specialized as null by that rule so far.
 [[nodiscard]] uint64_t UnmappedBufferNulls();
 
+// Why ApplyResourceSpecialization cannot apply this specialization to the program (it would stop
+// the emulator), or null: the permutation is skipped instead.
+[[nodiscard]] const char* UnsupportedResourceSpecialization(const Program&                program,
+                                                            const ResourceSpecialization& specialization);
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
