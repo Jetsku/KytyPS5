@@ -66,6 +66,8 @@ CodegenOptions FromEnvironment() {
 	options.indirect_coherent = EnvFlag("KYTY_INDIRECT_COHERENT", options.indirect_coherent);
 	options.buffer_pair_atomic =
 	    EnvFlag("KYTY_BUFFER_PAIR_ATOMIC", options.buffer_pair_atomic);
+	options.indirect_format_compact =
+	    EnvFlag("KYTY_INDIRECT_FORMAT_COMPACT", options.indirect_format_compact);
 	options.indirect_format_inline =
 	    EnvFlag("KYTY_INDIRECT_FORMAT_INLINE", options.indirect_format_inline);
 	if (const char* fast = std::getenv("KYTY_INDIRECT_FORMAT_FAST"); fast != nullptr) {

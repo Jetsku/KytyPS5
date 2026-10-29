@@ -258,6 +258,221 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
   return test;
 }
 
+// BUFFER_LOAD_FORMAT_XYZW through V#s the shader selects at runtime (the module's formatted-load
+// decoder: the per-format switch, or KYTY_INDIRECT_FORMAT_COMPACT's table-driven one). Every
+// format the decoder decodes, with its destination selects, element alignment (8/16-bit
+// formats at odd / 2-byte offsets), out-of-range elements (0, but a select of 1 still reads one),
+// formats it does not decode (0) and an element across a 16 KiB page-table page.
+TestCase FormattedLoadsThroughGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000130000000ull;
+  enum Kind : u32 { Uint, Sint, Unorm, Snorm, Float };
+  struct FormatDef {
+    u32 format;
+    Kind kind;
+    std::array<u32, 4> widths;
+  };
+  // The formats the decoder decodes (IndirectFormatDecoded), with their component widths.
+  const FormatDef formats[] = {
+      {1, Unorm, {8}}, {2, Snorm, {8}}, {5, Uint, {8}}, {6, Sint, {8}},
+      {7, Unorm, {16}}, {8, Snorm, {16}}, {11, Uint, {16}}, {12, Sint, {16}}, {13, Float, {16}},
+      {14, Unorm, {8, 8}}, {15, Snorm, {8, 8}}, {18, Uint, {8, 8}}, {19, Sint, {8, 8}},
+      {20, Uint, {32}}, {21, Sint, {32}}, {22, Float, {32}},
+      {23, Unorm, {16, 16}}, {24, Snorm, {16, 16}}, {27, Uint, {16, 16}}, {28, Sint, {16, 16}},
+      {29, Float, {16, 16}}, {36, Float, {11, 11, 10}}, {43, Float, {10, 11, 11}},
+      {44, Unorm, {2, 10, 10, 10}}, {45, Snorm, {2, 10, 10, 10}},
+      {50, Unorm, {10, 10, 10, 2}}, {51, Snorm, {10, 10, 10, 2}},
+      {56, Unorm, {8, 8, 8, 8}}, {57, Snorm, {8, 8, 8, 8}}, {60, Uint, {8, 8, 8, 8}},
+      {61, Sint, {8, 8, 8, 8}}, {62, Uint, {32, 32}}, {63, Sint, {32, 32}}, {64, Float, {32, 32}},
+      {65, Unorm, {16, 16, 16, 16}}, {66, Snorm, {16, 16, 16, 16}}, {69, Uint, {16, 16, 16, 16}},
+      {70, Sint, {16, 16, 16, 16}}, {71, Float, {16, 16, 16, 16}},
+      {72, Uint, {32, 32, 32}}, {73, Sint, {32, 32, 32}}, {74, Float, {32, 32, 32}},
+      {75, Uint, {32, 32, 32, 32}}, {76, Sint, {32, 32, 32, 32}}, {77, Float, {32, 32, 32, 32}},
+  };
+  struct LoadCase {
+    u32 def;          // index into formats, or UINT32_MAX: undecoded `format`
+    u32 format;       // for undecoded cases
+    u32 dst_sel;      // 12 bits
+    u32 offset;       // byte offset of the access in the case's data block
+    u32 records;      // OOB_SELECT 3 bound in bytes
+    u32 data_offset;  // the data block's byte offset in the buffer (0: default slot)
+  };
+  constexpr u32 Xyzw = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u);
+  std::vector<LoadCase> cases;
+  for (u32 n = 0; n < std::size(formats); ++n) {
+    u32 bits = 0;
+    for (const auto w : formats[n].widths) bits += w;
+    const u32 bytes = bits / 8u;
+    cases.push_back({n, 0, Xyzw, bytes >= 4u ? 8u : bytes == 2u ? 6u : 5u, 64, 0});
+  }
+  const auto def_of = [&](u32 format) {
+    for (u32 n = 0; n < std::size(formats); ++n) {
+      if (formats[n].format == format) return n;
+    }
+    return UINT32_MAX;
+  };
+  // Destination selects: one/zero/wrapping past the format's components.
+  cases.push_back({def_of(22), 0, 1u | (0u << 3u) | (7u << 6u) | (4u << 9u), 4, 64, 0});
+  cases.push_back({def_of(64), 0, 5u | (4u << 3u) | (1u << 6u) | (6u << 9u), 8, 64, 0});
+  cases.push_back({def_of(56), 0, 7u | (6u << 3u) | (5u << 6u) | (1u << 9u), 12, 64, 0});
+  cases.push_back({def_of(36), 0, 6u | (1u << 3u) | (4u << 6u) | (7u << 9u), 0, 64, 0});
+  // Unaligned access: 8-bit at byte 7, 16-bit at byte 3 (element aligned down to 2).
+  cases.push_back({def_of(1), 0, Xyzw, 7, 64, 0});
+  cases.push_back({def_of(11), 0, Xyzw, 3, 64, 0});
+  cases.push_back({def_of(14), 0, Xyzw, 9, 64, 0});
+  // Out of range (offset + element size > records): zeros, a select of 1 reads one.
+  cases.push_back({def_of(71), 0, 1u | (5u << 3u) | (6u << 6u) | (7u << 9u), 8, 15, 0});
+  cases.push_back({def_of(20), 0, 4u | (1u << 3u) | (0u << 6u) | (1u << 9u), 8, 11, 0});
+  // Formats the decoder does not decode: 0 (invalid), 3 (8 uscaled), 30 (11_11_10 unorm).
+  cases.push_back({UINT32_MAX, 0, 1u | (4u << 3u) | (5u << 6u) | (6u << 9u), 0, 64, 0});
+  cases.push_back({UINT32_MAX, 3, Xyzw, 0, 64, 0});
+  cases.push_back({UINT32_MAX, 30, 1u | (4u << 3u) | (5u << 6u) | (6u << 9u), 0, 64, 0});
+  // A 16-byte element across the 16 KiB page-table page at buffer byte 16384.
+  cases.push_back({def_of(77), 0, Xyzw, 8, 64, 16384 - 16});
+  const u32 Count = static_cast<u32>(cases.size());
+  const auto byte_at = [](u32 i, u32 b) {
+    return static_cast<uint8_t>(0x37u + i * 29u + b * 11u + (b * b) / 3u);
+  };
+  TestCase test;
+  test.name = "FormattedLoadsThroughGpuSelectedDescriptors";
+  test.initial.resize(16384 / 4 + 64);
+  std::vector<uint8_t> bytes(test.initial.size() * 4u, 0);
+  const auto data_of = [&](u32 i) { return cases[i].data_offset != 0 ? cases[i].data_offset : 8192u + i * 64u; };
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 data_offset = data_of(i);
+    for (u32 b = 0; b < 64; ++b) bytes[data_offset + b] = byte_at(i, b);
+    if (cases[i].def == UINT32_MAX) continue;
+    const auto &def = formats[cases[i].def];
+    u32 total = 0;
+    for (const auto w : def.widths) total += w;
+    const u32 size = total / 8u;
+    const u32 element = cases[i].offset & ~(std::min(4u, size) - 1u);
+    if (def.kind != Float) continue;
+    // Finite float components (random bits would hold NaNs).
+    u32 bit = 0;
+    for (u32 c = 0; c < 4 && def.widths[c] != 0; ++c) {
+      const u32 w = def.widths[c];
+      uint64_t value = 0;
+      if (w == 32) value = std::bit_cast<u32>(-1.25f * static_cast<float>(c + 1) + 0.0625f * i);
+      if (w == 16) value = 0x3800u + c * 0x0123u + i * 3u;       // 0.5 .. ~2
+      if (w == 11) value = ((13u + c) << 6u) | ((c * 9u + i) & 63u);
+      if (w == 10) value = ((14u + c) << 5u) | ((c * 7u + i) & 31u);
+      for (u32 k = 0; k < w; ++k) {
+        const u32 at = element * 8u + bit + k;
+        auto &byte = bytes[data_offset + at / 8u];
+        byte = static_cast<uint8_t>((byte & ~(1u << (at % 8u))) | (((value >> k) & 1u) << (at % 8u)));
+      }
+      bit += w;
+    }
+  }
+  const auto half_to_float = [](u32 h) {
+    const u32 sign = (h >> 15u) & 1u, e = (h >> 10u) & 31u, m = h & 1023u;
+    float value = e == 0 ? std::ldexp(static_cast<float>(m), -24)
+                         : std::ldexp(1.0f + static_cast<float>(m) / 1024.0f, static_cast<int>(e) - 15);
+    return sign != 0 ? -value : value;
+  };
+  const auto ufloat_to_float = [](u32 raw, u32 mantissa_bits) {
+    const u32 e = raw >> mantissa_bits, m = raw & ((1u << mantissa_bits) - 1u);
+    return e == 0 ? std::ldexp(static_cast<float>(m), 1 - 15 - static_cast<int>(mantissa_bits))
+                  : std::ldexp(1.0f + static_cast<float>(m) / static_cast<float>(1u << mantissa_bits),
+                               static_cast<int>(e) - 15);
+  };
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 data_offset = data_of(i);
+    const auto &input = cases[i];
+    const uint64_t base = GuestBase + data_offset;
+    const u32 format = input.def != UINT32_MAX ? formats[input.def].format : input.format;
+    const std::array<u32, 4> descriptor{static_cast<u32>(base), static_cast<u32>(base >> 32u),
+                                        input.records, (3u << 28u) | (format << 12u) | input.dst_sel};
+    for (u32 k = 0; k < 4; ++k) {
+      for (u32 b = 0; b < 4; ++b) bytes[4096 + i * 16 + k * 4 + b] = static_cast<uint8_t>(descriptor[k] >> (8u * b));
+    }
+  }
+  for (u32 w = 0; w < test.initial.size(); ++w) {
+    test.initial[w] = bytes[w * 4] | (bytes[w * 4 + 1] << 8u) | (bytes[w * 4 + 2] << 16u) |
+                      (static_cast<u32>(bytes[w * 4 + 3]) << 24u);
+  }
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 selected = Count - 1 - i;
+    const auto &input = cases[selected];
+    test.initial[512 + i] = selected;
+    AppendVMovU32(&test.code, 30, (512 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0))); // v_readfirstlane_b32 s20, v0
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 16
+    test.code.push_back(16);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0)); // s_buffer_load_dwordx4 s[8:11], s[0:3]
+    test.code.push_back(EncodeSmem1(4096, 20));
+    AppendSMovLiteral(&test.code, 22, 0);
+    AppendVMovU32(&test.code, 2, input.offset);
+    test.code.push_back(EncodeMubuf0(0x03, 0, false, true)); // buffer_load_format_xyzw
+    test.code.push_back(EncodeMubuf1(4, 2, 2, 22));          // v[4:7], s[8:11], v2, s22
+    for (u32 c = 0; c < 4; ++c) AppendStoreVgpr(&test.code, 4 + c, i * 4 + c);
+    // Reference decode.
+    std::array<u32, 4> channels{};
+    std::array<uint8_t, 4> is_float{};
+    if (input.def != UINT32_MAX) {
+      const auto &def = formats[input.def];
+      u32 count = 0, total = 0;
+      for (const auto w : def.widths) {
+        count += w != 0 ? 1u : 0u;
+        total += w;
+      }
+      const u32 size = total / 8u;
+      const u32 element = input.offset & ~(std::min(4u, size) - 1u);
+      const bool in = input.offset + size <= input.records;
+      const u32 data_offset = data_of(selected);
+      std::array<u32, 4> components{};
+      u32 bit = 0;
+      for (u32 c = 0; c < count; ++c) {
+        const u32 w = def.widths[c];
+        uint64_t raw = 0;
+        for (u32 k = 0; k < w && in; ++k) {
+          const u32 at = element * 8u + bit + k;
+          raw |= static_cast<uint64_t>((bytes[data_offset + at / 8u] >> (at % 8u)) & 1u) << k;
+        }
+        bit += w;
+        const int64_t signed_raw = w == 32 ? static_cast<int32_t>(raw)
+                                           : (raw & (1ull << (w - 1))) ? static_cast<int64_t>(raw) - (1ll << w)
+                                                                       : static_cast<int64_t>(raw);
+        switch (def.kind) {
+          case Uint: components[c] = static_cast<u32>(raw); break;
+          case Sint: components[c] = static_cast<u32>(static_cast<int32_t>(signed_raw)); break;
+          case Unorm:
+            components[c] = std::bit_cast<u32>(static_cast<float>(raw) / static_cast<float>((1u << w) - 1u));
+            break;
+          case Snorm:
+            components[c] = std::bit_cast<u32>(std::max(
+                static_cast<float>(signed_raw) / static_cast<float>((1u << (w - 1u)) - 1u), -1.0f));
+            break;
+          case Float:
+            components[c] = w == 32 ? static_cast<u32>(raw)
+                            : w == 16 ? std::bit_cast<u32>(half_to_float(static_cast<u32>(raw)))
+                                      : std::bit_cast<u32>(ufloat_to_float(static_cast<u32>(raw), w == 11 ? 6u : 5u));
+            break;
+        }
+      }
+      const u32 one = def.kind == Uint || def.kind == Sint ? 1u : 0x3f800000u;
+      for (u32 channel = 0; channel < 4; ++channel) {
+        const u32 sel = (input.dst_sel >> (3u * channel)) & 7u;
+        channels[channel] = sel >= 4 ? components[(sel - 4u) % count] : sel == 1 ? one : 0u;
+        is_float[channel] = (def.kind == Unorm || def.kind == Snorm) && sel >= 4 ? 1u : 0u;
+      }
+    }
+    for (u32 channel = 0; channel < 4; ++channel) {
+      test.expected.push_back(channels[channel]);
+      test.float_words.push_back(is_float[channel]);
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
 // Without KYTY_SRT_VARIANT_READS the loop-carried record reads above stay flat SRT slots, and no
 // evaluation before the dispatch can produce their addresses. FindVariantFlatRead names one of
 // them, which is how the pipeline cache tells such a plan (skipped with one log line) from any
@@ -937,6 +1152,17 @@ void RunAll(VulkanHarness *vulkan) {
     RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
     RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
     RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
+    RunCase(vulkan, FormattedLoadsThroughGpuSelectedDescriptors());
+    {
+      // KYTY_INDIRECT_FORMAT_COMPACT: the table-driven decoder gives the same channels.
+      auto compact = skipping;
+      compact.indirect_format_compact = true;
+      ScopedCodegenOptions compact_scope(compact);
+      auto test = FormattedLoadsThroughGpuSelectedDescriptors();
+      test.name = "FormattedLoadsCompactDecoder";
+      test.required_spirv.push_back("indirect_formatted_load_compact");
+      RunCase(vulkan, test);
+    }
     CallIsSkipped();
     CallTargetsFromUserData();
     CallTablesTraced();

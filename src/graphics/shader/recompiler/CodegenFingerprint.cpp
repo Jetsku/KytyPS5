@@ -133,6 +133,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 			b.Text(hashes);
 		}
 	}
+	if (options.indirect_format_compact) {
+		b.Text("indirect_format_compact");
+	}
 	if (options.indirect_format_inline) {
 		b.Text("indirect_format_inline");
 	}

@@ -258,6 +258,14 @@ struct CodegenOptions {
 	// (spirvEmitterMemory.cpp IndirectFormatFastSet). Keeps KYTY_INDIRECT_FORMAT_INLINE's crash fix
 	// without inlining the whole format switch into every RT kernel (driver memory).
 	bool indirect_format_fast = false;
+	// KYTY_INDIRECT_FORMAT_COMPACT=1 (default 0): the formatted loads through a computed V# call one
+	// small inlinable decoder for every format instead of the per-format switch (FAST / INLINE /
+	// DontInline). The format selects a packed descriptor (component widths, numeric kind, count)
+	// from a constant table; the element is read as up to four dwords with two page-table lookups
+	// and every component is extracted and converted generically. Same results as the switch; no
+	// DontInline function (device loss in huge RT kernels) and a small inlined copy per call site
+	// (driver compile memory). Takes precedence over KYTY_INDIRECT_FORMAT_FAST / _INLINE.
+	bool indirect_format_compact = false;
 	// KYTY_INDIRECT_FORMAT_INLINE_HASHES=<hex>[,<hex>...] (default unset): with
 	// KYTY_INDIRECT_FORMAT_FAST, these programs inline the full decoder (as
 	// KYTY_INDIRECT_FORMAT_INLINE does for all), the others keep the fast + DontInline pair.

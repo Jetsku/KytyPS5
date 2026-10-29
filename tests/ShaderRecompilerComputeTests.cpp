@@ -1910,6 +1910,8 @@ struct TestCase {
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
+  // Per readback word (when not empty): 1 = compare as a float within a relative 1e-6, 0 = exact.
+  std::vector<uint8_t> float_words;
   std::vector<u32> gds_initial;
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
@@ -33415,6 +33417,20 @@ void CompareWords(const TestCase &test, const char *stage,
                   const std::vector<u32> &actual) {
   if (actual == expected) {
     return;
+  }
+  if (!test.float_words.empty() && &expected == &test.expected && actual.size() == expected.size()) {
+    bool close = true;
+    for (size_t i = 0; close && i < expected.size(); i++) {
+      if (expected[i] == actual[i]) continue;
+      if (i >= test.float_words.size() || test.float_words[i] == 0u) {
+        close = false;
+        continue;
+      }
+      const float e = std::bit_cast<float>(expected[i]);
+      const float a = std::bit_cast<float>(actual[i]);
+      close = std::abs(e - a) <= 1e-6f * std::max(1.0f, std::abs(e));
+    }
+    if (close) return;
   }
   if (test.expected_float_tolerance > 0.0f &&
       std::equal(expected.begin(), expected.end(), actual.begin(), actual.end(),
