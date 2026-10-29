@@ -197,6 +197,9 @@ void PlaceCurrentThread(ThreadRole role);
 // after the first call; the thread is forgotten when it exits. Never call it from a thread that
 // may run hot work (the CP, guest threads, draw-prep workers).
 void PlaceCurrentThreadCold();
+// The calling thread runs below normal priority (background compile workers: more of them then
+// cost the game threads nothing they need). Windows only; a no-op elsewhere.
+void LowerCurrentThreadPriority();
 // A guest thread (guest pthreads, the guest main thread): with the V-cache placement and
 // KYTY_VCACHE_GUEST=all (default) it runs on every allowed processor outside the reserved cores,
 // otherwise on the process default. Idempotent per thread; forgotten when the thread exits.

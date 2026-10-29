@@ -1720,6 +1720,16 @@ private:
 // KYTY_ASYNC_TRANSLATION_THREADS=<n> (default 2, 1..8, startup): the worker count.
 static Live::Switch g_async_translation("KYTY_ASYNC_TRANSLATION", Live::ParseDefaultOff); // live
 
+// KYTY_PIPELINE_SKIP_ORDER=1 (default off, startup): see the skip builder in the PipelineCache
+// constructor; the translation workers take the newest job first as well.
+static bool SkipOrderEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_SKIP_ORDER");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
 // Set by GetGraphicsPrograms around one draw's program lookups: whether its new VS/PS translations
 // may go to the workers (the draw is skipped until they are ready).
 thread_local bool t_defer_translation = false;
@@ -1872,14 +1882,21 @@ private:
 	}
 
 	void Run() {
+		if (SkipOrderEnabled()) Common::LowerCurrentThreadPriority();
 		for (;;) {
 			std::unique_ptr<Job> job;
 			{
 				std::unique_lock lock(m_mutex);
 				m_wake.wait(lock, [&] { return m_stop || !m_jobs.empty(); });
 				if (m_stop) return;
-				job = std::move(m_jobs.front());
-				m_jobs.pop_front();
+				// KYTY_PIPELINE_SKIP_ORDER: newest first, the scene on screen before the backlog.
+				if (SkipOrderEnabled()) {
+					job = std::move(m_jobs.back());
+					m_jobs.pop_back();
+				} else {
+					job = std::move(m_jobs.front());
+					m_jobs.pop_front();
+				}
 			}
 			auto result = ShaderRecompiler::TranslateProgram(job->code, job->options);
 			std::scoped_lock lock(m_mutex);
@@ -5586,10 +5603,20 @@ struct PipelineCache::PrefetchState {
 	// and the prefetch pool: with prefetch on nearly every pipeline is built here, and without the
 	// key the journal stayed empty, so a cold start replayed nothing). drop_on_stop: Stop drops the
 	// queued builds no draw waits for (the skip builder).
+	// ordering (KYTY_PIPELINE_SKIP_ORDER, the skip builder): the worker order of
+	// PipelineCompileQueue::Ordering, at below normal priority.
 	explicit PrefetchState(PipelineCache& owner, size_t threads, size_t limit = 128, bool keyed_builds = false,
-	                       const char* name = "Pipeline prefetch", bool drop_queued_on_stop = false)
+	                       const char* name = "Pipeline prefetch", bool drop_queued_on_stop = false,
+	                       PipelineCompileQueue::Ordering ordering = {})
 	    : cache(owner), max_pending(limit), keyed(keyed_builds), drop_on_stop(drop_queued_on_stop), log_name(name),
-	      queue(threads, limit, Common::PlaceCurrentThreadCold) {}
+	      ordered(ordering.recent_first),
+	      queue(threads, limit,
+	            ordering.recent_first ? std::function<void()>([] {
+		            Common::PlaceCurrentThreadCold();
+		            Common::LowerCurrentThreadPriority();
+	            })
+	                                  : std::function<void()>(Common::PlaceCurrentThreadCold),
+	            ordering) {}
 	~PrefetchState() {
 		Stop();
 		for (auto& [key, job]: pending) {
@@ -5692,6 +5719,12 @@ struct PipelineCache::PrefetchState {
 		}
 		queue.Promote(ticket);
 		const auto begin = CompileClockNs();
+		// KYTY_PIPELINE_SKIP_ORDER (GT7 fork round 145): once the CP has waited 100 ms, every worker
+		// helps with the queue while it waits (the game is stopped; the next pipelines a draw that
+		// may not be skipped waits for are then done or under way).
+		while (ordered && future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+			queue.NoteStall();
+		}
 		auto result = future.get(); // Always wait: writes, depth and color draws all execute.
 		const auto elapsed = CompileClockNs() - begin;
 		used.fetch_add(1, std::memory_order_relaxed);
@@ -5742,6 +5775,7 @@ struct PipelineCache::PrefetchState {
 	const bool keyed;
 	const bool drop_on_stop;
 	const char* const log_name;
+	const bool ordered; // KYTY_PIPELINE_SKIP_ORDER
 	std::mutex mutex;
 	bool stopped = false;
 	uint64_t next_ticket = 0;
@@ -7147,11 +7181,28 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_skip_wait_ns     = std::min<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_WAIT_US", 2000), 1000000) * 1000ull;
 		m_skip_frame_budget_ns =
 		    std::min<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_FRAME_BUDGET_US", 0), 1000000) * 1000ull;
-		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip", true);
+		// KYTY_PIPELINE_SKIP_ORDER=1 (default off; adapted from usa-ratt/KytyPS5-GT7 rounds 141 and 145,
+		// 3adca0037 / bf5ffc229): the builders take the pipeline a draw asked for most recently first
+		// (worker 0 the oldest, so none starves: a car seen for a moment left its builds behind each
+		// new frame's), builds no draw asked for in the last 2 s run on the first
+		// KYTY_PIPELINE_SKIP_BACKGROUND_THREADS builders only (default 2), and all at below normal
+		// priority. Once a draw that may not be skipped has waited 100 ms for a build, every builder
+		// takes any build for the next 500 ms (a GT7 race start waited for 51 pipelines in a row with
+		// 13 of 16 workers idle). New VS/PS translations (KYTY_ASYNC_TRANSLATION) go newest first too.
+		PipelineCompileQueue::Ordering ordering;
+		ordering.recent_first = SkipOrderEnabled();
+		ordering.background_workers =
+		    static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_BACKGROUND_THREADS", 2), 1, 16));
+		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip", true, ordering);
 		PipelineCacheLog("Pipeline skip: {} background builders; draws that only change the picture wait "
 		                 "{} us for a new pipeline, then are skipped until it is built "
-		                 "(KYTY_PIPELINE_SKIP_THREADS, KYTY_PIPELINE_SKIP_WAIT_US)",
-		                 threads, m_skip_wait_ns / 1000);
+		                 "(KYTY_PIPELINE_SKIP_THREADS, KYTY_PIPELINE_SKIP_WAIT_US){}",
+		                 threads, m_skip_wait_ns / 1000,
+		                 ordering.recent_first
+		                     ? fmt::format("; most recently asked first, {} builders take older builds "
+		                                   "(KYTY_PIPELINE_SKIP_ORDER)",
+		                                   ordering.background_workers)
+		                     : std::string());
 	}
 	if (EnvU64("KYTY_PIPELINE_STATS", 0) != 0) m_stats_reporter = std::make_unique<StatsReporter>(*this);
 	if (EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0 && !PipelineCacheTitleId().empty()) RunListPrepare();
