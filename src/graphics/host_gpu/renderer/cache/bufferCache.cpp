@@ -2417,9 +2417,41 @@ bool BufferCache::StoreInPlace(uint64_t vaddr, const void* data, uint64_t size, 
 	return true;
 }
 
+bool BufferCache::TryLiftFaultPages(uint64_t page_begin, uint64_t page_end) {
+	const auto bytes = page_end - page_begin;
+	// Still GPU-written for the tracker, but no byte left to download or to wait for.
+	if (!m_memory_tracker.IsRegionGpuModified(page_begin, bytes) ||
+	    HasGpuDirtyBytes(page_begin, bytes) || HasPendingBackingPublication(page_begin, bytes) ||
+	    OverlapsPendingSideReadback(page_begin, page_end) ||
+	    m_texture_cache.IsRegionGpuModified(page_begin, bytes)) {
+		return false;
+	}
+	// An address-writing shader still running may write bytes of these pages nobody tracks yet.
+	if (m_unbounded_write_tick != 0 && !m_scheduler.IsFree(m_unbounded_write_tick)) {
+		return false;
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, bytes);
+	static std::atomic<uint64_t> lifted {0};
+	if (const auto n = lifted.fetch_add(1, std::memory_order_relaxed) + 1;
+	    (n & (n - 1)) == 0 && n >= 64) {
+		LOGF("ReadMemory: lifted the protection of %" PRIu64 " faulting page ranges without GPU-"
+		     "written bytes, no download (KYTY_FAULT_PAGE_LIFT)\n",
+		     n);
+	}
+	return true;
+}
+
 bool BufferCache::FaultPagesCurrent(uint64_t page_begin, uint64_t page_end) {
+	// KYTY_FAULT_PAGE_LIFT (default 0; 1 on, read once): see TryLiftFaultPages.
+	static const bool lift    = ParseEnvU64("KYTY_FAULT_PAGE_LIFT", 0) != 0;
 	static const bool enabled = ParseEnvU64("KYTY_CLEAN_PAGE", 0) != 0;
-	if (!enabled || page_end <= page_begin) {
+	if (page_end <= page_begin) {
+		return false;
+	}
+	if (lift && TryLiftFaultPages(page_begin, page_end)) {
+		return true;
+	}
+	if (!enabled) {
 		return false;
 	}
 	const auto bytes = page_end - page_begin;

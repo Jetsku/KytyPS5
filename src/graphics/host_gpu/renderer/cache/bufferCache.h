@@ -684,7 +684,15 @@ private:
 	// image: another thread's read made them current between the fault and now. The access then
 	// needs nothing (a write only its CPU-dirty transition), instead of a download of the window's
 	// other GPU-written ranges that it waits for. False when the switch is off.
+	// With KYTY_FAULT_PAGE_LIFT=1 also true when TryLiftFaultPages lifted the pages.
 	[[nodiscard]] bool FaultPagesCurrent(uint64_t page_begin, uint64_t page_end);
+	// KYTY_FAULT_PAGE_LIFT=1 (default off; adapted from usa-ratt/KytyPS5-GT7 6f3465806), GPU
+	// thread: the faulting pages are still protected as GPU-written but hold no GPU-written bytes,
+	// no bytes of a readback or publication still to land, no GPU-written image, and no address-
+	// writing shader is still running. Their protection is lifted (UnmarkRegionAsGpuModified)
+	// without a download, and true is returned. Without it the fault copies the window's other
+	// GPU-written ranges and waits for their writer.
+	[[nodiscard]] bool TryLiftFaultPages(uint64_t page_begin, uint64_t page_end);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
