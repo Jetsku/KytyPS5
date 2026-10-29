@@ -351,6 +351,13 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0xffu &&
 					     lhs.kind == Kind::PackedControlPoint))
 						value = constant(0u);
+					// Upstream 77458260f: bits 8-12 are the control point id, shifted by 8 (the
+					// indexed path's mask() already reads it).
+					if ((lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant == 0x1f00u &&
+					     rhs.kind == Kind::PackedControlPoint) ||
+					    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0x1f00u &&
+					     lhs.kind == Kind::PackedControlPoint))
+						value = {Kind::Affine, 0x100u, 0u};
 					break;
 				case Opcode::V_MOV_B32: value = lhs; break;
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
