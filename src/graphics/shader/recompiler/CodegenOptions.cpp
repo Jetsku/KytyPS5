@@ -82,6 +82,11 @@ CodegenOptions FromEnvironment() {
 	options.bindless_samplers = EnvFlag("KYTY_BINDLESS_SAMPLERS", options.bindless_samplers);
 	options.workgroup_images = EnvFlag("KYTY_WORKGROUP_IMAGES", options.workgroup_images);
 	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
+	if (const auto* cap = std::getenv("KYTY_CALL_LOOP_CAP"); cap != nullptr && cap[0] != '\0') {
+		options.call_loop_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
+	}
+	options.call_loops           = EnvFlag("KYTY_CALL_LOOPS", options.call_loops);
+	options.call_waterfall_clear = EnvFlag("KYTY_CALL_WATERFALL_CLEAR", options.call_waterfall_clear);
 	options.storage_length_zero =
 	    EnvFlag("KYTY_STORAGE_LENGTH_ZERO", options.storage_length_zero);
 	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {

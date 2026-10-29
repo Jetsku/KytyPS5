@@ -59519,10 +59519,15 @@ int main(int argc, char **argv) {
     ParallelCompileTests::CheckParallelCompile();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--call-loop-codegen-only") == 0) {
+    GiProbeTests::CheckCallLoopCapCodegen();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gi-probe-codegen-only") == 0) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();
     GiProbeTests::CheckLoopGuardCodegen();
+    GiProbeTests::CheckCallLoopCapCodegen();
     GiProbeTests::CheckPixelHelperAtomicsCodegen();
     return 0;
   }
@@ -59530,6 +59535,7 @@ int main(int argc, char **argv) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();
     GiProbeTests::CheckLoopGuardCodegen();
+    GiProbeTests::CheckCallLoopCapCodegen();
     GiProbeTests::CheckPixelHelperAtomicsCodegen();
     VulkanHarness vulkan;
     GiProbeTests::CheckPixelAppendHelperElection(&vulkan);

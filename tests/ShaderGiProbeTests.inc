@@ -385,6 +385,113 @@ void CheckLoopGuardCodegen() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// CPU only: KYTY_CALL_LOOP_CAP, KYTY_CALL_LOOPS and KYTY_CALL_WATERFALL_CLEAR (adapted from
+// usa-ratt/KytyPS5-GT7 08197df0b / 7e695ec62 / 655faf07e). The expansion brackets a looping callee
+// body only with the cap, leaves it out with KYTY_CALL_LOOPS=0, and clears a waterfall's flag where
+// the call returns only with the clear; the translation counts the rounds of a bracketed loop only.
+void CheckCallLoopCapCodegen() {
+  constexpr const char *name = "CallLoopCapCodegen";
+  namespace Decoder = ShaderRecompiler::Decoder;
+  constexpr uint64_t FunctionAddress = 0x0000001000000000ull;
+  // A callee with a loop: s0 counts to 4, then returns through s[30:31].
+  const std::vector<u32> looping = {
+      EncodeSMovB32(0, InlineU32(0)),
+      EncodeSop2(0x00, 0, 0, InlineU32(1)), // s_add_u32 s0, s0, 1
+      EncodeSopc(0x0a, 0, InlineU32(4)),    // s_cmp_lt_u32 s0, 4
+      EncodeSopp(0x05, 0xfffdu),            // s_cbranch_scc1 back to the add
+      EncodeSop1(0x20, 0, 30),              // s_setpc_b64 s[30:31]
+  };
+  const std::vector<u32> plain = {EncodeSop1(0x20, 0, 30)};
+  const auto reader = [](const std::vector<u32> &function) {
+    return Decoder::ShaderCodeReader([&function](uint64_t address, std::span<u32> values) {
+      if (address < FunctionAddress) return false;
+      const auto index = (address - FunctionAddress) / 4u;
+      if (index + values.size() > function.size()) return false;
+      std::copy_n(function.begin() + static_cast<std::ptrdiff_t>(index), values.size(), values.begin());
+      return true;
+    });
+  };
+  const auto expand = [&](const std::vector<u32> &program, const std::vector<u32> &function,
+                          Decoder::ShaderCallExpansion &expansion) {
+    std::vector<Decoder::ShaderCallSite> sites;
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(program, decoded, true);
+    for (const auto &inst : decoded.instructions) {
+      if (inst.family == Decoder::Family::SOP1 && Decoder::IsShaderCallWord(inst.raw[0])) {
+        sites.push_back({.pc = inst.pc, .source_reg = 4, .return_reg = 30, .addresses = {FunctionAddress}});
+      }
+    }
+    std::string reason;
+    Require(name, "expansion", Decoder::ExpandShaderCalls(program, 0x0000002000000000ull, sites, reader(function),
+                                                          64, expansion, reason),
+            "the expansion failed: " + reason);
+  };
+  const auto contains = [](const std::vector<u32> &code, u32 word) {
+    return std::ranges::find(code, word) != code.end();
+  };
+  const std::vector<u32> caller = {EncodeSop1(0x21, 30, 4), 0xbf810000u}; // s_swappc_b64; s_endpgm
+  for (const u32 cap : {0u, 64u}) {
+    auto options          = GetCodegenOptions();
+    options.call_loop_cap = cap;
+    ScopedCodegenOptions scoped(options);
+    Decoder::ShaderCallExpansion expansion;
+    expand(caller, looping, expansion);
+    const bool begin = contains(expansion.code, Decoder::ShaderCallLoopBodyBegin);
+    const bool end   = contains(expansion.code, Decoder::ShaderCallLoopBodyEnd);
+    Require(name, "bracket", expansion.inlined == 1u && begin == (cap != 0u) && end == (cap != 0u),
+            cap != 0u ? "a looping body was not bracketed with the cap" : "a body was bracketed without the cap");
+  }
+  {
+    auto options       = GetCodegenOptions();
+    options.call_loops = false;
+    ScopedCodegenOptions scoped(options);
+    Decoder::ShaderCallExpansion expansion;
+    expand(caller, looping, expansion);
+    Require(name, "KYTY_CALL_LOOPS=0", expansion.inlined == 0u && !expansion.dropped.empty(),
+            "a looping callee was placed with KYTY_CALL_LOOPS=0");
+  }
+  // A waterfall: v32 cleared, the call, exec restored, v32 tested, the loop repeated.
+  const std::vector<u32> waterfall = {
+      EncodeVop1(0x01, 32, InlineU32(0)),                    // v_mov_b32 v32, 0
+      EncodeSop1(0x21, 30, 4),                               // s_swappc_b64 s[30:31], s[4:5]
+      EncodeSop1(0x04, 126, 10),                             // s_mov_b64 exec, s[10:11]
+      0x7c000000u | (0xd5u << 17u) | (32u << 9u) | 128u,     // v_cmpx_ne_u32 0, v32
+      EncodeSopp(0x09, 0xfffbu),                             // s_cbranch_execnz to the clear
+      0xbf810000u,
+  };
+  for (const bool clear : {false, true}) {
+    auto options                 = GetCodegenOptions();
+    options.call_waterfall_clear = clear;
+    ScopedCodegenOptions scoped(options);
+    Decoder::ShaderCallExpansion expansion;
+    expand(waterfall, plain, expansion);
+    const auto cleared = std::ranges::count(expansion.code, EncodeVop1(0x01, 32, InlineU32(0)));
+    Require(name, "waterfall", cleared == (clear ? 2 : 1),
+            clear ? "the waterfall flag was not cleared where the call returns"
+                  : "the waterfall flag was cleared without the switch");
+  }
+  // The translation: a loop between the markers counts its rounds; the same loop unbracketed does not.
+  for (const bool bracketed : {false, true}) {
+    auto test = MakeEndlessLoopCase();
+    if (bracketed) {
+      // The loop's exit (the S_CBRANCH_SCC1 target) is the instruction after the S_BRANCH: the end
+      // marker goes there, so it is reached; the relative branches keep their targets.
+      test.code.insert(test.code.begin() + 5, Decoder::ShaderCallLoopBodyEnd);
+      test.code.insert(test.code.begin(), Decoder::ShaderCallLoopBodyBegin);
+    }
+    test.opcodes.push_back(ShaderOpcode::S_NOP);
+    auto options          = GetCodegenOptions();
+    options.call_loop_cap = 64u;
+    ScopedCodegenOptions scoped(options);
+    const auto compiled = CompileCase(test, 32u);
+    ValidateSpirv(name, compiled.spirv);
+    const auto names = CodegenTests::CountSpirv(compiled.spirv, "OpName %call_loop_rounds");
+    Require(name, "SPIR-V", names == (bracketed ? 1u : 0u),
+            bracketed ? "a bracketed loop does not count its rounds" : "an unbracketed loop counts its rounds");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // CPU only: KYTY_PS_HELPER_ATOMICS_SKIP. A pixel shader's BUFFER_ATOMIC_INC is an emulated
 // read-modify-write (a compare-exchange loop); helper invocations skip it by default, which declares
 // gl_HelperInvocation, and with the switch off the shader is as before. (BUFFER_STORE_BYTE was the

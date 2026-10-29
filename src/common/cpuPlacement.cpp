@@ -1138,6 +1138,12 @@ void PlaceCurrentThreadCold() {
 #endif
 }
 
+void LowerCurrentThreadPriority() {
+#if defined(_WIN32)
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
 void PlaceCurrentThreadGuest() {
 #if defined(_WIN32)
 	thread_local ColdRegistration registration(true);

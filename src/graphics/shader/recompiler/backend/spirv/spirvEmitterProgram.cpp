@@ -239,6 +239,30 @@ bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
 	});
 }
 
+// KYTY_CALL_LOOP_CAP: the merge of a loop of a bracketed callee body (CFG::Terminator::call_loop).
+bool IsCallLoopMergeBlock(const IR::Program& program, uint32_t target) {
+	return std::ranges::any_of(program.block_info, [=](const IR::BlockInfo& info) {
+		return info.terminator.loop_header && info.terminator.call_loop && info.terminator.merge_block == target;
+	});
+}
+
+// True once the invocation has run more rounds of such loops than the cap.
+uint32_t CallLoopExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.call_loop_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, GetCodegenOptions().call_loop_cap));
+	return exhausted;
+}
+
+void SpendCallLoop(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.call_loop_variable);
+	state.builder.AddFunction(spv::OpStore, state.call_loop_variable,
+	                          EmitAddU32(state, count, ConstantU32(state, 1)));
+}
+
 // An exhausted invocation reports once, at return, by adding one to the last GDS dword.
 void EmitLoopGuardReport(EmitterState& state) {
 	if (state.loop_guard_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
@@ -323,6 +347,9 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			if (ctx.state.loop_guard_variable != 0) {
 				SpendLoopGuard(ctx.state);
 			}
+			if (ctx.state.call_loop_variable != 0 && term.call_loop) {
+				SpendCallLoop(ctx.state);
+			}
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
@@ -379,6 +406,25 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 						                              exhausted);
 						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced,
 						                              condition, alive);
+					}
+					condition = forced;
+				}
+			}
+			if (ctx.state.call_loop_variable != 0) {
+				// KYTY_CALL_LOOP_CAP: an exhausted invocation leaves the bracketed bodies' loops.
+				const bool true_exits  = IsCallLoopMergeBlock(program, term.true_block);
+				const bool false_exits = IsCallLoopMergeBlock(program, term.false_block);
+				if (true_exits != false_exits) {
+					const auto exhausted = CallLoopExhausted(ctx.state);
+					const auto forced    = ctx.state.builder.AllocateId();
+					if (true_exits) {
+						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced, condition,
+						                              exhausted);
+					} else {
+						const auto alive = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), alive, exhausted);
+						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced, condition,
+						                              alive);
 					}
 					condition = forced;
 				}
@@ -1524,6 +1570,12 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (GetCodegenOptions().call_loop_cap != 0u && !program.dispatcher_fallback &&
+	    std::ranges::any_of(program.block_info,
+	                        [](const IR::BlockInfo& info) { return info.terminator.call_loop; })) {
+		state.call_loop_variable = state.builder.AllocateId();
+		state.builder.AddName(state.call_loop_variable, "call_loop_rounds");
+	}
 	if (LoopGuardApplies(program.shader_hash) && !program.dispatcher_fallback) {
 		state.loop_guard_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_guard_variable, "loop_guard");
@@ -1667,6 +1719,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_guard_variable, spv::StorageClassFunction);
 	}
+	if (state.call_loop_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.call_loop_variable, spv::StorageClassFunction);
+	}
 	if (state.bvh_node_count_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
@@ -1707,6 +1764,9 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
+	}
+	if (state.call_loop_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.call_loop_variable, ConstantU32(state, 0));
 	}
 	EmitGeometryOutputDefaults(state);
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {

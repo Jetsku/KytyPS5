@@ -77,6 +77,13 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 bool ReadShaderFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader& read,
                         uint32_t wave_size, std::vector<uint32_t>& words, std::string& reason);
 
+// KYTY_CALL_LOOP_CAP (CodegenOptions::call_loop_cap): a placed body with a back edge and no barrier
+// starts with this S_NOP, and this one stands before its last return; the translation budgets the
+// loops whose headers lie between them. S_NOP immediates real code does not use (the wait count is
+// the low bits). After usa-ratt/KytyPS5-GT7 08197df0b.
+constexpr uint32_t ShaderCallLoopBodyBegin = 0xbf80c0deu;
+constexpr uint32_t ShaderCallLoopBodyEnd   = 0xbf80c0dfu;
+
 constexpr uint32_t MaxShaderFunctionWords = 16384;
 constexpr uint32_t MaxExpandedShaderWords = 1u << 20u;
 

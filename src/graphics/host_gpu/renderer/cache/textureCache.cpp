@@ -5145,6 +5145,74 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+// KYTY_VIEW_PLACEMENT=1 (default off; adapted from usa-ratt/KytyPS5-GT7 rounds 71 and 74,
+// 509d22411 / e0200a03a): a texture or target the overlap loop finds inside an older, larger image
+// is viewed from its own place in the image the loop ends with (where its memory starts there, or
+// the last overlap's place when that overlap placed the binding itself), plus its descriptor's own
+// first mip and layer (BASE_LEVEL / BASE_ARRAY, a target's SLICE_START). Without it the last
+// overlap's place is used, whichever image that overlap was given, and the binding's own first
+// layer is dropped: GT7's reflection faces read their light grids through T#s of one 48-layer
+// grid with BASE_ARRAY 0, 8, ... 40, and a face whose grid lay inside an older image read the
+// first face's layers or other data (light counts of 65535 a pixel). A binding with no place, or
+// one its view does not fit in, gets an image of its own (logged).
+bool TextureCache::ViewPlacementEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_VIEW_PLACEMENT");
+		const bool  set   = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		if (set) {
+			LOGF("TextureCache: bindings inside larger images keep their own place and first layer "
+			     "(KYTY_VIEW_PLACEMENT)\n");
+		}
+		return set;
+	}();
+	return on;
+}
+
+void TextureCache::PlaceBindingView(const ImageDesc& desc, ImageId& result, bool loop_own,
+                                    int32_t& view_mip, int32_t& view_layer) const {
+	const auto& found      = m_slot_images[result].info;
+	const auto  loop_mip   = view_mip;
+	const auto  loop_layer = view_layer;
+	view_mip               = -1;
+	view_layer             = -1;
+	if (found.data.address == desc.info.data.address) {
+		if (loop_own) {
+			view_mip   = loop_mip;
+			view_layer = loop_layer;
+		}
+		return;
+	}
+	if (const auto mip = desc.info.MipOf(found); mip >= 0) {
+		view_mip   = mip;
+		view_layer = desc.info.SliceOf(found, mip);
+	} else if (loop_own) {
+		view_mip   = loop_mip;
+		view_layer = loop_layer;
+	}
+	const bool fits = view_mip >= 0 && view_layer >= 0 &&
+	                  static_cast<uint64_t>(view_mip) + desc.view_info.base_level + desc.view_info.level_count <=
+	                      found.resources.levels &&
+	                  static_cast<uint64_t>(view_layer) + desc.view_info.base_layer + desc.view_info.layer_count <=
+	                      found.resources.layers;
+	if (fits) {
+		return;
+	}
+	static std::atomic<uint64_t> unplaced {0};
+	const auto                   count = unplaced.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 16u || (count & (count - 1u)) == 0u) {
+		LOGF("TextureCache: 0x%012" PRIx64 " (%ux%u, mips %u, layers %u, view mips %u+%u layers %u+%u) lies "
+		     "in 0x%012" PRIx64 " (%ux%u, mips %u, layers %u) at mip %d layer %d, where its view does not "
+		     "fit: given an image of its own (%" PRIu64 " so far, KYTY_VIEW_PLACEMENT)\n",
+		     desc.info.data.address, desc.info.extent.width, desc.info.extent.height, desc.info.resources.levels,
+		     desc.info.resources.layers, desc.view_info.base_level, desc.view_info.level_count,
+		     desc.view_info.base_layer, desc.view_info.layer_count, found.data.address, found.extent.width,
+		     found.extent.height, found.resources.levels, found.resources.layers, view_mip, view_layer, count);
+	}
+	view_mip   = -1;
+	view_layer = -1;
+	result     = {};
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup* record) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	if (record != nullptr) {
@@ -5216,16 +5284,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			}
 			constexpr size_t CrowdedOverlap = 24;
 			m_overlap_crowded = candidates.size() > CrowdedOverlap;
+			const bool placement  = ViewPlacementEnabled();
+			ImageId    placed_in  = {};
+			bool       placed_raw = false; // placed against the binding's own address
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
+				if (!placement) {
+					view_mip   = -1;
+					view_layer = -1;
+				}
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				const bool  direct      = merged_info.data.address == desc.info.data.address;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+					result = overlap.image;
+					if (!placement || overlap.mip >= 0 || overlap.layer >= 0) {
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
+					placed_in  = overlap.mip >= 0 || overlap.layer >= 0 ? overlap.image : ImageId {};
+					placed_raw = direct;
 				}
+			}
+			if (result && placement) {
+				PlaceBindingView(desc, result, placed_in == result && placed_raw, view_mip, view_layer);
 			}
 		}
 
@@ -5240,6 +5321,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 		}
 		if (!result) {
 			first_page_answer = false;
+			if (ViewPlacementEnabled()) {
+				// The binding gets an image of its own: no place in another one applies.
+				view_mip   = -1;
+				view_layer = -1;
+			}
 			// A prefix computed as not applicable (0) keeps the image fully resident; InsertImage
 			// computes it when this lookup did not.
 			result = InsertImage(desc.info,
@@ -5252,11 +5338,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			}
 		}
 		auto& image = m_slot_images[result];
+		// KYTY_VIEW_PLACEMENT: the binding's view starts at its place plus its own first mip and
+		// layer (the T#'s BASE_LEVEL and BASE_ARRAY, a target's SLICE_START) when they fit;
+		// otherwise (and without the switch) at its place alone.
+		const bool keep_own = ViewPlacementEnabled();
 		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+			auto level = static_cast<uint32_t>(view_mip);
+			if (keep_own && level + desc.view_info.base_level + desc.view_info.level_count <=
+			                    image.info.resources.levels) {
+				level += desc.view_info.base_level;
+			}
+			desc.view_info.base_level = level;
 		}
 		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+			auto layer = static_cast<uint32_t>(view_layer);
+			if (keep_own && layer + desc.view_info.base_layer + desc.view_info.layer_count <=
+			                    image.info.resources.layers) {
+				layer += desc.view_info.base_layer;
+			}
+			desc.view_info.base_layer = layer;
 		}
 		// Every level the (adjusted) view can sample must be resident: a finer MIN_LOD than
 		// before extends the image, any non-sampling binding makes the whole chain resident.

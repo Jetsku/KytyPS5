@@ -229,7 +229,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache,
-                            const GraphicsPipelineCreateHook*      create_hook) {
+                            const GraphicsPipelineCreateHook*      create_hook,
+                            vk::Result*                            result_out) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -723,16 +724,38 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
+	const auto destroy_tess_modules = [&] {
+		if (tess_control_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+		}
+		if (tess_eval_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+		}
+	};
+	if (result_out != nullptr) {
+		// The caller can do without this pipeline (KYTY_PIPELINE_SKIP_PROBE's driver-cache lookup):
+		// the result is returned, and what was created for a failed one given back.
+		*result_out = result;
+		if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+			if (result == vk::Result::eSuccess) {
+				*result_out = vk::Result::eErrorUnknown;
+			}
+			if (pipeline.pipeline != nullptr) {
+				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+				pipeline.pipeline = nullptr;
+			}
+			ReleasePipelineLayout(graphics, pipeline.pipeline_layout, pipeline.descriptor_set_layout);
+			pipeline.pipeline_layout       = nullptr;
+			pipeline.descriptor_set_layout = nullptr;
+			destroy_tess_modules();
+			return;
+		}
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
-	if (tess_control_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
-	}
-	if (tess_eval_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
-	}
+	destroy_tess_modules();
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

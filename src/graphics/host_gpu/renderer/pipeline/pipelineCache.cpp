@@ -1385,6 +1385,54 @@ static std::mutex g_call_bodies_mutex;
 static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>>>
     g_call_bodies;
 
+// KYTY_CALL_EXCLUDE_FAILED=1 (default off; adapted from usa-ratt/KytyPS5-GT7 c17e3ccdd): a function
+// expansion whose translation gives up inside a placed callee body leaves that callee out of every
+// later expansion on the compile path too (the background translation, KYTY_SHADER_CALLS_ASYNC,
+// always did), and such a refusal is neither stored in the program cache nor taken from it: a
+// stored one kept the expansion skipped in every later session, as nothing learned the callee.
+static bool CallExcludeFailedEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CALL_EXCLUDE_FAILED");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>> ExpansionBodies(
+    uint64_t call_expansion) {
+	if (call_expansion == 0) return nullptr;
+	std::scoped_lock lock(g_call_bodies_mutex);
+	const auto       found = g_call_bodies.find(call_expansion);
+	return found != g_call_bodies.end() ? found->second : nullptr;
+}
+
+// A function expansion with placed callee bodies (KYTY_CALL_EXCLUDE_FAILED).
+static bool ExpansionHasBodies(uint64_t call_expansion) {
+	if (!CallExcludeFailedEnabled()) return false;
+	const auto bodies = ExpansionBodies(call_expansion);
+	return bodies != nullptr && !bodies->empty();
+}
+
+// A refused translation of a function expansion: the callee whose body holds the failing pc is
+// dropped. True when the refusal belongs to such an expansion (it is not stored then).
+static bool ExcludeFailedCallee(uint64_t call_expansion, const ShaderRecompiler::TranslateResult& translated,
+                                const ShaderRecompiler::CompileOptions& options) {
+	if (!CallExcludeFailedEnabled()) return false;
+	const auto bodies = ExpansionBodies(call_expansion);
+	if (bodies == nullptr || bodies->empty()) return false;
+	if (translated.skip_pc != UINT32_MAX) {
+		for (const auto& body: *bodies) {
+			if (translated.skip_pc >= body.begin && translated.skip_pc < body.end) {
+				CallExpander().DropTarget(body.address,
+				                          fmt::format("{} at +0x{:x} in CS 0x{:016x}", translated.skip_reason,
+				                                      translated.skip_pc - body.begin, options.shader_hash));
+				break;
+			}
+		}
+	}
+	return true;
+}
+
 // KYTY_SHADER_CALLS_SPLIT: the split program a renderer step selected, and the run a kernel's
 // lookup produced (taken by the renderer).
 thread_local const ShaderRecompiler::CallSplit::Code*          t_split_code = nullptr;
@@ -1477,6 +1525,39 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 	}
 	return true;
 }
+
+// Permutations whose specialization the program cannot take (IR::UnsupportedResourceSpecialization),
+// by source and specialization: skipped without translating again.
+struct UnsupportedPermutations {
+	static bool Contains(uint64_t key) {
+		auto&            state = Get();
+		std::scoped_lock lock(state.mutex);
+		return state.keys.contains(key);
+	}
+	static void Add(uint64_t key, const ShaderRecompiler::CompileOptions& options, const char* why) {
+		auto& state = Get();
+		{
+			std::scoped_lock lock(state.mutex);
+			if (state.keys.size() >= 65536u || !state.keys.insert(key).second) return;
+			if (state.logged.size() >= 256u || !state.logged.insert(options.shader_hash).second) return;
+		}
+		Log::WriteToConsoleAndLog(fmt::format("{} gave up hash=0x{:016x} for one specialization: {} (it is "
+		                                      "skipped with it)\n",
+		                                      options.dump_label != nullptr ? options.dump_label : "Shader",
+		                                      options.shader_hash, why));
+	}
+
+private:
+	struct State {
+		std::mutex                   mutex;
+		std::unordered_set<uint64_t> keys;
+		std::unordered_set<uint64_t> logged;
+	};
+	static State& Get() {
+		static State state;
+		return state;
+	}
+};
 
 // KYTY_SHADER_CALLS_ASYNC (default on): an expanded call program can be large (Miles Morales'
 // ray-tracing kernels: about 160K words) and its translation takes seconds, so it is translated on
@@ -1639,6 +1720,16 @@ private:
 // KYTY_ASYNC_TRANSLATION_THREADS=<n> (default 2, 1..8, startup): the worker count.
 static Live::Switch g_async_translation("KYTY_ASYNC_TRANSLATION", Live::ParseDefaultOff); // live
 
+// KYTY_PIPELINE_SKIP_ORDER=1 (default off, startup): see the skip builder in the PipelineCache
+// constructor; the translation workers take the newest job first as well.
+static bool SkipOrderEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_SKIP_ORDER");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
 // Set by GetGraphicsPrograms around one draw's program lookups: whether its new VS/PS translations
 // may go to the workers (the draw is skipped until they are ready).
 thread_local bool t_defer_translation = false;
@@ -1791,14 +1882,21 @@ private:
 	}
 
 	void Run() {
+		if (SkipOrderEnabled()) Common::LowerCurrentThreadPriority();
 		for (;;) {
 			std::unique_ptr<Job> job;
 			{
 				std::unique_lock lock(m_mutex);
 				m_wake.wait(lock, [&] { return m_stop || !m_jobs.empty(); });
 				if (m_stop) return;
-				job = std::move(m_jobs.front());
-				m_jobs.pop_front();
+				// KYTY_PIPELINE_SKIP_ORDER: newest first, the scene on screen before the backlog.
+				if (SkipOrderEnabled()) {
+					job = std::move(m_jobs.back());
+					m_jobs.pop_back();
+				} else {
+					job = std::move(m_jobs.front());
+					m_jobs.pop_front();
+				}
 			}
 			auto result = ShaderRecompiler::TranslateProgram(job->code, job->options);
 			std::scoped_lock lock(m_mutex);
@@ -3925,6 +4023,11 @@ struct PipelineCache::ProgramCache {
 			bool usable = disk_source->skip_dispatch ||
 			              ShaderRecompiler::IR::DecodeResourcePlan(disk_source->plan, stored_plan);
 			times.load_ns += CompileClockNs() - load_begin;
+			// KYTY_CALL_EXCLUDE_FAILED: a stored refusal of a function expansion (an older cache) is
+			// translated again, so the callee behind it is learned and left out.
+			if (usable && disk_source->skip_dispatch && ExpansionHasBodies(params.call_expansion)) {
+				usable = false;
+			}
 			if (usable && SyncVerify()) {
 				translate_now();
 				usable       = DiskSourceMatches(translated, *disk_source, options);
@@ -3989,7 +4092,11 @@ struct PipelineCache::ProgramCache {
 					}
 				}
 				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash, call_targets);
-				if (disk_on) {
+				// KYTY_CALL_EXCLUDE_FAILED: the callee whose placed body keeps an expansion from
+				// translating is left out of later expansions (the background translation does so
+				// already), and the refusal is not stored: a later session learns its exclusions again.
+				const bool expansion_refused = ExcludeFailedCallee(params.call_expansion, translated, options);
+				if (disk_on && !expansion_refused) {
 					disk->AddSource(disk_key, true, {});
 				}
 				lock.lock();
@@ -4045,6 +4152,27 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		};
 
+		// A specialization the program cannot take (an enumerated material image read other than by a
+		// sample, IR::UnsupportedResourceSpecialization): that permutation is skipped, as a shader
+		// that gives up is, instead of ending the emulator; remembered so later draws skip it at once.
+		std::vector<uint8_t> unsupported_bytes;
+		ShaderRecompiler::IR::EncodeSpecialization(prep.specialization, unsupported_bytes);
+		const uint64_t unsupported_key =
+		    XXH3_64bits_withSeed(unsupported_bytes.data(), unsupported_bytes.size(),
+		                         reinterpret_cast<uintptr_t>(source) ^ (uint64_t {push_data_cursor} << 48u));
+		if (UnsupportedPermutations::Contains(unsupported_key)) {
+			lock.lock();
+			FinishInFlight(record);
+			return nullptr;
+		}
+		const auto unsupported_specialization = [&](const ShaderRecompiler::TranslateResult& from) -> bool {
+			const char* why =
+			    ShaderRecompiler::IR::UnsupportedResourceSpecialization(from.program, prep.specialization);
+			if (why == nullptr) return false;
+			UnsupportedPermutations::Add(unsupported_key, options, why);
+			return true;
+		};
+
 		// The permutation: stored, or emitted from a translation.
 		std::optional<Permutation>                         compiled;
 		std::optional<ProgramDiskCache::PermutationRecord> reloaded; // from_disk
@@ -4069,6 +4197,12 @@ struct PipelineCache::ProgramCache {
 				obtain_translation();
 				if (translated.skip_dispatch) {
 					return skip_after_all();
+				}
+				if (unsupported_specialization(translated)) {
+					translated_now = false;
+					lock.lock();
+					FinishInFlight(record);
+					return nullptr;
 				}
 				auto fresh = EmitPermutation(params, options, std::move(translated),
 				                             prep.specialization, push_data_cursor,
@@ -4122,6 +4256,11 @@ struct PipelineCache::ProgramCache {
 			}
 			if (translated.skip_dispatch) {
 				return skip_after_all();
+			}
+			if (unsupported_specialization(translated)) {
+				lock.lock();
+				FinishInFlight(record);
+				return nullptr;
 			}
 			auto emitted = EmitPermutation(params, options, std::move(translated),
 			                               prep.specialization, push_data_cursor, key.static_state,
@@ -5534,10 +5673,20 @@ struct PipelineCache::PrefetchState {
 	// and the prefetch pool: with prefetch on nearly every pipeline is built here, and without the
 	// key the journal stayed empty, so a cold start replayed nothing). drop_on_stop: Stop drops the
 	// queued builds no draw waits for (the skip builder).
+	// ordering (KYTY_PIPELINE_SKIP_ORDER, the skip builder): the worker order of
+	// PipelineCompileQueue::Ordering, at below normal priority.
 	explicit PrefetchState(PipelineCache& owner, size_t threads, size_t limit = 128, bool keyed_builds = false,
-	                       const char* name = "Pipeline prefetch", bool drop_queued_on_stop = false)
+	                       const char* name = "Pipeline prefetch", bool drop_queued_on_stop = false,
+	                       PipelineCompileQueue::Ordering ordering = {})
 	    : cache(owner), max_pending(limit), keyed(keyed_builds), drop_on_stop(drop_queued_on_stop), log_name(name),
-	      queue(threads, limit, Common::PlaceCurrentThreadCold) {}
+	      ordered(ordering.recent_first),
+	      queue(threads, limit,
+	            ordering.recent_first ? std::function<void()>([] {
+		            Common::PlaceCurrentThreadCold();
+		            Common::LowerCurrentThreadPriority();
+	            })
+	                                  : std::function<void()>(Common::PlaceCurrentThreadCold),
+	            ordering) {}
 	~PrefetchState() {
 		Stop();
 		for (auto& [key, job]: pending) {
@@ -5640,6 +5789,12 @@ struct PipelineCache::PrefetchState {
 		}
 		queue.Promote(ticket);
 		const auto begin = CompileClockNs();
+		// KYTY_PIPELINE_SKIP_ORDER (GT7 fork round 145): once the CP has waited 100 ms, every worker
+		// helps with the queue while it waits (the game is stopped; the next pipelines a draw that
+		// may not be skipped waits for are then done or under way).
+		while (ordered && future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+			queue.NoteStall();
+		}
 		auto result = future.get(); // Always wait: writes, depth and color draws all execute.
 		const auto elapsed = CompileClockNs() - begin;
 		used.fetch_add(1, std::memory_order_relaxed);
@@ -5690,6 +5845,7 @@ struct PipelineCache::PrefetchState {
 	const bool keyed;
 	const bool drop_on_stop;
 	const char* const log_name;
+	const bool ordered; // KYTY_PIPELINE_SKIP_ORDER
 	std::mutex mutex;
 	bool stopped = false;
 	uint64_t next_ticket = 0;
@@ -7095,11 +7251,35 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_skip_wait_ns     = std::min<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_WAIT_US", 2000), 1000000) * 1000ull;
 		m_skip_frame_budget_ns =
 		    std::min<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_FRAME_BUDGET_US", 0), 1000000) * 1000ull;
-		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip", true);
+		// KYTY_PIPELINE_SKIP_ORDER=1 (default off; adapted from usa-ratt/KytyPS5-GT7 rounds 141 and 145,
+		// 3adca0037 / bf5ffc229): the builders take the pipeline a draw asked for most recently first
+		// (worker 0 the oldest, so none starves: a car seen for a moment left its builds behind each
+		// new frame's), builds no draw asked for in the last 2 s run on the first
+		// KYTY_PIPELINE_SKIP_BACKGROUND_THREADS builders only (default 2), and all at below normal
+		// priority. Once a draw that may not be skipped has waited 100 ms for a build, every builder
+		// takes any build for the next 500 ms (a GT7 race start waited for 51 pipelines in a row with
+		// 13 of 16 workers idle). New VS/PS translations (KYTY_ASYNC_TRANSLATION) go newest first too.
+		PipelineCompileQueue::Ordering ordering;
+		ordering.recent_first = SkipOrderEnabled();
+		ordering.background_workers =
+		    static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_BACKGROUND_THREADS", 2), 1, 16));
+		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip", true, ordering);
+		// KYTY_PIPELINE_SKIP_PROBE=1 (default off): driver-cache lookups first (TryGetGraphicsPipeline).
+		m_skip_probe =
+		    EnvU64("KYTY_PIPELINE_SKIP_PROBE", 0) != 0 && m_graphics.pipeline_creation_cache_control_enabled;
+		if (m_skip_probe) {
+			PipelineCacheLog("Pipeline skip: new pipelines of skippable draws are looked up in the driver cache "
+			                 "first (KYTY_PIPELINE_SKIP_PROBE)");
+		}
 		PipelineCacheLog("Pipeline skip: {} background builders; draws that only change the picture wait "
 		                 "{} us for a new pipeline, then are skipped until it is built "
-		                 "(KYTY_PIPELINE_SKIP_THREADS, KYTY_PIPELINE_SKIP_WAIT_US)",
-		                 threads, m_skip_wait_ns / 1000);
+		                 "(KYTY_PIPELINE_SKIP_THREADS, KYTY_PIPELINE_SKIP_WAIT_US){}",
+		                 threads, m_skip_wait_ns / 1000,
+		                 ordering.recent_first
+		                     ? fmt::format("; most recently asked first, {} builders take older builds "
+		                                   "(KYTY_PIPELINE_SKIP_ORDER)",
+		                                   ordering.background_workers)
+		                     : std::string());
 	}
 	if (EnvU64("KYTY_PIPELINE_STATS", 0) != 0) m_stats_reporter = std::make_unique<StatsReporter>(*this);
 	if (EnvU64("KYTY_PIPELINE_LIST_PREPARE", 0) != 0 && !PipelineCacheTitleId().empty()) RunListPrepare();
@@ -9129,7 +9309,68 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	const bool background_ok =
 	    (vertex_info.size() == 1 && topology != vk::PrimitiveTopology::ePatchList) ||
 	    (vertex_info.size() == 3 && SkipTessellatedEnabled());
-	if (skippable && background_ok && !graphics_debug_dump_enabled()) {
+	// KYTY_PIPELINE_SKIP_PROBE=1 (default off; adapted from usa-ratt/KytyPS5-GT7 round 87,
+	// 3a8591ae2): a skippable draw's new pipeline that no builder has yet is first looked up in the
+	// driver cache alone, here (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT): one the
+	// driver has is published at once instead of waiting behind the builders' queue (where a cache
+	// hit was skipped for seconds behind second-long compiles), one it does not have goes to the
+	// builders without a wait for the lookup. Needs pipelineCreationCacheControl.
+	bool probe_hit = false;
+	if (m_skip_probe && skippable && background_ok && !graphics_debug_dump_enabled()) {
+		bool try_probe = false;
+		{
+			Common::LockGuard lock(m_mutex);
+			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+				return remember(*iter->second);
+			}
+			try_probe = !(m_prefetch != nullptr && m_prefetch->Has(key)) && !m_skip->Has(key);
+		}
+		if (try_probe) {
+			const auto probe_begin = CompileClockNs();
+			auto       probed      = std::make_unique<Pipeline>();
+			GraphicsContent probed_content;
+			const bool keyed_probe = m_known != nullptr || m_journal != nullptr;
+			GraphicsPipelineCreateHook probe_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+			                                            std::span<const uint32_t>         layout_signature,
+			                                            vk::Pipeline*                     pipeline) {
+				auto probe_info = info;
+				probe_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+				const auto made =
+				    m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &probe_info, nullptr, pipeline);
+				if (made == vk::Result::eSuccess && *pipeline != nullptr && keyed_probe) {
+					probed_content = DescribeGraphicsPipeline(info, layout_signature);
+					NoteKnownPipeline(probed_content.key);
+				}
+				return made;
+			};
+			vk::Result probe_result = vk::Result::eSuccess;
+			{
+				Common::CrashContext::Scope note("graphics pipeline driver-cache lookup (VS, PS)",
+				                                 vs_input_info.stage.program != nullptr
+				                                     ? vs_input_info.stage.program->shader_hash
+				                                     : 0,
+				                                 ps_active && ps_input_info->stage.program != nullptr
+				                                     ? ps_input_info->stage.program->shader_hash
+				                                     : 0);
+				CreatePipelineInternal(m_graphics, *probed, key.rendering, key.vertex_input, vertex_info,
+				                       ps_input_info, programs, key.static_params, m_driver_cache, &probe_hook,
+				                       &probe_result);
+			}
+			const auto probe_ns = CompileClockNs() - probe_begin;
+			m_skip_probe_ns.fetch_add(probe_ns, std::memory_order_relaxed);
+			if (probe_result == vk::Result::eSuccess) {
+				m_skip_probe_hits.fetch_add(1, std::memory_order_relaxed);
+				ready.pipeline   = std::move(probed);
+				ready.content    = std::move(probed_content);
+				ready.compile_ns = probe_ns;
+				probe_hit        = true;
+				wait_begin       = probe_begin;
+			} else {
+				m_skip_probe_misses.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+	if (skippable && background_ok && !graphics_debug_dump_enabled() && !probe_hit) {
 		bool           queued = false;
 		PrefetchState* source = m_skip.get();
 		{
@@ -9164,6 +9405,13 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			                 "published ({} within the wait); {} lookups found the queue full",
 			                 skip.skipped_draws, skip.requested, skip.compile_ns / 1000000, skip.published,
 			                 skip.ready_in_wait, skip.not_queued);
+			if (m_skip_probe) {
+				PipelineCacheLog("Pipeline skip: driver-cache lookups found {} pipelines, sent {} to the "
+				                 "builders ({} ms looking; KYTY_PIPELINE_SKIP_PROBE)",
+				                 m_skip_probe_hits.load(std::memory_order_relaxed),
+				                 m_skip_probe_misses.load(std::memory_order_relaxed),
+				                 m_skip_probe_ns.load(std::memory_order_relaxed) / 1000000);
+			}
 		};
 		if (poll == PrefetchState::Poll::Pending) {
 			g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
@@ -9203,7 +9451,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			wait_begin = 0;
 		}
 	}
-	if (ready_from == nullptr && m_prefetch != nullptr && background_ok &&
+	if (ready_from == nullptr && !probe_hit && m_prefetch != nullptr && background_ok &&
 	    !graphics_debug_dump_enabled()) {
 		{
 			Common::LockGuard lock(m_mutex);
@@ -9224,7 +9472,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			m_graphics.device.destroyPipeline(ready.pipeline->pipeline, nullptr);
 			ReleasePipelineLayout(m_graphics, ready.pipeline->pipeline_layout,
 			                      ready.pipeline->descriptor_set_layout);
-			ready_from->Complete(key);
+			if (ready_from != nullptr) ready_from->Complete(key); // null: a driver-cache lookup's
 		}
 		return remember(*iter->second);
 	}
@@ -9306,7 +9554,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	const auto created_pipeline = cached->pipeline;
 	auto [iter, inserted]       = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
-	if (prefetched) ready_from->Complete(key);
+	if (prefetched && ready_from != nullptr) ready_from->Complete(key); // null: a driver-cache lookup's
 	if (prefetched && ready.content.key != 0) content = std::move(ready.content); // journaled below
 	const bool built_fast = fast_result.snapshot != nullptr; // EnqueueGraphics takes the snapshot
 	if (built_fast) {

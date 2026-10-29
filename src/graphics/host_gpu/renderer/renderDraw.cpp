@@ -2090,6 +2090,37 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 static bool AsyncTranslationDrawAllowed(CommandBuffer& buffer);
 static void NoteAsyncTranslationRefusals(const DrawRenderState& state);
 
+// KYTY_SKIP_OCCLUSION_VISIBLE=1 (default off; adapted from usa-ratt/KytyPS5-GT7 round 141,
+// 3adca0037): draws inside a counting occlusion query may be skipped while their pipelines build
+// (KYTY_PIPELINE_SKIP) or their shaders translate (KYTY_ASYNC_TRANSLATION), and such a skipped draw
+// counts as visible: it adds 1024 samples to what later dumps publish (OcclusionCounter::
+// AddSkippedSamples). With 0 samples the game would take the object for occluded and might stop
+// drawing it, so it stayed missing after its pipeline was ready. Without the switch such draws are
+// not skipped (they wait for their pipeline). A fixed count, not the draw's coverage: enough for
+// visibility tests; a flare sized by samples flickers until the pipeline is ready.
+static bool SkipOcclusionVisibleEnabled() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_SKIP_OCCLUSION_VISIBLE");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static void NoteSkippedOcclusionDraw(RenderContext& context, CommandBuffer& buffer) {
+	if (!SkipOcclusionVisibleEnabled()) return;
+	auto& occlusion = context.GetOcclusionCounter();
+	if (occlusion.WouldCount(buffer.GetRegisters().GetDepthCountControl())) {
+		constexpr uint64_t SkippedSamples = 1024;
+		occlusion.AddSkippedSamples(SkippedSamples);
+		const auto skipped = occlusion.SkippedDraws();
+		if (skipped == 1 || (skipped & (skipped - 1u)) == 0) {
+			LOGF("Occlusion: %" PRIu64 " draws skipped while compiling inside counting queries, counted "
+			     "visible (KYTY_SKIP_OCCLUSION_VISIBLE)\n",
+			     skipped);
+		}
+	}
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -2207,6 +2238,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		// pipeline builds (counted for KYTY_HOLD_SKIPPED_DRAWS); no draw-run record may be continued
 		// or recalled across it.
 		g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
+		NoteSkippedOcclusionDraw(m_context, buffer);
 		m_run.valid        = false;
 		m_run_active       = false;
 		m_run_targets_kept = false;
@@ -2674,7 +2706,7 @@ static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState
 	if (mesh_active || (vertex_stages.size() != 1 && !tess_ok)) {
 		return SkipRefusal::Stages;
 	}
-	if (context.GetOcclusionCounter().Active()) {
+	if (context.GetOcclusionCounter().Active() && !SkipOcclusionVisibleEnabled()) {
 		return SkipRefusal::Occlusion;
 	}
 	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state) &&
@@ -2720,7 +2752,7 @@ static bool AsyncTranslationDrawAllowed(CommandBuffer& buffer) {
 	auto&       ctx   = buffer.GetRegisters();
 	auto&       rc    = buffer.GetContext();
 	const auto& depth = ctx.GetDepthControl();
-	if (!depth.z_enable || rc.GetOcclusionCounter().Active()) return false;
+	if (!depth.z_enable || (rc.GetOcclusionCounter().Active() && !SkipOcclusionVisibleEnabled())) return false;
 	const auto& render = ctx.GetRenderControl();
 	if (render.depth_clear_enable || render.stencil_clear_enable) return false;
 	struct Seen {
@@ -4786,6 +4818,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
 		}
 		if (pipeline_object == nullptr) {
+			NoteSkippedOcclusionDraw(m_context, buffer);
 			// KYTY_PIPELINE_SKIP: skipped until its pipeline is built. Nothing was recorded; no
 			// draw-run record may be continued or recalled across it (its bindings replaced the
 			// record's).

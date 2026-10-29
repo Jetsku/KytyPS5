@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
@@ -216,6 +217,71 @@ bool NeedsCallScc(const Function& function) {
 	return true;
 }
 
+bool HasBackEdge(const Function& function) {
+	return std::ranges::any_of(function.instructions, [](const Instruction& inst) {
+		return IsDirectBranch(inst.opcode) && inst.branch_target <= inst.pc;
+	});
+}
+
+bool HasBarrier(const Function& function) {
+	return std::ranges::any_of(function.instructions,
+	                           [](const Instruction& inst) { return inst.opcode == Opcode::S_BARRIER; });
+}
+
+// KYTY_CALL_WATERFALL_CLEAR (after usa-ratt/KytyPS5-GT7 655faf07e): the VGPR a waterfall around the
+// call at instructions[call] keeps its "lanes left" flag in, or UINT32_MAX. GT7's material passes
+// call each material's function for its lanes in turn:
+//   loop: V_READFIRSTLANE_B32 s, vKey; S_MOV_B64 sE, exec; V_CMPX_EQ_U32 s, vKey
+//         V_MOV_B32 vF, 0            (these lanes are done)
+//         ... scalar setup ... S_SWAPPC_B64
+//         S_MOV_B64 exec, sE; V_CMPX_NE_U32 0, vF; S_CBRANCH_EXECNZ loop
+// A callee that left vF set would have its lanes called again, forever. Only this shape counts: the
+// exec restore, the test and the branch back to (or before) the clear right after the call, and
+// nothing but scalar instructions, none of them a branch target, between the clear and the call.
+uint32_t WaterfallFlag(const std::vector<Instruction>& instructions, size_t call) {
+	const auto zero = [](const Operand& operand) {
+		return operand.kind == OperandKind::IntegerInlineConstant && operand.value == 0;
+	};
+	const auto next = [&](size_t k) {
+		while (k < instructions.size() &&
+		       (instructions[k].opcode == Opcode::S_WAITCNT || instructions[k].opcode == Opcode::S_NOP)) {
+			k++;
+		}
+		return k;
+	};
+	const auto restore = next(call + 1u);
+	if (restore >= instructions.size() || instructions[restore].opcode != Opcode::S_MOV_B64 ||
+	    instructions[restore].dst.kind != OperandKind::ExecLo) {
+		return UINT32_MAX;
+	}
+	const auto test = next(restore + 1u);
+	if (test >= instructions.size() || instructions[test].opcode != Opcode::V_CMPX_NE_U32 ||
+	    !zero(instructions[test].src0) || instructions[test].src1.kind != OperandKind::Vgpr) {
+		return UINT32_MAX;
+	}
+	const auto flag   = instructions[test].src1.reg;
+	const auto branch = next(test + 1u);
+	if (branch >= instructions.size() || instructions[branch].opcode != Opcode::S_CBRANCH_EXECNZ) {
+		return UINT32_MAX;
+	}
+	for (size_t k = call; k-- > 0 && k + 24u > call;) {
+		const auto& inst = instructions[k];
+		if (inst.opcode == Opcode::V_MOV_B32 && inst.dst.kind == OperandKind::Vgpr && inst.dst.reg == flag &&
+		    zero(inst.src0)) {
+			const auto clear   = inst.pc;
+			const auto end     = instructions[call].pc;
+			const bool entered = std::ranges::any_of(instructions, [&](const Instruction& other) {
+				return IsDirectBranch(other.opcode) && other.branch_target > clear && other.branch_target <= end;
+			});
+			return instructions[branch].branch_target <= clear && !entered ? flag : UINT32_MAX;
+		}
+		if (!magic_enum::enum_name(inst.opcode).starts_with("S_") || IsDirectBranch(inst.opcode) || IsCall(inst)) {
+			break;
+		}
+	}
+	return UINT32_MAX;
+}
+
 using Branches = std::vector<std::pair<uint32_t, uint32_t>>; // (branch word, target word)
 
 // Patches the SOPP branches. An edge beyond simm16 goes through an island of two S_BRANCH placed
@@ -339,7 +405,13 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 			if (!functions.contains(key) && !unusable.contains(key)) {
 				Function    function;
 				std::string why;
-				if (ReadFunction(address, site.return_reg, read, wave_size, function, why)) {
+				const bool readable = ReadFunction(address, site.return_reg, read, wave_size, function, why);
+				if (readable && !GetCodegenOptions().call_loops && HasBackEdge(function)) {
+					// KYTY_CALL_LOOPS=0: looping callees take the skip path.
+					unusable.insert(key);
+					expansion.dropped.push_back(
+					    fmt::format("callee 0x{:x} has a loop (KYTY_CALL_LOOPS=0)", address));
+				} else if (readable) {
 					functions.emplace(key, std::move(function));
 				} else {
 					unusable.insert(key);
@@ -413,12 +485,20 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 			};
 			const auto emit_body = [&](const Function& function, std::vector<uint32_t>& exits) {
 				const auto body_begin = static_cast<uint32_t>(result.size());
+				// KYTY_CALL_LOOP_CAP: a looping body without a barrier is bracketed for the loop budget
+				// (the end marker before its last return, so that it is reached).
+				const bool bounded = GetCodegenOptions().call_loop_cap != 0u && HasBackEdge(function) &&
+				                     !HasBarrier(function);
+				if (bounded) result.push_back(ShaderCallLoopBodyBegin);
 				set_return();
 				std::map<uint32_t, uint32_t> local_pc;
 				Branches                     local_branches;
 				for (const auto& body: function.instructions) {
 					const auto at     = static_cast<uint32_t>(result.size());
 					local_pc[body.pc] = at;
+					if (bounded && &body == &function.instructions.back()) {
+						result.push_back(ShaderCallLoopBodyEnd);
+					}
 					if (body.opcode == Opcode::S_SETPC_B64) {
 						exits.push_back(branch());
 					} else if (body.opcode == Opcode::S_GETPC_B64) {
@@ -545,6 +625,16 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 			if (!emitted) {
 				if (reason.empty()) reason = "the expanded program exceeds the code bound";
 				return false;
+			}
+			// KYTY_CALL_WATERFALL_CLEAR: every callee leaves a waterfall's flag clear on the console
+			// (its lanes would be called forever otherwise); a body run on data the emulator does not
+			// reproduce may not, so the flag is cleared again where the call returns.
+			if (GetCodegenOptions().call_waterfall_clear && !site.addresses.empty()) {
+				const auto flag =
+				    WaterfallFlag(program.instructions, static_cast<size_t>(&inst - program.instructions.data()));
+				if (flag != UINT32_MAX) {
+					result.push_back(0x7e000280u | (flag << 17u)); // V_MOV_B32 v[flag], 0
+				}
 			}
 		}
 		if (result.size() > MaxExpandedShaderWords) {

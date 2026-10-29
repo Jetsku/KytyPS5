@@ -532,6 +532,10 @@ private:
 	// long in all for their new pipelines (each still at most KYTY_PIPELINE_SKIP_WAIT_US).
 	uint64_t                       m_skip_frame_budget_ns = 0;
 	uint64_t                       m_skip_frame = 0, m_skip_frame_used = 0;
+	// KYTY_PIPELINE_SKIP_PROBE: a skippable draw's new pipeline is first looked up in the driver
+	// cache alone on this thread (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
+	bool                           m_skip_probe = false;
+	std::atomic<uint64_t>          m_skip_probe_hits {0}, m_skip_probe_misses {0}, m_skip_probe_ns {0};
 	Pipeline* GetGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                  std::span<const ShaderVertexInputInfo> vertex_info,
 	                                  CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
@@ -621,7 +625,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache,
-                            const GraphicsPipelineCreateHook*      create_hook = nullptr);
+                            const GraphicsPipelineCreateHook*      create_hook = nullptr,
+                            // Not null: a failed creation is returned here (and cleaned up)
+                            // instead of stopping the emulator.
+                            vk::Result*                            result_out  = nullptr);
 // Creates a compute pipeline from the complete create info instead of vkCreateComputePipelines
 // (KYTY_PIPELINE_FAST_FIRST). The create info and its chained structures live only for the call.
 using ComputePipelineCreateHook =
