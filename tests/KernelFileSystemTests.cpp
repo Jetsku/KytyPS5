@@ -103,6 +103,17 @@ void WaitForMutexTest(Predicate ready) {
   }
 }
 
+void TestStaticRwlockDestroy() {
+  using namespace Libs::LibKernel;
+  PthreadRwlock rwlock = nullptr;
+  Check(PthreadRwlockDestroy(nullptr) == KERNEL_ERROR_EINVAL &&
+            PthreadRwlockDestroy(&rwlock) == OK && rwlock == nullptr,
+        "destroy an untouched static rwlock without allocating it");
+  Check(PthreadRwlockRdlock(&rwlock) == OK && PthreadRwlockUnlock(&rwlock) == OK &&
+            PthreadRwlockDestroy(&rwlock) == OK,
+        "static rwlock remains usable after destroying its untouched initializer");
+}
+
 struct MutexWaiter {
   Libs::LibKernel::PthreadMutex *mutex;
   Libs::LibKernel::KernelUseconds timeout = 0;
@@ -2437,6 +2448,7 @@ int main(int argc, char** argv) {
   subsystems.Initialize<Log::Lifecycle>();
 
   TestMutexHandoff();
+  TestStaticRwlockDestroy();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
