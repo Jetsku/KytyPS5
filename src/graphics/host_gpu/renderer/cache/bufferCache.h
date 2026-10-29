@@ -827,6 +827,9 @@ private:
 	// uploads; a page every BDA draw re-examines but the CPU rewrites about once a frame costs
 	// hundreds of 4 KiB compares per frame instead of one fault.
 	uint32_t                                          m_hot_check_limit  = 64;
+	// KYTY_INDIRECT_FORMAT_COUNT (CodegenOptions.h): per-format call counters of the full decoder.
+	std::unique_ptr<Buffer>                           m_format_counts;
+	uint32_t                                          m_format_count_frames = 0;
 	// KYTY_BUFFER_RANGE_MEMO (nullptr when disabled).
 	std::unique_ptr<RangeMemo[]>                      m_range_memo;
 	// Always counted (GPU thread; the BufferRangeMemo* frame events need a connected profiler).

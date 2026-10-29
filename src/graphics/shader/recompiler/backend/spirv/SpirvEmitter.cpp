@@ -593,6 +593,14 @@ bool GetHostBufferPairAtomics() {
 	return g_buffer_pair_atomics.load(std::memory_order_relaxed);
 }
 
+static std::atomic<uint64_t> g_indirect_format_count_address {0};
+void SetIndirectFormatCountAddress(uint64_t address) {
+	g_indirect_format_count_address.store(address, std::memory_order_release);
+}
+uint64_t IndirectFormatCountAddress() {
+	return g_indirect_format_count_address.load(std::memory_order_acquire);
+}
+
 bool Emitter::BufferPairAtomicProgram(uint64_t shader_hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> list;

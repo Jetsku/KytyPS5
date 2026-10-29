@@ -50,6 +50,10 @@ HostBufferRobustness GetHostBufferRobustness();
 // through BDA check the host address itself). The device layer sets this once.
 void SetHostBufferPairAtomics(bool supported);
 bool GetHostBufferPairAtomics();
+// KYTY_INDIRECT_FORMAT_COUNT (CodegenOptions.h): device address of the per-format counters of the
+// DontInline full formatted-load decoder (0: off). The buffer cache sets it once.
+void     SetIndirectFormatCountAddress(uint64_t address);
+uint64_t IndirectFormatCountAddress();
 
 // Derivatives in compute shaders (IMAGE_GET_LOD: OpImageQueryLod under DerivativeGroupQuads). The
 // device layer enables VK_KHR_compute_shader_derivatives, else VK_NV_compute_shader_derivatives

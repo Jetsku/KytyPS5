@@ -1487,6 +1487,26 @@ static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t funct
                                              uint32_t function_control, uint32_t function_type,
                                              std::span<const uint32_t> fast, uint32_t slow_function);
 
+// KYTY_INDIRECT_FORMAT_INLINE_HASHES: the programs that inline the full decoder.
+static bool IndirectFormatInlineHash(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> parsed;
+		const char*           value = std::getenv("KYTY_INDIRECT_FORMAT_INLINE_HASHES");
+		if (value == nullptr) return parsed;
+		std::string text(value);
+		size_t      start = 0;
+		while (start < text.size()) {
+			const auto end = text.find(',', start);
+			parsed.push_back(std::strtoull(text.substr(start, end == std::string::npos ? std::string::npos : end - start).c_str(),
+			                               nullptr, 16));
+			if (end == std::string::npos) break;
+			start = end + 1;
+		}
+		return parsed;
+	}();
+	return std::ranges::find(hashes, hash) != hashes.end();
+}
+
 void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	bool used = false;
 	for (const auto* block: state.program.blocks) {
@@ -1516,7 +1536,8 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	// the loads call a small ordinary function (the driver inlines it) that decodes the common
 	// formats itself and calls the full one only for the others.
 	const auto fast_formats = IndirectFormatFastSet();
-	if (options.indirect_format_fast && !options.indirect_format_inline && !fast_formats.empty()) {
+	const bool inline_this = options.indirect_format_inline || IndirectFormatInlineHash(state.program.shader_hash);
+	if (options.indirect_format_fast && !inline_this && !fast_formats.empty()) {
 		const auto slow = state.builder.AllocateId();
 		DefineIndirectFormatFunctionBody(state, slow, "indirect_formatted_load",
 		                                 spv::FunctionControlDontInlineMask, function_type, {}, 0u);
@@ -1527,8 +1548,8 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	}
 	state.indirect_format_function = state.builder.AllocateId();
 	DefineIndirectFormatFunctionBody(state, state.indirect_format_function, "indirect_formatted_load",
-	                                 options.indirect_format_inline ? spv::FunctionControlMaskNone
-	                                                                : spv::FunctionControlDontInlineMask,
+	                                 inline_this ? spv::FunctionControlMaskNone
+	                                             : spv::FunctionControlDontInlineMask,
 	                                 function_type, {}, 0u);
 }
 
@@ -1653,6 +1674,22 @@ static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t funct
 	std::array<uint32_t, 4> selects {};
 	for (uint32_t channel = 0; channel < 4u; ++channel) {
 		selects[channel] = field(word3, 3u * channel, 3u);
+	}
+	// KYTY_INDIRECT_FORMAT_COUNT: count the calls of the DontInline full decoder per format.
+	if (const auto counters = Spirv::IndirectFormatCountAddress();
+	    counters != 0 && fast.empty() && function_control == spv::FunctionControlDontInlineMask) {
+		const auto offset  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                            Binary(state, spv::OpBitwiseAnd, TypeU32(state), buffer.format,
+		                                   ConstantU32(state, 127)),
+		                            ConstantU32(state, 2));
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), ConstantU64(state, counters),
+		                            Unary(state, spv::OpUConvert, TypeU64(state), offset));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+		const auto added = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), added, pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1));
 	}
 	const auto decode_format = [&](uint32_t format) {
 		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));

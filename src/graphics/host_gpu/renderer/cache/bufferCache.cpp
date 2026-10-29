@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
@@ -1611,6 +1612,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
 	}
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	if (ParseEnvU64("KYTY_INDIRECT_FORMAT_COUNT", 0) == 1) {
+		m_format_counts = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, 128 * sizeof(uint32_t));
+		std::memset(m_format_counts->Mapped().data(), 0, 128 * sizeof(uint32_t));
+		m_format_counts->Flush(0, 128 * sizeof(uint32_t));
+		ShaderRecompiler::Spirv::SetIndirectFormatCountAddress(m_format_counts->BufferDeviceAddress());
+		LOGF("KYTY_INDIRECT_FORMAT_COUNT: counting full-decoder calls per format\n");
+	}
 	m_written_sync_skip = WrittenSyncSkipEnabled();
 	if (m_written_sync_skip) {
 		m_written_sync_skip_verify = EnvVerifyMode("KYTY_WRITTEN_SYNC_SKIP_VERIFY");
@@ -1747,6 +1757,17 @@ void BufferCache::AdvanceFrame() noexcept {
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 	MemoryTracker::SetHotOverride(static_cast<uint32_t>(g_hot_frames_live.Get()),
 	                              static_cast<uint32_t>(g_hot_max_live.Get()));
+	if (m_format_counts != nullptr && ++m_format_count_frames % 600 == 0) {
+		m_format_counts->Invalidate(0, 128 * sizeof(uint32_t));
+		const auto* counts = reinterpret_cast<const uint32_t*>(m_format_counts->Mapped().data());
+		std::string text;
+		for (uint32_t format = 0; format < 128; format++) {
+			if (counts[format] != 0) text += fmt::format(" {}:{}", format, counts[format]);
+		}
+		std::printf("Indirect formats via the full decoder (format:calls, cumulative):%s\n",
+		            text.empty() ? " none" : text.c_str());
+		std::fflush(stdout);
+	}
 }
 
 void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {

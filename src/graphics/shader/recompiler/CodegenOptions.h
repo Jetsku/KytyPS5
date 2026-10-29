@@ -258,6 +258,13 @@ struct CodegenOptions {
 	// (spirvEmitterMemory.cpp IndirectFormatFastSet). Keeps KYTY_INDIRECT_FORMAT_INLINE's crash fix
 	// without inlining the whole format switch into every RT kernel (driver memory).
 	bool indirect_format_fast = false;
+	// KYTY_INDIRECT_FORMAT_INLINE_HASHES=<hex>[,<hex>...] (default unset): with
+	// KYTY_INDIRECT_FORMAT_FAST, these programs inline the full decoder (as
+	// KYTY_INDIRECT_FORMAT_INLINE does for all), the others keep the fast + DontInline pair.
+	// KYTY_INDIRECT_FORMAT_COUNT=1 (diagnostic): every call of the DontInline full decoder adds one
+	// to a per-format counter in a host-visible buffer (Spirv::SetIndirectFormatCountAddress); the
+	// buffer cache prints the counts every 600 flips ("Indirect formats via the full decoder").
+	// Its address is part of the codegen fingerprint: use with KYTY_PROGRAM_CACHE_SAVE=0.
 	// KYTY_CFG_CLONE_EXITS=1 (default 0): before a CFG falls back to the dispatcher loop, a small
 	// terminal block (no successors, at most 8 instructions) entered from several blocks gets one
 	// copy per entering block, and structurization is retried. Pixel shaders branch to a shared

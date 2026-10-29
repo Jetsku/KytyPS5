@@ -140,6 +140,16 @@ std::vector<uint8_t> CodegenFingerprint() {
 		b.Text("indirect_format_fast");
 		if (const char* fast = std::getenv("KYTY_INDIRECT_FORMAT_FAST"); fast != nullptr) b.Text(fast);
 	}
+	// KYTY_INDIRECT_FORMAT_INLINE_HASHES: these programs inline the full decoder.
+	if (const char* hashes = std::getenv("KYTY_INDIRECT_FORMAT_INLINE_HASHES"); hashes != nullptr) {
+		b.Text("indirect_format_inline_hashes");
+		b.Text(hashes);
+	}
+	// KYTY_INDIRECT_FORMAT_COUNT: the counter buffer's address is baked into the modules.
+	if (const char* count = std::getenv("KYTY_INDIRECT_FORMAT_COUNT"); count != nullptr && count[0] == '1') {
+		b.Text("indirect_format_count");
+		b.Text(std::to_string(Spirv::IndirectFormatCountAddress()));
+	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}
