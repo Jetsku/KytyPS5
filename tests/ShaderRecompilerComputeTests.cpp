@@ -37772,6 +37772,60 @@ TestCase Vop3F32ClampFlushesNaN() {
   return test;
 }
 
+TestCase Vop3MadU16(u32 wave_size) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr std::array<std::array<u32, 3>, 4> inputs{{
+      {0xffff0002u, 0x80000003u, 0x00010004u},
+      {0xffffffffu, 0xffffffffu, 0xffffffffu},
+      {0x0000ffffu, 0x00010001u, 0x00010000u},
+      {0x7fff8000u, 0x80007fffu, 0x8000ffffu}}};
+  TestCase test;
+  test.name = wave_size == 32 ? "Vop3MadU16Wave32" : "Vop3MadU16Wave64";
+  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 modifier = 0; modifier < 9; ++modifier) {
+    const u32 words[] = {
+        EncodeVop3Word0(0x340, 9, modifier < 3 ? 1u << modifier : 0),
+        EncodeVop3Word1(Vgpr(2), Vgpr(3), Vgpr(4), modifier >= 6 ? modifier - 5 : 0,
+                        modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
+    D::Instruction decoded;
+    D::DecodeInstruction(words, 0, decoded);
+    Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
+            "unsigned 16-bit multiply-add accepted a floating-point modifier");
+  }
+  for (u32 i = 0; i < inputs.size(); ++i) {
+    for (u32 variant = 0; variant < 32; ++variant) {
+      const u32 selectors = variant & 15u;
+      const bool clamp = variant >= 16;
+      std::array<u32, 3> selected{};
+      for (u32 operand = 0; operand < 3; ++operand) {
+        AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
+        AppendBufferLoadDword(&code, 2 + operand, 30);
+        selected[operand] = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
+      }
+      const u32 dst = selectors % 4 < 3 ? 2 + selectors % 4 : 9;
+      AppendVMovLiteral(&code, 9, 0xa5a5beefu);
+      AppendVop3(&code, 0x340, dst, Vgpr(2), Vgpr(3), i == 3 ? 255 : Vgpr(4), 0,
+                  selectors, clamp);
+      if (i == 3) code.push_back(inputs[i][2]);
+      AppendStoreVgpr(&code, dst, static_cast<u32>(test.expected.size()));
+      const uint64_t wide = uint64_t{selected[0]} * selected[1] + selected[2];
+      const u32 result = clamp && wide > 0xffffu ? 0xffffu : static_cast<u32>(wide) & 0xffffu;
+      const u32 old = dst == 9 ? 0xa5a5beefu : inputs[i][dst - 2];
+      test.expected.push_back(selectors & 8u ? (old & 0xffffu) | (result << 16)
+                                              : (old & 0xffff0000u) | result);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   using O = ShaderOpcode;
   struct MadCase {
@@ -52618,6 +52672,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
+  cases.push_back(Vop3MadU16(32));
+  cases.push_back(Vop3MadU16(64));
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3F32ClampFlushesNaN);
   cases.push_back(Vop3Integer16Ternary(32));
@@ -59307,6 +59363,14 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3MadU16(32));
+    RunCase(&vulkan, Vop3MadU16(64));
+    RunCase(&vulkan, Vop3MadI16CapturedSelectorsAndSaturation());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--integer16-ternary-only") == 0) {
     EnsureConfigInitialized();
     VulkanHarness vulkan;

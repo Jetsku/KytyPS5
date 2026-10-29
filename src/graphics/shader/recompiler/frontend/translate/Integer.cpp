@@ -22,13 +22,18 @@ void Translator::Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpco
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
 
-void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
-	const auto lhs    = ReadU16AsU32(inst.src0, true);
-	const auto rhs    = ReadU16AsU32(inst.src1, true);
-	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, true));
+void Translator::Integer16Mad(const Decoder::Instruction& inst, bool sign) {
+	const auto lhs    = ReadU16AsU32(inst.src0, sign);
+	const auto rhs    = ReadU16AsU32(inst.src1, sign);
+	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, sign));
 	if (inst.dst.clamp) {
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
+		if (sign) {
+			result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
+			result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
+		} else {
+			// u16 * u16 + u16 fits in 32 bits.
+			result = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {result, IR::Value(0xffffu)}));
+		}
 	}
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }

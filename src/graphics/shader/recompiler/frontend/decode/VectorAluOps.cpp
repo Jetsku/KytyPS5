@@ -380,6 +380,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x311u, Opcode::V_PACK_B32_F16},
     {0x314u, Opcode::V_LSHLREV_B16},
     {0x319u, Opcode::V_SUBREV_I32},
+    {0x340u, Opcode::V_MAD_U16},
     {0x344u, Opcode::V_PERM_B32},
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
@@ -502,7 +503,7 @@ bool IsNativeVop3B16TernaryOpcode(Opcode opcode) {
 	return opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MIN3_U16 ||
 	       opcode == Opcode::V_MAX3_I16 || opcode == Opcode::V_MAX3_U16 ||
 	       opcode == Opcode::V_MED3_I16 || opcode == Opcode::V_MED3_U16 ||
-	       opcode == Opcode::V_MAD_I16;
+	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16;
 }
 
 bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
@@ -1545,9 +1546,9 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 
 bool SupportsNativeVop3Clamp(Opcode opcode) {
 	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
-	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MIN3_I16 ||
-	       opcode == Opcode::V_MAX3_I16 || opcode == Opcode::V_MAX3_U16 ||
-	       opcode == Opcode::V_MED3_U16;
+	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16 ||
+	       opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MAX3_I16 ||
+	       opcode == Opcode::V_MAX3_U16 || opcode == Opcode::V_MED3_U16;
 }
 
 bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,

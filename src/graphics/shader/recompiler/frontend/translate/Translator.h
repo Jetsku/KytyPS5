@@ -184,7 +184,7 @@ private:
 	void Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
-	void V_MAD_I16(const Decoder::Instruction& inst);
+	void Integer16Mad(const Decoder::Instruction& inst, bool sign);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
