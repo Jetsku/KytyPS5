@@ -1865,6 +1865,205 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// Whether `count` indices of `element_size` bytes hold `value`: blocks of 256 without an early exit
+// inside, which the compiler vectorizes.
+static bool HoldsIndex(const uint8_t* bytes, uint64_t count, uint32_t element_size, uint32_t value) {
+	constexpr uint64_t Block = 256;
+	for (uint64_t at = 0; at < count; at += Block) {
+		const uint64_t n   = std::min(Block, count - at);
+		bool           hit = false;
+		if (element_size == 2) {
+			const auto wanted = static_cast<uint16_t>(value);
+			for (uint64_t i = 0; i < n; i++) {
+				uint16_t index = 0;
+				std::memcpy(&index, bytes + (at + i) * 2u, 2);
+				hit |= index == wanted;
+			}
+		} else {
+			for (uint64_t i = 0; i < n; i++) {
+				uint32_t index = 0;
+				std::memcpy(&index, bytes + (at + i) * 4u, 4);
+				hit |= index == value;
+			}
+		}
+		if (hit) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// KYTY_LIST_RESET=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 589d2d821): an
+// indexed point, line, triangle or patch list draw with the guest's primitive reset on, whose
+// indices hold the reset index, is drawn as the console assembles it: the primitive the reset
+// index falls in is dropped and the next starts after it (GE_MULTI_PRIM_IB_RESET_EN applies to
+// lists as to strips). Vulkan restarts strips and fans only, so the index was drawn as a vertex
+// past the mesh (a suspect for spikes on GT7's glass roofs). The kept indices are drawn from the
+// stream buffer. Indirect draws, 8-bit indices, mesh-shader vertex stages (they read the guest's
+// indices themselves), lists over 16 MB and indices the GPU wrote (or whose download is still to
+// land) are left as they are.
+//
+// Returns the count of indices kept (written to `rewritten`, in the guest's element size), or
+// UINT32_MAX when the draw is left as it is.
+static uint32_t RewriteListReset(const CommandBuffer& buffer, BufferCache& cache,
+                                 const DrawIndexBufferSource& source, uint32_t index_count,
+                                 std::vector<uint8_t>& rewritten) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIST_RESET");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return UINT32_MAX;
+	}
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	if ((control & 0x1u) == 0 || (control & ~0x3u) != 0) {
+		return UINT32_MAX;
+	}
+	const auto prim_type     = buffer.GetUserConfig().GetPrimType();
+	uint32_t   per_primitive = 0;
+	switch (prim_type) {
+		case Prospero::PrimitiveType::kPointList: per_primitive = 1; break;
+		case Prospero::PrimitiveType::kLineList: per_primitive = 2; break;
+		case Prospero::PrimitiveType::kTriList: per_primitive = 3; break;
+		case Prospero::PrimitiveType::kPatch:
+			// The patch's input control points (VGT_LS_HS_CONFIG.HS_NUM_INPUT_CP).
+			per_primitive = (buffer.GetRegisters().GetShaderRegisters().m_vgtLsHsConfig >> 8u) & 0x3fu;
+			if (per_primitive == 0 || per_primitive > 32) {
+				return UINT32_MAX;
+			}
+			break;
+		default: return UINT32_MAX;
+	}
+	const auto         element_size = source.guest_element_size;
+	constexpr uint64_t MaxBytes     = 16ull << 20u;
+	if ((element_size != 2 && element_size != 4) || source.address == 0 || source.size == 0 ||
+	    source.size > MaxBytes || source.host_data != nullptr || index_count == 0) {
+		return UINT32_MAX;
+	}
+	const uint32_t index_mask = element_size == 2 ? 0xffffu : 0xffffffffu;
+	const auto     reset      = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset & ~index_mask) != 0) {
+		return UINT32_MAX; // matches no index of this size
+	}
+	const uint32_t restart = reset & index_mask;
+
+	// What each index buffer held when it was last looked at. One without the reset index is
+	// looked at again once its pages are CPU-dirty, and a quarter of a second after it was last
+	// looked at anyway. One with it keeps its bytes and the indices kept, used again while the
+	// guest bytes are the same.
+	struct Key {
+		uint64_t address;
+		uint64_t size;
+		uint32_t element_size;
+		uint32_t restart;
+		uint32_t per_primitive;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const noexcept {
+			return static_cast<size_t>((key.address * 0x9e3779b97f4a7c15ull) ^ (key.size << 7u) ^
+			                           key.restart ^ (uint64_t {key.per_primitive} << 48u) ^
+			                           (static_cast<uint64_t>(key.element_size) << 60u));
+		}
+	};
+	struct Seen {
+		bool                                  holds_reset = false;
+		std::chrono::steady_clock::time_point scanned {};
+		std::vector<uint8_t>                  original;  // holds_reset: the guest's bytes
+		std::vector<uint8_t>                  rewritten; // holds_reset: the indices kept
+	};
+	constexpr auto     RescanAfter    = std::chrono::milliseconds(250);
+	constexpr uint64_t MaxCachedBytes = 64ull << 20u;
+	thread_local std::unordered_map<Key, Seen, KeyHash> seen;
+	thread_local uint64_t                               cached_bytes = 0;
+	thread_local std::vector<uint8_t>                   guest;
+	const Key  key {source.address, source.size, element_size, restart, per_primitive};
+	auto       found = seen.find(key);
+	const auto now   = std::chrono::steady_clock::now();
+	if (found != seen.end() && !found->second.holds_reset &&
+	    now - found->second.scanned < RescanAfter &&
+	    !cache.IsRegionCpuModified(source.address, source.size)) {
+		return UINT32_MAX;
+	}
+	// The guest's bytes, as the console reads them: not when the GPU wrote them (they would need
+	// a download first).
+	if (cache.HasGpuDirtyBytes(source.address, source.size) ||
+	    cache.HasPendingBackingPublication(source.address, source.size)) {
+		return UINT32_MAX;
+	}
+	const uint64_t count      = std::min<uint64_t>(index_count, source.size / element_size);
+	const uint64_t byte_count = count * element_size;
+	guest.resize(byte_count);
+	if (!LibKernel::Memory::TryReadBacking(source.address, guest.data(), byte_count)) {
+		return UINT32_MAX;
+	}
+	const uint8_t* bytes = guest.data();
+	if (found != seen.end() && found->second.holds_reset && found->second.original.size() == byte_count &&
+	    std::memcmp(found->second.original.data(), bytes, byte_count) == 0) {
+		rewritten = found->second.rewritten;
+		return static_cast<uint32_t>(rewritten.size() / element_size);
+	}
+	if (seen.size() >= 65536 || cached_bytes > MaxCachedBytes) {
+		seen.clear();
+		cached_bytes = 0;
+	}
+	auto& entry = seen[key];
+	cached_bytes -= std::min<uint64_t>(cached_bytes, entry.original.size() + entry.rewritten.size());
+	std::vector<uint8_t>().swap(entry.original);
+	std::vector<uint8_t>().swap(entry.rewritten);
+	entry.scanned     = now;
+	entry.holds_reset = HoldsIndex(bytes, count, element_size, restart);
+	if (!entry.holds_reset) {
+		return UINT32_MAX;
+	}
+	entry.original.assign(bytes, bytes + byte_count);
+
+	// A reset index drops the primitive it falls in and the next starts after it; each complete
+	// primitive is copied whole.
+	const auto read = [&](uint64_t i) -> uint32_t {
+		if (element_size == 2) {
+			uint16_t value = 0;
+			std::memcpy(&value, bytes + i * 2u, 2);
+			return value;
+		}
+		uint32_t value = 0;
+		std::memcpy(&value, bytes + i * 4u, 4);
+		return value;
+	};
+	rewritten.resize(byte_count);
+	uint64_t kept   = 0;
+	uint64_t resets = 0;
+	uint64_t filled = 0;
+	for (uint64_t i = 0; i < count; i++) {
+		if (read(i) == restart) {
+			resets++;
+			filled = 0;
+			continue;
+		}
+		if (++filled < per_primitive) {
+			continue;
+		}
+		std::memcpy(rewritten.data() + kept * element_size,
+		            bytes + (i + 1 - per_primitive) * element_size, per_primitive * element_size);
+		kept += per_primitive;
+		filled = 0;
+	}
+	rewritten.resize(kept * element_size);
+	entry.rewritten = rewritten;
+	cached_bytes += entry.original.size() + entry.rewritten.size();
+
+	static std::atomic<uint64_t> lists {0};
+	if (const auto n = lists.fetch_add(1, std::memory_order_relaxed) + 1; n <= 16 || std::has_single_bit(n)) {
+		LOGF("Draw: an indexed list (primitive type %u, %u indices a primitive) at 0x%016" PRIx64
+		     " holds the primitive reset index 0x%x %" PRIu64 " times in %" PRIu64
+		     " indices: drawn with the %" PRIu64 " indices of the primitives it keeps (%" PRIu64
+		     " such lists; KYTY_LIST_RESET)\n",
+		     static_cast<uint32_t>(prim_type), per_primitive, source.address, restart, resets, count,
+		     kept, n);
+	}
+	return static_cast<uint32_t>(kept);
+}
+
 // KYTY_RENDER_STATE_FAST vertex (renderDraw.h): copies a vertex input as the used prefixes of its
 // arrays (and of each buffer's attribute list) and the fields after the arrays, and resets the
 // entries the destination used past the source's counts. Entries past the counts hold their
@@ -5465,8 +5664,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance};
 	// The member state is reused; the render mutex held above makes it exclusive to this draw.
 	auto& state = *m_draw_state;
 	state.Reset();
@@ -5495,6 +5694,24 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		index_source.host_data = expanded_indices.data();
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
+	}
+
+	// KYTY_LIST_RESET (RewriteListReset): after the draw's programs are known, as a mesh-shader
+	// vertex stage reads the guest's indices itself.
+	std::vector<uint8_t> list_reset_indices;
+	if (args.offset_source != DrawOffsetSource::IndirectArgs &&
+	    state.vertex_info[0].stage.program->stage != ShaderType::Mesh) {
+		if (const auto kept = RewriteListReset(buffer, m_context.GetBufferCache(), index_source,
+		                                       args.index_count, list_reset_indices);
+		    kept != UINT32_MAX) {
+			if (kept == 0) {
+				ResetBindings();
+				return;
+			}
+			index_source.host_data = list_reset_indices.data();
+			index_source.size      = list_reset_indices.size();
+			draw.index_count       = kept;
+		}
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
