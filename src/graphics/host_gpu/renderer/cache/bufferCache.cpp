@@ -1764,7 +1764,7 @@ void BufferCache::AdvanceFrame() noexcept {
 		for (uint32_t format = 0; format < 128; format++) {
 			if (counts[format] != 0) text += fmt::format(" {}:{}", format, counts[format]);
 		}
-		std::printf("Indirect formats via the full decoder (format:calls, cumulative):%s\n",
+		LOGF("Indirect formats via the full decoder (format:calls, cumulative):%s\n",
 		            text.empty() ? " none" : text.c_str());
 		std::fflush(stdout);
 	}
