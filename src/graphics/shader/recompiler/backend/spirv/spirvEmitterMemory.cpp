@@ -1532,6 +1532,48 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	                                 function_type, {}, 0u);
 }
 
+// A "g" item in KYTY_INDIRECT_FORMAT_FAST (e.g. g,20,22,64,71,74,77): the listed formats made of
+// 32-bit components (32 / 32_32 / 32_32_32 / 32_32_32_32, uint or float) share one decode block that
+// loads as many dwords as the format has, instead of one block each. The inlined decoder of every
+// call site gets smaller (Miles' hit kernels: ~35,000 call sites; driver compile memory).
+static bool IndirectFormatGroup32() {
+	static const bool group = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_FORMAT_FAST");
+		if (value == nullptr) return false;
+		std::string text(value);
+		size_t      start = 0;
+		while (start <= text.size()) {
+			const auto end  = text.find(',', start);
+			const auto item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			if (item == "g") return true;
+			if (end == std::string::npos) break;
+			start = end + 1;
+		}
+		return false;
+	}();
+	return group;
+}
+
+// The 32-bit-component formats IndirectFormatGroup32 groups: component count, float or not.
+static bool IndirectFormatRaw32(uint32_t format, uint32_t* count = nullptr, bool* is_float = nullptr) {
+	uint32_t n = 0;
+	bool     f = false;
+	switch (static_cast<Prospero::BufferFormat>(format)) {
+		case Prospero::BufferFormat::k32UInt: n = 1; break;
+		case Prospero::BufferFormat::k32Float: n = 1; f = true; break;
+		case Prospero::BufferFormat::k32_32UInt: n = 2; break;
+		case Prospero::BufferFormat::k32_32Float: n = 2; f = true; break;
+		case Prospero::BufferFormat::k32_32_32UInt: n = 3; break;
+		case Prospero::BufferFormat::k32_32_32Float: n = 3; f = true; break;
+		case Prospero::BufferFormat::k32_32_32_32UInt: n = 4; break;
+		case Prospero::BufferFormat::k32_32_32_32Float: n = 4; f = true; break;
+		default: return false;
+	}
+	if (count != nullptr) *count = n;
+	if (is_float != nullptr) *is_float = f;
+	return true;
+}
+
 // KYTY_INDIRECT_FORMAT_FAST=1 (default formats) or =<format>[,<format>...] (decimal BufferFormat
 // values): the formats indirect_formatted_load_fast decodes inline.
 static std::vector<uint32_t> IndirectFormatFastSet() {
@@ -1676,8 +1718,18 @@ static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t funct
 		const auto            default_label = state.builder.AllocateId();
 		std::vector<uint32_t> labels(fast.size());
 		std::vector<uint32_t> words {spv::OpSwitch, buffer.format, default_label};
+		// IndirectFormatGroup32: the 32-bit-component formats branch to one shared block.
+		const bool group32     = IndirectFormatGroup32();
+		uint32_t   group_label = 0;
+		std::vector<uint32_t> grouped;
 		for (size_t item = 0; item < fast.size(); item++) {
-			labels[item] = state.builder.AllocateId();
+			if (group32 && IndirectFormatRaw32(fast[item])) {
+				if (group_label == 0) group_label = state.builder.AllocateId();
+				labels[item] = group_label;
+				grouped.push_back(fast[item]);
+			} else {
+				labels[item] = state.builder.AllocateId();
+			}
 			words.push_back(fast[item]);
 			words.push_back(labels[item]);
 		}
@@ -1685,8 +1737,80 @@ static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t funct
 		state.builder.AddFunction(words);
 		std::vector<uint32_t> phi {spv::OpPhi, result, state.builder.AllocateId()};
 		for (size_t item = 0; item < fast.size(); item++) {
+			if (labels[item] == group_label && group_label != 0) continue;
 			EmitLabel(state, labels[item]);
 			phi.push_back(decode_format(fast[item]));
+			phi.push_back(state.current_label);
+			state.builder.AddFunction(spv::OpBranch, merge_label);
+		}
+		if (group_label != 0) {
+			EmitLabel(state, group_label);
+			// Component count and float-ness of the grouped format at run time.
+			auto count    = ConstantU32(state, 0);
+			auto is_float = ConstantBool(state, false);
+			for (const auto format: grouped) {
+				uint32_t n = 0;
+				bool     f = false;
+				IndirectFormatRaw32(format, &n, &f);
+				const auto match = Binary(state, spv::OpIEqual, TypeBool(state), buffer.format,
+				                          ConstantU32(state, format));
+				count    = Select(state, TypeU32(state), match, ConstantU32(state, n), count);
+				is_float = Select(state, TypeBool(state), match, ConstantBool(state, f), is_float);
+			}
+			// The whole element in bounds, by its byte size (as decode_format checks).
+			std::array<uint32_t, 4> whole {};
+			for (uint32_t n = 1; n <= 4u; ++n) {
+				whole[n - 1] = IndirectBufferInBounds(state, buffer, 0u, 4u * n, true);
+			}
+			auto in_bounds = whole[0];
+			for (uint32_t n = 2; n <= 4u; ++n) {
+				in_bounds = Select(state, TypeBool(state),
+				                   Binary(state, spv::OpIEqual, TypeBool(state), count, ConstantU32(state, n)),
+				                   whole[n - 1], in_bounds);
+			}
+			const auto element = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+			                            ConstantU64(state, ~uint64_t {3}));
+			std::array<uint32_t, 4> components {};
+			for (uint32_t component = 0; component < 4u; ++component) {
+				const auto address = component == 0u ? element
+				                                      : Binary(state, spv::OpIAdd, TypeU64(state), element,
+				                                               ConstantU64(state, component * 4u));
+				const auto active =
+				    component == 0u ? in_bounds
+				                    : AndCondition(state, in_bounds,
+				                                   Binary(state, spv::OpULessThan, TypeBool(state),
+				                                          ConstantU32(state, component), count));
+				components[component] = LoadBda(ctx, address, active, 32u);
+			}
+			const auto one = Select(state, TypeU32(state), is_float, ConstantU32(state, 0x3f800000u),
+			                        ConstantU32(state, 1u));
+			const auto safe_count =
+			    Select(state, TypeU32(state),
+			           Binary(state, spv::OpIEqual, TypeBool(state), count, ConstantU32(state, 0)),
+			           ConstantU32(state, 1), count);
+			std::array<uint32_t, 4> channels {};
+			for (uint32_t channel = 0; channel < 4u; ++channel) {
+				const auto sel   = selects[channel];
+				const auto which = Binary(state, spv::OpUMod, TypeU32(state),
+				                          Binary(state, spv::OpISub, TypeU32(state), sel, ConstantU32(state, 4)),
+				                          safe_count);
+				auto picked = components[0];
+				for (uint32_t component = 1; component < 4u; ++component) {
+					picked = Select(state, TypeU32(state),
+					                Binary(state, spv::OpIEqual, TypeBool(state), which,
+					                       ConstantU32(state, component)),
+					                components[component], picked);
+				}
+				const auto constant = Select(
+				    state, TypeU32(state),
+				    Binary(state, spv::OpIEqual, TypeBool(state), sel, ConstantU32(state, 1)), one,
+				    ConstantU32(state, 0));
+				channels[channel] = Select(
+				    state, TypeU32(state),
+				    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), sel, ConstantU32(state, 4)),
+				    picked, constant);
+			}
+			phi.push_back(ConstructU32Composite(state, 4, channels));
 			phi.push_back(state.current_label);
 			state.builder.AddFunction(spv::OpBranch, merge_label);
 		}
