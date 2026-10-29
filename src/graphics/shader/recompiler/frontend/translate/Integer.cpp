@@ -289,7 +289,7 @@ void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool addend) {
+void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high) {
 	const auto extract24 = [&](IR::U32 value) {
 		return IR::U32(
 		    ir.Emit(sign ? IR::ValueOpcode::BitFieldSExtract : IR::ValueOpcode::BitFieldUExtract,
@@ -297,7 +297,9 @@ void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool add
 	};
 	const auto lhs    = extract24(ReadU32(inst.src0));
 	const auto rhs    = extract24(ReadU32(inst.src1));
-	auto       result = ir.IMul(lhs, rhs);
+	const auto multiply = high ? (sign ? IR::ValueOpcode::SMulHi : IR::ValueOpcode::UMulHi)
+	                           : IR::ValueOpcode::IMul32;
+	auto result = IR::U32(ir.Emit(multiply, {lhs, rhs}));
 	if (addend) {
 		result = ir.IAdd(result, ReadU32(inst.src2));
 	}

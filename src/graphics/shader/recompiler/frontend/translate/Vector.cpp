@@ -722,6 +722,8 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MAD_U32_U24: return Integer24(inst, false, true);
 		case O::V_MUL_I32_I24: return Integer24(inst, true, false);
 		case O::V_MUL_U32_U24: return Integer24(inst, false, false);
+		case O::V_MUL_HI_I32_I24: return Integer24(inst, true, false, true);
+		case O::V_MUL_HI_U32_U24: return Integer24(inst, false, false, true);
 		case O::V_MAD_U64_U32: return V_MAD_U64_U32(inst);
 		case O::V_SAD_U32: return V_SAD_U32(inst);
 		case O::V_ADD3_U32: return V_ADD3_U32(inst);
