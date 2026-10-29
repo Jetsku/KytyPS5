@@ -3911,7 +3911,7 @@ struct PipelineCache::ProgramCache {
 			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words,
 			             speculative || params.call_expansion != 0);
 			if (source == nullptr) {
-				disk_source = disk->FindSource(disk_key);
+				disk_source = disk->FindSource(disk_key, !replay);
 			}
 			times.load_ns += CompileClockNs() - load_begin;
 		}
@@ -4053,7 +4053,7 @@ struct PipelineCache::ProgramCache {
 			ShaderRecompiler::IR::EncodeSpecialization(prep.specialization, specialization_bytes);
 			const auto load_begin = CompileClockNs();
 			const auto stored =
-			    disk->FindPermutation(disk_key.digest, push_data_cursor, specialization_bytes);
+			    disk->FindPermutation(disk_key.digest, push_data_cursor, specialization_bytes, !replay);
 			EmittedProgram loaded;
 			bool usable = stored.has_value() &&
 			              ShaderRecompiler::IR::DecodeCompiledShaderInfo(stored->info, loaded.info) &&

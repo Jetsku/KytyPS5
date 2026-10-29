@@ -325,7 +325,7 @@ void ProgramDiskCache::Load() {
 	}
 }
 
-std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const SourceKey& key) {
+std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const SourceKey& key, bool note_use) {
 	WaitLoaded();
 	std::scoped_lock lock(m_mutex);
 	if (!m_ambiguous.contains(key.digest)) {
@@ -334,7 +334,7 @@ std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const
 				const auto& record = m_records[id];
 				if (!record.invalid && Equal(record.key, key.bytes)) {
 					m_stats.source_hits++;
-					NoteUsed(id);
+					if (note_use) NoteUsed(id);
 					return SourceRecord {.id = id, .skip_dispatch = record.skip_dispatch,
 					                     .plan = record.plan};
 				}
@@ -347,7 +347,7 @@ std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const
 
 std::optional<ProgramDiskCache::PermutationRecord>
 ProgramDiskCache::FindPermutation(const Digest& source, uint32_t push_data_cursor,
-                                  std::span<const uint8_t> specialization) {
+                                  std::span<const uint8_t> specialization, bool note_use) {
 	WaitLoaded();
 	std::scoped_lock lock(m_mutex);
 	if (!m_ambiguous.contains(source)) {
@@ -357,7 +357,7 @@ ProgramDiskCache::FindPermutation(const Digest& source, uint32_t push_data_curso
 				if (!record.invalid && record.cursor == push_data_cursor &&
 				    Equal(record.specialization, specialization)) {
 					m_stats.permutation_hits++;
-					NoteUsed(id);
+					if (note_use) NoteUsed(id);
 					return PermutationRecord {.id = id, .info = record.info, .spirv = record.spirv,
 					                          .spirv_plain = record.spirv_plain};
 				}

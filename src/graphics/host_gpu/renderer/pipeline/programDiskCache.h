@@ -137,10 +137,12 @@ public:
 	ProgramDiskCache& operator=(const ProgramDiskCache&) = delete;
 
 	// Both wait for the loader. The returned spans stay valid for the cache's lifetime.
-	[[nodiscard]] std::optional<SourceRecord> FindSource(const SourceKey& key);
+	// note_use=false (a precompile replay of the journal): the hit does not count as a use for
+	// evict_unused, so the journal alone does not pin every record.
+	[[nodiscard]] std::optional<SourceRecord> FindSource(const SourceKey& key, bool note_use = true);
 	[[nodiscard]] std::optional<PermutationRecord>
 	FindPermutation(const Digest& source, uint32_t push_data_cursor,
-	                std::span<const uint8_t> specialization);
+	                std::span<const uint8_t> specialization, bool note_use = true);
 
 	// No-ops for keys already present, and beyond max_file_bytes.
 	void AddSource(const SourceKey& key, bool skip_dispatch, std::span<const uint8_t> plan);
