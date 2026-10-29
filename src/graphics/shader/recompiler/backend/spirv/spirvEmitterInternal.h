@@ -184,6 +184,10 @@ struct EmitterState {
 	uint32_t                                         bindless_translation_variable = 0;
 	uint32_t                                         bindless_feedback_variable    = 0;
 	uint32_t                                         bindless_slot                 = 0;
+	// KYTY_BINDLESS_SAMPLERS: the sampler array of set 1, and the slot of the current instruction's
+	// bindless sampler (0: its sampler is not bindless).
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
 	// KYTY_BINDLESS_3D_AS_ARRAY: the raw translation entry behind bindless_slot
 	// (BindlessSlotArrayFlag marks a 2D or 2D-array texture a 3D image instruction samples).
 	uint32_t                                         bindless_translation_raw      = 0;

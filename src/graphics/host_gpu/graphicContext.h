@@ -158,6 +158,8 @@ struct GraphicContext {
 	// hold; bindless_layout is created on first use (BindlessSetLayout, under its mutex).
 	bool                               bindless_enabled                      = false;
 	uint32_t                           bindless_max_sampled_images           = 0;
+	// KYTY_BINDLESS_SAMPLERS: the update-after-bind samplers one set and one stage may hold.
+	uint32_t                           bindless_max_samplers                 = 0;
 	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
 	Common::Mutex                      bindless_layout_mutex;
 	// VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a compatible color format

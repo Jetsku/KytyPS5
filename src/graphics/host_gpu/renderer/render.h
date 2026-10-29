@@ -1122,6 +1122,7 @@ private:
 	// Bindless heaps (Senaxx; descriptors.cpp): register the stage's heaps, patch their regions,
 	// and once per frame resolve the keys draws asked for.
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void ResolveBindlessRequests();
 	void SyncWrittenBindlessEntries();
 	bool ResolveBindlessKey(BindlessHeap& heap, uint32_t key);

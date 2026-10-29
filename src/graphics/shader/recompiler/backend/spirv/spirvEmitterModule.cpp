@@ -295,6 +295,25 @@ void DefineBindlessImages(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireVersion(0x00010500u);
 	}
+	// KYTY_BINDLESS_SAMPLERS: the samplers the host mirrors from guest sampler heaps.
+	if (state.bindless_sampler_variable == 0 &&
+	    std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless)) {
+		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray,
+		                                         state.builder.Type(spv::OpTypeSampler));
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassUniformConstant, array),
+		    spv::StorageClassUniformConstant);
+		state.builder.AddName(variable, "bindless_samplers");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
+		                            IR::BindlessSamplers);
+		state.bindless_sampler_variable = variable;
+		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireVersion(0x00010500u);
+	}
 	if (!state.bindless_image_variables.empty() && state.bindless_translation_variable == 0) {
 		const auto variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),

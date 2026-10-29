@@ -440,6 +440,14 @@ struct CodegenOptions {
 	// 188-byte material records) is looked up like a plain heap; the host reads key k's T# at
 	// table_offset + k * stride. Off: only 32-byte T# arrays, as before.
 	bool bindless_strided = false;
+	// KYTY_BINDLESS_SAMPLERS=1 (default 0; on in the GT7 title preset; a minimal port of Senaxx's
+	// mirrored sampler heaps, 59cb8a83e and 269b12f77): the S# beside a bindless or runtime image
+	// that the shader reads from a sampler heap at a key it computes (four scalar reads of one V# at
+	// key * stride + offset, stride 16 or more) samples with the game's own sampler instead of the
+	// linear/wrap stand-in: the host mirrors the heap's S# records into a sampler array (set 1,
+	// binding 6) and the shader indexes it with the key. Keys outside the heap, and heaps the host
+	// cannot read, use the stand-in (slot 0). Off: the stand-in for every such sampler, as before.
+	bool bindless_samplers = false;
 	// KYTY_CALL_TRACE_REACH=1 (default 0; on in the GT7 title preset; adapted from
 	// usa-ratt/KytyPS5-GT7 a6cd035f0): when the S_SWAPPC_B64 table trace finds no unique definition
 	// of a register range across control flow, it asks the instruction-level control flow graph:

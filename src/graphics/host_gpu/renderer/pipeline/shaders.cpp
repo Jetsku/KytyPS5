@@ -194,7 +194,9 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 }
 
 static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless);
+	return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) ||
+	       std::ranges::any_of(program.info.samplers,
+	                           &ShaderRecompiler::IR::SamplerResource::bindless);
 }
 
 // Set 0 plus one push-constant range {push_stages, 0, NativePushConstantSize}; interned by

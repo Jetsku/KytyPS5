@@ -45,6 +45,20 @@ struct ResourceSpecialization {
 	bool operator==(const ResourceSpecialization&) const = default;
 };
 
+// KYTY_BINDLESS_SAMPLERS: the bindless samplers of a program (SamplerResource::bindless), and the
+// flattened-SRT offset of the two words (region base, record count) of the index-th of them, which
+// MaterializeResources appends right after the program's SRT slots.
+[[nodiscard]] inline uint32_t BindlessSamplerCount(const ShaderInfo& info) {
+	uint32_t count = 0;
+	for (const auto& sampler: info.samplers) {
+		count += sampler.bindless ? 1u : 0u;
+	}
+	return count;
+}
+[[nodiscard]] inline uint32_t BindlessSamplerMappingOffset(size_t srt_slots, uint32_t index) {
+	return static_cast<uint32_t>(srt_slots) + 2u * index;
+}
+
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);

@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -1561,6 +1562,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
+		target.bindless_sampler    = source.bindless_sampler;
 		if (target.indirect_descriptor.has_value()) {
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
 			target.indirect_descriptor->selector_first =
@@ -1603,6 +1605,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, indirect.selector ? Source(plan, indirect.selector->source) : nullptr,
 		                   plan.clean_flat_slots, indirect.selector_mask);
 		MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
+	}
+	// KYTY_BINDLESS_SAMPLERS: the host reads the sampler heap itself; the plan needs its V#.
+	for (const auto& sampler: plan.info.samplers) {
+		const auto* source = Source(plan, sampler.source);
+		if (source != nullptr && source->bindless_sampler.has_value()) {
+			MarkCleanFlatSlots(plan, source, plan.clean_flat_slots);
+		}
 	}
 	BuildSrtReadRuns(plan);
 	BuildSrtEvaluationRecipes(plan);
@@ -1689,6 +1698,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	// reads every slot on the host).
 	snapshot.gpu_fills.clear();
 	snapshot.bindless_heaps.clear();
+	snapshot.bindless_sampler_heaps.clear();
 	observed.gpu_fills = nullptr;
 	const bool gpu_fill = runtime.gpu_written != nullptr && !capture_reads &&
 	                      !program.gpu_fill_slots.empty();
@@ -1720,6 +1730,15 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			snapshot.uniform_fill = fill.fill;
 			snapshot.uniform_fill.value = stored[0];
 		}
+	}
+	// KYTY_BINDLESS_SAMPLERS: two words per bindless sampler (region base, record count) right
+	// after the SRT slots, before any image's words (BindlessSamplerMappingOffset); zeros select
+	// the stand-in sampler.
+	if (const auto bindless_samplers = BindlessSamplerCount(program.info); bindless_samplers != 0u) {
+		if (snapshot.flattened_srt.size() != program.srt_reads.size()) {
+			return false;
+		}
+		snapshot.flattened_srt.resize(snapshot.flattened_srt.size() + 2u * bindless_samplers, 0u);
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
@@ -1851,8 +1870,34 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Resources::Specialization");
 		snapshot.samplers.resize(program.info.samplers.size());
+		snapshot.bindless_sampler_heaps.clear();
+		uint32_t bindless_sampler = 0;
 		for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-			if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+			const auto  source_index = program.info.samplers[i].source;
+			const auto* source       = Source(program, source_index);
+			if (source != nullptr && source->bindless_sampler.has_value()) {
+				// KYTY_BINDLESS_SAMPLERS: the shader indexes the host's mirror of the heap; set 0
+				// binds the stand-in sampler for this resource.
+				snapshot.samplers[i].dword_count = 4u;
+				std::copy_n(BindlessDefaultSampler, 4u, snapshot.samplers[i].dwords.begin());
+				const auto mapping_offset =
+				    BindlessSamplerMappingOffset(program.srt_reads.size(), bindless_sampler++);
+				DescriptorValue      table;
+				ShaderBufferResource heap;
+				if ((active.empty() || active[source_index]) &&
+				    clean.EvaluateDescriptor(source_index, table) &&
+				    DecodeBufferDescriptor(table, heap) && heap.Base48() != 0) {
+					snapshot.bindless_sampler_heaps.push_back(
+					    {.base           = heap.Base48(),
+					     .size           = heap.GetSize(),
+					     .table_offset   = source->bindless_sampler->table_offset,
+					     .stride         = source->bindless_sampler->stride,
+					     .sampler        = i,
+					     .mapping_offset = mapping_offset});
+				}
+				continue;
+			}
+			if (!evaluate(source_index, snapshot.samplers[i])) {
 				return false;
 			}
 			if (program.info.samplers[i].gather_lod) {
@@ -1978,11 +2023,20 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
+	// KYTY_BINDLESS_SAMPLERS: where MaterializeResources put each bindless sampler's two words. A
+	// class copy below shares its source's words (and so its mirror of the heap).
+	for (uint32_t index = 0, bindless = 0; index < samplers.size(); index++) {
+		if (samplers[index].bindless) {
+			samplers[index].bindless_mapping_offset =
+			    BindlessSamplerMappingOffset(program.srt_reads.size(), bindless++);
+		}
+	}
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
 		if (index >= program.info.samplers.size()) {
-			samplers.push_back(program.info.samplers[binding.source]);
+			const auto copy = samplers[binding.source];
+			samplers.push_back(copy);
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;

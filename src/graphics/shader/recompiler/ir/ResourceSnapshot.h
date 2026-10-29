@@ -65,6 +65,21 @@ struct BindlessHeapUse {
 	bool operator==(const BindlessHeapUse&) const = default;
 };
 
+// KYTY_BINDLESS_SAMPLERS: a guest sampler heap a bindless sampler indexes. The host mirrors its S#
+// records (key k's at base + table_offset + k * stride) into the bindless sampler array and
+// patches the sampler's two flattened-SRT words (region base, record count); zeros select the
+// stand-in sampler in slot 0.
+struct BindlessSamplerHeapUse {
+	uint64_t base           = 0;
+	uint64_t size           = 0;
+	uint32_t table_offset   = 0;
+	uint32_t stride         = 16;
+	uint32_t sampler        = 0;
+	uint32_t mapping_offset = 0;
+
+	bool operator==(const BindlessSamplerHeapUse&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -75,6 +90,7 @@ struct ResourceSnapshot {
 	// Compute refreshes on the command processor only (SrtRuntime::gpu_written).
 	std::vector<SrtGpuFill>      gpu_fills;
 	std::vector<BindlessHeapUse> bindless_heaps;
+	std::vector<BindlessSamplerHeapUse> bindless_sampler_heaps;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
