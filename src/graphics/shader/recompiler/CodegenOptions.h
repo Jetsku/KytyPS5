@@ -547,6 +547,13 @@ struct CodegenOptions {
 	// V_CVT_PK_I16_I32 saturate each 32-bit source to the 16-bit range (unsigned / signed), as the
 	// guest GPU; off, the low 16 bits are packed, as before.
 	bool cvt_pk_saturate = false;
+	// KYTY_UFLOAT_STORE_RTZ=1 (default off; upstream 59d8256b3, nmzik): formatted 11/10-bit float
+	// buffer stores truncate like the guest GPU: the f32 is converted to f16 rounding toward zero
+	// (the unsigned 11/10-bit floats share its bias) and the low mantissa bits are dropped; finite
+	// overflow gives the largest finite value, negatives and NaN store zero. Off: round to nearest
+	// even, NaN stays NaN and overflow is infinity (or the largest value with
+	// KYTY_FLOAT_STORE_CLAMP), as before.
+	bool ufloat_store_rtz = false;
 	// KYTY_WORKGROUP_IMAGES=1 (default off; the GT7 preset; adapted from upstream KytyPS5 0ee880090
 	// and c23de6218, nmzik): a compute image whose T# is read from a table at
 	// workgroup_id[axis] * stride + offset (GT7's CS 0xe042c5de1f18d724: two storage T#s per Z group

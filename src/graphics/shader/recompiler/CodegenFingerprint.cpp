@@ -228,6 +228,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.cvt_pk_saturate) {
 		b.Text("cvt_pk_saturate");
 	}
+	if (options.ufloat_store_rtz) {
+		b.Text("ufloat_store_rtz");
+	}
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");
 		b.U8(options.denorm_flush_skip);
