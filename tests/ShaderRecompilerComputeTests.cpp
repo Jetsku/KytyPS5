@@ -34794,6 +34794,43 @@ TestCase ScalarFlbitI32B32Gpu() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarFlbitSignedGpu() {
+  using O = ShaderOpcode;
+
+  // RDNA2's S_FLBIT_I32 examples; 64-bit signs come from the high word.
+  constexpr u32 values32[] = {0x00000000u, 0x0000ccccu, 0xffff3333u,
+                          0x7fffffffu, 0x80000000u, 0xffffffffu};
+  constexpr uint64_t values64[] = {0x0000000000000000ull, 0xffffffffffffffffull,
+                               0x0000000100000000ull, 0xffffffff7fffffffull,
+                               0xc000000000000000ull, 0x0000000000008000ull};
+  std::vector<u32> code;
+  u32 out = 0;
+  for (const auto value : values32) {
+    AppendSMovLiteral(&code, 0, value);
+    code.push_back(EncodeSop1(0x17, 20, 0));
+    AppendStoreSgpr(&code, 20, out++);
+  }
+  for (const auto value : values64) {
+    AppendSMovLiteral(&code, 0, static_cast<u32>(value));
+    AppendSMovLiteral(&code, 1, static_cast<u32>(value >> 32u));
+    code.push_back(EncodeSop1(0x18, 20, 0));
+    AppendStoreSgpr(&code, 20, out++);
+  }
+  // A signed 64-bit source sign-extends a literal.
+  code.push_back(EncodeSop1(0x18, 20, 255));
+  code.push_back(0x80000000u);
+  AppendStoreSgpr(&code, 20, out);
+  AppendEnd(&code);
+
+  return {"ScalarFlbitSignedGpu",
+          code,
+          {},
+          {0xffffffffu, 16, 16, 1, 1, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+           31, 32, 2, 48, 33},
+          {O::S_MOV_B32, O::S_FLBIT_I32, O::S_FLBIT_I32_I64, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarSaveExecOps() {
   using O = ShaderOpcode;
 
@@ -52314,6 +52351,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
   AddCase(ScalarFlbitI32B32Gpu);
+  AddCase(ScalarFlbitSignedGpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
@@ -59711,6 +59749,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF16Ops());
     RunCase(&vulkan, ScalarBrevB64OperandsAndMasks(32));
     RunCase(&vulkan, ScalarBrevB64OperandsAndMasks(64));
+    RunCase(&vulkan, ScalarFlbitSignedGpu());
     for (bool add : {false, true}) {
       RunCase(&vulkan, DsAtomic64Bounds(add));
       for (u32 wave_size : {32, 64}) {

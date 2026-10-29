@@ -157,6 +157,8 @@ bool KeepsScc(Opcode opcode) {
 		case Opcode::S_FF1_I32_B64:
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FLBIT_I32_B64:
+		case Opcode::S_FLBIT_I32:
+		case Opcode::S_FLBIT_I32_I64:
 		case Opcode::S_BITSET0_B32:
 		case Opcode::S_BITSET1_B32:
 		case Opcode::S_BITSET0_B64:

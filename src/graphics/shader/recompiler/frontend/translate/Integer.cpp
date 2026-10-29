@@ -246,18 +246,35 @@ void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero) 
 
 void Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
 	const auto source = ReadU32(inst.src0);
-	const auto value  = sign ? ir.BitwiseXor(
-	                              source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))))
-	                         : source;
-	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {value}));
+	if (sign) {
+		// Bits equal to the sign become zero; FindILsb of the reversed bits is ~0 when none.
+		const auto bits =
+		    ir.BitwiseXor(source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))));
+		const auto reversed = ir.Emit(IR::ValueOpcode::BitReverse32, {bits});
+		WriteOperand(DestinationOperand(inst),
+		             IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {reversed})));
+		return;
+	}
+	// ResourceTracking matches this 31 - FindUMsb32 form.
+	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {source}));
 	const auto position = ir.ISub(IR::U32(IR::Value(31u)), msb);
-	const auto result   = ir.Select(ir.INotEqual(value, IR::U32(IR::Value(0u))), position,
+	const auto result   = ir.Select(ir.INotEqual(source, IR::U32(IR::Value(0u))), position,
 	                                IR::U32(IR::Value(0xffffffffu)));
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst) {
-	const auto source   = ReadU64(inst.src0);
+void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign) {
+	auto source = ReadU64(inst.src0);
+	if (sign) {
+		// S_FLBIT_I32_I64 (upstream ecc30a1f2): a literal is sign-extended, then bits equal to the
+		// sign become zero, so the search finds the first bit that differs from the sign.
+		auto words = ReadU32Pair(inst.src0);
+		if (inst.src0.kind == Decoder::OperandKind::LiteralConstant) {
+			words[1] = ir.ShiftRightArithmetic(words[0], IR::U32(IR::Value(31u)));
+		}
+		const auto mask = ir.ShiftRightArithmetic(words[1], IR::U32(IR::Value(31u)));
+		source = ir.ConstructU64(ir.BitwiseXor(words[0], mask), ir.BitwiseXor(words[1], mask));
+	}
 	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb64, {source}));
 	const auto position = ir.ISub(IR::U32(IR::Value(63u)), msb);
 	const auto nonzero =
