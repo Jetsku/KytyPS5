@@ -69,6 +69,9 @@ struct PipelineStaticParameters {
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 	// Target 0 blends with logical alpha from the second source (KYTY_BLEND_ALPHA_REMAP).
 	bool                       blend_alpha_source_remap                           = false;
+	// KYTY_AA_MASK_COVERAGE: PA_SC_AA_MASK reduced to the draw's samples when the pixel shader's copy
+	// that applies it is used (aaMaskCoverage.h); all ones otherwise.
+	uint32_t                   aa_mask[2]                                         = {0xffffffffu, 0xffffffffu};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -78,7 +81,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 127);
+static_assert(sizeof(PipelineStaticParameters) == 135);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -154,6 +157,11 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+
+		// KYTY_ASYNC_TRANSLATION: a stage's translation is on the workers (the draw is skipped, as
+		// for a pipeline that builds), or this lookup took a finished one.
+		bool translation_pending = false;
+		bool translation_taken   = false;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -250,6 +258,14 @@ public:
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                                 const GraphicsPrograms& programs, bool skippable);
 	[[nodiscard]] bool PipelineSkipEnabled() const noexcept { return m_skip != nullptr; }
+	// KYTY_ASYNC_TRANSLATION=1 (default off, live): whether the next GetGraphicsPrograms of this
+	// thread may translate new VS/PS on the workers and report translation_pending instead
+	// (RefreshShaders decides from the draw's registers; GetGraphicsPrograms resets it).
+	[[nodiscard]] static bool AsyncTranslationEnabled() noexcept;
+	static void AllowDeferredTranslation(bool allow) noexcept;
+	// A shader whose program refuses skipping (DrawRunProgramEligible): its later sources translate
+	// at once.
+	static void NoteAsyncTranslationRefused(uint64_t shader_hash);
 	// KYTY_PIPELINE_SKIP_TESS: tessellated draws may be skipped / built in the background too.
 	[[nodiscard]] static bool SkipTessellatedEnabled();
 	// KYTY_PIPELINE_SKIP_FRAME_BUDGET_US: the frame the next skippable draws belong to (CP thread).

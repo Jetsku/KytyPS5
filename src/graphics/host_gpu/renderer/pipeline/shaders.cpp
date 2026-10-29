@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/aaMaskCoverage.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -297,17 +298,38 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		// shade per sample (VUID-VkPipelineMultisampleStateCreateInfo-rasterizationSamples-01415):
 		// a pixel shader that reads its sample index runs its per-pixel copy (pixelRateVariant.h;
 		// draws of one without a copy are skipped, RenderExecutor::ExecutePreparedDraw).
-		auto module = pixel_program.module;
+		auto module     = pixel_program.module;
+		bool pixel_rate = false;
 		if (rendering.color_samples != 0 &&
 		    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
 		    !EqaaPerSampleShading()) {
 			if (const auto variant = PixelRate::Find(pixel_program.id); variant.module != nullptr) {
-				module = variant.module;
+				module     = variant.module;
+				pixel_rate = true;
+			}
+		}
+		// KYTY_AA_MASK_COVERAGE: the copy that applies the key's AA masks (of the per-pixel copy
+		// above when the draw runs that one).
+		if (static_params.aa_mask[0] != 0xffffffffu || static_params.aa_mask[1] != 0xffffffffu) {
+			if (const auto masked = AaMaskCoverage::Lookup(pixel_program.id, pixel_rate, static_params.aa_mask[0],
+			                                               static_params.aa_mask[1]);
+			    masked != nullptr) {
+				module = masked;
 			}
 		}
 		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
 		                                       .module = module,
 		                                       .pName  = "main"};
+	} else if (static_params.aa_mask[0] != 0xffffffffu || static_params.aa_mask[1] != 0xffffffffu) {
+		// KYTY_AA_MASK_COVERAGE: a draw without a pixel shader whose AA masks leave samples out (the
+		// stencil marks of a ghost car): a fragment shader that only writes its coverage.
+		if (const auto masked =
+		        AaMaskCoverage::Lookup(0, false, static_params.aa_mask[0], static_params.aa_mask[1]);
+		    masked != nullptr && shader_stage_count < std::size(shader_stages)) {
+			shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
+			                                       .module = masked,
+			                                       .pName  = "main"};
+		}
 	}
 	// One guest wave per host subgroup where the device lets the stage require it (mesh and
 	// pixel shaders on AMD); GraphicsSubgroupSize and the mesh's host_subgroup_size
@@ -316,7 +338,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	for (uint32_t index = 0; index < shader_stage_count; index++) {
 		auto&      stage   = shader_stages[index];
 		const bool is_mesh = stage.stage == vk::ShaderStageFlagBits::eMeshEXT;
-		if (!is_mesh && (stage.stage != vk::ShaderStageFlagBits::eFragment || !ps_input_info->stage)) {
+		if (!is_mesh && (stage.stage != vk::ShaderStageFlagBits::eFragment || ps_input_info == nullptr ||
+		                 !ps_input_info->stage)) {
 			continue;
 		}
 		const auto wave_size = is_mesh ? vs_input_info.mesh.wave_size
