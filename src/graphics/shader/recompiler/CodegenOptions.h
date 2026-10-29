@@ -294,6 +294,11 @@ struct CodegenOptions {
 	// ("computes a descriptor at runtime that has no BDA path"). Exact; only programs that were
 	// skipped change.
 	bool heap_key_mask = false;
+	// KYTY_SRT_IMAGE_REACH=1 (default off; upstream 9801fd862): an image that only unreached blocks
+	// use reads a zero descriptor even when its descriptor source is live through another resource,
+	// and an indirect image's table key is then not evaluated (an unreached image's key can be
+	// garbage, which refused the draw). Off: every image of a live source is materialized.
+	bool srt_image_reach = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has

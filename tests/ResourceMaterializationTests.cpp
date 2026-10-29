@@ -832,6 +832,84 @@ void TestTraceReplayMatchesWalk() {
 // single-sample dimension the instruction reads (the host binds a copy of the first sample).
 // Render-target tiling, an instruction of a multisample dimension, or the switch off: the
 // multisample dimension, as before.
+// One T# serves an image read in the entry block, an image read only behind a user-data branch,
+// and an image no block lists. With KYTY_SRT_IMAGE_REACH the guarded image reads zero while its
+// block is unreached; the others, and every image with the switch off, keep the T#.
+bool NoSpecializationRead(void *, uint64_t, std::span<uint32_t>) { return false; }
+
+void TestUnreachedImageIgnoresSharedDescriptor(bool image_reach) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TileMode;
+  auto options = Libs::Graphics::ShaderRecompiler::GetCodegenOptions();
+  const auto saved = options;
+  options.srt_image_reach = image_reach;
+  Libs::Graphics::ShaderRecompiler::SetCodegenOptions(options);
+
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 2u;
+  auto &entry = AddValueBlock(program);
+  auto &guarded = AddValueBlock(program);
+  auto &done = AddValueBlock(program);
+  for (uint32_t i = 0; i < 3u; ++i) program.block_info[i].id = i;
+  const uint32_t words[8] = {
+      0x0120fc00u, static_cast<uint32_t>(BufferFormat::k32Float) << 20u | 0xc0000000u,
+      0x021bc1dfu,
+      static_cast<uint32_t>(ImageType::kColor2D) << 28u |
+          static_cast<uint32_t>(TileMode::kRenderTarget) << 20u | 0xfacu,
+      0u, 0u, 0u, 0u};
+  DescriptorSource source;
+  source.dword_count = 8u;
+  for (uint32_t i = 0; i < 8u; ++i) source.dwords[i] = Value(words[i]);
+  program.descriptor_sources.push_back(source);
+  for (uint32_t image = 0; image < 3u; ++image)
+    program.info.images.push_back(
+        {.source = 0u,
+         .resource_class = ImageResourceClass::Sampled,
+         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+         .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  for (uint32_t image = 0; image < 2u; ++image)
+    program.memory_info.push_back({.kind = ResourceKind::Image, .resource = image});
+  entry.AppendNewInst(ValueOpcode::ImageRead, {Value(0u), Value(0u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 0});
+  guarded.AppendNewInst(ValueOpcode::ImageRead, {Value(0u), Value(0u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
+  const auto user = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(1))}));
+  program.block_info[0].condition =
+      Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {user, Value(0u)}));
+  program.block_info[0].terminator.kind = TerminatorKind::ConditionalBranch;
+  program.block_info[0].terminator.true_block = 1u;
+  program.block_info[0].terminator.false_block = 2u;
+  program.block_info[1].terminator.kind = TerminatorKind::Branch;
+  program.block_info[1].terminator.true_block = 2u;
+  program.block_info[2].terminator.kind = TerminatorKind::Return;
+  auto plan = ExtractResourcePlan(program);
+  Check(!plan.control_flow.empty(), "image reach test plan has no control flow");
+  for (const uint32_t reached : {0u, 1u}) {
+    const std::array<uint32_t, 2> data{0u, reached};
+    const SrtRuntime runtime{.user_data = data,
+                             .read_specialization_memory = NoSpecializationRead};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 3u,
+          "image reach test failed to materialize");
+    for (uint32_t image = 0; image < 3u; ++image) {
+      const bool zero = image_reach && image == 1u && reached == 0u;
+      for (uint32_t i = 0; i < 8u; ++i) {
+        Check(snapshot.images[image].dwords[i] == (zero ? 0u : words[i]),
+              zero ? "unreached image kept the shared descriptor"
+                   : "reached or unlisted image lost the shared descriptor");
+      }
+    }
+  }
+  Libs::Graphics::ShaderRecompiler::SetCodegenOptions(saved);
+}
+
 void TestMultisampleDepthReadAsSingleSample() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
@@ -936,6 +1014,7 @@ int main() {
   TestGpuFillSlotsLeaveShaderOnlyReads();
   }
   TestMultisampleDepthReadAsSingleSample();
+  for (const bool image_reach : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(image_reach);
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

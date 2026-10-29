@@ -742,6 +742,8 @@ struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
 	std::vector<uint32_t> successors;
+	// Descriptor sources the block reads; with KYTY_SRT_IMAGE_REACH an entry
+	// descriptor_sources.size() + i also marks image i (ImageActiveSlot, SrtWalker.h).
 	std::vector<uint32_t> sources;
 };
 

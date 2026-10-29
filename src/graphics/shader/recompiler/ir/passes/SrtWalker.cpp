@@ -940,7 +940,7 @@ void BuildSrtEvaluationRecipes(ResourcePlan& program) {
 		program.flat_read_roots[slot] = compile(program.srt_reads[slot].value);
 	}
 	program.condition_roots.resize(program.control_flow.size());
-	program.initial_active_sources.assign(program.descriptor_sources.size(), 1u);
+	program.initial_active_sources.assign(ActiveSlotCount(program), 1u);
 	for (size_t block = 0; block < program.control_flow.size(); ++block) {
 		const auto& flow = program.control_flow[block];
 		program.condition_roots[block] = compile(flow.condition);
@@ -2186,7 +2186,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSourcesImpl() {
 	} else if (decoded) {
 		active = m_program.initial_active_sources;
 	} else {
-		active.assign(m_program.descriptor_sources.size(), 1u);
+		active.assign(ActiveSlotCount(m_program), 1u);
 		for (const auto& block: m_program.control_flow) {
 			for (const auto source: block.sources) {
 				active.at(source) = 0u;
