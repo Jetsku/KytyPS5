@@ -37943,6 +37943,67 @@ TestCase VectorVop3LshlrevB64Captured() {
   return test;
 }
 
+TestCase VectorVop3AshrrevI64Operands() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorVop3AshrrevI64Operands";
+  test.initial = {33u, 0x89abcdefu, 0xfedcba98u};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store_result = [&](u32 dst, uint64_t value, u32 count) {
+    const auto output = static_cast<u32>(test.expected.size());
+    AppendStoreVgpr(&code, dst, output);
+    AppendStoreVgpr(&code, dst + 1u, output + 1u);
+    const auto expected = ReferenceAshrI64(value, count);
+    test.expected.push_back(static_cast<u32>(expected));
+    test.expected.push_back(static_cast<u32>(expected >> 32u));
+  };
+
+  constexpr uint64_t value = 0xfedcba9889abcdefull;
+  AppendVMovU32(&code, 30, sizeof(u32));
+  AppendBufferLoadDword(&code, 2, 30);
+  AppendVMovU32(&code, 30, 2u * sizeof(u32));
+  AppendBufferLoadDword(&code, 3, 30);
+  code.push_back(0xd7010007u);
+  code.push_back(0x00020498u);
+  store_result(7, value, 24u);
+
+  AppendSMovLiteral(&code, 106, static_cast<u32>(value));
+  AppendSMovLiteral(&code, 107, static_cast<u32>(value >> 32u));
+  AppendVMovU32(&code, 12, 68);
+  code.push_back(0xd7010001u);
+  code.push_back(0x0000d50cu);
+  store_result(1, value, 68u);
+
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 12, 30);
+  for (const u32 literal : {0u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+    const uint64_t extended =
+        literal | ((literal & 0x80000000u) != 0 ? 0xffffffff00000000ull : 0ull);
+    for (const u32 count : {0u, 1u, 31u, 32u, 63u, 64u}) {
+      AppendVop3(&code, 0x301, 7, InlineU32(count), 255u);
+      code.push_back(literal);
+      store_result(7, extended, count);
+    }
+    AppendVop3(&code, 0x301, 7, Vgpr(12), 255u);
+    code.push_back(literal);
+    store_result(7, extended, 33u);
+  }
+  AppendVop3(&code, 0x301, 7, Vgpr(12), 193u);
+  store_result(7, UINT64_MAX, 33u);
+  AppendVMovLiteral(&code, 7, static_cast<u32>(value));
+  AppendVMovLiteral(&code, 8, static_cast<u32>(value >> 32u));
+  AppendVop3(&code, 0x301, 7, Vgpr(12), Vgpr(7));
+  store_result(7, value, 33u);
+
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_ASHRREV_I64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftRightArithmetic", "OpTypeInt 64 0"};
+  return test;
+}
+
 TestCase VectorDynamicU64ShiftEdges() {
   using O = ShaderOpcode;
   TestCase test;
@@ -37960,10 +38021,12 @@ TestCase VectorDynamicU64ShiftEdges() {
       // A buffer load prevents the constant-shift specialization.
       AppendVMovU32(&code, 30, index * sizeof(u32));
       AppendBufferLoadDword(&code, 3, 30);
-      for (const bool left : {true, false}) {
-        AppendVop3(&code, left ? 0x2ff : 0x300, 33, Vgpr(3), Vgpr(4));
+      for (const u32 opcode : {0x2ffu, 0x300u, 0x301u}) {
+        AppendVop3(&code, opcode, 33, Vgpr(3), Vgpr(4));
         const auto amount = test.initial[index] & 63u;
-        const auto expected = left ? source << amount : source >> amount;
+        const auto expected = opcode == 0x2ffu ? source << amount
+                              : opcode == 0x300u ? source >> amount
+                                                 : ReferenceAshrI64(source, amount);
         const auto output = static_cast<u32>(test.expected.size());
         AppendStoreVgpr(&code, 33, output);
         AppendStoreVgpr(&code, 34, output + 1u);
@@ -37975,9 +38038,10 @@ TestCase VectorDynamicU64ShiftEdges() {
   AppendEnd(&code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64,
-                  O::V_LSHRREV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+                  O::V_LSHRREV_B64, O::V_ASHRREV_I64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpShiftLeftLogical", "OpShiftRightLogical",
-                         "OpTypeInt 64 0"};
+                         "OpShiftRightArithmetic", "OpTypeInt 64 0"};
   return test;
 }
 
@@ -52280,6 +52344,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarAshrI64Masks(32));
   cases.push_back(ScalarAshrI64Masks(64));
   AddCase(VectorDynamicU64ShiftEdges);
+  AddCase(VectorVop3AshrrevI64Operands);
   AddCase(ScalarConditionalMoveB64);
   AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
@@ -60297,6 +60362,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarDynamic64BitOps());
     RunCase(&vulkan, VectorDynamicU64ShiftEdges());
+    RunCase(&vulkan, VectorVop3AshrrevI64Operands());
     RunCase(&vulkan, ScalarAshrI64Edges(false));
     RunCase(&vulkan, ScalarAshrI64Edges(true));
     RunCase(&vulkan, VectorCompareInteger64Edges());

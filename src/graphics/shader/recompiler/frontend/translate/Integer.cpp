@@ -152,6 +152,12 @@ void Translator::SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode
 		const auto arg_type = IR::ArgTypeOf(opcode, index);
 		const auto& operand = SourceAt(inst, reverse && index < 2u ? 1u - index : index);
 		args[index]         = ReadOperand(operand, arg_type == IR::Type::Void ? type : arg_type);
+		if (opcode == IR::ValueOpcode::ShiftRightArithmetic64 && index == 0u &&
+		    operand.kind == Decoder::OperandKind::LiteralConstant) {
+			args[index] = ir.ConstructU64(
+			    ReadU32(operand),
+			    IR::U32(IR::Value((operand.value & 0x80000000u) ? 0xffffffffu : 0u)));
+		}
 		if (mask_shift_count && index == 1u) {
 			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(31u)));
 		}
