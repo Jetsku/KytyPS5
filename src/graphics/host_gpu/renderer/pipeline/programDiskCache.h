@@ -38,7 +38,10 @@ namespace Libs::Graphics {
 //   it with this run's records (so a build or switch change costs one cold run).
 //
 // File: header (magic, format, identity, checksum), then records (magic, kind, size, XXH3-64 of
-// the payload, payload). Loading rejects the whole file on any header mismatch and keeps records
+// the payload, payload). A packed permutation (KYTY_PROGRAM_CACHE_COMPRESS) keeps its lookup key
+// (source digest, cursor, specialization) plain and its info and SPIR-V as one zstd frame, which
+// is expanded on its first hit (and kept expanded for the cache's lifetime); the size cap counts
+// stored bytes, so about four times as many programs fit. Loading rejects the whole file on any header mismatch and keeps records
 // up to the first damaged one (bad magic, size or checksum: a truncated or corrupt tail).
 //
 // Threads: the file is read and indexed on a loader thread started by the constructor; lookups
@@ -62,6 +65,9 @@ public:
 		// unused loaded records first, then the used ones, then this run's: the file order is the
 		// order of last use across runs, so the oldest-unused records go first.
 		bool                  evict_unused = false;
+		// KYTY_PROGRAM_CACHE_COMPRESS: zstd level for permutations added by this run (0: stored
+		// plain). Loading reads plain and packed records either way.
+		int                   compress_level = 0;
 		// Coalescing (see Due()), like the driver pipeline cache saves: after a burst (at least
 		// min_new new records, none for settle_ns, a third of an interval since the last save),
 		// after a trickle (none for settle_ns, an interval since the last save), and after three
@@ -128,6 +134,13 @@ public:
 		uint64_t evicted          = 0; // loaded records dropped for room (evict_unused)
 		uint64_t evicted_bytes    = 0;
 		uint64_t restored         = 0; // evicted records used again this run and kept
+		uint64_t packed_added     = 0; // permutations this run stored packed
+		uint64_t packed_raw_bytes = 0; // their payload bytes before / after packing
+		uint64_t packed_bytes     = 0;
+		uint64_t pack_ns          = 0;
+		uint64_t expanded         = 0; // packed records expanded by a hit
+		uint64_t expanded_bytes   = 0;
+		uint64_t expand_ns        = 0;
 	};
 
 	explicit ProgramDiskCache(Settings settings);
@@ -167,6 +180,7 @@ public:
 	static constexpr uint32_t RecordMagic      = 0x4352504bu; // "KPRC"
 	static constexpr uint32_t RecordSource      = 1;
 	static constexpr uint32_t RecordPermutation = 2;
+	static constexpr uint32_t RecordPermutationPacked = 3;
 	static constexpr size_t   RecordHeaderBytes = 4 + 4 + 8 + 8;
 
 private:
@@ -187,6 +201,11 @@ private:
 		std::span<const uint8_t> info;
 		std::span<const uint8_t> spirv;
 		std::span<const uint8_t> spirv_plain;
+		// Packed permutations: the zstd frame of info + SPIR-V; info and spirv are empty until
+		// Expand fills them (expanded).
+		std::span<const uint8_t> packed;
+		uint32_t                 raw_size = 0;
+		bool                     expanded = true;
 		bool                     invalid = false;
 		// evict_unused: returned by a lookup this run; left out of saves.
 		bool                     used    = false;
@@ -196,6 +215,11 @@ private:
 	void Load();
 	void WaitLoaded();
 	bool ParseRecord(std::span<const uint8_t> bytes, Record& record) const;
+	// Parses the expanded body of a packed permutation (info, SPIR-V, plain SPIR-V).
+	static bool ParseBody(std::span<const uint8_t> body, Record& record);
+	// Takes and returns `lock` (on m_mutex): expands the packed record `id`, unlocked while
+	// decompressing. False when the frame is damaged (the record is then invalidated).
+	bool Expand(uint32_t id, std::unique_lock<std::mutex>& lock);
 	// Requires m_mutex. Adds a parsed record to the index; false when it was a duplicate or made
 	// its digest ambiguous (the record is then not indexed).
 	bool IndexRecord(uint32_t id);
@@ -215,6 +239,7 @@ private:
 	bool                    m_loaded = false;
 	std::vector<uint8_t>    m_file;           // loaded file contents (records point into it)
 	std::deque<std::vector<uint8_t>> m_added; // records added by this run (stable storage)
+	std::deque<std::vector<uint8_t>> m_expanded; // bodies of expanded packed records
 	std::vector<Record>     m_records;
 	uint32_t                m_loaded_count = 0; // records [0, m_loaded_count) came from the file
 	bool                    m_order_dirty  = false; // evict_unused: use order changed since the last save

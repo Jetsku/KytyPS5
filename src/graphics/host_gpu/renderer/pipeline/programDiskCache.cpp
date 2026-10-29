@@ -10,10 +10,12 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <string_view>
 #include <system_error>
 #include <utility>
 #include <xxhash.h>
+#include <zstd.h>
 
 namespace Libs::Graphics {
 
@@ -70,6 +72,7 @@ public:
 	}
 
 	std::span<const uint8_t> Sized() { return Take(Get<uint32_t>()); }
+	std::span<const uint8_t> Rest() { return Take(m_failed ? 0 : m_bytes.size() - m_position); }
 	std::span<const uint8_t> SizedWords() { return Take(uint64_t {Get<uint32_t>()} * 4u); }
 
 	[[nodiscard]] bool   Failed() const { return m_failed; }
@@ -146,7 +149,7 @@ bool ProgramDiskCache::ParseRecord(std::span<const uint8_t> bytes, Record& recor
 	const auto size     = header.Get<uint64_t>();
 	const auto checksum = header.Get<uint64_t>();
 	if (header.Failed() || magic != RecordMagic ||
-	    (kind != RecordSource && kind != RecordPermutation) ||
+	    (kind != RecordSource && kind != RecordPermutation && kind != RecordPermutationPacked) ||
 	    size != bytes.size() - RecordHeaderBytes) {
 		return false;
 	}
@@ -175,12 +178,62 @@ bool ProgramDiskCache::ParseRecord(std::span<const uint8_t> bytes, Record& recor
 	} else {
 		record.cursor         = c.Get<uint32_t>();
 		record.specialization = c.Sized();
-		record.info           = c.Sized();
-		record.spirv          = c.SizedWords();
-		record.spirv_plain    = c.SizedWords();
-		if (record.spirv.empty()) return false;
+		if (kind == RecordPermutationPacked) {
+			record.raw_size = c.Get<uint32_t>();
+			record.packed   = c.Rest();
+			record.expanded = false;
+			// The frame must declare the body size (checked again when it is expanded).
+			return !c.Failed() && record.raw_size != 0 && !record.packed.empty() &&
+			       ZSTD_getFrameContentSize(record.packed.data(), record.packed.size()) ==
+			           record.raw_size;
+		}
+		return !c.Failed() && ParseBody(c.Rest(), record);
 	}
 	return c.AtEnd();
+}
+
+bool ProgramDiskCache::ParseBody(std::span<const uint8_t> body, Record& record) {
+	Cursor c(body);
+	record.info        = c.Sized();
+	record.spirv       = c.SizedWords();
+	record.spirv_plain = c.SizedWords();
+	return !record.spirv.empty() && c.AtEnd();
+}
+
+bool ProgramDiskCache::Expand(uint32_t id, std::unique_lock<std::mutex>& lock) {
+	if (m_records[id].expanded) return true;
+	const auto packed   = m_records[id].packed; // immutable storage (m_file or m_added)
+	const auto raw_size = m_records[id].raw_size;
+	lock.unlock();
+	const auto           begin = NowNs();
+	std::vector<uint8_t> body(raw_size);
+	const auto size = ZSTD_decompress(body.data(), body.size(), packed.data(), packed.size());
+	Record     parsed;
+	const bool ok   = ZSTD_isError(size) == 0 && size == body.size() && ParseBody(body, parsed);
+	const auto ns   = NowNs() - begin;
+	lock.lock();
+	auto& record = m_records[id];
+	if (record.expanded) return true; // another lookup expanded it meanwhile
+	if (!ok) {
+		if (!record.invalid) {
+			record.invalid = true;
+			if (!record.evicted) m_bytes -= record.bytes.size();
+			m_changes++;
+			m_last_change_ns = NowNs();
+			m_stats.invalidated++;
+		}
+		return false;
+	}
+	// A moved vector keeps its buffer, so the parsed spans stay valid.
+	m_expanded.push_back(std::move(body));
+	record.info        = parsed.info;
+	record.spirv       = parsed.spirv;
+	record.spirv_plain = parsed.spirv_plain;
+	record.expanded    = true;
+	m_stats.expanded++;
+	m_stats.expanded_bytes += raw_size;
+	m_stats.expand_ns += ns;
+	return true;
 }
 
 bool ProgramDiskCache::IndexRecord(uint32_t id) {
@@ -349,23 +402,33 @@ std::optional<ProgramDiskCache::PermutationRecord>
 ProgramDiskCache::FindPermutation(const Digest& source, uint32_t push_data_cursor,
                                   std::span<const uint8_t> specialization, bool note_use) {
 	WaitLoaded();
-	std::scoped_lock lock(m_mutex);
-	if (!m_ambiguous.contains(source)) {
-		if (const auto found = m_permutations.find(source); found != m_permutations.end()) {
-			for (const auto id: found->second) {
-				const auto& record = m_records[id];
-				if (!record.invalid && record.cursor == push_data_cursor &&
-				    Equal(record.specialization, specialization)) {
-					m_stats.permutation_hits++;
-					if (note_use) NoteUsed(id);
-					return PermutationRecord {.id = id, .info = record.info, .spirv = record.spirv,
-					                          .spirv_plain = record.spirv_plain};
+	std::unique_lock lock(m_mutex);
+	for (;;) {
+		auto match = UINT32_MAX;
+		if (!m_ambiguous.contains(source)) {
+			if (const auto found = m_permutations.find(source); found != m_permutations.end()) {
+				for (const auto id: found->second) {
+					const auto& record = m_records[id];
+					if (!record.invalid && record.cursor == push_data_cursor &&
+					    Equal(record.specialization, specialization)) {
+						match = id;
+						break;
+					}
 				}
 			}
 		}
+		if (match == UINT32_MAX) {
+			m_stats.permutation_misses++;
+			return std::nullopt;
+		}
+		// A packed record whose frame turns out damaged is invalidated: look again.
+		if (!Expand(match, lock) || m_records[match].invalid) continue;
+		m_stats.permutation_hits++;
+		if (note_use) NoteUsed(match);
+		const auto& record = m_records[match];
+		return PermutationRecord {.id = match, .info = record.info, .spirv = record.spirv,
+		                          .spirv_plain = record.spirv_plain};
 	}
-	m_stats.permutation_misses++;
-	return std::nullopt;
 }
 
 void ProgramDiskCache::AppendRecord(uint32_t kind, const std::vector<uint8_t>& payload,
@@ -434,12 +497,51 @@ void ProgramDiskCache::AddPermutation(const Digest& source, uint32_t push_data_c
 	payload.insert(payload.end(), source.begin(), source.end());
 	Put<uint32_t>(payload, push_data_cursor);
 	PutBytes(payload, specialization);
+	const auto key_size = payload.size();
 	PutBytes(payload, info);
 	PutWords(payload, spirv);
 	PutWords(payload, spirv_plain);
+	auto     kind      = RecordPermutation;
+	uint64_t pack_ns   = 0;
+	uint64_t raw_bytes = 0;
+	if (m_settings.compress_level > 0) {
+		// Packed: the key stays plain (the index reads it), the body becomes one zstd frame.
+		const auto begin = NowNs();
+		const auto body  = std::span<const uint8_t>(payload).subspan(key_size);
+		std::vector<uint8_t> packed(key_size + 4 + ZSTD_compressBound(body.size()));
+		std::memcpy(packed.data(), payload.data(), key_size);
+		const auto raw_size = static_cast<uint32_t>(body.size());
+		std::memcpy(packed.data() + key_size, &raw_size, sizeof(raw_size));
+		// The frame carries its content checksum: a damaged frame fails to expand instead of
+		// returning wrong SPIR-V.
+		thread_local std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context(ZSTD_createCCtx(),
+		                                                                           &ZSTD_freeCCtx);
+		size_t size = static_cast<size_t>(-1);
+		if (context != nullptr &&
+		    ZSTD_isError(ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel,
+		                                        m_settings.compress_level)) == 0 &&
+		    ZSTD_isError(ZSTD_CCtx_setParameter(context.get(), ZSTD_c_checksumFlag, 1)) == 0) {
+			size = ZSTD_compress2(context.get(), packed.data() + key_size + 4,
+			                      packed.size() - key_size - 4, body.data(), body.size());
+		}
+		if (ZSTD_isError(size) == 0 && body.size() == raw_size && key_size + 4 + size < payload.size()) {
+			packed.resize(key_size + 4 + size);
+			raw_bytes = payload.size();
+			payload   = std::move(packed);
+			kind      = RecordPermutationPacked;
+		}
+		pack_ns = NowNs() - begin;
+	}
 	{
 		std::scoped_lock lock(m_mutex);
-		AppendRecord(RecordPermutation, payload, source);
+		const auto added = m_stats.added_permutations;
+		AppendRecord(kind, payload, source);
+		if (kind == RecordPermutationPacked && m_stats.added_permutations != added) {
+			m_stats.packed_added++;
+			m_stats.packed_raw_bytes += raw_bytes;
+			m_stats.packed_bytes += payload.size();
+		}
+		m_stats.pack_ns += pack_ns;
 	}
 	m_saver_cv.notify_all();
 }
@@ -646,11 +748,25 @@ bool ProgramDiskCache::Save(bool final_save) {
 	}
 	if (!m_settings.quiet) {
 		if (ok) {
+			std::string packing;
+			{
+				std::scoped_lock lock(m_mutex);
+				if (m_stats.packed_added != 0 || m_stats.expanded != 0) {
+					packing = fmt::format(
+					    "; packed {} new permutations {:.1f} -> {:.1f} MiB in {:.0f} ms, expanded {} "
+					    "({:.1f} MiB) in {:.0f} ms",
+					    m_stats.packed_added, static_cast<double>(m_stats.packed_raw_bytes) / (1024.0 * 1024.0),
+					    static_cast<double>(m_stats.packed_bytes) / (1024.0 * 1024.0),
+					    static_cast<double>(m_stats.pack_ns) / 1.0e6, m_stats.expanded,
+					    static_cast<double>(m_stats.expanded_bytes) / (1024.0 * 1024.0),
+					    static_cast<double>(m_stats.expand_ns) / 1.0e6);
+				}
+			}
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Program cache: saved {} records ({:.1f} MiB) to {} ({}, {:.1f} ms)\n",
+			    "Program cache: saved {} records ({:.1f} MiB) to {} ({}, {:.1f} ms{})\n",
 			    records.size(), static_cast<double>(written) / (1024.0 * 1024.0),
 			    Common::PathToString(path), final_save ? "exit" : "periodic",
-			    static_cast<double>(ns) / 1.0e6));
+			    static_cast<double>(ns) / 1.0e6, packing));
 		} else {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Program cache: failed to write {}{}\n", Common::PathToString(path),

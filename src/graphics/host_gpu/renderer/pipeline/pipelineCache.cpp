@@ -7204,6 +7204,9 @@ void PipelineCache::InitializeProgramDiskCache() {
 	// KYTY_PROGRAM_CACHE_EVICT=1 (default 0): at the limit, records this run has not used make room
 	// for new ones (ProgramDiskCache::Settings::evict_unused); GT7 outgrows 3584 MiB in two runs.
 	settings.evict_unused = EnvU64("KYTY_PROGRAM_CACHE_EVICT", 0) != 0;
+	// KYTY_PROGRAM_CACHE_COMPRESS=<zstd level 1..19> (default 0): new permutations are stored packed
+	// (ProgramDiskCache::Settings::compress_level); SPIR-V packs ~4x, so MAX_MB holds ~4x the programs.
+	settings.compress_level = static_cast<int>(std::min<uint64_t>(EnvU64("KYTY_PROGRAM_CACHE_COMPRESS", 0), 19u));
 	const auto& properties  = m_graphics.GetPhysicalDeviceProperties();
 	const auto  device      = fmt::format("device {:08x}:{:08x}:{:08x}", properties.vendorID,
 	                                      properties.deviceID, properties.driverVersion);

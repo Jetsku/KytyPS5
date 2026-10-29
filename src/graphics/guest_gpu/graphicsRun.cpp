@@ -5162,18 +5162,23 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 	switch (kind) {
 		case CpSeq::OpKind::WaitRegMem: {
 			const auto address = static_cast<const CpSeq::WaitRegMemOp*>(payload)->addr;
-			Profiler::CountFrameEvent(address >= m_last_label_begin && address < m_last_label_end
-			                              ? Profiler::FrameEvent::CpSeqBarrierWaitSelfLabel
-			                              : Profiler::FrameEvent::CpSeqBarrierWaitOther);
+			const bool self = address >= m_last_label_begin && address < m_last_label_end;
+			Profiler::CountFrameEvent(self ? Profiler::FrameEvent::CpSeqBarrierWaitSelfLabel
+			                               : Profiler::FrameEvent::CpSeqBarrierWaitOther);
+			CpGaps::NoteStop(self ? CpGaps::Stop::WaitSelfLabel : CpGaps::Stop::WaitOther);
 			break;
 		}
 		case CpSeq::OpKind::WaitFlipDone:
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqBarrierFlipWait);
+			CpGaps::NoteStop(CpGaps::Stop::FlipWait);
 			break;
 		case CpSeq::OpKind::Predication:
 		case CpSeq::OpKind::CondExec:
 		case CpSeq::OpKind::Branch:
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqBarrierCondition);
+			CpGaps::NoteStop(kind == CpSeq::OpKind::Predication ? CpGaps::Stop::Predication
+			                 : kind == CpSeq::OpKind::CondExec  ? CpGaps::Stop::CondExec
+			                                                    : CpGaps::Stop::Branch);
 			break;
 		default: break;
 	}
@@ -5228,6 +5233,7 @@ bool CommandProcessor::AwaitPendingWrites(uint64_t begin, uint64_t end) {
 		return true;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPendingWriteStops);
+	CpGaps::NoteStop(CpGaps::Stop::PendingWrite);
 	if (!m_sequencer->Wait([this, needed] { return m_sequencer->Executed() >= needed; }, needed,
 	                       needed)) {
 		return false;
@@ -5242,6 +5248,12 @@ bool CommandProcessor::AwaitPendingWrites(uint64_t begin, uint64_t end) {
 	return true;
 }
 
+// KYTY_CP_SEQ_FINE_READS (live, default 0): the sequencer's guest reads (register-indirect pairs,
+// command bytes) test the 1 KiB GPU-touched marks instead of the 4 KiB ones (gpuTouchedPages.h:
+// both maps are sticky, exact and maintained from the start), so data that only shares a page
+// with GPU-written bytes is read directly instead of stopping the parse for a lockstep read.
+static Live::Switch g_seq_fine_reads("KYTY_CP_SEQ_FINE_READS", Live::ParseDefaultOff);
+
 bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* dst) {
 	if (size == 0) {
 		return true;
@@ -5249,7 +5261,7 @@ bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* 
 	if (!AwaitPendingWrites(address, address + size)) {
 		return false;
 	}
-	if (!GpuTouched::g_pages.AnyTouched(address, address + size)) {
+	if (!GpuTouched::AnyTouched(g_seq_fine_reads.On(), address, address + size)) {
 		// Never GPU-touched: the backing is authoritative and the read cannot fault
 		// (gpuTouchedPages.h); the serial CP would read the same bytes (P3-SEQUENCER.md 2.5).
 		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqDirectReads);
@@ -5257,6 +5269,10 @@ bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* 
 		return true;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqLockstepReads);
+	CpGaps::NoteStop(CpGaps::Stop::RegisterRead, address);
+	if (CpGaps::Enabled() && !GpuTouched::g_fine_pages.AnyTouched(address, address + size)) {
+		CpGaps::NoteStop(CpGaps::Stop::RegisterReadFineClean);
+	}
 	CpSeq::LockstepReadOp op;
 	op.address     = address;
 	op.size        = size;
@@ -5280,7 +5296,7 @@ bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {
 	if (!AwaitPendingWrites(rest_begin, rest_end)) {
 		return false;
 	}
-	if (cursor.copy == nullptr && !GpuTouched::g_pages.AnyTouched(rest_begin, rest_end)) {
+	if (cursor.copy == nullptr && !GpuTouched::AnyTouched(g_seq_fine_reads.On(), rest_begin, rest_end)) {
 		cursor.checked_epoch = m_barrier_epoch;
 		return true;
 	}
@@ -5293,6 +5309,7 @@ bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {
 	// GPU-touched command bytes (or a copy a CP write made stale): the resolver copies the rest
 	// of the buffer at this point of the stream.
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqLockstepBuffers);
+	CpGaps::NoteStop(CpGaps::Stop::CommandBytes, rest_begin);
 	auto copy = std::make_shared<std::vector<uint32_t>>(rest_dw);
 	CpSeq::LockstepReadOp op;
 	op.address     = rest_begin;

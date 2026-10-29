@@ -1,7 +1,11 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -37,6 +41,10 @@ struct Report {
 	uint64_t start_tsc = 0;
 	uint64_t frames    = 0;
 };
+
+std::array<std::atomic<uint64_t>, StopCount> g_stops {};
+std::mutex                                  g_stop_regions_mutex;
+std::unordered_map<uint64_t, uint64_t>      g_stop_regions; // 2 MiB region -> register reads
 
 Report& GetReport() {
 	static Report report; // GPU thread only
@@ -117,6 +125,32 @@ void Print(ThreadState& state, Report& report, uint64_t now_ns, uint64_t now_tsc
 		line += text;
 	}
 	state.events = {};
+	static constexpr const char* stop_names[] = {"wait-self", "wait-other", "flip-wait", "predication",
+	                                             "cond-exec", "branch",     "reg-read",  "cmd-bytes",
+	                                             "pending-write", "reg-read-fine-clean"};
+	static_assert(sizeof(stop_names) / sizeof(stop_names[0]) == StopCount, "one name per stop");
+	line += " | stops/f:";
+	for (size_t i = 0; i < StopCount; i++) {
+		std::snprintf(text, sizeof(text), " %s %.1f", stop_names[i],
+		              static_cast<double>(g_stops[i].exchange(0, std::memory_order_relaxed)) / frames);
+		line += text;
+	}
+	{
+		std::vector<std::pair<uint64_t, uint64_t>> regions;
+		{
+			std::scoped_lock lock(g_stop_regions_mutex);
+			regions.assign(g_stop_regions.begin(), g_stop_regions.end());
+			g_stop_regions.clear();
+		}
+		std::sort(regions.begin(), regions.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		if (!regions.empty()) line += " | reg-read regions/f:";
+		for (size_t i = 0; i < std::min<size_t>(regions.size(), 4); i++) {
+			std::snprintf(text, sizeof(text), " 0x%" PRIx64 " %.1f", regions[i].first << 21u,
+			              static_cast<double>(regions[i].second) / frames);
+			line += text;
+		}
+	}
 	if (ledger.Overflows() != 0) {
 		std::snprintf(text, sizeof(text), " | overflows %" PRIu64, ledger.Overflows());
 		line += text;
@@ -152,6 +186,14 @@ void AttachThread() {
 	std::printf("CpGaps: command-processor time accounting on (KYTY_CP_GAP_STATS), TSC %.3f GHz\n",
 	            state.ticks_per_ns);
 	std::fflush(stdout);
+}
+
+void NoteStopSlow(Stop stop, uint64_t address) noexcept {
+	g_stops[static_cast<size_t>(stop)].fetch_add(1, std::memory_order_relaxed);
+	if (stop == Stop::RegisterRead) {
+		std::scoped_lock lock(g_stop_regions_mutex);
+		g_stop_regions[address >> 21u]++;
+	}
 }
 
 void NoteFrame() {

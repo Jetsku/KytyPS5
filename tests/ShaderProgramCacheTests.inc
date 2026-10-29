@@ -681,6 +681,75 @@ void CheckCacheFile() {
     Require(name, "evict", !cache.FindSource(second.key).has_value(),
             "the oldest unused record was not the one evicted");
   }
+  // KYTY_PROGRAM_CACHE_COMPRESS: packed permutations come back byte-equal (in this run and the
+  // next), a plain file stays readable and mixes with packed records, and a packed record whose
+  // frame is damaged behind a valid checksum is dropped on its first hit.
+  {
+    // Repetitive SPIR-V (packs well, like real modules).
+    std::vector<u32> big_spirv;
+    for (u32 i = 0; i < 4096; i++) big_spirv.push_back(first.spirv[i % first.spirv.size()]);
+    WriteFileBytes(path, file);
+    {
+      auto packing = settings(identity_a);
+      packing.compress_level = 3;
+      ProgramDiskCache cache(packing);
+      check_complete(cache); // plain records of the old file
+      cache.AddPermutation(first.key.digest, 12, first.specialization, first.info, big_spirv,
+                           first.spirv);
+      const auto stats = cache.GetStats();
+      Require(name, "pack", stats.packed_added == 1 && stats.packed_bytes < stats.packed_raw_bytes,
+              "the new permutation was not stored packed");
+      const auto again = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      Require(name, "pack",
+              again.has_value() && SameBytes(again->info, first.info) &&
+                  SameBytes(again->spirv, WordBytes(big_spirv)) &&
+                  SameBytes(again->spirv_plain, WordBytes(first.spirv)),
+              "the packed permutation did not come back in its run");
+      Require(name, "pack", cache.Flush(), "the save failed");
+    }
+    const auto packed_file = ReadFileBytes(path);
+    Require(name, "pack", packed_file.size() < file.size() + big_spirv.size() * sizeof(u32) / 2,
+            "the saved file is not smaller than its plain form");
+    {
+      ProgramDiskCache cache(settings(identity_a)); // plain run reads packed records
+      check_complete(cache);
+      const auto packed = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      Require(name, "unpack",
+              packed.has_value() && SameBytes(packed->info, first.info) &&
+                  SameBytes(packed->spirv, WordBytes(big_spirv)) &&
+                  SameBytes(packed->spirv_plain, WordBytes(first.spirv)),
+              "the packed permutation did not come back in the next run");
+      const auto repeat = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      const auto stats  = cache.GetStats();
+      Require(name, "unpack",
+              repeat.has_value() && repeat->spirv.data() == packed->spirv.data() &&
+                  stats.expanded == 1 && stats.loaded_permutations == 4,
+              "a packed record was expanded more than once");
+    }
+    // Damage inside the zstd frame of the packed record (the last one), with its checksum fixed:
+    // loading keeps it (the frame header is intact), the first hit drops it, the others stay.
+    {
+      auto damaged = packed_file;
+      size_t offset = ends.back();
+      uint64_t size = 0;
+      std::memcpy(&size, damaged.data() + offset + 8, sizeof(size));
+      Require(name, "damaged frame", offset + ProgramDiskCache::RecordHeaderBytes + size == damaged.size(),
+              "unexpected packed layout");
+      const auto payload = offset + ProgramDiskCache::RecordHeaderBytes;
+      damaged[damaged.size() - 9] ^= 0x5au; // inside the frame's data (before the end)
+      const auto checksum = XXH3_64bits(damaged.data() + payload, size);
+      std::memcpy(damaged.data() + offset + 16, &checksum, sizeof(checksum));
+      WriteFileBytes(path, damaged);
+      ProgramDiskCache cache(settings(identity_a));
+      const auto broken = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      const auto stats  = cache.GetStats();
+      Require(name, "damaged frame",
+              !broken.has_value() && stats.invalidated == 1 &&
+                  !cache.FindPermutation(first.key.digest, 12, first.specialization).has_value(),
+              "a packed record with a damaged frame was returned");
+      check_complete(cache);
+    }
+  }
   RemoveTestFile(path);
   std::printf("[cpu]     %-32s ok (%zu truncations)\n", name, cuts.size());
 }
