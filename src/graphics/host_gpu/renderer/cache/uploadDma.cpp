@@ -576,9 +576,18 @@ void UploadDma::Worker(std::stop_token stop) {
 				return; // stopping and drained
 			}
 			jobs.swap(m_jobs);
+			// KYTY_UPLOAD_DMA_HELP: a waiting submission thread must not start a batch while this
+			// one runs (both would use m_batches and submit to the transfer queue at once: GT7
+			// lost the device with "WriteInvalid at 0x0" while upload DMA work was unfinished).
+			m_processing = true;
 		}
 		ProcessJobs(jobs);
 		jobs.clear();
+		{
+			std::scoped_lock lock(m_mutex);
+			m_processing = false;
+		}
+		m_available.notify_all();
 	}
 }
 
