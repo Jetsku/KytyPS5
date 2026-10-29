@@ -669,6 +669,25 @@ char* KYTY_SYSV_ABI strcpy(char* dest, const char* src) {
 	return ::strcpy(dest, src);
 }
 
+// strcpy_s (C11 Annex K): 0, or EINVAL/ERANGE with dest[0] = 0 when it does not fit. Upstream
+// 8c01d8e84 unbinds the NID that was bound to strcpy; ours implements it.
+int KYTY_SYSV_ABI strcpy_s(char* dest, size_t size, const char* src) {
+	if (dest == nullptr || size == 0) {
+		return 22; // EINVAL
+	}
+	if (src == nullptr) {
+		dest[0] = '\0';
+		return 22; // EINVAL
+	}
+	const auto length = ::strnlen(src, size);
+	if (length >= size) {
+		dest[0] = '\0';
+		return 34; // ERANGE
+	}
+	std::memcpy(dest, src, length + 1);
+	return 0;
+}
+
 char* KYTY_SYSV_ABI strncpy(char* dest, const char* src, size_t count) {
 	return ::strncpy(dest, src, count);
 }
@@ -771,10 +790,11 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
 	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
 	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
-	LIB_FUNC("aesyjrHVWy4", LibcInternal::strcmp);
-	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strncmp);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp);
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp);
 	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
-	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy);
+	LIB_FUNC("kiZSXIWd9vg", LibcInternal::strcpy);
+	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy_s);
 	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
 	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);
