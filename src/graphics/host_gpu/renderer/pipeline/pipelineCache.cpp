@@ -7201,6 +7201,9 @@ void PipelineCache::InitializeProgramDiskCache() {
 	// KYTY_PROGRAM_CACHE_MAX_MB (default 512, 64..3584): GT7 fills 512 MiB of translated programs
 	// in its first sessions, after which new programs were no longer kept.
 	settings.max_file_bytes = std::clamp<uint64_t>(EnvU64("KYTY_PROGRAM_CACHE_MAX_MB", 512), 64u, 3584u) << 20u;
+	// KYTY_PROGRAM_CACHE_EVICT=1 (default 0): at the limit, records this run has not used make room
+	// for new ones (ProgramDiskCache::Settings::evict_unused); GT7 outgrows 3584 MiB in two runs.
+	settings.evict_unused = EnvU64("KYTY_PROGRAM_CACHE_EVICT", 0) != 0;
 	const auto& properties  = m_graphics.GetPhysicalDeviceProperties();
 	const auto  device      = fmt::format("device {:08x}:{:08x}:{:08x}", properties.vendorID,
 	                                      properties.deviceID, properties.driverVersion);

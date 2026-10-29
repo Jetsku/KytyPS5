@@ -57,6 +57,11 @@ public:
 		bool                  periodic_saves = true;
 		// New records stop being added beyond this file size.
 		uint64_t              max_file_bytes = 512ull * 1024 * 1024;
+		// KYTY_PROGRAM_CACHE_EVICT: at the size limit, loaded records this run has not used are
+		// dropped (oldest first in file order) to make room for new ones, and saves write the
+		// unused loaded records first, then the used ones, then this run's: the file order is the
+		// order of last use across runs, so the oldest-unused records go first.
+		bool                  evict_unused = false;
 		// Coalescing (see Due()), like the driver pipeline cache saves: after a burst (at least
 		// min_new new records, none for settle_ns, a third of an interval since the last save),
 		// after a trickle (none for settle_ns, an interval since the last save), and after three
@@ -120,6 +125,9 @@ public:
 		uint64_t save_ns          = 0;
 		uint64_t save_failures    = 0;
 		bool     over_capacity    = false;
+		uint64_t evicted          = 0; // loaded records dropped for room (evict_unused)
+		uint64_t evicted_bytes    = 0;
+		uint64_t restored         = 0; // evicted records used again this run and kept
 	};
 
 	explicit ProgramDiskCache(Settings settings);
@@ -178,6 +186,9 @@ private:
 		std::span<const uint8_t> spirv;
 		std::span<const uint8_t> spirv_plain;
 		bool                     invalid = false;
+		// evict_unused: returned by a lookup this run; left out of saves.
+		bool                     used    = false;
+		bool                     evicted = false;
 	};
 
 	void Load();
@@ -186,6 +197,10 @@ private:
 	// Requires m_mutex. Adds a parsed record to the index; false when it was a duplicate or made
 	// its digest ambiguous (the record is then not indexed).
 	bool IndexRecord(uint32_t id);
+	// Requires m_mutex. A lookup returned the record (evict_unused bookkeeping).
+	void NoteUsed(uint32_t id);
+	// Requires m_mutex. Evicts unused loaded records until `bytes` more fit; false when they do not.
+	bool MakeRoom(uint64_t bytes);
 	void AppendRecord(uint32_t kind, const std::vector<uint8_t>& payload, const Digest& digest);
 	bool Save(bool final_save);
 	bool Due(uint64_t now) const;
@@ -199,6 +214,8 @@ private:
 	std::vector<uint8_t>    m_file;           // loaded file contents (records point into it)
 	std::deque<std::vector<uint8_t>> m_added; // records added by this run (stable storage)
 	std::vector<Record>     m_records;
+	uint32_t                m_loaded_count = 0; // records [0, m_loaded_count) came from the file
+	bool                    m_order_dirty  = false; // evict_unused: use order changed since the last save
 	std::unordered_map<Digest, std::vector<uint32_t>, DigestHash> m_sources;
 	std::unordered_map<Digest, std::vector<uint32_t>, DigestHash> m_permutations;
 	std::unordered_set<Digest, DigestHash>                        m_ambiguous;

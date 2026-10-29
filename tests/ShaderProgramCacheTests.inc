@@ -650,6 +650,37 @@ void CheckCacheFile() {
                 !cache.FindPermutation(first.key.digest, 0, first.specialization).has_value(),
             "records were added beyond the file size cap");
   }
+  // KYTY_PROGRAM_CACHE_EVICT: at the cap, records this run has not used make room for new ones;
+  // used ones and the new one are kept, and the file stays within the cap.
+  {
+    WriteFileBytes(path, file);
+    {
+      auto evicting = settings(identity_a);
+      evicting.evict_unused = true;
+      evicting.max_file_bytes = file.size();
+      ProgramDiskCache cache(evicting);
+      Require(name, "evict", cache.FindSource(first.key).has_value() &&
+                                 cache.FindPermutation(first.key.digest, 0, first.specialization).has_value(),
+              "the used records were not found");
+      cache.AddPermutation(first.key.digest, 0, other_specialization, first.info, first.spirv, {});
+      const auto stats = cache.GetStats();
+      Require(name, "evict", stats.evicted != 0 && stats.added_permutations == 1,
+              "nothing was evicted for the new record (evicted " + std::to_string(stats.evicted) + ")");
+      Require(name, "evict",
+              cache.FindPermutation(first.key.digest, 0, other_specialization).has_value(),
+              "the new record was not returned this run");
+      Require(name, "evict", cache.Flush(), "the save failed");
+    }
+    Require(name, "evict", ReadFileBytes(path).size() <= file.size(), "the saved file exceeds the cap");
+    ProgramDiskCache cache(settings(identity_a));
+    Require(name, "evict",
+            cache.FindSource(first.key).has_value() &&
+                cache.FindPermutation(first.key.digest, 0, first.specialization).has_value() &&
+                cache.FindPermutation(first.key.digest, 0, other_specialization).has_value(),
+            "a used or new record was not saved");
+    Require(name, "evict", !cache.FindSource(second.key).has_value(),
+            "the oldest unused record was not the one evicted");
+  }
   RemoveTestFile(path);
   std::printf("[cpu]     %-32s ok (%zu truncations)\n", name, cuts.size());
 }

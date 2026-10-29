@@ -293,6 +293,7 @@ void ProgramDiskCache::Load() {
 		} else {
 			m_bytes = 0;
 		}
+		m_loaded_count = static_cast<uint32_t>(m_records.size());
 		// A damaged tail or dropped records are rewritten at the next save. A file with another
 		// identity is left alone until this run has records of its own to save in its place.
 		if (rejected != 0 || m_stats.ambiguous != 0) {
@@ -333,6 +334,7 @@ std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const
 				const auto& record = m_records[id];
 				if (!record.invalid && Equal(record.key, key.bytes)) {
 					m_stats.source_hits++;
+					NoteUsed(id);
 					return SourceRecord {.id = id, .skip_dispatch = record.skip_dispatch,
 					                     .plan = record.plan};
 				}
@@ -355,6 +357,7 @@ ProgramDiskCache::FindPermutation(const Digest& source, uint32_t push_data_curso
 				if (!record.invalid && record.cursor == push_data_cursor &&
 				    Equal(record.specialization, specialization)) {
 					m_stats.permutation_hits++;
+					NoteUsed(id);
 					return PermutationRecord {.id = id, .info = record.info, .spirv = record.spirv,
 					                          .spirv_plain = record.spirv_plain};
 				}
@@ -369,7 +372,7 @@ void ProgramDiskCache::AppendRecord(uint32_t kind, const std::vector<uint8_t>& p
                                     const Digest& digest) {
 	// Requires m_mutex.
 	const auto total = RecordHeaderBytes + payload.size();
-	if (m_bytes + total > m_settings.max_file_bytes) {
+	if (m_bytes + total > m_settings.max_file_bytes && !MakeRoom(total)) {
 		if (!m_stats.over_capacity && !m_settings.quiet) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Program cache: {} would exceed {} MiB; new programs are no longer added\n",
@@ -445,10 +448,57 @@ void ProgramDiskCache::Invalidate(uint32_t id) {
 	std::scoped_lock lock(m_mutex);
 	if (id >= m_records.size() || m_records[id].invalid) return;
 	m_records[id].invalid = true;
-	m_bytes -= m_records[id].bytes.size();
+	if (!m_records[id].evicted) m_bytes -= m_records[id].bytes.size();
 	m_changes++;
 	m_last_change_ns = NowNs();
 	m_stats.invalidated++;
+}
+
+void ProgramDiskCache::NoteUsed(uint32_t id) {
+	// Requires m_mutex.
+	if (!m_settings.evict_unused || id >= m_records.size()) return;
+	auto& record = m_records[id];
+	if (!record.used && id < m_loaded_count) {
+		m_order_dirty = true; // its place in the file moves to the used group (saved at exit)
+	}
+	record.used = true;
+	// An evicted record used again is kept if it still fits (else a later run translates it).
+	if (record.evicted && m_bytes + record.bytes.size() <= m_settings.max_file_bytes) {
+		record.evicted = false;
+		m_bytes += record.bytes.size();
+		m_stats.restored++;
+		m_changes++;
+	}
+}
+
+bool ProgramDiskCache::MakeRoom(uint64_t bytes) {
+	// Requires m_mutex.
+	if (!m_settings.evict_unused || bytes > m_settings.max_file_bytes) return false;
+	uint64_t available = 0;
+	for (uint32_t id = 0; id < m_loaded_count && m_bytes + bytes > m_settings.max_file_bytes + available; id++) {
+		const auto& record = m_records[id];
+		if (!record.used && !record.evicted && !record.invalid) available += record.bytes.size();
+	}
+	if (m_bytes + bytes > m_settings.max_file_bytes + available) return false;
+	uint64_t freed = 0;
+	for (uint32_t id = 0; id < m_loaded_count && m_bytes + bytes > m_settings.max_file_bytes; id++) {
+		auto& record = m_records[id];
+		if (record.used || record.evicted || record.invalid) continue;
+		record.evicted = true;
+		m_bytes -= record.bytes.size();
+		freed += record.bytes.size();
+		m_stats.evicted++;
+		m_stats.evicted_bytes += record.bytes.size();
+	}
+	if (freed != 0) {
+		m_changes++;
+		if (m_stats.evicted_bytes == freed && !m_settings.quiet) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Program cache: {} is at {} MiB; records this run has not used are dropped for new ones\n",
+			    Common::PathToString(m_settings.path), m_settings.max_file_bytes >> 20u));
+		}
+	}
+	return true;
 }
 
 bool ProgramDiskCache::Due(uint64_t now) const {
@@ -489,7 +539,7 @@ bool ProgramDiskCache::Flush() {
 	WaitLoaded();
 	{
 		std::scoped_lock lock(m_mutex);
-		if (m_changes == m_saved_changes) return true;
+		if (m_changes == m_saved_changes && !m_order_dirty) return true;
 	}
 	return Save(true);
 }
@@ -502,12 +552,27 @@ bool ProgramDiskCache::Save(bool final_save) {
 	uint64_t                              changes = 0;
 	{
 		std::scoped_lock lock(m_mutex);
-		if (m_changes == m_saved_changes) return true;
+		if (m_changes == m_saved_changes && !(final_save && m_order_dirty)) return true;
 		changes = m_changes;
+		m_order_dirty = false;
 		records.reserve(m_records.size());
-		for (const auto& record: m_records) {
-			if (!record.invalid && !m_ambiguous.contains(record.digest)) {
-				records.push_back(record.bytes);
+		const auto keep = [&](const Record& record) {
+			return !record.invalid && !record.evicted && !m_ambiguous.contains(record.digest);
+		};
+		if (m_settings.evict_unused) {
+			// Order of last use: unused loaded records, used loaded ones, this run's.
+			for (uint32_t pass = 0; pass < 2; pass++) {
+				for (uint32_t id = 0; id < m_loaded_count; id++) {
+					const auto& record = m_records[id];
+					if (keep(record) && record.used == (pass == 1)) records.push_back(record.bytes);
+				}
+			}
+			for (uint32_t id = m_loaded_count; id < m_records.size(); id++) {
+				if (keep(m_records[id])) records.push_back(m_records[id].bytes);
+			}
+		} else {
+			for (const auto& record: m_records) {
+				if (keep(record)) records.push_back(record.bytes);
 			}
 		}
 	}
