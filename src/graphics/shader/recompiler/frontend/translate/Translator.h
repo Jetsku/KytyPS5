@@ -214,7 +214,7 @@ private:
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
 	void V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low);
 	void S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst);
-	void S_QUADMASK_B64(const Decoder::Instruction& inst);
+	void S_QUADMASK(const Decoder::Instruction& inst, bool is64);
 	void BFM_B32(const Decoder::Instruction& inst);
 	IR::U32 RightMask32(IR::U32 count);
 	IR::U64 RightMask64(IR::U32 count);
