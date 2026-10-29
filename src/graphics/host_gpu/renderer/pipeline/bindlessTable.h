@@ -184,6 +184,15 @@ public:
 	// Diagnostics: feedback word 0 (the last out-of-range key, top bit set) in the snapshot,
 	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
+	// KYTY_BINDLESS_EVICT usage probe (adapted from Senaxx 8585096e6). Every draw that samples a
+	// guest heap key stores the key's feedback word (0 resident, 1 pending), so marking every
+	// resident key's word with ProbeMark (ArmUsageProbe, through the mapped buffer, as the request
+	// flags are cleared) and reading a snapshot recorded some frames later shows which keys no
+	// draw sampled in between. CollectUnusedImages lists the images all of whose keys still carry
+	// the mark there. Runtime heaps are not marked: their images always count as sampled.
+	static constexpr uint32_t ProbeMark = 2;
+	void                      ArmUsageProbe();
+	void                      CollectUnusedImages(std::vector<ImageId>& unused);
 	void                   AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;

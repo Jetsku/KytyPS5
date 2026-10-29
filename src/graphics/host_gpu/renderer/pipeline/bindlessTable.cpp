@@ -856,6 +856,52 @@ uint32_t BindlessTable::TakeWordZero() {
 	return value;
 }
 
+void BindlessTable::ArmUsageProbe() {
+	if (m_feedback == nullptr) {
+		return;
+	}
+	auto* feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	for (const auto& heap: m_heaps) {
+		if (heap.runtime) {
+			continue;
+		}
+		uint32_t first = UINT32_MAX;
+		uint32_t last  = 0;
+		for (uint32_t key = 0; key < heap.entries && key < heap.images.size(); key++) {
+			if (heap.images[key]) {
+				feedback[heap.region + key] = ProbeMark;
+				first                       = std::min(first, key);
+				last                        = key;
+			}
+		}
+		if (first != UINT32_MAX) {
+			m_feedback->Flush((heap.region + first) * sizeof(uint32_t),
+			                  (last - first + 1u) * sizeof(uint32_t));
+		}
+	}
+}
+
+void BindlessTable::CollectUnusedImages(std::vector<ImageId>& unused) {
+	if (m_feedback_snapshot == nullptr) {
+		return;
+	}
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	m_feedback_snapshot->Invalidate(0, vk::DeviceSize {m_next_region} * sizeof(uint32_t));
+	// A key resolved, cleared by TakeRequests, or in a moved region since the marks reads 0 or
+	// 1: in use.
+	for (const auto& [image, refs]: m_image_refs) {
+		if (refs.empty()) {
+			continue;
+		}
+		const bool sampled = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) {
+			return ref.first->runtime || snapshot[ref.first->region + ref.second] != ProbeMark;
+		});
+		if (!sampled) {
+			unused.push_back(refs.front().first->images[refs.front().second]);
+		}
+	}
+}
+
 void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 	m_image_refs[ImageKey(id)].emplace_back(&heap, key);
 }

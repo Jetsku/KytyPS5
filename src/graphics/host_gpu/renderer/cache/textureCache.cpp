@@ -1273,7 +1273,8 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	HangTrace::SetImageFreeReason(reason);
 	auto& image = m_slot_images[id];
 	// Bindless-pinned images (a heap key samples them through set 1) are never collected.
-	if (image.bindless_pinned && (reason == HangTrace::ImageFreeReason::GarbageCollect ||
+	if (image.bindless_pinned && !m_bindless_evicting &&
+	    (reason == HangTrace::ImageFreeReason::GarbageCollect ||
 	                              reason == HangTrace::ImageFreeReason::PressureCollect ||
 	                              reason == HangTrace::ImageFreeReason::ResidentIdle)) {
 		return;
@@ -8240,6 +8241,59 @@ void TextureCache::FreeGuestDroppedImages(uint64_t frame) {
 	}
 }
 
+uint64_t TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {
+	std::scoped_lock lock {m_lock};
+	m_bindless_evictable.assign(ids.begin(), ids.end());
+	uint64_t bytes = 0;
+	for (const auto id: m_bindless_evictable) {
+		if (const auto* image = m_slot_images.try_get(id); image != nullptr && image->registered) {
+			bytes += image->AccountedSize();
+		}
+	}
+	return bytes;
+}
+
+void TextureCache::FreeBindlessEvictable(uint64_t frame) {
+	if (m_bindless_evictable.empty() || !BindlessUnderPressure()) {
+		return;
+	}
+	constexpr size_t     PerCall = 64;
+	constexpr uint64_t   MinAge  = 16; // frames since a bound (non-bindless) use
+	size_t               freed   = 0;
+	std::vector<ImageId> later;
+	for (const auto id: m_bindless_evictable) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || !image->bindless_pinned) {
+			continue; // gone, or no key refers to it any more (the regular collectors' now)
+		}
+		if (freed == PerCall || !BindlessUnderPressure()) {
+			later.push_back(id);
+			continue;
+		}
+		if (image->depth_id || image->IsGpuModified() || image->binding.is_bound ||
+		    image->binding.is_target || image->usage.video_out ||
+		    frame - std::min(frame, image->frame_accessed_last) <= MinAge) {
+			continue; // its contents are not in guest memory, or it is in use otherwise
+		}
+		m_bindless_evicted++;
+		m_bindless_evicted_bytes += image->AccountedSize();
+		m_bindless_evicting = true;
+		FreeImage(id, HangTrace::ImageFreeReason::PressureCollect);
+		m_bindless_evicting = false;
+		freed++;
+	}
+	m_bindless_evictable = std::move(later);
+	if (freed != 0) {
+		static uint64_t last_log = 0;
+		if (frame >= last_log + 600) {
+			last_log = frame;
+			LOGF("TexBindlessEvict: frame=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64
+			     " MB) (KYTY_BINDLESS_EVICT)\n",
+			     frame, m_bindless_evicted, m_bindless_evicted_bytes >> 20u);
+		}
+	}
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	RetireIdlePartialImages();
@@ -8249,6 +8303,7 @@ void TextureCache::RunGarbageCollector() {
 	}
 	const auto frame = m_frame.load(std::memory_order_relaxed);
 	FreeGuestDroppedImages(frame);
+	FreeBindlessEvictable(frame);
 	// Always (one entry per frame): KYTY_VRAM_GC_BUDGET is a live switch and needs recent frames.
 	NoteFrameTick(frame, tick);
 	if (m_idle_frames != 0 && frame >= m_idle_next_frame) {
