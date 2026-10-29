@@ -1280,6 +1280,10 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 		}
 		return {true, 0};
 	}
+	// KYTY_PM4_BARRIERS=guest (render.h): what comes after the wait comes after what it waited for.
+	if (GuestSyncBarriersEnabled()) {
+		EmitGlobalBarrier();
+	}
 	return {};
 }
 
@@ -1829,6 +1833,18 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+// KYTY_FLUSH_BEFORE_GC=1 (default off; Sakura 3aefac099 via usa-ratt/KytyPS5-GT7): at the end of
+// a submission the command buffer of its last commands is submitted before the garbage collectors
+// record their work, so a game thread's read of what those commands wrote does not wait behind
+// the collectors' image write-backs (in a GT7 race 70-310 ms behind 10-180 MB of write-backs).
+static bool FlushBeforeGc() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FLUSH_BEFORE_GC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	if (!submission.started) {
 		// Texture-heap entries the guest wrote before submitting are visible to all of this
@@ -1854,6 +1870,7 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 	if (first_slice && submission.reset_processor && submission.type != SubmissionType::Compute) {
 		CommitStats::OnFrameBoundary();
+		NoteCubeFrame();
 		CpGaps::NoteFrame();
 		Common::PrepPhases::NoteFrame();
 	}
@@ -1887,6 +1904,11 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	// KYTY_PM4_BARRIERS=guest (render.h): this queue's work comes after what the slices before it
+	// recorded, other queues' included (their labels this one may have waited for).
+	if (GuestSyncBarriersEnabled()) {
+		cp.SliceStartBarrier();
+	}
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: complete = ProcessGraphicsDirect(submission, cp); break;
@@ -1909,6 +1931,9 @@ bool GuestGpu::Process(Submission& submission) {
 			submission.slice_progress = submission.command_execution.MadeProgress();
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
+					if (FlushBeforeGc()) {
+						cp.BufferFlush();
+					}
 					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
@@ -1954,6 +1979,9 @@ bool GuestGpu::ProcessGraphicsDirect(Submission& submission, CommandProcessor& c
 	submission.slice_progress = progressed;
 	if (progressed) {
 		if (complete) {
+			if (FlushBeforeGc()) {
+				cp.BufferFlush();
+			}
 			m_renderer.RunGarbageCollector();
 		}
 		cp.BufferFlush();
@@ -1985,11 +2013,16 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		// sceAgcSuspendPoint.
 		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
 			CommitStats::OnFrameBoundary();
+			NoteCubeFrame();
 			CpGaps::NoteFrame();
 			Common::PrepPhases::NoteFrame();
 		}
 	}
 	cp.BufferInit();
+	// KYTY_PM4_BARRIERS=guest (render.h): as in Process.
+	if (GuestSyncBarriersEnabled()) {
+		cp.SliceStartBarrier();
+	}
 	if (submission.handoff) {
 		const bool complete = ProcessGraphicsDirect(submission, cp);
 		if (complete) {
@@ -2027,6 +2060,9 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	submission.slice_progress = progressed;
 	if (progressed) {
 		if (complete) {
+			if (FlushBeforeGc()) {
+				cp.BufferFlush();
+			}
 			m_renderer.RunGarbageCollector();
 		}
 		cp.BufferFlush();

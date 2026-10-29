@@ -415,7 +415,7 @@ public:
 	void Add(vk::ShaderModule module, std::span<const uint32_t> spirv) {
 		const auto hash = XXH3_64bits(spirv.data(), spirv.size_bytes());
 		std::scoped_lock lock(m_mutex);
-		m_modules[static_cast<VkShaderModule>(module)] = {hash};
+		m_modules[static_cast<VkShaderModule>(module)] = {.hash = hash, .words = spirv.size()};
 		m_by_hash.try_emplace(hash, static_cast<VkShaderModule>(module));
 	}
 	// The module was published for the permutation `identity` with these descriptor bindings.
@@ -452,6 +452,20 @@ public:
 		std::scoped_lock lock(m_mutex);
 		const auto       found = m_modules.find(static_cast<VkShaderModule>(module));
 		return found != m_modules.end() && !found->second.doomed ? found->second.hash : 0;
+	}
+	// The SPIR-V words the module was made from (0 if unknown); KYTY_COMPUTE_BACKGROUND_WORDS.
+	[[nodiscard]] uint64_t WordsOf(vk::ShaderModule module) const {
+		std::scoped_lock lock(m_mutex);
+		const auto       found = m_modules.find(static_cast<VkShaderModule>(module));
+		return found != m_modules.end() && !found->second.doomed ? found->second.words : 0;
+	}
+	// Pins this live module itself (false if unknown or doomed); Unpin releases it.
+	[[nodiscard]] bool PinModule(vk::ShaderModule module) {
+		std::scoped_lock lock(m_mutex);
+		const auto       found = m_modules.find(static_cast<VkShaderModule>(module));
+		if (found == m_modules.end() || found->second.doomed) return false;
+		found->second.pins++;
+		return true;
 	}
 	// A live module created from code with this hash, pinned until Unpin; null if none.
 	[[nodiscard]] vk::ShaderModule Pin(uint64_t hash) {
@@ -503,6 +517,7 @@ public:
 private:
 	struct Info {
 		uint64_t hash     = 0;
+		uint64_t words    = 0;
 		uint64_t identity = 0;
 		uint64_t bindings = 0;
 		uint32_t pins     = 0;
@@ -5345,6 +5360,9 @@ struct PipelineCache::RtState {
 		bool                                       asked        = false; // a dispatch has asked
 		bool                                       consumed     = false; // published or failed
 		bool                                       logged_skip  = false;
+		// KYTY_COMPUTE_BACKGROUND_WORDS: a huge compute program, not a software RT kernel (its
+		// failure does not turn software RT off; its module is pinned while it builds).
+		bool                                       huge         = false;
 	};
 	struct BuildContext {
 		PipelineCache*                cache  = nullptr;
@@ -5407,9 +5425,14 @@ struct PipelineCache::RtState {
 	}
 
 	// Under `mutex`. The job of kernel `id`, started when new; null when the queue refused it.
-	Job* Request(uint64_t id, const ShaderComputeInputInfo& input, const ShaderProgram& program) {
+	// huge: a huge compute program (KYTY_COMPUTE_BACKGROUND_WORDS), not an RT kernel.
+	Job* Request(uint64_t id, const ShaderComputeInputInfo& input, const ShaderProgram& program,
+	             bool huge = false) {
 		if (const auto found = jobs.find(id); found != jobs.end()) return &found->second;
+		// A huge program's module could be destroyed with its program while it builds: pinned.
+		if (huge && !g_shader_modules.PinModule(program.module)) return nullptr;
 		auto& job        = jobs[id];
+		job.huge         = huge;
 		job.shader_hash  = input.stage.program->shader_hash;
 		job.ticket       = ++next_ticket;
 		job.requested_ns = CompileClockNs();
@@ -5422,7 +5445,7 @@ struct PipelineCache::RtState {
 		const auto module      = program.module;
 		const auto shader_hash = job.shader_hash;
 		const bool queued      = queue.Submit(
-            [this, promise, info, module, id, shader_hash] {
+            [this, promise, info, module, id, shader_hash, huge] {
                 Profiler::SetThreadName("RtPipeline");
                 auto built         = std::make_shared<Built>();
                 built->shader_hash = shader_hash;
@@ -5446,11 +5469,13 @@ struct PipelineCache::RtState {
                                      id, shader_hash, static_cast<double>(built->ns) / 1.0e6,
                                      built->error.empty() ? "" : ": ", built->error);
                 }
+                if (huge) g_shader_modules.Unpin(cache.m_graphics.device, module);
                 promise->set_value(std::move(built));
             },
             job.ticket);
 		if (!queued) {
 			jobs.erase(id);
+			if (huge) g_shader_modules.Unpin(cache.m_graphics.device, module);
 			return nullptr;
 		}
 		totals.requested.fetch_add(1, std::memory_order_relaxed);
@@ -5468,6 +5493,13 @@ struct PipelineCache::RtState {
 		const auto waited_ms = (CompileClockNs() - job.requested_ns) / 1'000'000;
 		if (!built.error.empty()) {
 			totals.failed.fetch_add(1, std::memory_order_relaxed);
+			if (job.huge) {
+				// Its dispatches are skipped from now on (as KYTY_SKIP_INVALID's).
+				PipelineCacheLog("Compute pipeline of shader 0x{:016x} (KYTY_COMPUTE_BACKGROUND_WORDS) could "
+				                 "not be built in the background ({}); its dispatches are skipped",
+				                 job.shader_hash, built.error);
+				return nullptr;
+			}
 			if (RtSession::MarkFailed()) {
 				// Black lighting until the next launch: make it stand out in the console and log.
 				PipelineCacheLog("\n{0}\nWARNING: Software RT is turned off for the rest of this session: the "
@@ -5501,8 +5533,9 @@ struct PipelineCache::RtState {
 			                          .detail      = "rt-background"});
 		}
 		cache.NotePipelineCreated(built.ns);
-		PipelineCacheLog("Software RT pipeline of compute shader 0x{:016x} built in {:.0f} ms, ready {} ms "
+		PipelineCacheLog("{} pipeline of compute shader 0x{:016x} built in {:.0f} ms, ready {} ms "
 		                 "after it was first needed",
+		                 job.huge ? "Huge compute (KYTY_COMPUTE_BACKGROUND_WORDS)" : "Software RT",
 		                 job.shader_hash, static_cast<double>(built.ns) / 1.0e6, waited_ms);
 		return slot->second.get();
 	}
@@ -8651,6 +8684,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			                 skip.ready_in_wait, skip.not_queued);
 		};
 		if (poll == PrefetchState::Poll::Pending) {
+			g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
 			if (m_skip_draws.fetch_add(1, std::memory_order_relaxed) == 0) {
 				PipelineCacheLog("Pipeline skip: first draw skipped while its pipeline builds "
 				                 "(VS 0x{:016x})", vs_input_info.stage.program != nullptr
@@ -9026,13 +9060,31 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	// A call-split program (CallSplit.h) builds in the background too, and never waits.
 	const bool call_split =
 	    input_info.stage.program->bindings.call_state_dword != ShaderRecompiler::IR::PushData::NoStart;
-	if (!input_info.stage.program->info.uses_bvh && !call_split) {
+	const bool rt_kernel = input_info.stage.program->info.uses_bvh;
+	// KYTY_COMPUTE_BACKGROUND_WORDS=<n> (default 0 = off; usa-ratt/KytyPS5-GT7 767c1e25e,
+	// 518b92220, 5a41b9f8a, 1000000 there): a compute program of n SPIR-V words or more whose
+	// pipeline is not built yet goes the RT kernels' way: it builds on the RtState threads
+	// (KYTY_RT_PIPELINE_THREADS), its first dispatch waits up to KYTY_RT_PIPELINE_WAIT_MS for it
+	// (a driver-cache hit is done by then), and later dispatches are skipped until it is ready, so
+	// a cold compile of a huge program does not freeze the command processor for seconds.
+	static const uint64_t huge_words = EnvU64("KYTY_COMPUTE_BACKGROUND_WORDS", 0);
+	bool huge = false;
+	if (!rt_kernel && !call_split && huge_words != 0 &&
+	    g_shader_modules.WordsOf(compute_program.module) >= huge_words) {
+		Common::LockGuard lock(m_mutex);
+		if (const auto found = m_compute_pipelines.find(compute_program.id);
+		    found != m_compute_pipelines.end()) {
+			return found->second->build_failed ? nullptr : found->second.get();
+		}
+		huge = true;
+	}
+	if (!rt_kernel && !call_split && !huge) {
 		auto& built = GetComputePipeline(input_info, compute_program);
 		return built.build_failed ? nullptr : &built; // KYTY_SKIP_INVALID: the dispatch is skipped
 	}
 	const auto id = compute_program.id;
 	auto&      rt = Rt();
-	if (RtSession::Failed()) {
+	if (!huge && RtSession::Failed()) {
 		rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
 	}
@@ -9048,8 +9100,13 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	uint64_t                                            shader_hash = input_info.stage.program->shader_hash;
 	{
 		std::scoped_lock lock(rt.mutex);
-		auto*            job = rt.Request(id, input_info, compute_program);
+		auto*            job = rt.Request(id, input_info, compute_program, huge);
 		if (job == nullptr) {
+			if (huge) {
+				// Queue full (or the module is going): built here, as without the switch.
+				auto& built = GetComputePipeline(input_info, compute_program);
+				return built.build_failed ? nullptr : &built;
+			}
 			rt.totals.skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
 			return nullptr;
 		}
@@ -9064,6 +9121,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		ticket      = job->ticket;
 	}
 	bool ready = future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+	if (huge && first) {
+		PipelineCacheLog("Compute pipeline of shader 0x{:016x} ({} SPIR-V words) builds in the background "
+		                 "(KYTY_COMPUTE_BACKGROUND_WORDS); its dispatches are skipped until it is ready",
+		                 shader_hash, g_shader_modules.WordsOf(compute_program.module));
+	}
 	switch (RtSession::DecideDispatch(false, ready, first && !call_split, rt.wait_ms)) {
 		case RtSession::DispatchAction::Run: break;
 		case RtSession::DispatchAction::WaitBounded: {
@@ -9089,9 +9151,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		std::scoped_lock lock(rt.mutex);
 		if (const auto job = rt.jobs.find(id); job != rt.jobs.end() && !job->second.logged_skip) {
 			job->second.logged_skip = true;
-			PipelineCacheLog("Software RT: the pipeline of compute shader 0x{:016x} is still being built; "
-			                 "its dispatches are skipped until it is ready (the lighting it feeds lags)",
-			                 shader_hash);
+			PipelineCacheLog("{}: the pipeline of compute shader 0x{:016x} is still being built; "
+			                 "its dispatches are skipped until it is ready{}",
+			                 huge ? "Huge compute" : "Software RT", shader_hash,
+			                 huge ? "" : " (the lighting it feeds lags)");
 		}
 		return nullptr;
 	}

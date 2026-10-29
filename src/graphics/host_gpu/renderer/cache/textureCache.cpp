@@ -8184,6 +8184,62 @@ uint64_t TextureCache::RetireUnusedImages(uint64_t frame, uint64_t min_age, size
 	return freed;
 }
 
+// KYTY_BINDLESS_GUEST_DROP_FRAMES=<n> (live, default 0 = off; adapted from Senaxx 89b188d74 via
+// usa-ratt/KytyPS5-GT7, 300 there): the guest signals that a scene no longer needs a texture by
+// replacing or clearing its texture-heap entries (it never unregisters resources). When no heap
+// key refers to a bindless image any more, it is freed once no draw has used it, and it has not
+// been dropped again, for n presented frames, whatever the cache's memory threshold. Only images
+// the idle collector could free (IdleRetirable: clean of GPU writes, not bound, not a target, not
+// pinned again by a heap key) go. The guest drops entries and takes the same texture back
+// shortly after: a short grace frees and recreates textures (the fork's jungle slash stalled
+// 13 s with 3 frames).
+static Live::Switch g_guest_drop_frames("KYTY_BINDLESS_GUEST_DROP_FRAMES", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoull(value, nullptr, 10)) : 0;
+});
+
+void TextureCache::ReleaseDroppedByGuest(ImageId id) {
+	if (g_guest_drop_frames.Get() == 0) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	if (const auto* image = m_slot_images.try_get(id); image != nullptr && image->registered) {
+		m_guest_dropped.emplace_back(id, m_frame.load(std::memory_order_relaxed));
+	}
+}
+
+void TextureCache::FreeGuestDroppedImages(uint64_t frame) {
+	const auto grace = static_cast<uint64_t>(g_guest_drop_frames.Get());
+	if (m_guest_dropped.empty()) {
+		return;
+	}
+	if (grace == 0) {
+		m_guest_dropped.clear();
+		return;
+	}
+	std::erase_if(m_guest_dropped, [&](const std::pair<ImageId, uint64_t>& entry) {
+		const auto* image = m_slot_images.try_get(entry.first);
+		if (image == nullptr || !image->registered || image->bindless_pinned ||
+		    image->binding.is_target || image->IsGpuModified()) {
+			return true; // gone, pinned again, or kept for the regular collector
+		}
+		if (entry.second + grace > frame || !IdleRetirable(*image, frame, grace)) {
+			return false; // dropped or used lately (or bound): look again later
+		}
+		m_guest_dropped_freed++;
+		m_guest_dropped_freed_bytes += image->AccountedSize();
+		FreeImage(entry.first, HangTrace::ImageFreeReason::GarbageCollect);
+		return true;
+	});
+	static uint64_t last_log = 0;
+	if (frame >= last_log + 1000) {
+		last_log = frame;
+		LOGF("TexGuestDrop: frame=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 " MB) waiting=%zu "
+		     "(KYTY_BINDLESS_GUEST_DROP_FRAMES=%" PRIu64 ")\n",
+		     frame, m_guest_dropped_freed, m_guest_dropped_freed_bytes >> 20u,
+		     m_guest_dropped.size(), grace);
+	}
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	RetireIdlePartialImages();
@@ -8192,6 +8248,7 @@ void TextureCache::RunGarbageCollector() {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	const auto frame = m_frame.load(std::memory_order_relaxed);
+	FreeGuestDroppedImages(frame);
 	// Always (one entry per frame): KYTY_VRAM_GC_BUDGET is a live switch and needs recent frames.
 	NoteFrameTick(frame, tick);
 	if (m_idle_frames != 0 && frame >= m_idle_next_frame) {

@@ -2387,6 +2387,8 @@ bool RenderExecutor::ResettleBindlessKey(BindlessHeap& heap, uint32_t key) {
 		// No key refers to it any more: the texture cache may collect it again.
 		NoteBindlessStateChange(*image);
 		image->bindless_pinned = false;
+		// KYTY_BINDLESS_GUEST_DROP_FRAMES: and frees it once unused for a while.
+		texture_cache.ReleaseDroppedByGuest(old_image);
 	}
 	return resolved;
 }

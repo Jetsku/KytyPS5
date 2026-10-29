@@ -292,6 +292,19 @@ bool GraphicContext::CreateAllocator() {
 		}
 	}
 
+	// KYTY_VMA_BLOCK_MB=<n> (default unset: VMA's 256 MB; Sakura 45bc441ec via usa-ratt/
+	// KytyPS5-GT7): the size of the memory blocks VMA carves large heaps into. Smaller blocks leave
+	// less unused room inside them on a card short of video memory (64: 6.0 -> 4.35 GB at 1440p on
+	// a 6 GB card in the fork).
+	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
+		const auto block_mb = std::strtoull(value, nullptr, 10);
+		if (block_mb != 0) {
+			info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(block_mb) << 20u;
+			LOGF("KYTY_VMA_BLOCK_MB: VMA block size %" PRIu64 " MB\n",
+			     static_cast<uint64_t>(block_mb));
+		}
+	}
+
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());

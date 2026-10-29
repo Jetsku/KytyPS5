@@ -151,6 +151,14 @@ public:
 		});
 	}
 
+	// KYTY_TRACKER_DIRTY_WALK: whether any page of the region is CPU-dirty, without `lock`, from
+	// the count of non-zero CPU mirror words (published with the mirror, under `lock`, before any
+	// page it makes CPU-dirty becomes writable). False means an upload collection of any range of
+	// the region would find nothing (hot pages are always CPU-dirty).
+	[[nodiscard]] bool AnyCpuModifiedRelaxed() const noexcept {
+		return m_cpu_dirty_words.load(std::memory_order_acquire) != 0;
+	}
+
 	// IsModified without `lock` (KYTY_TRACKER_LOCKFREE_DIRTY, adapted from usa-ratt/KytyPS5-GT7
 	// ba83f1a64, mainline #1284): the mirror words, published with release stores under `lock`
 	// after every change of the bits, read with acquire loads. For the thread that owns the
@@ -531,9 +539,15 @@ private:
 	// (IsCpuModifiedRelaxed). Only the mirror words of those pages are stored, as above: a write
 	// fault no longer rewrites both mirror cache lines the GPU thread reads.
 	void PublishCpuMirror(size_t first = 0, size_t last = TRACKER_REGION_PAGES) noexcept {
+		uint32_t dirty_words = m_cpu_dirty_words.load(std::memory_order_relaxed);
 		for (size_t word = first / 64u; word < (last + 63u) / 64u; word++) {
-			m_cpu_mirror[word].store(m_cpu_dirty.Word(word), std::memory_order_release);
+			const uint64_t bits     = m_cpu_dirty.Word(word);
+			const uint64_t previous = m_cpu_mirror[word].load(std::memory_order_relaxed);
+			dirty_words += static_cast<uint32_t>(bits != 0);
+			dirty_words -= static_cast<uint32_t>(previous != 0);
+			m_cpu_mirror[word].store(bits, std::memory_order_release);
 		}
+		m_cpu_dirty_words.store(dirty_words, std::memory_order_release);
 	}
 
 	template <bool track, bool is_read>
@@ -598,6 +612,8 @@ private:
 	// Lock-free copies of m_gpu_dirty and m_cpu_dirty (Publish*Mirror), on their own cache lines.
 	alignas(64) std::array<std::atomic<uint64_t>, RegionBits::Words> m_gpu_mirror {};
 	alignas(64) std::array<std::atomic<uint64_t>, RegionBits::Words> m_cpu_mirror {};
+	// Non-zero words of m_cpu_mirror (PublishCpuMirror, AnyCpuModifiedRelaxed).
+	std::atomic<uint32_t> m_cpu_dirty_words {0};
 };
 
 } // namespace Libs::Graphics

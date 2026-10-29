@@ -1349,8 +1349,15 @@ static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	PRINT_NAME();
 
-	*mode    = 2; // PS5 Base
-	*submode = 0; // None
+	// KYTY_POWER_SAVER=1 (default off; Sakura a2e295ed3 via usa-ratt/KytyPS5-GT7, --power-saver
+	// there): report the console's power saver mode (submode 1). GT7 then selects its 1920x1080
+	// graphics profile, less GPU work than its default.
+	static const bool power_saver = [] {
+		const char* value = std::getenv("KYTY_POWER_SAVER");
+		return value != nullptr && value[0] == '1';
+	}();
+	*mode    = 2;                   // PS5 Base
+	*submode = power_saver ? 1 : 0; // power saver mode (KYTY_POWER_SAVER=1) or none
 	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
 	return OK;
 }

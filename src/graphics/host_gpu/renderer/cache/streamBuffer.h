@@ -86,6 +86,11 @@ public:
 	size_t lru_id       = 0;
 	// KYTY_BUFFER_LRU_SKIP=1 (BufferCache::TouchBuffer): the tick the LRU item last received.
 	mutable uint64_t lru_tick = 0;
+	// KYTY_GC_ASYNC_DOWNLOAD=1: collected with its download in flight (BufferCache::
+	// RunGarbageCollector), and whether a draw or dispatch used it again before the download
+	// landed (then it stays).
+	bool         gc_pending = false;
+	mutable bool gc_reused  = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

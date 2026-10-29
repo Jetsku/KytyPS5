@@ -1408,6 +1408,11 @@ void Presenter::Present(std::span<const Layer> layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
 		m_impl->frames.ValidateForPresent(layer.frame);
 		auto& previous = m_impl->layers[layer.bus];
+		if (layer.hold && previous.frame != nullptr && previous.frame != layer.frame) {
+			// KYTY_HOLD_SKIPPED_DRAWS: the frame shown before stays; this one goes back to the pool.
+			m_impl->frames.Release(layer.frame);
+			continue;
+		}
 		if (previous.frame != nullptr) {
 			m_impl->frames.Release(previous.frame);
 		}
