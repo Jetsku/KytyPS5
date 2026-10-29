@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -441,6 +442,32 @@ void TestFloatComparisonDescriptorInputs() {
   }
 }
 
+void TestSignedConversionDescriptorInputs() {
+  // 3.75 and -3.75 truncate, the largest float below 2^31 converts exactly, 2^31 and +inf
+  // saturate up, -2^31 and -1e10 saturate down, and -0.0, a denormal and both NaNs read zero.
+  constexpr std::array<std::pair<uint32_t, uint32_t>, 11> inputs = {{
+      {0x40700000u, 3u},          {0xc0700000u, 0xfffffffdu}, {0x4effffffu, 0x7fffff80u},
+      {0x4f000000u, 0x7fffffffu}, {0x7f800000u, 0x7fffffffu}, {0xcf000000u, 0x80000000u},
+      {0xd01502f9u, 0x80000000u}, {0x80000000u, 0u},          {0x00000001u, 0u},
+      {0x7fc00000u, 0u},          {0xffc00000u, 0u}}};
+  Fixture fixture;
+  const auto user = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  const auto converted = fixture.Emit(
+      ValueOpcode::ConvertS32F32, {fixture.Emit(ValueOpcode::BitCastF32U32, {user})});
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {converted}, .dword_count = 1});
+  fixture.Plan();
+  for (const auto &[bits, expected] : inputs) {
+    const std::array user_data{bits};
+    DescriptorValue result;
+    Check(SrtWalker(fixture.program, {.user_data = user_data})
+                  .EvaluateDescriptor(0, result) &&
+              result.dwords[0] == expected,
+          "descriptor signed conversion disagrees with the native conversion");
+  }
+}
+
 void TestSharedIntegerRuntimeDependencies() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::LaneId);
@@ -848,6 +875,7 @@ int main() {
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
     TestFloatComparisonDescriptorInputs();
+    TestSignedConversionDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();

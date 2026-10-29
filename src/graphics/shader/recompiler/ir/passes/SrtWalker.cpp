@@ -207,6 +207,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
@@ -770,6 +771,7 @@ uint32_t ArithmeticArity(const ResourcePlan::EvaluationRecipe& recipe) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::BitwiseNot32:
 		case ValueOpcode::LogicalNot:
@@ -1904,6 +1906,22 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				return true;
 			}
 			return false;
+		case ValueOpcode::ConvertS32F32:
+			if (arg(0, a)) {
+				// V_CVT_I32_F32 saturates and maps NaN to zero.
+				const auto value = Float32(a);
+				if (std::isnan(value)) {
+					result = 0u;
+				} else if (value >= 2147483648.0f) {
+					result = static_cast<uint32_t>(INT32_MAX);
+				} else if (value <= -2147483648.0f) {
+					result = static_cast<uint32_t>(INT32_MIN);
+				} else {
+					result = static_cast<uint32_t>(static_cast<int32_t>(value));
+				}
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPMul32:
 			if (binary()) {
 				result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
@@ -2505,6 +2523,7 @@ bool IsTracePure(ValueOpcode op) {
 		case ValueOpcode::UMin32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::FPMul32:
 		case ValueOpcode::FPTrunc32:
 		case ValueOpcode::FPIsNan32:
