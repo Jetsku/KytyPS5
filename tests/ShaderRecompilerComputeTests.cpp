@@ -50110,6 +50110,51 @@ TestCase ImageA16BiasTakesWholeVgpr() {
   return test;
 }
 
+// Each A16 1D gradient, and each of the last two 3D ones, takes the low half of its own VGPR. Their
+// high halves hold 0.0625, which would move the coordinates if read as part of the address.
+template <u32 dim> TestCase ImageA16GradientsTakeOwnVgpr() {
+  using O = ShaderOpcode;
+  constexpr bool volume = dim == 2u;
+  constexpr std::array names{"ImageA16GradientsTakeOwnVgpr1D", "ImageA16GradientsTakeOwnVgpr3D",
+                             "ImageA16GradientsTakeOwnVgpr1DArray"};
+  constexpr std::array types{Prospero::ImageType::kColor1D, Prospero::ImageType::kColor3D,
+                             Prospero::ImageType::kColor1DArray};
+  constexpr std::array views{vk::ImageViewType::e1D, vk::ImageViewType::e3D,
+                             vk::ImageViewType::e1DArray};
+  TestCase test;
+  test.name = names[dim / 2u];
+  u32 vaddr = 20;
+  if constexpr (volume) {
+    AppendVMovU32(&test.code, vaddr++, 0); // dh.x, dh.y
+    AppendVMovU32(&test.code, vaddr++, 0); // dh.z, dv.x
+  }
+  AppendVMovLiteral(&test.code, vaddr++, 0x2c000000u); // 1D dh or 3D dv.y
+  AppendVMovLiteral(&test.code, vaddr++, 0x2c000000u); // 1D dv or 3D dv.z
+  if constexpr (volume) {
+    AppendVMovLiteral(&test.code, vaddr++, 0x36003900u); // x=0.625, y=0.375: texel (2, 1)
+    AppendVMovLiteral(&test.code, vaddr, 0x2c003800u);   // z=0.5
+  } else {
+    AppendVMovLiteral(&test.code, vaddr, 0x3c003900u); // x=0.625, slice 1: texel 2 of layer 1
+  }
+  test.code.push_back(EncodeMimg0(0x22, 0x1, 0, false, dim)); // image_sample_d
+  test.code.push_back(EncodeMimg1(0, 20, 0, 0, true));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.expected = {RampTexel(2, dim == 0u ? 0u : 1u)};
+  // Row y of the ramp is 1D-array layer y.
+  test.sampled_image_rgba = MakeRampImage();
+  test.image_height = volume ? 4u : 1u;
+  test.sampled_image_type = volume ? vk::ImageType::e3D : vk::ImageType::e1D;
+  test.sampled_image_view_type = views[dim / 2u];
+  test.sampled_image_layers = dim == 4u ? 2u : 1u;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[3] = static_cast<u32>(types[dim / 2u]) << 28u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageSampleExplicitLod", "Grad"};
+  return test;
+}
+
 TestCase ImageGatherAddressVariants() {
   using O = ShaderOpcode;
   struct Gather {
@@ -53002,6 +53047,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageA16BiasTakesWholeVgpr);
+  AddCase(ImageA16GradientsTakeOwnVgpr<0>);
+  AddCase(ImageA16GradientsTakeOwnVgpr<4>);
+  AddCase(ImageA16GradientsTakeOwnVgpr<2>);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
@@ -60240,6 +60288,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, ImageGatherAddressVariants());
     RunCase(&vulkan, ImageA16BiasTakesWholeVgpr());
+    RunCase(&vulkan, ImageA16GradientsTakeOwnVgpr<0>());
+    RunCase(&vulkan, ImageA16GradientsTakeOwnVgpr<4>());
+    RunCase(&vulkan, ImageA16GradientsTakeOwnVgpr<2>());
     RunCase(nullptr, ImageGatherCompareOpcodes());
     return 0;
   }

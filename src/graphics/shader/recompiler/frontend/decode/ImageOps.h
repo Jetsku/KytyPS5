@@ -15,8 +15,9 @@ struct ImageAddressComponent {
 	uint32_t bit_width;
 };
 
-ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component);
-uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components);
+ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, ImageDimension dimension,
+                                                  uint32_t component);
+uint32_t ImageAddressDwordCount(uint32_t flags, ImageDimension dimension, uint32_t components);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
 

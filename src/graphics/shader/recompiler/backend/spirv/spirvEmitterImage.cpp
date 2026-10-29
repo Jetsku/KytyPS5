@@ -44,7 +44,8 @@ bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 
 uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
-	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component);
+	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags,
+	                                                         mem.image_dimension, component);
 	const auto packed = layout.bit_offset / 32u;
 	if (packed >= address.NumArgs()) return ConstantU32(ctx.state, 0);
 	auto value = ctx.Def(address.Arg(packed));
@@ -61,10 +62,11 @@ uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::
 
 uint32_t AddressF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
-	const auto value = AddressU32(ctx, mem, address, component);
-	return Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component).bit_width == 16u
-	           ? EmitF16BitsToF32(ctx.state, value)
-	           : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), value);
+	const auto value  = AddressU32(ctx, mem, address, component);
+	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags,
+	                                                         mem.image_dimension, component);
+	return layout.bit_width == 16u ? EmitF16BitsToF32(ctx.state, value)
+	                               : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), value);
 }
 
 ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
@@ -434,8 +436,9 @@ SampleOffset SampleOffsetFor(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	}
 	auto&      state      = ctx.state;
 	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
-	const auto packed_index =
-	    Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.offset).bit_offset / 32u;
+	const auto offset_layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags,
+	                                                              mem.image_dimension, layout.offset);
+	const auto packed_index  = offset_layout.bit_offset / 32u;
 	auto value =
 	    packed_index < address.NumArgs() ? address.Arg(packed_index).Resolve() : IR::Value(0u);
 	// Offsets are literals in guest code; under a non-uniform EXEC the register holds

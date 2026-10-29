@@ -331,21 +331,31 @@ uint32_t CountDmaskComponents(uint32_t dmask) {
 
 } // namespace
 
-ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component) {
+ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, ImageDimension dimension,
+                                                  uint32_t component) {
 	if ((flags & ImageSampleFlagA16) == 0u) return {component * 32u, 32u};
 	// A16 offsets, bias and PCF reference each take a whole VGPR, the bias as a half in its low
-	// 16 bits; the components after them pack two per VGPR.
+	// 16 bits. The other components pack two per VGPR, except that each 1D derivative and the last
+	// two 3D ones take the low half of their own VGPR.
 	const bool     has_bias    = (flags & ImageSampleFlagBias) != 0u;
 	const uint32_t bias_index  = (flags & ImageSampleFlagOffset) != 0u ? 1u : 0u;
 	const uint32_t whole_vgprs = std::popcount(
 	    flags & (ImageSampleFlagOffset | ImageSampleFlagBias | ImageSampleFlagCompare));
-	if (component >= whole_vgprs) return {(whole_vgprs + component) * 16u, 16u};
-	return {component * 32u, has_bias && component == bias_index ? 16u : 32u};
+	if (component < whole_vgprs) {
+		return {component * 32u, has_bias && component == bias_index ? 16u : 32u};
+	}
+	const uint32_t axes =
+	    (flags & ImageSampleFlagDerivative) != 0u ? ImageGradientComponents(dimension) : 0u;
+	const uint32_t unpaired = axes % 2u * 2u;
+	const uint32_t paired   = axes * 2u - unpaired;
+	const uint32_t index    = component - whole_vgprs;
+	const uint32_t half     = index + std::clamp(index, paired, paired + unpaired) - paired;
+	return {whole_vgprs * 32u + half * 16u, 16u};
 }
 
-uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {
+uint32_t ImageAddressDwordCount(uint32_t flags, ImageDimension dimension, uint32_t components) {
 	if (components == 0u) return 0u;
-	const auto last = ImageAddressComponentLayout(flags, components - 1u);
+	const auto last = ImageAddressComponentLayout(flags, dimension, components - 1u);
 	return (last.bit_offset + last.bit_width + 31u) / 32u;
 }
 

@@ -5724,6 +5724,9 @@ void TestImageAddressOperands() {
       Case{0x20, 1, true, false, 2, 1},  // packed xy
       Case{0x3d, 1, true, false, 5, 4},  // offset, half bias, full dref, packed xy
       Case{0x20, 2, true, true, 3, 2},   // packed xy/z in nonconsecutive VGPRs
+      Case{0x22, 4, true, false, 4, 3},  // a VGPR per 1D gradient, then packed x/slice
+      Case{0x22, 1, true, false, 6, 3},  // packed 2D gradients and xy
+      Case{0x22, 2, true, false, 9, 6},  // packed first four 3D gradients, a VGPR per last two
       Case{0x4c, 1, false, true, 4, 4},  // full dref, xy, and LOD in NSA VGPRs
       Case{0x0e, 1, false, false, 1, 1}, // resource query mip
   };
