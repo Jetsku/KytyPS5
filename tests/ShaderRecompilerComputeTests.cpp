@@ -40536,6 +40536,79 @@ TestCase VectorMed3F32NanUsesMin3Path() {
           {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop3FloatConversions(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct ConversionCase {
+    u32 opcode, input, expected;
+    u32 abs = 0, neg = 0, omod = 0;
+    bool clamp = false;
+    u32 exec = 1;
+  };
+  const ConversionCase cases[] = {
+      {0x18b, 0xabcd3e00u, 0x3fc00000u}, // Only the low half: 1.5.
+      {0x18b, 0x7c00c100u, 0xc0200000u}, // -2.5, despite +inf in the high half.
+      {0x18b, 0x12340000u, 0x00000000u},
+      {0x18b, 0x12348000u, 0x80000000u},
+      {0x18b, 0x12347c00u, 0x7f800000u},
+      {0x18b, 0x1234fc00u, 0xff800000u},
+      {0x18b, 0x1234c100u, 0x40200000u, 1},
+      {0x18b, 0x12343e00u, 0xbfc00000u, 0, 1},
+      {0x18b, 0x1234c100u, 0xc0200000u, 1, 1},
+      {0x18b, 0x12343e00u, 0x40400000u, 0, 0, 1},
+      {0x18b, 0x12343e00u, 0x40c00000u, 0, 0, 2},
+      {0x18b, 0x12343e00u, 0x3f400000u, 0, 0, 3},
+      {0x18b, 0x12343e00u, 0x3f800000u, 0, 0, 0, true},
+      {0x18b, 0x12343e00u, 0x00000000u, 0, 1, 0, true},
+      {0x18b, 0x12347e00u, 0x00000000u, 0, 0, 0, true}, // NaN clamp.
+      {0x18b, 0x12343e00u, 0x12343e00u, 0, 0, 0, false, 0},
+      {0x191, 0xff807f00u, 0x00000000u},
+      {0x192, 0xff807f00u, 0x42fe0000u},
+      {0x193, 0xff807f00u, 0x43000000u},
+      {0x194, 0xff807f00u, 0x437f0000u},
+      {0x191, 0xff807f00u, 0x00000000u, 1, 1, 1},
+      {0x192, 0xff807f00u, 0x43fe0000u, 1, 1, 2}, // 127 * 4; input modifiers ignored.
+      {0x193, 0xff807f00u, 0x42800000u, 1, 1, 3}, // 128 / 2.
+      {0x194, 0xff807f00u, 0x3f800000u, 1, 1, 0, true},
+      {0x194, 0xff807f00u, 0xff807f00u, 0, 0, 0, false, 0},
+  };
+  TestCase test;
+  test.name = wave_size == 32 ? "Vop3FloatConversionsWave32" : "Vop3FloatConversionsWave64";
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  for (const auto &entry : cases) test.initial.push_back(entry.input);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 2, 30); // Runtime source aliases the destination.
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    AppendVop3(&code, entry.opcode, 2, Vgpr(2), 0, 0, entry.abs, 0,
+                entry.clamp, entry.omod, entry.neg);
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendStoreVgpr(&code, 2, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(entry.expected);
+  }
+  // Exercise scalar, literal, and inline sources for every new encoding too.
+  AppendSMovLiteral(&code, 12, 0x44333e00u);
+  const u32 scalar_results[] = {0x3fc00000u, 0, 0x42780000u, 0x424c0000u, 0x42880000u};
+  const u32 opcodes[] = {0x18b, 0x191, 0x192, 0x193, 0x194};
+  for (u32 i = 0; i < std::size(opcodes); ++i) {
+    for (const u32 source : {12u, 255u, InlineU32(0)}) {
+      AppendVop3(&code, opcodes[i], 2, source, 0);
+      if (source == 255u) code.push_back(0x44333e00u);
+      AppendStoreVgpr(&code, 2, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(source == InlineU32(0) ? 0u : scalar_results[i]);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CVT_F32_F16, O::V_CVT_F32_UBYTE0, O::V_CVT_F32_UBYTE1,
+                  O::V_CVT_F32_UBYTE2, O::V_CVT_F32_UBYTE3,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorFloatConversionOps() {
   using O = ShaderOpcode;
 
@@ -52558,6 +52631,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
+  cases.push_back(Vop3FloatConversions(32));
+  cases.push_back(Vop3FloatConversions(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -59165,6 +59240,14 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--vop3-conversions-only") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3FloatConversions(32));
+    RunCase(&vulkan, Vop3FloatConversions(64));
+    RunCase(&vulkan, VectorFloatConversionOps());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--quadmask-only") == 0) {
     EnsureConfigInitialized();
     VulkanHarness vulkan;

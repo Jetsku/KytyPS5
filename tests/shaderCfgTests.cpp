@@ -2302,6 +2302,50 @@ void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestVop3FloatConversionDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const std::pair<uint32_t, Decoder::Opcode> conversions[] = {
+      {0x18b, Decoder::Opcode::V_CVT_F32_F16},
+      {0x191, Decoder::Opcode::V_CVT_F32_UBYTE0},
+      {0x192, Decoder::Opcode::V_CVT_F32_UBYTE1},
+      {0x193, Decoder::Opcode::V_CVT_F32_UBYTE2},
+      {0x194, Decoder::Opcode::V_CVT_F32_UBYTE3},
+  };
+  for (const auto &[encoding, opcode] : conversions) {
+    for (const uint32_t source : {261u, 12u, 128u, 255u}) {
+      const uint32_t code[] = {
+          EncodeVop3Word0(encoding, 20, 0, 1, true),
+          EncodeVop3Word1(source, 0, 0) | (2u << 27u) | (1u << 29u),
+          0xa5a53e00u,
+      };
+      Decoder::Instruction inst;
+      Decoder::DecodeInstruction(code, 0, inst);
+      Check(inst.opcode == opcode && inst.family == Decoder::Family::VOP3 &&
+                inst.src_count == 1 && inst.word_count == (source == 255u ? 3u : 2u),
+            "VOP3 conversion lost its opcode, unary source, or literal length");
+      Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 20 &&
+                inst.dst.sdwa_sel == 6 && inst.dst.clamp && inst.dst.omod == 2,
+            "VOP3 conversion lost its full-width destination or output modifiers");
+      const bool half = opcode == Decoder::Opcode::V_CVT_F32_F16;
+      Check(inst.src0.absolute == half && inst.src0.negate == half,
+            "VOP3 conversion must apply half-float modifiers and ignore byte modifiers");
+      Decoder::Operand expected_source;
+      Decoder::DecodeScalarSource(source, 0, expected_source);
+      Check(inst.src0.kind == expected_source.kind && inst.src0.reg == expected_source.reg &&
+                (source != 255u || inst.src0.value == code[2]),
+            "VOP3 conversion changed its source register or literal value");
+    }
+    for (const uint32_t op_sel : {1u, 2u, 4u, 8u}) {
+      const uint32_t code[] = {EncodeVop3Word0(encoding, 20, op_sel),
+                               EncodeVop3Word1(261, 0, 0)};
+      Decoder::Instruction inst;
+      Decoder::DecodeInstruction(code, 0, inst);
+      Check(inst.opcode == Decoder::Opcode::UNSUPPORTED,
+            "VOP3 conversion accepted unsupported OP_SEL bits");
+    }
+  }
+}
+
 void TestNewShaderRecompilerMoreAluFamilies() {
   const uint32_t shader[] = {
       EncodeSopk(0x00, 9, 7), // s_movk_i32 s9, 7
@@ -16226,6 +16270,7 @@ int main(int argc, char **argv) {
   TestRayTracingSharedFunction();
   TestTraversalLoopBreakRegion();
   TestDeclaredShaderHashMarker();
+  TestVop3FloatConversionDecode();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

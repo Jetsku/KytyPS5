@@ -157,6 +157,10 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x04u, Opcode::V_CVT_F64_I32},
     {0x0fu, Opcode::V_CVT_F32_F64},
     {0x10u, Opcode::V_CVT_F64_F32},
+    {0x11u, Opcode::V_CVT_F32_UBYTE0},
+    {0x12u, Opcode::V_CVT_F32_UBYTE1},
+    {0x13u, Opcode::V_CVT_F32_UBYTE2},
+    {0x14u, Opcode::V_CVT_F32_UBYTE3},
     {0x16u, Opcode::V_CVT_F64_U32},
     {0x17u, Opcode::V_TRUNC_F64},
     {0x18u, Opcode::V_CEIL_F64},
@@ -167,6 +171,7 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x07u, Opcode::V_CVT_U32_F32},
     {0x08u, Opcode::V_CVT_I32_F32},
     {0x0au, Opcode::V_CVT_F16_F32},
+    {0x0bu, Opcode::V_CVT_F32_F16},
     {0x0cu, Opcode::V_CVT_RPI_I32_F32},
     {0x0du, Opcode::V_CVT_FLR_I32_F32},
     {0x0eu, Opcode::V_CVT_OFF_F32_I4},
@@ -1566,6 +1571,12 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	}
 	switch (opcode) {
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
+		case Opcode::V_CVT_F32_UBYTE0:
+		case Opcode::V_CVT_F32_UBYTE1:
+		case Opcode::V_CVT_F32_UBYTE2:
+		case Opcode::V_CVT_F32_UBYTE3:
+			// Byte conversions ignore input modifiers and support all output modifiers.
+			return op_sel != 0u;
 		case Opcode::V_INTERP_P1LL_F16:
 		case Opcode::V_INTERP_P2_F16:
 			return abs != 0u || (op_sel & 0x7u) != 0u || clamp != 0u || omod != 0u || neg != 0u;
