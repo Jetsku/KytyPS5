@@ -20,6 +20,9 @@ public:
 		Frame* frame;
 		int    bus;
 		bool   premultiplied_alpha;
+		// KYTY_HOLD_SKIPPED_DRAWS: the bus keeps the frame it shows, and this one is released
+		// unshown.
+		bool hold = false;
 	};
 
 	explicit Presenter(WindowContext& window);

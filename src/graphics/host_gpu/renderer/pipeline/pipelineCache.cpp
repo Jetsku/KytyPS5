@@ -8651,6 +8651,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			                 skip.ready_in_wait, skip.not_queued);
 		};
 		if (poll == PrefetchState::Poll::Pending) {
+			g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
 			if (m_skip_draws.fetch_add(1, std::memory_order_relaxed) == 0) {
 				PipelineCacheLog("Pipeline skip: first draw skipped while its pipeline builds "
 				                 "(VS 0x{:016x})", vs_input_info.stage.program != nullptr

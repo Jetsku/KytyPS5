@@ -232,6 +232,11 @@ struct DrawAutoArgs {
 // barriers around every dispatch, as before.
 [[nodiscard]] bool GuestSyncBarriersEnabled();
 
+// KYTY_HOLD_SKIPPED_DRAWS (videoOut.cpp, the GT7 fork's round 133, usa-ratt 65ed4150b): draws
+// KYTY_PIPELINE_SKIP left out while their pipelines built in the background, since the last flip
+// of the main display.
+inline std::atomic<uint32_t> g_frame_pipeline_skips {0};
+
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
 	Guest,             // CP EmitGlobalBarrier: guest RELEASE_MEM / EVENT_WRITE flushes

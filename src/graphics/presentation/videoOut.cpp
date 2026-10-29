@@ -253,6 +253,8 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		// KYTY_HOLD_SKIPPED_DRAWS: the main display keeps the frame it shows (TakeFrameHold).
+		bool hold = false;
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -1164,6 +1166,9 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	cfg.flip_status.gcQueueNum     = 0;
 }
 
+// KYTY_HOLD_SKIPPED_DRAWS (defined below).
+static bool TakeFrameHold();
+
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
@@ -1251,6 +1256,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		    "for display (KYTY_HDR_TO_SDR=0 shows the PQ pixels unchanged).\n");
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
+	// KYTY_HOLD_SKIPPED_DRAWS: a main-display frame that left out many draws while their
+	// pipelines built is not shown.
+	const bool hold = !special && cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN && TakeFrameHold();
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
@@ -1280,6 +1288,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	prepared->frame = frame;
 	prepared->premultiplied_alpha = premultiplied_alpha;
+	prepared->hold                = hold;
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1356,6 +1365,43 @@ bool FlipQueue::IsPending(VideoOutConfig& cfg, int index, uint64_t before) {
 // KYTY_PRESENT_UNLOCKED, which releases the renderer's lock while presenting.)
 static Live::Switch g_present_unlocked("KYTY_PRESENT_PORT_UNLOCKED", Live::ParseDefaultOff);
 
+// KYTY_HOLD_SKIPPED_DRAWS=<n> (live, default 0 = off; the GT7 fork's round 133, usa-ratt
+// 65ed4150b, 100 there): at a flip of the main display, a frame that left out n draws or more
+// while their pipelines built in the background (KYTY_PIPELINE_SKIP) is released unshown and the
+// frame shown before stays: at most two in a row, then eight shown before the next. A burst of
+// pipeline builds (a race start) otherwise shows a frame with most of the scene missing.
+static Live::Switch g_hold_skipped_draws("KYTY_HOLD_SKIPPED_DRAWS", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 0;
+});
+
+// The thread that prepares flips, after the frame's draws: whether this main-display frame is held.
+static bool TakeFrameHold() {
+	constexpr uint32_t MaxInARow  = 2;
+	constexpr uint32_t ShownAfter = 8;
+	static uint32_t    in_a_row   = 0;
+	static uint32_t    shown      = ShownAfter;
+	static uint64_t    held       = 0;
+	const uint32_t     skips =
+	    Graphics::g_frame_pipeline_skips.exchange(0, std::memory_order_relaxed);
+	const auto threshold = static_cast<uint64_t>(g_hold_skipped_draws.Get());
+	const bool hold      = threshold != 0 && skips >= threshold && in_a_row < MaxInARow &&
+	                  (in_a_row != 0 || shown >= ShownAfter);
+	if (hold) {
+		in_a_row++;
+		shown = 0;
+		held++;
+		if (held <= 16 || (held & 63u) == 0) {
+			LOGF("Frame hold: a frame that left out %u draws while their pipelines built is not "
+			     "shown (%" PRIu64 " so far, KYTY_HOLD_SKIPPED_DRAWS=%" PRIu64 ")\n",
+			     skips, held, threshold);
+		}
+	} else {
+		in_a_row = 0;
+		shown    = std::min(shown + 1u, ShownAfter);
+	}
+	return hold;
+}
+
 bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1427,7 +1473,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		} else {
 			const bool headset    = r.cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
 			layers[layer_count++] = {r.frame, headset ? VIDEO_OUT_BUS_TYPE_MAIN : r.cfg->bus,
-			                         r.premultiplied_alpha};
+			                         r.premultiplied_alpha, r.hold};
 		}
 	}
 	if (due) {
