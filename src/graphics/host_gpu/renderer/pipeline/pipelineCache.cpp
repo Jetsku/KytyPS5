@@ -1385,6 +1385,54 @@ static std::mutex g_call_bodies_mutex;
 static std::unordered_map<uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>>>
     g_call_bodies;
 
+// KYTY_CALL_EXCLUDE_FAILED=1 (default off; adapted from usa-ratt/KytyPS5-GT7 c17e3ccdd): a function
+// expansion whose translation gives up inside a placed callee body leaves that callee out of every
+// later expansion on the compile path too (the background translation, KYTY_SHADER_CALLS_ASYNC,
+// always did), and such a refusal is neither stored in the program cache nor taken from it: a
+// stored one kept the expansion skipped in every later session, as nothing learned the callee.
+static bool CallExcludeFailedEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CALL_EXCLUDE_FAILED");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static std::shared_ptr<const std::vector<ShaderRecompiler::Decoder::ShaderCallBody>> ExpansionBodies(
+    uint64_t call_expansion) {
+	if (call_expansion == 0) return nullptr;
+	std::scoped_lock lock(g_call_bodies_mutex);
+	const auto       found = g_call_bodies.find(call_expansion);
+	return found != g_call_bodies.end() ? found->second : nullptr;
+}
+
+// A function expansion with placed callee bodies (KYTY_CALL_EXCLUDE_FAILED).
+static bool ExpansionHasBodies(uint64_t call_expansion) {
+	if (!CallExcludeFailedEnabled()) return false;
+	const auto bodies = ExpansionBodies(call_expansion);
+	return bodies != nullptr && !bodies->empty();
+}
+
+// A refused translation of a function expansion: the callee whose body holds the failing pc is
+// dropped. True when the refusal belongs to such an expansion (it is not stored then).
+static bool ExcludeFailedCallee(uint64_t call_expansion, const ShaderRecompiler::TranslateResult& translated,
+                                const ShaderRecompiler::CompileOptions& options) {
+	if (!CallExcludeFailedEnabled()) return false;
+	const auto bodies = ExpansionBodies(call_expansion);
+	if (bodies == nullptr || bodies->empty()) return false;
+	if (translated.skip_pc != UINT32_MAX) {
+		for (const auto& body: *bodies) {
+			if (translated.skip_pc >= body.begin && translated.skip_pc < body.end) {
+				CallExpander().DropTarget(body.address,
+				                          fmt::format("{} at +0x{:x} in CS 0x{:016x}", translated.skip_reason,
+				                                      translated.skip_pc - body.begin, options.shader_hash));
+				break;
+			}
+		}
+	}
+	return true;
+}
+
 // KYTY_SHADER_CALLS_SPLIT: the split program a renderer step selected, and the run a kernel's
 // lookup produced (taken by the renderer).
 thread_local const ShaderRecompiler::CallSplit::Code*          t_split_code = nullptr;
@@ -3958,6 +4006,11 @@ struct PipelineCache::ProgramCache {
 			bool usable = disk_source->skip_dispatch ||
 			              ShaderRecompiler::IR::DecodeResourcePlan(disk_source->plan, stored_plan);
 			times.load_ns += CompileClockNs() - load_begin;
+			// KYTY_CALL_EXCLUDE_FAILED: a stored refusal of a function expansion (an older cache) is
+			// translated again, so the callee behind it is learned and left out.
+			if (usable && disk_source->skip_dispatch && ExpansionHasBodies(params.call_expansion)) {
+				usable = false;
+			}
 			if (usable && SyncVerify()) {
 				translate_now();
 				usable       = DiskSourceMatches(translated, *disk_source, options);
@@ -4022,7 +4075,11 @@ struct PipelineCache::ProgramCache {
 					}
 				}
 				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash, call_targets);
-				if (disk_on) {
+				// KYTY_CALL_EXCLUDE_FAILED: the callee whose placed body keeps an expansion from
+				// translating is left out of later expansions (the background translation does so
+				// already), and the refusal is not stored: a later session learns its exclusions again.
+				const bool expansion_refused = ExcludeFailedCallee(params.call_expansion, translated, options);
+				if (disk_on && !expansion_refused) {
 					disk->AddSource(disk_key, true, {});
 				}
 				lock.lock();
