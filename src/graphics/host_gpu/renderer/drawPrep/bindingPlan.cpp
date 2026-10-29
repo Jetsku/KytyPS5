@@ -544,7 +544,8 @@ BindingTotals& GetBindingTotals() {
 
 void PrefetchBindingPipeline(const BindingPlanContext& context, const RegisterSnapshot& registers,
                              const DrawIndexArgs* index_args, const PreparedDraw& prepared) {
-	if (!context.pipelines->PipelinePrefetchEnabled() || !prepared.ok) return;
+	// KYTY_DRAW_PREP_TESS: a tessellated draw's three vertex stages are not planned.
+	if (!context.pipelines->PipelinePrefetchEnabled() || !prepared.ok || prepared.vertex_stages != 1) return;
 	// A regular pipeline binding plan below already requests the same key.
 	if (BindingPartEnabled(BindingParts(), BindingPart::Pipeline)) return;
 	BindingPlan plan;
@@ -563,7 +564,7 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
                         BindingPlan& plan) {
 	plan.Reset();
 	const auto parts = BindingParts();
-	if (parts == 0 || !prepared.ok) {
+	if (parts == 0 || !prepared.ok || prepared.vertex_stages != 1) {
 		return;
 	}
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepBindingPlan);

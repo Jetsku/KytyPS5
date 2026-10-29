@@ -172,7 +172,7 @@ uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_con
 		*swap_key = 0;
 	}
 	if (!prepared.ok || prepared.failure != DrawPrep::Failure::None ||
-	    !prepared.vertex_info.stage.program) {
+	    !prepared.vertex_info.stage.program || prepared.vertex_stages != 1) {
 		return 0;
 	}
 	// Every context register (targets, depth/stencil, blend, raster, viewports, shader registers).
@@ -263,7 +263,7 @@ void StructureKeyParts(const HW::Context& context, const HW::UserConfig& user_co
                        const DrawPrep::PreparedDraw& prepared, KeyParts& parts) {
 	parts.fill(0);
 	if (!prepared.ok || prepared.failure != DrawPrep::Failure::None ||
-	    !prepared.vertex_info.stage.program) {
+	    !prepared.vertex_info.stage.program || prepared.vertex_stages != 1) {
 		return;
 	}
 	context.VisitKeyDiagParts([&parts](uint32_t part, const void* data, size_t size) {

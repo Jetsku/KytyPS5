@@ -2075,6 +2075,12 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 	state.ps_input_info = prepared.pixel_info;
 	SwapPreparedStage(state.stage_preps.vertex[0], prepared.vertex_prep);
 	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
+	// KYTY_DRAW_PREP_TESS: a tessellated draw's HS and TES stages.
+	for (uint32_t i = 1; i < prepared.vertex_stages; i++) {
+		CopyPreparedVertexInfo(state.vertex_info[i], prepared.tess_info[i - 1]);
+		SwapPreparedStage(state.stage_preps.vertex[i], prepared.tess_prep[i - 1]);
+		state.vertex_info[i].stage.resources = &state.stage_preps.vertex[i].resources;
+	}
 	if (prepared.pixel_active) {
 		SwapPreparedStage(state.stage_preps.pixel, prepared.pixel_prep);
 		state.ps_input_info.stage.resources = &state.stage_preps.pixel.resources;
@@ -2142,8 +2148,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.vertex_stages_written = PipelineCache::TessellationActive(buffer.GetUserConfig()) ? 3u : 1u;
 	// Draw-prep: use the draw's speculative preparation when its certificate holds now.
 	CommitStats::StepMark(CommitStats::Step::TakePrepared);
+	// KYTY_DRAW_PREP_TESS: the preparation has the draw's vertex stages (both come from the draw's
+	// register snapshot, so they always agree once Validate holds).
 	const bool prepared_valid =
-	    prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping);
+	    prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping) &&
+	    prepared->vertex_stages == state.vertex_stages_written;
 	CommitStats::StepMark(CommitStats::Step::Validate);
 	if (prepared_valid) {
 		ApplyPreparedDraw(*prepared, state);

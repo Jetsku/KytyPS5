@@ -153,6 +153,11 @@ struct PreparedDraw {
 	ShaderPixelInputInfo                                pixel_info;
 	PipelineCache::StagePrep                            vertex_prep;
 	PipelineCache::StagePrep                            pixel_prep;
+	// KYTY_DRAW_PREP_TESS: 3 for a tessellated draw, whose LS stage is vertex_info/vertex_prep and
+	// whose HS and TES stages are tess_info/tess_prep; 1 otherwise.
+	uint32_t                                            vertex_stages = 1;
+	std::array<ShaderVertexInputInfo, 2>                tess_info;
+	std::array<PipelineCache::StagePrep, 2>             tess_prep;
 	ReadSet                                             reads;
 	uint64_t                                            coherence_generation  = 0;
 	uint64_t                                            shader_map_generation = 0;
