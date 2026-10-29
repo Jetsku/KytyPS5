@@ -4728,6 +4728,76 @@ struct PipelineCache::ProgramCache {
 		return Result::Ok;
 	}
 
+	// KYTY_DRAW_PREP_TESS: TryPrepareSpeculative for a tessellated draw, in the serial path's
+	// order: the pixel stage, then LS, HS and TES (no parameter linking, as GetGraphicsPrograms).
+	PipelineCache::SpeculativeResult
+	TryPrepareSpeculativeTess(bool pixel_active, const ShaderParams& ps_params,
+	                          ShaderPixelInputInfo& ps_info, StagePrep& ps_prep,
+	                          const std::array<ShaderParams, 3>&      vs_params,
+	                          std::array<ShaderVertexInputInfo*, 3> vs_info,
+	                          std::array<StagePrep*, 3> vs_prep, uint32_t push_data_cursor,
+	                          PipelineCache::GraphicsPrograms& programs,
+	                          uint64_t* compile_ns = nullptr) {
+		using Result     = PipelineCache::SpeculativeResult;
+		auto& scratch    = ThreadScratch();
+		auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
+		const auto initial_cursor = push_data_cursor;
+		const auto compile_missing = [&]() -> Result {
+			if (compile_ns == nullptr) return Result::NotPublished;
+			ShaderReadAttempt attempt;
+			auto cursor = initial_cursor;
+			if (pixel_active) {
+				programs.pixel = Get(ps_params, ps_info, ps_prep, cursor, attempt, scratch,
+				                     evaluation, true, compile_ns);
+				if (!programs.pixel) return Result::NotPublished;
+			}
+			for (uint32_t i = 0; i < 3; i++) {
+				LinkPixelParameters(false, *vs_info[i], ps_info);
+				programs.vertex[i] = Get(vs_params[i], *vs_info[i], *vs_prep[i], cursor, attempt,
+				                         scratch, evaluation, true, compile_ns);
+				if (!programs.vertex[i]) return Result::NotPublished;
+			}
+			return Result::Ok;
+		};
+		auto& key = scratch.key;
+		if (pixel_active) {
+			BuildKey(ps_params, ps_info, key);
+			const auto* source = FindSourceMemo(key, scratch);
+			if (source == nullptr || source->skip_dispatch.load(std::memory_order_relaxed)) {
+				return compile_missing();
+			}
+			if (!MaterializeStage(*source, MakeSpeculativeRuntime(ps_params), evaluation, ps_prep)) {
+				return Result::ReadFailed;
+			}
+			const auto* permutation = FindPermutationMemo(*source, key.stage, ps_prep.specialization,
+			                                              push_data_cursor, scratch);
+			if (permutation == nullptr) {
+				return compile_missing();
+			}
+			programs.pixel = Bind(*permutation, ps_info, ps_prep, push_data_cursor);
+		}
+		for (uint32_t i = 0; i < 3; i++) {
+			auto& info = *vs_info[i];
+			auto& prep = *vs_prep[i];
+			LinkPixelParameters(false, info, ps_info);
+			BuildKey(vs_params[i], info, key);
+			const auto* source = FindSourceMemo(key, scratch);
+			if (source == nullptr || source->skip_dispatch.load(std::memory_order_relaxed)) {
+				return compile_missing();
+			}
+			if (!MaterializeStage(*source, MakeSpeculativeRuntime(vs_params[i]), evaluation, prep)) {
+				return Result::ReadFailed;
+			}
+			const auto* permutation = FindPermutationMemo(*source, key.stage, prep.specialization,
+			                                              push_data_cursor, scratch);
+			if (permutation == nullptr) {
+				return compile_missing();
+			}
+			programs.vertex[i] = Bind(*permutation, info, prep, push_data_cursor);
+		}
+		return Result::Ok;
+	}
+
 	// KYTY_DRAW_PREP_DISPATCH: GetComputeProgram's lookup as TryPrepareSpeculative does it for a
 	// draw: the stage materialized on the calling thread with probe-only reads (the workgroup counts
 	// of the dispatch, as Get passes them), then the permutation looked up and bound.
@@ -8018,15 +8088,15 @@ static bool StageSamplersAllUnnormalized(const ShaderStageRuntime& stage) {
 // A hull shader sampling through unnormalized samplers only runs its copy with normalized
 // coordinates (pixelRateVariant.h), under an id of its own (its pipelines differ); its samplers are
 // made normalized when the draw binds them (ShaderProgram::normalized_samplers).
-static void ApplyNormalizedLod(PipelineCache::GraphicsPrograms&      programs,
-                               std::array<ShaderVertexInputInfo, 3>& vertex_info) {
+static void ApplyNormalizedLod(PipelineCache::GraphicsPrograms&            programs,
+                               std::array<const ShaderVertexInputInfo*, 3> vertex_info) {
 	for (uint32_t i = 0; i < 3; i++) {
 		auto& program = programs.vertex[i];
-		if (!program || vertex_info[i].logical_stage != ShaderType::TessellationControl) {
+		if (!program || vertex_info[i]->logical_stage != ShaderType::TessellationControl) {
 			continue;
 		}
 		const auto variant = NormalizedLod::Find(program.id);
-		if (variant.module == nullptr || !StageSamplersAllUnnormalized(vertex_info[i].stage)) {
+		if (variant.module == nullptr || !StageSamplersAllUnnormalized(vertex_info[i]->stage)) {
 			continue;
 		}
 		program.module              = variant.module;
@@ -8145,7 +8215,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			result.translation_taken   = t_translation_taken;
 			if (!read_attempt.materialization_failed || result.translation_pending) {
 				if (tess_active && UnnormalizedSamplingFix()) {
-					ApplyNormalizedLod(result, vertex_inputs);
+					ApplyNormalizedLod(result, {&vertex_inputs[0], &vertex_inputs[1], &vertex_inputs[2]});
 				}
 				return result;
 			}
@@ -8235,6 +8305,67 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	    compile_ahead ? compile_ns : nullptr);
 	if (result == SpeculativeResult::Ok && read_failed()) {
 		return SpeculativeResult::ReadFailed;
+	}
+	return result;
+}
+
+bool PipelineCache::DrawPrepTessEnabled() {
+	static const bool on = EnvU64("KYTY_DRAW_PREP_TESS", 0) != 0;
+	return on;
+}
+
+PipelineCache::SpeculativeResult PipelineCache::PrepareTessellatedProgramsSpeculative(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::array<ShaderVertexInputInfo*, 3> vertex_info, ShaderPixelInputInfo& pixel_info,
+    std::array<StagePrep*, 3> vertex_preps, StagePrep& pixel_prep, GraphicsPrograms& programs,
+    uint64_t* compile_ns) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	EXIT_IF(!DrawPrep::Speculative());
+	if (!TessellationActive(user_config) || ResourceReuseEnabled()) {
+		return SpeculativeResult::Ineligible;
+	}
+	const auto read_failed = [] { return DrawPrep::ActiveRecorder()->reads->Failed(); };
+	// GetGraphicsPrograms' static stage preparation for a tessellated draw.
+	std::array<ShaderVertexInputInfo, 3> infos;
+	bool                                 unsupported = false;
+	const auto vertex_params = PrepareTessellationPrograms(vertex_regs, context, infos, &unsupported);
+	if (read_failed()) {
+		return SpeculativeResult::ReadFailed;
+	}
+	if (unsupported) {
+		return SpeculativeResult::Ineligible; // the serial path skips the draw or ends
+	}
+	Common::PrepPhases::Mark(Common::PrepPhases::Phase::VsProgram);
+	ShaderParams pixel_params;
+	if (pixel_active) {
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		ApplyPixelParameterMode(context, user_config, false, true, pixel_info);
+		ApplyDualSourceBlending(context, pixel_info);
+		ApplyHalfFloatTargets(context, pixel_info);
+	}
+	ApplyClipSpace(m_graphics, context, infos[2], true,
+	               Prospero::IsRectList(user_config.GetPrimType()));
+	if (infos[2].user_clip_planes != 0) {
+		return SpeculativeResult::Ineligible; // the serial path places the plane dwords
+	}
+	if (read_failed()) {
+		return SpeculativeResult::ReadFailed;
+	}
+	Common::PrepPhases::Mark(Common::PrepPhases::Phase::PsProgram);
+	for (uint32_t i = 0; i < 3; i++) {
+		*vertex_info[i] = infos[i];
+	}
+	const bool compile_ahead = g_program_prefetch.On();
+	const auto result = m_program_cache->TryPrepareSpeculativeTess(
+	    pixel_active, pixel_params, pixel_info, pixel_prep, vertex_params, vertex_info,
+	    vertex_preps, 0, programs, compile_ahead ? compile_ns : nullptr);
+	if (result == SpeculativeResult::Ok && read_failed()) {
+		return SpeculativeResult::ReadFailed;
+	}
+	if (result == SpeculativeResult::Ok && UnnormalizedSamplingFix()) {
+		ApplyNormalizedLod(programs, {vertex_info[0], vertex_info[1], vertex_info[2]});
 	}
 	return result;
 }

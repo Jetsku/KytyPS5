@@ -50,12 +50,16 @@ struct ControllerSettings {
 	int     vibration_intensity = 100;
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	int     keyboard_player     = 0;
+	bool    wheel_enabled       = false;
+	// wheel.json beside the settings file; set when the settings are read, not stored.
+	QString wheel_config;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
 		s->setValue("controller_keyboard_player", keyboard_player);
+		s->setValue("wheel_enabled", wheel_enabled);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -70,6 +74,7 @@ struct ControllerSettings {
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
 		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
 		                         Config::MAX_PLAYERS);
+		wheel_enabled       = s->value("wheel_enabled", false).toBool();
 	}
 };
 

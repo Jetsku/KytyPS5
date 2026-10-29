@@ -218,6 +218,20 @@ public:
 	    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
 	    StagePrep& vertex_prep, StagePrep& pixel_prep, GraphicsPrograms& programs,
 	    uint64_t* compile_ns = nullptr);
+	// KYTY_DRAW_PREP_TESS=1 (default 0; adapted from usa-ratt/KytyPS5-GT7 59bd41633): a
+	// tessellated draw prepared as PrepareGraphicsProgramsSpeculative prepares the others, with
+	// GetGraphicsPrograms' tessellation path (PrepareTessellationPrograms; the pixel stage, then
+	// LS, HS and TES bound in that order, unlinked). vertex_info and vertex_preps are the LS, HS
+	// and TES stages. Ineligible for a set the serial path would skip or end on, a user clip plane
+	// or O15 resource reuse.
+	[[nodiscard]] static bool DrawPrepTessEnabled();
+	[[nodiscard]] SpeculativeResult PrepareTessellatedProgramsSpeculative(
+	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	    bool pixel_active, std::array<ShaderVertexInputInfo*, 3> vertex_info,
+	    ShaderPixelInputInfo& pixel_info, std::array<StagePrep*, 3> vertex_preps,
+	    StagePrep& pixel_prep, GraphicsPrograms& programs, uint64_t* compile_ns = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);

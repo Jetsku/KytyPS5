@@ -24,6 +24,7 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/wheelHost.h"
 #include "loader/additionalContent.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
@@ -121,6 +122,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
+	// After the window: SDL is initialised there, on this thread.
+	subsystems.Initialize<Libs::Wheel::Lifecycle>();
 }
 
 static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,

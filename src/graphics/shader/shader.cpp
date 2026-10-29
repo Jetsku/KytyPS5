@@ -1654,6 +1654,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	if (unsupported != nullptr) *unsupported = false;
+	// KYTY_DRAW_PREP_TESS (pipelineCache.cpp, adapted from usa-ratt/KytyPS5-GT7 59bd41633): a
+	// draw-prep preparation describes the set from the draw's register snapshot and never ends the
+	// emulator; whatever it cannot describe is refused (unsupported) or left to the serial path
+	// (a failed read), which decides at commit as before.
+	const bool speculative = DrawPrep::Speculative();
+	EXIT_IF(speculative && unsupported == nullptr);
+	if (speculative && DrawPrep::SpeculativeFailed()) {
+		return {};
+	}
 	const bool unsupported_types = local.type != Prospero::ShaderBinaryType::kHsFront ||
 	                               control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                               evaluation.type != Prospero::ShaderBinaryType::kGs;
@@ -1663,6 +1672,10 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	// the tessellator, a wave32 hull or domain stage, other binary types) has its patch draws
 	// skipped with KYTY_SKIP_INVALID (default on) instead of ending the emulator. Logged once per
 	// set and stage mask.
+	if (speculative && (unsupported_types || unsupported_stages || regs.hs_regs.user_data_addr == 0)) {
+		*unsupported = true;
+		return {};
+	}
 	if ((unsupported_types || unsupported_stages) && unsupported != nullptr &&
 	    Common::SkipInvalidEnabled()) {
 		static std::mutex                   logged_mutex;
@@ -1703,10 +1716,28 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
+	if (speculative && DrawPrep::SpeculativeFailed()) {
+		return {};
+	}
 
 	input_info = {};
-	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+	if (speculative) {
+		// The LS vertex tables as PrepareProgram's VS path reads them in a preparation: metadata
+		// copied from clean memory, every table word through the recorder.
+		PreparationMetadata metadata_copy;
+		ShaderMappedData    metadata = local;
+		if (!CopyMetadataForPreparation(local, metadata_copy, metadata)) {
+			return {};
+		}
+		if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+		                                    regs.hs_regs.rsrc2.user_sgpr, sh, metadata,
+		                                    input_info[0])) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return {};
+		}
+	} else if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+	                                           regs.hs_regs.rsrc2.user_sgpr, sh, local,
+	                                           input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;
@@ -1732,6 +1763,11 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .min_tess_level        = sh.m_vgtHosMinTessLevel,
 	    .max_tess_level        = sh.m_vgtHosMaxTessLevel,
 	};
+	if (speculative && (tess.input_control_points == 0 || tess.input_control_points > 32 ||
+	                    tess.output_control_points == 0 || tess.output_control_points > 32)) {
+		*unsupported = true;
+		return {};
+	}
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	// The analysis caches the LS/HS strides per program pair and control point counts itself

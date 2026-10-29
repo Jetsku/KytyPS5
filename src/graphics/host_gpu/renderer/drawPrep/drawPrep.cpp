@@ -322,6 +322,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
 	prepared.touched_valid     = false;
+	prepared.vertex_stages     = 1;
 	if (!eligible) {
 		prepared.failure = Failure::Ineligible;
 		return;
@@ -343,11 +344,25 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 
 	Recorder    recorder {&prepared.reads, exact};
 	RecordScope scope(recorder);
-	const auto  result = pipeline_cache.PrepareGraphicsProgramsSpeculative(
-	    sh_ctx.GetVs(), sh_ctx.GetPs(), ctx.GetShaderRegisters(), ctx, registers.user_config,
-	    prepared.target_export_mapping, prepared.pixel_active, prepared.vertex_info,
-	    prepared.pixel_info, prepared.vertex_prep, prepared.pixel_prep, prepared.programs,
-	    &prepared.program_compile_ns);
+	// KYTY_DRAW_PREP_TESS: a tessellated draw's three vertex stages (otherwise Ineligible).
+	const bool tess = PipelineCache::TessellationActive(registers.user_config) &&
+	                  PipelineCache::DrawPrepTessEnabled();
+	if (tess) {
+		prepared.vertex_stages = 3;
+	}
+	const auto result =
+	    tess ? pipeline_cache.PrepareTessellatedProgramsSpeculative(
+	               sh_ctx.GetVs(), sh_ctx.GetPs(), ctx.GetShaderRegisters(), ctx,
+	               registers.user_config, prepared.target_export_mapping, prepared.pixel_active,
+	               {&prepared.vertex_info, &prepared.tess_info[0], &prepared.tess_info[1]},
+	               prepared.pixel_info,
+	               {&prepared.vertex_prep, &prepared.tess_prep[0], &prepared.tess_prep[1]},
+	               prepared.pixel_prep, prepared.programs, &prepared.program_compile_ns)
+	         : pipeline_cache.PrepareGraphicsProgramsSpeculative(
+	               sh_ctx.GetVs(), sh_ctx.GetPs(), ctx.GetShaderRegisters(), ctx,
+	               registers.user_config, prepared.target_export_mapping, prepared.pixel_active,
+	               prepared.vertex_info, prepared.pixel_info, prepared.vertex_prep,
+	               prepared.pixel_prep, prepared.programs, &prepared.program_compile_ns);
 	switch (result) {
 		case PipelineCache::SpeculativeResult::Ok: break;
 		case PipelineCache::SpeculativeResult::Ineligible:
@@ -1310,13 +1325,18 @@ bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& p
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepVerifyChecks);
 	const bool programs_equal = programs.pixel.id == serial_programs.pixel.id &&
 	                            programs.vertex[0].id == serial_programs.vertex[0].id &&
-	                            programs.vertex[1].id == serial_programs.vertex[1].id;
+	                            programs.vertex[1].id == serial_programs.vertex[1].id &&
+	                            programs.vertex[2].id == serial_programs.vertex[2].id;
 	// Without an active pixel shader neither path writes the pixel prep (the draw state keeps
 	// an earlier draw's, which nothing reads).
 	const bool pixel_equal = SamePixelInfo(pixel_info, serial_pixel_info) &&
 	                         (!pixel_active || SamePrep(preps.pixel, serial_preps.pixel));
+	// KYTY_DRAW_PREP_TESS: a tessellated draw's HS and TES preps too.
+	const bool tess_equal = !serial_programs.vertex[1] ||
+	                        (SamePrep(preps.vertex[1], serial_preps.vertex[1]) &&
+	                         SamePrep(preps.vertex[2], serial_preps.vertex[2]));
 	const bool vertex_equal = SamePrep(preps.vertex[0], serial_preps.vertex[0]) &&
-	                          SameVertexInfo(vertex_info, serial_vertex_info);
+	                          SameVertexInfo(vertex_info, serial_vertex_info) && tess_equal;
 	if (programs_equal && pixel_equal && vertex_equal) {
 		return true;
 	}
