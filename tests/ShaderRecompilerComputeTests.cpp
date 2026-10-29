@@ -2346,7 +2346,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   const auto uses_image =
       std::any_of(test.opcodes.begin(), test.opcodes.end(), [](auto op) {
         return op >= ShaderOpcode::IMAGE_GET_RESINFO &&
-               op <= ShaderOpcode::IMAGE_GATHER4H;
+               op <= ShaderOpcode::IMAGE_GATHER4;
       });
   if (uses_image && ((user_data[3] >> 28u) & 0xfu) == 0) {
     user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
@@ -23355,7 +23355,7 @@ public:
       test.initial.assign(test.expected.size(), 0xdeadbeefu);
       test.expected_mip_descriptors = 2u;
       test.required_spirv = {"OpImageDrefGather", "OpSwitch"};
-      test.decoded_counts = {{"IMAGE_GATHER4_C_L", 6u}};
+      test.decoded_counts = {{"image_gather4_c_l", 6u}};
       const auto compiled = CompileCase(test, SubgroupSize());
       Require(test.name, "comparison mip resource", compiled.program.info.images.size() == 1u &&
                   compiled.program.info.images[0].depth_compare,
@@ -24482,7 +24482,7 @@ public:
     const auto sample_program = CompileCase(sample_test, SubgroupSize());
 
     auto gather_test = make_case("StreamedHeadGather4Lz", 4);
-    gather_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_GATHER4_LZ,
+    gather_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_GATHER4,
                            ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
     AppendVMovLiteral(&gather_test.code, 20, std::bit_cast<uint32_t>(0.5f));
     AppendVMovLiteral(&gather_test.code, 21, std::bit_cast<uint32_t>(0.5f));
@@ -33850,6 +33850,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::FLAT_LOAD_USHORT:
   case Opcode::FLAT_LOAD_SSHORT:
   case Opcode::FLAT_LOAD_SHORT_D16:
+  case Opcode::FLAT_LOAD_SHORT_D16_HI:
   case Opcode::FLAT_LOAD_DWORD:
   case Opcode::FLAT_LOAD_DWORDX2:
   case Opcode::FLAT_LOAD_DWORDX3:
@@ -33931,13 +33932,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_ATOMIC_FMIN:
   case Opcode::IMAGE_ATOMIC_FMAX:
   case Opcode::IMAGE_SAMPLE:
-  case Opcode::IMAGE_GATHER4_LZ:
-  case Opcode::IMAGE_GATHER4_C:
-  case Opcode::IMAGE_GATHER4_C_L:
-  case Opcode::IMAGE_GATHER4_C_LZ:
-  case Opcode::IMAGE_GATHER4_LZ_O:
-  case Opcode::IMAGE_GATHER4_C_O:
-  case Opcode::IMAGE_GATHER4_C_LZ_O:
+  case Opcode::IMAGE_GATHER4:
     return CoverageClass::NeedsImageCase;
 
   case Opcode::V_INTERP_P1_F32:
@@ -38584,6 +38579,28 @@ TestCase VectorMadU64U32UnsignedCarryOut() {
   test.required_spirv = {"OpTypeInt 64 0", "OpUMulExtended", "OpIMul %uint",
                          "OpIAdd %ulong", "OpULessThan"};
   test.forbidden_spirv = {"OpIMul %ulong", "OpIMul %long"};
+  return test;
+}
+
+// Like every VOP3B carry-out, the mask has zero bits for lanes outside EXEC.
+TestCase VectorMadU64U32CarryMasksInactiveLanes() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorMadU64U32CarryMasksInactiveLanes";
+  test.code = {EncodeVop2(0x1b, 3, InlineU32(1), 0), EncodeSop1(0x04, 40, 126),
+               EncodeVopc(0xd5, InlineU32(0), 3)};
+  AppendVop3B(&test.code, 0x176u, 10, 20, 193, 193, 193);
+  test.code.push_back(EncodeSop1(0x04, 126, 40));
+  AppendStoreSgpr(&test.code, 20, 0);
+  AppendEnd(&test.code);
+  test.initial = {0};
+  test.expected = {0xaaaaaaaau};
+  test.opcodes = {O::V_AND_B32, O::S_MOV_B64, O::V_CMPX_NE_U32, O::V_MAD_U64_U32,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -46360,7 +46377,17 @@ TestCase FlatSubdwordLoadsApplyByteOffset() {
   return test;
 }
 
-TestCase GlobalLoadShortD16Captured(u32 wave_size) {
+// D16_HI loads move the raw halfword into bits [31:16] and keep the old low half.
+constexpr u32 MergeD16Hi(u32 old_value, u32 halfword) {
+  return (old_value & 0xffffu) | ((halfword & 0xffffu) << 16u);
+}
+
+static_assert(MergeD16Hi(0xa5a51234u, 0x0000u) == 0x00001234u &&
+              MergeD16Hi(0xa5a51234u, 0x7fffu) == 0x7fff1234u &&
+              MergeD16Hi(0xa5a51234u, 0x8000u) == 0x80001234u &&
+              MergeD16Hi(0xa5a51234u, 0xffffu) == 0xffff1234u);
+
+TestCase GlobalLoadShortD16Captured(u32 wave_size, bool high = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   constexpr u32 Marker = 0xa5a50000u;
@@ -46368,16 +46395,32 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size) {
   constexpr uint64_t ExecMask = 0xaaaaaaaa55555555ull;
   constexpr u32 Values[] = {0u, 0x7fffu, 0x8000u, 0xffffu};
   TestCase test;
-  test.name = wave_size == 32u ? "GlobalLoadShortD16CapturedWave32"
-                              : "GlobalLoadShortD16CapturedWave64";
-  test.initial.resize(2u * wave_size + wave_size / 2u);
-  test.expected.resize(2u * wave_size);
+  if (high) {
+    test.name = wave_size == 32u ? "GlobalLoadShortD16HiCapturedWave32"
+                                : "GlobalLoadShortD16HiCapturedWave64";
+  } else {
+    test.name = wave_size == 32u ? "GlobalLoadShortD16CapturedWave32"
+                                : "GlobalLoadShortD16CapturedWave64";
+  }
+  // Pass 0 runs with the full EXEC, pass 1 with a partial EXEC and pass 2 (high half only) with
+  // EXEC=0 and an unmapped address, which must neither touch memory nor change the destination.
+  // Pass 2 reads its zero EXEC from the buffer so that the guard is exercised at run time rather
+  // than folded away together with the load.
+  const u32 passes = high ? 3u : 2u;
+  const u32 zero_dword = passes * wave_size + wave_size / 2u;
+  test.initial.resize(zero_dword + (high ? 1u : 0u));
+  test.expected.resize(passes * wave_size);
   for (u32 lane = 0; lane < wave_size; ++lane) {
     const u32 value = Values[lane % std::size(Values)];
-    test.initial[2u * wave_size + lane / 2u] |= value << (16u * (lane % 2u));
-    test.expected[lane] = Marker | value;
-    test.expected[wave_size + lane] = Marker |
-        ((ExecMask & (uint64_t{1} << lane)) != 0u ? value : lane * 2u);
+    test.initial[passes * wave_size + lane / 2u] |= value << (16u * (lane % 2u));
+    for (u32 pass = 0; pass < passes; ++pass) {
+      const bool active =
+          pass == 0 || (pass == 1 && (ExecMask & (uint64_t{1} << lane)) != 0);
+      const u32 old_value = Marker | (lane * 2u);
+      test.expected[pass * wave_size + lane] =
+          !active ? old_value
+                  : (high ? MergeD16Hi(old_value, value) : Marker | value);
+    }
   }
   auto &code = test.code;
   AppendSMovLiteral(&code, 2, static_cast<u32>(ScalarBase));
@@ -46385,20 +46428,35 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size) {
   code.push_back(EncodeVop2(0x1a, 6, InlineU32(1), 0));
   AppendVMovLiteral(&code, 5, Marker);
   code.push_back(EncodeVop2(0x25, 6, Vgpr(5), 6));
-  for (bool masked : {false, true}) {
+  for (u32 pass = 0; pass < passes; ++pass) {
+    const bool masked = pass != 0;
     code.push_back(EncodeVop1(0x01, 5, Vgpr(6)));
     if (masked) {
       code.push_back(EncodeSop1(0x04, 8, 126));
-      AppendSMovLiteral(&code, 126, static_cast<u32>(ExecMask));
-      AppendSMovLiteral(&code, 127, static_cast<u32>(ExecMask >> 32u));
+      if (pass == 1) {
+        AppendSMovLiteral(&code, 126, static_cast<u32>(ExecMask));
+        AppendSMovLiteral(&code, 127, static_cast<u32>(ExecMask >> 32u));
+      } else {
+        // s[2:3] hold the scalar base, so read through the output buffer descriptor s[48:51].
+        AppendVMovU32(&code, 9, zero_dword * 4u);
+        code.push_back(EncodeMubuf0(0x0cu));
+        code.push_back(EncodeMubuf1(9, 12, 9));
+        code.push_back(EncodeVop1(0x02, 20, Vgpr(9)));
+        code.push_back(EncodeVop1(0x02, 21, Vgpr(9)));
+        code.push_back(EncodeSop1(0x04, 126, 20));
+        AppendSMovLiteral(&code, 2, 0u);
+        AppendSMovLiteral(&code, 3, 0u);
+      }
     }
-    // Captured GLOBAL_LOAD_SHORT_D16: v5 supplies the byte offset and destination.
-    code.insert(code.end(), {0xdc908070u, 0x05020005u});
+    // Captured GLOBAL_LOAD_SHORT_D16 (the high variant only switches the opcode to D16_HI):
+    // v5 supplies the byte offset and destination.
+    code.insert(code.end(), {high ? 0xdc948070u : 0xdc908070u, 0x05020005u});
     if (masked) code.push_back(EncodeSop1(0x04, 126, 8));
-    AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, masked ? wave_size : 0u);
+    AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, pass * wave_size);
   }
   AppendEnd(&code);
-  test.bda_mappings = {{GuestBase, 8u * wave_size}};
+  test.bda_mappings = {{GuestBase, 4u * passes * wave_size}};
+  if (high) test.fault_free_address = uint64_t{Marker} + 0x70u;
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -46406,13 +46464,21 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size) {
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
   test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::V_MOV_B32, O::V_LSHLREV_B32,
-                  O::V_ADD_NC_U32, O::FLAT_LOAD_SHORT_D16,
+                  O::V_ADD_NC_U32,
+                  high ? O::FLAT_LOAD_SHORT_D16_HI : O::FLAT_LOAD_SHORT_D16,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16", 2}};
+  test.decoded_counts = {
+      {high ? "FLAT_LOAD_SHORT_D16_HI" : "FLAT_LOAD_SHORT_D16", passes}};
+  if (high) {
+    test.opcodes.insert(test.opcodes.end(),
+                        {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32});
+    // Every pass, including the EXEC=0 one, must keep its load.
+    test.ir_counts = {{"LoadAddressU16", passes}};
+  }
   return test;
 }
 
-TestCase FlatLoadShortD16AddressSegments() {
+TestCase FlatLoadShortD16AddressSegments(bool high = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   std::vector<u32> code;
@@ -46420,7 +46486,8 @@ TestCase FlatLoadShortD16AddressSegments() {
   AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
   for (u32 segment : {0u, 2u}) {
     AppendVMovLiteral(&code, 3, 0x12345678u);
-    code.push_back(EncodeFlat0(0x24, segment, segment == 0u ? 0u : 0xffeu));
+    code.push_back(EncodeFlat0(high ? 0x25 : 0x24, segment,
+                               segment == 0u ? 0u : 0xffeu));
     code.push_back(EncodeFlat1(3, 0x7d, 0, 20));
     AppendStoreVgpr(&code, 3, segment == 0u ? 0u : 1u);
   }
@@ -46429,17 +46496,118 @@ TestCase FlatLoadShortD16AddressSegments() {
   code.push_back(EncodeFlat0(0x1c, 1, 0));
   code.push_back(EncodeFlat1(0, 0x7d, 3, 20));
   AppendVMovLiteral(&code, 3, 0x98761234u);
-  code.push_back(EncodeFlat0(0x24, 1, 2));
+  code.push_back(EncodeFlat0(high ? 0x25 : 0x24, 1, 2));
   code.push_back(EncodeFlat1(3, 0x7d, 0, 20));
   AppendStoreVgpr(&code, 3, 2);
   AppendEnd(&code);
-  TestCase test{"FlatLoadShortD16AddressSegments", code,
+  TestCase test{high ? "FlatLoadShortD16HiAddressSegments"
+                     : "FlatLoadShortD16AddressSegments",
+                code,
                 {0, 0, 0, 0, 0x80017fffu},
-                {0x12348001u, 0x12347fffu, 0x9876beefu},
-                {O::V_MOV_B32, O::FLAT_LOAD_SHORT_D16, O::FLAT_STORE_DWORD,
-                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+                high ? std::vector<u32>{0x80015678u, 0x7fff5678u, 0xbeef1234u}
+                     : std::vector<u32>{0x12348001u, 0x12347fffu, 0x9876beefu},
+                {O::V_MOV_B32,
+                 high ? O::FLAT_LOAD_SHORT_D16_HI : O::FLAT_LOAD_SHORT_D16,
+                 O::FLAT_STORE_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.bda_mappings = {{GuestBase, 16}};
   test.compute_info.scratch_size_dwords = 1;
+  return test;
+}
+
+TestCase GlobalLoadShortD16HiMergesOldDestination(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t ScalarBase = GuestBase - 196u;
+  constexpr u32 Values[] = {0u, 0x7fffu, 0x8000u, 0xffffu};
+  // The destination does not alias the address. Changing only the old high half must not change
+  // the result, and changing only the old low half must change only the low half of the result.
+  constexpr u32 OldValues[] = {0xa5a51234u, 0x5a5a1234u, 0xa5a5abcdu};
+  constexpr u32 Neighbor = 0x0badf00du;
+  constexpr u32 Passes = static_cast<u32>(std::size(OldValues));
+  TestCase test;
+  test.name = wave_size == 32u ? "GlobalLoadShortD16HiMergesOldDestinationWave32"
+                               : "GlobalLoadShortD16HiMergesOldDestinationWave64";
+  const u32 data_dword = (Passes + 1u) * wave_size;
+  test.initial.resize(data_dword + wave_size / 2u);
+  test.expected.resize(data_dword);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const u32 value = Values[lane % std::size(Values)];
+    test.initial[data_dword + lane / 2u] |= value << (16u * (lane % 2u));
+    for (u32 pass = 0; pass < Passes; ++pass) {
+      test.expected[pass * wave_size + lane] = MergeD16Hi(OldValues[pass], value);
+    }
+    test.expected[Passes * wave_size + lane] = Neighbor;
+  }
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 0, static_cast<u32>(ScalarBase));
+  AppendSMovLiteral(&code, 1, static_cast<u32>(ScalarBase >> 32u));
+  code.push_back(EncodeVop2(0x1a, 18, InlineU32(1), 0));
+  AppendVMovLiteral(&code, 17, Neighbor);
+  for (u32 pass = 0; pass < Passes; ++pass) {
+    AppendVMovLiteral(&code, 16, OldValues[pass]);
+    // Captured from Ghost of Yotei CS 0x79b0066f0cd1f3cd:
+    // global_load_short_d16_hi v16, v18, s[0:1] offset:196
+    code.insert(code.end(), {0xdc9480c4u, 0x10000012u});
+    AppendStoreVgprAtLaneDwordOffset(&code, 16, 0, pass * wave_size);
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 17, 0, Passes * wave_size);
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 4u * data_dword}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_MOV_B32,     O::V_MOV_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::FLAT_LOAD_SHORT_D16_HI, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16_HI", Passes}};
+  return test;
+}
+
+TestCase FlatLoadShortD16HiIntoAddressHighVgpr(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Values[] = {0u, 0x7fffu, 0x8000u, 0xffffu};
+  constexpr u32 AddressHigh = static_cast<u32>(GuestBase >> 32u);
+  TestCase test;
+  test.name = wave_size == 32u ? "FlatLoadShortD16HiIntoAddressHighVgprWave32"
+                               : "FlatLoadShortD16HiIntoAddressHighVgprWave64";
+  const u32 data_dword = 2u * wave_size;
+  test.initial.resize(data_dword + wave_size / 2u);
+  test.expected.resize(data_dword);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const u32 value = Values[lane % std::size(Values)];
+    test.initial[data_dword + lane / 2u] |= value << (16u * (lane % 2u));
+    // The 64-bit address is read before v4 is replaced, so the old high address dword supplies
+    // the preserved low half and the low address dword stays as it was.
+    test.expected[lane] = MergeD16Hi(AddressHigh, value);
+    test.expected[wave_size + lane] = static_cast<u32>(GuestBase) + lane * 2u;
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(1), 0));
+  AppendVMovLiteral(&code, 9, static_cast<u32>(GuestBase));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(9), 3));
+  AppendVMovLiteral(&code, 4, AddressHigh);
+  // flat_load_short_d16_hi v4, v[3:4]
+  code.push_back(EncodeFlat0(0x25, 0, 0));
+  code.push_back(EncodeFlat1(4, 0x7d, 0, 3));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, wave_size);
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 4u * data_dword}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32,     O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,  O::FLAT_LOAD_SHORT_D16_HI,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16_HI", 1}};
   return test;
 }
 
@@ -49162,7 +49330,7 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   test.code = std::move(code);
   test.expected = {0x2abu, 0x456u, 0x321u, 0x321u,
                    0x456u, 0x456u, 0x456u, 0x456u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = std::vector<u32>(16, 0xaae2b321u);
   test.sampled_image_format = vk::Format::eR32Uint;
@@ -49227,7 +49395,7 @@ template <bool rg, bool snorm = false> TestCase ImageSamplePacked8() {
   for (float value : expected) {
     test.expected.push_back(std::bit_cast<u32>(value));
   }
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
@@ -49312,7 +49480,7 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   test.name = "ImageGather2DInstructionWith1DDescriptor";
   test.code = code;
   test.expected = {0x40000000u, 0x40400000u, 0x40400000u, 0x40000000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
@@ -49581,9 +49749,8 @@ TestCase ImageSampleAndGather() {
                    0x3f800000u,
                    0};
   test.opcodes = {
-      O::V_MOV_B32,        O::IMAGE_SAMPLE,       O::IMAGE_GET_LOD,
-      O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
-      O::S_ENDPGM};
+      O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GET_LOD, O::IMAGE_GATHER4,
+      O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   return test;
 }
@@ -49651,7 +49818,7 @@ TestCase ImageGatherExplicitLod() {
   TestCase test;
   test.name = "ImageGatherExplicitLod";
   test.code = std::move(code);
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_L, O::IMAGE_SAMPLE,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::IMAGE_SAMPLE,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   // A gather's single-mip descriptors must not replace the ordinary sample's
   // full mip chain when both instructions use the same guest descriptor.
@@ -49731,7 +49898,7 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
   }
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD,
-                  O::IMAGE_GATHER4_L, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::IMAGE_GATHER4, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
   test.user_data[1] |= (3u << 30u) | (mode == 3 ? 768u << 8u : 0u);
@@ -49783,7 +49950,7 @@ TestCase ImageD16GatherPacksHalfPairs() {
   test.name = "ImageD16GatherPacksHalfPairs";
   test.code = code;
   test.expected = {0x38003800u, 0x38003800u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
@@ -49903,6 +50070,141 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   return test;
 }
 
+u32 RampTexel(u32 x, u32 y) { return std::bit_cast<u32>(float(1u + x + y * 4u)); }
+
+std::vector<u32> MakeRampImage() {
+  auto image = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&image, 4, x, y, RampTexel(x, y), 0, 0, 0);
+    }
+  }
+  return image;
+}
+
+TestCase ImageA16BiasTakesWholeVgpr() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageA16BiasTakesWholeVgpr";
+  // The high half of the bias VGPR holds 0.0625, which would move the coordinates if read as one.
+  AppendVMovLiteral(&test.code, 20, 0x2c000000u); // bias 0
+  AppendVMovLiteral(&test.code, 21, 0x36003900u); // x=0.625, y=0.375: texel (2, 1)
+  test.code.push_back(EncodeMimg0(0x25, 0x1)); // image_sample_b
+  test.code.push_back(EncodeMimg1(0, 20, 0, 0, true));
+  AppendStoreVgpr(&test.code, 0, 0);
+  test.expected.push_back(RampTexel(2, 1));
+  AppendVMovLiteral(&test.code, 22, 0x2c000000u); // bias 0
+  AppendVMovLiteral(&test.code, 23, 0x37003980u); // x=0.6875, y=0.4375: x 2..3, y 1..2
+  test.code.push_back(EncodeMimg0(0x45, 0x1)); // image_gather4_b
+  test.code.push_back(EncodeMimg1(4, 22, 0, 0, true));
+  for (u32 component = 0; component < 4u; component++) {
+    AppendStoreVgpr(&test.code, 4u + component, 1u + component);
+  }
+  for (const auto [x, y] : {std::pair{2u, 2u}, {3u, 2u}, {3u, 1u}, {2u, 1u}}) {
+    test.expected.push_back(RampTexel(x, y));
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = MakeRampImage();
+  return test;
+}
+
+// Each A16 1D gradient, and each of the last two 3D ones, takes the low half of its own VGPR. Their
+// high halves hold 0.0625, which would move the coordinates if read as part of the address.
+template <u32 dim> TestCase ImageA16GradientsTakeOwnVgpr() {
+  using O = ShaderOpcode;
+  constexpr bool volume = dim == 2u;
+  constexpr std::array names{"ImageA16GradientsTakeOwnVgpr1D", "ImageA16GradientsTakeOwnVgpr3D",
+                             "ImageA16GradientsTakeOwnVgpr1DArray"};
+  constexpr std::array types{Prospero::ImageType::kColor1D, Prospero::ImageType::kColor3D,
+                             Prospero::ImageType::kColor1DArray};
+  constexpr std::array views{vk::ImageViewType::e1D, vk::ImageViewType::e3D,
+                             vk::ImageViewType::e1DArray};
+  TestCase test;
+  test.name = names[dim / 2u];
+  u32 vaddr = 20;
+  if constexpr (volume) {
+    AppendVMovU32(&test.code, vaddr++, 0); // dh.x, dh.y
+    AppendVMovU32(&test.code, vaddr++, 0); // dh.z, dv.x
+  }
+  AppendVMovLiteral(&test.code, vaddr++, 0x2c000000u); // 1D dh or 3D dv.y
+  AppendVMovLiteral(&test.code, vaddr++, 0x2c000000u); // 1D dv or 3D dv.z
+  if constexpr (volume) {
+    AppendVMovLiteral(&test.code, vaddr++, 0x36003900u); // x=0.625, y=0.375: texel (2, 1)
+    AppendVMovLiteral(&test.code, vaddr, 0x2c003800u);   // z=0.5
+  } else {
+    AppendVMovLiteral(&test.code, vaddr, 0x3c003900u); // x=0.625, slice 1: texel 2 of layer 1
+  }
+  test.code.push_back(EncodeMimg0(0x22, 0x1, 0, false, dim)); // image_sample_d
+  test.code.push_back(EncodeMimg1(0, 20, 0, 0, true));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.expected = {RampTexel(2, dim == 0u ? 0u : 1u)};
+  // Row y of the ramp is 1D-array layer y.
+  test.sampled_image_rgba = MakeRampImage();
+  test.image_height = volume ? 4u : 1u;
+  test.sampled_image_type = volume ? vk::ImageType::e3D : vk::ImageType::e1D;
+  test.sampled_image_view_type = views[dim / 2u];
+  test.sampled_image_layers = dim == 4u ? 2u : 1u;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[3] = static_cast<u32>(types[dim / 2u]) << 28u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageSampleExplicitLod", "Grad"};
+  return test;
+}
+
+TestCase ImageGatherAddressVariants() {
+  using O = ShaderOpcode;
+  struct Gather {
+    u32 opcode;
+    bool offset;
+    bool bias;
+    bool lod_or_clamp;
+  };
+  // Plain, LOD clamp, bias, LOD and offset gathers, with and without gradient adjust.
+  constexpr Gather gathers[] = {
+      {0x40, false, false, false}, {0x41, false, false, true},
+      {0x45, false, true, false},  {0x46, false, true, true},
+      {0x50, true, false, false},  {0x51, true, false, true},
+      {0x54, true, false, true},   {0x55, true, true, false},
+      {0x56, true, true, true},    {0xc0, false, false, false},
+      {0xc1, false, false, true},  {0xc5, false, true, false},
+      {0xc6, false, true, true},   {0xd0, true, false, false},
+      {0xd1, true, false, true},   {0xd5, true, true, false},
+      {0xd6, true, true, true},
+  };
+  TestCase test;
+  test.name = "ImageGatherAddressVariants";
+  for (u32 index = 0; index < std::size(gathers); index++) {
+    const auto &gather = gathers[index];
+    // Zero bias, clamp and LOD keep the base level; a misplaced offset or bias moves the footprint.
+    u32 vaddr = 20;
+    if (gather.offset) AppendVMovU32(&test.code, vaddr++, 0x3fu); // x offset -1
+    if (gather.bias) AppendVMovU32(&test.code, vaddr++, 0);
+    AppendVMovLiteral(&test.code, vaddr++, std::bit_cast<u32>(0.6875f));
+    AppendVMovLiteral(&test.code, vaddr++, std::bit_cast<u32>(0.4375f));
+    if (gather.lod_or_clamp) AppendVMovU32(&test.code, vaddr++, 0);
+    test.code.push_back(EncodeMimg0(gather.opcode, 0x1));
+    test.code.push_back(EncodeMimg1(0, 20));
+    for (u32 component = 0; component < 4u; component++) {
+      AppendStoreVgpr(&test.code, component, index * 4u + component);
+    }
+    // Footprint x 2..3, y 1..2, or x 1..2 with the offset, in (x0, y1), (x1, y1), (x1, y0),
+    // (x0, y0) order.
+    const u32 x0 = gather.offset ? 1u : 2u;
+    for (const auto [x, y] : {std::pair{x0, 2u}, {x0 + 1u, 2u}, {x0 + 1u, 1u}, {x0, 1u}}) {
+      test.expected.push_back(RampTexel(x, y));
+    }
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = MakeRampImage();
+  return test;
+}
+
 TestCase ImageGatherCompareOpcodes() {
   using O = ShaderOpcode;
 
@@ -49933,15 +50235,21 @@ TestCase ImageGatherCompareOpcodes() {
   AppendStoreVgpr(&code, 8, 1);
   AppendStoreVgpr(&code, 0, 2);
   AppendStoreVgpr(&code, 12, 3);
+  // The other compare gathers.
+  constexpr u32 variants[] = {0x49, 0x4c, 0x4d, 0x4e, 0x59, 0x5c, 0x5d, 0x5e,
+                              0xc8, 0xc9, 0xcd, 0xce, 0xd8, 0xd9, 0xdd, 0xde};
+  for (u32 index = 0; index < std::size(variants); index++) {
+    code.push_back(EncodeMimg0(variants[index], 0x1));
+    code.push_back(EncodeMimg1(40, 20));
+    AppendStoreVgpr(&code, 40, 4u + index);
+  }
   AppendEnd(&code);
 
   TestCase test;
   test.name = "ImageGatherCompareOpcodes";
   test.code = code;
-  test.opcodes = {
-      O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
-      O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
-      O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
@@ -52358,6 +52666,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BCarryOutUsesEncodedSdst);
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
+  AddCase(VectorMadU64U32CarryMasksInactiveLanes);
   AddCase(VectorLaneAndPackedOps);
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
@@ -52611,7 +52920,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
-  AddCase(FlatLoadShortD16AddressSegments);
+  cases.push_back(GlobalLoadShortD16Captured(32, true));
+  cases.push_back(GlobalLoadShortD16Captured(64, true));
+  cases.push_back(FlatLoadShortD16AddressSegments());
+  cases.push_back(FlatLoadShortD16AddressSegments(true));
+  cases.push_back(GlobalLoadShortD16HiMergesOldDestination(32));
+  cases.push_back(GlobalLoadShortD16HiMergesOldDestination(64));
+  cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(32));
+  cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
@@ -52713,6 +53029,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
+  AddCase(ImageGatherAddressVariants);
   AddCase(ImageCubeGradientsPreserveDerivatives);
   AddCase(ImageGatherExplicitLod);
   AddCase(ImageGatherLodPerLane<0>);
@@ -52729,6 +53046,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
+  AddCase(ImageA16BiasTakesWholeVgpr);
+  AddCase(ImageA16GradientsTakeOwnVgpr<0>);
+  AddCase(ImageA16GradientsTakeOwnVgpr<4>);
+  AddCase(ImageA16GradientsTakeOwnVgpr<2>);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
@@ -59936,7 +60257,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatLoadDlcCaptured(64));
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
     RunCase(&vulkan, GlobalLoadShortD16Captured(64));
+    RunCase(&vulkan, GlobalLoadShortD16Captured(32, true));
+    RunCase(&vulkan, GlobalLoadShortD16Captured(64, true));
     RunCase(&vulkan, FlatLoadShortD16AddressSegments());
+    RunCase(&vulkan, FlatLoadShortD16AddressSegments(true));
+    for (const u32 wave : {32u, 64u}) {
+      RunCase(&vulkan, GlobalLoadShortD16HiMergesOldDestination(wave));
+      RunCase(&vulkan, FlatLoadShortD16HiIntoAddressHighVgpr(wave));
+    }
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
@@ -59959,6 +60287,17 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-gather-variants-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleAndGather());
+    RunCase(&vulkan, ImageGatherAddressVariants());
+    RunCase(&vulkan, ImageA16BiasTakesWholeVgpr());
+    RunCase(&vulkan, ImageA16GradientsTakeOwnVgpr<0>());
+    RunCase(&vulkan, ImageA16GradientsTakeOwnVgpr<4>());
+    RunCase(&vulkan, ImageA16GradientsTakeOwnVgpr<2>());
+    RunCase(nullptr, ImageGatherCompareOpcodes());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-gather-lod-only") == 0) {
@@ -60307,6 +60646,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarAshrI64Edges(true));
     RunCase(&vulkan, VectorCompareInteger64Edges());
     RunCase(&vulkan, VectorMadU64U32UnsignedCarryOut());
+    RunCase(&vulkan, VectorMadU64U32CarryMasksInactiveLanes());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
     RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
     return 0;

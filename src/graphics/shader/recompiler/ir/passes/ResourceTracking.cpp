@@ -464,6 +464,8 @@ private:
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
 				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
 				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
+				    a.workgroup_multiplier != b.workgroup_multiplier ||
+				    a.workgroup_shift != b.workgroup_shift ||
 				    a.bindless != b.bindless || a.runtime != b.runtime ||
 				    a.record_pointer != b.record_pointer ||
 				    a.nested_vsharp != b.nested_vsharp || a.nested_heap != b.nested_heap ||
@@ -667,6 +669,52 @@ private:
 			return UINT32_MAX;
 		}
 		return axis;
+	}
+
+	// KYTY_WORKGROUP_IMAGES (upstream de3ed905c): key = (first + workgroup ID) * multiplier >> shift
+	// with shift >= 32 (a UMulHi and a shift), where first is a runtime value; first and the
+	// division are optional. Fills the indirect descriptor's workgroup fields on a match.
+	bool MatchWorkgroupKey(Value key, DescriptorSource::IndirectDescriptor* indirect) const {
+		uint32_t    bits = 0, multiplier = 0;
+		const auto* shift = key.Resolve().TryInstruction();
+		if (shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+			const auto* high = shift->Arg(0).Resolve().TryInstruction();
+			if (high != nullptr && high->GetOpcode() == ValueOpcode::UMulHi &&
+			    ImmediateU32(shift->Arg(1), bits) && bits < 32u &&
+			    ImmediateU32(high->Arg(1), multiplier)) {
+				key = high->Arg(0);
+				bits += 32u;
+			} else {
+				bits = 0;
+			}
+		} else if (shift != nullptr && shift->GetOpcode() == ValueOpcode::UMulHi &&
+		           ImmediateU32(shift->Arg(1), multiplier)) {
+			key  = shift->Arg(0);
+			bits = 32u;
+		}
+		Value    first;
+		uint32_t axis = WorkgroupAxis(key);
+		if (axis == UINT32_MAX) {
+			const auto* sum = key.Resolve().TryInstruction();
+			if (sum == nullptr || sum->GetOpcode() != ValueOpcode::IAdd32) return false;
+			for (uint32_t arm = 0; arm < 2u && axis == UINT32_MAX; ++arm) {
+				const auto base = sum->Arg(arm ^ 1u);
+				if (WorkgroupAxis(sum->Arg(arm)) == UINT32_MAX ||
+				    !ValidateRuntimeValue(m_program, base, RuntimeValueType::Integer)) {
+					continue;
+				}
+				axis  = WorkgroupAxis(sum->Arg(arm));
+				first = base;
+			}
+			if (axis == UINT32_MAX) return false;
+		}
+		if (indirect != nullptr) {
+			indirect->workgroup_axis       = axis;
+			indirect->selector_first       = first;
+			indirect->workgroup_multiplier = bits != 0u ? multiplier : 0u;
+			indirect->workgroup_shift      = static_cast<uint8_t>(bits);
+		}
+		return true;
 	}
 
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t* key_mask = nullptr,
@@ -1251,7 +1299,7 @@ private:
 				return workgroup && !strided &&
 				       MatchTableOffset(read->Arg(1), current_key, offset, &current_mask,
 				                        &current_masked, &current_stride) &&
-				       current_masked == nullptr && WorkgroupAxis(current_key) != UINT32_MAX;
+				       current_masked == nullptr && MatchWorkgroupKey(current_key, nullptr);
 			};
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
@@ -1401,14 +1449,13 @@ private:
 		// the workgroup id enumerates that axis' workgroup count at each dispatch, reading key k's
 		// T# at table_offset + k * table_stride (MaterializeIndirectImage); any user, storage
 		// images too. Words the shader also uses as values stay real reads (above).
-		const uint32_t workgroup_axis =
-		    workgroup && masked == nullptr && !word0_shared ? WorkgroupAxis(key) : UINT32_MAX;
-		if (workgroup_axis != UINT32_MAX) {
+		// The key may also be a runtime base plus the workgroup id, divided by a constant
+		// (MatchWorkgroupKey, upstream de3ed905c).
+		if (workgroup && masked == nullptr && !word0_shared && MatchWorkgroupKey(key, &indirect)) {
 			if (table_stride == 0u || (table_stride & 3u) != 0u || (table_offset & 3u) != 0u) {
 				return false;
 			}
-			indirect.table_stride   = table_stride;
-			indirect.workgroup_axis = workgroup_axis;
+			indirect.table_stride = table_stride;
 		} else if (masked != nullptr || word0_shared || table_stride != 32u || !enumerable()) {
 			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
 				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==

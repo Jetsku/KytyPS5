@@ -288,7 +288,9 @@ void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
 	if (inst.dst2.kind != Decoder::OperandKind::Null &&
 	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
 		// The 32x32 product fits in 64 bits, so only the addition can carry.
-		WriteMask(inst.dst2, IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product})));
+		// Like every VOP3B carry-out, lanes outside EXEC write zero mask bits.
+		const auto carry = IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product}));
+		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
 	}
 }
 

@@ -1510,6 +1510,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		}
 		info.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		info.start_instance_sgpr = start_instance_sgpr;
+		info.indirect_vertex_base = regs.indirect_vertex_base;
+		info.base_vertex_sgpr =
+		    regs.indirect_vertex_base && regs.base_vertex_user_sgpr >= 0 &&
+		            static_cast<uint32_t>(regs.base_vertex_user_sgpr) < regs.gs_regs.rsrc2.user_sgpr
+		        ? 8 + regs.base_vertex_user_sgpr
+		        : -1;
 		// Upstream fa8216c4d: per-invocation LDS emulation is sized by the GS stage's LDS_SIZE.
 		info.lds_size_dwords = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 		return params;

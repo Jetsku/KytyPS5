@@ -461,10 +461,8 @@ std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc
 				// EXEC off, so V_WRITELANE (which ignores EXEC) still stores into it.
 				case Opcode::V_PERMLANE16_B32:
 				case Opcode::V_PERMLANEX16_B32: why = "a lane access reads other lanes"; break;
-				case Opcode::IMAGE_GET_LOD:
-				case Opcode::IMAGE_GATHER4_C:
-				case Opcode::IMAGE_GATHER4_C_O:
-				case Opcode::IMAGE_GATHER4H: why = "an implicit level of detail reads other lanes"; break;
+				case Opcode::IMAGE_GET_LOD: why = "an implicit level of detail reads other lanes"; break;
+				case Opcode::IMAGE_GATHER4:
 				case Opcode::IMAGE_SAMPLE:
 					if ((inst.image_sample_flags &
 					     (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagLevelZero |

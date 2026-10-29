@@ -105,6 +105,7 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
+	options.srt_image_reach   = EnvFlag("KYTY_SRT_IMAGE_REACH", options.srt_image_reach);
 	options.shader_calls      = EnvFlag("KYTY_SHADER_CALLS", options.shader_calls);
 	options.call_trace_wave32 = EnvFlag("KYTY_CALL_TRACE_WAVE32", options.call_trace_wave32);
 	options.realtime_clock   = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);

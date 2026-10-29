@@ -1519,8 +1519,22 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::VertexIndex));
+			const auto* vertex_input = options.input_info.vertex;
+			if (vertex_input != nullptr && vertex_input->indirect_vertex_base) {
+				// KYTY_INDIRECT_VERTEX_BASE: as the GPU's, an indirect draw's index VGPR excludes the
+				// record's base vertex, which reaches only the SGPR its packet names (none: SH_NOP).
+				const auto base_vertex = builtin(IR::StageInputKind::BaseVertex);
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(5),
+				    entry_ir.ISub(builtin(IR::StageInputKind::VertexIndex), base_vertex));
+				if (vertex_input->base_vertex_sgpr >= 0) {
+					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(vertex_input->base_vertex_sgpr),
+					                      base_vertex);
+				}
+			} else {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+				                      builtin(IR::StageInputKind::VertexIndex));
+			}
 			// The instance ID counts from 0; the start instance is Vulkan's base instance.
 			const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),

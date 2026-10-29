@@ -47,6 +47,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 			}
 		}
 	}
+	if (info.indirect_vertex_base) {
+		// KYTY_INDIRECT_VERTEX_BASE: only when set, so other keys stay as they were.
+		key.push_back(0x1B5E0000u | (static_cast<uint32_t>(info.base_vertex_sgpr) & 0xffffu));
+	}
 	if (info.clip_space.vte_format != 0) {
 		// KYTY_VTE_CNTL: only when set, so other keys stay as they were.
 		key.push_back(0x7E7E0000u | info.clip_space.vte_format);

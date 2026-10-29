@@ -1,12 +1,13 @@
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
 
 layout(constant_id = 0) const uint D32 = 0u;
-// KYTY_TILER_CAS: one compare-and-swap loop per 16-bit element (see gpu_tiler_common.inc).
-layout(constant_id = 1) const uint SUBWORD_CAS = 0u;
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
-layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+// Each result is one 16-bit store (upstream 556538bed): no read-modify-write of the word that
+// holds the neighbouring texel (storageBuffer16BitAccess is a required device feature).
+layout(set = 0, binding = 1, std430) buffer Output { uint16_t data[]; } output_buffer;
 
 layout(push_constant, std430) uniform Push {
 	uint src_base;
@@ -39,19 +40,5 @@ void main() {
 	}
 	uint src = params.src_base + y * params.pitch_bytes + x * 4u;
 	uint dst = params.dst_base + y * params.slice_bytes + x * 2u;
-	uint shift = (dst & 2u) * 8u;
-	uint mask = 0xffffu << shift;
-	uint word = dst >> 2u;
-	uint value = decode(input_buffer.data[src >> 2u]) << shift;
-	if (SUBWORD_CAS != 0u) {
-		uint old = output_buffer.data[word];
-		for (;;) {
-			uint seen = atomicCompSwap(output_buffer.data[word], old, (old & ~mask) | value);
-			if (seen == old) break;
-			old = seen;
-		}
-	} else {
-		atomicAnd(output_buffer.data[word], ~mask);
-		atomicOr(output_buffer.data[word], value);
-	}
+	output_buffer.data[dst >> 1u] = uint16_t(decode(input_buffer.data[src >> 2u]));
 }

@@ -1330,10 +1330,9 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	}
 	auto& pipeline = *pipeline_pointer;
 	if (pipeline == nullptr) {
-		// Constant 1 (SUBWORD_CAS) only exists in the demote shader; promote ignores it.
-		const uint32_t                   values[] {d32 ? 1u : 0u, SubwordCas() ? 1u : 0u};
-		const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
-		const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
+		const uint32_t                   values[] {d32 ? 1u : 0u};
+		const vk::SpecializationMapEntry entries[] {{0, 0, 4}};
+		const vk::SpecializationInfo     specialization {1, entries, sizeof(values), values};
 		const uint32_t*                  code  = nullptr;
 		size_t                           words = 0;
 		if (direction == D16Direction::Promote) {
@@ -1404,7 +1403,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	                            vk::AccessFlagBits::eHostWrite |
 	                            vk::AccessFlagBits::eTransferWrite |
 	                            vk::AccessFlagBits::eShaderWrite;
-	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	// Both directions only store whole target elements.
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
