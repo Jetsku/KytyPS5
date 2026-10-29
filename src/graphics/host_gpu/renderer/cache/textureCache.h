@@ -269,6 +269,10 @@ public:
 	[[nodiscard]] static bool LightGridCapEnabled();
 	static void NoteLightGridShape(const ImageInfo& info);
 	void RunGarbageCollector();
+	// KYTY_BINDLESS_GUEST_DROP_FRAMES: no heap key refers to this bindless image any more (the
+	// guest replaced or cleared its entries): free it once no draw has used it for that many
+	// frames, whatever the memory pressure (RunGarbageCollector). Any thread but m_lock's holder.
+	void ReleaseDroppedByGuest(ImageId id);
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
 	void ReportVram();
@@ -596,6 +600,12 @@ private:
 	uint64_t           m_idle_frames          = 0;
 	uint64_t           m_idle_next_frame      = 0;
 	uint64_t           m_idle_freed           = 0;
+	// KYTY_BINDLESS_GUEST_DROP_FRAMES: images the guest dropped from its texture heaps, with the
+	// frame of the drop (ReleaseDroppedByGuest).
+	std::vector<std::pair<ImageId, uint64_t>> m_guest_dropped;
+	uint64_t                                  m_guest_dropped_freed       = 0;
+	uint64_t                                  m_guest_dropped_freed_bytes = 0;
+	void                                      FreeGuestDroppedImages(uint64_t frame);
 	uint64_t           m_pressure_frames      = 0;
 	uint64_t           m_pressure_frame       = 0;
 	uint64_t           m_pressure_freed_bytes = 0;
