@@ -332,27 +332,15 @@ uint32_t CountDmaskComponents(uint32_t dmask) {
 } // namespace
 
 ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component) {
-	const auto width = [flags](uint32_t index) {
-		if ((flags & ImageSampleFlagA16) == 0u) return 32u;
-		uint32_t cursor = 0;
-		if ((flags & ImageSampleFlagOffset) != 0u) {
-			if (index == cursor++) return 32u;
-		}
-		if ((flags & ImageSampleFlagBias) != 0u) {
-			if (index == cursor++) return 16u;
-		}
-		if ((flags & ImageSampleFlagCompare) != 0u && index == cursor) return 32u;
-		return 16u;
-	};
-	uint32_t offset = 0;
-	for (uint32_t index = 0; index < component; index++) {
-		const auto bits = width(index);
-		if (bits == 32u) offset = (offset + 31u) & ~31u;
-		offset += bits;
-	}
-	const auto bits = width(component);
-	if (bits == 32u) offset = (offset + 31u) & ~31u;
-	return {offset, bits};
+	if ((flags & ImageSampleFlagA16) == 0u) return {component * 32u, 32u};
+	// A16 offsets, bias and PCF reference each take a whole VGPR, the bias as a half in its low
+	// 16 bits; the components after them pack two per VGPR.
+	const bool     has_bias    = (flags & ImageSampleFlagBias) != 0u;
+	const uint32_t bias_index  = (flags & ImageSampleFlagOffset) != 0u ? 1u : 0u;
+	const uint32_t whole_vgprs = std::popcount(
+	    flags & (ImageSampleFlagOffset | ImageSampleFlagBias | ImageSampleFlagCompare));
+	if (component >= whole_vgprs) return {(whole_vgprs + component) * 16u, 16u};
+	return {component * 32u, has_bias && component == bias_index ? 16u : 32u};
 }
 
 uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {

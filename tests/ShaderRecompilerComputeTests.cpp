@@ -50070,6 +50070,46 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   return test;
 }
 
+u32 RampTexel(u32 x, u32 y) { return std::bit_cast<u32>(float(1u + x + y * 4u)); }
+
+std::vector<u32> MakeRampImage() {
+  auto image = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&image, 4, x, y, RampTexel(x, y), 0, 0, 0);
+    }
+  }
+  return image;
+}
+
+TestCase ImageA16BiasTakesWholeVgpr() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageA16BiasTakesWholeVgpr";
+  // The high half of the bias VGPR holds 0.0625, which would move the coordinates if read as one.
+  AppendVMovLiteral(&test.code, 20, 0x2c000000u); // bias 0
+  AppendVMovLiteral(&test.code, 21, 0x36003900u); // x=0.625, y=0.375: texel (2, 1)
+  test.code.push_back(EncodeMimg0(0x25, 0x1)); // image_sample_b
+  test.code.push_back(EncodeMimg1(0, 20, 0, 0, true));
+  AppendStoreVgpr(&test.code, 0, 0);
+  test.expected.push_back(RampTexel(2, 1));
+  AppendVMovLiteral(&test.code, 22, 0x2c000000u); // bias 0
+  AppendVMovLiteral(&test.code, 23, 0x37003980u); // x=0.6875, y=0.4375: x 2..3, y 1..2
+  test.code.push_back(EncodeMimg0(0x45, 0x1)); // image_gather4_b
+  test.code.push_back(EncodeMimg1(4, 22, 0, 0, true));
+  for (u32 component = 0; component < 4u; component++) {
+    AppendStoreVgpr(&test.code, 4u + component, 1u + component);
+  }
+  for (const auto [x, y] : {std::pair{2u, 2u}, {3u, 2u}, {3u, 1u}, {2u, 1u}}) {
+    test.expected.push_back(RampTexel(x, y));
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = MakeRampImage();
+  return test;
+}
+
 TestCase ImageGatherAddressVariants() {
   using O = ShaderOpcode;
   struct Gather {
@@ -50090,13 +50130,6 @@ TestCase ImageGatherAddressVariants() {
       {0xd1, true, false, true},   {0xd5, true, true, false},
       {0xd6, true, true, true},
   };
-  const auto texel = [](u32 x, u32 y) { return std::bit_cast<u32>(float(1u + x + y * 4u)); };
-  auto image = MakeRgbaImage(4, 4);
-  for (u32 y = 0; y < 4u; y++) {
-    for (u32 x = 0; x < 4u; x++) {
-      SetRgbaPixel(&image, 4, x, y, texel(x, y), 0, 0, 0);
-    }
-  }
   TestCase test;
   test.name = "ImageGatherAddressVariants";
   for (u32 index = 0; index < std::size(gathers); index++) {
@@ -50117,13 +50150,13 @@ TestCase ImageGatherAddressVariants() {
     // (x0, y0) order.
     const u32 x0 = gather.offset ? 1u : 2u;
     for (const auto [x, y] : {std::pair{x0, 2u}, {x0 + 1u, 2u}, {x0 + 1u, 1u}, {x0, 1u}}) {
-      test.expected.push_back(texel(x, y));
+      test.expected.push_back(RampTexel(x, y));
     }
   }
   AppendEnd(&test.code);
   test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.sampled_image_rgba = image;
+  test.sampled_image_rgba = MakeRampImage();
   return test;
 }
 
@@ -52968,6 +53001,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
+  AddCase(ImageA16BiasTakesWholeVgpr);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
@@ -60205,6 +60239,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, ImageGatherAddressVariants());
+    RunCase(&vulkan, ImageA16BiasTakesWholeVgpr());
     RunCase(nullptr, ImageGatherCompareOpcodes());
     return 0;
   }
