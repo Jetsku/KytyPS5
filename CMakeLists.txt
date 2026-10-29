@@ -662,6 +662,9 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+# Offline batch translation of shaders extracted from game files (Senaxx 5250bc5d4); a tool, not a
+# test: EXCLUDE_FROM_ALL, no add_test, built only on request.
+add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
 add_kyty_full_emulator_test(null_texture_desc_tests "${KYTY_TESTS_DIR}/NullTextureDescTests.cpp")
 add_kyty_full_emulator_test(sparse_residency_stress_tests "${KYTY_TESTS_DIR}/SparseResidencyStressTests.cpp")
 
