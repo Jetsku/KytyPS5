@@ -7194,6 +7194,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		ordering.background_workers =
 		    static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_SKIP_BACKGROUND_THREADS", 2), 1, 16));
 		m_skip = std::make_unique<PrefetchState>(*this, threads, 1024, true, "Pipeline skip", true, ordering);
+		// KYTY_PIPELINE_SKIP_PROBE=1 (default off): driver-cache lookups first (TryGetGraphicsPipeline).
+		m_skip_probe =
+		    EnvU64("KYTY_PIPELINE_SKIP_PROBE", 0) != 0 && m_graphics.pipeline_creation_cache_control_enabled;
+		if (m_skip_probe) {
+			PipelineCacheLog("Pipeline skip: new pipelines of skippable draws are looked up in the driver cache "
+			                 "first (KYTY_PIPELINE_SKIP_PROBE)");
+		}
 		PipelineCacheLog("Pipeline skip: {} background builders; draws that only change the picture wait "
 		                 "{} us for a new pipeline, then are skipped until it is built "
 		                 "(KYTY_PIPELINE_SKIP_THREADS, KYTY_PIPELINE_SKIP_WAIT_US){}",
@@ -9171,7 +9178,68 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	const bool background_ok =
 	    (vertex_info.size() == 1 && topology != vk::PrimitiveTopology::ePatchList) ||
 	    (vertex_info.size() == 3 && SkipTessellatedEnabled());
-	if (skippable && background_ok && !graphics_debug_dump_enabled()) {
+	// KYTY_PIPELINE_SKIP_PROBE=1 (default off; adapted from usa-ratt/KytyPS5-GT7 round 87,
+	// 3a8591ae2): a skippable draw's new pipeline that no builder has yet is first looked up in the
+	// driver cache alone, here (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT): one the
+	// driver has is published at once instead of waiting behind the builders' queue (where a cache
+	// hit was skipped for seconds behind second-long compiles), one it does not have goes to the
+	// builders without a wait for the lookup. Needs pipelineCreationCacheControl.
+	bool probe_hit = false;
+	if (m_skip_probe && skippable && background_ok && !graphics_debug_dump_enabled()) {
+		bool try_probe = false;
+		{
+			Common::LockGuard lock(m_mutex);
+			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+				return remember(*iter->second);
+			}
+			try_probe = !(m_prefetch != nullptr && m_prefetch->Has(key)) && !m_skip->Has(key);
+		}
+		if (try_probe) {
+			const auto probe_begin = CompileClockNs();
+			auto       probed      = std::make_unique<Pipeline>();
+			GraphicsContent probed_content;
+			const bool keyed_probe = m_known != nullptr || m_journal != nullptr;
+			GraphicsPipelineCreateHook probe_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+			                                            std::span<const uint32_t>         layout_signature,
+			                                            vk::Pipeline*                     pipeline) {
+				auto probe_info = info;
+				probe_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+				const auto made =
+				    m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &probe_info, nullptr, pipeline);
+				if (made == vk::Result::eSuccess && *pipeline != nullptr && keyed_probe) {
+					probed_content = DescribeGraphicsPipeline(info, layout_signature);
+					NoteKnownPipeline(probed_content.key);
+				}
+				return made;
+			};
+			vk::Result probe_result = vk::Result::eSuccess;
+			{
+				Common::CrashContext::Scope note("graphics pipeline driver-cache lookup (VS, PS)",
+				                                 vs_input_info.stage.program != nullptr
+				                                     ? vs_input_info.stage.program->shader_hash
+				                                     : 0,
+				                                 ps_active && ps_input_info->stage.program != nullptr
+				                                     ? ps_input_info->stage.program->shader_hash
+				                                     : 0);
+				CreatePipelineInternal(m_graphics, *probed, key.rendering, key.vertex_input, vertex_info,
+				                       ps_input_info, programs, key.static_params, m_driver_cache, &probe_hook,
+				                       &probe_result);
+			}
+			const auto probe_ns = CompileClockNs() - probe_begin;
+			m_skip_probe_ns.fetch_add(probe_ns, std::memory_order_relaxed);
+			if (probe_result == vk::Result::eSuccess) {
+				m_skip_probe_hits.fetch_add(1, std::memory_order_relaxed);
+				ready.pipeline   = std::move(probed);
+				ready.content    = std::move(probed_content);
+				ready.compile_ns = probe_ns;
+				probe_hit        = true;
+				wait_begin       = probe_begin;
+			} else {
+				m_skip_probe_misses.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+	if (skippable && background_ok && !graphics_debug_dump_enabled() && !probe_hit) {
 		bool           queued = false;
 		PrefetchState* source = m_skip.get();
 		{
@@ -9206,6 +9274,13 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			                 "published ({} within the wait); {} lookups found the queue full",
 			                 skip.skipped_draws, skip.requested, skip.compile_ns / 1000000, skip.published,
 			                 skip.ready_in_wait, skip.not_queued);
+			if (m_skip_probe) {
+				PipelineCacheLog("Pipeline skip: driver-cache lookups found {} pipelines, sent {} to the "
+				                 "builders ({} ms looking; KYTY_PIPELINE_SKIP_PROBE)",
+				                 m_skip_probe_hits.load(std::memory_order_relaxed),
+				                 m_skip_probe_misses.load(std::memory_order_relaxed),
+				                 m_skip_probe_ns.load(std::memory_order_relaxed) / 1000000);
+			}
 		};
 		if (poll == PrefetchState::Poll::Pending) {
 			g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
@@ -9245,7 +9320,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			wait_begin = 0;
 		}
 	}
-	if (ready_from == nullptr && m_prefetch != nullptr && background_ok &&
+	if (ready_from == nullptr && !probe_hit && m_prefetch != nullptr && background_ok &&
 	    !graphics_debug_dump_enabled()) {
 		{
 			Common::LockGuard lock(m_mutex);
@@ -9266,7 +9341,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			m_graphics.device.destroyPipeline(ready.pipeline->pipeline, nullptr);
 			ReleasePipelineLayout(m_graphics, ready.pipeline->pipeline_layout,
 			                      ready.pipeline->descriptor_set_layout);
-			ready_from->Complete(key);
+			if (ready_from != nullptr) ready_from->Complete(key); // null: a driver-cache lookup's
 		}
 		return remember(*iter->second);
 	}
@@ -9348,7 +9423,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	const auto created_pipeline = cached->pipeline;
 	auto [iter, inserted]       = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
-	if (prefetched) ready_from->Complete(key);
+	if (prefetched && ready_from != nullptr) ready_from->Complete(key); // null: a driver-cache lookup's
 	if (prefetched && ready.content.key != 0) content = std::move(ready.content); // journaled below
 	const bool built_fast = fast_result.snapshot != nullptr; // EnqueueGraphics takes the snapshot
 	if (built_fast) {
