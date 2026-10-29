@@ -822,17 +822,26 @@ size_t DropDeadPlanReferences(Program& program) {
 }
 
 size_t ResolvePlanIdentities(Program& program) {
-	size_t resolved = 0;
+	// Only references to instructions the program still holds: a reference to one an earlier
+	// pass erased points at freed memory (DropDeadPlanReferences clears it later). Following it
+	// read an argument-less "identity" and stopped the emulator (index >= args.size(), Miles'
+	// call-split permutations).
+	const auto live     = LivePlanReferences(program);
+	size_t     resolved = 0;
 	ForEachPlanReference(
 	    program,
 	    [&](Value& value) {
+		    const auto* inst = value.TryInstruction();
+		    if (inst == nullptr || !live.contains(inst)) {
+			    return;
+		    }
 		    if (value.IsIdentity()) {
 			    value = value.Resolve();
 			    resolved++;
 		    }
 	    },
 	    [&](const Inst*& inst) {
-		    if (inst == nullptr || inst->GetOpcode() != ValueOpcode::Identity) {
+		    if (inst == nullptr || !live.contains(inst) || inst->GetOpcode() != ValueOpcode::Identity) {
 			    return;
 		    }
 		    // An identity of an immediate names no instruction: DropDeadPlanReferences clears it.
