@@ -65,6 +65,7 @@ protected slots:
 	void delete_configuartion();
 	void edit_global_settings();
 	void edit_input_mapping();
+	void edit_wheel();
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
 	void open_game_folder();
 	void remove_save_data();

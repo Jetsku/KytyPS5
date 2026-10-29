@@ -365,6 +365,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
 	}
+	if (info.controller.wheel_enabled && !info.controller.wheel_config.isEmpty()) {
+		args << "--wheel" << BoolArg(true);
+		args << "--wheel-config" << info.controller.wheel_config;
+	}
 	AddFlag(args, info.renderdoc_enabled, "--rd");
 
 	QString game = info.basedir;

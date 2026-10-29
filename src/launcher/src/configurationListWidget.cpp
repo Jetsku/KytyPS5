@@ -13,6 +13,7 @@
 #include "mainDialog.h"
 #include "patchesDialog.h"
 #include "trophyViewerDialog.h"
+#include "wheelMappingDialog.h"
 
 #include <QAbstractItemModel>
 #include <QAbstractItemView>
@@ -261,6 +262,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	UpdateToolbarIcons();
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
+	m_ui->wheel_button->setToolTip(tr("Map a racing wheel"));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
@@ -286,6 +288,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::edit_global_settings);
 	connect(m_ui->input_mapping_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_input_mapping);
+	connect(m_ui->wheel_button, &QToolButton::clicked, this, &ConfigurationListWidget::edit_wheel);
 	connect(m_ui->edit_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_configuration);
 	connect(m_ui->delete_button, &QToolButton::clicked, this,
@@ -375,6 +378,7 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 	m_ui->refresh_action->setIcon(m_ui->refresh_button->icon());
 	set_icon(m_ui->global_settings_button, QStringLiteral(":/icons/global-settings.svg"));
 	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
+	set_icon(m_ui->wheel_button, QStringLiteral(":/icons/racing-wheel.svg"));
 	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
 	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
 	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
@@ -462,6 +466,8 @@ void ConfigurationListWidget::ReadSettings() {
 	}
 	m_global_info.controller.ReadSettings(s.get());
 	m_global_info.ReadGlobalOnlySettings(s.get());
+	m_global_info.controller.wheel_config =
+	    QDir(QFileInfo(m_settings_file).absolutePath()).filePath(QStringLiteral("wheel.json"));
 	s->endGroup();
 
 	qDeleteAll(m_custom_infos);
@@ -1058,6 +1064,15 @@ void ConfigurationListWidget::edit_input_mapping() {
 	InputMappingDialog dialog(m_global_info.host_input_mapping, m_controller_preview, this);
 	if (dialog.exec() == QDialog::Accepted) {
 		m_global_info.host_input_mapping = dialog.Mapping();
+		WriteSettings();
+	}
+}
+
+void ConfigurationListWidget::edit_wheel() {
+	WheelMappingDialog dialog(m_global_info.controller.wheel_config,
+	                          m_global_info.controller.wheel_enabled, this);
+	if (dialog.exec() == QDialog::Accepted) {
+		m_global_info.controller.wheel_enabled = dialog.Enabled();
 		WriteSettings();
 	}
 }

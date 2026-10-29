@@ -21,6 +21,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
+#include "libs/wheelHost.h"
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
@@ -297,6 +298,12 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
+		// A wheel, pedal set or shifter that SDL also maps as a gamepad would drive the pad too.
+		if (Wheel::IsBoundDevice(SDL_GetJoystickVendorForID(f.id),
+		                         SDL_GetJoystickProductForID(f.id))) {
+			LOGF("Controller: gamepad %d is bound to the wheel; not used as a pad\n", f.id);
+			return;
+		}
 		auto* pad = SDL_OpenGamepad(f.id);
 		if (pad == nullptr) {
 			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
