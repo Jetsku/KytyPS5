@@ -69,6 +69,9 @@ struct PipelineStaticParameters {
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 	// Target 0 blends with logical alpha from the second source (KYTY_BLEND_ALPHA_REMAP).
 	bool                       blend_alpha_source_remap                           = false;
+	// KYTY_AA_MASK_COVERAGE: PA_SC_AA_MASK reduced to the draw's samples when the pixel shader's copy
+	// that applies it is used (aaMaskCoverage.h); all ones otherwise.
+	uint32_t                   aa_mask[2]                                         = {0xffffffffu, 0xffffffffu};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -78,7 +81,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 127);
+static_assert(sizeof(PipelineStaticParameters) == 135);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};

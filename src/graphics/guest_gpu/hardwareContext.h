@@ -864,6 +864,11 @@ public:
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
 	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
+	// PA_SC_AA_MASK_X0Y0_X1Y0 (0) and PA_SC_AA_MASK_X0Y1_X1Y1 (1): the samples each pixel of a 2x2
+	// quad may cover (16 bits a pixel). Kept only with KYTY_AA_MASK_COVERAGE=1 (aaMaskCoverage.h);
+	// all ones otherwise.
+	[[nodiscard]] uint32_t GetAaMask(uint32_t index) const { return m_aa_mask[index & 1u]; }
+	void SetAaMask(uint32_t index, uint32_t value) { m_aa_mask[index & 1u] = value; }
 
 	[[nodiscard]] float GetDepthClearValue() const { return m_depth_clear_value; }
 	void                SetDepthClearValue(float clear_value) { m_depth_clear_value = clear_value; }
@@ -963,6 +968,7 @@ public:
 		f(Raster, &m_scan_mode_control, sizeof(m_scan_mode_control));
 		f(Raster, &m_aa_sample_control, sizeof(m_aa_sample_control));
 		f(Raster, &m_aa_config, sizeof(m_aa_config));
+		f(Raster, m_aa_mask, sizeof(m_aa_mask));
 		f(Raster, &m_mode_control, sizeof(m_mode_control));
 		f(Raster, &m_poly_offset, sizeof(m_poly_offset));
 		f(Raster, &m_eqaa_control, sizeof(m_eqaa_control));
@@ -987,6 +993,7 @@ private:
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;
+	uint32_t        m_aa_mask[2] = {0xffffffffu, 0xffffffffu};
 
 	uint32_t m_shader_stages = 0;
 

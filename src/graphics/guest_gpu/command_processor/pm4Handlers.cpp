@@ -306,8 +306,20 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
+// PA_SC_AA_MASK: kept for KYTY_AA_MASK_COVERAGE=1 (default off, startup; aaMaskCoverage.h, from the
+// GT7 fork's fc4111066), ignored otherwise as before.
+static void HwCtxSetAaMaskRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	static const bool kept = [] {
+		const char* text = std::getenv("KYTY_AA_MASK_COVERAGE");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	if (!kept) return;
+	if (cmd_offset == Pm4::PA_SC_AA_MASK_X0Y0_X1Y0) {
+		cp.GetCtx().SetAaMask(0, value);
+	} else if (cmd_offset == Pm4::PA_SC_AA_MASK_X0Y1_X1Y1) {
+		cp.GetCtx().SetAaMask(1, value);
+	}
+}
 
 // DB_ALPHA_TO_MASK as alpha-to-coverage (upstream 13b291f99). KYTY_ALPHA_TO_MASK=0 ignores the
 // register as before (no coverage from alpha, early depth tests kept).
@@ -539,7 +551,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset + i, buffer[i]);
+		HwCtxSetAaMaskRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -3856,16 +3868,16 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxSetAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxSetAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_VTX_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreVtxControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxSetAaMaskRegister(cp, cmd_offset, value); // not an AA mask register: ignored
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_BINNER_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePaScExtendedControl(cmd_offset, value);

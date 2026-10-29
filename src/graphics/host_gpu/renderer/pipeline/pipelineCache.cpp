@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
+#include "graphics/host_gpu/renderer/pipeline/aaMaskCoverage.h"
 #include "common/ramStats.h"
 
 #include "common/assert.h"
@@ -2714,11 +2715,15 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(emitted.spirv.size()), options.wave_size);
 		}
+		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+		// KYTY_AA_MASK_COVERAGE: the pixel SPIR-V kept (compressed) for the AA mask copies.
+		if (options.stage == ShaderType::Pixel) {
+			AaMaskCoverage::Register(id, options.shader_hash, emitted.spirv);
+		}
 		if (validator != nullptr) {
 			validator->Submit(options.dump_label, stage_name, options.shader_hash,
 			                  std::move(emitted.spirv), options.maintenance8_enabled);
 		}
-		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
 		if (shades_per_sample) {
 			PixelRate::Register(id, true, pixel_rate_module);
@@ -2741,6 +2746,10 @@ struct PipelineCache::ProgramCache {
 			const auto plain_module = CompileSPV(emitted.spirv_plain, device);
 			EXIT_IF(plain_module == nullptr);
 			g_shader_modules.Add(plain_module, emitted.spirv_plain);
+			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+			if (options.stage == ShaderType::Pixel) {
+				AaMaskCoverage::Register(plain_id, options.shader_hash, emitted.spirv_plain);
+			}
 			// The plain variant shades per sample as the program does (KYTY_EQAA_MIXED).
 			vk::ShaderModule plain_rate_module = nullptr;
 			if (shades_per_sample) {
@@ -2750,7 +2759,6 @@ struct PipelineCache::ProgramCache {
 				validator->Submit(options.dump_label, stage_name, options.shader_hash,
 				                  std::move(emitted.spirv_plain), options.maintenance8_enabled);
 			}
-			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 			GpuOpProfiler::RegisterShader(plain_id, stage_name, options.shader_hash);
 			if (shades_per_sample) {
 				PixelRate::Register(plain_id, true, plain_rate_module);
@@ -4133,6 +4141,8 @@ struct PipelineCache::ProgramCache {
 			// NoStart): keep permutations unique and drop this equal copy.
 			PixelRate::Forget(device, compiled->handle.id);
 			PixelRate::Forget(device, compiled->plain.id);
+			AaMaskCoverage::Forget(device, compiled->handle.id);
+			AaMaskCoverage::Forget(device, compiled->plain.id);
 			NormalizedLod::Forget(device, compiled->handle.id);
 			g_shader_modules.Destroy(device, compiled->handle.module);
 			if (compiled->plain.module != nullptr) {
@@ -4767,6 +4777,8 @@ struct PipelineCache::ProgramCache {
 			entry.permutations.ForEach([&](const Permutation& permutation) {
 				PixelRate::Forget(device, permutation.handle.id);
 				PixelRate::Forget(device, permutation.plain.id);
+				AaMaskCoverage::Forget(device, permutation.handle.id);
+				AaMaskCoverage::Forget(device, permutation.plain.id);
 				NormalizedLod::Forget(device, permutation.handle.id);
 				g_shader_modules.Destroy(device, permutation.handle.module);
 				if (permutation.plain.module != nullptr) {
@@ -7023,6 +7035,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 PipelineCache::~PipelineCache() {
 	m_stats_reporter.reset();
 	StopBackgroundPipelines();
+	AaMaskCoverage::Shutdown(m_graphics.device);
 	StopShaderPrecompile();
 	if (m_rt != nullptr) m_rt->Shutdown();
 	m_program_cache->StopBackgroundChecks();
@@ -8639,6 +8652,29 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 		return false;
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
+	// KYTY_AA_MASK_COVERAGE (aaMaskCoverage.h; the GT7 fork's fc4111066): PA_SC_AA_MASK reduced to
+	// the raster samples. A draw whose masks leave samples out runs the pixel shader's copy that
+	// applies them (or a coverage-only shader without one) once the copy is made; until then, and
+	// for shaders without a copy, the key keeps all ones and the draw runs as before.
+	if (AaMaskCoverage::Enabled()) {
+		const uint32_t samples = std::clamp<uint32_t>(attachment_samples, 1u, 16u);
+		const uint32_t full    = samples >= 16u ? 0xffffu : (1u << samples) - 1u;
+		const uint32_t both    = full | (full << 16u);
+		const uint32_t mask01  = ctx.GetAaMask(0) & both;
+		const uint32_t mask23  = ctx.GetAaMask(1) & both;
+		if (mask01 != both || mask23 != both) {
+			// The EQAA per-pixel copy the fragment stage runs (shaders.cpp), whose AA copy it takes.
+			const bool pixel_rate =
+			    ps_active && rendering.color_samples != 0 &&
+			    m_graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
+			    !EqaaPerSampleShading() && PixelRate::Find(pixel_program.id).module != nullptr;
+			if (AaMaskCoverage::Request(m_graphics.device, ps_active ? pixel_program.id : 0u, pixel_rate,
+			                            mask01, mask23) != nullptr) {
+				static_params.aa_mask[0] = mask01;
+				static_params.aa_mask[1] = mask23;
+			}
+		}
+	}
 	static_params.depth_bounds_test_enable = targets.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = targets.depth_min_bounds;
 	static_params.depth_max_bounds         = targets.depth_max_bounds;
