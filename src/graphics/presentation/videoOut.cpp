@@ -1374,19 +1374,35 @@ static Live::Switch g_hold_skipped_draws("KYTY_HOLD_SKIPPED_DRAWS", [](const cha
 	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 0;
 });
 
+// KYTY_HOLD_COMPILING=1 (live, default off; Sakura 45bc441ec via usa-ratt/KytyPS5-GT7): with
+// KYTY_HOLD_SKIPPED_DRAWS, frames are held in a row (one shown between runs) for up to
+// KYTY_HOLD_MAX_MS (live, default 5000) instead of two at most, so while a burst of pipelines
+// builds in parallel the screen shows only complete frames; one frame is shown after the cap.
+static Live::Switch g_hold_compiling("KYTY_HOLD_COMPILING", Live::ParseDefaultOff);
+static Live::Switch g_hold_max_ms("KYTY_HOLD_MAX_MS", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : 5000;
+});
+
 // The thread that prepares flips, after the frame's draws: whether this main-display frame is held.
 static bool TakeFrameHold() {
-	constexpr uint32_t MaxInARow  = 2;
-	constexpr uint32_t ShownAfter = 8;
-	static uint32_t    in_a_row   = 0;
-	static uint32_t    shown      = ShownAfter;
-	static uint64_t    held       = 0;
-	const uint32_t     skips =
-	    Graphics::g_frame_pipeline_skips.exchange(0, std::memory_order_relaxed);
-	const auto threshold = static_cast<uint64_t>(g_hold_skipped_draws.Get());
-	const bool hold      = threshold != 0 && skips >= threshold && in_a_row < MaxInARow &&
-	                  (in_a_row != 0 || shown >= ShownAfter);
+	const bool      compiling  = g_hold_compiling.On();
+	const uint32_t  MaxInARow  = compiling ? UINT32_MAX : 2u;
+	const uint32_t  ShownAfter = compiling ? 1u : 8u;
+	static uint32_t in_a_row   = 0;
+	static uint32_t shown      = 8;
+	static uint64_t held       = 0;
+	static std::chrono::steady_clock::time_point held_since;
+	const uint32_t skips = Graphics::g_frame_pipeline_skips.exchange(0, std::memory_order_relaxed);
+	const auto     threshold = static_cast<uint64_t>(g_hold_skipped_draws.Get());
+	const auto     now       = std::chrono::steady_clock::now();
+	const bool     hold      = threshold != 0 && skips >= threshold && in_a_row < MaxInARow &&
+	                  (in_a_row != 0 || shown >= ShownAfter) &&
+	                  (!compiling || in_a_row == 0 ||
+	                   now - held_since < std::chrono::milliseconds(g_hold_max_ms.Get()));
 	if (hold) {
+		if (in_a_row == 0) {
+			held_since = now;
+		}
 		in_a_row++;
 		shown = 0;
 		held++;
@@ -1397,7 +1413,7 @@ static bool TakeFrameHold() {
 		}
 	} else {
 		in_a_row = 0;
-		shown    = std::min(shown + 1u, ShownAfter);
+		shown    = std::min(shown + 1u, 8u);
 	}
 	return hold;
 }
