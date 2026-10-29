@@ -257,6 +257,11 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	// KYTY_BINDLESS_SAMPLERS: selected per lane by a key into a guest sampler heap
+	// (DescriptorSource::bindless_sampler). The shader indexes the bindless sampler array (set 1)
+	// with the region base and record count at this flattened-SRT offset, which the host patches.
+	bool     bindless                = false;
+	uint32_t bindless_mapping_offset = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -713,6 +718,15 @@ struct DescriptorSource {
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectDescriptor> indirect_descriptor;
+	// KYTY_BINDLESS_SAMPLERS: an S# read from a sampler heap at a key the shader computes. Dwords
+	// 0-2 are the heap's V# (dword 3 is 0); key k's S# is at table_offset + k * stride bytes.
+	struct BindlessSampler {
+		uint32_t table_offset = 0;
+		uint32_t stride       = 16;
+
+		bool operator==(const BindlessSampler& other) const = default;
+	};
+	std::optional<BindlessSampler> bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };

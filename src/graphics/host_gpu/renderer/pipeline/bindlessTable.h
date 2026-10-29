@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -111,6 +112,9 @@ public:
 	// The runtime image bindings (BindlessBindings.h); the enum values above index nothing else.
 	static constexpr uint32_t RuntimeTableBinding    = ShaderRecompiler::IR::BindlessRuntimeTable;
 	static constexpr uint32_t RuntimeRequestsBinding = ShaderRecompiler::IR::BindlessRuntimeRequests;
+	// KYTY_BINDLESS_SAMPLERS: the sampler array (BindlessBindings.h), at most MaxSamplers slots.
+	static constexpr uint32_t SamplersBinding = ShaderRecompiler::IR::BindlessSamplers;
+	static constexpr uint32_t MaxSamplers     = 4096;
 	// Keys of each binding's runtime heap (the T#s runtime images requested).
 	static constexpr uint32_t RuntimeKeys = 8192;
 	static constexpr uint32_t ImageArrays        = 4;
@@ -234,6 +238,35 @@ public:
 	// the runtime image table; UINT32_MAX when the heap is full.
 	[[nodiscard]] uint32_t RuntimeKey(Heap& heap, const std::array<uint32_t, 8>& dwords);
 
+	// KYTY_BINDLESS_SAMPLERS (a minimal port of Senaxx's mirrored sampler heaps, 59cb8a83e):
+	// whether set 1 has the sampler array (the switch), and its slots on this device.
+	[[nodiscard]] static bool     SamplersEnabled();
+	[[nodiscard]] static uint32_t SamplerSlots(const GraphicContext& graphics);
+	// A guest sampler heap as one kind of use samples it: a region of the sampler array that
+	// mirrors its S# records, key for key. Uses differ in whether the depth-compare function is
+	// kept, point filtering forced, border colours integer or cube edges clamped (the flags), so
+	// each kind gets its own region.
+	struct SamplerHeap {
+		uint64_t                             base          = 0;
+		uint32_t                             table_offset  = 0;
+		uint32_t                             stride        = 16;
+		uint32_t                             flags         = 0;
+		uint32_t                             region        = 0; // first slot; 0 = none yet
+		uint32_t                             capacity      = 0;
+		std::vector<std::array<uint32_t, 4>> records;           // mirrored S# records
+		uint64_t                             checked_frame = UINT64_MAX;
+	};
+	[[nodiscard]] SamplerHeap& FindOrCreateSamplerHeap(uint64_t base, uint32_t table_offset,
+	                                                   uint32_t stride, uint32_t flags);
+	// Mirrors the records into the heap's region. New records are appended in place (their slots
+	// were never used); a changed record, or more records than the region holds, moves the heap to
+	// a new region, because slots the GPU may be reading are never rewritten. False when the
+	// sampler array is full; the heap then keeps its previous records.
+	bool MirrorSamplerHeap(SamplerHeap& heap, std::span<const std::array<uint32_t, 4>> records,
+	                       const std::function<vk::Sampler(const std::array<uint32_t, 4>&)>& make);
+	// Slot 0 of the sampler array, used for keys outside their heap; written once.
+	void WriteDefaultSampler(vk::Sampler sampler);
+
 private:
 	void PublishRuntimeEntry(const Heap& heap, uint32_t key, const std::array<uint32_t, 8>& dwords);
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
@@ -294,6 +327,10 @@ private:
 	std::unique_ptr<Buffer>                 m_runtime_requests;
 	std::unique_ptr<Buffer>                 m_runtime_requests_snapshot;
 	std::array<Heap*, ImageArrays>          m_runtime_heaps {};
+	uint32_t                                m_sampler_slots           = 0;
+	uint32_t                                m_next_sampler_slot       = 1; // slot 0: the stand-in
+	bool                                    m_default_sampler_written = false;
+	std::deque<SamplerHeap>                 m_sampler_heaps;
 	std::map<std::pair<uint32_t, std::array<uint32_t, 8>>, uint32_t> m_runtime_keys;
 	uint64_t                                m_snapshot_tick = 0; // 0 = none recorded
 	// The view each image slot holds, and the slots each view is in (placeholders excluded).

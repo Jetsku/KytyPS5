@@ -2650,16 +2650,85 @@ void RenderExecutor::ResolveBindlessRequests() {
 	m_bindless_snapshot_frame = frame;
 }
 
+// KYTY_BINDLESS_SAMPLERS (a minimal port of Senaxx's mirrored sampler heaps, 59cb8a83e): the S#
+// records of each sampler heap a stage indexes are mirrored into the sampler array of set 1, once
+// per frame per heap and kind of use, and the shader gets the region base and record count. Keys
+// outside it, heaps the GPU has written or that cannot be read, and a full array, use the stand-in
+// sampler in slot 0 (the words stay 0, or the heap keeps its previous mirror).
+void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
+                                             PreparedBindings&         prepared) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	auto&       table    = m_context.GetBindlessTable();
+	auto&       cache    = m_context.GetSamplerCache();
+	{
+		ShaderSamplerResource stand_in;
+		std::copy_n(ShaderRecompiler::IR::BindlessDefaultSampler, 4u, stand_in.fields);
+		table.WriteDefaultSampler(cache.GetSampler(stand_in, false));
+	}
+	const auto         frame      = BindlessFrame();
+	constexpr uint64_t MaxRecords = 1024;
+	constexpr uint64_t MaxBytes   = 256u * 1024u;
+	std::vector<std::array<uint32_t, 4>> records;
+	for (const auto& use: snapshot.bindless_sampler_heaps) {
+		if (use.sampler >= program.info.samplers.size() || use.stride < 16u) {
+			continue;
+		}
+		const auto&    sampler = program.info.samplers[use.sampler];
+		const bool     cube    = CubeEdgeClamp() && SamplesCubesOnly(program, use.sampler);
+		const uint32_t flags   = (sampler.depth_compare ? 1u : 0u) |
+		                       (sampler.force_point_filtering ? 2u : 0u) |
+		                       (sampler.integer_border ? 4u : 0u) | (cube ? 8u : 0u);
+		auto& heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, use.stride, flags);
+		if (heap.checked_frame != frame) {
+			heap.checked_frame       = frame;
+			const uint64_t available = use.size > use.table_offset
+			                               ? (use.size - use.table_offset + use.stride - 16u) / use.stride
+			                               : 0u;
+			records.resize(std::min({available, MaxRecords, MaxBytes / use.stride}));
+			const uint64_t address = use.base + use.table_offset;
+			const uint64_t bytes =
+			    records.empty() ? 0u : (records.size() - 1u) * use.stride + sizeof(records[0]);
+			bool read = !records.empty() &&
+			            !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes);
+			if (read && use.stride == sizeof(records[0])) {
+				read = LibKernel::Memory::TryReadBacking(address, records.data(), bytes);
+			} else {
+				for (size_t key = 0; read && key < records.size(); key++) {
+					read = LibKernel::Memory::TryReadBacking(address + key * use.stride,
+					                                         records[key].data(),
+					                                         sizeof(records[key]));
+				}
+			}
+			if (read) {
+				const auto make = [&](const std::array<uint32_t, 4>& record) {
+					ShaderRecompiler::IR::DescriptorValue value;
+					value.dword_count = 4u;
+					std::copy(record.begin(), record.end(), value.dwords.begin());
+					return cache.GetSampler(NativeSamplerDescriptor(program, use.sampler, value),
+					                        sampler.integer_border);
+				};
+				(void)table.MirrorSamplerHeap(heap, records, make);
+			}
+		}
+		const uint32_t entries = heap.region != 0u ? static_cast<uint32_t>(heap.records.size()) : 0u;
+		prepared.bindless_patches.push_back({use.mapping_offset, heap.region, entries});
+	}
+}
+
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings&         prepared) {
 	prepared.bindless_patches.clear();
 	prepared.bindless_heaps.clear();
 	const auto& snapshot = *runtime.resources;
-	if (snapshot.bindless_heaps.empty()) [[likely]] {
+	if (snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty()) [[likely]] {
 		return;
 	}
 	const auto& program = *runtime.program;
 	auto&       table   = m_context.GetBindlessTable();
+	if (!snapshot.bindless_sampler_heaps.empty() && table.EnsureCreated()) {
+		PrepareBindlessSamplers(runtime, prepared);
+	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.record_pointer == UINT32_MAX && !use.runtime &&
 		    m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))

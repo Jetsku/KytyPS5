@@ -1019,6 +1019,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		const uint32_t     usable        = limit > SetZeroMargin ? limit - SetZeroMargin : 0u;
 		graphics.bindless_enabled = requested && supported && usable / 4u > 3u;
 		graphics.bindless_max_sampled_images = graphics.bindless_enabled ? usable : 0u;
+		graphics.bindless_max_samplers =
+		    graphics.bindless_enabled
+		        ? std::min(properties12.maxDescriptorSetUpdateAfterBindSamplers,
+		                   properties12.maxPerStageDescriptorUpdateAfterBindSamplers)
+		        : 0u;
 		if (graphics.bindless_enabled) {
 			features12.runtimeDescriptorArray                       = VK_TRUE;
 			features12.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;

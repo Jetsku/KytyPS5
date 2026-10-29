@@ -79,6 +79,7 @@ CodegenOptions FromEnvironment() {
 	    EnvFlag("KYTY_BINDLESS_3D_AS_ARRAY", options.bindless_3d_as_array);
 	options.runtime_images   = EnvFlag("KYTY_RUNTIME_IMAGES", options.runtime_images);
 	options.bindless_strided = EnvFlag("KYTY_BINDLESS_STRIDE", options.bindless_strided);
+	options.bindless_samplers = EnvFlag("KYTY_BINDLESS_SAMPLERS", options.bindless_samplers);
 	options.workgroup_images = EnvFlag("KYTY_WORKGROUP_IMAGES", options.workgroup_images);
 	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
 	options.storage_length_zero =

@@ -1146,6 +1146,36 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 	return slot;
 }
 
+// KYTY_BINDLESS_SAMPLERS: the sampler array slot of the sampler handle's key: region + key while
+// the key is inside the heap's record count (both from the flattened SRT, patched by the host),
+// otherwise slot 0, the stand-in sampler.
+static uint32_t BindlessSamplerSlot(ValueEmitContext& ctx, const IR::SamplerResource& sampler,
+                                    IR::Value sampler_arg) {
+	auto&       state  = ctx.state;
+	const auto* handle = sampler_arg.ResolveInstruction();
+	EXIT_IF(handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
+	        state.bindless_sampler_variable == 0);
+	const auto key  = ctx.Def(handle->Arg(0));
+	const auto Load = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, index));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto base     = Load(sampler.bindless_mapping_offset);
+	const auto count    = Load(sampler.bindless_mapping_offset + 1u);
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
+	const auto entry    = Binary(state, spv::OpIAdd, TypeU32(state), base, key);
+	const auto slot     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, in_range, entry,
+	                          ConstantU32(state, 0u));
+	state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+	return slot;
+}
+
 // KYTY_RUNTIME_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): runtime images
 // (ImageResource::runtime); the handle holds the eight T# dwords the shader loaded.
 static std::array<uint32_t, 8> RuntimeImageDwords(ValueEmitContext& ctx, IR::Value image_arg) {
@@ -1399,6 +1429,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = ImageResourceAt(state, mem.resource);
+	state.bindless_sampler_slot = 0u;
+	if (IR::ImageOpcodeInfoOf(inst.GetOpcode()).needs_sampler && inst.NumArgs() > 1u &&
+	    mem.sampler < state.program.info.samplers.size() &&
+	    state.program.info.samplers[mem.sampler].bindless) {
+		state.bindless_sampler_slot =
+		    BindlessSamplerSlot(ctx, state.program.info.samplers[mem.sampler], inst.Arg(1));
+	}
 	if (image.runtime) {
 		const auto dwords = RuntimeImageDwords(ctx, image_arg);
 		if (inst.GetOpcode() == IR::ValueOpcode::ImageQueryDimensions) {

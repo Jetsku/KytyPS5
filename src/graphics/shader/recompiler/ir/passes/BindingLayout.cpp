@@ -255,7 +255,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	    !program.srt_reads.empty() ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
 		    return image.indirect_search_iterations != 0u || image.bindless;
-	    });
+	    }) ||
+	    std::ranges::any_of(program.info.samplers, &SamplerResource::bindless);
 	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}

@@ -1115,6 +1115,161 @@ void CheckCallTraceReach() {
   std::printf("[bindless] %-32s ok\n", name);
 }
 
+// KYTY_BINDLESS_SAMPLERS (a minimal port of Senaxx's mirrored sampler heaps, 59cb8a83e): the Miles
+// waterfall whose S# is read from a sampler heap at the same key (S_LSHL_B32 4,
+// S_BUFFER_LOAD_DWORDX4 from the heap V# in s[12:15]). Without the switch the S# takes the
+// linear/wrap stand-in, as before; with it the sampler is bindless: the snapshot names the heap,
+// two flattened-SRT words follow the SRT slots, and the shader indexes the set-1 sampler array.
+std::vector<u32> SamplerHeapSampleCode() {
+  std::vector<u32> code;
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword v1, v0, s[0:3] idxen
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendVMovLiteral(&code, 3, 0x3f000000u);
+  AppendVMovLiteral(&code, 4, 0x3f000000u);
+  AppendVMovLiteral(&code, 5, 0x00000000u);
+  code.push_back(EncodeSop1(0x04u, 20, 126)); // s_mov_b64 s[20:21], exec
+  const auto loop = code.size();
+  code.push_back(EncodeSop1(0x14u, 22, 20));   // s_ff1_i32_b64 s22, s[20:21]
+  code.push_back(EncodeVop3Word0(0x360u, 23)); // v_readlane_b32 s23, v1, s22
+  code.push_back(EncodeVop3Word1(Vgpr(1), 22));
+  code.push_back(EncodeVopc(0xc2u, 23, 1));    // v_cmp_eq_u32 vcc, s23, v1
+  code.push_back(EncodeSop1(0x24u, 24, 106));  // s_and_saveexec_b64 s[24:25], vcc
+  code.push_back(EncodeSop2(0x1eu, 106, 23, InlineU32(5))); // s_lshl_b32 vcc_lo, s23, 5
+  code.push_back(EncodeSmem0(0x0bu, 32, 2)); // s_buffer_load_dwordx8 s[32:39], s[4:7], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSop2(0x1eu, 40, 23, InlineU32(4))); // s_lshl_b32 s40, s23, 4
+  code.push_back(EncodeSmem0(0x0au, 8, 6)); // s_buffer_load_dwordx4 s[8:11], s[12:15], s40
+  code.push_back(EncodeSmem1(0, 40));
+  code.push_back(EncodeSopp(0x0cu, 0));
+  code.push_back(EncodeMimg0(0x24u, 0x1u)); // image_sample_l v2, v[3:5], s[32:39], s[8:11]
+  code.push_back(EncodeMimg1(2, 3, 32 / 4, 8 / 4));
+  code.push_back(EncodeSop2(0x15u, 20, 20, 126)); // s_andn2_b64 s[20:21], s[20:21], exec
+  code.push_back(EncodeSop1(0x04u, 126, 24));     // s_mov_b64 exec, s[24:25]
+  const auto back = static_cast<int32_t>(loop) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1 loop
+  code.push_back(EncodeSopp(0x0cu, 0));
+  AppendBufferStoreDword(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckSamplerHeap() {
+  constexpr const char *name = "BindlessSamplerHeap";
+  const auto code = SamplerHeapSampleCode();
+  auto user_data = MilesHeapUserData();
+  // The sampler heap: 0x400 bytes (64 S# records) from 0x6000.
+  user_data[12] = 0x6000u;
+  user_data[13] = 0u;
+  user_data[14] = 0x400u;
+  user_data[15] = 0x5204u;
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  std::vector<u32> memory(0x4000u, 0u);
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadTestMemory,
+  };
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = true;
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+  {
+    // Switch off: the stand-in sampler, no sampler array, no sampler heap in the snapshot.
+    codegen.bindless_samplers = false;
+    ScopedCodegenOptions scope(codegen);
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "switch off", !translated.skip_dispatch,
+            "the bindless image was skipped without KYTY_BINDLESS_SAMPLERS");
+    const auto &samplers = translated.program.info.samplers;
+    Require(name, "switch off",
+            samplers.size() == 1u && !samplers[0].bindless &&
+                !translated.program.descriptor_sources.at(samplers[0].source)
+                     .bindless_sampler.has_value(),
+            "the sampler was planned as bindless without KYTY_BINDLESS_SAMPLERS");
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    Require(name, "switch off",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+                resources.bindless_sampler_heaps.empty() && resources.samplers.size() == 1u &&
+                resources.samplers[0].dwords[2] == ShaderRecompiler::IR::BindlessDefaultSampler[2],
+            "the stand-in sampler did not materialize");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    ValidateSpirv(name, result.spirv);
+    Require(name, "switch off",
+            CountSpirv(result.spirv, "\"bindless_samplers\"") == 0u &&
+                CountSpirv(result.spirv, "\"bindless_translation\"") == 1u,
+            "the switch-off SPIR-V has a bindless sampler array");
+    std::printf("[bindless] %-32s off ok (SPIR-V %zu words)\n", name, result.spirv.size());
+  }
+  codegen.bindless_samplers = true;
+  ScopedCodegenOptions scope(codegen);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "resource tracking", !translated.skip_dispatch,
+          "the bindless image was skipped with KYTY_BINDLESS_SAMPLERS");
+  const auto &samplers = translated.program.info.samplers;
+  Require(name, "bindless sampler plan", samplers.size() == 1u && samplers[0].bindless,
+          "expected one bindless sampler, got " + std::to_string(samplers.size()));
+  const auto &source = translated.program.descriptor_sources.at(samplers[0].source);
+  Require(name, "bindless sampler plan",
+          source.bindless_sampler.has_value() && source.bindless_sampler->table_offset == 0u &&
+              source.bindless_sampler->stride == 16u,
+          "the sampler is not a 16-byte sampler heap lookup");
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "the bindless sampler could not be materialized");
+  const auto expected_offset = static_cast<u32>(plan.srt_reads.size());
+  Require(name, "sampler heap",
+          resources.bindless_sampler_heaps.size() == 1u &&
+              resources.bindless_sampler_heaps[0].base == 0x6000u &&
+              resources.bindless_sampler_heaps[0].size == 0x400u &&
+              resources.bindless_sampler_heaps[0].stride == 16u &&
+              resources.bindless_sampler_heaps[0].sampler == 0u &&
+              resources.bindless_sampler_heaps[0].mapping_offset == expected_offset &&
+              resources.flattened_srt.size() >= expected_offset + 2u &&
+              resources.flattened_srt[expected_offset] == 0u &&
+              resources.bindless_heaps.size() == 1u &&
+              resources.bindless_heaps[0].mapping_offset >= expected_offset + 2u,
+          "the snapshot does not describe the sampler heap");
+  std::vector<uint8_t> plan_bytes;
+  ShaderRecompiler::IR::ResourcePlan decoded;
+  ShaderRecompiler::IR::ResourceSnapshot decoded_resources;
+  ShaderRecompiler::IR::ResourceSpecialization decoded_specialization;
+  Require(name, "program cache",
+          ShaderRecompiler::IR::EncodeResourcePlan(plan, plan_bytes) &&
+              ShaderRecompiler::IR::DecodeResourcePlan(plan_bytes, decoded) &&
+              ShaderRecompiler::IR::MaterializeResources(decoded, runtime, decoded_resources,
+                                                         decoded_specialization) &&
+              decoded_resources.bindless_sampler_heaps == resources.bindless_sampler_heaps &&
+              decoded_specialization == specialization,
+          "the decoded plan materialized another sampler heap");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+  ValidateSpirv(name, result.spirv);
+  Require(name, "bindless sampler SPIR-V",
+          CountSpirv(result.spirv, "\"bindless_samplers\"") == 1u &&
+              CountSpirv(result.spirv, "Binding 6") >= 1u &&
+              CountSpirv(result.spirv, "OpTypeRuntimeArray") >= 2u &&
+              CountSpirv(result.spirv, "OpImageSampleExplicitLod") >= 1u,
+          "the sample does not go through the bindless sampler array");
+  Require(name, "bindless sampler",
+          !result.program.info.samplers.empty() && result.program.info.samplers[0].bindless &&
+              result.program.info.samplers[0].bindless_mapping_offset == expected_offset,
+          "the compiled sampler does not read the materialized words");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
+}
+
 void RunCodegen() {
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
@@ -1124,6 +1279,7 @@ void RunCodegen() {
   CheckVolumeOverArray();
   CheckRuntimeImage();
   CheckStridedHeap();
+  CheckSamplerHeap();
   CheckWorkgroupStorageImage();
   CheckCallTraceReach();
 }
