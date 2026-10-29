@@ -1858,6 +1858,7 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 	if (first_slice && submission.reset_processor && submission.type != SubmissionType::Compute) {
 		CommitStats::OnFrameBoundary();
+		NoteCubeFrame();
 		CpGaps::NoteFrame();
 		Common::PrepPhases::NoteFrame();
 	}
@@ -1994,6 +1995,7 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		// sceAgcSuspendPoint.
 		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
 			CommitStats::OnFrameBoundary();
+			NoteCubeFrame();
 			CpGaps::NoteFrame();
 			Common::PrepPhases::NoteFrame();
 		}

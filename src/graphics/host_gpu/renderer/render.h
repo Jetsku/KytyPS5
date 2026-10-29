@@ -237,6 +237,9 @@ struct DrawAutoArgs {
 // of the main display.
 inline std::atomic<uint32_t> g_frame_pipeline_skips {0};
 
+// KYTY_CUBE_EVERY (renderDraw.cpp): a guest frame starts (the command processor's frame boundary).
+void NoteCubeFrame() noexcept;
+
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
 	Guest,             // CP EmitGlobalBarrier: guest RELEASE_MEM / EVENT_WRITE flushes

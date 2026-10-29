@@ -4101,6 +4101,73 @@ static CommitStats::DrawShape MakeCommitShape(
 	return shape;
 }
 
+// KYTY_CUBE_EVERY=<n> (live, 1 to 8, default 1 = every frame; usa-ratt/KytyPS5-GT7 fed07dcc3,
+// round 85): the draws into a reflection cube run every nth frame only; on the other frames the
+// cube keeps the last pictures drawn into it. GT7 draws its surroundings into a 512x512 cube of
+// six layers every frame for the cars' reflections: 550 to 750 draws a frame, 30 to 40 % of the
+// fork's GPU-thread draw time in a race. A cube is a color target of six square layers of at most
+// 2048 pixels; its address is learned at its first draw while the switch is above 1 (a
+// "Reflection cube:" line), and a direct draw (DrawIndex, DrawAuto) is left out, before anything
+// is prepared for it, while that address is its first color target and the draw writes it.
+// Command-processor thread only, but the frame count (NoteCubeFrame).
+static Live::Switch g_cube_every("KYTY_CUBE_EVERY", [](const char* value) -> int64_t {
+	const auto n = value != nullptr ? std::strtol(value, nullptr, 10) : 1l;
+	return std::clamp<int64_t>(n, 1, 8);
+});
+static std::array<uint64_t, 4> g_cube_targets {};
+static uint32_t                g_cube_target_count = 0;
+static uint64_t                g_cube_draws_left   = 0;
+static std::atomic<uint64_t>   g_cube_frame {0};
+
+void NoteCubeFrame() noexcept {
+	g_cube_frame.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void LearnCubeTarget(const CommandBuffer& buffer, const DrawRenderState& state) {
+	if (g_cube_every.Get() <= 1 || state.color_count == 0 ||
+	    g_cube_target_count >= g_cube_targets.size()) {
+		return;
+	}
+	const auto& color = state.color_info[0];
+	const auto& info  = color.desc.info;
+	if (color.target_slot != 0 || info.resources.layers != 6 ||
+	    info.extent.width != info.extent.height || info.extent.width > 2048u) {
+		return;
+	}
+	const auto address = buffer.GetRegisters().GetRenderTarget(0).base.addr;
+	const auto known   = std::span(g_cube_targets.data(), g_cube_target_count);
+	if (address == 0 || std::find(known.begin(), known.end(), address) != known.end()) {
+		return;
+	}
+	g_cube_targets[g_cube_target_count++] = address;
+	LOGF("Reflection cube: color target 0x%" PRIx64 ", %ux%u, 6 layers: its draws run every "
+	     "%" PRId64 " frames (KYTY_CUBE_EVERY)\n",
+	     address, info.extent.width, info.extent.height, g_cube_every.Get());
+}
+
+static bool SkipCubeDraw(const CommandBuffer& buffer) {
+	if (g_cube_target_count == 0) {
+		return false;
+	}
+	const auto every = static_cast<uint64_t>(g_cube_every.Get());
+	if (every <= 1 || g_cube_frame.load(std::memory_order_relaxed) % every == 0) {
+		return false;
+	}
+	const auto& regs    = buffer.GetRegisters();
+	const auto  address = regs.GetRenderTarget(0).base.addr;
+	const auto  known   = std::span(g_cube_targets.data(), g_cube_target_count);
+	if (address == 0 || std::find(known.begin(), known.end(), address) == known.end() ||
+	    (regs.GetRenderTargetMask() & 0xfu) == 0) {
+		return false;
+	}
+	const auto left = ++g_cube_draws_left;
+	if ((left & (left - 1u)) == 0 && left >= 1024u) {
+		LOGF("Reflection cube: %" PRIu64 " draws left out so far (KYTY_CUBE_EVERY=%" PRIu64 ")\n",
+		     left, every);
+	}
+	return true;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -4109,6 +4176,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	KYTY_GPU_OP_SITE("draw.execute");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
+	LearnCubeTarget(buffer, state);
 	if (m_context.GetOcclusionCounter().DebugLogActive()) {
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
 		                           buffer.GetShaders().GetVs().es_regs.data_addr);
@@ -5261,6 +5329,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return;
 	}
+	if (SkipCubeDraw(buffer)) {
+		return;
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("GraphicsRenderDrawIndex():Shader:\n");
@@ -5412,6 +5483,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	CommitStats::StepMark(CommitStats::Step::TargetOps);
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return;
+	}
+	if (SkipCubeDraw(buffer)) {
 		return;
 	}
 
