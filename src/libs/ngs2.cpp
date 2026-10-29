@@ -2714,24 +2714,22 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
 			break;
 		}
-		case Ngs2RackType::CustomMastering: {
-			const auto configured_size =
-			    voice->rack->option.custom_mastering.custom_rack_option.state_size;
-			EXIT_NOT_IMPLEMENTED(configured_size < sizeof(Ngs2CustomMasteringVoiceState));
-			EXIT_NOT_IMPLEMENTED(state_size != configured_size);
-			std::memset(state, 0, state_size);
-			auto* mastering = reinterpret_cast<Ngs2CustomMasteringVoiceState*>(state);
-			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
-			break;
-		}
+		case Ngs2RackType::CustomMastering:
 		case Ngs2RackType::CustomSampler: {
+			const bool sampler = voice->rack->type == Ngs2RackType::CustomSampler;
 			const auto configured_size =
 			    voice->rack->option.custom_sampler.custom_rack_option.state_size;
-			EXIT_NOT_IMPLEMENTED(configured_size < sizeof(Ngs2CustomSamplerVoiceState));
-			EXIT_NOT_IMPLEMENTED(state_size != configured_size);
-			std::memset(state, 0, state_size);
-			auto* sampler = reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state);
-			Ngs2FillSamplerState(*voice, *sampler);
+			EXIT_NOT_IMPLEMENTED(configured_size < (sampler ? sizeof(Ngs2CustomSamplerVoiceState)
+			                                                : sizeof(Ngs2CustomMasteringVoiceState)));
+			if (state_size < configured_size) {
+				return static_cast<int32_t>(0x804a8011u);
+			}
+			std::memset(state, 0, configured_size);
+			if (sampler) {
+				Ngs2FillSamplerState(*voice, *reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state));
+			} else {
+				state->state_flags = Ngs2GetStateFlags(voice);
+			}
 			break;
 		}
 		case Ngs2RackType::Sampler: {

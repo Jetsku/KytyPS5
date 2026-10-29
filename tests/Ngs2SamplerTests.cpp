@@ -867,6 +867,44 @@ void TestCustomMasteringChannelMixer() {
 	}
 }
 
+void TestCustomVoiceStateCapacity() {
+	for (auto type: {Ngs2RackType::CustomSampler, Ngs2RackType::CustomMastering}) {
+		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
+		f.rack.type = type;
+		f.rack.option.custom_sampler.custom_rack_option.state_size = 212;
+		f.voice.state_flags = 3;
+		f.voice.decoded_samples = 37;
+		f.voice.decoded_bytes = 128;
+		alignas(Ngs2CustomSamplerVoiceState) std::array<uint8_t, 384> storage;
+		auto* state = reinterpret_cast<Ngs2VoiceState*>(storage.data() + 8);
+		const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
+		for (size_t capacity: {212u, 368u}) {
+			storage.fill(0xa5);
+			Check(Ngs2VoiceGetState(handle, state, capacity) == OK && state->state_flags == 3 &&
+			          state->error_code == 0 &&
+			          std::all_of(storage.begin(), storage.begin() + 8,
+			                      [](uint8_t v) { return v == 0xa5; }) &&
+			          std::all_of(storage.begin() + 220, storage.end(),
+			                      [](uint8_t v) { return v == 0xa5; }),
+			      "oversized custom state buffer was rejected or overwritten past configured state");
+			if (type == Ngs2RackType::CustomSampler) {
+				const auto* sampler = reinterpret_cast<const Ngs2CustomSamplerVoiceState*>(state);
+				Check(sampler->num_decoded_samples == 37 && sampler->decoded_data_size == 128,
+				      "custom sampler state omitted playback progress");
+			}
+			const size_t base_size = type == Ngs2RackType::CustomSampler
+			    ? sizeof(Ngs2CustomSamplerVoiceState) : sizeof(Ngs2CustomMasteringVoiceState);
+			Check(std::all_of(storage.begin() + 8 + base_size, storage.begin() + 220,
+			                  [](uint8_t v) { return v == 0; }),
+			      "configured custom state extension was not initialized");
+		}
+		storage.fill(0xa5);
+		Check(Ngs2VoiceGetState(handle, state, 211) == static_cast<int32_t>(0x804a8011u) &&
+		          std::ranges::all_of(storage, [](uint8_t v) { return v == 0xa5; }),
+		      "undersized custom state buffer was accepted or modified");
+	}
+}
+
 void TestPitchLoopAndSkip() {
 	Fixture       f(24000);
 	const int16_t pcm[] = {-30000, 8192, 16384};
@@ -1773,6 +1811,7 @@ int main() {
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestCustomMasteringChannelMixer();
+	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
 	TestCustomSideChainUserFx();
 	TestWaveformBlockGeometry();
