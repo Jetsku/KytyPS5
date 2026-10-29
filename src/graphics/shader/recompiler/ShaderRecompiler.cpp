@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -1246,6 +1247,42 @@ ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code, const Comp
 	return analysis;
 }
 
+// KYTY_CALL_LOOP_CAP: the loop headers inside the callee bodies the function expansion bracketed
+// (Decoder::ShaderCallLoopBodyBegin / End) draw on the invocation's call-loop budget (the emitter
+// counts their rounds and takes their exits once it is spent). An empty header the structurizer
+// adds is judged by the block it enters.
+static void MarkCallLoopHeaders(const Decoder::Program& decoded, IR::Program& ir) {
+	if (GetCodegenOptions().call_loop_cap == 0u) return;
+	std::vector<std::pair<uint32_t, uint32_t>> bracketed;
+	for (const auto& inst: decoded.instructions) {
+		if (inst.opcode != Decoder::Opcode::S_NOP) continue;
+		if (inst.raw[0] == Decoder::ShaderCallLoopBodyBegin) {
+			bracketed.emplace_back(inst.pc, UINT32_MAX);
+		} else if (inst.raw[0] == Decoder::ShaderCallLoopBodyEnd && !bracketed.empty() &&
+		           bracketed.back().second == UINT32_MAX) {
+			bracketed.back().second = inst.pc;
+		}
+	}
+	if (bracketed.empty()) return;
+	const auto find = [&](uint32_t id) -> const IR::BlockInfo* {
+		const auto found = std::ranges::find_if(ir.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
+		return found != ir.block_info.end() ? &*found : nullptr;
+	};
+	for (auto& info: ir.block_info) {
+		if (!info.terminator.loop_header) continue;
+		const auto* first = &info;
+		for (uint32_t step = 0; first != nullptr && first->start_pc == first->end_pc &&
+		                        first->terminator.kind == CFG::TerminatorKind::Branch && step < 8;
+		     step++) {
+			first = find(first->terminator.true_block);
+		}
+		if (first == nullptr || first->start_pc == first->end_pc) continue;
+		info.terminator.call_loop = std::ranges::any_of(bracketed, [&](const auto& range) {
+			return first->start_pc >= range.first && first->start_pc < range.second;
+		});
+	}
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
@@ -1440,6 +1477,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	MarkCallLoopHeaders(decoded, ir);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

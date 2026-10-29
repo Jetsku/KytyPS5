@@ -330,6 +330,23 @@ struct CodegenOptions {
 	// three more) were skipped because a V_CMP to s11 looked like a write of their SRT pointer s12.
 	// Only programs whose trace failed change; not in the fingerprint (as KYTY_SHADER_CALLS).
 	bool call_trace_wave32 = false;
+	// KYTY_CALL_LOOP_CAP=<n> (default 0: off; adapted from usa-ratt/KytyPS5-GT7 08197df0b,
+	// 7e695ec62 and 655faf07e): a placed callee body with a back edge and no barrier
+	// (Decoder::ExpandShaderCalls) is bracketed by two S_NOPs (Decoder::ShaderCallLoopBodyBegin /
+	// End), and the loops whose headers lie in such a body draw on one per-invocation budget of <n>
+	// rounds: once it is spent, the invocation takes each such loop's exit edge (the loops around
+	// the call are left alone, so every remaining target is still called). GT7's lit material
+	// functions walk a per-pixel light list whose length they read from an image; a length from data
+	// the emulator does not reproduce ran up to 65,535 rounds a pixel and lost the device.
+	uint32_t call_loop_cap = 0;
+	// KYTY_CALL_LOOPS=0 (default 1): callee bodies with a back edge are left out of the expansions
+	// (their calls take the skip path) instead of being placed.
+	bool call_loops = true;
+	// KYTY_CALL_WATERFALL_CLEAR=1 (default off): a call inside a waterfall that keeps its "lanes
+	// left" flag in a VGPR (cleared before the call, tested after the exec restore, the loop
+	// repeated: Decoder::ExpandShaderCalls) clears the flag again where the call returns, so a callee
+	// that leaves it set does not repeat its lanes forever (GT7's material pass lost the device).
+	bool call_waterfall_clear = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,

@@ -23,10 +23,10 @@ constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Members: 44 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
 // loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
-// lds_limit_override.
+// lds_limit_override, call_loop_cap.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 128,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 136,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -225,6 +225,16 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");
 		b.U8(options.denorm_flush_skip);
+	}
+	if (options.call_loop_cap != 0u) {
+		b.Text("call_loop_cap");
+		b.U32(options.call_loop_cap);
+	}
+	if (!options.call_loops) {
+		b.Text("call_loops_off");
+	}
+	if (options.call_waterfall_clear) {
+		b.Text("call_waterfall_clear");
 	}
 
 	// Host device state the emitter reads (set once by the device layer).
