@@ -205,6 +205,11 @@ struct ShaderVertexInputInfo {
 	// Last: journals and pipeline lists store the fields before them (ShaderStoredInputInfoSize).
 	uint32_t                param_alias_mask = 0;
 	std::array<uint32_t, 32> param_alias_source {};
+	// KYTY_INDIRECT_VERTEX_BASE (upstream a833e1b73): an indirect draw's vertex index excludes its
+	// record's base vertex, which goes only to this user SGPR (s8 + GS user data index; -1: none).
+	// Not stored in journals and lists (a later build recompiles such a program).
+	bool                    indirect_vertex_base = false;
+	int32_t                 base_vertex_sgpr     = -1;
 };
 
 // Bytes of an input info that shader journals and pipeline lists store. A vertex input info is
