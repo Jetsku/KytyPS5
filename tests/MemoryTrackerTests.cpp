@@ -2266,6 +2266,60 @@ void TestCrossRegionUpload() {
   Release(memory);
 }
 
+void TestDirtyRegionWalk() {
+  // KYTY_TRACKER_DIRTY_WALK (adapted from Senaxx 6625a63ec): a read-only upload over three
+  // existing regions that starts and ends inside them, with dirty pages in the first and last
+  // region only: exactly the dirty pages inside the range upload, and one just past its end stays
+  // dirty. Run with the walk off and on; both must agree.
+  constexpr uint64_t region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  for (const int walk : {0, 1}) {
+    MemoryTracker::SetDirtyWalk(walk);
+    TrackerHarness harness;
+    auto &tracker = harness.tracker;
+    const auto page_size = harness.page_manager.GetPageSize();
+    auto *memory = AllocateFixedGuestRange(region_size * 3, region_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    tracker.ForEachUploadRange(address, region_size * 3, false,
+                               [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+    Check(!tracker.IsRegionCpuModified(address, region_size * 3),
+          "the first upload did not leave the three regions clean");
+
+    const auto begin = address + page_size * 3;
+    const auto end = address + region_size * 2 + page_size * 5;
+    tracker.MarkRegionAsCpuModified(address + page_size * 3, 16);
+    tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 4, 16);
+    tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 6, 16);
+    uint32_t ranges = 0;
+    bool first = false;
+    bool last = false;
+    tracker.ForEachUploadRange(
+        begin, end - begin, false,
+        [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+          Check(upload_size == page_size, "a dirty page uploaded with the wrong size");
+          first |= upload_address == address + page_size * 3;
+          last |= upload_address == address + region_size * 2 + page_size * 4;
+          ranges++;
+        },
+        []() noexcept {});
+    Check(ranges == 2 && first && last,
+          "the dirty walk did not upload exactly the dirty pages inside the range");
+    Check(tracker.IsRegionCpuModified(address + region_size * 2 + page_size * 6, 16) &&
+              !tracker.IsRegionCpuModified(begin, end - begin),
+          "the dirty walk cleared a page outside the range or left one inside dirty");
+    // A clean range uploads nothing and stays clean.
+    ranges = 0;
+    tracker.ForEachUploadRange(
+        begin, end - begin, false,
+        [&](uint64_t, uint64_t) noexcept { ranges++; }, []() noexcept {});
+    Check(ranges == 0, "a clean read-only upload reported pages");
+
+    tracker.MarkRegionAsCpuModified(address, region_size * 3);
+    tracker.UntrackMemory(address, region_size * 3);
+    Release(memory);
+  }
+  MemoryTracker::SetDirtyWalk(-1);
+}
+
 void TestConcurrentColdUploads() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -2971,6 +3025,7 @@ int main(int argc, char **argv) {
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
+  TestDirtyRegionWalk();
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -225,6 +226,22 @@ private:
 	}
 
 public:
+	// KYTY_TRACKER_DIRTY_WALK=1 (default off; adapted from Senaxx 6625a63ec via usa-ratt/
+	// KytyPS5-GT7): read-only uploads visit only the regions with CPU-dirty pages in the range
+	// (ForEachUploadRange). Tests set it; SetDirtyWalk(-1) returns to the variable.
+	static void SetDirtyWalk(int value) noexcept {
+		s_dirty_walk.store(value, std::memory_order_relaxed);
+	}
+	[[nodiscard]] static bool DirtyWalkEnabled() noexcept {
+		auto value = s_dirty_walk.load(std::memory_order_relaxed);
+		if (value < 0) {
+			const char* text = std::getenv("KYTY_TRACKER_DIRTY_WALK");
+			value            = text != nullptr && text[0] == '1' ? 1 : 0;
+			s_dirty_walk.store(value, std::memory_order_relaxed);
+		}
+		return value != 0;
+	}
+
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
 	// KYTY_FAULT_AHEAD_ADAPT (BufferCache): write faults use a fault-ahead window of at least this
@@ -312,7 +329,15 @@ public:
 		const bool  keep_hot              = hot_aware && !is_written;
 		const auto  frame                 = Frame();
 		uint32_t    demoted               = 0;
+		// KYTY_TRACKER_DIRTY_WALK=1: a read-only upload skips, without their locks, the regions
+		// with no CPU-dirty page in the range: their collection below would find nothing and
+		// change nothing (a region created here starts CPU-dirty and is visited).
+		const bool dirty_walk = !is_written && DirtyWalkEnabled();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (dirty_walk && (!manager->AnyCpuModifiedRelaxed() ||
+			                   !manager->IsModifiedAcquire<DirtySource::Cpu>(offset, bytes))) {
+				return;
+			}
 			manager->lock.lock();
 			demoted += manager->CollectUpload(
 			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
@@ -421,6 +446,7 @@ private:
 		return sum;
 	}
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	inline static std::atomic_int                   s_dirty_walk {-1};
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
