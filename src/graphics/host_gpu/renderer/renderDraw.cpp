@@ -5029,7 +5029,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 	}
-	if (shader_write_stages) {
+	// KYTY_PM4_BARRIERS=guest (render.h): the guest's own sync points order the draw's writes.
+	// A later indirect draw of this instance still records its own argument barrier.
+	if (shader_write_stages && GuestSyncBarriersEnabled()) {
+		m_indirect_barrier_rendering = 0;
+	} else if (shader_write_stages) {
 		const CommitStats::SubScope barrier_scope(CommitStats::Sub::Barriers);
 		if (DrawWriteSinkEnabled()) {
 			// Queued without ending the instance (render.h, KYTY_DRAW_WRITE_SINK): a later draw of

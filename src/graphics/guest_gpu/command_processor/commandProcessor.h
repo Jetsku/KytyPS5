@@ -199,6 +199,8 @@ public:
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
+	// KYTY_PM4_BARRIERS=guest: the full barrier at the start of a queue's slice (executor thread).
+	void SliceStartBarrier() { EmitGlobalBarrier(); }
 	// COND_EXEC: whether the condition dword at `address` is non-zero (read in order).
 	[[nodiscard]] bool CondExec(uint64_t address);
 	// Conditional INDIRECT_BUFFER: whether the then-buffer is taken (the 64-bit value at

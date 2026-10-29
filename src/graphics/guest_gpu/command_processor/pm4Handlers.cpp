@@ -1352,6 +1352,11 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	// IT_ACQUIRE_MEM in its PS4 (7 DWORDs) and PS5 (8 DWORDs, what AgcDcbAcquireMem emits) forms,
 	// and the custom NOP form older builds emitted (kept for recorded command streams).
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800 && cmd_id != 0xc0061050);
+	// KYTY_PM4_BARRIERS=guest (render.h GuestSyncBarriersEnabled): the guest's wait for its
+	// earlier work and its cache actions, recorded as a CS partial flush's full barrier.
+	if (GuestSyncBarriersEnabled()) {
+		cp.TriggerEvent(0x00000007, 0, 0);
+	}
 	return cmd_id == 0xc0061050 ? 7 : KYTY_PM4_LEN(cmd_id) - 1;
 }
 

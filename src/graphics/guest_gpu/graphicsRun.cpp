@@ -1280,6 +1280,10 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 		}
 		return {true, 0};
 	}
+	// KYTY_PM4_BARRIERS=guest (render.h): what comes after the wait comes after what it waited for.
+	if (GuestSyncBarriersEnabled()) {
+		EmitGlobalBarrier();
+	}
 	return {};
 }
 
@@ -1887,6 +1891,11 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	// KYTY_PM4_BARRIERS=guest (render.h): this queue's work comes after what the slices before it
+	// recorded, other queues' included (their labels this one may have waited for).
+	if (GuestSyncBarriersEnabled()) {
+		cp.SliceStartBarrier();
+	}
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: complete = ProcessGraphicsDirect(submission, cp); break;
@@ -1990,6 +1999,10 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		}
 	}
 	cp.BufferInit();
+	// KYTY_PM4_BARRIERS=guest (render.h): as in Process.
+	if (GuestSyncBarriersEnabled()) {
+		cp.SliceStartBarrier();
+	}
 	if (submission.handoff) {
 		const bool complete = ProcessGraphicsDirect(submission, cp);
 		if (complete) {

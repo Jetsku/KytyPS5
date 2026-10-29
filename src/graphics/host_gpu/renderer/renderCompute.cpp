@@ -924,7 +924,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	const bool overlap_enabled = DispatchOverlapEnabled();
 	const bool overlap         = buffer.TakeDispatchOverlap(no_overlap, overlap_enabled);
 	CountDispatchOverlap(overlap, overlap_enabled);
-	if (has_storage_writes && !(overlap && overlap_enabled)) {
+	// KYTY_PM4_BARRIERS=guest (render.h): the guest's own sync points order dispatches instead.
+	const bool guest_barriers = GuestSyncBarriersEnabled() && !no_overlap;
+	if (has_storage_writes && !(overlap && overlap_enabled) && !guest_barriers) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -1023,7 +1025,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!guest_barriers) {
+		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	buffer.NoteGuestDispatch(no_overlap);
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
@@ -1324,7 +1328,10 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
+	// KYTY_PM4_BARRIERS=guest (render.h): the guest's own sync points order dispatches instead.
+	const bool guest_barriers = GuestSyncBarriersEnabled() &&
+	                            bindings.shared_memory.buffer == nullptr && !program.info.bda_writes;
+	if (has_storage_writes && !guest_barriers) {
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	if (BarrierBatchEnabled()) {
@@ -1351,7 +1358,9 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!guest_barriers) {
+		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
 	}

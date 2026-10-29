@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <functional>
 #include <array>
 #include <memory>
@@ -221,6 +222,15 @@ struct DrawAutoArgs {
 // Indirect dispatches keep their barriers (their argument barrier serializes them anyway).
 // KYTY_DISPATCH_OVERLAP=0 restores the barrier pair between every two dispatches.
 [[nodiscard]] bool DispatchOverlapEnabled();
+// KYTY_PM4_BARRIERS=guest (live, default off; the GT7 fork's barriers:guest, usa-ratt
+// a67c978c5/31b711db6): the guest's own synchronization orders the GPU work. A full barrier at
+// its ACQUIRE_MEMs, passed WAIT_REG_MEMs and the start of each queue's slice (another queue's
+// labels it may have waited for), in addition to the partial flushes, cache actions and
+// RELEASE_MEMs that already record one; and none before or after guest dispatches nor after draws
+// that write buffers. Dispatches with emulated LDS (one device buffer) or BDA writes, and the
+// ordered-append and split-dispatch paths, keep their barriers. Any other value: the renderer's
+// barriers around every dispatch, as before.
+[[nodiscard]] bool GuestSyncBarriersEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {

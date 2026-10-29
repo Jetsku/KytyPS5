@@ -39,6 +39,10 @@ namespace Libs::Graphics {
 static Live::Switch g_sink_routes("KYTY_CP_SINK_ROUTES", Live::ParseDefaultOn);
 // KYTY_DISPATCH_OVERLAP (render.h DispatchOverlapEnabled): live; default on.
 static Live::Switch g_dispatch_overlap("KYTY_DISPATCH_OVERLAP", Live::ParseDefaultOn);
+// KYTY_PM4_BARRIERS=guest (render.h GuestSyncBarriersEnabled): live; default off.
+static Live::Switch g_pm4_guest_barriers("KYTY_PM4_BARRIERS", [](const char* value) -> int64_t {
+	return value != nullptr && std::strcmp(value, "guest") == 0 ? 1 : 0;
+});
 
 // ------------------------------------------------------------------------------------------------
 // Barrier batcher
@@ -341,6 +345,10 @@ void CommandBuffer::ResetBarrierState() const {
 
 bool DispatchOverlapEnabled() {
 	return BarrierBatchEnabled() && g_dispatch_overlap.Get() != 0;
+}
+
+bool GuestSyncBarriersEnabled() {
+	return g_pm4_guest_barriers.Get() != 0;
 }
 
 void CommandBuffer::NoteGuestDispatch(bool lds) const {
