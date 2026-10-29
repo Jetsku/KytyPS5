@@ -602,14 +602,29 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			t_workgroup_counts_missing = true;
 			return false;
 		}
-		if (indirect.table_stride == 0u || key_count > MaxIndirectImageProbes ||
-		    uint64_t {indirect.table_offset} + uint64_t {key_count - 1u} * indirect.table_stride +
-		            32u > UINT32_MAX + 1ull) {
+		// Upstream de3ed905c: a runtime base added to the id, and a constant division after it.
+		uint32_t first = 0;
+		if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first)) {
+			return false;
+		}
+		if (indirect.table_stride == 0u || key_count > MaxIndirectImageProbes) {
 			return false;
 		}
 		key_stride = indirect.table_stride;
 		keys.resize(key_count);
-		std::iota(keys.begin(), keys.end(), 0u);
+		std::iota(keys.begin(), keys.end(), first);
+		if (indirect.workgroup_shift != 0u) {
+			for (auto& key: keys) {
+				key = static_cast<uint32_t>(uint64_t {key} * indirect.workgroup_multiplier >>
+				                            indirect.workgroup_shift);
+			}
+		}
+		std::ranges::sort(keys);
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		if (uint64_t {indirect.table_offset} + uint64_t {keys.back()} * indirect.table_stride +
+		        32u > UINT32_MAX + 1ull) {
+			return false;
+		}
 	} else if (!indirect.selector) {
 		uint32_t key_count = 0;
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);

@@ -22,7 +22,7 @@ namespace {
 // ImageResource 22; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (BindlessSampler 2, IndirectDescriptor
-// 16, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// 18, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
 // ResourceSpecialization 2 (Buffer 3, Image 12).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
@@ -776,6 +776,8 @@ public:
 				w.U32(image.nested_vsharp);
 				w.U32(image.nested_heap);
 				w.U32(image.nested_keys);
+				w.U32(image.workgroup_multiplier);
+				w.U32(image.workgroup_shift);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
@@ -1020,6 +1022,8 @@ public:
 				image.nested_vsharp      = r.U32();
 				image.nested_heap        = r.U32();
 				image.nested_keys        = r.U32();
+				image.workgroup_multiplier = r.U32();
+				image.workgroup_shift      = static_cast<uint8_t>(r.U32());
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;

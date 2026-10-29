@@ -697,6 +697,9 @@ struct DescriptorSource {
 		// KYTY_RUNTIME_IMAGES: no table either; the T# is a value the shader loads
 		// (ImageResource::runtime).
 		bool     runtime      = false;
+		// KYTY_WORKGROUP_IMAGES (upstream de3ed905c): nonzero, the workgroup keys are
+		// (selector_first + ID) * workgroup_multiplier >> workgroup_shift (shift 32..63).
+		uint8_t  workgroup_shift = 0;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		// Bindless through a record pointer: the key selects a table_stride-byte record of the
 		// table, whose 64-bit word at this byte offset points at the T# (table_offset bytes past
@@ -709,7 +712,9 @@ struct DescriptorSource {
 		uint32_t nested_vsharp   = UINT32_MAX;
 		uint32_t nested_heap     = 0;
 		uint32_t nested_keys     = 0;
+		uint32_t workgroup_multiplier = 0;
 		Value    key_count;
+		// With workgroup_axis: a runtime base the shader adds to the workgroup ID (empty: none).
 		Value                 selector_first;
 		Value    selector_mask;
 

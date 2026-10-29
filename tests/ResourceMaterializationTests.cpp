@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -910,6 +911,84 @@ void TestUnreachedImageIgnoresSharedDescriptor(bool image_reach) {
   Libs::Graphics::ShaderRecompiler::SetCodegenOptions(saved);
 }
 
+// KYTY_WORKGROUP_IMAGES with a runtime base and a constant division (upstream de3ed905c): the key
+// (3 + workgroup ID z) * 0xaaaaaaab >> 33 = (3 + z) / 3 over four workgroups reaches rows 1 and 2
+// only, and the key mapping that ends the flattened SRT lists exactly those.
+struct WorkgroupTableMemory {
+  uint64_t base = 0x10000u;
+  std::vector<uint32_t> words;
+};
+
+bool ReadWorkgroupTable(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  const auto &memory = *static_cast<const WorkgroupTableMemory *>(userdata);
+  for (size_t i = 0; i < values.size(); ++i) {
+    const auto index = (address - memory.base) / 4u + i;
+    if (address < memory.base || index >= memory.words.size()) return false;
+    values[i] = memory.words[index];
+  }
+  return true;
+}
+
+void TestWorkgroupDividedImageKeys() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TileMode;
+  constexpr uint32_t table_offset = 0x100u;
+  WorkgroupTableMemory memory;
+  memory.words.resize((table_offset + 4u * 32u) / 4u);
+  for (uint32_t row = 0; row < 4u; ++row) {
+    const uint32_t words[8] = {
+        row + 1u, static_cast<uint32_t>(BufferFormat::k32Float) << 20u, 0u,
+        static_cast<uint32_t>(ImageType::kColor2D) << 28u |
+            static_cast<uint32_t>(TileMode::kRenderTarget) << 20u | 0xfacu,
+        0u, 0u, 0u, 0u};
+    std::copy_n(words, 8, memory.words.begin() + (table_offset + row * 32u) / 4u);
+  }
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  AddValueBlock(program);
+  DescriptorSource table;
+  table.dword_count = 2u;
+  table.dwords.fill(Value(0u));
+  table.dwords[0] = Value(static_cast<uint32_t>(memory.base));
+  program.descriptor_sources.push_back(table);
+  DescriptorSource image;
+  image.dword_count = 8u;
+  image.dwords.fill(Value(0u));
+  auto &indirect = image.indirect_descriptor.emplace();
+  indirect.table_source = 0u;
+  indirect.table_offset = table_offset;
+  indirect.table_stride = 32u;
+  indirect.workgroup_axis = 2u;
+  indirect.selector_first = Value(3u);
+  indirect.workgroup_multiplier = 0xaaaaaaabu;
+  indirect.workgroup_shift = 33u;
+  program.descriptor_sources.push_back(image);
+  program.info.images.push_back(
+      {.source = 1u,
+       .resource_class = ImageResourceClass::Sampled,
+       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  auto plan = ExtractResourcePlan(program);
+  const std::array<uint32_t, 3> groups{1u, 1u, 4u};
+  const SrtRuntime runtime{.userdata = &memory,
+                           .read_specialization_memory = ReadWorkgroupTable,
+                           .workgroup_counts = groups};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "divided workgroup image keys failed to materialize");
+  const auto &flat = snapshot.flattened_srt;
+  const std::array<uint32_t, 5> expected{2u, 1u, 0u, 2u, 1u};
+  Check(flat.size() >= expected.size() &&
+            std::equal(expected.begin(), expected.end(), flat.end() - expected.size()) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 2u &&
+            snapshot.images[1].dwords[0] == 3u,
+        "divided workgroup image keys enumerated other rows");
+}
+
 void TestMultisampleDepthReadAsSingleSample() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
@@ -1015,6 +1094,7 @@ int main() {
   }
   TestMultisampleDepthReadAsSingleSample();
   for (const bool image_reach : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(image_reach);
+  TestWorkgroupDividedImageKeys();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
