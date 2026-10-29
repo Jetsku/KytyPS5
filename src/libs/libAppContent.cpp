@@ -13,6 +13,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -32,6 +33,7 @@ namespace AppContent {
 
 constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL = 3;
 constexpr int      APP_CONTENT_ERROR_PARAMETER        = -2133262334; /* 0x80D90002 */
+constexpr int      APP_CONTENT_ERROR_BUSY             = -2133262333; /* 0x80D90003 */
 constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED      = -2133262332; /* 0x80D90004 */
 constexpr int      APP_CONTENT_ERROR_NOT_FOUND        = -2133262331; /* 0x80D90005 */
 constexpr int      APP_CONTENT_ERROR_MOUNT_FULL       = -2133262330; /* 0x80D90006 */
@@ -208,8 +210,17 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 
 	std::lock_guard lock(g_addcont_mutex);
 
+	// KYTY_ADDCONT_MOUNT_BUSY=1 (default off; upstream 97bef2992): a second mount of a mounted
+	// add-on returns BUSY, as the PS5 does, so two callers do not both own (and unmount) one mount.
+	// Off: it returns OK with the existing mount point, as before.
+	const auto* busy_value = std::getenv("KYTY_ADDCONT_MOUNT_BUSY");
+	const bool  busy = busy_value != nullptr && busy_value[0] != '\0' && std::strcmp(busy_value, "0") != 0;
 	for (const auto& m: g_addcont_mounts) {
 		if (m.label == entry->entitlement_label) {
+			if (busy) {
+				LOGF("\t already mounted %s\n", m.point.c_str());
+				return APP_CONTENT_ERROR_BUSY;
+			}
 			const auto guest_point = m.point.substr(0, m.point.size() - 1);
 			std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
 			LOGF("\t already mounted %s\n", guest_point.c_str());
