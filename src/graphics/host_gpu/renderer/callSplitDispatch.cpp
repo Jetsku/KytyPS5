@@ -384,8 +384,9 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 	// One program of the chain: its preparation through the pipeline cache as a dispatch of the
 	// kernel, then the dispatch (direct: the kernel's workgroups; indirect: a bin pass's command).
 	Wait       last_wait = Wait::None; // why the latest dispatch() returned false
+	// `target`: a callee program's callee (its SplitTargetCompare parameter), 0 for the others.
 	const auto dispatch  = [&](const CallSplit::Code& code, uint64_t list, const vk::Buffer* indirect,
-	                          uint64_t indirect_offset) {
+	                          uint64_t indirect_offset, uint64_t target = 0) {
 		auto info = pristine;
 		PipelineCache::SelectCallSplitCode(&code);
 		const auto program_handle = pipelines.GetComputeProgram(cs_regs, sh_regs, info, m_compute_prep);
@@ -411,7 +412,8 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			    static_cast<uint32_t>(base),   static_cast<uint32_t>(base >> 32u),
 			    static_cast<uint32_t>(list),   static_cast<uint32_t>(list >> 32u),
 			    static_cast<uint32_t>(header), static_cast<uint32_t>(header >> 32u),
-			    run.wave_dwords};
+			    run.wave_dwords,
+			    static_cast<uint32_t>(target), static_cast<uint32_t>(target >> 32u)};
 			std::copy(std::begin(params), std::end(params), bindings.shader_data.begin() + dword);
 		}
 		bindings.dispatch_groups     = {groups_x, groups_y, groups_z};
@@ -590,7 +592,8 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 				continue;
 			}
 			const bool ran = dispatch(*site.callees[t], address + layout.lists[k - 1u] + uint64_t {t} * waves * 4u,
-			                          &handle, layout.args[k - 1u] + uint64_t {t} * 12u);
+			                          &handle, layout.args[k - 1u] + uint64_t {t} * 12u,
+			                          t < site.targets.size() ? site.targets[t] : 0u);
 			note("C", ran);
 			if (ran) {
 				g_totals.callee_dispatches.fetch_add(1, std::memory_order_relaxed);

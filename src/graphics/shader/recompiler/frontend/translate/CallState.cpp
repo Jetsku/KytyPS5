@@ -102,6 +102,12 @@ void Translator::S_KYTY_CALL_STATE(const Decoder::Instruction& inst) {
 		EmitCallPartition(inst);
 		return;
 	}
+	if (const auto split_op = static_cast<Decoder::CallStateOp>(inst.offset);
+	    split_op == Decoder::CallStateOp::SplitTargetCompare ||
+	    split_op == Decoder::CallStateOp::ShaderAddress) {
+		EmitCallSplitAddress(inst);
+		return;
+	}
 	auto* split = CallSplit::Current();
 	EXIT_IF(split == nullptr || program.wave_size != 64u);
 	const auto& header   = split->header;
@@ -272,6 +278,42 @@ void Translator::S_KYTY_CALL_STATE(const Decoder::Instruction& inst) {
 		}
 	}
 	EXIT("unknown S_KYTY_CALL_STATE operation %u at pc 0x%08x", inst.offset, inst.pc);
+}
+
+// Call-split callee programs (CallSplitPlan.cpp BuildCode): SplitTargetCompare sets SCC to whether the
+// target pair s[reg:reg+1] is the callee the dispatch runs (push parameters ParamTargetLo/Hi);
+// ShaderAddress writes the shader base plus an offset into a scalar pair (S_MOV_B32: SCC kept).
+void Translator::EmitCallSplitAddress(const Decoder::Instruction& inst) {
+	const auto op       = static_cast<Decoder::CallStateOp>(inst.offset);
+	const auto pair_reg = inst.word_count >= 2u ? inst.raw[1] : 0xffffffffu;
+	EXIT_IF(op == Decoder::CallStateOp::SplitTargetCompare ? inst.word_count != 2u : inst.word_count != 3u);
+	Decoder::Operand lo_operand;
+	Decoder::Operand hi_operand;
+	if (pair_reg == 106u) {
+		lo_operand.kind = Decoder::OperandKind::VccLo;
+		hi_operand.kind = Decoder::OperandKind::VccHi;
+	} else {
+		EXIT_IF(pair_reg + 1u >= 106u);
+		lo_operand.kind = Decoder::OperandKind::Sgpr;
+		lo_operand.reg  = pair_reg;
+		hi_operand      = lo_operand;
+		hi_operand.reg  = pair_reg + 1u;
+	}
+	if (op == Decoder::CallStateOp::SplitTargetCompare) {
+		EXIT_IF(CallSplit::Current() == nullptr);
+		const auto param = [&](uint32_t index) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::CallStateParam, {IR::Value(index)}));
+		};
+		ir.SetScc(ir.LogicalAnd(ir.IEqual(ReadRawU32(lo_operand), param(CallSplit::ParamTargetLo)),
+		                        ir.IEqual(ReadRawU32(hi_operand), param(CallSplit::ParamTargetHi))));
+		return;
+	}
+	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
+	const auto address = IR::U64(
+	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.raw[2]))}));
+	const auto words = ExtractU64(address);
+	WriteOperand(lo_operand, words[0]);
+	WriteOperand(hi_operand, words[1]);
 }
 
 // KYTY_CALL_PARTITIONS (ShaderCalls.h): the partition markers of an expanded call. The target pair

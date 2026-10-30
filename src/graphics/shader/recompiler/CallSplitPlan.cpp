@@ -253,10 +253,15 @@ bool BuildCode(const Shape& shape, const Header& layouts, Kind kind, uint32_t si
 		std::vector<uint32_t> region(original.begin() + s.a / 4u, original.begin() + s.b / 4u);
 		region.push_back(Decoder::EncodeCallStateWord(Decoder::CallStateOp::SaveChanged, 0));
 		region.push_back(SEndpgm);
-		const Decoder::ShaderCallSite call {.pc         = s.call_pc - s.a,
-		                                    .source_reg = s.source_reg,
-		                                    .return_reg = s.return_reg,
-		                                    .addresses  = {callee}};
+		// The callee is compared with the target the dispatch passes in and the kernel's addresses
+		// are written relative to its shader base: the words hold no guest address, so the program
+		// (and its pipeline) is the same in every session, wherever the game loaded the callee.
+		const Decoder::ShaderCallSite call {.pc           = s.call_pc - s.a,
+		                                    .source_reg   = s.source_reg,
+		                                    .return_reg   = s.return_reg,
+		                                    .addresses    = {callee},
+		                                    .split_callee = true,
+		                                    .shader_base  = base};
 		Decoder::ShaderCallExpansion expansion;
 		if (!Decoder::ExpandShaderCalls(region, base + s.a, std::span(&call, 1u), read, 64u, expansion,
 		                                failure)) {

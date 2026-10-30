@@ -50,9 +50,22 @@ void EmitMove(std::vector<uint32_t>& code, uint32_t reg, uint32_t value) {
 	code.push_back(value);
 }
 
+// A scalar pair set to `value`: its moves, or with a shader base (call-split callee programs) the
+// ShaderAddress marker of the offset from it, so the words do not hold the guest address.
+void EmitPair(std::vector<uint32_t>& code, uint32_t reg, uint64_t value, uint64_t shader_base) {
+	if (shader_base != 0 && value >= shader_base && value - shader_base <= 0xffffffffull) {
+		code.push_back(EncodeCallStateWord(CallStateOp::ShaderAddress, 2u));
+		code.push_back(reg);
+		code.push_back(static_cast<uint32_t>(value - shader_base));
+		return;
+	}
+	EmitMove(code, reg, static_cast<uint32_t>(value));
+	EmitMove(code, reg + 1u, static_cast<uint32_t>(value >> 32u));
+}
+
 // S_GETPC_B64 at guest address `address`: moves of its value (S_MOV_B32 keeps SCC, as GETPC).
 bool EmitGetPc(std::vector<uint32_t>& code, const Instruction& inst, uint64_t address,
-               std::string& reason) {
+               std::string& reason, uint64_t shader_base = 0) {
 	if (inst.dst.kind == OperandKind::Null) {
 		code.push_back(SNop);
 		return true;
@@ -64,8 +77,7 @@ bool EmitGetPc(std::vector<uint32_t>& code, const Instruction& inst, uint64_t ad
 		return false;
 	}
 	const auto pc = address + inst.word_count * sizeof(uint32_t);
-	EmitMove(code, reg, static_cast<uint32_t>(pc));
-	EmitMove(code, reg + 1u, static_cast<uint32_t>(pc >> 32u));
+	EmitPair(code, reg, pc, shader_base);
 	return true;
 }
 
@@ -353,6 +365,11 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 		expansion.reads.emplace_back(function.address & 0x0000ffffffffffffull, function.code);
 	}
 
+	// Call-split callee programs: addresses in the program's own code relative to its shader base.
+	uint64_t relative_base = 0;
+	for (const auto& site: sites) {
+		if (site.split_callee) relative_base = site.shader_base;
+	}
 	std::vector<uint32_t>        result;
 	std::map<uint32_t, uint32_t> main_pc; // guest pc -> word in `result`
 	Branches                     main_branches;
@@ -365,7 +382,7 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 			if (inst.opcode == Opcode::S_ENDPGM) {
 				result.push_back(SEndpgm);
 			} else if (inst.opcode == Opcode::S_GETPC_B64) {
-				if (!EmitGetPc(result, inst, base + inst.pc, reason)) return false;
+				if (!EmitGetPc(result, inst, base + inst.pc, reason, relative_base)) return false;
 			} else {
 				if (IsDirectBranch(inst.opcode)) {
 					main_branches.emplace_back(static_cast<uint32_t>(result.size()), inst.branch_target);
@@ -376,10 +393,7 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 			auto site      = *found->second;
 			site.addresses = reachable.at(site.pc);
 			const uint64_t return_pc = base + inst.pc + inst.word_count * sizeof(uint32_t);
-			const auto     set_return = [&] {
-                EmitMove(result, site.return_reg, static_cast<uint32_t>(return_pc));
-                EmitMove(result, site.return_reg + 1u, static_cast<uint32_t>(return_pc >> 32u));
-			};
+			const auto     set_return = [&] { EmitPair(result, site.return_reg, return_pc, relative_base); };
 			// Selection, shaped for the structurizer: every selection of it has its own merge block (an
 			// S_BRANCH to the next instruction) and no block is entered from two places, so the CFG
 			// needs no merge splitting. The targets of a high address word are found by a balanced
@@ -514,12 +528,47 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 				merge(exits);
 				return true;
 			};
+			// A call-split callee program: the callee the dispatch runs (bin pass) against the target
+			// pair, compared at run time instead of with its guest address.
+			const auto emit_split = [&](uint32_t restore) -> bool {
+				if (site.addresses.empty()) {
+					skip(0);
+					return true;
+				}
+				std::vector<uint32_t> exits;
+				marker(CallStateOp::SplitTargetCompare);
+				const auto miss = static_cast<uint32_t>(result.size());
+				result.push_back(SCbranchScc0);
+				if (restore != 0) result.push_back(restore);
+				if (!emit_body(functions.at({site.addresses.front(), site.return_reg}), exits)) return false;
+				relocations.emplace_back(miss, static_cast<uint32_t>(result.size()));
+				skip(restore);
+				merge(exits);
+				return true;
+			};
 			bool emitted = false;
-			if (site.partition && site.addresses.size() > 1u) {
+			if (site.split_callee && (site.partition || site.addresses.size() > 1u)) {
+				reason = "a call-split callee with more than one target";
+				return false;
+			}
+			if (site.split_callee && !dual) {
+				emitted = emit_split(0);
+			} else if (site.split_callee) {
+				const auto select = static_cast<uint32_t>(result.size());
+				result.push_back(SCbranchScc1);
+				std::vector<uint32_t> exits;
+				emitted = emit_split(SetScc0);
+				exits.push_back(branch());
+				relocations.emplace_back(select, static_cast<uint32_t>(result.size()));
+				emitted = emitted && emit_split(SetScc1);
+				merge(exits);
+			} else if (site.partition && site.addresses.size() > 1u) {
 				reason = "a partition with more than one target";
 				return false;
 			}
-			if (site.partition && !dual) {
+			if (site.split_callee) {
+				// emitted above
+			} else if (site.partition && !dual) {
 				emitted = emit_partition(0);
 			} else if (site.partition) {
 				const auto select = static_cast<uint32_t>(result.size());

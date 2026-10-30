@@ -38,6 +38,11 @@ struct ShaderCallSite {
 	// body runs when the target pair equals the target the dispatch passes in (PartitionCompare);
 	// every other target is reported and its lanes dropped (PartitionDrop).
 	bool partition = false;
+	// Call-split callee programs (CallSplitPlan.cpp): one address, whose body runs when the target
+	// pair equals the callee the split dispatch passes in (SplitTargetCompare); the return pair and
+	// the program's own S_GETPC_B64 values are written relative to `shader_base` (ShaderAddress).
+	bool     split_callee = false;
+	uint64_t shader_base  = 0;
 
 	bool operator==(const ShaderCallSite&) const = default;
 };

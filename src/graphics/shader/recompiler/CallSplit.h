@@ -57,6 +57,8 @@ enum Param : uint32_t {
 	ParamHeaderLo = 4, // one word per wave: the site it suspended at
 	ParamHeaderHi = 5,
 	ParamStride   = 6, // dwords per wave block
+	ParamTargetLo = 7, // callee programs: the guest address of the callee this dispatch runs
+	ParamTargetHi = 8,
 };
 
 // The registers kept for a site: uniform words (one per wave) then 64 lanes per vector register.

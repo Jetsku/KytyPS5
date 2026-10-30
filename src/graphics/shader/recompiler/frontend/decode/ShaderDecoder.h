@@ -837,13 +837,21 @@ constexpr uint32_t CallStateSoppOpcode = 0x7fu;
 // call's target pair register. Compare sets SCC to whether the pair equals the target the dispatch
 // passes in; Drop reports the pair to the dispatch's report set and drops the active lanes (they
 // leave EXEC for the rest of the program: another dispatch of the shader runs their target).
+// SplitTargetCompare (call-split callee programs, CallSplitPlan.cpp): one payload word, the call's
+// target pair register; sets SCC to whether the pair equals the callee the split dispatch runs
+// (CallSplit::ParamTargetLo/Hi). ShaderAddress: two payload words, a scalar pair register and a byte
+// offset; the pair becomes the shader base plus the offset (S_MOV_B32 semantics: SCC is kept). With
+// both, a callee program carries neither its callee's nor its kernel's guest address as a literal,
+// so its translation and pipeline are the same in every session wherever the game loaded them.
 enum class CallStateOp : uint32_t {
-	Header           = 1,
-	Save             = 2,
-	SaveChanged      = 3,
-	Probe            = 4,
-	PartitionCompare = 5,
-	PartitionDrop    = 6,
+	Header             = 1,
+	Save               = 2,
+	SaveChanged        = 3,
+	Probe              = 4,
+	PartitionCompare   = 5,
+	PartitionDrop      = 6,
+	SplitTargetCompare = 7,
+	ShaderAddress      = 8,
 };
 [[nodiscard]] constexpr uint32_t EncodeCallStateWord(CallStateOp op, uint32_t payload_words) {
 	return 0xbf800000u | (CallStateSoppOpcode << 16u) | (static_cast<uint32_t>(op) << 12u) |

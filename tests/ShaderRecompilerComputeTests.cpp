@@ -20544,6 +20544,42 @@ public:
     for (u32 i = 0; i < 8; i++) text += " " + Hex(stored[i]) + "/" + Hex(expected[i]);
     text += " lane 64: " + Hex(stored[64]) + "/" + Hex(expected[64]);
     Require(name, "split calls", matched, "lanes 0-7 stored/expected:" + text);
+    {
+      // A callee program does not depend on where the game loaded the callee or the kernel (its
+      // words, and so its translation and pipeline, are the same in every session): the same
+      // callee code at another address, with the kernel at another base, builds the same words.
+      namespace Split = ShaderRecompiler::CallSplit;
+      std::memcpy(reinterpret_cast<void *>(callees + 0x800u), functions[0].data(), functions[0].size() * sizeof(u32));
+      ShaderComputeInputInfo compute{};
+      compute.threads_num[0] = 64;
+      compute.threads_num[1] = 1;
+      compute.threads_num[2] = 1;
+      compute.wave_size = 64;
+      ShaderRecompiler::CompileOptions shape_options;
+      shape_options.stage = ShaderType::Compute;
+      shape_options.wave_size = 64;
+      shape_options.input_info.compute = &compute;
+      Split::Shape shape;
+      std::string failure;
+      Require(name, "call-split shape", Split::AnalyzeShape(code, shape_options, shape, failure), failure);
+      Split::Header layouts;
+      layouts.sites.resize(shape.sites.size());
+      const ShaderRecompiler::Decoder::ShaderCodeReader read_mapped = [&](uint64_t address, std::span<u32> values) {
+        if (address < base || address + values.size_bytes() > base + allocation_size) return false;
+        std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+        return true;
+      };
+      std::vector<u32> first;
+      std::vector<u32> second;
+      const bool built =
+          Split::BuildCode(shape, layouts, Split::Kind::Callee, 1, false, code, 0x0000000209000000ull, callees,
+                           read_mapped, first, failure) &&
+          Split::BuildCode(shape, layouts, Split::Kind::Callee, 1, false, code, 0x000000020a340000ull,
+                           callees + 0x800u, read_mapped, second, failure);
+      Require(name, "callee programs built", built, failure);
+      Require(name, "callee program relocatable", first == second,
+              "the words of a callee program depend on the callee's or the kernel's address");
+    }
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "call-split mapping release failed");

@@ -273,6 +273,7 @@ private:
 
 	void S_KYTY_CALL_STATE(const Decoder::Instruction& inst);
 	void EmitCallPartition(const Decoder::Instruction& inst);
+	void EmitCallSplitAddress(const Decoder::Instruction& inst);
 	IR::Value CallStateAddress(IR::Value base, IR::U32 dword);
 	IR::U32 ReadCallStateCode(uint16_t code);
 	void    WriteCallStateCode(uint16_t code, IR::U32 value);
