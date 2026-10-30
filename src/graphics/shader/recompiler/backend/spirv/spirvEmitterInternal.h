@@ -430,6 +430,10 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+// Fragment output kind and type of an MRT (spirvEmitterFlow.cpp; KYTY_PS_INTEGER_OUTPUTS).
+enum class MrtOutputKind : uint8_t { Float, Uint, Sint };
+MrtOutputKind MrtOutputKindOf(const EmitterState& state, uint32_t index, uint32_t mode);
+uint32_t      MrtOutputType(EmitterState& state, MrtOutputKind kind);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 

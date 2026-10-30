@@ -294,6 +294,10 @@ struct ShaderPixelInputInfo {
 	// exports clamp to the half range. In padding before `stage`: the struct keeps its size, and
 	// stored journals and pipeline lists read it as zero (ShaderSanitizeStoredInputInfo).
 	uint8_t                                        target_half_float_mask = 0;
+	// KYTY_PS_INTEGER_OUTPUTS: MRT i goes to a UINT / SINT render target (bit i), its output is a
+	// uvec4 / ivec4. Also in padding before `stage` (zeroed for stored infos).
+	uint8_t                                        target_uint_mask       = 0;
+	uint8_t                                        target_sint_mask       = 0;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
@@ -310,6 +314,8 @@ inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
 		info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	}
 	info.target_half_float_mask = 0;
+	info.target_uint_mask       = 0;
+	info.target_sint_mask       = 0;
 }
 inline void ShaderSanitizeStoredInputInfo(ShaderVertexInputInfo& info) {
 	info.clip_space.vte_format = 0;

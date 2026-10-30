@@ -913,12 +913,14 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				const bool mrt = binding.kind == IR::StageOutputKind::Mrt &&
+				                 state.program.stage == ShaderType::Pixel &&
+				                 binding.index < std::size(state.input_info.pixel->target_output_mode);
+				const auto type =
+				    mrt ? MrtOutputType(state, MrtOutputKindOf(
+				                                   state, binding.index,
+				                                   state.input_info.pixel->target_output_mode[binding.index]))
+				        : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&

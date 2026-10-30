@@ -559,6 +559,10 @@ struct CodegenOptions {
 	// images also acquires and releases uniform and image memory, as shaders read other waves'
 	// stores with plain loads right after the barrier. Off: workgroup (LDS) memory only.
 	bool barrier_stores = false;
+	// KYTY_PS_INTEGER_OUTPUTS=1 (upstream 26ca60923): pixel outputs to UINT and SINT render targets
+	// are uvec4 / ivec4 (ShaderPixelInputInfo::target_uint_mask / target_sint_mask); compressed
+	// SINT exports sign-extend. Off: only 32-bit UINT exports (mode 7) are integer, as before.
+	bool ps_integer_outputs = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;

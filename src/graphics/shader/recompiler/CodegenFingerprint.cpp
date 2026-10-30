@@ -225,6 +225,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.barrier_stores) {
 		b.Text("barrier_stores");
 	}
+	if (options.ps_integer_outputs) {
+		b.Text("ps_integer_outputs");
+	}
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");
 		b.U8(options.denorm_flush_skip);

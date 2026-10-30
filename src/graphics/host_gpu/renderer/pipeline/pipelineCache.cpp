@@ -7926,6 +7926,37 @@ static void ApplyHalfFloatTargets(const HW::Context& context, ShaderPixelInputIn
 	}
 }
 
+// KYTY_PS_INTEGER_OUTPUTS (upstream 26ca60923): the MRTs that go to a UINT or SINT render target,
+// whose fragment outputs are then typed as integer vectors, as Vulkan requires for integer
+// attachments (a float output there is undefined). Only with the default export routing.
+static void ApplyIntegerTargets(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
+	pixel_info.target_uint_mask = 0;
+	pixel_info.target_sint_mask = 0;
+	if (!ShaderRecompiler::GetCodegenOptions().ps_integer_outputs ||
+	    pixel_info.target_shader_mask != UINT32_MAX) {
+		return;
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX && slot < 8u; slot++) {
+		if (pixel_info.target_output_mode[slot] == 0) {
+			continue;
+		}
+		const auto& rt = context.GetRenderTarget(slot);
+		if (rt.base.addr == 0) {
+			continue;
+		}
+		if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
+			pixel_info.target_uint_mask |= static_cast<uint8_t>(1u << slot);
+		} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
+			pixel_info.target_sint_mask |= static_cast<uint8_t>(1u << slot);
+		}
+	}
+	if (pixel_info.dual_source_blending) {
+		// MRT1 is the second blend source of target 0; blended targets are not integer.
+		pixel_info.target_uint_mask &= static_cast<uint8_t>(~2u);
+		pixel_info.target_sint_mask &= static_cast<uint8_t>(~2u);
+	}
+}
+
 void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
                     ShaderVertexInputInfo& last_vertex_stage, bool tess_active = false,
                     bool rect_list = false) {
@@ -8090,6 +8121,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		ApplyPixelParameterMode(context, user_config, mesh_active, tess_active, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
 		ApplyHalfFloatTargets(context, pixel_info);
+		ApplyIntegerTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, vertex_info[tess_active ? 2u : 0u], tess_active,
 	               Prospero::IsRectList(user_config.GetPrimType()));
@@ -8212,6 +8244,7 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 		                        false, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
 		ApplyHalfFloatTargets(context, pixel_info);
+		ApplyIntegerTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, vertex_info, false,
 	               Prospero::IsRectList(user_config.GetPrimType()));
