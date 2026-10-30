@@ -14,6 +14,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -563,6 +564,17 @@ int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	return OK;
 }
 
+// KYTY_SAVEDATA_SORT_KEY=1 (default off; upstream 4b0282e34): a directory search sorts by the key it
+// asks for (user param, blocks, free blocks, newest mtime; the name breaks ties). Off: by name for
+// every key, as before.
+static bool SaveDataSortKeyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SAVEDATA_SORT_KEY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
                                         SaveDataDirNameSearchResult*     result) {
 	PRINT_NAME();
@@ -601,6 +613,11 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	const std::string title_id = cond->title_id != nullptr ? cond->title_id->data : get_title_id();
 	const auto        root     = save_user_directory(title_id, cond->user_id);
 	std::vector<std::string> dir_list;
+	struct Found {
+		uint64_t    key = 0;
+		std::string name;
+		auto        operator<=>(const Found&) const = default;
+	};
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
@@ -616,9 +633,41 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
-	});
+	if (SaveDataSortKeyEnabled()) {
+		// A save whose metadata cannot be read sorts as 0. Descending order reverses both.
+		std::vector<Found> found(dir_list.size());
+		for (size_t i = 0; i < dir_list.size(); i++) {
+			found[i].name        = dir_list[i];
+			const auto directory = root / dir_list[i];
+			switch (cond->key) {
+				case SaveDataSortKey::UserParam: {
+					SaveDataParam param {};
+					if (read_save_param(save_param_path(directory), &param) == OK) {
+						found[i].key = param.user_param;
+					}
+					break;
+				}
+				case SaveDataSortKey::Blocks:
+				case SaveDataSortKey::FreeBlocks:
+					if (read_save_blocks(directory, &found[i].key) != OK) {
+						found[i].key = 0;
+					}
+					break;
+				case SaveDataSortKey::Mtime:
+					found[i].key = static_cast<uint64_t>(newest_save_time(directory));
+					break;
+				default: break;
+			}
+		}
+		std::sort(found.begin(), found.end());
+		for (size_t i = 0; i < found.size(); i++) {
+			dir_list[i] = std::move(found[i].name);
+		}
+	} else {
+		std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
+			return std::strcmp(a.c_str(), b.c_str()) < 0;
+		});
+	}
 
 	if (cond->order == SaveDataSortOrder::Descent) {
 		std::vector<std::string> reversed;

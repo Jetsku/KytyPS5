@@ -602,6 +602,18 @@ struct CodegenOptions {
 	// conversions. Off, a denormal there stays denormal instead of reading as a signed zero
 	// (rcp(denormal) is then a large finite value, not an infinity). Bits: DenormFlushSkip*.
 	uint8_t denorm_flush_skip = 0;
+	// KYTY_BARRIER_STORES=1 (upstream ceb154d9e): S_BARRIER of a program that stores to buffers or
+	// images also acquires and releases uniform and image memory, as shaders read other waves'
+	// stores with plain loads right after the barrier. Off: workgroup (LDS) memory only.
+	bool barrier_stores = false;
+	// KYTY_PS_INTEGER_OUTPUTS=1 (upstream 26ca60923): pixel outputs to UINT and SINT render targets
+	// are uvec4 / ivec4 (ShaderPixelInputInfo::target_uint_mask / target_sint_mask); compressed
+	// SINT exports sign-extend. Off: only 32-bit UINT exports (mode 7) are integer, as before.
+	bool ps_integer_outputs = false;
+	// KYTY_PS_EXEC_WORDS=1 (adapted from upstream 5429888d4): a pixel shader's EXEC and VCC words
+	// leave out the helper lanes the per-lane EXEC keeps for derivatives: the entry words are the
+	// live lanes, VALU masks are limited to the EXEC words, SAVEEXEC combines the words bitwise.
+	bool ps_exec_words = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;

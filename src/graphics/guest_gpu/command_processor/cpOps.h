@@ -335,6 +335,13 @@ struct FlipOp {
 };
 
 struct WaitRegMemOp {
+	// wait_op values past WAIT_REG_MEM's own (0, 1): a MEM_SEMAPHORE on the 64-bit counter at addr
+	// (upstream 1b7093805), executed in order like a wait: a signal adds one (or writes one), a
+	// wait stalls while the counter is zero, then takes one.
+	static constexpr uint32_t SemaphoreSignal = 2;
+	static constexpr uint32_t SemaphoreWrite  = 3;
+	static constexpr uint32_t SemaphoreWait   = 4;
+
 	uint64_t addr    = 0;
 	uint64_t ref     = 0;
 	uint64_t mask    = 0;

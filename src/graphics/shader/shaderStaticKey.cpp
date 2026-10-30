@@ -139,6 +139,10 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 		// KYTY_FLOAT_STORE_CLAMP: only when set, so other keys stay as they were.
 		key.push_back(0x48460000u | info.target_half_float_mask);
 	}
+	if (info.target_uint_mask != 0 || info.target_sint_mask != 0) {
+		// KYTY_PS_INTEGER_OUTPUTS: only when set, so other keys stay as they were.
+		key.push_back(0x494e0000u | info.target_uint_mask | (uint32_t {info.target_sint_mask} << 8u));
+	}
 	if (const auto mask = info.target_shader_mask; mask != UINT32_MAX) {
 		// KYTY_CB_SHADER_MASK_EXPORTS: which targets are written decides export locations.
 		key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);

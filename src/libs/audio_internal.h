@@ -38,6 +38,16 @@ bool     AudioOutObjectsEnabled();
 // blocks make one second.
 bool     AudioOut2BuzzWatchesPortType(uint16_t port_type);
 uint32_t AudioOut2BuzzThresholdBlocks(uint32_t sampling_freq, uint32_t frames_per_block);
+// AudioOut2 switches read once from the environment (libAudio2.cpp); tests set them here first.
+// KYTY_AUDIO2_CONSUME_PCM (upstream 64a554dea), KYTY_AUDIO2_EXACT_GRAIN (upstream 7ff8aff5e),
+// KYTY_AUDIO2_SDK_DEFAULTS (upstream 2efd31443's sceAudioOut2ContextResetParam defaults).
+struct AudioOut2Switches {
+	bool consume_pcm  = false;
+	bool exact_grain  = false;
+	bool sdk_defaults = false;
+};
+const AudioOut2Switches& AudioOut2GetSwitches();
+void                     AudioOut2SetSwitchesForTest(const AudioOut2Switches& switches);
 
 } // namespace Libs::Audio::AudioInternal
 

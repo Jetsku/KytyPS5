@@ -687,15 +687,22 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
 	const bool copy = source.backing.samples == 1;
-	EXIT_IF(layers == 0 || info.extent.width > source_width || info.extent.height > source_height ||
-	        info.extent.width > destination_width || info.extent.height > destination_height ||
-	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
-	              : source.backing.format != backing.format));
+	EXIT_IF(layers == 0 || (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
+	                             : source.backing.format != backing.format));
 	auto resolved_source_range             = source_range;
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
-	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
+	// Upstream 17a0f53d3: a target the texture cache placed at a level of a larger image (or one
+	// whose level is smaller than the image's own extent) resolves the area both levels have,
+	// where this was an abort. Extents that fit resolve the image's extent, as before.
+	const bool fits = info.extent.width <= source_width && info.extent.height <= source_height &&
+	                  info.extent.width <= destination_width &&
+	                  info.extent.height <= destination_height;
+	const vk::Extent3D resolve_extent =
+	    fits ? vk::Extent3D {info.extent.width, info.extent.height, 1}
+	         : vk::Extent3D {std::min(source_width, destination_width),
+	                         std::min(source_height, destination_height), 1};
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();

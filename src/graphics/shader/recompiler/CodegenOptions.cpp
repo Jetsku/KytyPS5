@@ -178,6 +178,9 @@ CodegenOptions FromEnvironment() {
 	options.cvt_pk_saturate = EnvFlag("KYTY_CVT_PK_SATURATE", options.cvt_pk_saturate);
 	options.ufloat_store_rtz = EnvFlag("KYTY_UFLOAT_STORE_RTZ", options.ufloat_store_rtz);
 	options.ls_active_lanes  = EnvFlag("KYTY_LS_ACTIVE_LANES", options.ls_active_lanes);
+	options.barrier_stores = EnvFlag("KYTY_BARRIER_STORES", options.barrier_stores);
+	options.ps_integer_outputs = EnvFlag("KYTY_PS_INTEGER_OUTPUTS", options.ps_integer_outputs);
+	options.ps_exec_words = EnvFlag("KYTY_PS_EXEC_WORDS", options.ps_exec_words);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.
 	const auto flush_off = [](const char* name) {

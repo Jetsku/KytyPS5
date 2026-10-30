@@ -2754,6 +2754,22 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	return payload_dw;
 }
 
+// Upstream 1b7093805: the async command buffer's MEM_SEMAPHORE (AgcAcbMemSemaphore), signal (6) or
+// wait (7); SIGNAL_TYPE (bit 20) writes one instead of adding one.
+KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+
+	const auto control = buffer[2];
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
+	                     (control >> 29u) < 6u);
+
+	auto* counter = reinterpret_cast<uint64_t*>(
+	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
+	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
+
+	return 3;
+}
+
 KYTY_CP_OP_PARSER(CpOpWaitRegMem32) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 

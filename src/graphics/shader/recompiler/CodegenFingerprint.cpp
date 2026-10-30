@@ -247,6 +247,15 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.ls_active_lanes) {
 		b.Text("ls_active_lanes");
 	}
+	if (options.barrier_stores) {
+		b.Text("barrier_stores");
+	}
+	if (options.ps_integer_outputs) {
+		b.Text("ps_integer_outputs");
+	}
+	if (options.ps_exec_words) {
+		b.Text("ps_exec_words");
+	}
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");
 		b.U8(options.denorm_flush_skip);
