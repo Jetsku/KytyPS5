@@ -212,7 +212,7 @@ private:
 	void V_XOR3_B32(const Decoder::Instruction& inst);
 	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign);
+	void S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign = false);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);

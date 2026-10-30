@@ -124,6 +124,9 @@ static void PrintUsage() {
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
+	::printf(
+	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
+	    "                                       <dir>, or license only without <dir>. Repeatable.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
@@ -152,8 +155,12 @@ static void PrintUsage() {
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf(
+	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
+	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --wheel <true|false>                 Show the game a racing wheel fed by host\n"
 	         "                                       devices (see --wheel-config).\n");
 	::printf("  --wheel-config <json>                Wheel mapping file. Default: wheel.json in\n"
@@ -167,6 +174,7 @@ static void PrintUsage() {
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
+	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
@@ -372,6 +380,35 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		// Value-less like upstream's flags (the launcher passes them without a value).
+		if (arg == "--stretch") {
+			options.config.stretch_enabled = true;
+			continue;
+		}
+
+		if (arg == "--trinity") {
+			options.config.pro_enabled = true;
+			continue;
+		}
+
+		if (arg == "--emulate-psn") {
+			options.config.psn_emulation_enabled = true;
+			continue;
+		}
+
+		// --shader-cache and --occlusion-queries (upstream launcher flags) are accepted and have no effect:
+		// ours keeps its own program cache and --gpu-occlusion.
+		if (arg == "--shader-cache") {
+			options.config.shader_cache_enabled = true;
+			continue;
+		}
+
+		if (arg == "--occlusion-queries") {
+			options.config.occlusion_queries_enabled = true;
+			continue;
+		}
+
+
 		if (arg == "--amd-cpu" || arg == "--no-amd-cpu") {
 			amd_cpu        = arg == "--amd-cpu" ? AmdCpuChoice::On : AmdCpuChoice::Off;
 			amd_cpu_source = arg;
@@ -466,6 +503,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--addcont") {
+			auto entry = Common::ParseAddContent(value);
+			if (!entry) {
+				::printf("--addcont needs <16-character A-Z/0-9 label>[=<existing folder>]: %s\n",
+				         value.c_str());
+				return false;
+			}
+			options.addcont.push_back(std::move(*entry));
 		} else if (arg == "--screen-width") {
 			if (!ParseUint32(value, options.config.screen_width) ||
 			    options.config.screen_width == 0) {

@@ -393,6 +393,19 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_INT_MRT_OUTPUTS=1 (default off; upstream 26ca60923): pixel exports to UINT and SINT render
+	// targets are typed as integer vectors of the target's signedness (Vulkan requires the output
+	// type to match the attachment's numeric type); compressed 16-bit exports to SINT targets are
+	// sign-extended instead of unpacked as FP16. Off: only 32_ABGR exports are unsigned vectors.
+	bool int_mrt_outputs = false;
+	// KYTY_BARRIER_ACQUIRE_STORES=1 (default off; upstream ceb154d9e): S_BARRIER in a program that
+	// writes buffers or images also orders uniform and image memory (other waves' stores become
+	// visible to plain loads right after the barrier). Off: the barrier orders LDS only.
+	bool barrier_acquire_stores = false;
+	// KYTY_UFLOAT_STORE_RTZ=1 (default off; upstream 59d8256b3): formatted buffer stores to 11/10-bit
+	// unsigned floats truncate (round toward zero through f16) and store negatives and NaN as zero.
+	// Off: round to nearest even, KYTY_FLOAT_STORE_CLAMP overflow, NaN kept.
+	bool ufloat_store_rtz = false;
 	// KYTY_RT_STUB=1: translate IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (MIMG
 	// 0xe6/0xe7) as "no intersection" for every lane instead of skipping compute dispatches that
 	// contain them (and failing other stages). A box node returns four invalid child pointers
@@ -567,25 +580,6 @@ struct CodegenOptions {
 	// folds the shifted patch ordinal; HS and TES share the patch-constant range the analysis
 	// found. Factor or patch-constant addresses that still do not fold skip the stage's draws.
 	bool tess_indexed = false;
-	// KYTY_FRACT_CLAMP=1 (default off; upstream e864cb20b, TheCruZ): V_FRACT_F16/F32/F64 return the
-	// largest value below one (as the guest GPU) where x - floor(x) rounds up to 1.0 for a tiny
-	// negative x. NaN passes through. Off: the host fract result, as before.
-	bool fract_clamp = false;
-	// KYTY_CVT_PK_SATURATE=1 (default off; upstream 9210264d4, TheCruZ): V_CVT_PK_U16_U32 and
-	// V_CVT_PK_I16_I32 saturate each 32-bit source to the 16-bit range (unsigned / signed), as the
-	// guest GPU; off, the low 16 bits are packed, as before.
-	bool cvt_pk_saturate = false;
-	// KYTY_UFLOAT_STORE_RTZ=1 (default off; upstream 59d8256b3, nmzik): formatted 11/10-bit float
-	// buffer stores truncate like the guest GPU: the f32 is converted to f16 rounding toward zero
-	// (the unsigned 11/10-bit floats share its bias) and the low mantissa bits are dropped; finite
-	// overflow gives the largest finite value, negatives and NaN store zero. Off: round to nearest
-	// even, NaN stays NaN and overflow is infinity (or the largest value with
-	// KYTY_FLOAT_STORE_CLAMP), as before.
-	bool ufloat_store_rtz = false;
-	// KYTY_LS_ACTIVE_LANES=1 (default off; upstream 63207739b, Çağatay Güçlü): a local (LS) shader's
-	// s3 starts as its wave's active lane count (the vertices it got) instead of 64, as the NGG
-	// vertex stage's ESVertCount already does.
-	bool ls_active_lanes = false;
 	// KYTY_WORKGROUP_IMAGES=1 (default off; the GT7 preset; adapted from upstream KytyPS5 0ee880090
 	// and c23de6218, nmzik): a compute image whose T# is read from a table at
 	// workgroup_id[axis] * stride + offset (GT7's CS 0xe042c5de1f18d724: two storage T#s per Z group
@@ -607,10 +601,6 @@ struct CodegenOptions {
 	// branches as one, as the emulated two-half path does on 32-wide hosts. Off: each lane branches
 	// on its own bit there (no effect on NVIDIA, whose subgroups are 32 wide).
 	bool native_wave64_branch = false;
-	// KYTY_TESS_CP_MASK=1 (default off; upstream 77458260f): the LS/HS stride reflection reads
-	// packed HS ID & 0x1f00 as the control point times 256 without KYTY_TESS_INDEXED too (which
-	// already does). Off: such an address does not reflect and the stage's draws are skipped.
-	bool tess_cp_mask = false;
 	// KYTY_SAMPLER_READS_DEFER=1 (default off; the GT7 preset after testing): with bindless images, an
 	// S_BUFFER_LOAD S# read that feeds only sampler handles is collected after the walk (and only if an
 	// ordinary sampler still uses it), so a bindless or stand-in sampler plan no longer strands it as a
@@ -625,18 +615,14 @@ struct CodegenOptions {
 	// conversions. Off, a denormal there stays denormal instead of reading as a signed zero
 	// (rcp(denormal) is then a large finite value, not an infinity). Bits: DenormFlushSkip*.
 	uint8_t denorm_flush_skip = 0;
-	// KYTY_BARRIER_STORES=1 (upstream ceb154d9e): S_BARRIER of a program that stores to buffers or
-	// images also acquires and releases uniform and image memory, as shaders read other waves'
-	// stores with plain loads right after the barrier. Off: workgroup (LDS) memory only.
-	bool barrier_stores = false;
-	// KYTY_PS_INTEGER_OUTPUTS=1 (upstream 26ca60923): pixel outputs to UINT and SINT render targets
-	// are uvec4 / ivec4 (ShaderPixelInputInfo::target_uint_mask / target_sint_mask); compressed
-	// SINT exports sign-extend. Off: only 32-bit UINT exports (mode 7) are integer, as before.
-	bool ps_integer_outputs = false;
 	// KYTY_PS_EXEC_WORDS=1 (adapted from upstream 5429888d4): a pixel shader's EXEC and VCC words
 	// leave out the helper lanes the per-lane EXEC keeps for derivatives: the entry words are the
 	// live lanes, VALU masks are limited to the EXEC words, SAVEEXEC combines the words bitwise.
 	bool ps_exec_words = false;
+	// KYTY_FRACT_CLAMP=1 (default off; upstream e864cb20b): V_FRACT_F16/F32/F64 results are clamped
+	// below one (the largest value under 1.0 in the destination precision), as the hardware returns
+	// for a tiny negative source where x - floor(x) rounds to 1.0. One compare and select per fract.
+	bool fract_clamp = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;

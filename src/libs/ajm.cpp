@@ -290,18 +290,6 @@ static void AjmLogDecodeResult(const char* name, uint32_t instance, const AjmDec
 }
 
 // A job of the batch: its space taken now, its work run when the batch starts (AjmDeferJobs), or now.
-// KYTY_AJM_OPUS_RESAMPLE=1 (default off; upstream c528324d2, #1914): Opus instances created with
-// the resample flag buffer whole decoded packets and resample them (libs/ajm/resampler.h) by the
-// ratio sceAjmBatchJobSetResampleParameters(Ex) / the control flags set, and the resample info
-// reports it. Off: resample parameters are accepted and ignored (ratio 1), as before.
-static bool AjmOpusResampleEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_AJM_OPUS_RESAMPLE");
-		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
-}
-
 static int AjmQueueJob(AjmBatchInfo* info, size_t job_size, const char* name, std::function<void()> work) {
 	if (!AjmDeferJobs()) {
 		work();
@@ -471,7 +459,7 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 	}
 
 	// The resampler requires one complete decoded packet per decoder call.
-	if (AjmOpusResampleEnabled() && state->codec == static_cast<uint32_t>(AjmCodec::DecOpus) &&
+	if (state->codec == static_cast<uint32_t>(AjmCodec::DecOpus) &&
 	    (state->flags & AJM_INSTANCE_FLAG_RESAMPLE) != 0) {
 		return state->resampler.Decode(*state->decoder, state->flags, input, input_size, output,
 		                               output_size, multiple_frames, &state->gapless);
@@ -571,7 +559,7 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 		sideband_input_size -= AJM_SIDEBAND_GAPLESS_SIZE;
 	}
 	for (const auto flag : {AJM_FLAG_CONTROL_RESAMPLE, AJM_FLAG_CONTROL_RESAMPLE_EX}) {
-		if ((flags & flag) == 0 || !AjmOpusResampleEnabled()) {
+		if ((flags & flag) == 0) {
 			continue;
 		}
 		const bool   extended = flag == AJM_FLAG_CONTROL_RESAMPLE_EX;
@@ -1009,24 +997,16 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t 
                                                    float ratio, uint32_t flags, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
+	const struct {
+		float    ratio;
+		uint32_t flags;
+	} params {ratio, flags};
+	const auto decoded = AjmControlInstance(instance, AJM_FLAG_CONTROL_RESAMPLE, &params,
+	                                        sizeof(params), nullptr, nullptr);
+	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
 	     static_cast<double>(ratio), flags);
-	if (!AjmOpusResampleEnabled()) {
-		AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
-		return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
-	}
-	// In batch order with the decode jobs (KYTY_AJM_DEFER).
-	return AjmQueueJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample",
-	                   [instance, ratio, flags, result] {
-		                   const struct {
-			                   float    ratio;
-			                   uint32_t flags;
-		                   } params {ratio, flags};
-		                   const auto decoded = AjmControlInstance(
-		                       instance, AJM_FLAG_CONTROL_RESAMPLE, &params, sizeof(params), nullptr,
-		                       nullptr);
-		                   AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
-	                   });
+	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
 }
 
 int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_t instance,
@@ -1035,25 +1015,14 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_
                                                      void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	if (AjmOpusResampleEnabled()) {
-		LOGF("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
-		     "\n",
-		     instance, static_cast<double>(ratio_start),
-		     static_cast<double>(ratio_change_per_sample), flags);
-		return AjmQueueJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample-ex",
-		                   [instance, ratio_start, ratio_change_per_sample, flags, result] {
-			                   const struct {
-				                   float    ratio;
-				                   float    change;
-				                   uint32_t flags;
-			                   } params {ratio_start, ratio_change_per_sample, flags};
-			                   const auto decoded = AjmControlInstance(
-			                       instance, AJM_FLAG_CONTROL_RESAMPLE_EX, &params, sizeof(params),
-			                       nullptr, nullptr);
-			                   AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
-		                   });
-	}
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
+	const struct {
+		float    ratio;
+		float    change;
+		uint32_t flags;
+	} params {ratio_start, ratio_change_per_sample, flags};
+	const auto decoded = AjmControlInstance(instance, AJM_FLAG_CONTROL_RESAMPLE_EX, &params,
+	                                        sizeof(params), nullptr, nullptr);
+	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
 	     "\n",
 	     instance, static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample),
@@ -1069,13 +1038,9 @@ int KYTY_SYSV_ABI AjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instan
 		(void)AjmGetInstanceFormat(instance, &decode_result);
 		AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_RESAMPLE_INFO_SIZE, decode_result);
 		if (result != nullptr) {
-			auto* resample  = reinterpret_cast<AjmSidebandResampleInfo*>(static_cast<uint8_t*>(result) +
-			                                                             AJM_SIDEBAND_RESULT_SIZE);
-			if (AjmOpusResampleEnabled()) {
-				*resample = decode_result.resample_info;
-			} else {
-				resample->ratio = 1.0f;
-			}
+			auto* resample = reinterpret_cast<AjmSidebandResampleInfo*>(static_cast<uint8_t*>(result) +
+			                                                            AJM_SIDEBAND_RESULT_SIZE);
+			*resample      = decode_result.resample_info;
 		}
 	});
 }

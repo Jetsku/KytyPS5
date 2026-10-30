@@ -86,7 +86,6 @@ CodegenOptions FromEnvironment() {
 	options.table_key_bounds = EnvFlag("KYTY_TABLE_KEY_BOUNDS", options.table_key_bounds);
 	options.native_wave64_branch =
 	    EnvFlag("KYTY_NATIVE_WAVE64_BRANCH", options.native_wave64_branch);
-	options.tess_cp_mask    = EnvFlag("KYTY_TESS_CP_MASK", options.tess_cp_mask);
 	options.sampler_reads_deferred =
 	    EnvFlag("KYTY_SAMPLER_READS_DEFER", options.sampler_reads_deferred);
 	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
@@ -121,6 +120,10 @@ CodegenOptions FromEnvironment() {
 	options.lane_reductions   = EnvFlag("KYTY_LANE_REDUCTIONS", options.lane_reductions);
 	options.ir_linear_uses    = EnvFlag("KYTY_IR_LINEAR_USES", options.ir_linear_uses);
 	options.fold_lane_masks   = EnvFlag("KYTY_FOLD_LANE_MASKS", options.fold_lane_masks);
+	options.int_mrt_outputs   = EnvFlag("KYTY_INT_MRT_OUTPUTS", options.int_mrt_outputs);
+	options.barrier_acquire_stores =
+	    EnvFlag("KYTY_BARRIER_ACQUIRE_STORES", options.barrier_acquire_stores);
+	options.ufloat_store_rtz = EnvFlag("KYTY_UFLOAT_STORE_RTZ", options.ufloat_store_rtz);
 	if (const auto* cap = std::getenv("KYTY_DISPATCHER_CAP"); cap != nullptr && cap[0] != '\0') {
 		options.dispatcher_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
 	}
@@ -135,6 +138,7 @@ CodegenOptions FromEnvironment() {
 		    std::strcmp(mode, "exit") == 0;
 	}
 	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
+	options.fract_clamp  = EnvFlag("KYTY_FRACT_CLAMP", options.fract_clamp);
 	if (const auto* mode = std::getenv("KYTY_RT_SOFTWARE");
 	    mode != nullptr && mode[0] != '\0' && std::strcmp(mode, "auto") != 0) {
 		options.rt_software      = std::strcmp(mode, "0") != 0;
@@ -180,12 +184,6 @@ CodegenOptions FromEnvironment() {
 	options.snapshot_written_guard =
 	    EnvFlag("KYTY_SNAPSHOT_WRITTEN_GUARD", options.snapshot_written_guard);
 	options.tess_indexed = EnvFlag("KYTY_TESS_INDEXED", options.tess_indexed);
-	options.fract_clamp     = EnvFlag("KYTY_FRACT_CLAMP", options.fract_clamp);
-	options.cvt_pk_saturate = EnvFlag("KYTY_CVT_PK_SATURATE", options.cvt_pk_saturate);
-	options.ufloat_store_rtz = EnvFlag("KYTY_UFLOAT_STORE_RTZ", options.ufloat_store_rtz);
-	options.ls_active_lanes  = EnvFlag("KYTY_LS_ACTIVE_LANES", options.ls_active_lanes);
-	options.barrier_stores = EnvFlag("KYTY_BARRIER_STORES", options.barrier_stores);
-	options.ps_integer_outputs = EnvFlag("KYTY_PS_INTEGER_OUTPUTS", options.ps_integer_outputs);
 	options.ps_exec_words = EnvFlag("KYTY_PS_EXEC_WORDS", options.ps_exec_words);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.

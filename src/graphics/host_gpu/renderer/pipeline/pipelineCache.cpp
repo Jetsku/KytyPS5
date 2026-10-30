@@ -8047,8 +8047,8 @@ namespace {
 
 // Static stage information shared by GetGraphicsPrograms and the draw-prep speculative
 // preparation: pure functions of the registers and constant device limits.
-// False when the program exceeds the host's mesh limits (upstream 560756f34: the draw is skipped
-// with a one-time warning instead of ending the session).
+// False when the mesh program exceeds the host's mesh limits: with KYTY_SKIP_INVALID (default on)
+// its draws are skipped, as upstream 560756f34 does, instead of stopping the emulator.
 [[nodiscard]] bool FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
 	if (!graphics.mesh_shader_enabled) {
 		ExitWithoutMeshShaders(graphics);
@@ -8070,10 +8070,14 @@ namespace {
 	if (mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
 	    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 	    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			std::printf("Warning: skipping draws of mesh shaders that exceed host limits (threads=%u "
-			            "vertices=%u primitives=%u LDS=%u; logged once)\n",
+		if (!Common::SkipInvalidEnabled()) {
+			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
+			     mesh.HostThreads(), mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+		}
+		static std::atomic_bool logged = false;
+		if (Common::LogOnce(logged)) {
+			std::printf("Warning: draws of mesh shaders that exceed the host's mesh limits are skipped "
+			            "(KYTY_SKIP_INVALID, logged once): threads=%u vertices=%u primitives=%u LDS=%u\n",
 			            mesh.HostThreads(), mesh.max_vertices, mesh.max_primitives,
 			            mesh.lds_size_dwords);
 		}
@@ -8186,32 +8190,36 @@ static void ApplyHalfFloatTargets(const HW::Context& context, ShaderPixelInputIn
 	}
 }
 
-// KYTY_PS_INTEGER_OUTPUTS (upstream 26ca60923): the MRTs that go to a UINT or SINT render target,
-// whose fragment outputs are then typed as integer vectors, as Vulkan requires for integer
-// attachments (a float output there is undefined). Only with the default export routing.
+// KYTY_INT_MRT_OUTPUTS=1 (default off; upstream 26ca60923, CodegenOptions::int_mrt_outputs): the exports that go
+// to UINT and SINT render targets are typed as integer vectors (the emitter's PixelOutputType), as Vulkan requires
+// for integer attachments; by default they stay float vectors whose bits the attachment takes.
+// Off by default: it changes the pixel programs (and static keys) of draws to integer targets.
+static bool IntTargetOutputsEnabled() {
+	return ShaderRecompiler::GetCodegenOptions().int_mrt_outputs;
+}
+
 static void ApplyIntegerTargets(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
 	pixel_info.target_uint_mask = 0;
 	pixel_info.target_sint_mask = 0;
-	if (!ShaderRecompiler::GetCodegenOptions().ps_integer_outputs ||
-	    pixel_info.target_shader_mask != UINT32_MAX) {
+	if (!IntTargetOutputsEnabled()) {
 		return;
 	}
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX && slot < 8u; slot++) {
-		if (pixel_info.target_output_mode[slot] == 0) {
-			continue;
-		}
+	for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+		const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+		if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
 		const auto& rt = context.GetRenderTarget(slot);
-		if (rt.base.addr == 0) {
+		if (rt.base.addr == 0 || render_target_mask_slot(context.GetRenderTargetMask(), slot) == 0u) {
 			continue;
 		}
 		if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
-			pixel_info.target_uint_mask |= static_cast<uint8_t>(1u << slot);
+			pixel_info.target_uint_mask |= static_cast<uint8_t>(1u << export_index);
 		} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
-			pixel_info.target_sint_mask |= static_cast<uint8_t>(1u << slot);
+			pixel_info.target_sint_mask |= static_cast<uint8_t>(1u << export_index);
 		}
 	}
-	if (pixel_info.dual_source_blending) {
-		// MRT1 is the second blend source of target 0; blended targets are not integer.
+	// MRT1 as the second blend source (or the remapped alpha) of target 0 is not an integer output.
+	if (pixel_info.dual_source_blending ||
+	    pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
 		pixel_info.target_uint_mask &= static_cast<uint8_t>(~2u);
 		pixel_info.target_sint_mask &= static_cast<uint8_t>(~2u);
 	}
@@ -8373,7 +8381,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active && !FinishMeshStage(m_graphics, vertex_info[0])) {
-		return {};
+		return SkipUnmaterializable("a mesh shader exceeds the host's mesh limits");
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
@@ -8567,6 +8575,7 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareTessellatedProgramsSpecul
 		ApplyPixelParameterMode(context, user_config, false, true, pixel_info);
 		ApplyDualSourceBlending(context, pixel_info);
 		ApplyHalfFloatTargets(context, pixel_info);
+		ApplyIntegerTargets(context, pixel_info);
 	}
 	ApplyClipSpace(m_graphics, context, infos[2], true,
 	               Prospero::IsRectList(user_config.GetPrimType()));

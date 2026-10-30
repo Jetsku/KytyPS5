@@ -651,6 +651,11 @@ void TestWaveformBlockGeometry() {
 	Check(Ngs2CalcWaveformBlock(&format, 0, 0, &block) == OK && block.data_size == 0 &&
 	          block.num_samples == 0,
 	      "empty ATRAC9 block acquired encoded data");
+	const Ngs2WaveformFormat pcm {0x12, 2, 48000};
+	Check(Ngs2CalcWaveformBlock(&pcm, 4096, 4096, &block) == OK &&
+	          block.data_offset == 16384 && block.data_size == 16384 &&
+	          block.num_skip_samples == 0 && block.num_samples == 4096,
+	      "PCM block calculation omitted the sample frames");
 	Fixture f(24000);
 	const int16_t silence = 0;
 	f.Queue(&silence, 0, 0, UINT32_MAX);
@@ -805,6 +810,76 @@ void TestPcm16RenderOutput() {
 	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
 	          std::ranges::all_of(output_samples, [](int16_t sample) { return sample == 0; }),
 	      "PCM16 output retained samples from the previous render");
+}
+
+void TestPatchToRackHandle() {
+	Ngs2Internal system;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& source = sampler.Voice();
+	Ngs2VoicePatchParam patch {{24, 0, 5}, 0, 0, master.handle};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&source), &patch.header) == OK &&
+	          source.ports[0].dest == &master.Voice(),
+	      "patch to a rack handle did not connect to its voice #0");
+}
+
+void TestMasteringGain() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 1;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& source = sampler.Voice();
+	auto& mastering = master.Voice();
+	mastering.channels = 8;
+	mastering.state = Ngs2VoicePlayState::Playing;
+	const int16_t frame[8] = {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192};
+	source.SetupSampler({0x12, 8, 48000});
+	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
+	source.ports[0].dest = &mastering;
+	source.SetEvent(1);
+	struct {
+		Ngs2VoiceParamHeader header {16, 0, 0x30000004};
+		float fbw = 5.0f, lfe = 0.5f;
+	} gain;
+	float pcm[8] = {};
+	Ngs2RenderBufferInfo output {pcm, sizeof(pcm), 0x18, 8};
+	const float expected[8] = {1.0f, 1.0f, 1.0f, 0.125f, 1.0f, 1.0f, 1.0f, 1.0f};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &gain.header) == OK &&
+	          Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
+	          std::ranges::equal(pcm, expected),
+	      "mastering gain was not clamped or applied per full band and LFE channel");
+}
+
+void TestReverbDryLevel() {
+	Fixture          f(48000);
+	Ngs2RackInternal reverb_rack {};
+	reverb_rack.ngs  = &f.system;
+	reverb_rack.type = Ngs2RackType::Reverb;
+	Ngs2VoiceInternal reverb;
+	reverb.rack = &reverb_rack;
+	f.voice.ports.push_back({&reverb, 0, 1.0f, -1});
+	const int16_t pcm = 8192;
+	f.Queue(&pcm, 1, 0);
+	struct {
+		Ngs2VoiceParamHeader header {24, 24, 0x20010000};
+		uint32_t             channels[4] = {1, 1, 0, 0};
+		Ngs2VoiceParamHeader levels_header {96, 0, 0x20010001};
+		float                levels[22] = {0.6f, 0.4f};
+	} setup;
+	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header);
+	reverb.SetEvent(1);
+	Ngs2RenderVoice(reverb, {&f.voice, &reverb}, 1);
+	Check(reverb.has_samples && reverb.samples[0] == 0.25f * 0.4f,
+	      "reverb did not pass its dry signal");
 }
 
 void TestCustomMasteringChannelMixer() {
@@ -1026,6 +1101,35 @@ void TestMonoRateAndRouting() {
 	      "22.05 kHz effect duration was incorrect");
 }
 
+void TestDefaultMatrix() {
+	struct Case {
+		uint32_t           src_channels;
+		int32_t            matrix;
+		uint32_t           dst_channels;
+		std::vector<float> expected;
+	};
+	constexpr float minus_3db = std::numbers::sqrt2_v<float> / 2;
+	const int16_t   pcm[]     = {8192, -16384};
+	for (const auto& c: {Case {1, -1, 2, {0.25f * minus_3db, 0.25f * minus_3db}},
+	                     Case {1, 0, 2, {0.25f * minus_3db, 0.25f * minus_3db}},
+	                     Case {2, -1, 1, {0.25f * minus_3db + -0.5f * minus_3db}},
+	                     Case {1, -1, 6, {0, 0, 0.25f, 0, 0, 0}}}) {
+		Fixture          f(48000, c.src_channels);
+		Ngs2RackInternal rack {};
+		rack.ngs  = &f.system;
+		rack.type = Ngs2RackType::Mastering;
+		Ngs2VoiceInternal dest;
+		dest.rack     = &rack;
+		dest.channels = c.dst_channels;
+		dest.state    = Ngs2VoicePlayState::Playing;
+		f.voice.matrices.resize(1);
+		f.voice.ports.push_back({&dest, 0, 1.0f, c.matrix});
+		f.Queue(pcm, 1, 0);
+		Ngs2RenderVoice(dest, {&f.voice, &dest}, 1);
+		Check(dest.samples == c.expected, "default port mix produced the wrong channel levels");
+	}
+}
+
 void TestMatrixOutputChannels() {
 	Fixture f(48000, 2);
 	Ngs2RackInternal mastering_rack {};
@@ -1109,6 +1213,38 @@ void TestDeferredSamplerSetup() {
 	f.Render(1);
 	Check(f.voice.samples[0] == 0.25f,
 	      "sampler did not play after deferred stream setup");
+}
+
+void TestClearReopensClosedList() {
+	Fixture       f(48000);
+	const int16_t first = 8192, second = -16384;
+	f.Queue(&first, 1, 0);
+	f.Queue(&second, 1, 4);
+	f.Render(1);
+	Check(f.voice.samples[0] == -0.5f, "CLEAR did not reopen a closed waveform list");
+}
+
+void TestSetupQuery() {
+	Fixture  f(48000, 2);
+	uint32_t info[2] = {99, 99};
+	Ngs2VoiceQueryInfo(reinterpret_cast<uintptr_t>(&f.voice), 0x4001, info, sizeof(info));
+	Check(info[0] == 2 && info[1] == 0, "setup query did not report the voice channels");
+}
+
+void TestPortInfo() {
+	Fixture           f(48000);
+	Ngs2VoiceInternal dest;
+	f.voice.ports.push_back({&dest, 1, 0.5f, 0});
+	struct {
+		int32_t   matrix;
+		float     volume;
+		uint32_t  delay_samples, input;
+		uintptr_t dest;
+	} info {99, 99, 99, 99, 99};
+	Ngs2VoiceGetPortInfo(reinterpret_cast<uintptr_t>(&f.voice), 0, &info, sizeof(info));
+	Check(info.matrix == 0 && info.volume == 0.5f && info.delay_samples == 0 && info.input == 1 &&
+	          info.dest == reinterpret_cast<uintptr_t>(&dest),
+	      "port info did not report the port routing and volume");
 }
 
 void TestPlayStateBeforeRender() {
@@ -1797,19 +1933,15 @@ void TestFiniteFilterTail() {
 } // namespace
 
 int main() {
-	// KYTY_NGS2_CHANNEL_MIXER (default off in the emulator) is what TestCustomMasteringChannelMixer
-	// checks.
-#ifdef _WIN32
-	_putenv_s("KYTY_NGS2_CHANNEL_MIXER", "1");
-#else
-	setenv("KYTY_NGS2_CHANNEL_MIXER", "1", 1);
-#endif
 	TestProgressDrivenWaveformRing();
 	TestWaveformQueueCapacity();
 	TestWaveformRingReuse();
 	TestAtrac9Vibration();
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
+	TestPatchToRackHandle();
+	TestMasteringGain();
+	TestReverbDryLevel();
 	TestCustomMasteringChannelMixer();
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
@@ -1844,8 +1976,12 @@ int main() {
 	TestPcmSkipAcrossBlocks();
 	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
+	TestDefaultMatrix();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
+	TestClearReopensClosedList();
+	TestSetupQuery();
+	TestPortInfo();
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();

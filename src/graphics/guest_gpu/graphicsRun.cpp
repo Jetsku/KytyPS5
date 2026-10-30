@@ -1202,9 +1202,6 @@ static void LogCpAddress(const char* kind, uint64_t address, uint64_t value, uin
 }
 
 CpSeq::Result CommandProcessor::ExecWaitRegMem(const CpSeq::WaitRegMemOp& op) {
-	if (op.wait_op >= CpSeq::WaitRegMemOp::SemaphoreSignal) {
-		return ExecMemSemaphore(op);
-	}
 	return op.size == sizeof(uint64_t) ? ExecWaitRegMemSized<uint64_t>(op)
 	                                   : ExecWaitRegMemSized<uint32_t>(op);
 }
@@ -1295,38 +1292,20 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
 
-// MEM_SEMAPHORE (upstream 1b7093805, AgcAcbMemSemaphore): an ordered op on the counter, carried as a
-// WAIT_REG_MEM op so it is an ordering point like a wait. A signal updates the counter before the
-// next packet; a wait on a zero counter suspends the queue at this packet, which runs again.
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	// Agc emits MEM_SEMAPHORE on async compute queues, whose front is always direct. A sequenced
+	// (or verified) front would have to order this guest write and wait as a lockstep op.
+	EXIT_NOT_IMPLEMENTED(m_front_mode != FrontMode::Direct);
 	EXIT_IF(counter == nullptr);
-	CpSeq::WaitRegMemOp op;
-	op.addr    = reinterpret_cast<uint64_t>(counter);
-	op.size    = static_cast<uint32_t>(sizeof(uint64_t));
-	op.wait_op = !signal ? CpSeq::WaitRegMemOp::SemaphoreWait
-	             : write ? CpSeq::WaitRegMemOp::SemaphoreWrite
-	                     : CpSeq::WaitRegMemOp::SemaphoreSignal;
-	if (Submit(op).suspended) {
+	if (signal) {
+		*counter = write ? 1u : *counter + 1u;
+		NoteCpWrite(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
+	} else if (*counter == 0) {
 		SuspendPm4();
+	} else {
+		(*counter)--;
+		NoteCpWrite(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
 	}
-}
-
-CpSeq::Result CommandProcessor::ExecMemSemaphore(const CpSeq::WaitRegMemOp& op) {
-	auto value = ReadGuestForCp<uint64_t>(op.addr);
-	switch (op.wait_op) {
-		case CpSeq::WaitRegMemOp::SemaphoreSignal: value++; break;
-		case CpSeq::WaitRegMemOp::SemaphoreWrite: value = 1; break;
-		default:
-			if (value == 0) {
-				return {true, 0};
-			}
-			value--;
-			break;
-	}
-	StreamCopyDefer::NoteGuestWrite(op.addr, sizeof(value));
-	std::memcpy(reinterpret_cast<void*>(op.addr), &value, sizeof(value));
-	NoteCpWrite(op.addr, sizeof(value));
-	return {};
 }
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
@@ -3658,16 +3637,6 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	return true;
 }
 
-// A label the command processor stores now (not deferred): KYTY_LABEL_IN_PLACE keeps a page the GPU
-// wrote from being downloaded for it (RenderContext::StoreLabelInPlace); otherwise through the
-// guest mapping, whose fault makes the page current first.
-static void StoreCpLabel(RenderContext& renderer, void* dst, const void* data, uint64_t size) {
-	if (!renderer.StoreLabelInPlace(reinterpret_cast<uint64_t>(dst), data, size)) {
-		StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), size);
-		std::memcpy(dst, data, size);
-	}
-}
-
 // KYTY_EOP_DROPPED_LABELS: "write" (default) also writes the data of end-of-pipe events whose
 // interrupt selector made Kyty skip it (graphics INT_SEL=1, RELEASE_MEM INT_SEL=4 with a data
 // selection); "count" only counts them, as before.
@@ -3692,7 +3661,8 @@ bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t siz
 		return interrupt;
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
-	StoreCpLabel(m_renderer, dst, &value, size);
+	StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), size);
+	std::memcpy(dst, &value, size);
 	NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 	QueueEopTimestamp(timestamp_slot, dst, value);
 	TraceCpLabel("label-dropped", dst, value, size);
@@ -3834,6 +3804,27 @@ bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32
 	return true;
 }
 
+// KYTY_LABEL_BACKING=1 (default off; upstream 2463e3aaf): an end-of-pipe label that sits beside
+// GPU-written bytes (whose page the buffer cache tracks as GPU-modified, with no dirty bytes left
+// to download) is written to the backing store, so the guest-mapping fault does not download the
+// GPU-written bytes under it first. Other labels, and any failure, go through the guest mapping.
+static void WriteEopLabel(RenderContext& renderer, void* dst, const void* value, uint64_t size) {
+	static const bool enabled = [] {
+		const auto* v = std::getenv("KYTY_LABEL_BACKING");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	if (enabled) {
+		const auto vaddr   = reinterpret_cast<uint64_t>(dst);
+		auto&      buffers = renderer.GetBufferCache();
+		if (GuestRange {vaddr, size}.Valid() && buffers.IsRegionGpuModified(vaddr, size) &&
+		    !buffers.HasGpuDirtyBytes(vaddr, size) &&
+		    LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+			return;
+		}
+	}
+	std::memcpy(dst, value, size);
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -3948,7 +3939,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			// Guest label pages can be protected by resource tracking. Attribute any
 			// resulting fault separately from the end-of-pipe submission/interrupt work.
 			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
-			StoreCpLabel(m_renderer, dst, &data, sizeof(data));
+			StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
+			WriteEopLabel(m_renderer, dst, &data, sizeof(data));
 		}
 		NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		TraceCpLabel("label-eop", dst, data, sizeof(data));
@@ -3991,7 +3983,18 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
 					if (with_interrupt) {
-						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+						// KYTY_GDS_INTERRUPT_QUEUED=1 (default off; upstream 6aaa53329): queue the
+						// interrupt behind earlier end-of-pipe interrupts instead of raising it now.
+						static const bool queued = [] {
+							const auto* v = std::getenv("KYTY_GDS_INTERRUPT_QUEUED");
+							return v != nullptr && std::strcmp(v, "1") == 0;
+						}();
+						if (queued) {
+							TriggerEopEventAtEndOfPipe(interrupt_context_id);
+							BufferFlushForEop();
+						} else {
+							m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+						}
 					}
 					return;
 				}
@@ -4034,7 +4037,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 					{
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
-						StoreCpLabel(m_renderer, dst, &value, sizeof(value));
+						StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
+						WriteEopLabel(m_renderer, dst, &value, sizeof(value));
 					}
 					NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
 					QueueEopTimestamp(timestamp_slot, dst, value);
@@ -4538,7 +4542,8 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			}
 
 			if (!DeferFlipLabel(dst_gpu_addr, value, false)) {
-				StoreCpLabel(m_renderer, dst_gpu_addr, &value, sizeof(value));
+				StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
+				std::memcpy(dst_gpu_addr, &value, sizeof(value));
 				NoteCpWrite(op.dst, sizeof(value));
 			}
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
@@ -4583,7 +4588,8 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
 				return;
 			}
-			StoreCpLabel(m_renderer, dst_gpu_addr, &value, sizeof(value));
+			StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
+			std::memcpy(dst_gpu_addr, &value, sizeof(value));
 			NoteCpWrite(op.dst, sizeof(value));
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
@@ -4872,6 +4878,7 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 			break;
 		case OpKind::DmaData: ExecDmaData(*static_cast<const CpSeq::DmaDataOp*>(payload)); break;
 		case OpKind::LodStats: ExecLodStats(*static_cast<const CpSeq::LodStatsOp*>(payload)); break;
+		case OpKind::Pssr: ExecPssr(*static_cast<const CpSeq::PssrOp*>(payload)); break;
 		case OpKind::Flip: ExecFlip(*static_cast<const CpSeq::FlipOp*>(payload)); break;
 		case OpKind::WaitRegMem:
 			return ExecWaitRegMem(*static_cast<const CpSeq::WaitRegMemOp*>(payload));
@@ -4980,6 +4987,25 @@ void CommandProcessor::GetLodStats(const uint32_t* body) {
 	CpSeq::LodStatsOp op;
 	std::memcpy(op.body, body, sizeof(op.body));
 	(void)Submit(op);
+}
+
+void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
+	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
+	static_assert(sizeof(CpSeq::PssrOp::request) == sizeof(Pssr::Request));
+	CpSeq::PssrOp op;
+	std::memcpy(op.request, &request, sizeof(op.request));
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecPssr(const CpSeq::PssrOp& op) {
+	Pssr::Request request {};
+	std::memcpy(&request, op.request, sizeof(request));
+	// The host PSSR pass (upstream 651ef73a0 renderPssr.cpp) is not ported yet: only reachable in Pro mode
+	// (--trinity), the request is decoded and dropped, so the output image keeps its previous contents.
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true)) {
+		printf("PSSR request dropped (host pass not ported): %ux%u\n", request.width, request.height);
+	}
 }
 
 void CommandProcessor::SetCeComplete(bool complete) {
@@ -5645,7 +5671,7 @@ void CommandProcessor::NoteLastLabel(CpSeq::OpKind kind, const void* payload) {
 }
 
 bool CommandProcessor::IsSelfLabelWait(const CpSeq::WaitRegMemOp& op) const {
-	if (!m_last_label_known || op.wait_op >= CpSeq::WaitRegMemOp::SemaphoreSignal || op.addr != m_last_label_begin || op.size > m_last_label_size) {
+	if (!m_last_label_known || op.addr != m_last_label_begin || op.size > m_last_label_size) {
 		return false;
 	}
 	const auto value =

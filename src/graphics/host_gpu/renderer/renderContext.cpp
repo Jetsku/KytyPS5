@@ -390,24 +390,6 @@ bool RenderContext::TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t 
 	return true;
 }
 
-bool RenderContext::StoreLabelInPlace(uint64_t vaddr, const void* data, uint64_t size) noexcept {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_LABEL_IN_PLACE");
-		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
-	if (!enabled || size == 0 || !GuestGpu::IsGpuThread() || !IsMapped(vaddr, size) ||
-	    !m_buffer_cache.IsRegionGpuModifiedRelaxed(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
-	                                               Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) -
-	                                                   Common::AlignDown(vaddr, TRACKER_PAGE_SIZE))) {
-		return false;
-	}
-	if (!m_buffer_cache.StoreInPlace(vaddr, data, size, true, false)) {
-		return false;
-	}
-	m_bindless_table.OnCpuWrite(vaddr, size);
-	return true;
-}
-
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;

@@ -20,6 +20,7 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -1335,15 +1336,7 @@ static void* KYTY_SYSV_ABI KernelGetProcParam() {
 }
 
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
-	static std::atomic_uint32_t call_count {0};
-
-	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
-	if (count < 8 || (count % 1024) == 0) {
-		PRINT_NAME();
-		LOGF("\tcall = %u, return = 0 (base PS5 mode)\n", count + 1);
-	}
-
-	return 0;
+	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
@@ -1356,8 +1349,8 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 		const char* value = std::getenv("KYTY_POWER_SAVER");
 		return value != nullptr && value[0] == '1';
 	}();
-	*mode    = 2;                   // PS5 Base
-	*submode = power_saver ? 1 : 0; // power saver mode (KYTY_POWER_SAVER=1) or none
+	*mode    = Loader::SystemContentIsTrinityMode() ? 3 : 2; // PS5 Pro (experimental Pro mode) or Base
+	*submode = power_saver ? 1 : 0;                          // power saver mode (KYTY_POWER_SAVER=1) or none
 	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
 	return OK;
 }
@@ -1391,28 +1384,22 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 	[[maybe_unused]] auto* heap_posix_memalign = api[6];
 }
 
-static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
-	// PRINT_NAME();
-
-	if (Network::Net::IsSocket(d)) {
-		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
-	}
-
-	// KYTY_WRITE_STDIO=1 (default off; upstream e0c5ae090): descriptors 0-2 go through KernelWrite
-	// too, which prints 1 and 2 to the host's stdout/stderr (flushed per write) and rejects 0.
-	// Off: they are dropped (the size is returned), as before. A negative descriptor is EBADF
-	// instead of an exit.
-	static const bool stdio = [] {
-		const char* value = std::getenv("KYTY_WRITE_STDIO");
-		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+// _write to descriptors 0-2: upstream e0c5ae090 sends it through KernelWrite (printed and flushed). That
+// changes what a title that writes a lot to stdout costs, so it is opt-in here: KYTY_GUEST_STDOUT=1;
+// by default the bytes are dropped and reported as written, as before.
+static bool GuestStdoutEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_STDOUT");
+		return value != nullptr && value[0] == '1';
 	}();
-	if (d > 2 || d < 0 || stdio) {
-		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, static_cast<size_t>(size)));
+	return enabled;
+}
+
+static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	if (d >= 0 && d <= 2 && !GuestStdoutEnabled()) {
+		return static_cast<int64_t>(nbytes);
 	}
-
-	int size_int = static_cast<int>(size);
-
-	return size_int;
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {

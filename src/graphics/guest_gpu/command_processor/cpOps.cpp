@@ -96,6 +96,7 @@ const char* OpKindName(OpKind kind) noexcept {
 		case OpKind::ReferenceClock: return "ReferenceClock";
 		case OpKind::DmaData: return "DmaData";
 		case OpKind::LodStats: return "LodStats";
+		case OpKind::Pssr: return "Pssr";
 		case OpKind::Flip: return "Flip";
 		case OpKind::WaitRegMem: return "WaitRegMem";
 		case OpKind::WaitFlipDone: return "WaitFlipDone";
@@ -129,6 +130,7 @@ uint32_t PayloadSize(OpKind kind) noexcept {
 		case OpKind::ReferenceClock: return sizeof(ReferenceClockOp);
 		case OpKind::DmaData: return sizeof(DmaDataOp);
 		case OpKind::LodStats: return sizeof(LodStatsOp);
+		case OpKind::Pssr: return sizeof(PssrOp);
 		case OpKind::Flip: return sizeof(FlipOp);
 		case OpKind::WaitRegMem: return sizeof(WaitRegMemOp);
 		case OpKind::WaitFlipDone: return sizeof(WaitFlipDoneOp);

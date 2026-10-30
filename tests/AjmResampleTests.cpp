@@ -329,12 +329,6 @@ void EndPersistsUntilReset(const std::vector<uint8_t>& packet) {
 } // namespace
 
 int main(int argc, char** argv) {
-	// KYTY_AJM_OPUS_RESAMPLE is default off in the emulator; these tests are its behaviour.
-#ifdef _WIN32
-	_putenv_s("KYTY_AJM_OPUS_RESAMPLE", "1");
-#else
-	setenv("KYTY_AJM_OPUS_RESAMPLE", "1", 1);
-#endif
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
 	SmallOutputs(packet, 312);

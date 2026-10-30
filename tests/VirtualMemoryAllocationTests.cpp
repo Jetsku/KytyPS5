@@ -185,7 +185,7 @@ void InitSubsystems() {
 	      "failed to write temporary param.json");
 
 	Loader::SystemContentLoadParamSfo(param_json);
-	const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
+	const auto flexible_memory_size = Loader::SystemContentGetMemoryParams().flexible_size;
 	Check("InitSubsystems", Common::File::DeleteFile(param_json),
 	      "failed to remove temporary param.json");
 	Check("InitSubsystems", flexible_memory_size == TestFlexibleMemorySize,
@@ -5231,8 +5231,15 @@ void TestTlsStubsPreserveFlags() {
 }
 #endif
 
+// tests/TrinityTests.cpp (upstream 651ef73a0), linked into this test.
+int RunTrinityTests();
+
 int main(int argc, char** argv) {
+	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
+		return RunTrinityTests();
+	}
 	InitSubsystems();
+
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);

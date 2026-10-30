@@ -376,9 +376,9 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 }
 
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      MrtOutputKind kind) {
+                      uint32_t vector_type) {
 	auto&      state          = ctx.state;
-	const bool integer_output = kind != MrtOutputKind::Float;
+	const bool integer_output = vector_type != TypeF32Vector(state, 4);
 	if (exp.compr && !integer_output) {
 		// SPI_SHADER_COL_FORMAT of a compressed export: 5 UNORM16_ABGR, 6 SNORM16_ABGR,
 		// 8 SINT16_ABGR (not modelled: it would need an integer output), otherwise FP16_ABGR.
@@ -426,9 +426,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		    ConstantU32(state, integer_output ? 1u : 0x3f800000u),
 		};
 		if (exp.compr) {
-			// An ivec4 output (KYTY_PS_INTEGER_OUTPUTS, SINT target) sign-extends each 16-bit half.
-			const auto extract =
-			    kind == MrtOutputKind::Sint ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract;
+			const auto extract = vector_type == TypeU32Vector(state, 4) ? spv::OpBitFieldUExtract
+			                                                            : spv::OpBitFieldSExtract;
 			for (uint32_t pair = 0; pair < 2u; pair++) {
 				if ((exp.en & (3u << (pair * 2u))) == 0u) {
 					continue;
@@ -440,8 +439,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 						continue;
 					}
 					raw[component] = state.builder.AllocateId();
-					state.builder.AddFunction(extract, TypeU32(state), raw[component],
-					                          packed, ConstantU32(state, lane * 16u),
+					state.builder.AddFunction(extract, TypeU32(state), raw[component], packed,
+					                          ConstantU32(state, lane * 16u),
 					                          ConstantU32(state, 16));
 				}
 			}
@@ -456,12 +455,10 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), data,
 		                          raw[0], raw[1], raw[2], raw[3]);
 	}
-	if (kind == MrtOutputKind::Uint) {
+	if (vector_type == TypeU32Vector(state, 4)) {
 		return data;
 	}
-	const auto vector = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, MrtOutputType(state, kind), vector, data);
-	return vector;
+	return Unary(state, spv::OpBitcast, vector_type, data);
 }
 
 uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
@@ -659,30 +656,6 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
-
-// The fragment output type of MRT `index` with output mode `mode`: a 32-bit UINT export (mode 7) is
-// a uvec4; with KYTY_PS_INTEGER_OUTPUTS (upstream 26ca60923) every written MRT that goes to a UINT
-// or SINT render target is a uvec4 / ivec4, as Vulkan requires for integer attachments.
-MrtOutputKind MrtOutputKindOf(const EmitterState& state, uint32_t index, uint32_t mode) {
-	if (state.program.stage == ShaderType::Pixel && mode != 0u && index < 8u) {
-		const auto& pixel = *state.input_info.pixel;
-		if ((pixel.target_sint_mask & (1u << index)) != 0u) {
-			return MrtOutputKind::Sint;
-		}
-		if ((pixel.target_uint_mask & (1u << index)) != 0u) {
-			return MrtOutputKind::Uint;
-		}
-	}
-	return mode == 7u ? MrtOutputKind::Uint : MrtOutputKind::Float;
-}
-
-uint32_t MrtOutputType(EmitterState& state, MrtOutputKind kind) {
-	switch (kind) {
-		case MrtOutputKind::Uint: return TypeU32Vector(state, 4);
-		case MrtOutputKind::Sint: return TypeI32Vector(state, 4);
-		default: return TypeF32Vector(state, 4);
-	}
-}
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -760,12 +733,19 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const auto kind         = MrtOutputKindOf(state, exp.index, MrtOutputMode(state, exp));
-		const bool float_output = kind == MrtOutputKind::Float;
-		const auto vector_type  = MrtOutputType(state, kind);
-		auto       value        = ExportVector(ctx, data, exp, kind);
+		// KYTY_INT_MRT_OUTPUTS=1 (upstream 26ca60923): exports to UINT and SINT targets are typed
+		// as integer vectors of the target's signedness. Off: only 32_ABGR exports (mode 7) are
+		// unsigned, every other export a float vector (the behaviour before).
+		const auto output_mode = MrtOutputMode(state, exp);
+		const auto vector_type = GetCodegenOptions().int_mrt_outputs
+		                             ? (output_mode != 0u ? MrtOutputType(state, exp.index)
+		                                                  : TypeF32Vector(state, 4))
+		                             : (output_mode == 7u ? TypeU32Vector(state, 4)
+		                                                  : TypeF32Vector(state, 4));
+		const bool uint_output = vector_type != TypeF32Vector(state, 4);
+		auto       value       = ExportVector(ctx, data, exp, vector_type);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    float_output && !exp.compr && exp.index < 8u &&
+		    !uint_output && !exp.compr && exp.index < 8u &&
 		    (state.input_info.pixel->target_half_float_mask & (1u << exp.index)) != 0u) {
 			// KYTY_FLOAT_STORE_CLAMP: a 32-bit export to a 16-bit float target keeps the guest's
 			// range (the largest half, not the host's infinity). Packed half exports are in range.
@@ -783,7 +763,7 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                          components[1], components[2], components[3]);
 		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && float_output &&
+		    exp.index == 0 && !uint_output &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
@@ -924,9 +904,10 @@ void EmitBarrier(EmitterState& state) {
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
 	auto       memory       = LdsMemorySemantics(state);
-	// KYTY_BARRIER_STORES (upstream ceb154d9e): shaders read other waves' buffer and image stores
-	// with plain loads right after S_BARRIER.
-	if (GetCodegenOptions().barrier_stores) {
+	// KYTY_BARRIER_ACQUIRE_STORES=1 (upstream ceb154d9e): shaders read other waves' buffer and
+	// image stores with plain loads right after S_BARRIER, so a program that writes buffers or
+	// images also makes those visible at the barrier.
+	if (GetCodegenOptions().barrier_acquire_stores) {
 		const auto written = [](const auto& resource) { return resource.written; };
 		if (std::ranges::any_of(state.program.info.buffers, written) ||
 		    std::ranges::any_of(state.program.info.images, written)) {

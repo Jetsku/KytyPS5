@@ -260,6 +260,17 @@ static bool GetMipTailLayout(const TileBlockLayout& block, MipTailLayout& out) {
 	return false;
 }
 
+static uint32_t FirstTailLevel(const MipTailLayout& tail, uint32_t width, uint32_t height,
+                               uint32_t levels) {
+	for (uint32_t level = 0; levels > 1 && level < levels; ++level) {
+		if (ShiftCeil(width, level) <= tail.width_limit &&
+		    ShiftCeil(height, level) <= tail.height_limit && levels - level <= tail.max_levels) {
+			return level;
+		}
+	}
+	return levels;
+}
+
 bool TileGetTextureElementLayout(Prospero::BufferFormat format, TileTextureElementLayout& out) {
 	if (const auto bytes = Prospero::NumBytesPerElement(format); std::has_single_bit(bytes)) {
 		out = {bytes, 1, 1};
@@ -337,23 +348,14 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 	TileSurfaceLayout result {};
 	result.description      = description;
 	result.texture          = texture;
-	result.first_tail_level = description.levels;
 	const uint32_t block_slices =
 	    volume ? ShiftCeil(description.depth, std::countr_zero(block.block_depth))
 	           : description.layers;
 
 	MipTailLayout tail {};
-	const bool    has_tail = GetMipTailLayout(block, tail);
-	if (has_tail && description.levels > 1) {
-		for (uint32_t level = 0; level < description.levels; ++level) {
-			if (ShiftCeil(width0, level) <= tail.width_limit &&
-			    ShiftCeil(height0, level) <= tail.height_limit &&
-			    description.levels - level <= tail.max_levels) {
-				result.first_tail_level = level;
-				break;
-			}
-		}
-	}
+	result.first_tail_level = GetMipTailLayout(block, tail)
+	                              ? FirstTailLevel(tail, width0, height0, description.levels)
+	                              : description.levels;
 
 	for (uint32_t level = 0; level < result.first_tail_level; ++level) {
 		auto& mip = result.mips[level];
@@ -1216,9 +1218,12 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 
 bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
                     uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
-                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
+                    TileSizeAlign& total_size, uint32_t num_fragments_log2, TileSizeOffset* mips) {
 	total_size = {};
-	if (width == 0 || height == 0 || slices == 0 || levels != 1 || num_fragments_log2 != 0 ||
+	// Mipmapped DCC (upstream a5cfdcfd3) is reported only to callers that ask for the per-level
+	// layout (mips != nullptr); existing single-mip callers keep the levels == 1 rule.
+	if (width == 0 || height == 0 || slices == 0 || levels == 0 || levels > 16 ||
+	    (levels != 1 && mips == nullptr) || num_fragments_log2 != 0 ||
 	    !std::has_single_bit(bytes_per_element) || bytes_per_element > 16 ||
 	    (tile != Prospero::TileMode::kRenderTarget && tile != Prospero::TileMode::kDepth)) {
 		return false;
@@ -1226,16 +1231,44 @@ bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
 	// Gen5 color metadata uses 4 KiB blocks, with one byte per 256 bytes of color data.
 	// Metadata stays thin for volume surfaces, so every depth slice has its own block raster.
 	const uint32_t coverage_bits = 20u - std::countr_zero(bytes_per_element);
-	const uint32_t block_width   = 1u << ((coverage_bits + 1u) / 2u);
-	const uint32_t block_height  = 1u << (coverage_bits / 2u);
-	const uint64_t blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
-	const uint64_t blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
-	const uint64_t blocks   = blocks_x * blocks_y;
-	if (blocks > UINT32_MAX / 4096u / slices) {
+	if (levels == 1) {
+		const uint32_t block_width  = 1u << ((coverage_bits + 1u) / 2u);
+		const uint32_t block_height = 1u << (coverage_bits / 2u);
+		const uint64_t blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
+		const uint64_t blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
+		const uint64_t blocks   = blocks_x * blocks_y;
+		if (blocks > UINT32_MAX / 4096u / slices) {
+			return false;
+		}
+		total_size.size  = static_cast<uint32_t>(blocks * slices * 4096u);
+		total_size.align = 4096;
+		if (mips != nullptr) {
+			mips[0] = {.size = static_cast<uint32_t>(blocks * 4096u), .offset = 0};
+		}
+		return true;
+	}
+	// Each slice stores its mips backwards through the first tail mip, which fits one block;
+	// later tail mips have none.
+	TileBlockLayout block {};
+	MipTailLayout   tail {};
+	if (!TileGetBlockLayout(tile == Prospero::TileMode::kDepth ? TileBlockFamily::Depth64KB
+	                                                           : TileBlockFamily::RenderTarget64KB,
+	                        bytes_per_element, block) ||
+	    !GetMipTailLayout(block, tail)) {
 		return false;
 	}
-	total_size.size  = static_cast<uint32_t>(blocks * slices * 4096u);
-	total_size.align = 4096;
+	uint64_t slice_size = 0;
+	for (uint32_t level = std::min(FirstTailLevel(tail, width, height, levels) + 1u, levels);
+	     level-- > 0;) {
+		const uint64_t size = uint64_t {ShiftCeil(width, level + (coverage_bits + 1u) / 2u)} *
+		                      ShiftCeil(height, level + coverage_bits / 2u) * 4096u;
+		mips[level] = {.size = static_cast<uint32_t>(size), .offset = static_cast<uint32_t>(slice_size)};
+		slice_size += size;
+	}
+	if (slice_size == 0 || slice_size > UINT32_MAX / slices) {
+		return false;
+	}
+	total_size = {static_cast<uint32_t>(slice_size * slices), 4096};
 	return true;
 }
 

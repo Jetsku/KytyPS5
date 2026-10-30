@@ -172,8 +172,9 @@ MakeAddcontInfo(const Loader::AddContentEntry& entry) {
 	NpEntitlementAccessAddcontEntitlementInfo info {};
 	std::memcpy(info.entitlement_label.data, entry.entitlement_label.data(),
 	            entry.entitlement_label.size());
-	info.package_type    = 2; // Additional content with extra data.
-	info.download_status = 4; // Installed.
+	const bool extra_data = !entry.mount_dir.empty();
+	info.package_type     = extra_data ? 2 : 3; // PSAC (with extra data) or PSAL (license only).
+	info.download_status  = extra_data ? 4 : 0; // INSTALLED or NO_EXTRA_DATA.
 	return info;
 }
 

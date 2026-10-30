@@ -396,6 +396,38 @@ void TestClassicSavePaths() {
 	CHECK(Search(1) == names);
 }
 
+void TestConvert() {
+	Reset("CONVERT");
+	const auto             source = DirName("save");
+	const auto             memory = DirName("sce_sdmemory");
+	struct SaveDataConvert convert {};
+	convert.user_id      = 1;
+	convert.src_dir_name = &memory;
+	convert.dst_blocks   = 96;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
+	// A missing source fails at once.
+	convert.src_dir_name = &source;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NOT_FOUND);
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &source;
+	mount.mount_mode = 4;
+	mount.blocks     = 96;
+	SaveDataMountResult mounted {};
+	CHECK(SaveDataMount3(&mount, &mounted) == OK);
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_BUSY);
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	convert.dst_blocks = 95;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC);
+	convert.dst_dir_name = &source;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_EXISTS);
+	for (const uint64_t blocks: {47u, 16385u}) {
+		convert.dst_blocks = blocks;
+		CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
+	}
+}
+
 void TestGuestSaveIsolation() {
 	Reset("MULTIUSER");
 	const auto name = DirName("slot");
@@ -628,25 +660,6 @@ void TestClassicSaveParams() {
 	CHECK(params[0].mtime == nested_mtime);
 }
 
-void RunChild(const fs::path& executable, const char* mode) {
-#ifdef _WIN32
-	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
-	              static_cast<char*>(nullptr)) == 0);
-#else
-	const pid_t pid = fork();
-	CHECK(pid >= 0);
-	if (pid == 0) {
-		execl(executable.c_str(), executable.c_str(), mode, static_cast<char*>(nullptr));
-		_exit(127);
-	}
-	int status = 0;
-	CHECK(waitpid(pid, &status, 0) == pid);
-	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-#endif
-}
-} // namespace
-
-// KYTY_SAVEDATA_SORT_KEY (upstream 4b0282e34): searches sort by the requested key.
 void TestSearchSortKeys() {
 	Reset("SORTED");
 	const std::array names {DirName("alpha"), DirName("bravo"), DirName("charlie")};
@@ -688,12 +701,25 @@ void TestSearchSortKeys() {
 	CHECK(search(SaveDataSortKey::Blocks, SaveDataSortOrder::Ascent) == "alpha bravo charlie");
 }
 
-int main(int argc, char** argv) {
+void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
-	_putenv("KYTY_SAVEDATA_SORT_KEY=1");
+	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
+	              static_cast<char*>(nullptr)) == 0);
 #else
-	setenv("KYTY_SAVEDATA_SORT_KEY", "1", 1);
+	const pid_t pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0) {
+		execl(executable.c_str(), executable.c_str(), mode, static_cast<char*>(nullptr));
+		_exit(127);
+	}
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 #endif
+}
+} // namespace
+
+int main(int argc, char** argv) {
 	Config::Initialize();
 	if (argc == 2) {
 		if (std::string_view(argv[1]) == "write") {
@@ -717,6 +743,7 @@ int main(int argc, char** argv) {
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
+	TestConvert();
 	TestGuestSaveIsolation();
 	TestSaveAllocations();
 	TestClassicSaveParams();

@@ -1994,6 +1994,18 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	return 5;
 }
 
+// Experimental Pro mode (upstream 651ef73a0): libPsml's linear PSSR request.
+KYTY_CP_OP_PARSER(CpOpPssr) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+
+	const auto packet_dw = KYTY_PM4_LEN(cmd_id) - 1;
+	EXIT_NOT_IMPLEMENTED(packet_dw < Pssr::RequestDwords || packet_dw > dw);
+	Pssr::Request request {};
+	std::memcpy(&request, buffer, sizeof(request));
+	cp.ProcessPssr(request);
+	return packet_dw;
+}
+
 KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
@@ -2524,11 +2536,36 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
+	// Agc emits RELEASE_MEM as a private NOP (R_RELEASE_MEM); a guest-built native packet
+	// (upstream bf5dd62ee) has the same body, with ADDRESS_LO's low two bits reserved.
+	if (cmd_id == 0xc0064900) {
+		uint32_t body[7];
+		std::memcpy(body, buffer, sizeof(body));
+		body[2] &= ~0x3u;
+		cp.ReleaseMem(body);
+		return 7;
+	}
+
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
 	cp.ReleaseMem(buffer);
 
 	return 7;
+}
+
+KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+
+	const auto control = buffer[2];
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
+	                     (control >> 29u) < 6u);
+
+	auto* counter = reinterpret_cast<uint64_t*>(
+	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
+	// A signal updates the counter before the next packet, so its mailbox stall never waits.
+	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
+
+	return 3;
 }
 
 KYTY_CP_OP_PARSER(CpOpSetContextReg) {
@@ -2752,22 +2789,6 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
 
 	return payload_dw;
-}
-
-// Upstream 1b7093805: the async command buffer's MEM_SEMAPHORE (AgcAcbMemSemaphore), signal (6) or
-// wait (7); SIGNAL_TYPE (bit 20) writes one instead of adding one.
-KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
-	KYTY_PROFILER_DETAIL_FUNCTION();
-
-	const auto control = buffer[2];
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
-	                     (control >> 29u) < 6u);
-
-	auto* counter = reinterpret_cast<uint64_t*>(
-	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
-	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
-
-	return 3;
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem32) {

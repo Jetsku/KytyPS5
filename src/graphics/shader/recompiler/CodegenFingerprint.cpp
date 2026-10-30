@@ -26,7 +26,7 @@ constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 // lds_limit_override, call_loop_cap.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 152,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 144,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -193,9 +193,6 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.native_wave64_branch) {
 		b.Text("native_wave64_branch");
 	}
-	if (options.tess_cp_mask) {
-		b.Text("tess_cp_mask");
-	}
 	if (options.sampler_reads_deferred) {
 		b.Text("sampler_reads_deferred");
 	}
@@ -247,23 +244,17 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.tess_indexed) {
 		b.Text("tess_indexed");
 	}
-	if (options.fract_clamp) {
-		b.Text("fract_clamp");
+	if (options.int_mrt_outputs) {
+		b.Text("int_mrt_outputs");
 	}
-	if (options.cvt_pk_saturate) {
-		b.Text("cvt_pk_saturate");
+	if (options.barrier_acquire_stores) {
+		b.Text("barrier_acquire_stores");
 	}
 	if (options.ufloat_store_rtz) {
 		b.Text("ufloat_store_rtz");
 	}
-	if (options.ls_active_lanes) {
-		b.Text("ls_active_lanes");
-	}
-	if (options.barrier_stores) {
-		b.Text("barrier_stores");
-	}
-	if (options.ps_integer_outputs) {
-		b.Text("ps_integer_outputs");
+	if (options.fract_clamp) {
+		b.Text("fract_clamp");
 	}
 	if (options.ps_exec_words) {
 		b.Text("ps_exec_words");

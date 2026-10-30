@@ -277,7 +277,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_FF0_I32_B64: return S_FF_I32_B64(inst, true);
 		case O::S_FF1_I32_B64: return S_FF_I32_B64(inst, false);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
-		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst, false);
+		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
 		case O::S_FLBIT_I32: return V_FFBH_32(inst, true);
 		case O::S_FLBIT_I32_I64: return S_FLBIT_I32_B64(inst, true);
 

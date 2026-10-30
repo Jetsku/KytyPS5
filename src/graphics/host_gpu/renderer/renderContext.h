@@ -149,11 +149,6 @@ public:
 	// by the GPU thread (BufferCache::StoreInPlace), the page left protected. False to decline.
 	[[nodiscard]] bool TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
 	                                   const void* data, uint64_t size) noexcept;
-	// KYTY_LABEL_IN_PLACE (adapted from upstream 2463e3aaf): the command processor's end-of-pipe
-	// label store on a page protected because the GPU wrote it, done on both copies by the GPU
-	// thread (BufferCache::StoreInPlace) instead of a write fault that downloads the page's
-	// GPU-written bytes first. False to decline: the caller stores through the guest mapping.
-	[[nodiscard]] bool StoreLabelInPlace(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// A host write of the whole of [vaddr, vaddr + size) is about to happen (an APR file read):
 	// when resource tracking watches any of its pages, one invalidation of the range (as the

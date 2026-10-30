@@ -27,13 +27,7 @@ void Translator::Integer16Mad(const Decoder::Instruction& inst, bool sign) {
 	const auto rhs    = ReadU16AsU32(inst.src1, sign);
 	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, sign));
 	if (inst.dst.clamp) {
-		if (sign) {
-			result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
-			result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
-		} else {
-			// u16 * u16 + u16 fits in 32 bits.
-			result = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {result, IR::Value(0xffffu)}));
-		}
+		result = Saturate16(result, sign);
 	}
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
@@ -269,17 +263,17 @@ void Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
 }
 
 void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign) {
-	auto source = ReadU64(inst.src0);
+	auto words = ReadU32Pair(inst.src0);
 	if (sign) {
-		// S_FLBIT_I32_I64 (upstream ecc30a1f2): a literal is sign-extended, then bits equal to the
-		// sign become zero, so the search finds the first bit that differs from the sign.
-		auto words = ReadU32Pair(inst.src0);
+		// S_FLBIT_I32_I64 (upstream ecc30a1f2): a signed source sign-extends a literal; then bits
+		// equal to the sign become zero, so the search finds the first bit that differs from it.
 		if (inst.src0.kind == Decoder::OperandKind::LiteralConstant) {
 			words[1] = ir.ShiftRightArithmetic(words[0], IR::U32(IR::Value(31u)));
 		}
 		const auto mask = ir.ShiftRightArithmetic(words[1], IR::U32(IR::Value(31u)));
-		source = ir.ConstructU64(ir.BitwiseXor(words[0], mask), ir.BitwiseXor(words[1], mask));
+		words           = {ir.BitwiseXor(words[0], mask), ir.BitwiseXor(words[1], mask)};
 	}
+	const auto source   = ir.ConstructU64(words[0], words[1]);
 	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb64, {source}));
 	const auto position = ir.ISub(IR::U32(IR::Value(63u)), msb);
 	const auto nonzero =

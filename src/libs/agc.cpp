@@ -25,6 +25,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -1072,8 +1073,8 @@ static bool is_native_reg_indirect_packet(const uint32_t* cmd, RegIndirectPacket
 	return ((cmd[0] >> 8u) & 0xffu) == reg_indirect_native_op(type);
 }
 
-static constexpr bool is_trinity_mode() {
-	return false;
+static bool is_trinity_mode() {
+	return Loader::SystemContentIsTrinityMode();
 }
 
 static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
@@ -3323,8 +3324,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	                        poll_cycles);
 }
 
-// Upstream 1b7093805: the async MEM_SEMAPHORE, framed by Agc's internal-data markers. A signal pads
-// with a NOP header where a wait ends with its end marker.
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
                                            uint8_t mailbox, uint8_t signal_type, uint8_t op) {
 	EXIT_NOT_IMPLEMENTED(op != 6u && op != 7u);
@@ -3343,6 +3342,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
 	cmd[3] = static_cast<uint32_t>(address_value);
 
+	// A signal pads with a NOP header where a wait ends with its end marker.
 	auto* semaphore = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
 	if (signal) {
 		semaphore[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_NOP, 0u);
@@ -4061,8 +4061,6 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
                                                       const volatile Label* address) {
 	PRINT_NAME();
 
-	// Not sure
-
 	AgcTrace("\t cmd     = 0x%016" PRIx64 "\n"
 	         "\t address = 0x%016" PRIx64 "\n",
 	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
@@ -4074,8 +4072,11 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 
 	if ((op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM) ||
 	    op == Pm4::IT_RELEASE_MEM) {
-		cmd[3] = static_cast<uint32_t>(vaddr & 0xffffffffu);
-		cmd[4] = static_cast<uint32_t>((vaddr >> 32u) & 0xffffffffu);
+		// A kSendIntCtx release has no address (upstream bf5dd62ee); ADDRESS_LO keeps its low bits.
+		if (((cmd[2] >> 24u) & 0x7u) != 4u) {
+			cmd[3] = (cmd[3] & 0x3u) | (static_cast<uint32_t>(vaddr) & ~0x3u);
+			cmd[4] = static_cast<uint32_t>(vaddr >> 32u);
+		}
 	} else if (op == Pm4::IT_EVENT_WRITE_EOP) {
 		cmd[2] = static_cast<uint32_t>(vaddr & 0xffffffffu);
 		cmd[3] = (cmd[3] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);

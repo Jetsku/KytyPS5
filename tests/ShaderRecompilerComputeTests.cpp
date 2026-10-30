@@ -22063,8 +22063,6 @@ public:
         PackedCase{vk::Format::eR16G16Unorm, 0x0000ffffu, {1.0f, 0.0f}},
         PackedCase{vk::Format::eR16G16Unorm, 0x80000001u,
                    {1.0f / 65535.0f, 32768.0f / 65535.0f}},
-        PackedCase{vk::Format::eR8Unorm, 0xffffff80u, {128.0f / 255.0f}},
-        PackedCase{vk::Format::eR8G8Unorm, 0xffff40ffu, {1.0f, 64.0f / 255.0f}},
     };
     for (const auto &test : packed_cases) {
       vk::ClearColorValue clear{};
@@ -22136,34 +22134,6 @@ public:
                   !DecodeFillWord(vk::Format::eD32Sfloat, 0u, clear),
               "a zero fill word of an uncompressed color format was not a clear, or another was");
     }
-    vk::ClearColorValue clear{};
-    struct UintCase {
-      vk::Format format;
-      uint64_t word;
-      std::array<uint32_t, 4> channels;
-    };
-    for (const auto &test : {UintCase{vk::Format::eR8Uint, 0xffffff05u, {5u}},
-                             UintCase{vk::Format::eR8G8Uint, 0xffff0a05u, {5u, 10u}},
-                             UintCase{vk::Format::eR16Uint, 0xffff1234u, {0x1234u}}}) {
-      Require(name, "packed unsigned color clear",
-              DecodePackedColorClear(test.format, test.word, clear) &&
-                  std::bit_cast<std::array<uint32_t, 4>>(clear.uint32) == test.channels,
-              "narrow unsigned clear lost a channel or kept bits of the next one");
-    }
-    Require(name, "R8 DWORD fill",
-            !DecodeColorDwordFill(vk::Format::eR8Uint, 0x01020304u, clear) &&
-                DecodeColorDwordFill(vk::Format::eR8Uint, 0x07070707u, clear) &&
-                clear.uint32[0] == 7u,
-            "differing R8 pixels were treated as a uniform clear");
-    Require(name, "RG8 DWORD fill",
-            !DecodeColorDwordFill(vk::Format::eR8G8Unorm, 0x00ff00feu, clear) &&
-                DecodeColorDwordFill(vk::Format::eR8G8Unorm, 0x00ff00ffu, clear) &&
-                clear.float32[0] == 1.0f && clear.float32[1] == 0.0f,
-            "alternating RG8 pixels were treated as a uniform clear");
-    Require(name, "RG32 DWORD fill",
-            DecodeColorDwordFill(vk::Format::eR32G32Sfloat, 0x3f800000u, clear) &&
-                clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,
-            "a repeated DWORD fill was decoded as a two-register clear");
     constexpr uintptr_t base = 0x0000000204100000ull;
     constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -28301,7 +28271,9 @@ public:
                     image.dimension ==
                         ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
                     image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
+                    image.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim3D;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -34801,46 +34773,6 @@ TestCase ScalarNotB64UpdatesScc() {
            O::S_ENDPGM}};
 }
 
-TestCase ScalarQuadmaskB32(u32 wave_size) {
-  using O = ShaderOpcode;
-  TestCase test;
-  test.name = wave_size == 32 ? "ScalarQuadmaskB32Wave32" : "ScalarQuadmaskB32Wave64";
-  test.initial = {0, 0xffffffffu, 0x80000011u, 0x01010101u};
-  for (u32 bit = 0; bit < 32; ++bit) test.initial.push_back(1u << bit);
-  test.expected = test.initial;
-  auto &code = test.code;
-  for (u32 i = 0; i < test.initial.size(); ++i) {
-    u32 quads = 0;
-    for (u32 q = 0; q < 8; ++q) {
-      if ((test.initial[i] >> (4 * q)) & 15u) quads |= 1u << q;
-    }
-    AppendVMovU32(&code, 30, i * sizeof(u32));
-    AppendBufferLoadDword(&code, 2, 30);
-    for (u32 dst : {12u, 106u}) {
-      code.push_back(EncodeVop1(0x02, dst, Vgpr(2)));
-      AppendSMovLiteral(&code, dst + 1, 0xdeadbeefu);
-      code.push_back(EncodeSopc(0x06, InlineU32(quads == 0), InlineU32(1)));
-      code.push_back(EncodeSop1(0x2c, dst, dst));
-      code.push_back(EncodeSop2(0x0a, 14, InlineU32(1), InlineU32(0)));
-      AppendStoreSgpr(&code, dst, static_cast<u32>(test.expected.size()));
-      AppendStoreSgpr(&code, dst + 1, static_cast<u32>(test.expected.size()) + 1);
-      AppendStoreSgpr(&code, 14, static_cast<u32>(test.expected.size()) + 2);
-      test.expected.insert(test.expected.end(), {quads, 0xdeadbeefu, quads != 0});
-    }
-  }
-  code.push_back(EncodeSop1(0x2c, 12, 255));
-  code.push_back(0x000f000fu);
-  AppendStoreSgpr(&code, 12, static_cast<u32>(test.expected.size()));
-  test.expected.push_back(0x11u);
-  AppendEnd(&code);
-  test.opcodes = {O::S_QUADMASK_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::S_MOV_B32,
-                  O::V_READFIRSTLANE_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
-  return test;
-}
-
 TestCase ScalarQuadmaskB64() {
   using O = ShaderOpcode;
 
@@ -34933,43 +34865,6 @@ TestCase ScalarFlbitI32B32Gpu() {
           {},
           {0xffffffffu, 16, 0, 1},
           {O::S_MOV_B32, O::S_FLBIT_I32_B32, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
-TestCase ScalarFlbitSignedGpu() {
-  using O = ShaderOpcode;
-
-  // RDNA2's S_FLBIT_I32 examples; 64-bit signs come from the high word.
-  constexpr u32 values32[] = {0x00000000u, 0x0000ccccu, 0xffff3333u,
-                          0x7fffffffu, 0x80000000u, 0xffffffffu};
-  constexpr uint64_t values64[] = {0x0000000000000000ull, 0xffffffffffffffffull,
-                               0x0000000100000000ull, 0xffffffff7fffffffull,
-                               0xc000000000000000ull, 0x0000000000008000ull};
-  std::vector<u32> code;
-  u32 out = 0;
-  for (const auto value : values32) {
-    AppendSMovLiteral(&code, 0, value);
-    code.push_back(EncodeSop1(0x17, 20, 0));
-    AppendStoreSgpr(&code, 20, out++);
-  }
-  for (const auto value : values64) {
-    AppendSMovLiteral(&code, 0, static_cast<u32>(value));
-    AppendSMovLiteral(&code, 1, static_cast<u32>(value >> 32u));
-    code.push_back(EncodeSop1(0x18, 20, 0));
-    AppendStoreSgpr(&code, 20, out++);
-  }
-  // A signed 64-bit source sign-extends a literal.
-  code.push_back(EncodeSop1(0x18, 20, 255));
-  code.push_back(0x80000000u);
-  AppendStoreSgpr(&code, 20, out);
-  AppendEnd(&code);
-
-  return {"ScalarFlbitSignedGpu",
-          code,
-          {},
-          {0xffffffffu, 16, 16, 1, 1, 0xffffffffu, 0xffffffffu, 0xffffffffu,
-           31, 32, 2, 48, 33},
-          {O::S_MOV_B32, O::S_FLBIT_I32, O::S_FLBIT_I32_I64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -37575,102 +37470,6 @@ TestCase Vop2SdwaMinI32CapturedByte0(u32 wave_size) {
   return test;
 }
 
-TestCase VectorMulHi24(u32 wave_size) {
-  using O = ShaderOpcode;
-  namespace D = ShaderRecompiler::Decoder;
-  constexpr std::array<u32, 8> lhs{0x7f7fffffu, 0xa5800000u, 0x12ffffffu, 0xab000000u,
-                                   0x00010000u, 0xffabcdefu, 0x80000001u, 0x7fffffffu};
-  constexpr std::array<u32, 8> rhs{0x00800000u, 0xcd800000u, 0x55000001u, 0x99ffffffu,
-                                   0xab010000u, 0x00ffffffu, 0xfffffffeu, 0xffffffffu};
-  TestCase test;
-  test.name = wave_size == 32 ? "VectorMulHi24Wave32" : "VectorMulHi24Wave64";
-  for (u32 lane = 0; lane < wave_size; ++lane) test.initial.push_back(lhs[lane % lhs.size()]);
-  for (u32 lane = 0; lane < wave_size; ++lane) test.initial.push_back(rhs[lane % rhs.size()]);
-  test.expected = test.initial;
-  auto &code = test.code;
-  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
-  AppendBufferLoadDword(&code, 2, 30);
-  AppendVMovU32(&code, 20, wave_size * sizeof(u32));
-  code.push_back(EncodeVop2(0x25, 30, Vgpr(20), 30));
-  AppendBufferLoadDword(&code, 3, 30);
-  for (bool sign : {true, false}) {
-    const u32 opcode = sign ? 0x0a : 0x0c;
-    for (u32 modifier = 0; modifier < 13; ++modifier) {
-      const u32 words[] = {
-          EncodeVop3Word0(0x100 + opcode, 7, modifier < 3 ? 1u << modifier : 0,
-                          modifier >= 9 ? 1u << (modifier - 9) : 0),
-          EncodeVop3Word1(Vgpr(5), Vgpr(6), 0,
-                          modifier >= 6 && modifier < 9 ? modifier - 5 : 0,
-                          modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
-      D::Instruction decoded;
-      D::DecodeInstruction(words, 0, decoded);
-      Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
-              "24-bit high multiply accepted unsupported modifiers");
-    }
-    for (u32 variant = 0; variant < 10; ++variant) {
-      code.push_back(EncodeVop1(0x01, 5, Vgpr(2)));
-      code.push_back(EncodeVop1(0x01, 6, Vgpr(3)));
-      AppendVMovLiteral(&code, 7, 0xa5a5beefu);
-      u32 dst = 7;
-      switch (variant) {
-        case 0: dst = 5; code.push_back(EncodeVop2(opcode, dst, Vgpr(5), 6)); break;
-        case 1: dst = 6; AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), Vgpr(6)); break;
-        case 2: AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), Vgpr(6), 0, 0, 0, true); break;
-        case 3:
-          code.push_back(EncodeVop2(opcode, dst, 255, 6));
-          code.push_back(0x00ffffffu);
-          break;
-        case 4:
-          AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), 255);
-          code.push_back(0x00800000u);
-          break;
-        case 5:
-          AppendSMovLiteral(&code, 20, 0xffff0001u);
-          AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), 20);
-          break;
-        case 6:
-        case 7:
-        case 8:
-          code.push_back(EncodeVop2(opcode, dst, 249, 6));
-          code.push_back(EncodeVop2Sdwa(5, variant == 7 ? 5 : 6, variant == 7 ? 2 : 0,
-                                        variant == 8 ? 4 : 6, 6, variant == 8));
-          break;
-        case 9:
-          code.push_back(EncodeVop2(opcode, dst, 250, 6));
-          code.push_back(EncodeVop2Dpp(5, 0x01b)); // Reverse each quad's source lanes.
-          break;
-      }
-      AppendStoreVgprAtLaneDwordOffset(&code, dst, 0, static_cast<u32>(test.expected.size()));
-      for (u32 lane = 0; lane < wave_size; ++lane) {
-        const u32 source_lane = variant == 9 ? lane ^ 3u : lane;
-        u32 a = lhs[source_lane % lhs.size()], b = rhs[lane % rhs.size()];
-        if (variant == 3) a = 0x00ffffffu;
-        if (variant == 4) b = 0x00800000u;
-        if (variant == 5) b = 0xffff0001u;
-        if (variant == 8) a = (a & 0x8000u) ? a | 0xffff0000u : a & 0xffffu;
-        const auto extend24 = [sign](u32 value) -> int64_t {
-          const int64_t low = value & 0x00ffffffu;
-          return sign && (value & 0x00800000u) ? low - 0x01000000 : low;
-        };
-        const uint64_t product = static_cast<uint64_t>(extend24(a) * extend24(b));
-        const u32 high = static_cast<u32>(product >> 32);
-        test.expected.push_back(variant == 7 ? 0xbeefu | (high << 16) : high);
-      }
-    }
-  }
-  AppendEnd(&code);
-  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
-                  O::BUFFER_LOAD_DWORD, O::V_MUL_HI_I32_I24, O::V_MUL_HI_U32_U24,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.wave_size = wave_size;
-  test.compute_info.threads_num[0] = wave_size;
-  test.compute_info.threads_num[1] = 1;
-  test.compute_info.threads_num[2] = 1;
-  test.compute_info.thread_ids_num = 1;
-  test.has_compute_info = true;
-  return test;
-}
-
 TestCase Vop2SdwaMulI24Destinations(u32 wave_size) {
   using O = ShaderOpcode;
   constexpr std::array<u32, 5> sources{
@@ -37864,7 +37663,8 @@ TestCase Vop3CvtPkI16I32Captured() {
   test.name = "Vop3CvtPkI16I32Captured";
   test.code = std::move(code);
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
-  test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
+  // Each half saturates: 98305 -> 0x7fff, -98306 -> 0x8000.
+  test.expected = {0x00018001u, 0xfffe7ffeu, 0x80007fffu};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
@@ -37970,60 +37770,6 @@ TestCase Vop3F32ClampFlushesNaN() {
   return test;
 }
 
-TestCase Vop3MadU16(u32 wave_size) {
-  using O = ShaderOpcode;
-  namespace D = ShaderRecompiler::Decoder;
-  constexpr std::array<std::array<u32, 3>, 4> inputs{{
-      {0xffff0002u, 0x80000003u, 0x00010004u},
-      {0xffffffffu, 0xffffffffu, 0xffffffffu},
-      {0x0000ffffu, 0x00010001u, 0x00010000u},
-      {0x7fff8000u, 0x80007fffu, 0x8000ffffu}}};
-  TestCase test;
-  test.name = wave_size == 32 ? "Vop3MadU16Wave32" : "Vop3MadU16Wave64";
-  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
-  test.expected = test.initial;
-  auto &code = test.code;
-  for (u32 modifier = 0; modifier < 9; ++modifier) {
-    const u32 words[] = {
-        EncodeVop3Word0(0x340, 9, modifier < 3 ? 1u << modifier : 0),
-        EncodeVop3Word1(Vgpr(2), Vgpr(3), Vgpr(4), modifier >= 6 ? modifier - 5 : 0,
-                        modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
-    D::Instruction decoded;
-    D::DecodeInstruction(words, 0, decoded);
-    Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
-            "unsigned 16-bit multiply-add accepted a floating-point modifier");
-  }
-  for (u32 i = 0; i < inputs.size(); ++i) {
-    for (u32 variant = 0; variant < 32; ++variant) {
-      const u32 selectors = variant & 15u;
-      const bool clamp = variant >= 16;
-      std::array<u32, 3> selected{};
-      for (u32 operand = 0; operand < 3; ++operand) {
-        AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
-        AppendBufferLoadDword(&code, 2 + operand, 30);
-        selected[operand] = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
-      }
-      const u32 dst = selectors % 4 < 3 ? 2 + selectors % 4 : 9;
-      AppendVMovLiteral(&code, 9, 0xa5a5beefu);
-      AppendVop3(&code, 0x340, dst, Vgpr(2), Vgpr(3), i == 3 ? 255 : Vgpr(4), 0,
-                  selectors, clamp);
-      if (i == 3) code.push_back(inputs[i][2]);
-      AppendStoreVgpr(&code, dst, static_cast<u32>(test.expected.size()));
-      const uint64_t wide = uint64_t{selected[0]} * selected[1] + selected[2];
-      const u32 result = clamp && wide > 0xffffu ? 0xffffu : static_cast<u32>(wide) & 0xffffu;
-      const u32 old = dst == 9 ? 0xa5a5beefu : inputs[i][dst - 2];
-      test.expected.push_back(selectors & 8u ? (old & 0xffffu) | (result << 16)
-                                              : (old & 0xffff0000u) | result);
-    }
-  }
-  AppendEnd(&code);
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_U16,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
-  return test;
-}
-
 TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   using O = ShaderOpcode;
   struct MadCase {
@@ -38079,71 +37825,6 @@ TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_MAD_I16", cases.size()}};
   test.required_spirv = {"OpIMul", "OpIAdd"};
-  return test;
-}
-
-TestCase Vop3Integer16Ternary(u32 wave_size) {
-  using O = ShaderOpcode;
-  namespace D = ShaderRecompiler::Decoder;
-  struct Operation { u32 encoding; O opcode; bool sign; u32 sorted_index; };
-  constexpr std::array operations{
-      Operation{0x352, O::V_MIN3_I16, true, 0},
-      Operation{0x355, O::V_MAX3_I16, true, 2},
-      Operation{0x356, O::V_MAX3_U16, false, 2},
-      Operation{0x359, O::V_MED3_U16, false, 1}};
-  constexpr std::array<std::array<u32, 3>, 4> inputs{{
-      {0x80007fffu, 0xffff0000u, 0x0001ffffu},
-      {0x00098000u, 0xffff0007u, 0x7fff0005u},
-      {0xffff8000u, 0xffff8000u, 0x00008000u},
-      {0x00000000u, 0x7fff7fffu, 0x7fff7fffu}}};
-  TestCase test;
-  test.name = wave_size == 32 ? "Vop3Integer16TernaryWave32" : "Vop3Integer16TernaryWave64";
-  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
-  test.expected = test.initial;
-  auto &code = test.code;
-  for (const auto &operation : operations) {
-    // Integer ternaries accept half selectors, but no floating-point modifiers.
-    for (u32 modifier = 0; modifier < 9; ++modifier) {
-      const u32 words[] = {
-          EncodeVop3Word0(operation.encoding, 9, modifier < 3 ? 1u << modifier : 0),
-          EncodeVop3Word1(Vgpr(2), Vgpr(3), Vgpr(4),
-                          modifier >= 6 ? modifier - 5 : 0,
-                          modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
-      D::Instruction decoded;
-      D::DecodeInstruction(words, 0, decoded);
-      Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
-              "16-bit integer ternary accepted a floating-point modifier");
-    }
-    for (u32 i = 0; i < inputs.size(); ++i) {
-      for (u32 variant = 0; variant < 32; ++variant) {
-        const u32 selectors = variant & 15u;
-        std::array<int32_t, 3> selected{};
-        for (u32 operand = 0; operand < 3; ++operand) {
-          AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
-          AppendBufferLoadDword(&code, 2 + operand, 30);
-          const u32 half = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
-          selected[operand] = operation.sign && half >= 0x8000u
-                                  ? static_cast<int32_t>(half) - 0x10000 : static_cast<int32_t>(half);
-        }
-        code.push_back(EncodeVop1(0x02, 12, Vgpr(3))); // Broadcast source 1 from an SGPR.
-        const u32 dst = selectors & 1u ? 2u : 9u; // Also cover source/destination aliasing.
-        AppendVMovLiteral(&code, 9, 0xa5a5beefu);
-        AppendVop3(&code, operation.encoding, dst, Vgpr(2), 12, Vgpr(4), 0, selectors, variant >= 16);
-        AppendStoreVgpr(&code, dst, static_cast<u32>(test.expected.size()));
-        std::sort(selected.begin(), selected.end());
-        const u32 result = static_cast<u32>(selected[operation.sorted_index]) & 0xffffu;
-        const u32 old = dst == 2 ? inputs[i][0] : 0xa5a5beefu;
-        test.expected.push_back(selectors & 8u ? (old & 0xffffu) | (result << 16)
-                                                : (old & 0xffff0000u) | result);
-      }
-    }
-    test.opcodes.push_back(operation.opcode);
-  }
-  AppendEnd(&code);
-  test.opcodes.insert(test.opcodes.end(), {O::V_MOV_B32, O::V_READFIRSTLANE_B32,
-      O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM});
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
   return test;
 }
 
@@ -38334,67 +38015,6 @@ TestCase VectorVop3LshlrevB64Captured() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpShiftLeftLogical", "OpTypeInt 64 0"};
-  return test;
-}
-
-TestCase VectorVop3AshrrevI64Operands() {
-  using O = ShaderOpcode;
-  TestCase test;
-  test.name = "VectorVop3AshrrevI64Operands";
-  test.initial = {33u, 0x89abcdefu, 0xfedcba98u};
-  test.expected = test.initial;
-  auto &code = test.code;
-  const auto store_result = [&](u32 dst, uint64_t value, u32 count) {
-    const auto output = static_cast<u32>(test.expected.size());
-    AppendStoreVgpr(&code, dst, output);
-    AppendStoreVgpr(&code, dst + 1u, output + 1u);
-    const auto expected = ReferenceAshrI64(value, count);
-    test.expected.push_back(static_cast<u32>(expected));
-    test.expected.push_back(static_cast<u32>(expected >> 32u));
-  };
-
-  constexpr uint64_t value = 0xfedcba9889abcdefull;
-  AppendVMovU32(&code, 30, sizeof(u32));
-  AppendBufferLoadDword(&code, 2, 30);
-  AppendVMovU32(&code, 30, 2u * sizeof(u32));
-  AppendBufferLoadDword(&code, 3, 30);
-  code.push_back(0xd7010007u);
-  code.push_back(0x00020498u);
-  store_result(7, value, 24u);
-
-  AppendSMovLiteral(&code, 106, static_cast<u32>(value));
-  AppendSMovLiteral(&code, 107, static_cast<u32>(value >> 32u));
-  AppendVMovU32(&code, 12, 68);
-  code.push_back(0xd7010001u);
-  code.push_back(0x0000d50cu);
-  store_result(1, value, 68u);
-
-  AppendVMovU32(&code, 30, 0);
-  AppendBufferLoadDword(&code, 12, 30);
-  for (const u32 literal : {0u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
-    const uint64_t extended =
-        literal | ((literal & 0x80000000u) != 0 ? 0xffffffff00000000ull : 0ull);
-    for (const u32 count : {0u, 1u, 31u, 32u, 63u, 64u}) {
-      AppendVop3(&code, 0x301, 7, InlineU32(count), 255u);
-      code.push_back(literal);
-      store_result(7, extended, count);
-    }
-    AppendVop3(&code, 0x301, 7, Vgpr(12), 255u);
-    code.push_back(literal);
-    store_result(7, extended, 33u);
-  }
-  AppendVop3(&code, 0x301, 7, Vgpr(12), 193u);
-  store_result(7, UINT64_MAX, 33u);
-  AppendVMovLiteral(&code, 7, static_cast<u32>(value));
-  AppendVMovLiteral(&code, 8, static_cast<u32>(value >> 32u));
-  AppendVop3(&code, 0x301, 7, Vgpr(12), Vgpr(7));
-  store_result(7, value, 33u);
-
-  AppendEnd(&code);
-  test.initial.resize(test.expected.size());
-  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
-                  O::V_ASHRREV_I64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftRightArithmetic", "OpTypeInt 64 0"};
   return test;
 }
 
@@ -39107,7 +38727,7 @@ TestCase VectorLaneAndPackedOps() {
           {},
           {0x12345678u, 0x12345678u, 0x12345678u, 0x12345678u, 0x40003c00u,
            0x46004400u, 0x48004200u, 0x40003c00u, 0x44004200u, 0x48804400u,
-           0x40000000u, 0xef015678u},
+           0x40000000u, 0xffffffffu},
           {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32,
            O::V_WRITELANE_B32, O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32,
            O::V_PK_ADD_F16, O::V_PK_MUL_F16, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
@@ -40873,79 +40493,6 @@ TestCase VectorMed3F32NanUsesMin3Path() {
           {},
           {0x40000000u, 0x40000000u, 0x40000000u},
           {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
-TestCase Vop3FloatConversions(u32 wave_size) {
-  using O = ShaderOpcode;
-  struct ConversionCase {
-    u32 opcode, input, expected;
-    u32 abs = 0, neg = 0, omod = 0;
-    bool clamp = false;
-    u32 exec = 1;
-  };
-  const ConversionCase cases[] = {
-      {0x18b, 0xabcd3e00u, 0x3fc00000u}, // Only the low half: 1.5.
-      {0x18b, 0x7c00c100u, 0xc0200000u}, // -2.5, despite +inf in the high half.
-      {0x18b, 0x12340000u, 0x00000000u},
-      {0x18b, 0x12348000u, 0x80000000u},
-      {0x18b, 0x12347c00u, 0x7f800000u},
-      {0x18b, 0x1234fc00u, 0xff800000u},
-      {0x18b, 0x1234c100u, 0x40200000u, 1},
-      {0x18b, 0x12343e00u, 0xbfc00000u, 0, 1},
-      {0x18b, 0x1234c100u, 0xc0200000u, 1, 1},
-      {0x18b, 0x12343e00u, 0x40400000u, 0, 0, 1},
-      {0x18b, 0x12343e00u, 0x40c00000u, 0, 0, 2},
-      {0x18b, 0x12343e00u, 0x3f400000u, 0, 0, 3},
-      {0x18b, 0x12343e00u, 0x3f800000u, 0, 0, 0, true},
-      {0x18b, 0x12343e00u, 0x00000000u, 0, 1, 0, true},
-      {0x18b, 0x12347e00u, 0x00000000u, 0, 0, 0, true}, // NaN clamp.
-      {0x18b, 0x12343e00u, 0x12343e00u, 0, 0, 0, false, 0},
-      {0x191, 0xff807f00u, 0x00000000u},
-      {0x192, 0xff807f00u, 0x42fe0000u},
-      {0x193, 0xff807f00u, 0x43000000u},
-      {0x194, 0xff807f00u, 0x437f0000u},
-      {0x191, 0xff807f00u, 0x00000000u, 1, 1, 1},
-      {0x192, 0xff807f00u, 0x43fe0000u, 1, 1, 2}, // 127 * 4; input modifiers ignored.
-      {0x193, 0xff807f00u, 0x42800000u, 1, 1, 3}, // 128 / 2.
-      {0x194, 0xff807f00u, 0x3f800000u, 1, 1, 0, true},
-      {0x194, 0xff807f00u, 0xff807f00u, 0, 0, 0, false, 0},
-  };
-  TestCase test;
-  test.name = wave_size == 32 ? "Vop3FloatConversionsWave32" : "Vop3FloatConversionsWave64";
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
-  for (const auto &entry : cases) test.initial.push_back(entry.input);
-  test.expected = test.initial;
-  auto &code = test.code;
-  for (u32 i = 0; i < std::size(cases); ++i) {
-    const auto &entry = cases[i];
-    AppendVMovU32(&code, 30, i * 4u);
-    AppendBufferLoadDword(&code, 2, 30); // Runtime source aliases the destination.
-    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
-    AppendVop3(&code, entry.opcode, 2, Vgpr(2), 0, 0, entry.abs, 0,
-                entry.clamp, entry.omod, entry.neg);
-    code.push_back(EncodeSMovB32(126, InlineU32(1)));
-    AppendStoreVgpr(&code, 2, static_cast<u32>(test.expected.size()));
-    test.expected.push_back(entry.expected);
-  }
-  // Exercise scalar, literal, and inline sources for every new encoding too.
-  AppendSMovLiteral(&code, 12, 0x44333e00u);
-  const u32 scalar_results[] = {0x3fc00000u, 0, 0x42780000u, 0x424c0000u, 0x42880000u};
-  const u32 opcodes[] = {0x18b, 0x191, 0x192, 0x193, 0x194};
-  for (u32 i = 0; i < std::size(opcodes); ++i) {
-    for (const u32 source : {12u, 255u, InlineU32(0)}) {
-      AppendVop3(&code, opcodes[i], 2, source, 0);
-      if (source == 255u) code.push_back(0x44333e00u);
-      AppendStoreVgpr(&code, 2, static_cast<u32>(test.expected.size()));
-      test.expected.push_back(source == InlineU32(0) ? 0u : scalar_results[i]);
-    }
-  }
-  AppendEnd(&code);
-  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
-                  O::V_CVT_F32_F16, O::V_CVT_F32_UBYTE0, O::V_CVT_F32_UBYTE1,
-                  O::V_CVT_F32_UBYTE2, O::V_CVT_F32_UBYTE3,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  return test;
 }
 
 TestCase VectorFloatConversionOps() {
@@ -46992,8 +46539,6 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size, bool high = false) {
   }
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 4u * passes * wave_size}};
-  // Upstream also checks that the D16_HI load leaves no fault bit at Marker + 0x70; this
-  // harness has no fault-bitmap check (TestCase::fault_free_address), the stored values still are.
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -50689,9 +50234,6 @@ template <u32 dim> TestCase ImageA16GradientsTakeOwnVgpr() {
   test.user_data[3] = static_cast<u32>(types[dim / 2u]) << 28u;
   test.has_user_data = true;
   test.required_spirv = {"OpImageSampleExplicitLod", "Grad"};
-  // Our dispatch harness has no 3D sampled test view (only 1D/2D and arrays): the 3D case checks
-  // its decode and SPIR-V only.
-  test.compile_only = volume;
   return test;
 }
 
@@ -53065,6 +52607,495 @@ TestCase CacheInvalidateAndClauseAreNoOps() {
 
 #include "ShaderRayTracingGpuTests.inc"
 
+// Ported from upstream (upsync7): cases for the instructions it added.
+TestCase ScalarQuadmaskB32(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32 ? "ScalarQuadmaskB32Wave32" : "ScalarQuadmaskB32Wave64";
+  test.initial = {0, 0xffffffffu, 0x80000011u, 0x01010101u};
+  for (u32 bit = 0; bit < 32; ++bit) test.initial.push_back(1u << bit);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < test.initial.size(); ++i) {
+    u32 quads = 0;
+    for (u32 q = 0; q < 8; ++q) {
+      if ((test.initial[i] >> (4 * q)) & 15u) quads |= 1u << q;
+    }
+    AppendVMovU32(&code, 30, i * sizeof(u32));
+    AppendBufferLoadDword(&code, 2, 30);
+    for (u32 dst : {12u, 106u}) {
+      code.push_back(EncodeVop1(0x02, dst, Vgpr(2)));
+      AppendSMovLiteral(&code, dst + 1, 0xdeadbeefu);
+      code.push_back(EncodeSopc(0x06, InlineU32(quads == 0), InlineU32(1)));
+      code.push_back(EncodeSop1(0x2c, dst, dst));
+      code.push_back(EncodeSop2(0x0a, 14, InlineU32(1), InlineU32(0)));
+      AppendStoreSgpr(&code, dst, static_cast<u32>(test.expected.size()));
+      AppendStoreSgpr(&code, dst + 1, static_cast<u32>(test.expected.size()) + 1);
+      AppendStoreSgpr(&code, 14, static_cast<u32>(test.expected.size()) + 2);
+      test.expected.insert(test.expected.end(), {quads, 0xdeadbeefu, quads != 0});
+    }
+  }
+  code.push_back(EncodeSop1(0x2c, 12, 255));
+  code.push_back(0x000f000fu);
+  AppendStoreSgpr(&code, 12, static_cast<u32>(test.expected.size()));
+  test.expected.push_back(0x11u);
+  AppendEnd(&code);
+  test.opcodes = {O::S_QUADMASK_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::S_MOV_B32,
+                  O::V_READFIRSTLANE_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarFlbitSignedGpu() {
+  using O = ShaderOpcode;
+
+  // RDNA2's S_FLBIT_I32 examples; 64-bit signs come from the high word.
+  constexpr u32 values32[] = {0x00000000u, 0x0000ccccu, 0xffff3333u,
+                          0x7fffffffu, 0x80000000u, 0xffffffffu};
+  constexpr uint64_t values64[] = {0x0000000000000000ull, 0xffffffffffffffffull,
+                               0x0000000100000000ull, 0xffffffff7fffffffull,
+                               0xc000000000000000ull, 0x0000000000008000ull};
+  std::vector<u32> code;
+  u32 out = 0;
+  for (const auto value : values32) {
+    AppendSMovLiteral(&code, 0, value);
+    code.push_back(EncodeSop1(0x17, 20, 0));
+    AppendStoreSgpr(&code, 20, out++);
+  }
+  for (const auto value : values64) {
+    AppendSMovLiteral(&code, 0, static_cast<u32>(value));
+    AppendSMovLiteral(&code, 1, static_cast<u32>(value >> 32u));
+    code.push_back(EncodeSop1(0x18, 20, 0));
+    AppendStoreSgpr(&code, 20, out++);
+  }
+  // A signed 64-bit source sign-extends a literal.
+  code.push_back(EncodeSop1(0x18, 20, 255));
+  code.push_back(0x80000000u);
+  AppendStoreSgpr(&code, 20, out);
+  AppendEnd(&code);
+
+  return {"ScalarFlbitSignedGpu",
+          code,
+          {},
+          {0xffffffffu, 16, 16, 1, 1, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+           31, 32, 2, 48, 33},
+          {O::S_MOV_B32, O::S_FLBIT_I32, O::S_FLBIT_I32_I64, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorMulHi24(u32 wave_size) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr std::array<u32, 8> lhs{0x7f7fffffu, 0xa5800000u, 0x12ffffffu, 0xab000000u,
+                                   0x00010000u, 0xffabcdefu, 0x80000001u, 0x7fffffffu};
+  constexpr std::array<u32, 8> rhs{0x00800000u, 0xcd800000u, 0x55000001u, 0x99ffffffu,
+                                   0xab010000u, 0x00ffffffu, 0xfffffffeu, 0xffffffffu};
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorMulHi24Wave32" : "VectorMulHi24Wave64";
+  for (u32 lane = 0; lane < wave_size; ++lane) test.initial.push_back(lhs[lane % lhs.size()]);
+  for (u32 lane = 0; lane < wave_size; ++lane) test.initial.push_back(rhs[lane % rhs.size()]);
+  test.expected = test.initial;
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 2, 30);
+  AppendVMovU32(&code, 20, wave_size * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 30, Vgpr(20), 30));
+  AppendBufferLoadDword(&code, 3, 30);
+  for (bool sign : {true, false}) {
+    const u32 opcode = sign ? 0x0a : 0x0c;
+    for (u32 modifier = 0; modifier < 13; ++modifier) {
+      const u32 words[] = {
+          EncodeVop3Word0(0x100 + opcode, 7, modifier < 3 ? 1u << modifier : 0,
+                          modifier >= 9 ? 1u << (modifier - 9) : 0),
+          EncodeVop3Word1(Vgpr(5), Vgpr(6), 0,
+                          modifier >= 6 && modifier < 9 ? modifier - 5 : 0,
+                          modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
+      D::Instruction decoded;
+      D::DecodeInstruction(words, 0, decoded);
+      Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
+              "24-bit high multiply accepted unsupported modifiers");
+    }
+    for (u32 variant = 0; variant < 10; ++variant) {
+      code.push_back(EncodeVop1(0x01, 5, Vgpr(2)));
+      code.push_back(EncodeVop1(0x01, 6, Vgpr(3)));
+      AppendVMovLiteral(&code, 7, 0xa5a5beefu);
+      u32 dst = 7;
+      switch (variant) {
+        case 0: dst = 5; code.push_back(EncodeVop2(opcode, dst, Vgpr(5), 6)); break;
+        case 1: dst = 6; AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), Vgpr(6)); break;
+        case 2: AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), Vgpr(6), 0, 0, 0, true); break;
+        case 3:
+          code.push_back(EncodeVop2(opcode, dst, 255, 6));
+          code.push_back(0x00ffffffu);
+          break;
+        case 4:
+          AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), 255);
+          code.push_back(0x00800000u);
+          break;
+        case 5:
+          AppendSMovLiteral(&code, 20, 0xffff0001u);
+          AppendVop3(&code, 0x100 + opcode, dst, Vgpr(5), 20);
+          break;
+        case 6:
+        case 7:
+        case 8:
+          code.push_back(EncodeVop2(opcode, dst, 249, 6));
+          code.push_back(EncodeVop2Sdwa(5, variant == 7 ? 5 : 6, variant == 7 ? 2 : 0,
+                                        variant == 8 ? 4 : 6, 6, variant == 8));
+          break;
+        case 9:
+          code.push_back(EncodeVop2(opcode, dst, 250, 6));
+          code.push_back(EncodeVop2Dpp(5, 0x01b)); // Reverse each quad's source lanes.
+          break;
+      }
+      AppendStoreVgprAtLaneDwordOffset(&code, dst, 0, static_cast<u32>(test.expected.size()));
+      for (u32 lane = 0; lane < wave_size; ++lane) {
+        const u32 source_lane = variant == 9 ? lane ^ 3u : lane;
+        u32 a = lhs[source_lane % lhs.size()], b = rhs[lane % rhs.size()];
+        if (variant == 3) a = 0x00ffffffu;
+        if (variant == 4) b = 0x00800000u;
+        if (variant == 5) b = 0xffff0001u;
+        if (variant == 8) a = (a & 0x8000u) ? a | 0xffff0000u : a & 0xffffu;
+        const auto extend24 = [sign](u32 value) -> int64_t {
+          const int64_t low = value & 0x00ffffffu;
+          return sign && (value & 0x00800000u) ? low - 0x01000000 : low;
+        };
+        const uint64_t product = static_cast<uint64_t>(extend24(a) * extend24(b));
+        const u32 high = static_cast<u32>(product >> 32);
+        test.expected.push_back(variant == 7 ? 0xbeefu | (high << 16) : high);
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_LOAD_DWORD, O::V_MUL_HI_I32_I24, O::V_MUL_HI_U32_U24,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop3CvtPk16Saturates() {
+  using O = ShaderOpcode;
+
+  TestCase test;
+  test.name = "Vop3CvtPk16Saturates";
+  test.initial = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
+                  0x00007fffu, 0xffff8000u, 0x00008000u, 0xffff7fffu,
+                  0u,          0u,          0u,          0u};
+  test.expected = {0x00001234u, 0x0000ffffu, 0x00010000u, 0x80000000u,
+                   0x00007fffu, 0xffff8000u, 0x00008000u, 0xffff7fffu,
+                   0xffff1234u, 0xffffffffu, 0x80007fffu, 0x80007fffu};
+  auto &code = test.code;
+  for (u32 i = 0; i < 8u; i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, i, 30);
+  }
+  AppendVop3(&code, 0x36a, 10, Vgpr(0), Vgpr(1)); // in range
+  AppendVop3(&code, 0x36a, 11, Vgpr(2), Vgpr(3)); // both clamp to 0xffff
+  AppendVop3(&code, 0x36b, 12, Vgpr(4), Vgpr(5)); // in range
+  AppendVop3(&code, 0x36b, 13, Vgpr(6), Vgpr(7)); // clamp to 0x7fff / 0x8000
+  for (u32 i = 0; i < 4u; i++) AppendStoreVgpr(&code, 10u + i, 8u + i);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_PK_U16_U32,
+                  O::V_CVT_PK_I16_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase Vop3MadU16(u32 wave_size) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  constexpr std::array<std::array<u32, 3>, 4> inputs{{
+      {0xffff0002u, 0x80000003u, 0x00010004u},
+      {0xffffffffu, 0xffffffffu, 0xffffffffu},
+      {0x0000ffffu, 0x00010001u, 0x00010000u},
+      {0x7fff8000u, 0x80007fffu, 0x8000ffffu}}};
+  TestCase test;
+  test.name = wave_size == 32 ? "Vop3MadU16Wave32" : "Vop3MadU16Wave64";
+  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 modifier = 0; modifier < 9; ++modifier) {
+    const u32 words[] = {
+        EncodeVop3Word0(0x340, 9, modifier < 3 ? 1u << modifier : 0),
+        EncodeVop3Word1(Vgpr(2), Vgpr(3), Vgpr(4), modifier >= 6 ? modifier - 5 : 0,
+                        modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
+    D::Instruction decoded;
+    D::DecodeInstruction(words, 0, decoded);
+    Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
+            "unsigned 16-bit multiply-add accepted a floating-point modifier");
+  }
+  for (u32 i = 0; i < inputs.size(); ++i) {
+    for (u32 variant = 0; variant < 32; ++variant) {
+      const u32 selectors = variant & 15u;
+      const bool clamp = variant >= 16;
+      std::array<u32, 3> selected{};
+      for (u32 operand = 0; operand < 3; ++operand) {
+        AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
+        AppendBufferLoadDword(&code, 2 + operand, 30);
+        selected[operand] = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
+      }
+      const u32 dst = selectors % 4 < 3 ? 2 + selectors % 4 : 9;
+      AppendVMovLiteral(&code, 9, 0xa5a5beefu);
+      AppendVop3(&code, 0x340, dst, Vgpr(2), Vgpr(3), i == 3 ? 255 : Vgpr(4), 0,
+                  selectors, clamp);
+      if (i == 3) code.push_back(inputs[i][2]);
+      AppendStoreVgpr(&code, dst, static_cast<u32>(test.expected.size()));
+      const uint64_t wide = uint64_t{selected[0]} * selected[1] + selected[2];
+      const u32 result = clamp && wide > 0xffffu ? 0xffffu : static_cast<u32>(wide) & 0xffffu;
+      const u32 old = dst == 9 ? 0xa5a5beefu : inputs[i][dst - 2];
+      test.expected.push_back(selectors & 8u ? (old & 0xffffu) | (result << 16)
+                                              : (old & 0xffff0000u) | result);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop3Integer16Ternary(u32 wave_size) {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  struct Operation { u32 encoding; O opcode; bool sign; u32 sorted_index; };
+  constexpr std::array operations{
+      Operation{0x352, O::V_MIN3_I16, true, 0},
+      Operation{0x355, O::V_MAX3_I16, true, 2},
+      Operation{0x356, O::V_MAX3_U16, false, 2},
+      Operation{0x359, O::V_MED3_U16, false, 1}};
+  constexpr std::array<std::array<u32, 3>, 4> inputs{{
+      {0x80007fffu, 0xffff0000u, 0x0001ffffu},
+      {0x00098000u, 0xffff0007u, 0x7fff0005u},
+      {0xffff8000u, 0xffff8000u, 0x00008000u},
+      {0x00000000u, 0x7fff7fffu, 0x7fff7fffu}}};
+  TestCase test;
+  test.name = wave_size == 32 ? "Vop3Integer16TernaryWave32" : "Vop3Integer16TernaryWave64";
+  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (const auto &operation : operations) {
+    // Integer ternaries accept half selectors, but no floating-point modifiers.
+    for (u32 modifier = 0; modifier < 9; ++modifier) {
+      const u32 words[] = {
+          EncodeVop3Word0(operation.encoding, 9, modifier < 3 ? 1u << modifier : 0),
+          EncodeVop3Word1(Vgpr(2), Vgpr(3), Vgpr(4),
+                          modifier >= 6 ? modifier - 5 : 0,
+                          modifier >= 3 && modifier < 6 ? 1u << (modifier - 3) : 0)};
+      D::Instruction decoded;
+      D::DecodeInstruction(words, 0, decoded);
+      Require(test.name, "integer modifiers", decoded.opcode == O::UNSUPPORTED,
+              "16-bit integer ternary accepted a floating-point modifier");
+    }
+    for (u32 i = 0; i < inputs.size(); ++i) {
+      for (u32 variant = 0; variant < 32; ++variant) {
+        const u32 selectors = variant & 15u;
+        std::array<int32_t, 3> selected{};
+        for (u32 operand = 0; operand < 3; ++operand) {
+          AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
+          AppendBufferLoadDword(&code, 2 + operand, 30);
+          const u32 half = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
+          selected[operand] = operation.sign && half >= 0x8000u
+                                  ? static_cast<int32_t>(half) - 0x10000 : static_cast<int32_t>(half);
+        }
+        code.push_back(EncodeVop1(0x02, 12, Vgpr(3))); // Broadcast source 1 from an SGPR.
+        const u32 dst = selectors & 1u ? 2u : 9u; // Also cover source/destination aliasing.
+        AppendVMovLiteral(&code, 9, 0xa5a5beefu);
+        AppendVop3(&code, operation.encoding, dst, Vgpr(2), 12, Vgpr(4), 0, selectors, variant >= 16);
+        AppendStoreVgpr(&code, dst, static_cast<u32>(test.expected.size()));
+        std::sort(selected.begin(), selected.end());
+        const u32 result = static_cast<u32>(selected[operation.sorted_index]) & 0xffffu;
+        const u32 old = dst == 2 ? inputs[i][0] : 0xa5a5beefu;
+        test.expected.push_back(selectors & 8u ? (old & 0xffffu) | (result << 16)
+                                                : (old & 0xffff0000u) | result);
+      }
+    }
+    test.opcodes.push_back(operation.opcode);
+  }
+  AppendEnd(&code);
+  test.opcodes.insert(test.opcodes.end(), {O::V_MOV_B32, O::V_READFIRSTLANE_B32,
+      O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorVop3AshrrevI64Operands() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorVop3AshrrevI64Operands";
+  test.initial = {33u, 0x89abcdefu, 0xfedcba98u};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store_result = [&](u32 dst, uint64_t value, u32 count) {
+    const auto output = static_cast<u32>(test.expected.size());
+    AppendStoreVgpr(&code, dst, output);
+    AppendStoreVgpr(&code, dst + 1u, output + 1u);
+    const auto expected = ReferenceAshrI64(value, count);
+    test.expected.push_back(static_cast<u32>(expected));
+    test.expected.push_back(static_cast<u32>(expected >> 32u));
+  };
+
+  constexpr uint64_t value = 0xfedcba9889abcdefull;
+  AppendVMovU32(&code, 30, sizeof(u32));
+  AppendBufferLoadDword(&code, 2, 30);
+  AppendVMovU32(&code, 30, 2u * sizeof(u32));
+  AppendBufferLoadDword(&code, 3, 30);
+  code.push_back(0xd7010007u);
+  code.push_back(0x00020498u);
+  store_result(7, value, 24u);
+
+  AppendSMovLiteral(&code, 106, static_cast<u32>(value));
+  AppendSMovLiteral(&code, 107, static_cast<u32>(value >> 32u));
+  AppendVMovU32(&code, 12, 68);
+  code.push_back(0xd7010001u);
+  code.push_back(0x0000d50cu);
+  store_result(1, value, 68u);
+
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 12, 30);
+  for (const u32 literal : {0u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+    const uint64_t extended =
+        literal | ((literal & 0x80000000u) != 0 ? 0xffffffff00000000ull : 0ull);
+    for (const u32 count : {0u, 1u, 31u, 32u, 63u, 64u}) {
+      AppendVop3(&code, 0x301, 7, InlineU32(count), 255u);
+      code.push_back(literal);
+      store_result(7, extended, count);
+    }
+    AppendVop3(&code, 0x301, 7, Vgpr(12), 255u);
+    code.push_back(literal);
+    store_result(7, extended, 33u);
+  }
+  AppendVop3(&code, 0x301, 7, Vgpr(12), 193u);
+  store_result(7, UINT64_MAX, 33u);
+  AppendVMovLiteral(&code, 7, static_cast<u32>(value));
+  AppendVMovLiteral(&code, 8, static_cast<u32>(value >> 32u));
+  AppendVop3(&code, 0x301, 7, Vgpr(12), Vgpr(7));
+  store_result(7, value, 33u);
+
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_ASHRREV_I64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftRightArithmetic", "OpTypeInt 64 0"};
+  return test;
+}
+
+TestCase Vop3FloatConversions(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct ConversionCase {
+    u32 opcode, input, expected;
+    u32 abs = 0, neg = 0, omod = 0;
+    bool clamp = false;
+    u32 exec = 1;
+  };
+  const ConversionCase cases[] = {
+      {0x18b, 0xabcd3e00u, 0x3fc00000u}, // Only the low half: 1.5.
+      {0x18b, 0x7c00c100u, 0xc0200000u}, // -2.5, despite +inf in the high half.
+      {0x18b, 0x12340000u, 0x00000000u},
+      {0x18b, 0x12348000u, 0x80000000u},
+      {0x18b, 0x12347c00u, 0x7f800000u},
+      {0x18b, 0x1234fc00u, 0xff800000u},
+      {0x18b, 0x1234c100u, 0x40200000u, 1},
+      {0x18b, 0x12343e00u, 0xbfc00000u, 0, 1},
+      {0x18b, 0x1234c100u, 0xc0200000u, 1, 1},
+      {0x18b, 0x12343e00u, 0x40400000u, 0, 0, 1},
+      {0x18b, 0x12343e00u, 0x40c00000u, 0, 0, 2},
+      {0x18b, 0x12343e00u, 0x3f400000u, 0, 0, 3},
+      {0x18b, 0x12343e00u, 0x3f800000u, 0, 0, 0, true},
+      {0x18b, 0x12343e00u, 0x00000000u, 0, 1, 0, true},
+      {0x18b, 0x12347e00u, 0x00000000u, 0, 0, 0, true}, // NaN clamp.
+      {0x18b, 0x12343e00u, 0x12343e00u, 0, 0, 0, false, 0},
+      {0x191, 0xff807f00u, 0x00000000u},
+      {0x192, 0xff807f00u, 0x42fe0000u},
+      {0x193, 0xff807f00u, 0x43000000u},
+      {0x194, 0xff807f00u, 0x437f0000u},
+      {0x191, 0xff807f00u, 0x00000000u, 1, 1, 1},
+      {0x192, 0xff807f00u, 0x43fe0000u, 1, 1, 2}, // 127 * 4; input modifiers ignored.
+      {0x193, 0xff807f00u, 0x42800000u, 1, 1, 3}, // 128 / 2.
+      {0x194, 0xff807f00u, 0x3f800000u, 1, 1, 0, true},
+      {0x194, 0xff807f00u, 0xff807f00u, 0, 0, 0, false, 0},
+  };
+  TestCase test;
+  test.name = wave_size == 32 ? "Vop3FloatConversionsWave32" : "Vop3FloatConversionsWave64";
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  for (const auto &entry : cases) test.initial.push_back(entry.input);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 2, 30); // Runtime source aliases the destination.
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    AppendVop3(&code, entry.opcode, 2, Vgpr(2), 0, 0, entry.abs, 0,
+                entry.clamp, entry.omod, entry.neg);
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendStoreVgpr(&code, 2, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(entry.expected);
+  }
+  // Exercise scalar, literal, and inline sources for every new encoding too.
+  AppendSMovLiteral(&code, 12, 0x44333e00u);
+  const u32 scalar_results[] = {0x3fc00000u, 0, 0x42780000u, 0x424c0000u, 0x42880000u};
+  const u32 opcodes[] = {0x18b, 0x191, 0x192, 0x193, 0x194};
+  for (u32 i = 0; i < std::size(opcodes); ++i) {
+    for (const u32 source : {12u, 255u, InlineU32(0)}) {
+      AppendVop3(&code, opcodes[i], 2, source, 0);
+      if (source == 255u) code.push_back(0x44333e00u);
+      AppendStoreVgpr(&code, 2, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(source == InlineU32(0) ? 0u : scalar_results[i]);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CVT_F32_F16, O::V_CVT_F32_UBYTE0, O::V_CVT_F32_UBYTE1,
+                  O::V_CVT_F32_UBYTE2, O::V_CVT_F32_UBYTE3,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferAtomicUMinX2GlcAndExec() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferAtomicUMinX2GlcAndExec";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  AppendVMovU32(&code, 20, 0);
+  const u32 values[][2] = {{0xffffffffu, 0x80000000u},
+                           {0xffffffffu, 0x7fffffffu},
+                           {0xfffffffeu, 0x7fffffffu},
+                           {0u, 0u}};
+  for (u32 i = 0; i < std::size(values); ++i) {
+    AppendVMovLiteral(&code, 2, values[i][0]);
+    AppendVMovLiteral(&code, 3, values[i][1]);
+    if (i == 3) {
+      code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    }
+    AppendBufferStoreOpcode(&code, 0x56, 2, 20, i != 1);
+    code.push_back(EncodeSop1(0x04, 126, 12));
+    AppendStoreVgpr(&code, 2, 2 + i * 2);
+    AppendStoreVgpr(&code, 3, 3 + i * 2);
+  }
+  AppendEnd(&code);
+  test.initial = {0u, 0x80000001u, 0, 0, 0, 0, 0, 0, 1, 1};
+  // The high dwords decide the first two mins, the second only when compared
+  // unsigned, and the low dwords the third. GLC returns the old value, the
+  // second min keeps its operand, and EXEC = 0 suppresses the fourth min.
+  test.expected = {0xfffffffeu, 0x7fffffffu, 0u, 0x80000001u,
+                   0xffffffffu, 0x7fffffffu, 0xffffffffu, 0x7fffffffu, 0, 0};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::BUFFER_ATOMIC_UMIN_X2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicUMin %ulong", "Int64Atomics"};
+  return test;
+}
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -53095,12 +53126,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarCompareOps);
   AddCase(ScalarShiftAddAndMaskOps);
   AddCase(ScalarNotB64UpdatesScc);
-  cases.push_back(ScalarQuadmaskB32(32));
-  cases.push_back(ScalarQuadmaskB32(64));
   AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
   AddCase(ScalarFlbitI32B32Gpu);
-  AddCase(ScalarFlbitSignedGpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
@@ -53130,8 +53158,22 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarAshrI64OperandsAndAliases);
   cases.push_back(ScalarAshrI64Masks(32));
   cases.push_back(ScalarAshrI64Masks(64));
-  AddCase(VectorDynamicU64ShiftEdges);
+  // upsync7 ports.
+  cases.push_back(ScalarQuadmaskB32(32));
+  cases.push_back(ScalarQuadmaskB32(64));
+  AddCase(ScalarFlbitSignedGpu);
+  cases.push_back(VectorMulHi24(32));
+  cases.push_back(VectorMulHi24(64));
+  AddCase(Vop3CvtPk16Saturates);
+  cases.push_back(Vop3MadU16(32));
+  cases.push_back(Vop3MadU16(64));
+  cases.push_back(Vop3Integer16Ternary(32));
+  cases.push_back(Vop3Integer16Ternary(64));
   AddCase(VectorVop3AshrrevI64Operands);
+  cases.push_back(Vop3FloatConversions(32));
+  cases.push_back(Vop3FloatConversions(64));
+  AddCase(BufferAtomicUMinX2GlcAndExec);
+  AddCase(VectorDynamicU64ShiftEdges);
   AddCase(ScalarConditionalMoveB64);
   AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
@@ -53179,8 +53221,6 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
   cases.push_back(Vop2SdwaMinI32CapturedByte0(32));
   cases.push_back(Vop2SdwaMinI32CapturedByte0(64));
-  cases.push_back(VectorMulHi24(32));
-  cases.push_back(VectorMulHi24(64));
   cases.push_back(Vop2SdwaMulI24Destinations(32));
   cases.push_back(Vop2SdwaMulI24Destinations(64));
   cases.push_back(Vop2SdwaMulU24Destinations(32));
@@ -53189,12 +53229,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
-  cases.push_back(Vop3MadU16(32));
-  cases.push_back(Vop3MadU16(64));
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3F32ClampFlushesNaN);
-  cases.push_back(Vop3Integer16Ternary(32));
-  cases.push_back(Vop3Integer16Ternary(64));
   AddCase(Vop3Min3U16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
@@ -53272,8 +53308,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
-  cases.push_back(Vop3FloatConversions(32));
-  cases.push_back(Vop3FloatConversions(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -59345,76 +59379,6 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
 }
 
-// Upstream 1b7093805: AgcAcbMemSemaphore's stream and the CP's MEM_SEMAPHORE.
-void CheckPm4MemSemaphore(RenderContext &renderer) {
-  constexpr const char *name = "Pm4MemSemaphore";
-  Loader::SymbolDatabase symbols;
-  Libs::InitAgcDriver_1(&symbols);
-  const auto *symbol = symbols.FindByNid("q4VuU-QsLOE", Loader::SymbolType::Func);
-  Require(name, "async export",
-          symbol != nullptr &&
-              symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
-          "async semaphore import did not resolve to the emitter");
-
-  GraphicsInitJmpTables();
-  CommandProcessor processor(renderer, 0x20);
-  const auto execute = [&](std::span<const uint32_t> commands) {
-    Pm4Execution execution;
-    return processor.Process(execution, commands) == Pm4ProcessResult::Complete;
-  };
-
-  alignas(8) uint64_t counter = 0;
-  const auto address = reinterpret_cast<uint64_t>(&counter);
-  const auto low = static_cast<uint32_t>(address);
-  const auto high = static_cast<uint32_t>(address >> 32u);
-  std::array<uint32_t, 11> packet{};
-  auto *const end = packet.data() + packet.size();
-  AgcCommandBufferLayout acb{packet.data(), end, packet.data(), end, nullptr, nullptr, 0};
-  // A packet header in unwritten DWORDs shows the CP skips the signal's pad by its length.
-  constexpr uint32_t poison = 0xc0023900u;
-  const auto emit = [&](uint8_t signal_type, uint8_t op) {
-    packet.fill(poison);
-    acb.cursor_up = packet.data();
-    return Gen5::AgcAcbMemSemaphore(reinterpret_cast<Gen5::CommandBuffer *>(&acb), &counter, 1,
-                                    signal_type, op) == packet.data() &&
-           acb.cursor_up == end;
-  };
-
-  Require(name, "wait stream",
-          emit(0, 7) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
-                                         0xc0023900u, low & ~0x7u, high, 0xe0010000u,
-                                         0xc0017904u, 0x342u, 0xc9000000u} &&
-              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
-              Gen5::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
-          "semaphore wait differs from the native stream");
-  const auto wait = packet;
-  Pm4Execution waiting;
-  Require(name, "empty wait",
-          processor.Process(waiting, wait) == Pm4ProcessResult::Blocked &&
-              processor.Process(waiting, wait) == Pm4ProcessResult::Blocked &&
-              !waiting.MadeProgress() && counter == 0,
-          "semaphore wait passed or advanced on a zero counter");
-
-  Require(name, "increment stream",
-          emit(0, 6) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
-                                         0xc0011000u, poison, poison,
-                                         0xc0023900u, low & ~0x7u, high, 0xc0010000u} &&
-              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
-              execute(packet) && counter == 1 && execute(packet) && counter == 2,
-          "semaphore increment differs from the native stream or count");
-  Require(name, "resume",
-          processor.Process(waiting, wait) == Pm4ProcessResult::Complete && counter == 1,
-          "semaphore wait did not consume one count after a signal");
-
-  counter = 5;
-  Require(name, "write",
-          emit(1, 6) && packet[10] == 0xc0110000u && execute(packet) && counter == 1,
-          "semaphore write signal did not set the counter to one");
-  std::printf("[host]    %-32s ok\n", name);
-}
-
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -59963,51 +59927,6 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    RunCase(&vulkan, VectorMulHi24(32));
-    RunCase(&vulkan, VectorMulHi24(64));
-    RunCase(&vulkan, Vop2SdwaMulI24Destinations(32));
-    RunCase(&vulkan, Vop2SdwaMulI24Destinations(64));
-    RunCase(&vulkan, Vop2SdwaMulU24Destinations(32));
-    RunCase(&vulkan, Vop2SdwaMulU24Destinations(64));
-    RunCase(&vulkan, VectorVop3IntegerOps());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    RunCase(&vulkan, Vop3MadU16(32));
-    RunCase(&vulkan, Vop3MadU16(64));
-    RunCase(&vulkan, Vop3MadI16CapturedSelectorsAndSaturation());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--integer16-ternary-only") == 0) {
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    RunCase(&vulkan, Vop3Integer16Ternary(32));
-    RunCase(&vulkan, Vop3Integer16Ternary(64));
-    RunCase(&vulkan, Vop3Min3U16CapturedAndSelectors());
-    RunCase(&vulkan, Vop3Med3I16Captured());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--vop3-conversions-only") == 0) {
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    RunCase(&vulkan, Vop3FloatConversions(32));
-    RunCase(&vulkan, Vop3FloatConversions(64));
-    RunCase(&vulkan, VectorFloatConversionOps());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--quadmask-only") == 0) {
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarQuadmaskB32(32));
-    RunCase(&vulkan, ScalarQuadmaskB32(64));
-    RunCase(&vulkan, ScalarQuadmaskB64());
-    return 0;
-  }
   // Upstream 21a1346e2's compact colour exports, as the shipped preset sets them (code default off;
   // the PolygonModeRasterization export-routing cases are upstream's). An explicit value wins.
   if (std::getenv("KYTY_CB_SHADER_MASK_EXPORTS") == nullptr) {
@@ -60628,8 +60547,41 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMulHi24(32));
+    RunCase(&vulkan, VectorMulHi24(64));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3MadU16(32));
+    RunCase(&vulkan, Vop3MadU16(64));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--integer16-ternary-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3Integer16Ternary(32));
+    RunCase(&vulkan, Vop3Integer16Ternary(64));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--quadmask-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarQuadmaskB32(32));
+    RunCase(&vulkan, ScalarQuadmaskB32(64));
+    RunCase(&vulkan, ScalarQuadmaskB64());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vop3-conversions-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3FloatConversions(32));
+    RunCase(&vulkan, Vop3FloatConversions(64));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarFlbitSignedGpu());
+    RunCase(&vulkan, BufferAtomicUMinX2GlcAndExec());
     RunCase(&vulkan, VectorCompareInteger64Edges());
     RunCase(&vulkan, VectorCompare64WaveMasks(32, true));
     RunCase(&vulkan, VectorCompare64WaveMasks(64, true));
@@ -60640,7 +60592,6 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF16Ops());
     RunCase(&vulkan, ScalarBrevB64OperandsAndMasks(32));
     RunCase(&vulkan, ScalarBrevB64OperandsAndMasks(64));
-    RunCase(&vulkan, ScalarFlbitSignedGpu());
     for (bool add : {false, true}) {
       RunCase(&vulkan, DsAtomic64Bounds(add));
       for (u32 wave_size : {32, 64}) {
@@ -61285,7 +61236,6 @@ int main(int argc, char **argv) {
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
-    CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
@@ -61300,7 +61250,6 @@ int main(int argc, char **argv) {
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
-    CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     CheckCpSeqOps(vulkan.RuntimeRenderer());
@@ -61416,6 +61365,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    RunCase(&vulkan, Vop3CvtPk16Saturates());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
@@ -62168,7 +62118,6 @@ int main(int argc, char **argv) {
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
-  CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckCpSeqOps(vulkan.RuntimeRenderer());

@@ -34,6 +34,11 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 	return ret;
 }
 
+// F32 bits (u32) to f16 bits, rounding toward zero (upstream's helper for 59d8256b3).
+uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
+	return EmitF32ToF16RtzBits(state, EmitBitcastU32ToF32(state, bits));
+}
+
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto bits = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, f32);
