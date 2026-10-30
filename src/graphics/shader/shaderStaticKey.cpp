@@ -162,8 +162,10 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords | (info.lds_storage ? 0x80000000u : 0u));
 	key.push_back(info.scratch_size_dwords);
 	// Bit 1: an async compute queue (S_GETREG_B32 HW_ID2 answers only for graphics compute).
+	// Bit 2: thread counts read through a device address (KYTY_INDIRECT_THREADS_GPU).
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	              (static_cast<uint32_t>(info.async_compute) << 1u) |
+	              (static_cast<uint32_t>(info.dispatch_dimensions_indirect) << 2u));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

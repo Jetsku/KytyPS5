@@ -66,6 +66,18 @@ namespace Libs::Graphics {
 static std::atomic<uint64_t> g_overlap_direct {0}, g_overlap_pairs {0}, g_overlap_taken {0},
     g_overlap_indirect {0}, g_overlap_empty_indirect {0};
 static Live::Switch g_skip_empty_indirect("KYTY_SKIP_EMPTY_INDIRECT", Live::ParseDefaultOn);
+// KYTY_INDIRECT_THREADS_GPU=1 (default off, live; GT7 fork 633e00962): DISPATCH_INDIRECT with the
+// thread-dimension initiator carries thread counts, not workgroup counts. The command processor
+// reads them on the CPU and dispatches directly, but the previous dispatch usually writes them on
+// the GPU, so each read drains the GPU. With the switch the dispatch stays indirect: the dispatch
+// guard's pass (dispatchGuard.h) converts the counts to workgroup counts on the GPU and keeps a copy
+// of the thread counts, which the shader reads through a device address to bound its lanes
+// (ShaderComputeInputInfo::dispatch_dimensions_indirect).
+static Live::Switch g_indirect_threads_gpu("KYTY_INDIRECT_THREADS_GPU", Live::ParseDefaultOff);
+
+bool RenderExecutor::IndirectThreadsOnGpu() {
+	return g_indirect_threads_gpu.On();
+}
 static std::atomic<int64_t> g_overlap_last_print_ns {0};
 
 // KYTY_DISPATCH_TRACE=<hash>[,<hash>...] or all (hexadecimal guest shader hashes, diagnostic): logs the
@@ -1241,8 +1253,10 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	KYTY_GPU_OP_SITE("dispatch.indirect");
 	g_overlap_indirect.fetch_add(1, std::memory_order_relaxed);
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	// KYTY_INDIRECT_THREADS_GPU: the arguments are thread counts (the command processor sends these
+	// here only with the switch on).
+	const bool thread_counts = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopReadyOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -1255,7 +1269,9 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
+	input_info.async_compute                = async_compute;
+	input_info.dispatch_thread_dimensions   = thread_counts;
+	input_info.dispatch_dimensions_indirect = thread_counts;
 	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	ShaderProgram compute_program;
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): as in DispatchDirect, from no workgroup counts.
@@ -1274,7 +1290,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	if (step != nullptr) {
 		PipelineCache::SelectCallSplitCode(step->code);
 	}
-	if (step == nullptr && prepared != nullptr && !async_compute &&
+	if (step == nullptr && prepared != nullptr && !async_compute && !thread_counts &&
 	    DrawPrep::ValidateDispatch(*prepared, input_info)) {
 		if (DrawPrep::VerifyMode() != 0) {
 			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
@@ -1301,6 +1317,15 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 			input_info.workgroup_counts[0] = args.x;
 			input_info.workgroup_counts[1] = args.y;
 			input_info.workgroup_counts[2] = args.z;
+			if (thread_counts) {
+				const uint32_t local[3] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+				                           cs_regs.cs_regs.num_thread_z};
+				for (uint32_t i = 0; i < 3u; i++) {
+					const auto threads = input_info.workgroup_counts[i];
+					input_info.workgroup_counts[i] =
+					    threads == 0 ? 0u : (threads - 1u) / std::max(local[i], 1u) + 1u;
+				}
+			}
 			return true;
 		};
 		bool counts_read = false;
@@ -1422,11 +1447,21 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	DispatchGuard::Slot guard_slot {};
-	if (DispatchGuard::Enabled()) {
+	const bool          guard_checks = DispatchGuard::Enabled();
+	if (guard_checks || thread_counts) {
 		if (m_dispatch_guard == nullptr) {
 			m_dispatch_guard = std::make_unique<DispatchGuard>(m_context);
 		}
 		guard_slot = m_dispatch_guard->Reserve();
+	}
+	if (thread_counts && program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		// KYTY_INDIRECT_THREADS_GPU: the dispatch-thread dwords hold the address of the slot's copy
+		// of the thread counts (written by the guard pass below), which bounds the lanes.
+		const auto threads = m_dispatch_guard->SlotThreads(guard_slot);
+		const auto dword   = program.bindings.dispatch_thread_dword;
+		bindings.shader_data[dword]      = static_cast<uint32_t>(threads);
+		bindings.shader_data[dword + 1u] = static_cast<uint32_t>(threads >> 32u);
+		bindings.shader_data[dword + 2u] = 0u;
 	}
 	RebindBuffers(bindings);
 	// KYTY_REBIND_AFTER_JOIN: the bindings' lookups joined the argument buffer (or one another's).
@@ -1448,8 +1483,14 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	vk::Buffer dispatch_buffer = args_buffer->Handle();
 	uint64_t   dispatch_offset = args_offset;
 	if (guard_slot.buffer) {
+		std::array<uint32_t, 3> local_size {0, 0, 0};
+		if (thread_counts) {
+			local_size = {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+			              std::max(cs_regs.cs_regs.num_thread_y, 1u),
+			              std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+		}
 		m_dispatch_guard->Record(buffer, guard_slot, args_buffer->Handle(), args_offset,
-		                         program.shader_hash);
+		                         program.shader_hash, local_size, guard_checks);
 		dispatch_buffer = guard_slot.buffer;
 		dispatch_offset = guard_slot.offset;
 	}

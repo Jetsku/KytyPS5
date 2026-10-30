@@ -1079,6 +1079,12 @@ public:
 	                    bool async_compute = false);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute = false);
+	// KYTY_INDIRECT_THREADS_GPU (renderCompute.cpp): thread-dimension indirect dispatches go to
+	// DispatchIndirect, converted on the GPU, instead of a CPU read of their counts.
+	[[nodiscard]] static bool IndirectThreadsOnGpu();
+	// KYTY_GPU_INSTANCE_COUNT (renderDraw.cpp): draws inheriting a native indirect draw's instance
+	// count read it on the GPU (DrawIndexArgs/DrawAutoArgs::gpu_instance_address).
+	[[nodiscard]] static bool GpuInstanceCountEnabled();
 
 	// plan: the committed draw's binding plan for this stage (KYTY_DRAW_PREP_BINDINGS), or null.
 	// keep_images (KYTY_DRAW_RUN continuation): the stage's texture and sampler bindings are the

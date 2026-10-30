@@ -16979,6 +16979,8 @@ public:
       uint32_t mode;
       uint32_t expected_threads;
       bool transfer = false;
+      // KYTY_INDIRECT_THREADS_GPU on: thread counts converted on the GPU (GT7 fork 633e00962).
+      bool threads_gpu = false;
     };
     constexpr std::array cases{
         DispatchCase{{2, 1, 1}, 0x41u, 8},
@@ -16987,6 +16989,12 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        DispatchCase{{6, 1, 1}, 0x61u, 6, false, true},
+        DispatchCase{{0, 1, 1}, 0x61u, 0, false, true},
+    };
+    const auto set_threads_gpu = [](bool on) {
+      Live::Testing::StageText(on ? "KYTY_INDIRECT_THREADS_GPU=1\n" : "KYTY_INDIRECT_THREADS_GPU=\n");
+      Live::OnCpFlip();
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -17100,6 +17108,10 @@ public:
                              .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
+        set_threads_gpu(test.threads_gpu);
+        Require(name, "thread-count switch",
+                Libs::Graphics::RenderExecutor::IndirectThreadsOnGpu() == test.threads_gpu,
+                "KYTY_INDIRECT_THREADS_GPU did not follow the live change");
         const auto tick = scheduler.CurrentTick();
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),
@@ -17114,6 +17126,11 @@ public:
           Require(name, "offset indirect packet",
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
+        }
+        set_threads_gpu(false);
+        if (test.threads_gpu) {
+          Require(name, "asynchronous thread-count dispatch", scheduler.CurrentTick() == tick,
+                  "thread-count arguments caused a host submission or readback");
         }
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,

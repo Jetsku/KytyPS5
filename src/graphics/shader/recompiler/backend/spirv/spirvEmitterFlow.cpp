@@ -993,7 +993,26 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
 		ctx.Fail(inst, "invalid dispatch thread extent");
 	}
-	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+	if (!DispatchDimensionsIndirect(ctx.state)) {
+		return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+	}
+	// KYTY_INDIRECT_THREADS_GPU (GT7 fork 633e00962): the counts stay in GPU memory, a copy the
+	// renderer made of the guest's indirect arguments; the shader data holds its device address.
+	auto&      state = ctx.state;
+	const auto u64   = TypeU64(state);
+	const auto low   = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, start));
+	const auto high  = Binary(state, spv::OpShiftLeftLogical, u64,
+	                          Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, start + 1u)),
+	                          state.builder.Constant(spv::OpConstant, u64, 32u, 0u));
+	const auto address =
+	    Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpBitwiseOr, u64, low, high),
+	           state.builder.Constant(spv::OpConstant, u64, inst.Arg(0).U32() * 4u, 0u));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
+	return value;
 }
 
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {

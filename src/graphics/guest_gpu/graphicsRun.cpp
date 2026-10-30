@@ -3237,7 +3237,9 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 		m_draw_prep->ExecuteDispatch(op.window, [this, &plain] { ExecDispatchIndirect(plain); });
 		return;
 	}
-	if ((op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+	// KYTY_INDIRECT_THREADS_GPU: thread counts converted on the GPU (no GPU drain for the read).
+	if ((op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0 &&
+	    !RenderExecutor::IndirectThreadsOnGpu()) {
 		const auto args = ReadGuestForCp<vk::DispatchIndirectCommand>(op.args_addr);
 		CpSeq::DispatchDirectOp direct;
 		direct.x    = args.x;

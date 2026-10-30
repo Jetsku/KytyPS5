@@ -24,6 +24,7 @@ struct PushData {
 	uint32_t out_word  = 0;
 	uint32_t max_dim   = 0;
 	uint32_t max_total = 0;
+	uint32_t local[3]  = {0, 0, 0};
 };
 
 constexpr uint32_t SlotBytes = 32;
@@ -103,8 +104,14 @@ DispatchGuard::Slot DispatchGuard::Reserve() {
 	return Slot {m_ring->Handle(), offset};
 }
 
+vk::DeviceAddress DispatchGuard::SlotThreads(const Slot& slot) const {
+	EXIT_IF(m_ring == nullptr || slot.buffer != m_ring->Handle());
+	return m_ring->BufferDeviceAddress() + slot.offset + 4u * sizeof(uint32_t);
+}
+
 void DispatchGuard::Record(CommandBuffer& buffer, const Slot& slot, vk::Buffer args,
-                           uint64_t args_offset, uint64_t shader_hash) {
+                           uint64_t args_offset, uint64_t shader_hash,
+                           const std::array<uint32_t, 3>& local_size, bool guard) {
 	Initialize();
 	auto& graphics  = m_context.GetGraphics();
 	auto& scheduler = m_context.GetCommandScheduler();
@@ -135,18 +142,27 @@ void DispatchGuard::Record(CommandBuffer& buffer, const Slot& slot, vk::Buffer a
 	PushData push;
 	push.args_word = static_cast<uint32_t>((args_offset - aligned) / 4u);
 	push.out_word  = 0;
-	push.max_dim   = max_dim;
+	push.max_dim   = guard ? max_dim : 0u;
 	push.max_total = max_total;
-	auto sink = buffer.Sink();
-	sink.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	sink.dispatch(1, 1, 1);
-	// The guard's write before the indirect read of the dispatch that follows (and a host read).
+	for (uint32_t i = 0; i < 3u; i++) {
+		push.local[i] = local_size[0] != 0 ? std::max(local_size[i], 1u) : 0u;
+	}
+	// Through the command buffer's push-constant shadow: the guest pipeline's push data that
+	// follows must not be taken as already pushed.
+	buffer.PushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, sizeof(push), &push);
+	buffer.Sink().dispatch(1, 1, 1);
+	// The guard's write before the indirect read of the dispatch that follows (and a host read, and
+	// the dispatch's own read of the thread counts with KYTY_INDIRECT_THREADS_GPU).
 	buffer.RequestMemoryBarrier(
 	    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
-	    vk::PipelineStageFlagBits2::eDrawIndirect | vk::PipelineStageFlagBits2::eHost,
-	    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eHostRead,
+	    vk::PipelineStageFlagBits2::eDrawIndirect | vk::PipelineStageFlagBits2::eHost |
+	        vk::PipelineStageFlagBits2::eComputeShader,
+	    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eHostRead |
+	        vk::AccessFlagBits2::eShaderStorageRead,
 	    BarrierOrigin::IndirectArgs);
-	scheduler.DeferPriorityOperation([this, slot, shader_hash] { Check(slot, shader_hash); });
+	if (guard) {
+		scheduler.DeferPriorityOperation([this, slot, shader_hash] { Check(slot, shader_hash); });
+	}
 }
 
 void DispatchGuard::Check(const Slot& slot, uint64_t shader_hash) {
