@@ -368,6 +368,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.table_key_bounds) {
 		b.Text("table_key_bounds");
 	}
+	if (options.selector_keys != 0u) {
+		b.Text("selector_keys");
+		b.U8(options.selector_keys);
+	}
 	if (options.native_wave64_branch) {
 		b.Text("native_wave64_branch");
 	}

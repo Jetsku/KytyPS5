@@ -1632,7 +1632,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::BuildSrtPlan(ir, variant_reads);
 	IR::EliminateDeadCode(ir.blocks);
 	if (const auto unresolved_pc =
-	        IR::TrackResources(ir, variant_reads, GetCodegenOptions().bda_writes);
+	        IR::TrackResources(ir, variant_reads, GetCodegenOptions().bda_writes,
+	                           ShaderWorkgroupInput(options.stage, options.input_info));
 	    unresolved_pc != UINT32_MAX) {
 		NoteSkippedProgram(options, unresolved_pc,
 		                   "computes a descriptor at runtime that has no BDA path");

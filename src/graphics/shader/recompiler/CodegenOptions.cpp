@@ -141,6 +141,20 @@ CodegenOptions FromEnvironment() {
 	options.bindless_samplers = EnvFlag("KYTY_BINDLESS_SAMPLERS", options.bindless_samplers);
 	options.workgroup_images = EnvFlag("KYTY_WORKGROUP_IMAGES", options.workgroup_images);
 	options.table_key_bounds = EnvFlag("KYTY_TABLE_KEY_BOUNDS", options.table_key_bounds);
+	{
+		const auto selector_bit = [&](const char* name, uint8_t bit) {
+			if (EnvFlag(name, (options.selector_keys & bit) != 0u)) {
+				options.selector_keys |= bit;
+			} else {
+				options.selector_keys &= static_cast<uint8_t>(~bit);
+			}
+		};
+		selector_bit("KYTY_SELECTOR_BITSCAN", SelectorKeysBitscan);
+		selector_bit("KYTY_SELECTOR_EXCLUDED", SelectorKeysExcluded);
+		selector_bit("KYTY_SELECTOR_MASK_RANKS", SelectorKeysMaskRanks);
+		selector_bit("KYTY_SELECTOR_SHARED_LIST", SelectorKeysSharedList);
+		selector_bit("KYTY_SELECTOR_BITSET", SelectorKeysBitset);
+	}
 	options.native_wave64_branch =
 	    EnvFlag("KYTY_NATIVE_WAVE64_BRANCH", options.native_wave64_branch);
 	options.sampler_reads_deferred =

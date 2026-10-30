@@ -677,13 +677,75 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		uint32_t key_count = 0;
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
 		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
+		// KYTY_SELECTOR_BITSET (upstream 49ebbfd62): a reversed range starts at a runtime first key.
+		uint32_t first = 0;
+		if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first)) {
+			return false;
+		}
+		// A range base - maximum .. base whose base is below the maximum: the wrapped (negative)
+		// keys are never the shader's, so only 0 .. base remain.
+		if (uint64_t {first} + key_count > UINT32_MAX + 1ull) {
+			key_count = static_cast<uint32_t>(uint64_t {first} + key_count - (UINT32_MAX + 1ull));
+			first     = 0;
+		}
 		if (table_value.dword_count != 2u || !evaluated ||
 		    key_count > MaxIndirectImageProbes ||
-		    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
+		    uint64_t {indirect.table_offset} + (uint64_t {first} + key_count) * 32u >
+		        UINT32_MAX + 1ull) {
 			return false;
 		}
 		keys.resize(key_count);
-		std::iota(keys.begin(), keys.end(), 0u);
+		std::iota(keys.begin(), keys.end(), first);
+	} else if (indirect.selector->bitset) {
+		// KYTY_SELECTOR_BITSET (adapted from upstream 145578ac0 and 914a3bb4b): the keys are
+		// first + count - 1 - rank for every rank some bitmap record of the buffer sets.
+		ShaderBufferResource      material;
+		std::array<uint32_t, 8>   masks {};
+		const auto                record_words = indirect.selector->stride / 4u;
+		uint32_t                  first = 0, count = 0;
+		if (table_value.dword_count != 2u || (record_words != 4u && record_words != 8u) ||
+		    !DecodeBufferDescriptor(material_value, material) ||
+		    !clean.Evaluate(indirect.selector_first, first) ||
+		    !clean.Evaluate(indirect.key_count, count) || count != record_words * 32u ||
+		    indirect.selector->offset != 0u || material.Type() != 0u ||
+		    material.Stride() != indirect.selector->stride || material.SwizzleEnabled() ||
+		    material.AddTid() || material.OutOfBounds() != 0u || (material.Base48() & 3u) != 0u) {
+			return false;
+		}
+		// The last key is the range base; ranks above a base below the maximum are negative keys
+		// (never the shader's) and are left out.
+		const auto last  = static_cast<uint32_t>(uint64_t {first} + count - 1u);
+		const bool wraps = uint64_t {first} + count > UINT32_MAX + 1ull;
+		if (uint64_t {indirect.table_offset} + (uint64_t {wraps ? last : first + count - 1u} + 1u) * 32u >
+		    UINT32_MAX + 1ull) {
+			return false;
+		}
+		if (material.Format() != Prospero::BufferFormat::kInvalid) {
+			// Bitmap storage can grow with resolution while the key domain stays at 32 keys per
+			// record word: read it in bounded chunks.
+			const auto words = material.GetSize() / sizeof(uint32_t);
+			for (uint64_t first_word = 0; first_word < words; first_word += keys.size()) {
+				keys.resize(static_cast<size_t>(
+				    std::min<uint64_t>(words - first_word, MaxIndirectImageProbes)));
+				if (first_word * 4u > UINT32_MAX ||
+				    !ReadScalarTable(material.Base48(), material.GetSize(),
+				                     static_cast<uint32_t>(first_word * 4u), runtime, keys)) {
+					return false;
+				}
+				for (size_t word = 0; word < keys.size(); ++word) {
+					masks[(first_word + word) % record_words] |= keys[word];
+				}
+			}
+		}
+		keys.clear();
+		for (uint32_t word = 0; word < record_words; ++word) {
+			for (auto mask = masks[word]; mask != 0u; mask &= mask - 1u) {
+				const auto rank = word * 32u + static_cast<uint32_t>(std::countr_zero(mask));
+				if (wraps && rank > last) continue;
+				keys.push_back(last - rank);
+			}
+		}
+		std::ranges::sort(keys);
 	} else if (!indirect.selector_mask.IsEmpty()) {
 		uint32_t mask = 0;
 		uint32_t count = 0;
@@ -707,6 +769,67 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			keys.push_back(key);
 			mask &= mask - 1u;
 		}
+		std::ranges::sort(keys);
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+	} else if (!indirect.key_count.IsEmpty()) {
+		// KYTY_SELECTOR_BITSCAN / KYTY_SELECTOR_SHARED_LIST (adapted from upstream f297c0bfe,
+		// 0e9c77b0a and ffb6ad6ca): the selector index is below key_count, so only those records
+		// are read; out-of-bounds scalar reads return zero.
+		const auto&          selector = *indirect.selector;
+		ShaderBufferResource material;
+		uint32_t             count = 0;
+		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
+		    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectImageProbes ||
+		    (count != 0u && uint64_t {count - 1u} * selector.stride + selector.offset + 4u >
+		                        UINT32_MAX + 1ull)) {
+			return false;
+		}
+		const auto read_record = [&](uint32_t record) {
+			uint32_t key = 0;
+			if (!ReadScalarTable(material.Base48(), material.GetSize(),
+			                     record * selector.stride + selector.offset, runtime, {&key, 1})) {
+				return false;
+			}
+			keys.push_back(key);
+			return true;
+		};
+		if (selector.ranks) {
+			// KYTY_SELECTOR_MASK_RANKS (upstream 99f4eba22): a scan selects only the ranks some word
+			// of its mask's address class sets.
+			const auto&          mask = *selector.ranks;
+			DescriptorValue      mask_value;
+			ShaderBufferResource masks;
+			if (count > 32u || mask.stride < 4u || (mask.stride & 3u) != 0u ||
+			    !clean.EvaluateDescriptor(mask.source, mask_value) ||
+			    !DecodeBufferDescriptor(mask_value, masks)) {
+				return false;
+			}
+			const auto words = mask.stride / 4u;
+			// Each chunk holds whole strides of the class, or one of its words.
+			const uint64_t chunk = words <= MaxIndirectImageProbes ? MaxIndirectImageProbes / words * words
+			                                                       : 1u;
+			uint32_t       ranks = 0;
+			for (uint64_t at = mask.offset; at + 4u <= masks.GetSize() && at <= UINT32_MAX;
+			     at += std::max<uint64_t>(chunk, words) * 4u) {
+				keys.resize(static_cast<size_t>(std::min<uint64_t>((masks.GetSize() - at) / 4u, chunk)));
+				if (!ReadScalarTable(masks.Base48(), masks.GetSize(), static_cast<uint32_t>(at),
+				                     runtime, keys)) {
+					return false;
+				}
+				for (size_t word = 0; word < keys.size(); word += words) ranks |= keys[word];
+			}
+			keys.clear();
+			if (count < 32u) ranks &= (1u << count) - 1u;
+			for (; ranks != 0u; ranks &= ranks - 1u) {
+				if (!read_record(static_cast<uint32_t>(std::countr_zero(ranks)))) return false;
+			}
+		} else {
+			keys.reserve(count);
+			for (uint32_t record = 0; record < count; ++record) {
+				if (!read_record(record)) return false;
+			}
+		}
+		if (selector.excluded) std::erase(keys, *selector.excluded);
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	} else {
@@ -736,6 +859,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 				break;
 			}
 		}
+		if (indirect.selector->excluded) std::erase(keys, *indirect.selector->excluded);
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
@@ -1942,6 +2066,15 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, indirect.selector ? Source(plan, indirect.selector->source) : nullptr,
 		                   plan.clean_flat_slots, indirect.selector_mask);
 		MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
+		// The KYTY_SELECTOR_* plans' mask buffer, counts and first keys are read by the host too.
+		if (indirect.selector && indirect.selector->ranks) {
+			MarkCleanFlatSlots(plan, Source(plan, indirect.selector->ranks->source),
+			                   plan.clean_flat_slots);
+		}
+		if (GetCodegenOptions().selector_keys != 0u) {
+			MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.key_count);
+			MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_first);
+		}
 	}
 	// KYTY_BINDLESS_SAMPLERS: the host reads the sampler heap itself; the plan needs its V#.
 	for (const auto& sampler: plan.info.samplers) {

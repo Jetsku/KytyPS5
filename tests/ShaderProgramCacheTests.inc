@@ -806,10 +806,46 @@ void CheckCacheFile() {
   std::printf("[cpu]     %-32s ok (%zu truncations)\n", name, cuts.size());
 }
 
+// KYTY_SELECTOR_*: the selector read's bitmap flag, excluded key and mask ranks survive the codec,
+// and the switches change the codegen fingerprint.
+void CheckSelectorReadCodec() {
+  constexpr const char *name = "ProgramCacheSelectorRead";
+  using ShaderRecompiler::IR::DescriptorSource;
+  for (uint32_t variant = 0; variant < 3u; ++variant) {
+    ShaderRecompiler::IR::ResourcePlan plan;
+    auto &source = plan.descriptor_sources.emplace_back();
+    source.dword_count = 8u;
+    auto &indirect = source.indirect_descriptor.emplace();
+    auto &selector = indirect.selector.emplace(
+        DescriptorSource::IndirectDescriptor::SelectorRead{.source = 0u, .stride = 32u, .offset = 4u});
+    selector.bitset = variant == 1u;
+    if (variant != 0u) selector.excluded = 5u + variant;
+    if (variant == 2u)
+      selector.ranks = DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks{
+          .source = 0u, .stride = 16u, .offset = 8u};
+    std::vector<uint8_t> bytes;
+    ShaderRecompiler::IR::ResourcePlan decoded;
+    Require(name, "round trip",
+            ShaderRecompiler::IR::EncodeResourcePlan(plan, bytes) &&
+                ShaderRecompiler::IR::DecodeResourcePlan(bytes, decoded) &&
+                decoded.descriptor_sources.size() == 1u &&
+                decoded.descriptor_sources[0].indirect_descriptor.has_value() &&
+                decoded.descriptor_sources[0].indirect_descriptor->selector == selector,
+            "a selector read changed through the program codec");
+  }
+  const auto base = ShaderRecompiler::CodegenFingerprint();
+  auto options = GetCodegenOptions();
+  options.selector_keys = ShaderRecompiler::SelectorKeysBitscan;
+  ScopedCodegenOptions scope(options);
+  Require(name, "fingerprint", ShaderRecompiler::CodegenFingerprint() != base,
+          "the fingerprint does not depend on CodegenOptions::selector_keys");
+}
+
 void RunCpu() {
   CheckSourceKeys();
   CheckFingerprint();
   CheckCacheFile();
+  CheckSelectorReadCodec();
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -902,6 +902,21 @@ struct CodegenOptions {
 	// zero-based per-lane loop key takes the runtime count every uniform zero-based loop of the
 	// program shares (a heuristic, logged). Off: such programs are skipped or go bindless, as before.
 	bool table_key_bounds = false;
+	// GPU-selected image keys from upstream KytyPS5's selector proofs (all default off; bits
+	// SelectorKeys*). Off: such programs are enumerated over the whole material buffer, go bindless
+	// or are skipped, as before.
+	// - KYTY_SELECTOR_BITSCAN=1 (f297c0bfe): a scalar material record whose index a bit scan of a
+	//   nonzero value (or another proven constant maximum) selects reads only records 0..maximum.
+	// - KYTY_SELECTOR_EXCLUDED=1 (f297c0bfe): a material key that a uniform guard rules out on every
+	//   path to the image is left out of the enumeration.
+	// - KYTY_SELECTOR_MASK_RANKS=1 (99f4eba22, with BITSCAN): the bit-scanned value keeps only bits of
+	//   one scalar mask load, so only the records at the ranks some reachable mask word sets are read.
+	// - KYTY_SELECTOR_SHARED_LIST=1 (0e9c77b0a, ffb6ad6ca): a material record selected by
+	//   V_READFIRSTLANE from a one-wave LDS append list is bounded by the list's producer bound.
+	// - KYTY_SELECTOR_BITSET=1 (49ebbfd62 part, 145578ac0, 914a3bb4b): an address-table key
+	//   base - V_READFIRSTLANE(rank) is a reversed range; a rank built from four- or eight-word light
+	//   bitmaps reads only the keys at the set ranks of the bitmap buffer.
+	uint8_t selector_keys = 0;
 	// KYTY_NATIVE_WAVE64_BRANCH=1 (default off; Senaxx 49723097f): a wave64 compute or mesh program
 	// on a 64-wide host subgroup (AMD) takes a ballot for its VCC/EXEC/SCC branches, so the wave
 	// branches as one, as the emulated two-half path does on 32-wide hosts. Off: each lane branches
@@ -930,6 +945,11 @@ struct CodegenOptions {
 	// for a tiny negative source where x - floor(x) rounds to 1.0. One compare and select per fract.
 	bool fract_clamp = false;
 };
+inline constexpr uint8_t SelectorKeysBitscan    = 1u;
+inline constexpr uint8_t SelectorKeysExcluded   = 2u;
+inline constexpr uint8_t SelectorKeysMaskRanks  = 4u;
+inline constexpr uint8_t SelectorKeysSharedList = 8u;
+inline constexpr uint8_t SelectorKeysBitset     = 16u;
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;
 inline constexpr uint8_t DenormFlushSkipGeometry = 4u;

@@ -22,7 +22,7 @@ namespace {
 // ImageResource 22; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (BindlessSampler 2, IndirectDescriptor
-// 18, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// 18, SelectorRead 6 (MaskRanks 3));SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
 // ResourceSpecialization 2 (Buffer 3, Image 12).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
@@ -42,8 +42,8 @@ static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: upd
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
 static_assert(sizeof(CompiledShaderInfo) == 368, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 272, "IR::DescriptorSource changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 112,
+static_assert(sizeof(DescriptorSource) == 304, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 144,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update ProgramCodec");
@@ -776,6 +776,15 @@ public:
 					w.U32(image.selector->source);
 					w.U32(image.selector->stride);
 					w.U32(image.selector->offset);
+					w.Bool(image.selector->bitset);
+					w.Bool(image.selector->excluded.has_value());
+					if (image.selector->excluded) w.U32(*image.selector->excluded);
+					w.Bool(image.selector->ranks.has_value());
+					if (image.selector->ranks) {
+						w.U32(image.selector->ranks->source);
+						w.U32(image.selector->ranks->stride);
+						w.U32(image.selector->ranks->offset);
+					}
 				}
 				w.U32(image.table_source);
 				w.U32(image.table_offset);
@@ -1022,6 +1031,14 @@ public:
 					selector.source = r.U32();
 					selector.stride = r.U32();
 					selector.offset = r.U32();
+					selector.bitset = r.Bool();
+					if (r.Bool()) selector.excluded = r.U32();
+					if (r.Bool()) {
+						auto& ranks  = selector.ranks.emplace();
+						ranks.source = r.U32();
+						ranks.stride = r.U32();
+						ranks.offset = r.U32();
+					}
 				}
 				image.table_source       = r.U32();
 				image.table_offset       = r.U32();

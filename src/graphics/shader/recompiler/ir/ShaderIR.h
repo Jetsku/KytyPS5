@@ -728,9 +728,25 @@ struct BlockInfo {
 struct DescriptorSource {
 	struct IndirectDescriptor {
 		struct SelectorRead {
+			// KYTY_SELECTOR_MASK_RANKS (upstream 99f4eba22): the mask words whose set bits are the
+			// records a bit scan selects; every word at offset + k * stride of this buffer counts.
+			struct MaskRanks {
+				uint32_t source = UINT32_MAX;
+				uint32_t stride = 0;
+				uint32_t offset = 0;
+
+				bool operator==(const MaskRanks& other) const = default;
+			};
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
+			// KYTY_SELECTOR_BITSET (upstream 145578ac0, 914a3bb4b): stride / 4 bitmap words per
+			// record (four or eight); the keys are first + key_count - 1 - each set-bit rank of the
+			// words OR-ed over the buffer.
+			bool     bitset = false;
+			// KYTY_SELECTOR_EXCLUDED (upstream f297c0bfe): a guard keeps this key from the read.
+			std::optional<uint32_t>  excluded;
+			std::optional<MaskRanks> ranks;
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
@@ -762,8 +778,12 @@ struct DescriptorSource {
 		uint32_t nested_heap     = 0;
 		uint32_t nested_keys     = 0;
 		uint32_t workgroup_multiplier = 0;
+		// Address tables: keys 0 .. key_count - 1 (from selector_first when set, KYTY_SELECTOR_BITSET's
+		// reversed ranges). A scalar material selector (KYTY_SELECTOR_BITSCAN /
+		// KYTY_SELECTOR_SHARED_LIST): the records 0 .. key_count - 1 instead of every offset.
 		Value    key_count;
 		// With workgroup_axis: a runtime base the shader adds to the workgroup ID (empty: none).
+		// Without it, on an address table: the first key (KYTY_SELECTOR_BITSET).
 		Value                 selector_first;
 		Value    selector_mask;
 
