@@ -1250,7 +1250,8 @@ private:
 	                                                  bool* keep_dispatch = nullptr);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                              uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                                              uint64_t code_address = 0);
 
 	// KYTY_LDS_DEVICE_BUFFER: binds the LDS regions of a compute program whose LDS lives in a device
 	// buffer (a SharedMemory binding): one region per workgroup of `groups` (null: an indirect

@@ -720,6 +720,116 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 	}
 }
 
+// KYTY_WIDE_FILL_CLEAR=2 (default off; GT7 fork 83707d403): DecodeFilledColorClear plus the fill
+// words of more color formats. Zero bits clear any uncompressed single-plane color format; 8- and
+// 16-bit-channel formats whose texel the word repeats (R8, R8G8, R16) and the two- and four-channel
+// 16-bit formats whose texels the word holds; R8G8B8A8 uint. Float channels must be zero or normal
+// numbers (a clear need not keep a NaN payload, an infinity or a denormal; the fill's store would).
+[[nodiscard]] inline bool DecodeFillWord(vk::Format format, uint32_t packed,
+                                         vk::ClearColorValue& clear) {
+	const auto exact_float = [](uint32_t bits) {
+		const auto exponent = (bits >> 23u) & 0xffu;
+		return bits == 0 || (exponent != 0 && exponent != 0xffu);
+	};
+	const auto exact_half = [](uint32_t bits) {
+		const auto exponent = (bits >> 10u) & 0x1fu;
+		return bits == 0 || (exponent != 0 && exponent != 0x1fu);
+	};
+	// Normal (or zero) half bits only: see exact_half.
+	const auto half = [](uint32_t bits) {
+		if ((bits & 0x7fffu) == 0) {
+			return std::bit_cast<float>((bits & 0x8000u) << 16u);
+		}
+		return std::bit_cast<float>(((bits & 0x8000u) << 16u) | ((((bits >> 10u) & 0x1fu) + 112u) << 23u) |
+		                            ((bits & 0x3ffu) << 13u));
+	};
+	const auto unorm = [](uint32_t value, uint32_t bits) {
+		return static_cast<float>(value) / static_cast<float>((1u << bits) - 1u);
+	};
+	const uint32_t low         = packed & 0xffffu;
+	const uint32_t high        = packed >> 16u;
+	const bool     same_bytes  = packed == (packed & 0xffu) * 0x01010101u;
+	const bool     same_halves = low == high;
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if (!exact_float(packed)) return false;
+			return DecodeFilledColorClear(format, packed, clear);
+		case vk::Format::eR16Sfloat:
+			if (!same_halves || !exact_half(low)) return false;
+			next.float32[0] = half(low);
+			break;
+		case vk::Format::eR16G16Sfloat:
+			if (!exact_half(low) || !exact_half(high)) return false;
+			next.float32[0] = half(low);
+			next.float32[1] = half(high);
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			if (!exact_half(low) || !exact_half(high)) return false;
+			next.float32[0] = next.float32[2] = half(low);
+			next.float32[1] = next.float32[3] = half(high);
+			break;
+		case vk::Format::eR8Unorm:
+			if (!same_bytes) return false;
+			next.float32[0] = unorm(packed & 0xffu, 8);
+			break;
+		case vk::Format::eR8Uint:
+			if (!same_bytes) return false;
+			next.uint32[0] = packed & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			if (!same_halves) return false;
+			next.float32[0] = unorm(low & 0xffu, 8);
+			next.float32[1] = unorm(low >> 8u, 8);
+			break;
+		case vk::Format::eR8G8Uint:
+			if (!same_halves) return false;
+			next.uint32[0] = low & 0xffu;
+			next.uint32[1] = low >> 8u;
+			break;
+		case vk::Format::eR16Unorm:
+			if (!same_halves) return false;
+			next.float32[0] = unorm(low, 16);
+			break;
+		case vk::Format::eR16Uint:
+			if (!same_halves) return false;
+			next.uint32[0] = low;
+			break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[0] = unorm(low, 16);
+			next.float32[1] = unorm(high, 16);
+			break;
+		case vk::Format::eR16G16Uint:
+			next.uint32[0] = low;
+			next.uint32[1] = high;
+			break;
+		case vk::Format::eR8G8B8A8Uint:
+			for (uint32_t channel = 0; channel < 4; ++channel) {
+				next.uint32[channel] = (packed >> (channel * 8u)) & 0xffu;
+			}
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[0] = next.float32[2] = unorm(low, 16);
+			next.float32[1] = next.float32[3] = unorm(high, 16);
+			break;
+		default:
+			if (DecodeFilledColorClear(format, packed, clear)) {
+				return true;
+			}
+			// Zero bits are zero in any uncompressed single-plane color format (the core formats
+			// before the depth/stencil and block-compressed ones).
+			if (packed != 0 || static_cast<int32_t>(format) < VK_FORMAT_R4G4_UNORM_PACK8 ||
+			    static_cast<int32_t>(format) > VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) {
+				return false;
+			}
+			break;
+	}
+	clear = next;
+	return true;
+}
+
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {
 	const auto value = static_cast<uint8_t>(packed);
 	if (packed != static_cast<uint32_t>(value) * 0x01010101u) {
