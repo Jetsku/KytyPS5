@@ -205,7 +205,9 @@ bool ShaderCallExpander::Refresh(Program& program, std::span<const uint32_t> cod
 		auto& site = sites.emplace_back(Decoder::ShaderCallSite {.pc         = call.trace.pc,
 		                                                         .source_reg = call.trace.source_reg,
 		                                                         .return_reg = call.trace.return_reg});
-		if (call.trace.user_sgpr != UINT32_MAX) {
+		if (call.trace.null_callee) {
+			// KYTY_RAY_HIT_CALLS_RETURN: no target; the call takes the skip path (returns at once).
+		} else if (call.trace.user_sgpr != UINT32_MAX) {
 			const auto index = call.trace.user_sgpr - options.user_data_base;
 			if (index + 2u > options.user_data.size()) {
 				fail(call, "user data too short");

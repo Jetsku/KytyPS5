@@ -1221,6 +1221,19 @@ ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code, const Comp
 	(void)FindCallTargets(decoded, options, unresolved, &user_calls);
 	std::string table_failures;
 	auto        tables = FindCallTables(decoded, options, table_failures);
+	// KYTY_RAY_HIT_CALLS_RETURN=1 (default off; usa-ratt/KytyPS5-GT7's RayHitCallsReturn): in a
+	// program that traces rays (IMAGE_BVH_INTERSECT_RAY), a call whose target cannot be traced is
+	// a hit function (GT7's traversal calls one for a candidate on non-opaque geometry, with v7 = 1
+	// "accept" set before it): it returns at once, so every candidate counts as opaque, instead of
+	// the whole program being refused and its dispatches skipped (GT7 CS 0x2218a07ab01d4f46).
+	static const bool ray_hit_return = [] {
+		const char* value = std::getenv("KYTY_RAY_HIT_CALLS_RETURN");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool traces_rays =
+	    ray_hit_return && std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+	    });
 	for (const auto& inst: decoded.instructions) {
 		if (!IsUnsupportedCall(inst)) {
 			continue;
@@ -1235,6 +1248,8 @@ ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code, const Comp
 		} else if (const auto table = std::ranges::find(tables, inst.pc, &CallTable::call_pc);
 		           table != tables.end()) {
 			call.table = *table;
+		} else if (traces_rays) {
+			call.null_callee = true;
 		} else {
 			analysis.failures += fmt::format("{}pc 0x{:x}: target not traced", analysis.failures.empty() ? "" : "; ",
 			                                 inst.pc);

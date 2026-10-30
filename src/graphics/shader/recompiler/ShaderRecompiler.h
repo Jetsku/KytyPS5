@@ -73,8 +73,12 @@ struct ShaderCall {
 	uint32_t                 return_reg = 0;
 	uint32_t                 user_sgpr  = UINT32_MAX;
 	std::optional<CallTable> table;
+	// KYTY_RAY_HIT_CALLS_RETURN: an untraced call of a ray-tracing program that returns at once.
+	bool                     null_callee = false;
 
-	[[nodiscard]] bool Traced() const { return user_sgpr != UINT32_MAX || table.has_value(); }
+	[[nodiscard]] bool Traced() const {
+		return user_sgpr != UINT32_MAX || table.has_value() || null_callee;
+	}
 };
 
 struct ShaderCallAnalysis {
