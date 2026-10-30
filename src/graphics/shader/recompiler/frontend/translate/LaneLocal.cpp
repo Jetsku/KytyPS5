@@ -157,6 +157,8 @@ bool KeepsScc(Opcode opcode) {
 		case Opcode::S_FF1_I32_B64:
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FLBIT_I32_B64:
+		case Opcode::S_FLBIT_I32:
+		case Opcode::S_FLBIT_I32_I64:
 		case Opcode::S_BITSET0_B32:
 		case Opcode::S_BITSET1_B32:
 		case Opcode::S_BITSET0_B64:
@@ -245,6 +247,7 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::V_MBCNT_HI_U32_B32: return "V_MBCNT";
 		case Opcode::V_MOVRELD_B32:
 		case Opcode::V_MOVRELS_B32: return "V_MOVREL";
+		case Opcode::S_QUADMASK_B32:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_BITREPLICATE_B64_B32: return "lane-mask layout";
 		case Opcode::S_GETPC_B64:

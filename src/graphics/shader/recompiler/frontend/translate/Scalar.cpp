@@ -277,14 +277,17 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_FF0_I32_B64: return S_FF_I32_B64(inst, true);
 		case O::S_FF1_I32_B64: return S_FF_I32_B64(inst, false);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
-		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
+		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst, false);
+		case O::S_FLBIT_I32: return V_FFBH_32(inst, true);
+		case O::S_FLBIT_I32_I64: return S_FLBIT_I32_B64(inst, true);
 
 		case O::S_BITSET0_B32: return S_BITSET_B32(inst, false);
 		case O::S_BITSET1_B32: return S_BITSET_B32(inst, true);
 		case O::S_BITSET0_B64: return S_BITSET_B64(inst, false);
 		case O::S_BITSET1_B64: return S_BITSET_B64(inst, true);
 		case O::S_BITREPLICATE_B64_B32: return S_BITREPLICATE_B64_B32(inst);
-		case O::S_QUADMASK_B64: return S_QUADMASK_B64(inst);
+		case O::S_QUADMASK_B32: return S_QUADMASK(inst, false);
+		case O::S_QUADMASK_B64: return S_QUADMASK(inst, true);
 		case O::S_BFM_B32: return BFM_B32(inst);
 		case O::S_BFM_B64: return S_BFM_B64(inst);
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);

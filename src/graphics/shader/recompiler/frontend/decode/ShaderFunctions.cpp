@@ -31,7 +31,8 @@ uint32_t DestinationWords(const Instruction& inst, uint32_t wave_size) {
 	const auto name = magic_enum::enum_name(inst.opcode);
 	if (name.starts_with("V_CMP")) return wave_size / 32u;
 	// A 32-bit result of a 64-bit source (S_FF1_I32_B64, S_BCNT1_I32_B64): one SGPR.
-	const bool pair = name.find("64") != std::string_view::npos && !name.ends_with("32_B64");
+	const bool pair = name.find("64") != std::string_view::npos && !name.ends_with("32_B64") &&
+	                  !name.ends_with("I32_I64");
 	return std::max(inst.data_dwords, pair ? 2u : 1u);
 }
 

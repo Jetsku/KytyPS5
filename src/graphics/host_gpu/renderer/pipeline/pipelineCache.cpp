@@ -8046,7 +8046,9 @@ namespace {
 
 // Static stage information shared by GetGraphicsPrograms and the draw-prep speculative
 // preparation: pure functions of the registers and constant device limits.
-void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
+// False when the program exceeds the host's mesh limits (upstream 560756f34: the draw is skipped
+// with a one-time warning instead of ending the session).
+[[nodiscard]] bool FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
 	if (!graphics.mesh_shader_enabled) {
 		ExitWithoutMeshShaders(graphics);
 	}
@@ -8067,9 +8069,16 @@ void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vert
 	if (mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
 	    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 	    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-		EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-		     mesh.HostThreads(), mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			std::printf("Warning: skipping draws of mesh shaders that exceed host limits (threads=%u "
+			            "vertices=%u primitives=%u LDS=%u; logged once)\n",
+			            mesh.HostThreads(), mesh.max_vertices, mesh.max_primitives,
+			            mesh.lds_size_dwords);
+		}
+		return false;
 	}
+	return true;
 }
 
 // How the pixel stage's parameters relate to the vertex exports (upstream b38b7454a): rect lists
@@ -8331,8 +8340,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
-	if (mesh_active) {
-		FinishMeshStage(m_graphics, vertex_info[0]);
+	if (mesh_active && !FinishMeshStage(m_graphics, vertex_info[0])) {
+		return {};
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
@@ -8451,8 +8460,8 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	if (ShaderTakePrepareFailed()) {
 		return SpeculativeResult::Ineligible; // the serial path skips the draw
 	}
-	if (vertex_info.logical_stage == ShaderType::Mesh) {
-		FinishMeshStage(m_graphics, vertex_info);
+	if (vertex_info.logical_stage == ShaderType::Mesh && !FinishMeshStage(m_graphics, vertex_info)) {
+		return SpeculativeResult::Ineligible; // the serial path skips the draw
 	}
 	Common::PrepPhases::Mark(Common::PrepPhases::Phase::VsProgram);
 	ShaderParams pixel_params;

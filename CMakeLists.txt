@@ -997,6 +997,12 @@ add_executable(unresolved_import_log_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/UnresolvedImportLogTests.cpp"
 )
 target_include_directories(unresolved_import_log_tests PRIVATE ${inc_headers})
+add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmResampleTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
+target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
 
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
@@ -1487,6 +1493,7 @@ if(BUILD_TESTING)
 	add_test(NAME ajm_defer COMMAND $<TARGET_FILE:ajm_defer_tests>)
 	add_test(NAME audio_propagation COMMAND $<TARGET_FILE:audio_propagation_tests>)
 	add_test(NAME unresolved_import_log COMMAND $<TARGET_FILE:unresolved_import_log_tests>)
+	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
@@ -1500,6 +1507,16 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
+	add_test(NAME shader_recompiler_quadmask
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
+	add_test(NAME shader_recompiler_vop3_conversions
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_integer16_ternary
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
+	add_test(NAME shader_recompiler_mad_u16
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-u16-only)
+	add_test(NAME shader_recompiler_mul_hi24
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -2632,6 +2649,7 @@ if(BUILD_TESTING)
 		ajm_defer_tests
 		audio_propagation_tests
 		unresolved_import_log_tests
+		ajm_resample_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests

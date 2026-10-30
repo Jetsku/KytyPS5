@@ -2302,6 +2302,50 @@ void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestVop3FloatConversionDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const std::pair<uint32_t, Decoder::Opcode> conversions[] = {
+      {0x18b, Decoder::Opcode::V_CVT_F32_F16},
+      {0x191, Decoder::Opcode::V_CVT_F32_UBYTE0},
+      {0x192, Decoder::Opcode::V_CVT_F32_UBYTE1},
+      {0x193, Decoder::Opcode::V_CVT_F32_UBYTE2},
+      {0x194, Decoder::Opcode::V_CVT_F32_UBYTE3},
+  };
+  for (const auto &[encoding, opcode] : conversions) {
+    for (const uint32_t source : {261u, 12u, 128u, 255u}) {
+      const uint32_t code[] = {
+          EncodeVop3Word0(encoding, 20, 0, 1, true),
+          EncodeVop3Word1(source, 0, 0) | (2u << 27u) | (1u << 29u),
+          0xa5a53e00u,
+      };
+      Decoder::Instruction inst;
+      Decoder::DecodeInstruction(code, 0, inst);
+      Check(inst.opcode == opcode && inst.family == Decoder::Family::VOP3 &&
+                inst.src_count == 1 && inst.word_count == (source == 255u ? 3u : 2u),
+            "VOP3 conversion lost its opcode, unary source, or literal length");
+      Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 20 &&
+                inst.dst.sdwa_sel == 6 && inst.dst.clamp && inst.dst.omod == 2,
+            "VOP3 conversion lost its full-width destination or output modifiers");
+      const bool half = opcode == Decoder::Opcode::V_CVT_F32_F16;
+      Check(inst.src0.absolute == half && inst.src0.negate == half,
+            "VOP3 conversion must apply half-float modifiers and ignore byte modifiers");
+      Decoder::Operand expected_source;
+      Decoder::DecodeScalarSource(source, 0, expected_source);
+      Check(inst.src0.kind == expected_source.kind && inst.src0.reg == expected_source.reg &&
+                (source != 255u || inst.src0.value == code[2]),
+            "VOP3 conversion changed its source register or literal value");
+    }
+    for (const uint32_t op_sel : {1u, 2u, 4u, 8u}) {
+      const uint32_t code[] = {EncodeVop3Word0(encoding, 20, op_sel),
+                               EncodeVop3Word1(261, 0, 0)};
+      Decoder::Instruction inst;
+      Decoder::DecodeInstruction(code, 0, inst);
+      Check(inst.opcode == Decoder::Opcode::UNSUPPORTED,
+            "VOP3 conversion accepted unsupported OP_SEL bits");
+    }
+  }
+}
+
 void TestNewShaderRecompilerMoreAluFamilies() {
   const uint32_t shader[] = {
       EncodeSopk(0x00, 9, 7), // s_movk_i32 s9, 7
@@ -7065,6 +7109,17 @@ void TestPixelAncillaryLayerInput() {
     CheckSpirvBinaryValidates(wqm_result.spirv);
   }
 
+  uint32_t dpp[] = {
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
+      EncodeVop1(0x01, 5, 250), EncodeVop1Dpp(6) | (1u << 19u), // Bound-zero DPP overwrite.
+      EncodeExp0(0x00, 0x1), EncodeExp1(5, 0, 0, 0), EncodeSopp(0x01),
+  };
+  auto dpp_result = RecompileForTest(dpp, options);
+  Check(ProgramHasInput(dpp_result.program, StageInputKind::Layer) &&
+            !ProgramHasInput(dpp_result.program, StageInputKind::PackedAncillary),
+        "DPP write retained the old ancillary register value");
+  CheckSpirvBinaryValidates(dpp_result.spirv);
+
   const uint32_t loop[] = {
       EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
       EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
@@ -7118,6 +7173,9 @@ void TestPixelAncillaryLayerInput() {
   shader[5] = EncodeExp1(6, 7, 5, 0);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "direct raw ancillary export was silently replaced after field lowering");
+  dpp[3] = EncodeVop1Dpp(6); // Without BOUND_CTRL, lanes with inactive sources keep the value.
+  ExpectFatal([&] { (void)RecompileForTest(dpp, options); },
+              "DPP write without BOUND_CTRL silently replaced the ancillary value");
 #endif
 }
 
@@ -10042,6 +10100,43 @@ void TestNewShaderRecompilerNativeU64Translation() {
   result = RecompileForTest(lshlrev_b64_shader, options);
   Check((result.decoded_dump.find("V_LSHLREV_B64 v33, v3, 1") != std::string::npos),
         "captured VOP3 V_LSHLREV_B64 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t ashrrev_i64_shader[] = {
+      0xd7010001u, 0x0000d50cu,
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_ashrrev_i64;
+  ShaderRecompiler::Decoder::DecodeInstruction(ashrrev_i64_shader, 0u,
+                                               decoded_ashrrev_i64);
+  Check(decoded_ashrrev_i64.opcode == Decoder::Opcode::V_ASHRREV_I64 &&
+            decoded_ashrrev_i64.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_i64.dst.reg == 1u &&
+            decoded_ashrrev_i64.src_count == 2u &&
+            decoded_ashrrev_i64.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_i64.src0.reg == 12u &&
+            decoded_ashrrev_i64.src1.kind == Decoder::OperandKind::VccLo,
+        "decoder rejected VOP3 V_ASHRREV_I64 fields");
+  result = RecompileForTest(ashrrev_i64_shader, options);
+  Check((result.decoded_dump.find("V_ASHRREV_I64 v1, v12, vcc_lo") != std::string::npos),
+        "VOP3 V_ASHRREV_I64 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t ashrrev_captured[] = {0xd7010007u, 0x00020498u, EncodeSopp(0x01)};
+  Decoder::Instruction decoded_ashrrev_captured;
+  ShaderRecompiler::Decoder::DecodeInstruction(ashrrev_captured, 0u,
+                                               decoded_ashrrev_captured);
+  Check(decoded_ashrrev_captured.opcode == Decoder::Opcode::V_ASHRREV_I64 &&
+            decoded_ashrrev_captured.family == Decoder::Family::VOP3 &&
+            decoded_ashrrev_captured.src_count == 2u &&
+            decoded_ashrrev_captured.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_captured.dst.reg == 7u &&
+            decoded_ashrrev_captured.src0.kind == Decoder::OperandKind::IntegerInlineConstant &&
+            decoded_ashrrev_captured.src0.value == 24u &&
+            decoded_ashrrev_captured.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_captured.src1.reg == 2u,
+        "captured VOP3 V_ASHRREV_I64 opcode 0x301 was not decoded");
+  result = RecompileForTest(ashrrev_captured, options);
   CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t cmpx_i64_shader[] = {
@@ -16406,6 +16501,7 @@ int main(int argc, char **argv) {
   TestRayTracingSharedFunction();
   TestTraversalLoopBreakRegion();
   TestDeclaredShaderHashMarker();
+  TestVop3FloatConversionDecode();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

@@ -103,6 +103,17 @@ void WaitForMutexTest(Predicate ready) {
   }
 }
 
+void TestStaticRwlockDestroy() {
+  using namespace Libs::LibKernel;
+  PthreadRwlock rwlock = nullptr;
+  Check(PthreadRwlockDestroy(nullptr) == KERNEL_ERROR_EINVAL &&
+            PthreadRwlockDestroy(&rwlock) == OK && rwlock == nullptr,
+        "destroy an untouched static rwlock without allocating it");
+  Check(PthreadRwlockRdlock(&rwlock) == OK && PthreadRwlockUnlock(&rwlock) == OK &&
+            PthreadRwlockDestroy(&rwlock) == OK,
+        "static rwlock remains usable after destroying its untouched initializer");
+}
+
 struct MutexWaiter {
   Libs::LibKernel::PthreadMutex *mutex;
   Libs::LibKernel::KernelUseconds timeout = 0;
@@ -667,6 +678,21 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, &info[3].label, &repeated) == OK &&
             std::strcmp(repeated.data, point.data) == 0,
         "duplicate mount returns the same mount point");
+  // KYTY_ADDCONT_MOUNT_BUSY (upstream 97bef2992): the duplicate is rejected, the mount stays.
+#ifdef _WIN32
+  _putenv_s("KYTY_ADDCONT_MOUNT_BUSY", "1");
+#else
+  setenv("KYTY_ADDCONT_MOUNT_BUSY", "1", 1);
+#endif
+  MountPoint rejected {};
+  Check(mount(0, &info[3].label, &rejected) == static_cast<int>(0x80d90003u) &&
+            !FileSystem::GetRealFilename(mounted_file).empty(),
+        "KYTY_ADDCONT_MOUNT_BUSY: duplicate mount reports BUSY and keeps the original mount");
+#ifdef _WIN32
+  _putenv_s("KYTY_ADDCONT_MOUNT_BUSY", "0");
+#else
+  setenv("KYTY_ADDCONT_MOUNT_BUSY", "0", 1);
+#endif
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
             unmount(&point) == static_cast<int>(0x80d90004u),
         "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
@@ -2437,6 +2463,7 @@ int main(int argc, char** argv) {
   subsystems.Initialize<Log::Lifecycle>();
 
   TestMutexHandoff();
+  TestStaticRwlockDestroy();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");

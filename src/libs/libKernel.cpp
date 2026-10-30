@@ -1394,14 +1394,20 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(d < 0);
-
 	if (Network::Net::IsSocket(d)) {
 		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
 	}
 
-	if (d > 2) {
-		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
+	// KYTY_WRITE_STDIO=1 (default off; upstream e0c5ae090): descriptors 0-2 go through KernelWrite
+	// too, which prints 1 and 2 to the host's stdout/stderr (flushed per write) and rejects 0.
+	// Off: they are dropped (the size is returned), as before. A negative descriptor is EBADF
+	// instead of an exit.
+	static const bool stdio = [] {
+		const char* value = std::getenv("KYTY_WRITE_STDIO");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (d > 2 || d < 0 || stdio) {
+		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, static_cast<size_t>(size)));
 	}
 
 	int size_int = static_cast<int>(size);
