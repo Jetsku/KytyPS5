@@ -1142,6 +1142,12 @@ private:
 	std::unordered_set<uint64_t>               m_bindless_surveyed; // base ^ table offset << 48
 	uint64_t                                   m_bindless_frame          = UINT64_MAX;
 	uint64_t                                   m_bindless_snapshot_frame = 0;
+	// KYTY_BINDLESS_EVICT usage probe (UpdateBindlessUsageProbe): the frame it was armed in
+	// (0 = idle) and the first frame the next may start.
+	uint64_t                                   m_bindless_probe_frame = 0;
+	uint64_t                                   m_bindless_next_probe  = 0;
+	std::vector<ImageId>                       m_bindless_unused;
+	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
 	std::vector<uint32_t>                      m_bindless_requests;
 	// KYTY_RUNTIME_IMAGES: T#s (and bindings) shaders requested, taken from the snapshot.
 	std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>> m_runtime_image_requests;

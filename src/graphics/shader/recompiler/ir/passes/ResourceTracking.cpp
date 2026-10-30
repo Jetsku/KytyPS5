@@ -210,6 +210,7 @@ public:
 				Collect(inst);
 			}
 		}
+		CollectDeferredSamplerReads();
 		if (!m_dead_stores.empty()) {
 			// Global legs of aperture-routed stores that can never run: erase them.
 			for (auto* block: m_program.blocks) {
@@ -1924,6 +1925,95 @@ private:
 		       source->indirect_descriptor->bindless;
 	}
 
+	// With bindless images, the S# beside a bindless or runtime T# may be read from a sampler heap
+	// with S_BUFFER_LOAD (per key, like the T#). The sampler plan (TryMakeBindlessSampler or the
+	// stand-in, UseDefaultSamplerIfUnresolved) is made at the image operation, after the walk has
+	// passed those reads: collected first, they became a buffer resource whose V# words dead code
+	// elimination then removed with the stranded reads, and materialization failed. A scalar
+	// buffer read that feeds nothing but sampler handles (and the dead phis a waterfall loop
+	// leaves) is collected after the walk instead, and only if an ordinary sampler still uses it;
+	// otherwise it is planning-only, like an indirect image plan's T# reads (Senaxx 59cb8a83e
+	// marks a bindless sampler's exclusive reads the same way).
+	bool IsSamplerOnlyRead(const Inst& inst) const {
+		if (!BindlessImagesEnabled() || inst.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+			return false;
+		}
+		uint32_t index = 0;
+		if (ScalarReadMemory(inst, index) == nullptr || inst.Uses().empty()) {
+			return false;
+		}
+		bool sampler = false;
+		if (!FeedsOnlySamplers(inst, sampler) || !sampler) {
+			return false;
+		}
+		return true;
+	}
+
+	// Whether every use of value (through phis) is a sampler handle; sampler: one was found.
+	static bool FeedsOnlySamplers(const Inst& value, bool& sampler) {
+		std::vector<const Inst*> pending {&value};
+		std::unordered_set<const Inst*> visited {&value};
+		while (!pending.empty()) {
+			const auto* current = pending.back();
+			pending.pop_back();
+			for (const auto& use: current->Uses()) {
+				const auto op = use.user->GetOpcode();
+				if (op == ValueOpcode::GetSamplerResource) {
+					sampler = true;
+				} else if (op == ValueOpcode::Phi) {
+					if (visited.insert(use.user).second) {
+						pending.push_back(use.user);
+					}
+				} else {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	void CollectDeferredSamplerReads() {
+		if (m_deferred_sampler_reads.empty()) {
+			return;
+		}
+		auto deferred = std::move(m_deferred_sampler_reads);
+		m_deferred_sampler_reads.clear();
+		std::vector<const Inst*> stranded;
+		m_collecting_deferred = true;
+		for (auto* read: deferred) {
+			// Still the S# of a sampler without a heap plan: an ordinary read.
+			bool live = false;
+			std::vector<const Inst*>        pending {read};
+			std::unordered_set<const Inst*> visited {read};
+			while (!pending.empty() && !live) {
+				const auto* current = pending.back();
+				pending.pop_back();
+				for (const auto& use: current->Uses()) {
+					if (use.user->GetOpcode() == ValueOpcode::Phi) {
+						if (visited.insert(use.user).second) {
+							pending.push_back(use.user);
+						}
+					} else if (FindBindlessSampler(use.user) == nullptr) {
+						live = true;
+						break;
+					}
+				}
+			}
+			if (live) {
+				Collect(*read);
+				continue;
+			}
+			m_program.memory_info[read->Flags<MemoryFlags>().index].planning_only = true;
+			stranded.push_back(read);
+		}
+		m_collecting_deferred = false;
+		if (!stranded.empty()) {
+			std::erase_if(m_program.dynamic_reads, [&](Value value) {
+				return std::ranges::find(stranded, value.Resolve().TryInstruction()) != stranded.end();
+			});
+		}
+	}
+
 	// Stopgap (Senaxx's default sampler): the S# beside a bindless T# that is read per key too
 	// (from the same material record) has no plan. Sample with one fixed sampler (trilinear,
 	// wrap, full LOD range) rather than skipping the program; only filtering and edge addressing
@@ -2284,6 +2374,10 @@ private:
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
 			return;
 		}
+		if (!m_collecting_deferred && IsSamplerOnlyRead(inst)) {
+			m_deferred_sampler_reads.push_back(&inst);
+			return;
+		}
 		Inst*    handle   = nullptr;
 		uint32_t source   = 0;
 		uint32_t resource = 0;
@@ -2526,6 +2620,8 @@ private:
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<BindlessSamplerPlan>           m_bindless_samplers;
+	std::vector<Inst*>                         m_deferred_sampler_reads; // IsSamplerOnlyRead
+	bool                                       m_collecting_deferred = false;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 	bool                                       m_logged_runtime_image = false;

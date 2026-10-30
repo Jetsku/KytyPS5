@@ -273,6 +273,16 @@ public:
 	// guest replaced or cleared its entries): free it once no draw has used it for that many
 	// frames, whatever the memory pressure (RunGarbageCollector). Any thread but m_lock's holder.
 	void ReleaseDroppedByGuest(ImageId id);
+	// KYTY_BINDLESS_EVICT: bindless images no draw sampled during the last usage probe
+	// (RenderExecutor::UpdateBindlessUsageProbe); replaces the previous list. They stay pinned,
+	// but while the cache is under pressure RunGarbageCollector frees the clean, unbound ones.
+	// Returns their accounted bytes. GPU thread; takes m_lock.
+	uint64_t SetBindlessEvictable(std::span<const ImageId> ids);
+	// Whether the cache's images (or, with a reported budget, the device's usage) are at its
+	// pressure threshold.
+	[[nodiscard]] bool BindlessUnderPressure() const noexcept {
+		return m_total_used_memory >= m_pressure_gc_memory;
+	}
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
 	void ReportVram();
@@ -612,6 +622,12 @@ private:
 	uint64_t                                  m_guest_dropped_freed       = 0;
 	uint64_t                                  m_guest_dropped_freed_bytes = 0;
 	void                                      FreeGuestDroppedImages(uint64_t frame);
+	// KYTY_BINDLESS_EVICT (SetBindlessEvictable).
+	std::vector<ImageId> m_bindless_evictable;
+	uint64_t             m_bindless_evicted       = 0;
+	uint64_t             m_bindless_evicted_bytes = 0;
+	bool                 m_bindless_evicting      = false; // FreeImage frees a pinned image
+	void                 FreeBindlessEvictable(uint64_t frame);
 	uint64_t           m_pressure_frames      = 0;
 	uint64_t           m_pressure_frame       = 0;
 	uint64_t           m_pressure_freed_bytes = 0;

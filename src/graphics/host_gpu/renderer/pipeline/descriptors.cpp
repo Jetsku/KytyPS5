@@ -2550,6 +2550,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 		return;
 	}
 	table.ConsumeSnapshot();
+	const auto snapshot_frame = m_bindless_snapshot_frame;
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget    = 128;
 	uint32_t           resolved  = RevalidateBindlessKeys(Budget);
@@ -2646,8 +2647,62 @@ void RenderExecutor::ResolveBindlessRequests() {
 		     resolved);
 	}
 	LogBindlessHeapStats(table, frame);
+	UpdateBindlessUsageProbe(frame, snapshot_frame);
 	table.RecordFeedbackSnapshot();
 	m_bindless_snapshot_frame = frame;
+}
+
+// KYTY_BINDLESS_EVICT=1 (default off; adapted from Senaxx 8585096e6, on by default there):
+// bindless textures stay pinned in the texture cache while a heap key refers to them, and the
+// guest's heaps refer to every texture it has streamed in (2-5 GB on 4-8 GB cards in the fork's
+// title). Under memory pressure (TextureCache::BindlessUnderPressure) a probe marks every resident
+// key's feedback word; draws that sample a key overwrite the mark, and a snapshot recorded
+// ProbeFrames later lists the images whose keys all kept it. While the cache stays under
+// pressure, TextureCache::RunGarbageCollector frees those (clean, unbound ones only); their keys
+// go back to pending, and a draw that samples one again requests it anew. The fork's slot reuse
+// and placeholder-type fix are in this line already (FreeSlot, OnImageUnregistered).
+void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_EVICT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	constexpr uint64_t ProbeFrames   = 16; // frames a texture must go unsampled
+	constexpr uint64_t ProbeInterval = 32; // frames between the end of one probe and the next
+	auto&              table         = m_context.GetBindlessTable();
+	auto&              texture_cache = m_context.GetTextureCache();
+	if (m_bindless_probe_frame != 0) {
+		// The snapshot read here must have been recorded ProbeFrames after the marks.
+		if (snapshot_frame < m_bindless_probe_frame + ProbeFrames) {
+			return;
+		}
+		m_bindless_unused.clear();
+		table.CollectUnusedImages(m_bindless_unused);
+		const auto bytes       = texture_cache.SetBindlessEvictable(m_bindless_unused);
+		m_bindless_probe_frame = 0;
+		m_bindless_next_probe  = frame + ProbeInterval;
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1) < 32) {
+			LOGF("Bindless probe: frame=%" PRIu64 " unused=%zu (%" PRIu64
+			     " MB) may be evicted (KYTY_BINDLESS_EVICT)\n",
+			     frame, m_bindless_unused.size(), bytes >> 20u);
+		}
+		return;
+	}
+	if (frame < m_bindless_next_probe) {
+		return;
+	}
+	if (!texture_cache.BindlessUnderPressure()) {
+		// No pressure: an older list must not free textures sampled since.
+		m_bindless_unused.clear();
+		(void)texture_cache.SetBindlessEvictable(m_bindless_unused);
+		m_bindless_next_probe = frame + ProbeInterval;
+		return;
+	}
+	table.ArmUsageProbe();
+	m_bindless_probe_frame = std::max<uint64_t>(frame, 1u); // 0 = idle
 }
 
 // KYTY_BINDLESS_SAMPLERS (a minimal port of Senaxx's mirrored sampler heaps, 59cb8a83e): the S#
