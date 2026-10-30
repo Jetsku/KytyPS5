@@ -132,6 +132,10 @@ struct Translation {
 	std::vector<IR::Value>        loaded;      // per vector slot of the entry site
 	std::vector<uint32_t>         marker_codes; // liveness: CallStateParam(MarkerBase + i) -> code
 	std::map<uint32_t, uint32_t>  site_at_pc;   // Save / Probe markers: guest pc -> site
+	// Bytes in front of the guest code in this program (the header and, for a resume program, its
+	// branch to a_k): an S_GETPC_B64 of the canonical code returns its guest address, so PC-relative
+	// data after the guest code (Miles' 0x6d9e reads its pixel jitter table this way) is found.
+	uint32_t                      guest_pc_offset = 0;
 	bool                          prepared = false;
 };
 constexpr uint32_t MarkerBase = 0x1000u;
