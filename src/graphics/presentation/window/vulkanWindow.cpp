@@ -938,8 +938,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 	// Only used by the driver-cache probes of the library path and KYTY_PIPELINE_FAST_FIRST; the
 	// default device stays unchanged.
+	// KYTY_PIPELINE_SKIP_PROBE=1 needs it too: without the feature the probe was silently off (the
+	// GT7 preset turns fast-first off, so nothing else asked for it).
+	const bool skip_probe_requested = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_PROBE");
+		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+	}();
 	graphics.pipeline_creation_cache_control_enabled =
-	    (graphics.pipeline_library_enabled ||
+	    (graphics.pipeline_library_enabled || skip_probe_requested ||
 	     Libs::Graphics::PipelineFastFirstRequested(graphics.GetPhysicalDeviceProperties().vendorID)) &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
