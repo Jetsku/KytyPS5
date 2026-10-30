@@ -352,8 +352,8 @@ void LogRtStatus(PipelineCache& pipelines) {
 	(void)chains;
 	if (announce_ready) {
 		Log::WriteToConsoleAndLog(
-		    "RT shaders ready: every ray-tracing pipeline and callee program the game used so far is compiled; "
-		    "reflections are complete from here on (new areas can still bring new materials)\n");
+		    "RT shaders ready: every ray-tracing pipeline and callee program the game used so far is compiled, "
+		    "so no ray-tracing pass waits for a compile any more (new areas can still bring new materials)\n");
 	} else if (announce_again) {
 		Log::WriteToConsoleAndLog("RT: new ray-tracing shaders are compiling (new materials); reflections may "
 		                          "lag or have gaps until the next \"RT shaders ready\"\n");
