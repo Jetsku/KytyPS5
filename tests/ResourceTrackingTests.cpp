@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -717,6 +718,119 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+}
+
+// KYTY_TABLE_KEY_BOUNDS (upstream dfcf1c0b0, 20bb268a4, a3ac6d0d3): an address-table image key
+// bounded by truncated clamped float arithmetic, a signed clamp, or an inclusive guard enumerates
+// keys 0..maximum.
+void TestTableKeyBounds() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  namespace SR = Libs::Graphics::ShaderRecompiler;
+  enum class Variant { Float, Clamp, Guard, Unbounded };
+  // The key_count the plan proves, 0 when tracking rejects the key.
+  const auto plan = [](Variant variant, bool enabled) -> uint32_t {
+    const auto saved = SR::GetCodegenOptions();
+    auto options = saved;
+    options.table_key_bounds = enabled;
+    SR::SetCodegenOptions(options);
+    uint32_t count = 0;
+    try {
+      Fixture fixture(ShaderType::Pixel);
+      auto *entry = fixture.block;
+      auto *sample = fixture.AddBlock();
+      auto *exit = fixture.AddBlock();
+      entry->AddBranch(sample);
+      entry->AddBranch(exit);
+      sample->AddBranch(exit);
+      const auto lane = fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
+      Value key;
+      switch (variant) {
+        case Variant::Float: {
+          const auto unit = fixture.Emit(ValueOpcode::FPSaturate32,
+              {fixture.Emit(ValueOpcode::BitCastF32U32, {lane})});
+          const auto scaled = fixture.Emit(ValueOpcode::FPMad32,
+              {unit, Value::F32(15.0f),
+               Value::F32(0.0f)});
+          key = fixture.Emit(ValueOpcode::ReadFirstLane,
+              {fixture.Emit(ValueOpcode::ConvertS32F32, {scaled}), Value(true)});
+          break;
+        }
+        case Variant::Clamp:
+          key = fixture.Emit(ValueOpcode::SMin32,
+              {fixture.Emit(ValueOpcode::ReadFirstLane, {lane, Value(true)}), Value(7u)});
+          break;
+        case Variant::Guard:
+        case Variant::Unbounded:
+          key = fixture.Emit(ValueOpcode::ReadFirstLane, {lane, Value(true)});
+          break;
+      }
+      fixture.program.block_info[0].condition =
+          variant == Variant::Guard ? fixture.Emit(ValueOpcode::ULessThanEqual32, {key, Value(9u)})
+                                    : fixture.Emit(ValueOpcode::INotEqual32,
+                                                   {fixture.UserData(2), Value(0u)});
+      fixture.program.block_info[0].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1u, .false_block = 2u};
+      fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                  .true_block = 2u};
+      fixture.program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Return};
+      const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+      std::array<Value, 2> pointer;
+      for (uint32_t word = 0; word < pointer.size(); ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = word * 4u;
+        pointer[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                     {srt, Value(0u), Value(0u), Value(true)},
+                                     fixture.AddMemory(memory, 0x20));
+      }
+      fixture.block = sample;
+      const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+          {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(64u)});
+      std::array<Value, 8> words;
+      const auto table = fixture.Address(pointer[0], pointer[1]);
+      for (uint32_t group = 0; group < 2u; ++group) {
+        const auto group_offset =
+            group == 0u ? offset : fixture.Emit(ValueOpcode::IAdd32, {offset, Value(16u)});
+        for (uint32_t word = 0; word < 4u; ++word) {
+          MemoryInfo memory;
+          memory.kind = ResourceKind::ScalarAddress;
+          memory.offset = word * 4u;
+          words[group * 4u + word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                                  {table, group_offset, Value(0u), Value(true)},
+                                                  fixture.AddMemory(memory, 0x100 + group * 8u));
+        }
+      }
+      const auto image = fixture.Image(words, 0x128);
+      const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Image;
+      memory.image_dimension = Decoder::ImageDimension::Dim2D;
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                   fixture.AddMemory(memory, 0x128));
+      fixture.PlanAndTrack();
+      if (fixture.program.resource_tracking_complete && fixture.program.info.images.size() == 1u) {
+        const auto source = fixture.program.info.images[0].source;
+        const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+        if (indirect && !indirect->bindless && indirect->table_offset == 64u &&
+            indirect->key_count.Resolve().IsImmediate()) {
+          count = indirect->key_count.Resolve().U32();
+        }
+      }
+    } catch (const std::runtime_error &) {
+      count = 0;
+    }
+    SR::SetCodegenOptions(saved);
+    return count;
+  };
+  Check(plan(Variant::Float, true) == 16u,
+        "a key truncated from saturate * 15 did not enumerate 16 keys");
+  Check(plan(Variant::Clamp, true) == 8u, "a key clamped by SMin32(key, 7) did not enumerate 8 keys");
+  Check(plan(Variant::Guard, true) == 10u,
+        "a key guarded by key <= 9 did not enumerate 10 keys");
+  Check(plan(Variant::Unbounded, true) == 0u, "an unbounded key was enumerated");
+  for (const auto variant : {Variant::Float, Variant::Clamp, Variant::Guard}) {
+    Check(plan(variant, false) == 0u, "KYTY_TABLE_KEY_BOUNDS off still bounded a table key");
+  }
 }
 
 void TestBoundedComputeImageLoop() {
@@ -3407,6 +3521,7 @@ int main() {
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
+    Run("table key bounds", TestTableKeyBounds);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);

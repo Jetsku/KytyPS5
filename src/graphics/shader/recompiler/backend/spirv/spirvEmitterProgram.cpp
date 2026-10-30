@@ -317,6 +317,36 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 		return Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state), word,
 		              ConstantU32(ctx.state, zero ? ~0u : 0u));
 	}
+	// KYTY_NATIVE_WAVE64_BRANCH (Senaxx 49723097f): a wave64 workgroup shader on a 64-wide host
+	// subgroup (compute and mesh shaders on AMD) runs natively, one guest lane per invocation. Its
+	// VCC/EXEC/SCC branch decides for the wave, as the two emulated halves below do; a lane's own
+	// bit would split the wave. Lanes a partial workgroup lacks are not in the ballot, so a zero
+	// condition holds when no present lane fails it.
+	if (ctx.other_half == nullptr && !ctx.state.split_wave &&
+	    kind != CFG::BranchCondition::ScalarInstruction &&
+	    kind != CFG::BranchCondition::GotoVariable && GetCodegenOptions().native_wave64_branch &&
+	    ctx.state.program.wave_size == 64u) {
+		const auto* workgroup = ShaderWorkgroupInput(ctx.state.program.stage, ctx.state.input_info);
+		if (workgroup != nullptr && workgroup->host_subgroup_size == 64u) {
+			auto& state     = ctx.state;
+			auto  predicate = ctx.Def(info.condition);
+			if (zero) {
+				predicate = Unary(state, spv::OpLogicalNot, TypeBool(state), predicate);
+			}
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+			const auto ballot = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+			                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+			const auto low  = state.builder.AllocateId();
+			const auto high = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+			const auto any = Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+			return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), any,
+			              ConstantU32(state, 0));
+		}
+	}
 	// Scalar-instruction conditions already test the full wave's raw register values.
 	if ((ctx.other_half == nullptr && !ctx.state.split_wave) ||
 	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||

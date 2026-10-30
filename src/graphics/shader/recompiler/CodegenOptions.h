@@ -594,6 +594,23 @@ struct CodegenOptions {
 	// own group's image by the workgroup id. Off: such a program is skipped ("computes a descriptor
 	// at runtime that has no BDA path"), as before.
 	bool workgroup_images = false;
+	// KYTY_TABLE_KEY_BOUNDS=1 (default off; adapted from upstream KytyPS5 dfcf1c0b0, 20bb268a4,
+	// a3ac6d0d3 and b2053c286): an address-table image key that neither a bit scan nor a bounded
+	// loop covers is enumerated up to a constant maximum proven from its value (truncated clamped
+	// float arithmetic, signed/unsigned minimums, masks, shifts, waterfall ReadFirstLane of a
+	// bounded lane value) or from guards on the access (key < C, key <= C); failing that, a
+	// zero-based per-lane loop key takes the runtime count every uniform zero-based loop of the
+	// program shares (a heuristic, logged). Off: such programs are skipped or go bindless, as before.
+	bool table_key_bounds = false;
+	// KYTY_NATIVE_WAVE64_BRANCH=1 (default off; Senaxx 49723097f): a wave64 compute or mesh program
+	// on a 64-wide host subgroup (AMD) takes a ballot for its VCC/EXEC/SCC branches, so the wave
+	// branches as one, as the emulated two-half path does on 32-wide hosts. Off: each lane branches
+	// on its own bit there (no effect on NVIDIA, whose subgroups are 32 wide).
+	bool native_wave64_branch = false;
+	// KYTY_TESS_CP_MASK=1 (default off; upstream 77458260f): the LS/HS stride reflection reads
+	// packed HS ID & 0x1f00 as the control point times 256 without KYTY_TESS_INDEXED too (which
+	// already does). Off: such an address does not reflect and the stage's draws are skipped.
+	bool tess_cp_mask = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,
