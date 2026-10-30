@@ -2634,7 +2634,12 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 			// The inherited count may be GPU data an earlier (pending) draw writes.
 			DrainPreparedDraws();
 		}
-		args.instance_count = NumInstances();
+		// KYTY_GPU_INSTANCE_COUNT (GT7 fork dcac2bb4f): a count a native indirect draw left in
+		// GPU memory is read by the GPU at this draw; the pending sources stay for later draws.
+		if ((op.flags & CpSeq::DrawFlagPublished) == 0) {
+			args.gpu_instance_address = GpuInstanceCountAddress();
+		}
+		args.instance_count = args.gpu_instance_address != 0 ? 1u : NumInstances();
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		// Thread mode: the sequencer published the draw; commit its prepared slot now, in order.
@@ -2652,7 +2657,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 	if (RepeatTrace::Enabled()) {
 		NoteRepeatTraceDrawPacket();
 	}
-	if (TrySubmitPreparedDraw(&args, nullptr)) {
+	if (args.gpu_instance_address == 0 && TrySubmitPreparedDraw(&args, nullptr)) {
 		// Draw-prep: the engine runs MaybeFlushIdleGpu after it records (commits) each draw. The
 		// slice may count the draw now: a yield ends the slice after this packet, and the slice
 		// end commits the whole window before anything else runs.
@@ -2681,6 +2686,22 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
+}
+
+uint64_t CommandProcessor::GpuInstanceCountAddress() const {
+	if (!RenderExecutor::GpuInstanceCountEnabled() || m_pending_num_instances.empty()) {
+		return 0;
+	}
+	// Without a count buffer the newest source drew max_count (> 0) records: its last record's
+	// instance count is the one NumInstances reads; older sources cannot decide.
+	const auto& pending = m_pending_num_instances.back();
+	if (pending.count_addr != 0 || pending.max_count == 0) {
+		return 0;
+	}
+	const auto address = pending.args_addr +
+	                     static_cast<uint64_t>(pending.max_count - 1u) * pending.stride +
+	                     IndirectInstanceCountOffset;
+	return m_renderer.IsMapped(address, sizeof(uint32_t)) ? address : 0;
 }
 
 uint32_t CommandProcessor::NumInstances() {
@@ -3304,7 +3325,11 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		if (!m_pending_num_instances.empty()) {
 			DrainPreparedDraws();
 		}
-		args.instance_count = NumInstances();
+		// KYTY_GPU_INSTANCE_COUNT: as in ExecDrawIndex.
+		if ((op.flags & CpSeq::DrawFlagPublished) == 0) {
+			args.gpu_instance_address = GpuInstanceCountAddress();
+		}
+		args.instance_count = args.gpu_instance_address != 0 ? 1u : NumInstances();
 	}
 	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
 		m_draw_prep->CommitPublished(
@@ -3317,7 +3342,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 	if (RepeatTrace::Enabled()) {
 		NoteRepeatTraceDrawPacket();
 	}
-	if (TrySubmitPreparedDraw(nullptr, &args)) {
+	if (args.gpu_instance_address == 0 && TrySubmitPreparedDraw(nullptr, &args)) {
 		// See DrawIndex: idle flushes follow each commit, the slice counts the draw now.
 		MaybeYieldSlice();
 		return;

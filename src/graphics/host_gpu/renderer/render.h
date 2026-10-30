@@ -93,6 +93,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// KYTY_GPU_INSTANCE_COUNT: nonzero, the instance count is the guest dword the GPU reads there
+	// (instance_count is then 1, a placeholder).
+	uint64_t         gpu_instance_address       = 0;
 };
 
 // GPU-resident draw arguments for vkCmdDraw*Indirect*. Guest DrawIndexedIndirect (20 bytes) and
@@ -124,6 +127,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// KYTY_GPU_INSTANCE_COUNT: as in DrawIndexArgs.
+	uint64_t         gpu_instance_address       = 0;
 };
 
 // Barrier batcher (KYTY_BARRIER_BATCH, default on; KYTY_BARRIER_BATCH=0 restores the direct
