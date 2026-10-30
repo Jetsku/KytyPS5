@@ -393,6 +393,19 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_INT_MRT_OUTPUTS=1 (default off; upstream 26ca60923): pixel exports to UINT and SINT render
+	// targets are typed as integer vectors of the target's signedness (Vulkan requires the output
+	// type to match the attachment's numeric type); compressed 16-bit exports to SINT targets are
+	// sign-extended instead of unpacked as FP16. Off: only 32_ABGR exports are unsigned vectors.
+	bool int_mrt_outputs = false;
+	// KYTY_BARRIER_ACQUIRE_STORES=1 (default off; upstream ceb154d9e): S_BARRIER in a program that
+	// writes buffers or images also orders uniform and image memory (other waves' stores become
+	// visible to plain loads right after the barrier). Off: the barrier orders LDS only.
+	bool barrier_acquire_stores = false;
+	// KYTY_UFLOAT_STORE_RTZ=1 (default off; upstream 59d8256b3): formatted buffer stores to 11/10-bit
+	// unsigned floats truncate (round toward zero through f16) and store negatives and NaN as zero.
+	// Off: round to nearest even, KYTY_FLOAT_STORE_CLAMP overflow, NaN kept.
+	bool ufloat_store_rtz = false;
 	// KYTY_RT_STUB=1: translate IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (MIMG
 	// 0xe6/0xe7) as "no intersection" for every lane instead of skipping compute dispatches that
 	// contain them (and failing other stages). A box node returns four invalid child pointers
@@ -577,6 +590,10 @@ struct CodegenOptions {
 	// conversions. Off, a denormal there stays denormal instead of reading as a signed zero
 	// (rcp(denormal) is then a large finite value, not an infinity). Bits: DenormFlushSkip*.
 	uint8_t denorm_flush_skip = 0;
+	// KYTY_FRACT_CLAMP=1 (default off; upstream e864cb20b): V_FRACT_F16/F32/F64 results are clamped
+	// below one (the largest value under 1.0 in the destination precision), as the hardware returns
+	// for a tiny negative source where x - floor(x) rounds to 1.0. One compare and select per fract.
+	bool fract_clamp = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;

@@ -42,6 +42,11 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 		}
 		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
 	}
+	// KYTY_2_10_10_10_ROTATE (upstream 963aaeb3b): the transfers rotate the 2-bit component to the
+	// top (ColorTransform::Rotate2_10_10_10), so the host image keeps the guest's bit fields.
+	if (guest_format == Prospero::BufferFormat::k2_10_10_10UNorm && Rotate2_10_10_10Enabled()) {
+		return {vk::Format::eA2R10G10B10UnormPack32, Prospero::ColorMappingAbgr};
+	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k8_8_8_8UNorm:

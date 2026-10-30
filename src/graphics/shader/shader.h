@@ -299,10 +299,18 @@ struct ShaderPixelInputInfo {
 	// exports clamp to the half range. In padding before `stage`: the struct keeps its size, and
 	// stored journals and pipeline lists read it as zero (ShaderSanitizeStoredInputInfo).
 	uint8_t                                        target_half_float_mask = 0;
+	// KYTY_INT_MRT_OUTPUTS (upstream 26ca60923): exports to UINT and SINT targets, which take
+	// integer outputs of the same signedness. The last padding bytes before `stage`; journals and
+	// pipeline lists read them as zero (ShaderSanitizeStoredInputInfo).
+	uint8_t                                        target_uint_mask       = 0;
+	uint8_t                                        target_sint_mask       = 0;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
+// Journals and pipeline lists store the whole pixel input info: the masks above must stay in padding.
+static_assert(offsetof(ShaderPixelInputInfo, stage) == 216,
+              "ShaderPixelInputInfo layout changed: stored journals and pipeline lists would break");
 
 // Journals and pipeline lists written before async_compute / parameter_mode existed hold padding
 // bytes where those fields now sit (sizeof did not change). Called after a stored input info is
@@ -315,6 +323,8 @@ inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
 		info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	}
 	info.target_half_float_mask = 0;
+	info.target_uint_mask       = 0;
+	info.target_sint_mask       = 0;
 }
 inline void ShaderSanitizeStoredInputInfo(ShaderVertexInputInfo& info) {
 	info.clip_space.vte_format = 0;

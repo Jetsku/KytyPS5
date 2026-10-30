@@ -134,6 +134,7 @@ private:
 	                                 float safe_upper, uint32_t lower_result,
 	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
+	IR::U32 Saturate16(IR::U32 value, bool signed_value);
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
@@ -161,6 +162,7 @@ private:
 	void V_CVT_PKRTZ_F16_F32(const Decoder::Instruction& inst);
 	void V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
+	void V_CVT_PK_16_32(const Decoder::Instruction& inst, bool signed_value);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
@@ -171,6 +173,7 @@ private:
 	void Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                    bool mix);
 	void FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	void V_FRACT(const Decoder::Instruction& inst, IR::Type type);
 	void FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse);
 	void FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                  bool mix);
@@ -184,7 +187,7 @@ private:
 	void Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
-	void V_MAD_I16(const Decoder::Instruction& inst);
+	void Integer16Mad(const Decoder::Instruction& inst, bool sign);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
@@ -204,8 +207,8 @@ private:
 	void V_XOR3_B32(const Decoder::Instruction& inst);
 	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
-	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
+	void S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign = false);
+	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
 	void V_ADD3_U32(const Decoder::Instruction& inst);
@@ -214,7 +217,7 @@ private:
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
 	void V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low);
 	void S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst);
-	void S_QUADMASK_B64(const Decoder::Instruction& inst);
+	void S_QUADMASK(const Decoder::Instruction& inst, bool is64);
 	void BFM_B32(const Decoder::Instruction& inst);
 	IR::U32 RightMask32(IR::U32 count);
 	IR::U64 RightMask64(IR::U32 count);

@@ -39,6 +39,15 @@ uvec2 transform_color(uvec2 value, uint transform, bool to_host) {
 			}
 			break;
 		}
+		case 4u:
+			// KYTY_2_10_10_10_ROTATE (upstream 963aaeb3b): the guest's 2-bit component moves to the
+			// host's alpha bits at the top.
+			if (to_host) {
+				value.x = (value.x >> 2u) | (value.x << 30u);
+			} else {
+				value.x = (value.x << 2u) | (value.x >> 30u);
+			}
+			break;
 	}
 	return value;
 }

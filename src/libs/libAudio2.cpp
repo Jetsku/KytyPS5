@@ -269,6 +269,8 @@ struct AudioOut2PortStateEntry {
 	uint32_t               pcm_sets_since_push = 0;
 	const void*            pcm_pointer         = nullptr;
 	AudioOut2BlockTrace    block_trace;
+	// KYTY_AUDIO2_CONSUME_PCM: no PCM attribute was set since the previous push.
+	bool                   pcm_stale = false;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -323,6 +325,33 @@ static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHand
 	}
 
 	return nullptr;
+}
+
+// KYTY_AUDIO2_EXACT_GRAIN=1 (default off; upstream 7ff8aff5e): the context queue drains at an
+// exact 48 kHz grain rate (a clock of sixth microseconds, one sample = 125 ticks) instead of whole
+// microseconds per grain (10666 us for 512 samples, about 0.006% fast).
+static bool audioout2_exact_grain() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO2_EXACT_GRAIN");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+// The clock of AudioOut2ContextState::last_update.
+static uint64_t audioout2_clock() {
+	return LibKernel::KernelGetProcessTime() * (audioout2_exact_grain() ? 6u : 1u);
+}
+
+// KYTY_AUDIO2_CONSUME_PCM=1 (default off; upstream 64a554dea): a push consumes the PCM of a plain
+// port, so a port the game stops feeding falls silent instead of repeating its last block (object
+// ports are already silent when not fed again).
+static bool audioout2_consume_pcm() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO2_CONSUME_PCM");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
 }
 
 static uint32_t audioout2_grain_micros(uint32_t grains) {
@@ -394,13 +423,16 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
-	const auto now = LibKernel::KernelGetProcessTime();
+	const auto now = audioout2_clock();
 	if (state->last_update == 0 || state->queued == 0) {
 		state->last_update = now;
 		return;
 	}
 
-	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+	// In clock ticks (KYTY_AUDIO2_EXACT_GRAIN: 125 per sample).
+	const auto grain_micros = audioout2_exact_grain()
+	                              ? uint64_t {state->num_grains == 0 ? 512u : state->num_grains} * 125u
+	                              : static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
 	if (now <= state->last_update || grain_micros == 0) {
 		return;
 	}
@@ -737,12 +769,15 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 			if (trace) {
 				audioout2_trace_block_locked(&state);
 			}
+			state.pcm_stale           = state.pcm_sets_since_push == 0;
 			state.pcm_sets_since_push = 0;
 		}
 	}
+	const bool consume = audioout2_consume_pcm();
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
-		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
+		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX &&
+		    !(consume && state.pcm_stale)) {
 			const void* data = state.pcm_data.data();
 			if (objects_on && !objects_mixed && audioout2_is_object_bed(state)) {
 				data          = audioout2_mix_objects_locked(ctx, state, &object_mix);
@@ -864,7 +899,7 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	state->queue_depth = (params->queue_depth == 0 ? 4u : params->queue_depth);
 	state->queued      = 0;
 	state->num_grains  = (params->num_grains == 0 ? 512u : params->num_grains);
-	state->last_update = LibKernel::KernelGetProcessTime();
+	state->last_update = audioout2_clock();
 	state->max_ports        = params->max_ports;
 	state->max_object_ports = params->max_object_ports;
 	g_audioout2_context_mutex.Unlock();
@@ -1073,7 +1108,7 @@ static int AudioOut2ContextPushImpl(AudioOut2ContextHandle ctx, uint32_t blockin
 			sleep_micros = audioout2_grain_micros(state->num_grains);
 			if (state->queued < state->queue_depth || use_device_clock) {
 				if (state->queued == 0) {
-					state->last_update = LibKernel::KernelGetProcessTime();
+					state->last_update = audioout2_clock();
 				}
 				if (state->queued < state->queue_depth) {
 					state->queued++;

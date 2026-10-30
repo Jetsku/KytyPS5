@@ -22,6 +22,7 @@
 #include "graphics/shader/shader.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -91,9 +92,35 @@ constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t DEFAULT_GUEST_MEMORY_SIZE    = 13824ull * 1024ull * 1024ull;
+// PS5 Pro mode (--trinity on a title that supports it; upstream 651ef73a0): more guest memory.
+constexpr uint64_t TRINITY_EXTRA_MEMORY_SIZE = 1216ull * 1024ull * 1024ull;
 
+// KYTY_UPSTREAM_MEMORY_DEFAULTS=1 (default off; upstream 09753bf8f, 0a140911a): upstream's memory
+// sizes. A game gets 12.5 GiB; a fixed 64 MiB cache and the mapping table memory its param.json
+// asks for past the 64 MiB included for each of the CPU, GPU and AMM tables come off the top;
+// flexible memory defaults to 448 MiB and loaded modules' segments are charged to it; the page
+// table stats report the param.json table sizes. Off: 13.5 GiB, 1 GiB flexible memory by default,
+// module segments not charged, a fixed 4 GiB page table pool per side (as before).
+static bool UpstreamMemoryDefaults() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPSTREAM_MEMORY_DEFAULTS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+constexpr uint64_t UPSTREAM_GUEST_MEMORY_BUDGET   = 12800ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_DEFAULT_FLEXIBLE_SIZE = 448ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_RESERVED_CACHE_SIZE   = 64ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_INCLUDED_TABLE_MEMORY = 64ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_MAPPING_TABLE_SIZE    = 4ull * 1024ull;
+
+static uint64_t                      g_guest_memory_size           = DEFAULT_GUEST_MEMORY_SIZE;
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
+// Page table entries per side (KernelGetPageTableStats).
+static uint64_t g_cpu_page_table_entries = PAGE_TABLE_POOL_ENTRIES;
+static uint64_t g_gpu_page_table_entries = PAGE_TABLE_POOL_ENTRIES;
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
@@ -1066,8 +1093,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
-	static uint64_t           Size() {
+	static uint64_t TotalSize() { return g_guest_memory_size; }
+	static uint64_t Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;
 	}
@@ -1136,6 +1163,8 @@ public:
 
 	static uint64_t Size() { return g_flexible_memory_size; }
 	uint64_t        Available();
+	void            Charge(uint64_t size);
+	void            Release(uint64_t size);
 
 	bool Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mode mode, GpuAccessMode gpu_mode,
 	         const char* name);
@@ -2070,7 +2099,41 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
+// The memory sizes from the game's param.json (Loader::SystemContentGetMemoryParams); it replaces
+// the emulator's SetFlexibleMemorySize call, which upstream removed with its param.json reader.
+static void InitializeMemorySizes() {
+	const auto params        = Loader::SystemContentGetMemoryParams();
+	const auto trinity_extra = Loader::SystemContentIsTrinityMode() ? TRINITY_EXTRA_MEMORY_SIZE : 0;
+	if (UpstreamMemoryDefaults()) {
+		g_flexible_memory_size = params.flexible_size != 0 ? params.flexible_size : UPSTREAM_DEFAULT_FLEXIBLE_SIZE;
+		const auto cpu_tables  = std::max(params.cpu_table_memory, UPSTREAM_INCLUDED_TABLE_MEMORY);
+		const auto gpu_tables  = std::max(params.gpu_table_memory, UPSTREAM_INCLUDED_TABLE_MEMORY);
+		const auto amm_tables  = std::max(params.amm_table_memory, UPSTREAM_INCLUDED_TABLE_MEMORY);
+		const auto overhead    = cpu_tables + gpu_tables + amm_tables - 3 * UPSTREAM_INCLUDED_TABLE_MEMORY;
+		const auto budget      = UPSTREAM_GUEST_MEMORY_BUDGET + trinity_extra;
+		EXIT_IF(g_flexible_memory_size + overhead >= budget - UPSTREAM_RESERVED_CACHE_SIZE);
+		g_guest_memory_size      = budget - UPSTREAM_RESERVED_CACHE_SIZE - overhead;
+		g_cpu_page_table_entries = cpu_tables / UPSTREAM_MAPPING_TABLE_SIZE;
+		g_gpu_page_table_entries = gpu_tables / UPSTREAM_MAPPING_TABLE_SIZE;
+	} else {
+		g_guest_memory_size = DEFAULT_GUEST_MEMORY_SIZE + trinity_extra;
+		if (params.flexible_size != 0) {
+			constexpr uint64_t GuestPageSize = 0x4000;
+			EXIT_IF((params.flexible_size & (GuestPageSize - 1u)) != 0 ||
+			        params.flexible_size >= g_guest_memory_size);
+			g_flexible_memory_size = params.flexible_size;
+		}
+	}
+	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB%s\n",
+	     g_flexible_memory_size / (1024ull * 1024ull),
+	     (g_guest_memory_size - g_flexible_memory_size) / (1024ull * 1024ull),
+	     UpstreamMemoryDefaults() ? " (KYTY_UPSTREAM_MEMORY_DEFAULTS)" : "");
+}
+
 void Initialize() {
+	if (!g_flexible_memory_size_frozen) {
+		InitializeMemorySizes();
+	}
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize() +
@@ -3078,6 +3141,19 @@ void FlexibleMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const cha
 	}
 }
 
+void FlexibleMemory::Charge(uint64_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	m_allocated_total += size;
+}
+
+void FlexibleMemory::Release(uint64_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	EXIT_IF(size > m_allocated_total);
+	m_allocated_total -= size;
+}
+
 uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
@@ -3770,17 +3846,15 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 	const auto gpu_used =
 	    (g_virtual_ranges != nullptr ? g_virtual_ranges->CountPageTableEntries(true) : 0);
 
-	*cpu_total     = PAGE_TABLE_POOL_ENTRIES;
-	*gpu_total     = PAGE_TABLE_POOL_ENTRIES;
-	*cpu_available = PAGE_TABLE_POOL_ENTRIES -
-	                 static_cast<int>(std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES));
-	*gpu_available = PAGE_TABLE_POOL_ENTRIES -
-	                 static_cast<int>(std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES));
+	const uint64_t cpu_entries = g_cpu_page_table_entries;
+	const uint64_t gpu_entries = g_gpu_page_table_entries;
+	*cpu_total                 = static_cast<int>(cpu_entries);
+	*gpu_total                 = static_cast<int>(gpu_entries);
+	*cpu_available = static_cast<int>(cpu_entries - std::min<uint64_t>(cpu_used, cpu_entries));
+	*gpu_available = static_cast<int>(gpu_entries - std::min<uint64_t>(gpu_used, gpu_entries));
 	if (Profiler::LoadingEnabled()) {
-		const auto cpu_free = PAGE_TABLE_POOL_ENTRIES -
-		                      std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES);
-		const auto gpu_free = PAGE_TABLE_POOL_ENTRIES -
-		                      std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES);
+		const auto cpu_free = cpu_entries - std::min<uint64_t>(cpu_used, cpu_entries);
+		const auto gpu_free = gpu_entries - std::min<uint64_t>(gpu_used, gpu_entries);
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableStatsSuccesses);
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableCpuAvailableSum, cpu_free);
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableGpuAvailableSum, gpu_free);
@@ -4959,6 +5033,24 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	return vaddr;
 }
 
+// Upstream 0a140911a, only with KYTY_UPSTREAM_MEMORY_DEFAULTS=1: loaded modules' segments use
+// flexible memory without taking its backing. Returns the size charged (0 when off).
+uint64_t ChargeFlexibleMemory(uint64_t size) {
+	if (!UpstreamMemoryDefaults() || size == 0 || g_flexible_memory == nullptr) {
+		return 0;
+	}
+
+	g_flexible_memory->Charge(size);
+	return size;
+}
+
+void ReleaseFlexibleMemory(uint64_t size) {
+	if (size != 0 && g_flexible_memory != nullptr) {
+		g_flexible_memory->Release(size);
+	}
+
+}
+
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
                                const char* name) {
 	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
@@ -5592,7 +5684,8 @@ DebugStats GetDebugStats() {
 	stats.direct_total       = PhysicalMemory::Size();
 	stats.flexible_total     = FlexibleMemory::Size();
 	stats.pool_committed     = g_memory_pool_committed.load(std::memory_order_relaxed);
-	stats.page_entries_total = PAGE_TABLE_POOL_ENTRIES;
+	stats.cpu_page_entries_total = g_cpu_page_table_entries;
+	stats.gpu_page_entries_total = g_gpu_page_table_entries;
 	if (g_physical_memory != nullptr) {
 		Common::LockGuard lock(g_physical_memory->GetMutex());
 		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {

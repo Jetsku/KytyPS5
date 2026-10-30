@@ -99,7 +99,11 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U32(options.dispatcher_cap);
 	b.U8(options.ir_linear_uses ? 1u : 0u);
 	b.U8(options.fold_lane_masks ? 1u : 0u);
+	b.U8(options.int_mrt_outputs ? 1u : 0u);
+	b.U8(options.barrier_acquire_stores ? 1u : 0u);
+	b.U8(options.ufloat_store_rtz ? 1u : 0u);
 	b.U8(options.rt_stub ? 1u : 0u);
+	b.U8(options.fract_clamp ? 1u : 0u);
 	b.U8(options.rt_software ? 1u : 0u);
 	b.U32(options.rt_function);
 	b.U8(options.rt_type6 ? 1u : 0u);

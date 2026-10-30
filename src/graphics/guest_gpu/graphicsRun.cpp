@@ -1292,6 +1292,22 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
 
+void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	// Agc emits MEM_SEMAPHORE on async compute queues, whose front is always direct. A sequenced
+	// (or verified) front would have to order this guest write and wait as a lockstep op.
+	EXIT_NOT_IMPLEMENTED(m_front_mode != FrontMode::Direct);
+	EXIT_IF(counter == nullptr);
+	if (signal) {
+		*counter = write ? 1u : *counter + 1u;
+		NoteCpWrite(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
+	} else if (*counter == 0) {
+		SuspendPm4();
+	} else {
+		(*counter)--;
+		NoteCpWrite(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
+	}
+}
+
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	CpSeq::WriteDataOp op;
@@ -3759,6 +3775,27 @@ bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32
 	return true;
 }
 
+// KYTY_LABEL_BACKING=1 (default off; upstream 2463e3aaf): an end-of-pipe label that sits beside
+// GPU-written bytes (whose page the buffer cache tracks as GPU-modified, with no dirty bytes left
+// to download) is written to the backing store, so the guest-mapping fault does not download the
+// GPU-written bytes under it first. Other labels, and any failure, go through the guest mapping.
+static void WriteEopLabel(RenderContext& renderer, void* dst, const void* value, uint64_t size) {
+	static const bool enabled = [] {
+		const auto* v = std::getenv("KYTY_LABEL_BACKING");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	if (enabled) {
+		const auto vaddr   = reinterpret_cast<uint64_t>(dst);
+		auto&      buffers = renderer.GetBufferCache();
+		if (GuestRange {vaddr, size}.Valid() && buffers.IsRegionGpuModified(vaddr, size) &&
+		    !buffers.HasGpuDirtyBytes(vaddr, size) &&
+		    LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+			return;
+		}
+	}
+	std::memcpy(dst, value, size);
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -3874,7 +3911,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			// resulting fault separately from the end-of-pipe submission/interrupt work.
 			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
 			StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
-			std::memcpy(dst, &data, sizeof(data));
+			WriteEopLabel(m_renderer, dst, &data, sizeof(data));
 		}
 		NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		TraceCpLabel("label-eop", dst, data, sizeof(data));
@@ -3917,7 +3954,18 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
 					if (with_interrupt) {
-						m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+						// KYTY_GDS_INTERRUPT_QUEUED=1 (default off; upstream 6aaa53329): queue the
+						// interrupt behind earlier end-of-pipe interrupts instead of raising it now.
+						static const bool queued = [] {
+							const auto* v = std::getenv("KYTY_GDS_INTERRUPT_QUEUED");
+							return v != nullptr && std::strcmp(v, "1") == 0;
+						}();
+						if (queued) {
+							TriggerEopEventAtEndOfPipe(interrupt_context_id);
+							BufferFlushForEop();
+						} else {
+							m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+						}
 					}
 					return;
 				}
@@ -3961,7 +4009,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					{
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
 						StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
-						std::memcpy(dst, &value, sizeof(value));
+						WriteEopLabel(m_renderer, dst, &value, sizeof(value));
 					}
 					NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
 					QueueEopTimestamp(timestamp_slot, dst, value);
@@ -4801,6 +4849,7 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 			break;
 		case OpKind::DmaData: ExecDmaData(*static_cast<const CpSeq::DmaDataOp*>(payload)); break;
 		case OpKind::LodStats: ExecLodStats(*static_cast<const CpSeq::LodStatsOp*>(payload)); break;
+		case OpKind::Pssr: ExecPssr(*static_cast<const CpSeq::PssrOp*>(payload)); break;
 		case OpKind::Flip: ExecFlip(*static_cast<const CpSeq::FlipOp*>(payload)); break;
 		case OpKind::WaitRegMem:
 			return ExecWaitRegMem(*static_cast<const CpSeq::WaitRegMemOp*>(payload));
@@ -4909,6 +4958,25 @@ void CommandProcessor::GetLodStats(const uint32_t* body) {
 	CpSeq::LodStatsOp op;
 	std::memcpy(op.body, body, sizeof(op.body));
 	(void)Submit(op);
+}
+
+void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
+	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
+	static_assert(sizeof(CpSeq::PssrOp::request) == sizeof(Pssr::Request));
+	CpSeq::PssrOp op;
+	std::memcpy(op.request, &request, sizeof(op.request));
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecPssr(const CpSeq::PssrOp& op) {
+	Pssr::Request request {};
+	std::memcpy(&request, op.request, sizeof(request));
+	// The host PSSR pass (upstream 651ef73a0 renderPssr.cpp) is not ported yet: only reachable in Pro mode
+	// (--trinity), the request is decoded and dropped, so the output image keeps its previous contents.
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true)) {
+		printf("PSSR request dropped (host pass not ported): %ux%u\n", request.width, request.height);
+	}
 }
 
 void CommandProcessor::SetCeComplete(bool complete) {

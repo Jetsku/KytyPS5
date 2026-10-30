@@ -77,15 +77,19 @@ struct ConfigOptions {
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
+	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
 	std::string            amd_cpu_decision; // why amd_cpu_enabled is set as it is, for the log
 	bool                   network_connected           = false;
+	bool                   psn_emulation_enabled       = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   shader_cache_enabled        = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -102,6 +106,7 @@ struct ConfigOptions {
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   occlusion_queries_enabled   = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -143,15 +148,19 @@ int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
+bool     StretchEnabled();
 bool     VrEnabled();
+bool     Ps5ProEnabled();
 bool     AmdCpuEnabled();
 const std::string& GetAmdCpuDecision();
 bool     IsNetworkConnected();
+bool     PsnEmulationEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+bool                   ShaderCacheEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
@@ -186,6 +195,7 @@ inline bool SyncRawImageBuffersEnabled() {
 	return Detail::g_sync_raw_image_buffers;
 }
 bool TessellationEnabled();
+bool OcclusionQueriesEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

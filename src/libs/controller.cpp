@@ -741,6 +741,8 @@ static bool PadStateCoalescing() {
 	return on;
 }
 
+// Input that changes no button or touch contact updates the newest unread sample, so a burst of
+// stick or sensor events between two reads cannot push unread button or touch changes out.
 void GameController::AddState() {
 	if (m_states_num != 0 && PadStateCoalescing()) {
 		const auto  newest = (m_first_state + m_states_num - 1) % STATES_MAX;
