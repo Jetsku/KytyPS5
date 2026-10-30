@@ -1400,6 +1400,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
 		case IR::Type::F64: return TypeF64(state);
+		case IR::Type::Bvh8Result: return TypeBvh8Result(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
@@ -1752,6 +1753,7 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineBvhNodeTestFunction(state);
+	DefineBvh8IntersectFunction(state);
 	DefineIndirectFormatFunction(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {

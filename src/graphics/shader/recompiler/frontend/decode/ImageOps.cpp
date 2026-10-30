@@ -288,6 +288,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe5u: return Opcode::IMAGE_BVH8_INTERSECT_RAY;
 		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
@@ -424,6 +425,46 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect does not support TFE or LWE");
 	} else if (bvh && nsa_dwords != 0u && 1u + nsa_dwords * 4u < inst.image_address_components) {
 		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect NSA form has too few addresses");
+	}
+	if (inst.opcode == Opcode::IMAGE_BVH8_INTERSECT_RAY) {
+		// PS5 Pro (upstream 5eab0ec73). Address dwords: encoded base lo/hi, ray extent, instance
+		// mask, origin xyz, direction xyz, node pointer. The NSA form (two dwords) names the first
+		// four individually, then the origin, direction and node registers (the origin and the
+		// direction are register triples); they are expanded here to one register per component.
+		inst.image_address_components = 11u;
+		inst.data_components = inst.data_dwords = 10u;
+		if (a16 || d16 || !r128 || inst.dmask != 0xfu || inst.tfe || inst.lwe ||
+		    (nsa_dwords != 0u && nsa_dwords != 2u) || vdata > 246u ||
+		    (nsa_dwords == 0u && vaddr > 245u)) {
+			SetUnsupported(inst, Family::MIMG, opcode, "invalid BVH8 ray or destination encoding");
+		}
+		if (nsa_dwords == 2u) {
+			const auto origin    = inst.image_nsa_addr[3];
+			const auto direction = inst.image_nsa_addr[4];
+			const auto node      = inst.image_nsa_addr[5];
+			if (origin > 253u || direction > 253u) {
+				SetUnsupported(inst, Family::MIMG, opcode, "BVH8 ray registers exceed VGPR range");
+			}
+			for (uint32_t i = 0; i < 3u; i++) {
+				inst.image_nsa_addr[3u + i] = origin + i;
+				inst.image_nsa_addr[6u + i] = direction + i;
+			}
+			inst.image_nsa_addr[9] = node;
+		}
+		// An instance node writes the transformed ray back over the origin and direction registers,
+		// a non-instance result may land in them; the two must not partly overlap.
+		const uint32_t origin    = nsa_dwords != 0u ? inst.image_nsa_addr[3] : vaddr + 4u;
+		const uint32_t direction = nsa_dwords != 0u ? inst.image_nsa_addr[6] : vaddr + 7u;
+		bool overlapping = origin < direction + 3u && direction < origin + 3u;
+		for (const uint32_t output: {2u, 3u, 6u, 7u}) {
+			const uint32_t reg = vdata + output;
+			overlapping |= (reg >= origin && reg < origin + 3u) ||
+			               (reg >= direction && reg < direction + 3u);
+		}
+		if (overlapping) {
+			SetUnsupported(inst, Family::MIMG, opcode,
+			               "overlapping BVH8 instance outputs are unsupported");
+		}
 	}
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

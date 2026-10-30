@@ -705,6 +705,8 @@ enum class Opcode {
 	DS_READ2ST64_B64,
 	DS_READ_B96,
 	DS_READ_B128,
+	// PS5 Pro (Trinity) DS 0xe1: pushes up to eight BVH children on an LDS ring stack and pops one.
+	DS_BVH_STACK_PUSH8_POP1_RTN_B32,
 	DS_WRITE_B8,
 	DS_WRITE_B16,
 	DS_WRITE_B8_D16_HI,
@@ -745,6 +747,9 @@ enum class Opcode {
 	// MIMG 0xe6/0xe7: one ray/BVH-node test (RDNA2 ISA 8.2.10). Four result dwords, no sampler.
 	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_BVH64_INTERSECT_RAY,
+	// PS5 Pro (Trinity) MIMG 0xe5: one ray against a BVH8 node (two 4-child boxes, a triangle pair or
+	// an instance). Eleven address dwords, ten result dwords; an instance also rewrites the ray.
+	IMAGE_BVH8_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,

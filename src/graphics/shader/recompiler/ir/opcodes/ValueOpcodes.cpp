@@ -44,6 +44,7 @@ constexpr Type AddressResource = Type::AddressResource;
 constexpr Type ImageResource   = Type::ImageResource;
 constexpr Type SamplerResource = Type::SamplerResource;
 constexpr Type ImageAddress    = Type::ImageAddress;
+constexpr Type Bvh8Result      = Type::Bvh8Result;
 
 constexpr std::array<OpcodeMeta, static_cast<size_t>(ValueOpcode::Count)> MetaTable = {{
 #define VALUE_OPCODE(name, ...) MakeMeta(#name __VA_OPT__(, ) __VA_ARGS__),
@@ -247,6 +248,7 @@ AddressOpcodeInfo AddressOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::LoadAddressU16: return {AddressAccess::Read, 16u};
 		case ValueOpcode::LoadAddressU32: return {AddressAccess::Read, 32u};
 		case ValueOpcode::BvhIntersectRay: return {AddressAccess::Read, 32u};
+		case ValueOpcode::Bvh8IntersectRay: return {AddressAccess::Read, 32u};
 		case ValueOpcode::StoreAddressU8: return {AddressAccess::Write, 8u};
 		case ValueOpcode::StoreAddressU16: return {AddressAccess::Write, 16u};
 		case ValueOpcode::StoreAddressU32: return {AddressAccess::Write, 32u};

@@ -48,7 +48,8 @@ bool IsLdsWriteOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::DS_WRITE2ST64_B64:
 		case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 		case Decoder::Opcode::DS_MIN_F32:
-		case Decoder::Opcode::DS_MAX_F32: return true;
+		case Decoder::Opcode::DS_MAX_F32:
+		case Decoder::Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32: return true;
 		default:
 			return opcode >= Decoder::Opcode::DS_ADD_U32 &&
 			       opcode <= Decoder::Opcode::DS_WRXCHG_RTN_B32;
@@ -1433,6 +1434,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4: return IMAGE_GATHER(inst);
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
+		case Decoder::Opcode::IMAGE_BVH8_INTERSECT_RAY: return IMAGE_BVH8_INTERSECT_RAY(inst);
+		case Decoder::Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32: return DS_BVH_STACK(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicFMin32, false);

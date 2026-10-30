@@ -328,6 +328,9 @@ uint32_t              EmitRayQueryKept(ValueEmitContext& ctx, const IR::Inst& in
 void                  EmitRayQueryCount(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  DeclareRayQueryVariables(EmitterState& state);
 void                  InitializeRayQueryVariables(EmitterState& state);
+// PS5 Pro IMAGE_BVH8_INTERSECT_RAY (spirvEmitterBvh8.cpp).
+uint32_t              EmitBvh8IntersectRay(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitLoadBufferU8          = EmitLoadMemory;
 inline constexpr auto EmitLoadBufferU16         = EmitLoadMemory;
 inline constexpr auto EmitLoadBufferU32         = EmitLoadMemory;

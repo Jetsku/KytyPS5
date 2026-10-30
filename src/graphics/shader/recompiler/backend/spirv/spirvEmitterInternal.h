@@ -212,6 +212,9 @@ struct EmitterState {
 	};
 	std::array<RayQuerySiteVariables, 4>             ray_query {};
 	bool                                             ray_query_keep = false;
+	// PS5 Pro IMAGE_BVH8_INTERSECT_RAY: its result struct and module function (spirvEmitterBvh8.cpp).
+	uint32_t                                         bvh8_result_type        = 0;
+	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -336,6 +339,7 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
+uint32_t TypeBvh8Result(EmitterState& state); // spirvEmitterBvh8.cpp
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);

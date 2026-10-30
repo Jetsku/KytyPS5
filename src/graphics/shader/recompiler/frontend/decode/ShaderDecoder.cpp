@@ -151,7 +151,8 @@ std::string FormatMimg(const Instruction& inst) {
 		                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 		                    inst.image_address_components);
 	} else if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
-	           inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) {
+	           inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY ||
+	           inst.opcode == Opcode::IMAGE_BVH8_INTERSECT_RAY) {
 		text += fmt::format(" a16={} addr_dwords={}",
 		                    (inst.image_sample_flags & ImageSampleFlagA16) != 0u ? 1u : 0u,
 		                    inst.image_address_components);
@@ -650,7 +651,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GET_LOD:
 		case Opcode::IMAGE_GATHER4:
 		case Opcode::IMAGE_BVH_INTERSECT_RAY:
-		case Opcode::IMAGE_BVH64_INTERSECT_RAY: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_BVH64_INTERSECT_RAY:
+		case Opcode::IMAGE_BVH8_INTERSECT_RAY: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:
@@ -793,6 +795,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ2ST64_B64:
 		case Opcode::DS_READ_B96:
 		case Opcode::DS_READ_B128:
+		case Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32:
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
 		case Opcode::DS_WRITE_B8_D16_HI:

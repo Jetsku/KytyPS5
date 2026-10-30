@@ -929,8 +929,10 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	include_vector(inst.dst, memory_family ? std::max(inst.data_dwords, 1u) + status_dwords : 1u);
 	include_vector(inst.dst2);
 	const bool bvh = inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY ||
-	                 inst.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY;
-	// A contiguous BVH address spans 8-12 VGPRs from VADDR (only VADDR with NSA).
+	                 inst.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY ||
+	                 inst.opcode == Decoder::Opcode::IMAGE_BVH8_INTERSECT_RAY;
+	// A contiguous BVH address spans 8-12 VGPRs from VADDR (only VADDR with NSA; the NSA registers
+	// are counted below, BVH8's expanded per component).
 	include_vector(inst.src0, bvh && inst.image_nsa_dwords == 0u
 	                              ? std::max(inst.image_address_components, 1u)
 	                              : 1u);
@@ -1033,6 +1035,8 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 				include_vector(inst.src1, 2u);
 				include_vector(inst.src2, 2u);
 				break;
+			// The eight child pointers in DATA1..DATA1+7.
+			case Decoder::Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32: include_vector(inst.src2, 8u); break;
 			case Decoder::Opcode::DS_WRITE2_B32:
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:

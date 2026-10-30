@@ -16555,10 +16555,14 @@ int main(int argc, char **argv) {
     TestRayTracingStub();
     TestRayTracingSharedFunction();
     TestTraversalLoopBreakRegion();
+    TestTrinityStackInstruction();
+    TestTrinityBvhInstruction();
     return 0;
   }
   TestRayTracingDispatchDetection();
   TestRayTracingStub();
+  TestTrinityStackInstruction();
+  TestTrinityBvhInstruction();
   TestRayTracingSharedFunction();
   TestTraversalLoopBreakRegion();
   TestDeclaredShaderHashMarker();

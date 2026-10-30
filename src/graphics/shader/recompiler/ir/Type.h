@@ -28,6 +28,8 @@ enum class Type : uint32_t {
 	SamplerResource = 1u << 18u,
 	ImageAddress    = 1u << 19u,
 	F64             = 1u << 20u,
+	// IMAGE_BVH8_INTERSECT_RAY's composite result (four U32x4 groups and the instance flag).
+	Bvh8Result      = 1u << 21u,
 };
 
 constexpr Type operator|(Type lhs, Type rhs) {

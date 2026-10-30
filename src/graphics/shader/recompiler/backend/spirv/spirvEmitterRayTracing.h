@@ -35,6 +35,11 @@ uint32_t EmitBvhNodeTest(ValueEmitContext& ctx, const BvhOperands& operands);
 // Emitted before the guest function (like get_bda_pointer); needs info.uses_dma.
 void DefineBvhNodeTestFunction(EmitterState& state);
 
+// PS5 Pro IMAGE_BVH8_INTERSECT_RAY (spirvEmitterBvh8.cpp, upstream 5eab0ec73): defines the module's
+// BVH8 node test (trinity_bvh_intersect and its helpers) when the program has a Bvh8IntersectRay;
+// needs info.uses_dma.
+void DefineBvh8IntersectFunction(EmitterState& state);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 
 #endif

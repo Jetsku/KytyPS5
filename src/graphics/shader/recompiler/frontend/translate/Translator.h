@@ -128,6 +128,10 @@ private:
 	void IMAGE_GATHER(const Decoder::Instruction& inst);
 	IR::U32 ReadBvhAddress(const Decoder::Instruction& inst, uint32_t index);
 	void    IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
+	// PS5 Pro (Trinity) BVH instructions (RayTracing.cpp).
+	IR::U32 ReadBvh8Address(const Decoder::Instruction& inst, uint32_t index);
+	void    IMAGE_BVH8_INTERSECT_RAY(const Decoder::Instruction& inst);
+	void    DS_BVH_STACK(const Decoder::Instruction& inst);
 	void WriteFetchStatus(const Decoder::Instruction& inst, const IR::MemoryInfo& memory);
 	IR::Value LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
 	                        uint32_t pc);

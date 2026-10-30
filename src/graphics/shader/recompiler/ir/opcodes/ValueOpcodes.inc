@@ -293,6 +293,12 @@ VALUE_OPCODE(RayQueryExit, Void)
 VALUE_OPCODE(RayQueryKeep, Void, U32)
 VALUE_OPCODE(RayQueryKept, U32)
 VALUE_OPCODE(RayQueryCount, Void, U1)
+// IMAGE_BVH8_INTERSECT_RAY (PS5 Pro, upstream 5eab0ec73): GetAddressResource(T# base lo, hi), T#
+// dwords 0-3, encoded base lo/hi, ray extent, instance mask, origin xyz, direction xyz, node pointer,
+// EXEC. Bvh8Extract reads result dword 0-9 (destination), 10-15 (ray out) or 16 (instance flag).
+VALUE_OPCODE(Bvh8IntersectRay, Bvh8Result, AddressResource, U32x4, U32, U32, U32, U32, U32, U32, U32,
+             U32, U32, U32, U32, U1)
+VALUE_OPCODE(Bvh8Extract, U32, Bvh8Result, U32)
 VALUE_OPCODE(LoadBufferU8, U8, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU16, U16, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU32, U32, BufferResource, U32, U32, U32, U1)
