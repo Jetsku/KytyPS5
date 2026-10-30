@@ -58472,6 +58472,76 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
 }
 
+// Upstream 1b7093805: AgcAcbMemSemaphore's stream and the CP's MEM_SEMAPHORE.
+void CheckPm4MemSemaphore(RenderContext &renderer) {
+  constexpr const char *name = "Pm4MemSemaphore";
+  Loader::SymbolDatabase symbols;
+  Libs::InitAgcDriver_1(&symbols);
+  const auto *symbol = symbols.FindByNid("q4VuU-QsLOE", Loader::SymbolType::Func);
+  Require(name, "async export",
+          symbol != nullptr &&
+              symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
+          "async semaphore import did not resolve to the emitter");
+
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0x20);
+  const auto execute = [&](std::span<const uint32_t> commands) {
+    Pm4Execution execution;
+    return processor.Process(execution, commands) == Pm4ProcessResult::Complete;
+  };
+
+  alignas(8) uint64_t counter = 0;
+  const auto address = reinterpret_cast<uint64_t>(&counter);
+  const auto low = static_cast<uint32_t>(address);
+  const auto high = static_cast<uint32_t>(address >> 32u);
+  std::array<uint32_t, 11> packet{};
+  auto *const end = packet.data() + packet.size();
+  AgcCommandBufferLayout acb{packet.data(), end, packet.data(), end, nullptr, nullptr, 0};
+  // A packet header in unwritten DWORDs shows the CP skips the signal's pad by its length.
+  constexpr uint32_t poison = 0xc0023900u;
+  const auto emit = [&](uint8_t signal_type, uint8_t op) {
+    packet.fill(poison);
+    acb.cursor_up = packet.data();
+    return Gen5::AgcAcbMemSemaphore(reinterpret_cast<Gen5::CommandBuffer *>(&acb), &counter, 1,
+                                    signal_type, op) == packet.data() &&
+           acb.cursor_up == end;
+  };
+
+  Require(name, "wait stream",
+          emit(0, 7) &&
+              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
+                                         0xc0023900u, low & ~0x7u, high, 0xe0010000u,
+                                         0xc0017904u, 0x342u, 0xc9000000u} &&
+              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
+              Gen5::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
+          "semaphore wait differs from the native stream");
+  const auto wait = packet;
+  Pm4Execution waiting;
+  Require(name, "empty wait",
+          processor.Process(waiting, wait) == Pm4ProcessResult::Blocked &&
+              processor.Process(waiting, wait) == Pm4ProcessResult::Blocked &&
+              !waiting.MadeProgress() && counter == 0,
+          "semaphore wait passed or advanced on a zero counter");
+
+  Require(name, "increment stream",
+          emit(0, 6) &&
+              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
+                                         0xc0011000u, poison, poison,
+                                         0xc0023900u, low & ~0x7u, high, 0xc0010000u} &&
+              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
+              execute(packet) && counter == 1 && execute(packet) && counter == 2,
+          "semaphore increment differs from the native stream or count");
+  Require(name, "resume",
+          processor.Process(waiting, wait) == Pm4ProcessResult::Complete && counter == 1,
+          "semaphore wait did not consume one count after a signal");
+
+  counter = 5;
+  Require(name, "write",
+          emit(1, 6) && packet[10] == 0xc0110000u && execute(packet) && counter == 1,
+          "semaphore write signal did not set the counter to one");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -60272,6 +60342,7 @@ int main(int argc, char **argv) {
     CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
@@ -60286,6 +60357,7 @@ int main(int argc, char **argv) {
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     CheckCpSeqOps(vulkan.RuntimeRenderer());
@@ -61151,6 +61223,7 @@ int main(int argc, char **argv) {
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
+  CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckCpSeqOps(vulkan.RuntimeRenderer());

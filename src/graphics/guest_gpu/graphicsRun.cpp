@@ -1202,6 +1202,9 @@ static void LogCpAddress(const char* kind, uint64_t address, uint64_t value, uin
 }
 
 CpSeq::Result CommandProcessor::ExecWaitRegMem(const CpSeq::WaitRegMemOp& op) {
+	if (op.wait_op >= CpSeq::WaitRegMemOp::SemaphoreSignal) {
+		return ExecMemSemaphore(op);
+	}
 	return op.size == sizeof(uint64_t) ? ExecWaitRegMemSized<uint64_t>(op)
 	                                   : ExecWaitRegMemSized<uint32_t>(op);
 }
@@ -1291,6 +1294,40 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
                                                      uint32_t, uint32_t);
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
+
+// MEM_SEMAPHORE (upstream 1b7093805, AgcAcbMemSemaphore): an ordered op on the counter, carried as a
+// WAIT_REG_MEM op so it is an ordering point like a wait. A signal updates the counter before the
+// next packet; a wait on a zero counter suspends the queue at this packet, which runs again.
+void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	EXIT_IF(counter == nullptr);
+	CpSeq::WaitRegMemOp op;
+	op.addr    = reinterpret_cast<uint64_t>(counter);
+	op.size    = static_cast<uint32_t>(sizeof(uint64_t));
+	op.wait_op = !signal ? CpSeq::WaitRegMemOp::SemaphoreWait
+	             : write ? CpSeq::WaitRegMemOp::SemaphoreWrite
+	                     : CpSeq::WaitRegMemOp::SemaphoreSignal;
+	if (Submit(op).suspended) {
+		SuspendPm4();
+	}
+}
+
+CpSeq::Result CommandProcessor::ExecMemSemaphore(const CpSeq::WaitRegMemOp& op) {
+	auto value = ReadGuestForCp<uint64_t>(op.addr);
+	switch (op.wait_op) {
+		case CpSeq::WaitRegMemOp::SemaphoreSignal: value++; break;
+		case CpSeq::WaitRegMemOp::SemaphoreWrite: value = 1; break;
+		default:
+			if (value == 0) {
+				return {true, 0};
+			}
+			value--;
+			break;
+	}
+	StreamCopyDefer::NoteGuestWrite(op.addr, sizeof(value));
+	std::memcpy(reinterpret_cast<void*>(op.addr), &value, sizeof(value));
+	NoteCpWrite(op.addr, sizeof(value));
+	return {};
+}
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
@@ -5579,7 +5616,7 @@ void CommandProcessor::NoteLastLabel(CpSeq::OpKind kind, const void* payload) {
 }
 
 bool CommandProcessor::IsSelfLabelWait(const CpSeq::WaitRegMemOp& op) const {
-	if (!m_last_label_known || op.addr != m_last_label_begin || op.size > m_last_label_size) {
+	if (!m_last_label_known || op.wait_op >= CpSeq::WaitRegMemOp::SemaphoreSignal || op.addr != m_last_label_begin || op.size > m_last_label_size) {
 		return false;
 	}
 	const auto value =
