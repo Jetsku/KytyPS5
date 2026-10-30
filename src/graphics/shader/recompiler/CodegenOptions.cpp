@@ -166,6 +166,7 @@ CodegenOptions FromEnvironment() {
 	options.snapshot_written_guard =
 	    EnvFlag("KYTY_SNAPSHOT_WRITTEN_GUARD", options.snapshot_written_guard);
 	options.tess_indexed = EnvFlag("KYTY_TESS_INDEXED", options.tess_indexed);
+	options.barrier_stores = EnvFlag("KYTY_BARRIER_STORES", options.barrier_stores);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.
 	const auto flush_off = [](const char* name) {

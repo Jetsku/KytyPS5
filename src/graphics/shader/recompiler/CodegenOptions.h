@@ -555,6 +555,10 @@ struct CodegenOptions {
 	// conversions. Off, a denormal there stays denormal instead of reading as a signed zero
 	// (rcp(denormal) is then a large finite value, not an infinity). Bits: DenormFlushSkip*.
 	uint8_t denorm_flush_skip = 0;
+	// KYTY_BARRIER_STORES=1 (upstream ceb154d9e): S_BARRIER of a program that stores to buffers or
+	// images also acquires and releases uniform and image memory, as shaders read other waves'
+	// stores with plain loads right after the barrier. Off: workgroup (LDS) memory only.
+	bool barrier_stores = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;

@@ -893,9 +893,19 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	auto       memory       = LdsMemorySemantics(state);
+	// KYTY_BARRIER_STORES (upstream ceb154d9e): shaders read other waves' buffer and image stores
+	// with plain loads right after S_BARRIER.
+	if (GetCodegenOptions().barrier_stores) {
+		const auto written = [](const auto& resource) { return resource.written; };
+		if (std::ranges::any_of(state.program.info.buffers, written) ||
+		    std::ranges::any_of(state.program.info.images, written)) {
+			memory = memory | spv::MemorySemanticsUniformMemoryMask |
+			         spv::MemorySemanticsImageMemoryMask;
+		}
+	}
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
-	                                    : spv::MemorySemanticsAcquireReleaseMask |
-	                                          LdsMemorySemantics(state);
+	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	NoteWaveSync(state);
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
