@@ -1244,6 +1244,7 @@ void CheckSamplerHeap() {
   };
   auto codegen = GetCodegenOptions();
   codegen.srt_variant_reads = true;
+  codegen.sampler_reads_deferred = true; // KYTY_SAMPLER_READS_DEFER
   ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
   {
     // Switch off: the stand-in sampler, no sampler array, no sampler heap in the snapshot.

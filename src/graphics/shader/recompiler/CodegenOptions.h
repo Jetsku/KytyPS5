@@ -611,6 +611,12 @@ struct CodegenOptions {
 	// packed HS ID & 0x1f00 as the control point times 256 without KYTY_TESS_INDEXED too (which
 	// already does). Off: such an address does not reflect and the stage's draws are skipped.
 	bool tess_cp_mask = false;
+	// KYTY_SAMPLER_READS_DEFER=1 (default off; the GT7 preset after testing): with bindless images, an
+	// S_BUFFER_LOAD S# read that feeds only sampler handles is collected after the walk (and only if an
+	// ordinary sampler still uses it), so a bindless or stand-in sampler plan no longer strands it as a
+	// buffer resource whose V# words dead code elimination removed (materialization failed). Off: the
+	// walk collects it in place, as before (other titles' binding layouts stay as they were).
+	bool sampler_reads_deferred = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,

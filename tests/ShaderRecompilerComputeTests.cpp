@@ -22136,6 +22136,7 @@ public:
                   !DecodeFillWord(vk::Format::eD32Sfloat, 0u, clear),
               "a zero fill word of an uncompressed color format was not a clear, or another was");
     }
+    vk::ClearColorValue clear{};
     struct UintCase {
       vk::Format format;
       uint64_t word;

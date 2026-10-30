@@ -87,6 +87,8 @@ CodegenOptions FromEnvironment() {
 	options.native_wave64_branch =
 	    EnvFlag("KYTY_NATIVE_WAVE64_BRANCH", options.native_wave64_branch);
 	options.tess_cp_mask    = EnvFlag("KYTY_TESS_CP_MASK", options.tess_cp_mask);
+	options.sampler_reads_deferred =
+	    EnvFlag("KYTY_SAMPLER_READS_DEFER", options.sampler_reads_deferred);
 	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
 	if (const auto* cap = std::getenv("KYTY_CALL_LOOP_CAP"); cap != nullptr && cap[0] != '\0') {
 		options.call_loop_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));

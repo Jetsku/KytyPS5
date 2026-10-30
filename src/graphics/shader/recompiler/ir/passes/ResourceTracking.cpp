@@ -2228,7 +2228,8 @@ private:
 	// otherwise it is planning-only, like an indirect image plan's T# reads (Senaxx 59cb8a83e
 	// marks a bindless sampler's exclusive reads the same way).
 	bool IsSamplerOnlyRead(const Inst& inst) const {
-		if (!BindlessImagesEnabled() || inst.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+		if (!GetCodegenOptions().sampler_reads_deferred || !BindlessImagesEnabled() ||
+		    inst.GetOpcode() != ValueOpcode::ReadConstBuffer) {
 			return false;
 		}
 		uint32_t index = 0;
