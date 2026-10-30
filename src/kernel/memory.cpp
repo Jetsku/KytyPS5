@@ -4016,6 +4016,28 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 		}
 	}
 
+	// KYTY_DROP_RELEASED=1 (default off; GT7 fork 7717116d8): the released range's host pages go
+	// back to the system; its views are unmapped above, and a later allocation gets undefined bytes (as
+	// on the console: zeros or the old ones). GT7 peaked
+	// at 9.8 GB of direct memory while using 3.5 GB, and the rest stayed resident.
+	static const bool drop_released = [] {
+		const char* value = std::getenv("KYTY_DROP_RELEASED");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (drop_released) {
+		static std::atomic<uint64_t> dropped_total {0};
+		uint64_t                     dropped = 0;
+		for (const auto& block: allocated_span) {
+			dropped += g_guest_address_space->DropBacking(block.start_addr, block.size);
+		}
+		const auto total = dropped_total.fetch_add(dropped) + dropped;
+		if (dropped >= (uint64_t {64} << 20u)) {
+			LOGF("Direct memory: %" PRIu64 " MiB of released memory handed back to the system (%" PRIu64
+			     " MiB so far, KYTY_DROP_RELEASED)\n",
+			     dropped >> 20u, total >> 20u);
+		}
+	}
+
 	return OK;
 }
 
