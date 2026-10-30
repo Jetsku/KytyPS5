@@ -426,6 +426,54 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+// KYTY_SPARSE_FILLS=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 4409d9020): a
+// uniform compute buffer fill (ResolveComputeBufferFill) that no image took as a clear, over memory
+// with holes in its mappings (sparse memory), fills each mapped piece on the GPU, as the hardware's
+// writes land there, and the dispatch is skipped; the holes are left alone, where the hardware drops
+// the writes. A binding stops at the first hole, so the dispatch never reached the mapped pages past
+// it (none at all when the first page is a hole). False (the dispatch runs) for a range without
+// holes or with more than 16384 mapped pieces.
+static bool TryFillMappedParts(RenderContext& context, const ShaderComputeInputInfo& input,
+                               uint32_t group_x, uint32_t group_y, uint32_t group_z, uint32_t mode) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_FILLS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || input.stage.resources->uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+		return false;
+	}
+	ShaderBufferResource descriptor;
+	uint32_t             value = 0;
+	uint64_t             size  = 0;
+	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, value, size)) {
+		return false;
+	}
+	const auto base   = descriptor.Base48();
+	const auto prefix = Libs::LibKernel::Memory::ClampRangeSizeQuiet(base, size);
+	if (prefix == size || (base & 3u) != 0 || (size & 3u) != 0) {
+		return false;
+	}
+	constexpr size_t                           MaxSpans = 16384;
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!Libs::LibKernel::Memory::CommittedSpans(base, size, MaxSpans, &spans)) {
+		return false;
+	}
+	uint64_t mapped = 0;
+	for (const auto& span: spans) {
+		mapped += span.second;
+	}
+	context.GetBufferCache().FillMappedSpans(spans, value);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("GraphicsRenderDispatchDirect: buffer fill 0x%012" PRIx64 "+0x%" PRIx64
+		     " with 0x%08x by cs %016" PRIx64 " over memory with holes: its %zu mapped pieces "
+		     "(0x%" PRIx64 " bytes) filled, the holes left alone (a dispatch stops at the first, "
+		     "0x%" PRIx64 " in; KYTY_SPARSE_FILLS)\n",
+		     base, size, value, input.stage.program->shader_hash, spans.size(), mapped, prefix);
+	}
+	return true;
+}
+
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                 CommandBuffer& command, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z, uint32_t mode) {
@@ -800,6 +848,11 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	}
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
+	if (step == nullptr &&
+	    TryFillMappedParts(m_context, input_info, thread_group_x, thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}

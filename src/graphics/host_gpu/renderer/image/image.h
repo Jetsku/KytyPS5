@@ -349,6 +349,14 @@ public:
 		return m_cpu_dirty;
 	}
 
+	// KYTY_GUEST_HASH_IMAGES_KB (TextureCache::RefreshByContent): the guest bytes are still what the
+	// last upload took; a maybe-dirty mark (a write next to the image) is dropped.
+	void ClearMaybeCpuDirty() {
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+		NoteImageStateChange();
+	}
+
 	void RefreshComplete() {
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
@@ -539,6 +547,13 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// KYTY_SPARSE_HOLES (TextureCache::ResetUnmappedDepth): the content serial it last checked.
+	uint64_t         sparse_checked_serial = UINT64_MAX;
+	// KYTY_GUEST_HASH_IMAGES_KB (TextureCache::ChecksGuestContent): the hash of the guest bytes its
+	// last upload took, and the guest submission (SyncEpoch) they were last compared in.
+	uint64_t         content_hash             = 0;
+	uint64_t         content_check_submission = 0;
+	bool             content_hash_valid       = false;
 	// Stencil associations that refer to this depth image (upstream f4692a450).
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.

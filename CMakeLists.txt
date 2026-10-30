@@ -436,6 +436,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${bda_write_pages_shader_header}")
+# KYTY_NAN_SCRUB (NanScrubber): rewrites the float fields of image words that are not finite.
+set(nan_scrub_shader_source "${gpu_tiler_shader_dir}/nan_scrub.comp")
+set(nan_scrub_shader_spv "${gpu_tiler_generated_dir}/nan_scrub.spv")
+set(nan_scrub_shader_header "${gpu_tiler_generated_dir}/nan_scrub_spv.h")
+add_custom_command(
+	OUTPUT "${nan_scrub_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${nan_scrub_shader_spv}" "${nan_scrub_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${nan_scrub_shader_spv} -DOUTPUT=${nan_scrub_shader_header}
+	        -DSYMBOL=NAN_SCRUB_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${nan_scrub_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${nan_scrub_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

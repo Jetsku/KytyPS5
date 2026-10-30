@@ -219,7 +219,27 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// The guest bytes of a range, staged for an image upload whatever buffer covers them (the
+	// caller knows the GPU wrote none of them; ObtainBufferForImage copies from such a buffer).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageGuestBytesForImage(uint64_t vaddr, uint64_t size);
+	// KYTY_PENDING_FILLS=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 bdab60022): a
+	// GPU fill (FillBuffer's GPU path, or a compute shader's uniform fill, both recorded as known
+	// fills) that found no image still holds for its range, the bytes of it that were not mapped
+	// then among them: a render or depth target created later inside it starts as the fill
+	// (TextureCache::ClearFromKnownFill) instead of what its memory holds then.
+	[[nodiscard]] static bool PendingFillsEnabled();
+	// GPU thread, for a target made over [vaddr, vaddr + size): the dword of the known fill that
+	// holds all of it, when the mapped bytes of it are all still GPU-written. `take` forgets the
+	// range from the fill, which keeps the rest of it for other images.
+	[[nodiscard]] bool FillOfNewImage(uint64_t vaddr, uint64_t size, uint32_t& value, bool take);
+	// KYTY_PENDING_FILLS: a write over [vaddr, vaddr + size) the other paths do not see (an image's
+	// GPU write, a CPU-path fill or copy), newer than the fills there.
+	void ForgetFillsUnder(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// GPU thread, KYTY_SPARSE_FILLS: a GPU fill of the mapped `spans` of a range with holes in its
+	// mappings (a compute shader's fill of sparse memory), as the hardware's writes land there;
+	// the holes, where the hardware drops the writes, are left alone.
+	void FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans, uint32_t value);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
 	// at its position in the GPU timeline and returns true; false leaves it to the CPU write.
 	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);

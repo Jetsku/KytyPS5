@@ -6,6 +6,8 @@
 #include "common/virtualMemory.h"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -210,6 +212,13 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.
 [[nodiscard]] uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size);
+// The committed parts of [vaddr, vaddr + size), adjacent ones merged, in order, as (start, size):
+// where a GPU write over a range with holes in its mappings (sparse memory) lands. At most
+// max_spans; false (and none) when there are more. Any thread.
+[[nodiscard]] bool CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
+                                  std::vector<std::pair<uint64_t, uint64_t>>* spans);
+// From vaddr to the end of the last committed byte of [vaddr, vaddr + size); 0 when none is.
+[[nodiscard]] uint64_t CommittedExtent(uint64_t vaddr, uint64_t size);
 // The guest virtual ranges' change generation (advanced before every change starts; 0 before
 // they exist). Unchanged since a read made before a ClampRangeSize call: the call's answer holds.
 [[nodiscard]] uint64_t VirtualRangesGeneration() noexcept;
