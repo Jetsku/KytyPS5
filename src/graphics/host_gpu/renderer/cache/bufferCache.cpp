@@ -1256,9 +1256,17 @@ Buffer* BufferCache::GetBdaPageTableBuffer() {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
-	InvalidateBdaSynchronization();
-	EnsureBdaPageTableInitialized();
 	auto& buffer = m_slot_buffers[id];
+	if constexpr (insert) {
+		if (m_bda_register_log) {
+			NoteBdaRegistered(buffer.CpuAddress(), buffer.Size());
+		} else {
+			InvalidateBdaSynchronization();
+		}
+	} else {
+		InvalidateBdaSynchronization();
+	}
+	EnsureBdaPageTableInitialized();
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
@@ -1601,6 +1609,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (m_bda_dirty_log) {
 		m_memory_tracker.EnableDirtiedLog();
 		m_bda_log_verify = BdaDirtyLogVerifyMode();
+		// KYTY_BDA_REGISTER_LOG (bufferCache.h; default off).
+		m_bda_register_log = m_bda_incremental_sync && ParseEnvU64("KYTY_BDA_REGISTER_LOG", 0) != 0;
 	}
 	m_bda_epoch_skip  = SyncEpoch::Enabled() && ParseEnvU64("KYTY_BDA_SYNC_EPOCH", 1) != 0;
 	// The verify mode tells guest writes from missed pages by the fault epoch, which the tracker
@@ -5859,7 +5869,28 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+void BufferCache::NoteBdaRegistered(uint64_t vaddr, uint64_t size) {
+	// The range and the structure epoch move together (SynchronizeBdaBuffersNow takes both).
+	constexpr size_t MaxRegisteredRanges = 4096;
+	std::lock_guard lock(m_bda_registered_mutex);
+	if (!m_bda_registered_overflow) {
+		m_bda_registered.Add(vaddr, size);
+		m_bda_registered_overflow = m_bda_registered.Size() > MaxRegisteredRanges;
+	}
+	auto epoch = m_bda_structure_epoch.load(std::memory_order_relaxed);
+	while (epoch != UINT64_MAX &&
+	       !m_bda_structure_epoch.compare_exchange_weak(epoch, epoch + 1,
+	                                                     std::memory_order_release,
+	                                                     std::memory_order_relaxed)) {}
+}
+
 void BufferCache::InvalidateBdaSynchronization() noexcept {
+	// KYTY_BDA_REGISTER_LOG: a change other than a new buffer; the next pass scans everything.
+	std::unique_lock<std::mutex> lock;
+	if (m_bda_register_log) {
+		lock = std::unique_lock(m_bda_registered_mutex);
+		m_bda_layout_epoch.fetch_add(1, std::memory_order_release);
+	}
 	// Also without incremental synchronization: KYTY_BDA_SYNC_EPOCH skips a pass only while the
 	// registered buffers and GPU mappings are the ones its last pass scanned.
 	auto epoch = m_bda_structure_epoch.load(std::memory_order_relaxed);
@@ -6020,11 +6051,29 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	                       : m_bda_dirty_log       ? fault_epoch
 	                       : m_bda_hot_sync        ? m_memory_tracker.FaultMutationEpoch()
 	                                               : m_memory_tracker.CpuMutationEpoch();
-	const auto structure_epoch =
-	    m_bda_incremental_sync ? m_bda_structure_epoch.load(std::memory_order_acquire) : 0;
+	// KYTY_BDA_REGISTER_LOG: the structure epoch, the layout epoch and the buffers registered up
+	// to that structure epoch, taken together.
+	RangeSet registered;
+	bool     registered_complete = false;
+	uint64_t layout_epoch        = 0;
+	uint64_t structure_epoch     = 0;
+	if (m_bda_register_log) {
+		std::lock_guard lock(m_bda_registered_mutex);
+		structure_epoch     = m_bda_structure_epoch.load(std::memory_order_acquire);
+		layout_epoch        = m_bda_layout_epoch.load(std::memory_order_acquire);
+		registered_complete = !m_bda_registered_overflow;
+		std::swap(registered, m_bda_registered);
+		m_bda_registered_overflow = false;
+	} else if (m_bda_incremental_sync) {
+		structure_epoch = m_bda_structure_epoch.load(std::memory_order_acquire);
+	}
 	const bool structure_holds = m_bda_incremental_sync && cpu_epoch != UINT64_MAX &&
 	                             structure_epoch != UINT64_MAX &&
 	                             structure_epoch == m_bda_scanned_structure_epoch;
+	// Only new buffers since the last pass (their ranges are in `registered`).
+	const bool structure_grew = m_bda_register_log && !structure_holds && registered_complete &&
+	                            cpu_epoch != UINT64_MAX && structure_epoch != UINT64_MAX &&
+	                            layout_epoch == m_bda_scanned_layout_epoch;
 	using LookupPart = BufferLookupStats::Part;
 	m_bda_pass_kind  = static_cast<uint8_t>(LookupPart::BdaFull);
 	if (structure_holds && cpu_epoch == m_bda_scanned_cpu_epoch) {
@@ -6056,11 +6105,16 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		}
 		// A recorded buffer is gone although the structure epoch held: scan everything.
 		m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaFull);
-	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
+	} else if ((structure_holds || structure_grew) && m_bda_dirty_log && log_complete &&
+	           m_bda_log_baseline &&
 	           (m_bda_pass_kind = static_cast<uint8_t>(LookupPart::BdaLog),
-	            SynchronizeBdaDirtied(mapped_ranges))) {
+	            SynchronizeBdaDirtied(mapped_ranges, structure_grew ? &registered : nullptr))) {
 		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
+		if (structure_grew) {
+			m_bda_scanned_structure_epoch = structure_epoch;
+			m_bda_register_passes++;
+		}
 		if (m_bda_log_verify != 0) {
 			m_bda_log_totals.verify_checks++;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogVerifyChecks);
@@ -6104,6 +6158,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	if (m_bda_incremental_sync) {
 		m_bda_scanned_cpu_epoch       = cpu_epoch;
 		m_bda_scanned_structure_epoch = structure_epoch;
+		m_bda_scanned_layout_epoch    = layout_epoch;
 	}
 	// The log taken above holds nothing this scan did not cover; later transitions log again.
 	m_bda_log_baseline = m_bda_dirty_log;
@@ -6116,7 +6171,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 }
 
-bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
+bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges, const RangeSet* registered) {
 	// A hot run grows at most a few entries per pass; past this, rebuild the list in a full scan.
 	constexpr size_t MaxHotRanges = 4096;
 	if (m_bda_hot_ranges.size() > MaxHotRanges) {
@@ -6142,6 +6197,15 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 				SynchronizeBuffersInRange(start, finish - start, &stats);
 			});
 		});
+		if (registered != nullptr) {
+			// KYTY_BDA_REGISTER_LOG: new buffers, whose CPU-dirty pages no fault logged.
+			registered->ForEach([&](uint64_t begin, uint64_t end) {
+				logged++;
+				mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+					SynchronizeBuffersInRange(start, finish - start, &stats);
+				});
+			});
+		}
 		BdaSyncStats hot_stats;
 		for (const auto& range: m_bda_hot_ranges) {
 			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,

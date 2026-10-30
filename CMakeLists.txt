@@ -1671,6 +1671,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
 	set_tests_properties(bda_sync_dirty_log_off PROPERTIES
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_DIRTY_LOG=0")
+	# KYTY_BDA_REGISTER_LOG: the pass after a new buffer synchronizes it from the log (verified).
+	add_test(NAME bda_sync_register_log_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_register_log_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_REGISTER_LOG=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit;KYTY_BDA_HOT_SYNC_VERIFY=exit")
 	# KYTY_BINDING_EPOCH_MEMO: default, verify mode, off, and off through KYTY_SYNC_EPOCH=0.
 	add_test(NAME binding_epoch_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)

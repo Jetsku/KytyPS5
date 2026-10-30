@@ -279,6 +279,10 @@ struct BufferCacheTestAccess {
   static int BdaEpochVerify(const BufferCache &cache) { return cache.m_bda_epoch_verify; }
   static bool BdaDirtyLog(const BufferCache &cache) { return cache.m_bda_dirty_log; }
   static int BdaDirtyLogVerify(const BufferCache &cache) { return cache.m_bda_log_verify; }
+  static bool BdaRegisterLog(const BufferCache &cache) { return cache.m_bda_register_log; }
+  static uint64_t BdaRegisterPasses(const BufferCache &cache) {
+    return cache.m_bda_register_passes;
+  }
   static BufferCache::BdaLogTotals BdaLogTotals(const BufferCache &cache) {
     return cache.m_bda_log_totals;
   }
@@ -8814,6 +8818,8 @@ public:
       using LogTotals = decltype(BufferCacheTestAccess::BdaLogTotals(cache));
       Totals first{}, skipped{}, advanced{}, second{}, restructured{};
       LogTotals log_first{}, log_advanced{}, log_second{}, log_restructured{};
+      const Libs::Graphics::Buffer *other_buffer = nullptr;
+      uint64_t other_buffer_offset = 0;
       OnGpuThread(context, [&] {
         context.PrepareBda();
         first = totals();
@@ -8832,18 +8838,25 @@ public:
         context.PrepareBda();
         second = totals();
         log_second = BufferCacheTestAccess::BdaLogTotals(cache);
-        (void)cache.ObtainBuffer(base + other_offset, buffer_size, false, false); // new buffer
+        // A new buffer (its pages were never uploaded).
+        const auto [other, other_at] =
+            cache.ObtainBuffer(base + other_offset, buffer_size, false, false);
+        other_buffer = other;
+        other_buffer_offset = other_at;
         context.PrepareBda(); // the same epoch, but the structure moved
         restructured = totals();
         log_restructured = BufferCacheTestAccess::BdaLogTotals(cache);
       });
+      const bool register_log = BufferCacheTestAccess::BdaRegisterLog(cache);
       if (BufferCacheTestAccess::BdaDirtyLog(cache)) {
         // The first pass is a full scan; the writes before a pass with unchanged buffers are
-        // then synchronized from the log, and the pass after the new buffer is a full scan.
+        // then synchronized from the log, and the pass after the new buffer is a full scan, or
+        // with KYTY_BDA_REGISTER_LOG a logged pass that synchronizes the new buffer's range.
         Require(name, "logged passes",
                 log_first.passes == 0 && log_advanced.passes >= 1 &&
                     log_second.passes == log_advanced.passes + 1 &&
-                    log_restructured.passes == log_second.passes && log_second.ranges >= 2 &&
+                    log_restructured.passes == log_second.passes + (register_log ? 1 : 0) &&
+                    log_second.ranges >= 2 &&
                     log_restructured.verify_mismatch_pages == 0,
                 "the passes after CPU writes with unchanged buffers did not synchronize from the "
                 "dirtied-range log, or its verify mode found a missed page");
@@ -8877,6 +8890,13 @@ public:
       Require(name, "write uploaded after the epoch",
               std::memcmp(words.data(), memory + buffer_offset, buffer_size) == 0,
               "the pass after the epoch advanced did not upload the CPU write");
+      Require(name, "register log passes",
+              !register_log || BufferCacheTestAccess::BdaRegisterPasses(cache) == 1,
+              "KYTY_BDA_REGISTER_LOG: the pass after the new buffer did not take the log");
+      const auto other_words = read_native(*other_buffer, other_buffer_offset, buffer_size);
+      Require(name, "new buffer uploaded",
+              std::memcmp(other_words.data(), memory + other_offset, buffer_size) == 0,
+              "the pass after a new buffer did not upload its guest bytes");
       scheduler.Finish();
       context.UnmapMemory(base, allocation_size);
     }
@@ -8888,8 +8908,9 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "BDA-epoch direct-memory allocation release failed");
-    std::printf("[host]    %-32s ok (skip %s, verify %s)\n", name,
+    std::printf("[host]    %-32s ok (skip %s, register log %s, verify %s)\n", name,
                 BufferCacheTestAccess::BdaEpochSkip(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::BdaRegisterLog(context.GetBufferCache()) ? "on" : "off",
                 BufferCacheTestAccess::BdaEpochVerify(context.GetBufferCache()) != 0 ? "on"
                                                                                        : "off");
   }
