@@ -5592,12 +5592,9 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 void CommandProcessor::ExecPssr(const CpSeq::PssrOp& op) {
 	Pssr::Request request {};
 	std::memcpy(&request, op.request, sizeof(request));
-	// The host PSSR pass (upstream 651ef73a0 renderPssr.cpp) is not ported yet: only reachable in Pro mode
-	// (--trinity), the request is decoded and dropped, so the output image keeps its previous contents.
-	static std::atomic_bool logged {false};
-	if (!logged.exchange(true)) {
-		printf("PSSR request dropped (host pass not ported): %ux%u\n", request.width, request.height);
-	}
+	// Only reachable in Pro mode (--trinity), where libPsml writes the packet: the host pass
+	// (renderPssr.cpp, upstream 651ef73a0) upscales the input image into the output image.
+	m_renderer.GetRenderExecutor().ProcessPssr(CurrentBuffer(), request);
 }
 
 void CommandProcessor::SetCeComplete(bool complete) {

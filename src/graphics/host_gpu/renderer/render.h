@@ -1103,11 +1103,19 @@ struct GraphicsDynamicStateShadow {
 [[nodiscard]] bool RebindAfterJoinEnabled();
 void               NoteRebindAfterJoin(const char* kind, const char* name);
 
+namespace Pssr {
+struct Request;
+} // namespace Pssr
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context);
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
+
+	// Experimental Pro mode (renderPssr.cpp, upstream 651ef73a0): libPsml's PSSR request as a
+	// bilinear upscale of the input T#'s active rectangle into the output T# (graphics queue).
+	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
@@ -1374,6 +1382,9 @@ private:
 	                       uint32_t groups_z);
 	struct CallSplitState;
 	std::shared_ptr<CallSplitState> m_call_split; // shared_ptr: destroyed where it is complete
+	// The PSSR pass's pipeline (renderPssr.cpp), created by the first request.
+	struct PssrState;
+	std::shared_ptr<PssrState> m_pssr;
 	// KYTY_CALL_PARTITIONS (callPartitionDispatch.cpp, shader/recompiler/ShaderCalls.h): a dispatch of
 	// a partitioned program runs once per partition. A step is the partition one run of
 	// DispatchDirectOne / DispatchIndirectOne dispatches (its code, report set and target).

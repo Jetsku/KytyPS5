@@ -480,6 +480,7 @@ add_gpu_blit_shader(gpu_blit_ms_stencil_sample0 gpu_blit_ms_stencil_sample0.frag
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_video_out_downscale gpu_video_out_downscale.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
@@ -1648,6 +1649,10 @@ if(BUILD_TESTING)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
+	# Experimental Pro mode: the PSSR host pass and the Trinity BVH8/BVH stack instructions on the GPU.
+	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
+	add_test(NAME trinity_ray_tracing
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --trinity-rt-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline

@@ -21,6 +21,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -17429,6 +17430,8 @@ public:
     DestroyBuffer(&probe);
     return result;
   }
+
+#include "PssrGpuTests.inc"
 
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
@@ -61733,6 +61736,22 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--trinity-rt-only") == 0) {
+    // PS5 Pro BVH8 intersections and BVH stack (ShaderRayTracingGpuTests.inc, upstream 5eab0ec73,
+    // bfd4c34b8).
+    VulkanHarness vulkan;
+    for (const auto &test : TrinityBvhCases()) RunCase(&vulkan, test);
+    for (const u32 wave : {32u, 64u}) {
+      for (const u32 capacity : {8u, 16u, 31u}) RunCase(&vulkan, TrinityStack(wave, capacity));
+      RunCase(&vulkan, TrinityStack(wave, 8, true));
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPssr();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BvhIntersections(true, true, 1));
