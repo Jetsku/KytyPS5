@@ -492,9 +492,38 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
-	           0 &&
-	       GetLastError() == ERROR_TIMEOUT);
+	// KYTY_US_WAITS=1 (default off; GT7 fork 29ebd192d): the kernel's timeouts are microseconds
+	// (SceKernelUseconds; HR timers nanoseconds), but SleepConditionVariableCS counts whole
+	// milliseconds on a 1 ms tick: a wait ended up to ~1.3 ms late, and never in under 1 ms. With
+	// the switch the condition variable sleeps only until ~1 ms before the deadline; the rest is
+	// slept outside it with the high-resolution timer in slices of at most 0.5 ms, each returned
+	// as a spurious wakeup (every caller re-checks its condition and its own deadline).
+	static const bool micro_deadlines = [] {
+		const char* value = std::getenv("KYTY_US_WAITS");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	if (!micro_deadlines) {
+		ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
+		           0 &&
+		       GetLastError() == ERROR_TIMEOUT);
+		return ok;
+	}
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+	if (micros >= 2000) {
+		if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros - 1000) / 1000) != 0 ||
+		    GetLastError() != ERROR_TIMEOUT) {
+			return true;
+		}
+	}
+	const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+	    deadline - std::chrono::steady_clock::now());
+	if (remaining.count() <= 0) {
+		return false;
+	}
+	LeaveCriticalSection(&mutex->m_mutex->m_cs);
+	SleepHighResolution100ns(static_cast<uint64_t>(std::min<int64_t>(remaining.count(), 500)) * 10u);
+	EnterCriticalSection(&mutex->m_mutex->m_cs);
+	ok = std::chrono::steady_clock::now() < deadline;
 #else
 	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
 	      std::cv_status::no_timeout);
