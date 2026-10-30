@@ -1443,8 +1443,9 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 		return true;
 	}
 	auto&                            expander = CallExpander();
-	// KYTY_CALL_PARTITIONS: one dispatch per known target of a large table call (ShaderCalls.h).
-	if (ShaderRecompiler::CallPartitionsEnabled()) {
+	// KYTY_CALL_PARTITIONS: one dispatch per known target of a large table call (ShaderCalls.h);
+	// KYTY_CALL_LEARN: one dispatch of the learned targets' expansion, through the same report set.
+	if (ShaderRecompiler::CallPartitionsEnabled() || expander.learn) {
 		ShaderRecompiler::CompileOptions part_options;
 		part_options.stage       = ShaderType::Compute;
 		part_options.wave_size   = wave_size;

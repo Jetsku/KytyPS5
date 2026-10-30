@@ -81,6 +81,17 @@ void CallTableTargets(const CallTableView& view, std::span<const uint32_t> words
 // remembered targets that the shader's table still holds known at its first dispatch, so their
 // partitions (cached programs by then) run from the start instead of after a probe and readbacks.
 [[nodiscard]] bool CallPartitionMemoryEnabled();
+// KYTY_CALL_LEARN=1 (default off; adapted from usa-ratt/KytyPS5-GT7 8b76a992a, which learns
+// table variants from the GPU's miss reports): a compute program whose one call is a table call
+// with more targets than an expansion places (over MaxCallSiteTargets, or over
+// KYTY_SHADER_CALLS_TOPK when that is set) and that is not partitioned is expanded with the targets
+// its dispatches reported missing, at most KYTY_CALL_VARIANTS (default 32), in the order they were
+// reported. Every other target reports itself into the program's report set (the partitions' set
+// and readback, CallStateOp::MissReport) and takes the skip path as before; a new report makes the
+// next dispatch use an expansion with that target too. Off: such a table call does not expand
+// ("more than the bound") or keeps its TOPK targets, as before.
+[[nodiscard]] bool     CallLearnEnabled();
+[[nodiscard]] uint32_t CallLearnVariants();
 // Why the code outside the call keeps a program from being partitioned (empty when it does not).
 [[nodiscard]] std::string CallPartitionUnsafe(std::span<const uint32_t> code);
 
@@ -122,6 +133,11 @@ public:
 	void SetPartitionMemory(const std::string& path);
 
 	uint32_t rescan_interval = 64;
+	// KYTY_CALL_LEARN (tests set these): the learned mode, the variant bound, and the table size
+	// above which it applies (0: the bound Expand applies, MaxCallSiteTargets or the TOPK cap).
+	bool     learn          = CallLearnEnabled();
+	uint32_t learn_variants = CallLearnVariants();
+	size_t   learn_over     = 0;
 	// Once every call of a program reaches two targets, that expansion is kept for every table
 	// (targets outside it take the skip path): changing tables compile no new pipelines.
 	bool sticky = StickyExpansionsDefault();
@@ -157,8 +173,13 @@ private:
 		std::map<uint64_t, CallPartitionPart>  partition_parts;   // by target (0: the probe)
 		uint64_t                               shader_hash     = 0;
 		bool                                   memory_seeded   = false; // KYTY_CALL_PARTITION_MEMORY
-
+		// KYTY_CALL_LEARN: the expansion of the learned targets and the set it holds (by key).
+		CallPartitionPart                      learn_part;
+		uint64_t                               learn_key = 0;
 	};
+	// KYTY_CALL_LEARN: the run of a program in the learned mode (Partition takes it).
+	bool Learn(Program& program, uint64_t key, std::span<const uint32_t> code, uint64_t base,
+	           const CompileOptions& options, const Decoder::ShaderCodeReader& read, CallPartitionRun& run);
 
 	bool Refresh(Program& program, std::span<const uint32_t> code, uint64_t base,
 	             const CompileOptions& options, const Decoder::ShaderCodeReader& read);

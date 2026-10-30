@@ -38,6 +38,9 @@ struct ShaderCallSite {
 	// body runs when the target pair equals the target the dispatch passes in (PartitionCompare);
 	// every other target is reported and its lanes dropped (PartitionDrop).
 	bool partition = false;
+	// KYTY_CALL_LEARN (ShaderCalls.h): a target outside `addresses` is reported (MissReport) before
+	// its call takes the skip path, so a later expansion can place it.
+	bool report_misses = false;
 
 	bool operator==(const ShaderCallSite&) const = default;
 };

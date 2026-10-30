@@ -487,7 +487,7 @@ std::string CallPartitionUnsafe(std::span<const uint32_t> code, uint32_t call_pc
 bool ShaderCallExpander::Partition(std::span<const uint32_t> code, uint64_t base,
                                    const CompileOptions& options, const Decoder::ShaderCodeReader& read,
                                    CallPartitionRun& run) {
-	if (!CallPartitionsEnabled() || options.stage != ShaderType::Compute) return false;
+	if ((!CallPartitionsEnabled() && !learn) || options.stage != ShaderType::Compute) return false;
 	std::scoped_lock lock(m_mutex);
 	const auto       key = base ^ (options.shader_hash * 0x9e3779b97f4a7c15ull) ^ code.size();
 	auto [entry, inserted] = m_programs.try_emplace(key);
@@ -511,16 +511,25 @@ bool ShaderCallExpander::Partition(std::span<const uint32_t> code, uint64_t base
 			why = fmt::format("{} calls", program.calls.size());
 		} else if (program.calls.front().trace.user_sgpr != UINT32_MAX || !program.calls.front().trace.table) {
 			why = "the call's target is user data, not a table";
-		} else {
-			why = CallPartitionUnsafe(code, program.calls.front().trace.pc);
 		}
-		program.partition_state = why.empty() ? 1 : -1;
-		Log::WriteToConsoleAndLog(
-		    why.empty() ? fmt::format("KYTY_CALL_PARTITIONS: CS shader 0x{:016x} can be partitioned.\n",
-		                              options.shader_hash)
-		                : fmt::format("KYTY_CALL_PARTITIONS: CS shader 0x{:016x} is not partitioned: {}.\n",
-		                              options.shader_hash, why));
-		if (!why.empty()) return false;
+		// KYTY_CALL_LEARN: one table call, whether or not its program can be partitioned.
+		const bool learnable = why.empty() && learn;
+		if (why.empty()) {
+			why = CallPartitionsEnabled() ? CallPartitionUnsafe(code, program.calls.front().trace.pc)
+			                              : std::string("partitions are off");
+		}
+		program.partition_state = why.empty() ? 1 : learnable ? 2 : -1;
+		if (CallPartitionsEnabled()) {
+			Log::WriteToConsoleAndLog(
+			    why.empty() ? fmt::format("KYTY_CALL_PARTITIONS: CS shader 0x{:016x} can be partitioned.\n",
+			                              options.shader_hash)
+			                : fmt::format("KYTY_CALL_PARTITIONS: CS shader 0x{:016x} is not partitioned: {}.\n",
+			                              options.shader_hash, why));
+		}
+		if (program.partition_state < 0) return false;
+	}
+	if (program.partition_state == 2) {
+		return Learn(program, key, code, base, options, read, run);
 	}
 	// The table's targets (read again every rescan_interval dispatches, as Refresh does).
 	auto&         call = program.calls.front();
@@ -605,6 +614,103 @@ bool ShaderCallExpander::Partition(std::span<const uint32_t> code, uint64_t base
 		if (const auto* part = make_part(0); part != nullptr) run.parts.push_back(*part);
 	}
 	return !run.parts.empty();
+}
+
+bool CallLearnEnabled() {
+	const char* text = std::getenv("KYTY_CALL_LEARN");
+	return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+}
+
+uint32_t CallLearnVariants() {
+	const char* text = std::getenv("KYTY_CALL_VARIANTS");
+	return std::max(text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 0)) : 32u, 1u);
+}
+
+bool ShaderCallExpander::Learn(Program& program, uint64_t key, std::span<const uint32_t> code, uint64_t base,
+                               const CompileOptions& options, const Decoder::ShaderCodeReader& read,
+                               CallPartitionRun& run) {
+	// The table's targets (read again every rescan_interval dispatches, as Refresh does).
+	auto&         call = program.calls.front();
+	const auto    now  = program.dispatches++;
+	CallTableView view;
+	std::string   why;
+	if (!EvaluateCallTable(*call.trace.table, options.user_data, options.user_data_base, read, view, why)) {
+		return false;
+	}
+	auto [state, fresh] =
+	    call.tables.try_emplace(std::tuple {view.base, view.bytes, view.record_bytes, view.target_offset});
+	if (fresh || (rescan_interval != 0 && now - state->second.scanned_at >= rescan_interval)) {
+		if (!ReadCallTable(view, read, m_table_words, why)) return false;
+		const auto digest = XXH3_64bits(m_table_words.data(), m_table_words.size() * sizeof(uint32_t));
+		if (fresh || digest != state->second.digest) {
+			std::set<uint64_t> found;
+			CallTableTargets(view, m_table_words, found);
+			state->second.targets.assign(found.begin(), found.end());
+		}
+		state->second.digest     = digest;
+		state->second.scanned_at = now;
+	}
+	const auto& targets = state->second.targets;
+	// A table an expansion places whole (or with its TOPK targets) expands as before.
+	const size_t over = learn_over != 0                ? learn_over
+	                    : MaxTargetsPerTable() != 0 ? std::min(MaxTargetsPerTable(), MaxCallSiteTargets)
+	                                                : MaxCallSiteTargets;
+	if (targets.size() <= over) return false;
+	program.partition_targets = targets;
+	program.shader_hash       = options.shader_hash;
+	// KYTY_CALL_PARTITION_MEMORY: the targets this shader reported in earlier starts.
+	if (!program.memory_seeded && !m_memory.empty()) {
+		program.memory_seeded = true;
+		for (auto it = m_memory.lower_bound({options.shader_hash, 0});
+		     it != m_memory.end() && it->first == options.shader_hash; ++it) {
+			if (std::ranges::binary_search(targets, it->second) &&
+			    std::ranges::find(program.partition_known, it->second) == program.partition_known.end()) {
+				program.partition_known.push_back(it->second);
+			}
+		}
+	}
+	// The reported targets the table still holds, in the order they were reported.
+	std::vector<uint64_t> known;
+	for (const auto target: program.partition_known) {
+		if (known.size() >= learn_variants) break;
+		if (std::ranges::binary_search(targets, target) && !m_dropped.contains(target & AddressMask)) {
+			known.push_back(target);
+		}
+	}
+	std::ranges::sort(known);
+	const auto set_key = XXH3_64bits_withSeed(known.data(), known.size() * sizeof(uint64_t), 0x1ea4u) | 1u;
+	if (set_key != program.learn_key) {
+		program.learn_key  = set_key;
+		program.learn_part = {};
+		Decoder::ShaderCallSite site {
+		    .pc = call.trace.pc, .source_reg = call.trace.source_reg, .return_reg = call.trace.return_reg};
+		site.addresses     = known;
+		site.report_misses = true;
+		Decoder::ShaderCallExpansion expansion;
+		std::string                  reason;
+		if (!Decoder::ExpandShaderCalls(code, base, std::span(&site, 1u), read, options.wave_size, expansion,
+		                                reason)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_CALL_LEARN: CS shader 0x{:016x}: no expansion with {} learned target(s): {}.\n",
+			    options.shader_hash, known.size(), reason));
+			return false;
+		}
+		auto& part  = program.learn_part;
+		part.target = known.empty() ? 0 : known.front(); // 0: nothing learned yet, read back every dispatch
+		part.digest = XXH3_64bits(expansion.code.data(), expansion.code.size() * sizeof(uint32_t)) | 1u;
+		part.code   = std::make_shared<const std::vector<uint32_t>>(std::move(expansion.code));
+		m_retained.push_back(part.code);
+		Dump(fmt::format("learn_{:016x}_{:016x}", options.shader_hash, part.digest), *part.code);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_CALL_LEARN: CS shader 0x{:016x}: expansion with {} learned target(s) ({} placed) of {} in "
+		    "the table, {} words.\n",
+		    options.shader_hash, known.size(), expansion.inlined, targets.size(), part.code->size()));
+	}
+	if (program.learn_part.code == nullptr) return false;
+	run.program     = key;
+	run.shader_hash = options.shader_hash;
+	run.parts.assign(1u, program.learn_part);
+	return true;
 }
 
 void ShaderCallExpander::ReportPartitionKeys(uint64_t program_key, std::span<const uint32_t> keys) {
