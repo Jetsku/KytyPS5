@@ -5522,6 +5522,18 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+namespace {
+// Buffers that KYTY_HOST_BUFFER_MB placed in system memory cost no video memory, and the one such
+// a title has is its whole heap (2.7 GB): collecting it downloads it when the GPU wrote to it (a
+// ~100 ms drain) and the next draw uploads all of it again. They stay unless
+// KYTY_GC_HOST_BUFFERS=1 (adapted from Senaxx/wolverine 75dea37fd).
+bool KeptOutOfCollection(uint64_t size) {
+	static const bool gc_host = std::getenv("KYTY_GC_HOST_BUFFERS") != nullptr;
+	const auto        bytes   = HostBufferBytes();
+	return !gc_host && bytes != 0 && size >= bytes;
+}
+} // namespace
+
 void BufferCache::RetireUnusedBuffers(uint64_t frame, uint64_t min_age) {
 	if (frame <= min_age) {
 		return;
@@ -5539,7 +5551,8 @@ void BufferCache::RetireUnusedBuffers(uint64_t frame, uint64_t min_age) {
 	size_t                scanned = 0;
 	m_lru_cache.ForEachItemBelow(limit_tick, [&](BufferId id) {
 		const auto& buffer = m_slot_buffers[id];
-		if (!buffer.is_deleted && !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+		if (!buffer.is_deleted && !KeptOutOfCollection(buffer.Size()) &&
+		    !m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
 			candidates.push_back(id);
 		}
 		return ++scanned >= 4096 || candidates.size() >= 64;
@@ -5632,6 +5645,9 @@ void BufferCache::RunGarbageCollector() {
 		EXIT_IF(buffer.is_deleted);
 		if (buffer.gc_pending) {
 			return false; // KYTY_GC_ASYNC_DOWNLOAD: its download is in flight, dropped below
+		}
+		if (KeptOutOfCollection(buffer.Size())) {
+			return false;
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");

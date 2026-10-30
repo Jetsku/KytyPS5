@@ -64,6 +64,14 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 
 } // namespace
 
+uint64_t HostBufferBytes() {
+	static const uint64_t bytes = []() -> uint64_t {
+		const char* value = std::getenv("KYTY_HOST_BUFFER_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+	}();
+	return bytes;
+}
+
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
                bool transfer_shared, bool host_cached, bool sparse_residency)
@@ -132,6 +140,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		                                VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 		allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	}
+	// KYTY_HOST_BUFFER_MB (default 0 = off; adapted from Senaxx/wolverine 75dea37fd): device-local
+	// buffers of at least this many MiB are placed in system memory, which the GPU reads over PCIe.
+	// A title's whole-heap mirror (one 2.7 GB buffer) otherwise takes a quarter of a 12 GB card;
+	// with the desktop's share on top the card fills and the machine stalls.
+	const bool in_host = usage == MemoryUsage::DeviceLocal && !host_cached &&
+	                     HostBufferBytes() != 0 && size >= HostBufferBytes();
+	if (in_host) {
+		allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation_info.preferredFlags = 0;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -169,6 +187,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	if (in_host) {
+		static std::atomic<uint32_t> placed {0};
+		if (placed.fetch_add(1, std::memory_order_relaxed) < 16) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Kyty VRAM: a {} MB buffer at guest 0x{:x} placed in system memory (KYTY_HOST_BUFFER_MB)\n",
+			    size >> 20u, cpu_address));
+		}
+	}
 	m_buffer = native_buffer;
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
