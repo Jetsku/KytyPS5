@@ -21,12 +21,12 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 45 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
+// Members: 49 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
 // loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
 // lds_limit_override, call_loop_cap.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 136,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 144,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -174,6 +174,18 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.workgroup_images) {
 		b.Text("workgroup_images");
+	}
+	if (options.table_key_bounds) {
+		b.Text("table_key_bounds");
+	}
+	if (options.native_wave64_branch) {
+		b.Text("native_wave64_branch");
+	}
+	if (options.tess_cp_mask) {
+		b.Text("tess_cp_mask");
+	}
+	if (options.ls_active_lanes) {
+		b.Text("ls_active_lanes");
 	}
 	if (options.wave64_warps) {
 		b.Text("wave64_warps");

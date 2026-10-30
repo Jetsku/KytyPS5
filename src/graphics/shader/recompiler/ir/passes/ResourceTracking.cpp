@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
@@ -32,6 +33,8 @@ bool BindlessImagesEnabled() {
 
 namespace {
 
+// KYTY_TABLE_KEY_BOUNDS: matches MaxIndirectImageProbes (ResourceMaterialization.cpp).
+constexpr uint32_t MaxTableKeyProbes = 65536u;
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
@@ -1174,6 +1177,289 @@ private:
 		return {};
 	}
 
+	// KYTY_TABLE_KEY_BOUNDS (adapted from upstream dfcf1c0b0, 20bb268a4, a3ac6d0d3 and b2053c286):
+	// a constant maximum for an address-table image key that neither a bit scan nor a bounded loop
+	// covers, so the table enumerates keys 0..maximum instead of the program being skipped (or
+	// going bindless).
+
+	// Bounds of an F32 value; -inf / +inf when a side is unknown.
+	std::pair<float, float> KeyFloatRange(Value value, uint32_t depth = 0) const {
+		constexpr std::pair<float, float> unknown {-INFINITY, INFINITY};
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::F32) return {value.F32Value(), value.F32Value()};
+			return unknown;
+		}
+		const auto* inst = value.TryInstruction();
+		// A multiply-add evaluates three operands; keep the search shallow.
+		if (depth > 12u || inst == nullptr) return unknown;
+		const auto range  = [&](uint32_t arg) { return KeyFloatRange(inst->Arg(arg), depth + 1u); };
+		const auto finite = [](const std::pair<float, float>& r) {
+			return std::isfinite(r.first) && std::isfinite(r.second);
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::BitCastU32F32: return range(0);
+			// Clamping maps NaN to zero.
+			case ValueOpcode::FPSaturate32: return {0.0f, 1.0f};
+			case ValueOpcode::FPFloor32: {
+				const auto [low, high] = range(0);
+				return {std::floor(low), std::floor(high)};
+			}
+			case ValueOpcode::FPMin32: {
+				const auto a = range(0), b = range(1);
+				return {std::min(a.first, b.first), std::min(a.second, b.second)};
+			}
+			case ValueOpcode::FPMax32: {
+				const auto a = range(0), b = range(1);
+				return {std::max(a.first, b.first), std::max(a.second, b.second)};
+			}
+			case ValueOpcode::FPAdd32: {
+				const auto a = range(0), b = range(1);
+				return {a.first + b.first, a.second + b.second};
+			}
+			case ValueOpcode::FPMul32:
+			case ValueOpcode::FPMad32:
+			case ValueOpcode::FPFma32: {
+				// The rounded multiply and add are monotonic, so the bounds lie at the corners.
+				const auto a = range(0), b = range(1);
+				if (!finite(a) || !finite(b)) return unknown;
+				const auto c = inst->GetOpcode() == ValueOpcode::FPMul32
+				                   ? std::pair<float, float> {0.0f, 0.0f}
+				                   : range(2);
+				const auto [low, high] = std::minmax({a.first * b.first, a.first * b.second,
+				                                      a.second * b.first, a.second * b.second});
+				return {low + c.first, high + c.second};
+			}
+			default: return unknown;
+		}
+	}
+
+	// The largest value key can hold where guard (an EXEC or branch predicate, true on the lanes
+	// that use key) holds: key < C, key <= C (inclusive, a3ac6d0d3), key == C and mirrored forms.
+	uint32_t GuardKeyMaximum(Value guard, Value key, bool positive = true, uint32_t depth = 0) const {
+		if (guard.IsEmpty() || depth > 8u) return UINT32_MAX;
+		const auto* test = SimplifyGuard(guard).TryInstruction();
+		if (test == nullptr) return UINT32_MAX;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::LogicalNot) {
+			return GuardKeyMaximum(test->Arg(0), key, !positive, depth + 1u);
+		}
+		if ((op == ValueOpcode::LogicalAnd && positive) || (op == ValueOpcode::LogicalOr && !positive)) {
+			return std::min(GuardKeyMaximum(test->Arg(0), key, positive, depth + 1u),
+			                GuardKeyMaximum(test->Arg(1), key, positive, depth + 1u));
+		}
+		if (test->NumArgs() != 2u) return UINT32_MAX;
+		uint32_t   limit    = 0;
+		const bool key_left = EquivalentValue(m_program, test->Arg(0), key) &&
+		                      ImmediateU32(test->Arg(1), limit);
+		const bool key_right = !key_left && EquivalentValue(m_program, test->Arg(1), key) &&
+		                       ImmediateU32(test->Arg(0), limit);
+		if (!key_left && !key_right) return UINT32_MAX;
+		// Normalise to "key OP limit" on the lanes where the test holds.
+		auto opcode = op;
+		if (key_right) {
+			switch (op) {
+				case ValueOpcode::ULessThan32: opcode = ValueOpcode::UGreaterThan32; break;
+				case ValueOpcode::ULessThanEqual32: opcode = ValueOpcode::UGreaterThanEqual32; break;
+				case ValueOpcode::UGreaterThan32: opcode = ValueOpcode::ULessThan32; break;
+				case ValueOpcode::UGreaterThanEqual32: opcode = ValueOpcode::ULessThanEqual32; break;
+				default: break;
+			}
+		}
+		if (!positive) {
+			switch (opcode) {
+				case ValueOpcode::ULessThan32: opcode = ValueOpcode::UGreaterThanEqual32; break;
+				case ValueOpcode::ULessThanEqual32: opcode = ValueOpcode::UGreaterThan32; break;
+				case ValueOpcode::UGreaterThan32: opcode = ValueOpcode::ULessThanEqual32; break;
+				case ValueOpcode::UGreaterThanEqual32: opcode = ValueOpcode::ULessThan32; break;
+				case ValueOpcode::INotEqual32: opcode = ValueOpcode::IEqual32; break;
+				default: return UINT32_MAX;
+			}
+		}
+		switch (opcode) {
+			case ValueOpcode::ULessThan32: return limit == 0u ? 0u : limit - 1u;
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::IEqual32: return limit;
+			default: return UINT32_MAX;
+		}
+	}
+
+	// GuardKeyMaximum over every unique-predecessor edge that leads to block after key's definition.
+	uint32_t EntryKeyMaximum(Value key, const Block* block) const {
+		uint32_t    result     = UINT32_MAX;
+		const auto* definition = key.Resolve().TryInstruction();
+		for (size_t depth = 0; block != nullptr && depth < m_program.blocks.size(); ++depth) {
+			if (block->ImmPredecessors().size() != 1u ||
+			    (definition != nullptr && definition->Parent() == block)) {
+				break;
+			}
+			const auto* previous = block->ImmPredecessors()[0];
+			Value       condition;
+			bool        positive = false;
+			if (ConditionalEdge(previous, block, condition, positive)) {
+				result = std::min(result, GuardKeyMaximum(condition, key, positive));
+			}
+			block = previous;
+		}
+		return result;
+	}
+
+	uint32_t KeyMaximum(Value value, Value guard, uint32_t depth = 0) const {
+		value              = value.Resolve();
+		uint32_t immediate = 0;
+		if (ImmediateU32(value, immediate)) return immediate;
+		const auto* inst = value.TryInstruction();
+		if (depth > 24u || inst == nullptr) return UINT32_MAX;
+		uint32_t   result  = std::min(PossibleU32Bits(value), GuardKeyMaximum(guard, value));
+		const auto maximum = [&](uint32_t arg, Value context) {
+			return KeyMaximum(inst->Arg(arg), context, depth + 1u);
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane: {
+				// The value is some lane's: a context-free bound on every lane applies, and a
+				// waterfall guard (local == key) bounds it by the executing lanes' local value.
+				result           = std::min(result, maximum(0, {}));
+				const auto local = EqualLocalKey(guard, value);
+				if (!local.IsEmpty()) result = std::min(result, KeyMaximum(local, guard, depth + 1u));
+				break;
+			}
+			case ValueOpcode::UMin32:
+			case ValueOpcode::BitwiseAnd32:
+				result = std::min(result, std::min(maximum(0, guard), maximum(1, guard)));
+				break;
+			case ValueOpcode::SMin32: {
+				const auto left = maximum(0, guard), right = maximum(1, guard);
+				// Signed and unsigned minimums agree on nonnegative operands.
+				if (std::max(left, right) <= static_cast<uint32_t>(INT32_MAX)) {
+					result = std::min(result, std::min(left, right));
+					break;
+				}
+				// A signed clamp to a constant (20bb268a4): a negative key finds no enumerated
+				// row and reads the first candidate.
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
+					uint32_t row = 0;
+					if (ImmediateU32(inst->Arg(arg), row) && row <= static_cast<uint32_t>(INT32_MAX)) {
+						result = std::min(result, row);
+					}
+				}
+				break;
+			}
+			case ValueOpcode::ShiftRightLogical32:
+				if (ImmediateU32(inst->Arg(1), immediate)) {
+					result = std::min(result, maximum(0, guard) >> (immediate & 31u));
+				}
+				break;
+			case ValueOpcode::BitFieldUExtract:
+				if (inst->NumArgs() == 3u && ImmediateU32(inst->Arg(2), immediate) && immediate < 32u) {
+					result = std::min(result, (1u << immediate) - 1u);
+				}
+				break;
+			case ValueOpcode::IAdd32: {
+				const uint64_t sum = uint64_t {maximum(0, guard)} + maximum(1, guard);
+				if (sum <= UINT32_MAX) result = std::min(result, static_cast<uint32_t>(sum));
+				break;
+			}
+			case ValueOpcode::SelectU32:
+				if (inst->NumArgs() == 3u) {
+					result = std::min(result, !guard.IsEmpty() && Implies(guard, inst->Arg(0))
+					                              ? maximum(1, guard)
+					                              : std::max(maximum(1, guard), maximum(2, guard)));
+				}
+				break;
+			case ValueOpcode::ConvertS32F32:
+			case ValueOpcode::ConvertU32F32: {
+				// The conversion truncates toward zero (dfcf1c0b0).
+				const auto [low, high] = KeyFloatRange(inst->Arg(0));
+				if (low > -1.0f && high < 0x1p31f) {
+					result = std::min(result, static_cast<uint32_t>(high));
+				}
+				break;
+			}
+			default: break;
+		}
+		return result;
+	}
+
+	// The EXEC predicate of an image access through use, else the branch predicate of its block.
+	Value KeyUseGuard(const Use& use) const {
+		const auto& access = *use.user;
+		if (use.operand == 0u && access.NumArgs() != 0u &&
+		    ImageOpcodeInfoOf(access.GetOpcode()).access != ImageAccess::None) {
+			const auto mask = access.Arg(access.NumArgs() - 1u);
+			if (mask.GetType() == Type::U1 && mask.Resolve() != Value(true)) return mask;
+		}
+		return PositiveUseGuard(access.Parent());
+	}
+
+	uint32_t TableKeyMaximum(Value key, const Inst& handle) const {
+		uint32_t result = 0;
+		bool     any    = false;
+		for (const auto& use: handle.Uses()) {
+			if (ImageOpcodeInfoOf(use.user->GetOpcode()).access == ImageAccess::None) {
+				return UINT32_MAX;
+			}
+			result = std::max(result, std::min(EntryKeyMaximum(key, use.user->Parent()),
+			                                   KeyMaximum(key, KeyUseGuard(use))));
+			any = true;
+		}
+		return any ? result : UINT32_MAX;
+	}
+
+	static bool ZeroBasedInduction(const Inst* phi) {
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->GetType() != Type::U32 ||
+		    phi->NumArgs() != 2u) {
+			return false;
+		}
+		const Value key(const_cast<Inst*>(phi));
+		for (uint32_t initial = 0; initial < 2u; ++initial) {
+			const auto  zero      = phi->Arg(initial).Resolve();
+			const auto* step      = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
+			uint32_t    increment = 0;
+			if (zero.IsImmediate() && zero.GetType() == Type::U32 && zero.U32() == 0u &&
+			    step != nullptr && step->GetOpcode() == ValueOpcode::IAdd32 &&
+			    ((step->Arg(0).Resolve() == key && ImmediateU32(step->Arg(1), increment) &&
+			      increment == 1u) ||
+			     (step->Arg(1).Resolve() == key && ImmediateU32(step->Arg(0), increment) &&
+			      increment == 1u))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// b2053c286: a zero-based loop key that only per-lane data bounds takes the runtime count that
+	// every uniformly bounded zero-based loop of the program shares, assuming each lane's count
+	// stays within it.
+	Value ProgramLoopCount(Value key) const {
+		key = key.Resolve();
+		if (m_shader_writes || !ZeroBasedInduction(key.TryInstruction())) return {};
+		Value count;
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if ((inst.GetOpcode() != ValueOpcode::SLessThan32 &&
+				     inst.GetOpcode() != ValueOpcode::ULessThan32) ||
+				    inst.NumArgs() != 2u) {
+					continue;
+				}
+				const auto induction = inst.Arg(0).Resolve();
+				if (induction == key || !ZeroBasedInduction(induction.TryInstruction()) ||
+				    !ValidateRuntimeValue(m_program, inst.Arg(1))) {
+					continue;
+				}
+				if (!count.IsEmpty() && !EquivalentValue(m_program, count, inst.Arg(1))) return {};
+				count = inst.Arg(1);
+			}
+		}
+		if (!count.IsEmpty()) {
+			std::printf("Warning: shader 0x%016" PRIx64 " bounds a per-lane table loop by its uniform "
+			            "loops' count (KYTY_TABLE_KEY_BOUNDS)\n",
+			            m_program.shader_hash);
+		}
+		return count;
+	}
+
 	// KYTY_HEAP_KEY_MASK (adapted from KytyPS5-Frank's ResolveDescriptorPhi): a descriptor word that
 	// is a Phi web where the register held the T# word on the sampling paths and a data value on
 	// others (PPSA03671's 0xbf3eac34fedbad2d restores a spilled heap T# with V_READLANE after loops
@@ -1402,7 +1688,14 @@ private:
 				}
 				if (indirect.key_count.IsEmpty() &&
 				    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, pc)) {
-					return false;
+					if (!GetCodegenOptions().table_key_bounds) return false;
+					const auto maximum = TableKeyMaximum(key, handle);
+					if (maximum < MaxTableKeyProbes) {
+						indirect.key_count = Value(maximum + 1u);
+					} else {
+						indirect.key_count = ProgramLoopCount(key);
+						if (indirect.key_count.IsEmpty()) return false;
+					}
 				}
 				if ((table_offset & 3u) != 0u ||
 				    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
