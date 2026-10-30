@@ -434,13 +434,17 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	uint32_t   pitch  = 0;
 	uint64_t   size   = 0;
 	bool       tile   = false;
+	// Experimental Pro mode: Miles Morales renders to 256B-tiled targets (the PSSR output layout);
+	// they are texture-tiled like the 4KB ones. Base PS5 titles never reached this (it stopped here).
+	const bool     standard256  = rt.attrib3.tile_mode == Prospero::TileMode::kStandard256B;
 	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
 	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
 	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	const bool     texture_tile = standard256 || standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
 		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:
