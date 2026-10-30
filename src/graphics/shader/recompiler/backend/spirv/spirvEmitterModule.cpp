@@ -259,6 +259,17 @@ void DefineBindlessImages(EmitterState& state) {
 			continue;
 		}
 		images.push_back(image);
+		// KYTY_RUNTIME_INT_IMAGES: a runtime T# may name an integer texture; its loads read the slot
+		// through an alias of the binding with the texture's component type (EmitImage).
+		if (image.runtime && GetCodegenOptions().runtime_int_images) {
+			for (const auto numeric_class:
+			     {Prospero::TextureNumericClass::Uint, Prospero::TextureNumericClass::Sint}) {
+				auto alias          = image;
+				alias.numeric_class = numeric_class;
+				alias.depth_compare = false;
+				images.push_back(alias);
+			}
+		}
 		// KYTY_BINDLESS_3D_AS_ARRAY: a 3D image instruction may get a 2D or 2D-array T#
 		// (BindlessSlotArrayFlag); it reads the 2D-array array too.
 		if (BindlessVolumeMayBeArray(image)) {
