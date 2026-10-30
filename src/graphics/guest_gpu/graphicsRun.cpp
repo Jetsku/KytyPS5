@@ -3592,6 +3592,16 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	return true;
 }
 
+// A label the command processor stores now (not deferred): KYTY_LABEL_IN_PLACE keeps a page the GPU
+// wrote from being downloaded for it (RenderContext::StoreLabelInPlace); otherwise through the
+// guest mapping, whose fault makes the page current first.
+static void StoreCpLabel(RenderContext& renderer, void* dst, const void* data, uint64_t size) {
+	if (!renderer.StoreLabelInPlace(reinterpret_cast<uint64_t>(dst), data, size)) {
+		StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), size);
+		std::memcpy(dst, data, size);
+	}
+}
+
 // KYTY_EOP_DROPPED_LABELS: "write" (default) also writes the data of end-of-pipe events whose
 // interrupt selector made Kyty skip it (graphics INT_SEL=1, RELEASE_MEM INT_SEL=4 with a data
 // selection); "count" only counts them, as before.
@@ -3616,8 +3626,7 @@ bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t siz
 		return interrupt;
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
-	StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), size);
-	std::memcpy(dst, &value, size);
+	StoreCpLabel(m_renderer, dst, &value, size);
 	NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 	QueueEopTimestamp(timestamp_slot, dst, value);
 	TraceCpLabel("label-dropped", dst, value, size);
@@ -3873,8 +3882,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			// Guest label pages can be protected by resource tracking. Attribute any
 			// resulting fault separately from the end-of-pipe submission/interrupt work.
 			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
-			StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
-			std::memcpy(dst, &data, sizeof(data));
+			StoreCpLabel(m_renderer, dst, &data, sizeof(data));
 		}
 		NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		TraceCpLabel("label-eop", dst, data, sizeof(data));
@@ -3960,8 +3968,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 					{
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
-						StreamCopyDefer::NoteGuestWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
-						std::memcpy(dst, &value, sizeof(value));
+						StoreCpLabel(m_renderer, dst, &value, sizeof(value));
 					}
 					NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
 					QueueEopTimestamp(timestamp_slot, dst, value);
@@ -4465,8 +4472,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			}
 
 			if (!DeferFlipLabel(dst_gpu_addr, value, false)) {
-				StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
-				std::memcpy(dst_gpu_addr, &value, sizeof(value));
+				StoreCpLabel(m_renderer, dst_gpu_addr, &value, sizeof(value));
 				NoteCpWrite(op.dst, sizeof(value));
 			}
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
@@ -4511,8 +4517,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
 				return;
 			}
-			StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
-			std::memcpy(dst_gpu_addr, &value, sizeof(value));
+			StoreCpLabel(m_renderer, dst_gpu_addr, &value, sizeof(value));
 			NoteCpWrite(op.dst, sizeof(value));
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
