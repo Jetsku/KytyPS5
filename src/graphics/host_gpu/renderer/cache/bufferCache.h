@@ -331,6 +331,10 @@ public:
 	void               SynchronizeBdaBuffers(const RangeSet& mapped_ranges);
 	// Map/unmap callers may run outside the GPU thread, under the mapped-range lock.
 	void               InvalidateBdaSynchronization() noexcept;
+	// KYTY_BDA_REGISTER_LOG: a new registered buffer's range, logged for the next BDA pass
+	// (ChangeRegister<true>); every other structure change goes through
+	// InvalidateBdaSynchronization.
+	void               NoteBdaRegistered(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
 	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
@@ -412,7 +416,10 @@ private:
 	// KYTY_BDA_DIRTY_LOG pass (SynchronizeBdaBuffersNow): synchronizes the ranges the tracker
 	// logged since the last pass (m_bda_dirtied) and the recorded hot runs, instead of every
 	// mapped buffer. False (nothing done) when a recorded hot run's buffer is gone.
-	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
+	// `registered` (KYTY_BDA_REGISTER_LOG, may be null): the ranges of buffers registered since the
+	// last pass, synchronized as well.
+	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges,
+	                                         const RangeSet* registered = nullptr);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
 	// KYTY_BUFFER_LOOKUP_STATS: the kind of the last SynchronizeBdaBuffersNow (BufferLookupStats::Part).
@@ -961,6 +968,21 @@ private:
 	bool                                              m_bda_log_baseline = false;
 	int                                               m_bda_log_verify   = 0;
 	RangeSet                                          m_bda_dirtied;
+	// KYTY_BDA_REGISTER_LOG=1 (default off; needs KYTY_BDA_DIRTY_LOG; adapted from the GT7 fork's
+	// b970ba6fe, whose BDA walk visits only the regions where pages turned CPU-dirty or a buffer
+	// was registered since the last walk). A new registered buffer moves the structure epoch, and
+	// the pass after it used to scan every mapped buffer. With the log, a pass whose structure
+	// changed only by new buffers (the layout epoch, moved by unregistrations and GPU mapping
+	// changes, held) synchronizes the logged CPU-dirty ranges plus the new buffers' ranges.
+	// m_bda_registered and the structure epoch move together under m_bda_registered_mutex, so a
+	// pass takes the log with the epoch it accounts for.
+	bool                                              m_bda_register_log = false;
+	std::mutex                                        m_bda_registered_mutex;
+	RangeSet                                          m_bda_registered;
+	bool                                              m_bda_registered_overflow = false;
+	std::atomic_uint64_t                              m_bda_layout_epoch {1};
+	uint64_t                                          m_bda_scanned_layout_epoch = 0;
+	uint64_t                                          m_bda_register_passes      = 0;
 	struct BdaLogTotals {
 		uint64_t passes                = 0;
 		uint64_t ranges                = 0;

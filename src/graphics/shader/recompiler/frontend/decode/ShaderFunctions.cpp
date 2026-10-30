@@ -522,7 +522,12 @@ bool ExpandShaderCalls(std::span<const uint32_t> code, uint64_t base,
 				return result.size() <= MaxExpandedShaderWords;
 			};
 			// Code that enters with the target pair in s[source_reg:+1] and leaves by falling through.
+			// KYTY_CALL_LEARN: a miss reports the target first (the marker keeps SCC).
 			const auto skip = [&](uint32_t restore) {
+				if (site.report_misses && !site.partition) {
+					result.push_back(EncodeCallStateWord(CallStateOp::MissReport, 1u));
+					result.push_back(site.source_reg);
+				}
 				if (restore != 0) result.push_back(restore);
 				set_return();
 			};

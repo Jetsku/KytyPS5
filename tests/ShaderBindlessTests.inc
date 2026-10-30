@@ -854,6 +854,70 @@ void CheckRuntimeImage() {
   std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, result.spirv.size());
 }
 
+// KYTY_RUNTIME_INT_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): an IMAGE_LOAD of a runtime
+// image reads its slot through uint / sint aliases of the bindless array when the T# format is an
+// integer one. Off: one float array, as before; on: three arrays and a valid module.
+void CheckRuntimeIntImage() {
+  constexpr const char *name = "BindlessRuntimeIntImage";
+  auto code = RuntimeImageCode();
+  // image_load v2, v[3:4], s[32:39] (the sample's place; integer coordinates 0, 0).
+  for (size_t i = 0; i + 1u < code.size(); ++i) {
+    if (code[i] == EncodeMimg0(0x24u, 0x1u)) {
+      code[i] = EncodeMimg0(0x00u, 0x1u);
+      code[i + 1u] = EncodeMimg1(2, 3, 32 / 4, 0);
+      break;
+    }
+  }
+  const auto user_data = MilesHeapUserData();
+  ShaderComputeInputInfo compute_info{};
+  compute_info.lds_size_dwords = 1024;
+  compute_info.host_subgroup_size = 64;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  const auto compile = [&](bool integer) {
+    auto codegen = GetCodegenOptions();
+    codegen.srt_variant_reads = true;
+    codegen.runtime_images = true;
+    codegen.runtime_int_images = integer;
+    ScopedCodegenOptions scope(codegen);
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "resource tracking",
+            !translated.skip_dispatch && translated.program.info.images.size() == 1u &&
+                translated.program.info.images[0].runtime,
+            "the runtime T# of the load was not a runtime image");
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    std::vector<u32> memory(0x4000u, 0u);
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+        .read_memory = ReadTestMemory,
+        .userdata = &memory,
+        .read_specialization_memory = ReadTestMemory,
+    };
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+            "the runtime image did not materialize");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    ShaderRecompiler::IR::SetBindlessImagesEnabled(false);
+    ValidateSpirv(name, result.spirv);
+    return result.spirv;
+  };
+  const auto off = compile(false);
+  Require(name, "switch off", CountSpirv(off, "\"bindless_images\"") == 1u,
+          "the load declares integer aliases without KYTY_RUNTIME_INT_IMAGES");
+  const auto on = compile(true);
+  Require(name, "integer aliases",
+          CountSpirv(on, "\"bindless_images\"") == 3u &&
+              CountSpirv(on, "OpImageFetch") + CountSpirv(on, "OpImageRead") >= 3u,
+          "the load does not read the uint and sint aliases selected by the T# format");
+  std::printf("[bindless] %-32s ok (SPIR-V %zu words)\n", name, on.size());
+}
+
 // KYTY_BINDLESS_STRIDE (adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): GT7's material shaders
 // select their T#s from 188-byte material records, key * 188 (S_MUL_I32) instead of key << 5. The
 // Miles waterfall with that multiply: without the switch the program is skipped; with it the heap
@@ -1283,6 +1347,7 @@ void RunCodegen() {
   CheckRecordHeap();
   CheckVolumeOverArray();
   CheckRuntimeImage();
+  CheckRuntimeIntImage();
   CheckStridedHeap();
   CheckSamplerHeap();
   CheckWorkgroupStorageImage();

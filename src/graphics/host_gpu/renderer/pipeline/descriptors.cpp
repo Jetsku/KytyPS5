@@ -2046,9 +2046,17 @@ uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& resource)
 // A heap entry the bindless array of this binding can hold: a float-sampled, single-sample
 // texture of a matching shape. Anything else stays the placeholder rather than reaching
 // ResolveTexture, which exits on descriptors a draw would never bind that way.
-bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
-	if (descriptor.IsNull() || Prospero::SampledTextureNumericClass(descriptor.Format()) !=
-	                               Prospero::TextureNumericClass::Float) {
+// allow_integer (KYTY_RUNTIME_INT_IMAGES, runtime heaps): uint and sint textures too, which the
+// shader's loads read through integer aliases of the binding.
+bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding,
+                        bool allow_integer = false) {
+	if (descriptor.IsNull()) {
+		return false;
+	}
+	const auto numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());
+	if (numeric_class != Prospero::TextureNumericClass::Float &&
+	    !(allow_integer && (numeric_class == Prospero::TextureNumericClass::Uint ||
+	                        numeric_class == Prospero::TextureNumericClass::Sint))) {
 		return false;
 	}
 	switch (descriptor.Type()) {
@@ -2245,7 +2253,8 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	if (!BindlessCompatible(descriptor, heap.binding)) {
+	const bool integer_views = heap.runtime && ShaderRecompiler::GetCodegenOptions().runtime_int_images;
+	if (!BindlessCompatible(descriptor, heap.binding, integer_views)) {
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -2260,6 +2269,14 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	auto resource = heap.resource;
 	if (as_array) {
 		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+	}
+	if (integer_views) {
+		// KYTY_RUNTIME_INT_IMAGES: an integer T#'s view has its own component type.
+		if (const auto numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());
+		    numeric_class != Prospero::TextureNumericClass::Float) {
+			resource.numeric_class = numeric_class;
+			resource.depth_compare = false;
+		}
 	}
 	auto& texture_cache = m_context.GetTextureCache();
 	// KYTY_BINDLESS_HOLD_EXTENT=1 (default 0; on in the PPSA03671 preset; adapted from upstream

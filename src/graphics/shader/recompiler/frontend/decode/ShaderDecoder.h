@@ -848,6 +848,9 @@ enum class CallStateOp : uint32_t {
 	Probe            = 4,
 	PartitionCompare = 5,
 	PartitionDrop    = 6,
+	// KYTY_CALL_LEARN (ShaderCalls.h): one payload word, the target pair register, reported to the
+	// dispatch's report set as PartitionDrop does; the lanes stay (they take the skip path).
+	MissReport = 7,
 };
 [[nodiscard]] constexpr uint32_t EncodeCallStateWord(CallStateOp op, uint32_t payload_words) {
 	return 0xbf800000u | (CallStateSoppOpcode << 16u) | (static_cast<uint32_t>(op) << 12u) |

@@ -1257,6 +1257,36 @@ static uint32_t RuntimeImageFloat(EmitterState& state, const std::array<uint32_t
 	return Binary(state, spv::OpINotEqual, TypeBool(state), bit, ConstantU32(state, 0));
 }
 
+// KYTY_RUNTIME_INT_IMAGES: the component class of the T#'s format (0 float, 1 uint, 2 sint, 3
+// none), two bits per format from a table of the 512 formats, selected with a switch on the word.
+static uint32_t RuntimeImageNumericClass(EmitterState& state, const std::array<uint32_t, 8>& dwords) {
+	static const std::array<uint32_t, 32> table = [] {
+		std::array<uint32_t, 32> words {};
+		for (uint32_t format = 0; format < 512u; format++) {
+			uint32_t value = 3u;
+			switch (Prospero::SampledTextureNumericClass(static_cast<Prospero::BufferFormat>(format))) {
+				case Prospero::TextureNumericClass::Float: value = 0u; break;
+				case Prospero::TextureNumericClass::Uint: value = 1u; break;
+				case Prospero::TextureNumericClass::Sint: value = 2u; break;
+				case Prospero::TextureNumericClass::Unsupported: value = 3u; break;
+			}
+			words[format / 16u] |= value << ((format % 16u) * 2u);
+		}
+		return words;
+	}();
+	const auto u32    = TypeU32(state);
+	const auto format = EmitBitFieldUExtract(state, dwords[1], ConstantU32(state, 20),
+	                                         ConstantU32(state, 9));
+	const auto word   = EmitIndexSwitch(
+	    state, Binary(state, spv::OpShiftRightLogical, u32, format, ConstantU32(state, 4)), 32u, u32,
+	    [&](uint32_t index) { return ConstantU32(state, table[index]); });
+	const auto shift = Binary(state, spv::OpShiftLeftLogical, u32,
+	                          Binary(state, spv::OpBitwiseAnd, u32, format, ConstantU32(state, 15)),
+	                          ConstantU32(state, 1));
+	return Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, word, shift),
+	              ConstantU32(state, 3));
+}
+
 // The bindless slot of a runtime image's T#. The runtime image table maps the eight dwords and
 // the binding to a translation entry, which holds the slot as a heap key's entry does: pending
 // entries flag the feedback buffer and sample the pending placeholder. A T# the table lacks
@@ -1426,6 +1456,67 @@ static uint32_t RuntimeQueryDimensions(ValueEmitContext& ctx, const IR::MemoryIn
 static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst);
 static void EmitBindlessVolumeOrArray(ValueEmitContext& ctx, const IR::Inst& inst);
 
+// KYTY_RUNTIME_INT_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): a load of a runtime image
+// reads its slot through the alias of the T#'s component class: float through the image's own
+// array, uint / sint through the aliases DefineBindlessImages declares. A T# whose class has no
+// view, or an integer one still pending, reads zeros (the pending placeholder is a float view).
+// The load is a fetch (no derivatives), so the class selects a branch.
+static void EmitRuntimeImageRead(ValueEmitContext& ctx, const IR::Inst& inst,
+                                 const IR::ImageResource& image, const std::array<uint32_t, 8>& dwords) {
+	auto&      state         = ctx.state;
+	const auto& mem          = ctx.Memory(inst);
+	const auto numeric_class = RuntimeImageNumericClass(state, dwords);
+	const auto entry         = RuntimeImageSlot(ctx, image, dwords);
+	const auto u32           = TypeU32(state);
+	const auto boolean       = TypeBool(state);
+	const auto pending =
+	    Binary(state, spv::OpIEqual, boolean, entry, ConstantU32(state, IR::BindlessPendingSlot));
+	// An existing definition (a value used before this point) is re-pointed at the selection.
+	std::optional<uint32_t> predefined;
+	if (const auto found = ctx.definitions.find(&inst); found != ctx.definitions.end()) {
+		predefined = found->second;
+		ctx.definitions.erase(found);
+	}
+	const auto read = [&](Prospero::TextureNumericClass alias_class, uint32_t slot) {
+		if (alias_class != image.numeric_class) {
+			state.image_override_index        = mem.resource;
+			state.image_override              = state.program.info.images.at(mem.resource);
+			state.image_override.numeric_class = alias_class;
+			state.image_override.depth_compare = false;
+		}
+		state.bindless_slot = slot;
+		EmitImageOperation(ctx, inst);
+		state.image_override_index = UINT32_MAX;
+		const auto found           = ctx.definitions.find(&inst);
+		EXIT_IF(found == ctx.definitions.end());
+		const auto value = found->second;
+		ctx.definitions.erase(found);
+		return value;
+	};
+	const auto vector = TypeU32Vector(state, 4);
+	const auto value  = EmitIndexSwitch(state, numeric_class, 4u, vector, [&](uint32_t which) {
+		if (which == 0u || which == 3u) {
+			// Float (or no view: the placeholder, which reads as the float path did before).
+			const auto slot = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, u32, slot,
+			                          Binary(state, spv::OpIEqual, boolean, numeric_class,
+			                                 ConstantU32(state, 0)),
+			                          entry, ConstantU32(state, IR::BindlessPendingSlot));
+			state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+			return read(image.numeric_class, slot);
+		}
+		const auto alias_class =
+		    which == 1u ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Sint;
+		return EmitValueOrDefaultIfCondition(
+		    state, Unary(state, spv::OpLogicalNot, boolean, pending), vector,
+		    ConstantU32CompositeZero(state, 4), [&]() { return read(alias_class, entry); });
+	});
+	if (predefined) {
+		ctx.definitions.emplace(&inst, *predefined);
+	}
+	ctx.Define(inst, value);
+}
+
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state     = ctx.state;
 	const auto& mem       = ctx.Memory(inst);
@@ -1444,6 +1535,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (inst.GetOpcode() == IR::ValueOpcode::ImageQueryDimensions) {
 			const auto* address = ctx.ImageAddress(inst.Arg(1));
 			ctx.Define(inst, RuntimeQueryDimensions(ctx, mem, *address, image.dimension, dwords));
+			return;
+		}
+		if (inst.GetOpcode() == IR::ValueOpcode::ImageRead && GetCodegenOptions().runtime_int_images &&
+		    image.resource_class == IR::ImageResourceClass::Sampled &&
+		    ImageDimensionInfoFor(image.dimension).multisampled == 0u) {
+			EmitRuntimeImageRead(ctx, inst, image, dwords);
 			return;
 		}
 		const auto is_float = RuntimeImageFloat(state, dwords);

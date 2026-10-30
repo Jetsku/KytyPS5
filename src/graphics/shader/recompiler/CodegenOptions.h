@@ -456,6 +456,12 @@ struct CodegenOptions {
 	// placeholder and is requested, and the host resolves it like a heap key. Off: such a program
 	// is skipped ("descriptor computed at runtime without a BDA path"), as before.
 	bool runtime_images = false;
+	// KYTY_RUNTIME_INT_IMAGES=1 (default 0; needs KYTY_RUNTIME_IMAGES; adapted from usa-ratt/
+	// KytyPS5-GT7 2fa6c6514): a load (IMAGE_LOAD*, not a sample) of a runtime image whose T# has an
+	// integer format reads the texture through an alias of its bindless array with that component
+	// type (uint or sint), and the host resolves such T#s into the runtime heap with integer views.
+	// Off: such a load reads the pending placeholder (zeros), as before.
+	bool runtime_int_images = false;
 	// KYTY_BINDLESS_STRIDE=1 (default 0; on in the GT7 title preset; adapted from
 	// usa-ratt/KytyPS5-GT7 a6cd035f0): a bindless heap T# selected as key * stride (an immediate
 	// multiply, or a shift other than 5) with a 4-byte-aligned stride of at least 32 bytes (GT7's

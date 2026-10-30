@@ -175,6 +175,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.runtime_images) {
 		b.Text("runtime_images");
 	}
+	if (options.runtime_int_images) {
+		b.Text("runtime_int_images");
+	}
 	if (options.bindless_strided) {
 		b.Text("bindless_strided");
 	}
