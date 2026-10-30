@@ -50689,6 +50689,9 @@ template <u32 dim> TestCase ImageA16GradientsTakeOwnVgpr() {
   test.user_data[3] = static_cast<u32>(types[dim / 2u]) << 28u;
   test.has_user_data = true;
   test.required_spirv = {"OpImageSampleExplicitLod", "Grad"};
+  // Our dispatch harness has no 3D sampled test view (only 1D/2D and arrays): the 3D case checks
+  // its decode and SPIR-V only.
+  test.compile_only = volume;
   return test;
 }
 
