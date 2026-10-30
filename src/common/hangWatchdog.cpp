@@ -1,5 +1,6 @@
 #include "common/hangWatchdog.h"
 
+#include "common/compileWatch.h"
 #include "common/cpuPlacement.h"
 #include "common/hostException.h"
 #include "common/liveSwitch.h"
@@ -669,6 +670,7 @@ void NoteFlip() {
 	if (Enabled()) g_flips.fetch_add(1, std::memory_order_relaxed);
 }
 void NoteSubmission() {
+	CompileWatch::NoteSubmission();
 	if (Enabled()) g_submissions.fetch_add(1, std::memory_order_relaxed);
 }
 Scope::Scope(const char* kind, uint64_t addr, uint64_t expected, uint64_t observed, uint64_t mask,
@@ -749,10 +751,12 @@ void NoteQueue(uint32_t queue, uint64_t submission, const char* state, uint64_t 
 }
 void NoteQueueWait(uint32_t queue, const char* kind, uint64_t address, uint64_t expected,
                    uint64_t observed, uint64_t mask, uint64_t compare, uint64_t size) {
+	CompileWatch::NoteQueueWait(queue, kind, address);
 	if (Enabled() && queue < MaxQueues)
 		Store(g_queues[queue].wait, kind, {address, expected, observed, mask, compare, size});
 }
 void ClearQueueWait(uint32_t queue) {
+	CompileWatch::ClearQueueWait(queue);
 	if (Enabled() && queue < MaxQueues) Store(g_queues[queue].wait, nullptr, {});
 }
 uint32_t RegisterTimeline(uint64_t semaphore) {

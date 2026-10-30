@@ -745,6 +745,14 @@ if(LINUX)
 	target_link_libraries(hang_watchdog_tests Threads::Threads)
 endif()
 
+# Compile-wait console lines (common/compileWatch.h): blocked waits, the periodic summary, frame stalls.
+add_executable(compile_watch_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CompileWatchTests.cpp")
+target_link_libraries(compile_watch_tests common)
+target_include_directories(compile_watch_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(compile_watch_tests Threads::Threads)
+endif()
+
 # Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
 add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
@@ -1352,6 +1360,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
+	add_test(NAME compile_watch COMMAND $<TARGET_FILE:compile_watch_tests>)
 	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
 	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
 	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)

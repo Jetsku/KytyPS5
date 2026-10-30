@@ -4,6 +4,7 @@
 #include "common/ramStats.h"
 
 #include "common/assert.h"
+#include "common/compileWatch.h"
 #include "common/cpuPlacement.h"
 #include "common/prepPhases.h"
 #include "common/crashContext.h"
@@ -3641,6 +3642,10 @@ struct PipelineCache::ProgramCache {
 			bool account;
 			~StallScope() { if (account) AddCompileStall(CompileClockNs() - begin); }
 		} stall {.account = !speculative && !replay};
+		// A draw or dispatch waits for its own translation; replays and look-ahead translations do not.
+		CompileWatch::Build watch_build(CompileWatch::Kind::Shader, key.hash);
+		std::optional<CompileWatch::Wait> watch_wait;
+		if (!speculative && !replay) watch_wait.emplace("draw/dispatch preparation", CompileWatch::Kind::Shader, key.hash);
 		std::vector<uint32_t> owned_code;
 		auto translation_code = params.code;
 		DumpRequestedProgram(params, key.stage);
@@ -5507,6 +5512,12 @@ struct PipelineCache::PrefetchState {
 		     pixel_copy = pixel != nullptr ? std::optional(*pixel) : std::nullopt, programs] {
 			    const auto& vertex = stages[0];
 			    Profiler::SetThreadName("PipelineCompiler");
+			    queued_builds.Sub();
+			    CompileWatch::Build watch(CompileWatch::Kind::GraphicsPipeline,
+			                              vertex.stage.program != nullptr ? vertex.stage.program->shader_hash : 0,
+			                              pixel_copy && pixel_copy->stage.program != nullptr
+			                                  ? pixel_copy->stage.program->shader_hash
+			                                  : 0);
 			    Result result {std::make_unique<Pipeline>()};
 			    const auto begin = CompileClockNs();
 			    GraphicsPipelineCreateHook keyed_hook;
@@ -5541,6 +5552,7 @@ struct PipelineCache::PrefetchState {
 		auto future = task->get_future();
 		const auto ticket = ++next_ticket;
 		auto started = std::make_shared<std::atomic<bool>>(false);
+		queued_builds.Add();
 		if (queue.Submit([task, started] {
 			    started->store(true, std::memory_order_release);
 			    (*task)();
@@ -5550,6 +5562,7 @@ struct PipelineCache::PrefetchState {
 			submitted.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
+		queued_builds.Sub();
 		return false;
 	}
 	Result Take(const GraphicsPipelineKey& key) {
@@ -5617,6 +5630,7 @@ struct PipelineCache::PrefetchState {
 	const bool keyed;
 	const bool drop_on_stop;
 	const char* const log_name;
+	CompileWatch::QueueCounter queued_builds {log_name};
 	std::mutex mutex;
 	bool stopped = false;
 	uint64_t next_ticket = 0;
@@ -5728,9 +5742,16 @@ struct PipelineCache::RtState {
 		info->stage.resources = &EmptyResources();
 		const auto module      = program.module;
 		const auto shader_hash = job.shader_hash;
+		const auto watch_kind  = huge ? CompileWatch::Kind::HugeCompute
+		                         : input.stage.program->bindings.call_state_dword != ShaderRecompiler::IR::PushData::NoStart
+		                             ? CompileWatch::Kind::SplitPipeline
+		                             : CompileWatch::Kind::RtPipeline;
+		queued_builds.Add();
 		const bool queued      = queue.Submit(
-            [this, promise, info, module, id, shader_hash, huge] {
+            [this, promise, info, module, id, shader_hash, huge, watch_kind] {
                 Profiler::SetThreadName("RtPipeline");
+                queued_builds.Sub();
+                CompileWatch::Build watch(watch_kind, shader_hash);
                 auto built         = std::make_shared<Built>();
                 built->shader_hash = shader_hash;
                 built->program_id  = id;
@@ -5758,6 +5779,7 @@ struct PipelineCache::RtState {
             },
             job.ticket);
 		if (!queued) {
+			queued_builds.Sub();
 			jobs.erase(id);
 			if (huge) g_shader_modules.Unpin(cache.m_graphics.device, module);
 			return nullptr;
@@ -5883,6 +5905,7 @@ struct PipelineCache::RtState {
 
 	PipelineCache&                    cache;
 	const uint32_t                    wait_ms;
+	CompileWatch::QueueCounter        queued_builds {"background compute"};
 	std::mutex                        mutex;
 	std::unordered_map<uint64_t, Job> jobs;
 	uint64_t                          next_ticket = 0;
@@ -7556,11 +7579,22 @@ void PipelineCache::InitializeShaderPrecompile() {
 		PrewarmComputePipeline(info, program);
 	};
 	replay.log         = [](const std::string& message) { PipelineCacheLog("{}", message); };
-	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
+	// Progress for the compile-wait lines (common/compileWatch.h).
+	const uint64_t replay_total = replay.max_entries != 0
+	                                  ? std::min<uint64_t>(m_shader_journal->Entries().size(), replay.max_entries)
+	                                  : m_shader_journal->Entries().size();
+	auto replay_done = std::make_shared<std::atomic<uint64_t>>(0);
+	CompileWatch::NotePrecompile(0, replay_total);
+	replay.on_finished = [this, replay_total] {
+		CompileWatch::NotePrecompile(replay_total, replay_total);
+		m_shader_journal->ReleaseLoaded();
+	};
 	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
 	    *m_shader_journal, std::move(replay),
-	    [this](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
-		    return m_program_cache->ReplayEntry(source, entry);
+	    [this, replay_total, replay_done](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
+		    const auto outcome = m_program_cache->ReplayEntry(source, entry);
+		    CompileWatch::NotePrecompile(replay_done->fetch_add(1, std::memory_order_relaxed) + 1, replay_total);
+		    return outcome;
 	    });
 	if (EnvU64("KYTY_SHADER_PRECOMPILE_WAIT", 0) != 0) {
 		// Start-up waits for the replay (the best case of precompiling: tests, measurements).
@@ -8934,6 +8968,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
+	// For the compile-wait lines (common/compileWatch.h).
+	const uint64_t watch_vs_hash = vs_input_info.stage.program != nullptr ? vs_input_info.stage.program->shader_hash : 0;
+	const uint64_t watch_ps_hash =
+	    ps_active && ps_input_info->stage.program != nullptr ? ps_input_info->stage.program->shader_hash : 0;
 
 	GraphicsPipelineKey key {};
 	(void)BuildGraphicsPipelineKey(targets, command.GetRegisters(), command.GetUserConfig(),
@@ -9056,6 +9094,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			}
 		}
 		wait_begin = CompileClockNs();
+		CompileWatch::Wait watch("draw", CompileWatch::Kind::GraphicsPipeline, watch_vs_hash, watch_ps_hash);
 		ready      = m_skip->Take(key);
 		if (ready.pipeline != nullptr) {
 			ready_from = m_skip.get();
@@ -9075,6 +9114,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			if (PipelinePrefetchEnabled()) m_prefetch->Request(key, vertex_info, ps_input_info, programs);
 		}
 		wait_begin = CompileClockNs();
+		CompileWatch::Wait watch("draw", CompileWatch::Kind::GraphicsPipeline, watch_vs_hash, watch_ps_hash);
 		ready = m_prefetch->Take(key);
 		if (ready.pipeline != nullptr) ready_from = m_prefetch.get();
 	}
@@ -9139,6 +9179,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	}
 	if (!prefetched) {
 		Profiler::ScopedFrameWait pipeline_create(Profiler::FrameWait::GraphicsPipelineCreate);
+		CompileWatch::Build       watch_build(CompileWatch::Kind::GraphicsPipeline, watch_vs_hash, watch_ps_hash);
+		CompileWatch::Wait        watch_wait("draw", CompileWatch::Kind::GraphicsPipeline, watch_vs_hash, watch_ps_hash);
 		HangWatchdog::Scope       compile(
 		    "graphics-pipeline",
 		    vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0, vs_id,
@@ -9290,6 +9332,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	HangWatchdog::Scope compile(
 	    "compute-pipeline", input_info.stage.program ? input_info.stage.program->shader_hash : 0,
 	    compute_program.id);
+	const uint64_t      watch_hash = input_info.stage.program ? input_info.stage.program->shader_hash : 0;
+	CompileWatch::Build watch_build(CompileWatch::Kind::ComputePipeline, watch_hash);
+	CompileWatch::Wait  watch_wait("dispatch", CompileWatch::Kind::ComputePipeline, watch_hash);
 	const uint64_t cs_hash = input_info.stage.program ? input_info.stage.program->shader_hash : 0;
 	Common::CrashContext::Scope note("compute pipeline build (CS)", cs_hash);
 	FastFirstState::ComputeFast fast_result;
@@ -9472,7 +9517,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		case RtSession::DispatchAction::Run: break;
 		case RtSession::DispatchAction::WaitBounded: {
 			rt.queue.Promote(ticket);
-			const auto begin = CompileClockNs();
+			const auto         begin = CompileClockNs();
+			CompileWatch::Wait watch("dispatch", huge ? CompileWatch::Kind::HugeCompute : CompileWatch::Kind::RtPipeline,
+			                         shader_hash);
 			if (rt.wait_ms == UINT32_MAX) {
 				future.wait();
 			} else {
