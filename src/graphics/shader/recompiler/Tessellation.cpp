@@ -351,6 +351,12 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0xffu &&
 					     lhs.kind == Kind::PackedControlPoint))
 						value = constant(0u);
+					// KYTY_TESS_CP_MASK (upstream 77458260f): bits 8..12 of the packed HS ID are the
+					// control point, 256 per step (as mask() does under KYTY_TESS_INDEXED).
+					if (GetCodegenOptions().tess_cp_mask &&
+					    ((lhs.kind == Kind::PackedControlPoint && rhs == constant(0x1f00u)) ||
+					     (rhs.kind == Kind::PackedControlPoint && lhs == constant(0x1f00u))))
+						value = {Kind::Affine, 0x100u, 0u};
 					break;
 				case Opcode::V_MOV_B32: value = lhs; break;
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
