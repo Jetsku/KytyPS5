@@ -361,6 +361,42 @@ std::atomic<uint64_t> g_readback_flush_side_copies {0};
 // calls) still drain: nothing faults again after them.
 Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOn);
 
+// KYTY_ASYNC_DRAIN counts (BufferCache::AsyncDrainEnabled).
+namespace {
+struct AsyncDrainStats {
+	std::atomic<uint64_t> issued {0};
+	std::atomic<uint64_t> released {0};
+	std::atomic<uint64_t> redrained {0};
+	std::atomic<uint64_t> wait_ns {0};
+};
+AsyncDrainStats g_async_drain;
+
+void ReportAsyncDrain() {
+	static std::atomic<uint64_t> last_ns {0};
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	auto previous = last_ns.load(std::memory_order_relaxed);
+	if (previous == 0) {
+		last_ns.compare_exchange_strong(previous, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - previous < 30'000'000'000ull ||
+	    !last_ns.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto issued    = g_async_drain.issued.exchange(0, std::memory_order_relaxed);
+	const auto released  = g_async_drain.released.exchange(0, std::memory_order_relaxed);
+	const auto redrained = g_async_drain.redrained.exchange(0, std::memory_order_relaxed);
+	const auto wait_ns   = g_async_drain.wait_ns.exchange(0, std::memory_order_relaxed);
+	std::printf("Async drain 30s: %" PRIu64 " guest drains waited on their own thread (%.0f us "
+	            "each), %" PRIu64 " windows released, %" PRIu64
+	            " drained again on the command processor (KYTY_ASYNC_DRAIN)\n",
+	            issued, issued != 0 ? static_cast<double>(wait_ns) / 1e3 / static_cast<double>(issued) : 0.0,
+	            released, redrained);
+}
+} // namespace
+
 // KYTY_READBACK_EAGER_WRITES (live, default off; =1 on): a guest write fault on GPU-owned bytes
 // makes its pages eager-hot as a read fault does (KYTY_READBACK_EAGER). The next recordings that
 // write them then end with a copy of their bytes, published when the recording completes, so a
@@ -2209,6 +2245,26 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			return;
 		}
 	}
+	// KYTY_ASYNC_DRAIN: a guest thread's drain is waited for here, not on the command processor.
+	AsyncDrain  async_drain;
+	AsyncDrain* async = !gpu_thread && AsyncDrainEnabled() ? &async_drain : nullptr;
+	const auto  finish_async = [&, this, vaddr, size, is_write] {
+		if (async_drain.tick == 0) {
+			return;
+		}
+		{
+			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
+			const auto                    start = FaultCost::NowNs();
+			flush_note.Begin();
+			m_scheduler.WaitPriorityOperations(async_drain.tick);
+			flush_note.End();
+			g_async_drain.wait_ns.fetch_add(FaultCost::NowNs() - start, std::memory_order_relaxed);
+		}
+		gpu.SendCommandSync([&, this, vaddr, size, is_write] {
+			FinishAsyncDrain(vaddr, size, is_write, async_drain, trace);
+		});
+		ReportAsyncDrain();
+	};
 	if (!side_path) {
 		flush_note.kind = FaultCost::FlushKind::Drain;
 		diag_path("drain-nonside");
@@ -2217,8 +2273,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
 			CpGaps::Note(is_write ? CpGaps::Event::DrainWrite : CpGaps::Event::DrainOther);
-			ReadMemoryDrain(vaddr, size, is_write, trace);
+			ReadMemoryDrain(vaddr, size, is_write, trace, async);
 		});
+		finish_async();
 		record(std::nullopt);
 		return;
 	}
@@ -2325,7 +2382,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			             : result == SideIssueResult::CurrentWriter ? CpGaps::Event::DrainCurrentWriter
 			             : result == SideIssueResult::Unbounded     ? CpGaps::Event::DrainUnbounded
 			                                                        : CpGaps::Event::DrainOther);
-			ReadMemoryDrain(vaddr, size, is_write, trace);
+			ReadMemoryDrain(vaddr, size, is_write, trace, async);
 		}
 	};
 	gpu.SendCommandSync([&issue] { issue(); });
@@ -2406,6 +2463,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			break;
 	}
 	flush_note.kind = FaultCost::FlushKind::Drain; // ReadMemoryDrain ran on the command processor
+	finish_async();
 	record(std::nullopt);
 }
 
@@ -2550,8 +2608,48 @@ bool BufferCache::FaultPagesCurrent(uint64_t page_begin, uint64_t page_end) {
 	return true;
 }
 
+// KYTY_ASYNC_DRAIN (default 0; 1 on, read once; adapted from usa-ratt/KytyPS5-GT7's
+// KYTY_ASYNC_READBACK, default on there): a guest thread's fault that takes the drain path (a write
+// fault the side copy refused, a read whose side copy was refused) no longer makes the command
+// processor wait for the GPU. The command processor records the window's download as before,
+// submits the recording and goes on; the faulting thread waits for the download's publication
+// itself (WaitPriorityOperations), then the command processor releases the window
+// (FinishAsyncDrain) if no GPU write reached it in between, or drains again synchronously.
+bool BufferCache::AsyncDrainEnabled() {
+	static const bool enabled = ParseEnvU64("KYTY_ASYNC_DRAIN", 0) != 0;
+	return enabled;
+}
+
+
+
+void BufferCache::FinishAsyncDrain(uint64_t vaddr, uint64_t size, bool is_write,
+                                   const AsyncDrain& async, ReadMemoryTrace& trace) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	const auto begin = async.window_begin;
+	const auto bytes = async.window_end - async.window_begin;
+	// What the synchronous drain releases after its wait, provided nothing was recorded since that
+	// put GPU-written bytes (or a newer readback) in the window: then the window holds exactly what
+	// it held after the publication.
+	const bool clean = !HasGpuDirtyBytes(begin, bytes) && !HasPendingBackingPublication(begin, bytes) &&
+	                   !OverlapsPendingSideReadback(Common::AlignDown(begin, TRACKER_PAGE_SIZE),
+	                                                Common::AlignUp(begin + bytes, TRACKER_PAGE_SIZE)) &&
+	                   (m_early_released.empty() || !OverlapsUnpublished(begin, bytes)) &&
+	                   !m_texture_cache.IsRegionGpuModified(begin, bytes) &&
+	                   (m_unbounded_write_tick == 0 || m_scheduler.IsFree(m_unbounded_write_tick));
+	if (!clean) {
+		g_async_drain.redrained.fetch_add(1, std::memory_order_relaxed);
+		ReadMemoryDrain(vaddr, size, is_write, trace);
+		return;
+	}
+	g_async_drain.released.fetch_add(1, std::memory_order_relaxed);
+	m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+}
+
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
-                                  ReadMemoryTrace& trace) {
+                                  ReadMemoryTrace& trace, AsyncDrain* async) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	HangWatchdog::Scope drain("buffer-readback-drain", vaddr, size, 0, 0, is_write);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -2581,6 +2679,14 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	trace.size  = window_end - window_begin;
 	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		trace.downloaded = true;
+		if (async != nullptr) {
+			// KYTY_ASYNC_DRAIN: submit the download and go on; the guest thread waits for it.
+			async->tick         = m_scheduler.FlushObservable();
+			async->window_begin = window_begin;
+			async->window_end   = window_end;
+			g_async_drain.issued.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 		const auto                    tick = m_scheduler.CurrentTick();
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
 		m_scheduler.Wait(tick);

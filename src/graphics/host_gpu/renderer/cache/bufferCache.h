@@ -703,8 +703,24 @@ private:
 		uint64_t size       = 0;
 		bool     downloaded = false;
 	};
-	// The drain path: GPU thread only.
-	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+	// KYTY_ASYNC_DRAIN (adapted from usa-ratt/KytyPS5-GT7's KYTY_ASYNC_READBACK): the download a
+	// guest thread's drain records is submitted and the GPU thread goes on; the guest thread waits
+	// for its publication, then FinishAsyncDrain releases the window on the GPU thread.
+	struct AsyncDrain {
+		uint64_t tick         = 0; // 0: nothing to wait for (done, or drained synchronously)
+		uint64_t window_begin = 0;
+		uint64_t window_end   = 0;
+	};
+	[[nodiscard]] static bool AsyncDrainEnabled();
+	// The drain path: GPU thread only. With `async` (guest-thread faults only) a recorded download
+	// is submitted without waiting and its tick returned in *async.
+	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace,
+	                     AsyncDrain* async = nullptr);
+	// GPU thread, after the guest thread waited for async.tick's publication: the window's pages
+	// lose their GPU-written protection when nothing was written to them since (else the drain is
+	// redone synchronously), and a write's bytes become CPU-dirty, as the synchronous drain does.
+	void FinishAsyncDrain(uint64_t vaddr, uint64_t size, bool is_write, const AsyncDrain& async,
+	                      ReadMemoryTrace& trace);
 	// KYTY_CLEAN_PAGE=1 (adapted from usa-ratt/KytyPS5-GT7 ba83f1a64, its round 135), GPU thread:
 	// the faulting pages [page_begin, page_end) are no longer GPU-written for the tracker and hold
 	// no GPU-written bytes, no bytes of a readback or publication still to land, and no GPU-written

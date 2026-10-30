@@ -29,6 +29,7 @@
 #include <atomic>
 #include <bit>
 #include <bitset>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -1634,11 +1635,67 @@ static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Re
 	return ReadFailure::None;
 }
 
+// KYTY_DRAW_PREP_BACKING_DIAG=1 (diagnostic, default off): draw-prep worker reads that found no
+// backing (DrawPrep fallback "backing"), by 1 MiB region, with the size, the calling host code
+// (module offset) and whether the first byte alone has a backing; one console line every 10 s.
+static void NoteDrawPrepBackingDiag(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_BACKING_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	struct Site {
+		uint64_t count = 0, size = 0, caller = 0, vaddr = 0;
+		bool     first_byte = false;
+	};
+	static std::mutex                               mutex;
+	static std::unordered_map<uint64_t, Site>       sites;
+	static uint64_t                                 last_ns = 0;
+	uint8_t    byte  = 0;
+	const bool first = TryReadBacking(vaddr, &byte, 1);
+	const auto now   = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	std::scoped_lock lock(mutex);
+	auto&            site = sites[(vaddr >> 20u) ^ (static_cast<uint64_t>(first) << 63u)];
+	site.count++;
+	site.size       = size;
+	site.vaddr      = vaddr;
+	site.first_byte = first;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	site.caller = caller - reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+#else
+	site.caller = caller;
+#endif
+	if (last_ns == 0) {
+		last_ns = now;
+	}
+	if (now - last_ns < 10'000'000'000ull) {
+		return;
+	}
+	last_ns = now;
+	std::vector<std::pair<uint64_t, Site>> top(sites.begin(), sites.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	std::string text;
+	for (size_t i = 0; i < top.size() && i < 8; i++) {
+		const auto& s = top[i].second;
+		char line[160];
+		std::snprintf(line, sizeof(line), " | %" PRIu64 " x 0x%" PRIx64 "+%" PRIu64 " caller +0x%" PRIx64 "%s",
+		              s.count, s.vaddr, s.size, s.caller, s.first_byte ? " (first byte backed)" : "");
+		text += line;
+	}
+	std::printf("DrawPrep backing misses 10s:%s\n", text.c_str());
+	sites.clear();
+}
+
 // A backing read that failed after the gate (exact reads fail as Unclean, as before).
 static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
     const Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, uint64_t size, uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
 	if (!recorder.exact) {
+		NoteDrawPrepBackingDiag(vaddr, size, caller);
 		return ReadFailure::Backing;
 	}
 	NoteDrawPrepUnclean(Profiler::FrameEvent::DrawPrepUncleanBacking, "backing", vaddr, size,
