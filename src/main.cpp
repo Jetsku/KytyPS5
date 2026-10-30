@@ -677,6 +677,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	}
 	ResolveAmdCpu(amd_cpu, amd_cpu_source, options.config);
 
+	// KYTY_READBACK_LINEAR_IMAGES=1|0 overrides --readback-linear-images (the launcher's "Readback"
+	// box), so a title preset can turn it on for a game that needs it: Miles Morales reads a
+	// GPU-written linear image on the CPU during the boot logos and freezes there without it.
+	if (const char* env = std::getenv("KYTY_READBACK_LINEAR_IMAGES"); env != nullptr && env[0] != '\0') {
+		bool on = options.config.readback_linear_images;
+		if (!ParseBool(env, on)) {
+			::printf("invalid boolean for KYTY_READBACK_LINEAR_IMAGES: %s\n", env);
+			return false;
+		}
+		if (on != options.config.readback_linear_images) {
+			::printf("KYTY_READBACK_LINEAR_IMAGES=%s: read-back of linear images %s (the command line had it %s)\n",
+			         env, on ? "on" : "off", on ? "off" : "on");
+		}
+		options.config.readback_linear_images = on;
+	}
+
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
