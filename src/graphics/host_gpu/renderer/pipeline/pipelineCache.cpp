@@ -29,6 +29,8 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -5233,8 +5235,9 @@ struct PipelineCache::LibraryState {
 			    "graphics-pipeline-optimize",
 			    reinterpret_cast<uint64_t>(static_cast<VkPipeline>(job.linked)),
 			    job.key->vertex_shader_ids[0], job.key->ps_shader_id);
-			const auto   result    = cache.m_graphics.device.createGraphicsPipelines(
-			    cache.m_driver_cache, 1, &job.snapshot->Info(), nullptr, &optimized);
+			const auto   result    = PipelineFeedback::CreateGraphics(cache.m_graphics.device, cache.m_driver_cache,
+			                                                          job.snapshot->Info(), &optimized,
+			                                                          PipelineFeedback::Path::Builder);
 			const auto ns = CompileClockNs() - begin;
 			Profiler::AddFrameWait(Profiler::FrameWait::PipelineOptimize, 1, ns);
 			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Optimized, ns);
@@ -5381,10 +5384,17 @@ struct PipelineCache::FastFirstState {
 	                          vk::Pipeline* pipeline, GraphicsFast& out) {
 		auto&      device = cache.m_graphics.device;
 		const auto plain  = [&] {
-			const auto result = device.createGraphicsPipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
+			const auto result = PipelineFeedback::CreateGraphics(device, cache.m_driver_cache, info, pipeline,
+			                                                     PipelineFeedback::Path::Sync);
 			if (result == vk::Result::eSuccess) cache.NoteKnownPipeline(content.key);
 			return result;
 		};
+		if (auto adopted = cache.TakeAdoptedPipeline(content.key); adopted != nullptr) {
+			PipelineFeedback::NoteAdopted(PipelineFeedback::Path::Sync);
+			out.cache_hit = true;
+			*pipeline     = adopted;
+			return vk::Result::eSuccess;
+		}
 		NoteSeen();
 		auto snapshot = content.snapshot != nullptr
 		                    ? content.snapshot
@@ -5399,8 +5409,8 @@ struct PipelineCache::FastFirstState {
 			probe_info.flags = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 			vk::Pipeline cached      = nullptr;
 			const auto   probe_begin = CompileClockNs();
-			const auto   probed =
-			    device.createGraphicsPipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
+			const auto   probed = PipelineFeedback::CreateGraphics(device, cache.m_driver_cache, probe_info, &cached,
+			                                                       PipelineFeedback::Path::Probe);
 			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
 			if (probed == vk::Result::eSuccess && cached != nullptr) {
 				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
@@ -5547,8 +5557,9 @@ struct PipelineCache::FastFirstState {
 		HangWatchdog::Scope compile("graphics-pipeline-optimize",
 		                            reinterpret_cast<uint64_t>(static_cast<VkPipeline>(fast)),
 		                            key->vertex_shader_ids[0], key->ps_shader_id);
-		const auto          result = cache.m_graphics.device.createGraphicsPipelines(
-            cache.m_driver_cache, 1, &snapshot.Info(), nullptr, &optimized);
+		const auto          result = PipelineFeedback::CreateGraphics(cache.m_graphics.device, cache.m_driver_cache,
+		                                                              snapshot.Info(), &optimized,
+		                                                              PipelineFeedback::Path::Builder);
 		Finish(result, optimized, begin, [&](uint64_t ns) {
 			cache.NoteKnownPipeline(known_key);
 			cache.ReplaceFastPipeline(key, 0, fast, optimized, fast_ns, ns);
@@ -5736,9 +5747,15 @@ struct PipelineCache::PrefetchState {
 			    if (keyed && (cache.m_known != nullptr || cache.m_journal != nullptr)) {
 				    keyed_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 				                     std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
-					    result.content    = DescribeGraphicsPipeline(info, layout_signature);
-					    const auto made   = cache.m_graphics.device.createGraphicsPipelines(
-                            cache.m_driver_cache, 1, &info, nullptr, pipeline);
+					    result.content = DescribeGraphicsPipeline(info, layout_signature);
+					    if (auto adopted = cache.TakeAdoptedPipeline(result.content.key); adopted != nullptr) {
+						    PipelineFeedback::NoteAdopted(PipelineFeedback::Path::Builder);
+						    *pipeline = adopted;
+						    return vk::Result::eSuccess;
+					    }
+					    const auto made = PipelineFeedback::CreateGraphics(cache.m_graphics.device,
+					                                                       cache.m_driver_cache, info, pipeline,
+					                                                       PipelineFeedback::Path::Builder);
 					    if (made == vk::Result::eSuccess) cache.NoteKnownPipeline(result.content.key);
 					    return made;
 				    };
@@ -6413,6 +6430,10 @@ struct PipelineCache::JournalReplay {
 		                 skipped_known.load(), missing.load(), failed.load(), skipped_full.load(),
 		                 order.size() - std::min<uint64_t>(order.size(), next.load()), unpredicted.load(),
 		                 created.load());
+		if (cache.m_adopt) {
+			PipelineCacheLog("Pipeline journal: {} records the game had already created were not built; {}",
+			                 already_created.load(), cache.AdoptReport());
+		}
 		if (track) {
 			// Coverage: the pipelines the game created that the replay rebuilt or found known (or that
 			// the journal held), by the content key both compute from the same modules and state.
@@ -6461,6 +6482,13 @@ struct PipelineCache::JournalReplay {
 			if (index >= order.size()) break;
 			const bool can_defer = early && precompiler != nullptr && !precompiler->GetProgress().finished;
 			if (!Replay(items[order[index]], can_defer)) {
+				if (early_rounds) {
+					// KYTY_PIPELINE_JOURNAL_EARLY=2: set aside at once (a large journal waited 2 s per
+					// record), retried in rounds below while the shader replay publishes.
+					std::scoped_lock lock(deferred_mutex);
+					deferred.push_back(order[index]);
+					continue;
+				}
 				// The replay publishes in about the order the pipelines were first needed: wait up to
 				// 2 s for this record's modules, then set it aside.
 				bool       replayed = false;
@@ -6482,6 +6510,7 @@ struct PipelineCache::JournalReplay {
 			done.fetch_add(1, std::memory_order_relaxed);
 			MaybeReport();
 		}
+		if (early_rounds && precompiler != nullptr) RetryDeferredRounds(*precompiler);
 		if (early && precompiler != nullptr && !stop.load(std::memory_order_acquire)) {
 			precompiler->Wait();
 			while (!stop.load(std::memory_order_acquire)) {
@@ -6512,6 +6541,41 @@ struct PipelineCache::JournalReplay {
 			                 built_list.load(), skipped_known.load(), missing.load(), failed.load(),
 			                 skipped_full.load(), first_level, Level(), cache_bytes);
 			items = {}; // the last worker: nothing reads the records any more
+		}
+	}
+
+	// KYTY_PIPELINE_JOURNAL_EARLY=2: while the shader replay runs, the set-aside records are tried
+	// again about every second once it has published more; those still missing stay set aside for
+	// the final pass after the replay. Each worker takes the whole list in turn.
+	void RetryDeferredRounds(ShaderPrecompiler& precompiler) {
+		uint64_t last_done = UINT64_MAX;
+		while (!stop.load(std::memory_order_acquire)) {
+			const auto progress = precompiler.GetProgress();
+			if (progress.finished) return;
+			if (progress.done == last_done) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+				continue;
+			}
+			last_done = progress.done;
+			std::vector<uint32_t> round;
+			{
+				std::scoped_lock lock(deferred_mutex);
+				round.swap(deferred);
+			}
+			std::vector<uint32_t> still;
+			for (const auto item: round) {
+				if (stop.load(std::memory_order_acquire) || !Replay(items[item], true)) {
+					still.push_back(item);
+					continue;
+				}
+				done.fetch_add(1, std::memory_order_relaxed);
+				MaybeReport();
+			}
+			{
+				std::scoped_lock lock(deferred_mutex);
+				deferred.insert(deferred.end(), still.begin(), still.end());
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 		}
 	}
 
@@ -6554,7 +6618,7 @@ struct PipelineCache::JournalReplay {
 		// Known to the driver cache: nothing to build, but only while the record's own modules are the
 		// ones this run uses (after a translator or preset change the record's key is still known
 		// although the game now needs the retargeted pipeline: checked below with its new key).
-		const auto known_record = !force && !item.from_list && cache.IsKnownPipeline(record.key);
+		const auto known_record = !force && !cache.m_adopt && !item.from_list && cache.IsKnownPipeline(record.key);
 		if (known_record && (!retarget || RecordModulesPublished(payload))) {
 			skipped_known.fetch_add(1, std::memory_order_relaxed);
 			g_compile_totals.journal_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -6596,18 +6660,31 @@ struct PipelineCache::JournalReplay {
 			unpin();
 			return false;
 		}
-		if (!found || modules.empty() || signature.size() < 4 || (signature.size() - 4) % 4 != 0) {
+		// A pipeline that samples bindless images ends its signature with one marker word and has
+		// the bindless table as set 1 (pipeline/shaders.cpp).
+		const bool bindless = signature.size() >= 5 && (signature.size() - 5) % 4 == 0 && signature.back() == 0xb1d1e55u;
+		const auto binding_words = bindless ? signature.size() - 1 : signature.size();
+		if (!found || modules.empty() || signature.size() < 4 || (!bindless && (signature.size() - 4) % 4 != 0)) {
 			unpin();
 			missing.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
+		vk::DescriptorSetLayout bindless_set = nullptr;
+		if (bindless) {
+			bindless_set = BindlessSetLayout(cache.m_graphics);
+			if (bindless_set == nullptr) {
+				unpin();
+				missing.fetch_add(1, std::memory_order_relaxed);
+				return true;
+			}
+		}
 		std::vector<vk::DescriptorSetLayoutBinding> bindings;
-		for (size_t i = 4; i < signature.size(); i += 4) {
+		for (size_t i = 4; i < binding_words; i += 4) {
 			bindings.push_back({signature[i], static_cast<vk::DescriptorType>(signature[i + 1]), signature[i + 2],
 			                    vk::ShaderStageFlags(signature[i + 3]), nullptr});
 		}
 		const auto layouts = AcquirePipelineLayout(cache.m_graphics, bindings, vk::ShaderStageFlags(signature[2]),
-		                                           signature[3]);
+		                                           signature[3], bindless_set);
 		// Modules by stage index: list records have every hash 0.
 		uint32_t   lookup   = 0;
 		const auto snapshot = GraphicsPipelineSnapshot::Deserialize(
@@ -6627,9 +6704,13 @@ struct PipelineCache::JournalReplay {
 			// The rebuilt create info must describe the journaled pipeline exactly.
 			const auto check = DescribeGraphicsPipeline(snapshot->Info(), signature.subspan(0));
 			if (check.key != 0) NoteReplayKey(check.key);
-			if (retargeted && check.key != 0 && !force && cache.IsKnownPipeline(check.key)) {
+			if (retargeted && check.key != 0 && !force && !cache.m_adopt && cache.IsKnownPipeline(check.key)) {
 				skipped_known.fetch_add(1, std::memory_order_relaxed);
 				g_compile_totals.journal_skipped.fetch_add(1, std::memory_order_relaxed);
+				ok = true;
+			} else if (cache.m_adopt && check.key != 0 && CreatedByGame(check.key)) {
+				// The game made it already: an adopted copy would never be taken.
+				already_created.fetch_add(1, std::memory_order_relaxed);
 				ok = true;
 			} else if (CacheFull()) {
 				skipped_full.fetch_add(1, std::memory_order_relaxed);
@@ -6651,6 +6732,7 @@ struct PipelineCache::JournalReplay {
 					if (item.from_list) built_list.fetch_add(1, std::memory_order_relaxed);
 					cache.NoteKnownPipeline(check.key);
 					cache.NotePipelineCreated(ns);
+					if (cache.m_adopt && cache.OfferAdoptedPipeline(check.key, pipeline)) pipeline = nullptr;
 				}
 			} else {
 				mismatched.fetch_add(1, std::memory_order_relaxed);
@@ -6680,9 +6762,9 @@ struct PipelineCache::JournalReplay {
 	};
 	static void BuildSafely(void* raw) {
 		auto& context  = *static_cast<BuildContext*>(raw);
-		context.result = context.cache->m_graphics.device.createGraphicsPipelines(context.cache->m_driver_cache, 1,
-		                                                                          context.info, nullptr,
-		                                                                          context.pipeline);
+		context.result = PipelineFeedback::CreateGraphics(context.cache->m_graphics.device,
+		                                                  context.cache->m_driver_cache, *context.info,
+		                                                  context.pipeline, PipelineFeedback::Path::Replay);
 	}
 
 	void NoteReplayKey(uint64_t key) {
@@ -6692,8 +6774,17 @@ struct PipelineCache::JournalReplay {
 	}
 
 	// The command processor created a graphics pipeline with this content key.
+	[[nodiscard]] bool CreatedByGame(uint64_t key) {
+		std::scoped_lock lock(game_keys_mutex);
+		return game_keys.contains(key);
+	}
+
 	void NoteCreated(uint64_t key, const std::array<uint64_t, 4>& guest) {
 		created.fetch_add(1, std::memory_order_relaxed);
+		if (cache.m_adopt) {
+			std::scoped_lock lock(game_keys_mutex);
+			game_keys.insert(key);
+		}
 		if (track) {
 			std::scoped_lock lock(keys_mutex);
 			created_keys.push_back(key);
@@ -6732,9 +6823,12 @@ struct PipelineCache::JournalReplay {
 	    retargets {0}, skipped_full {0};
 	const bool            retarget = EnvU64("KYTY_PIPELINE_JOURNAL_RETARGET", 1) != 0;
 	const bool            early    = EnvU64("KYTY_PIPELINE_JOURNAL_EARLY", 0) != 0;
+	const bool            early_rounds = EnvU64("KYTY_PIPELINE_JOURNAL_EARLY", 0) >= 2;
 	std::mutex            deferred_mutex;
 	std::vector<uint32_t> deferred; // indices into items: modules not published at the first try
-	std::atomic<uint64_t> created {0}, unpredicted {0}, logged_misses {0};
+	std::atomic<uint64_t> created {0}, unpredicted {0}, logged_misses {0}, already_created {0};
+	std::mutex                   game_keys_mutex; // KYTY_PIPELINE_ADOPT: content keys the game created
+	std::unordered_set<uint64_t> game_keys;
 	std::mutex                   keys_mutex;
 	std::unordered_set<uint64_t> replay_keys;
 	std::vector<uint64_t>        created_keys;
@@ -6809,10 +6903,54 @@ void PipelineCache::InitializeKnownPipelines() {
 	m_known->ReleaseLoaded();
 }
 
+vk::Pipeline PipelineCache::TakeAdoptedPipeline(uint64_t key) {
+	if (!m_adopt || key == 0) return nullptr;
+	vk::Pipeline pipeline = nullptr;
+	{
+		std::scoped_lock lock(m_adopt_mutex);
+		if (const auto found = m_adopted.find(key); found != m_adopted.end()) {
+			pipeline = found->second;
+			m_adopted.erase(found);
+		}
+	}
+	if (pipeline != nullptr) m_adopt_taken.fetch_add(1, std::memory_order_relaxed);
+	return pipeline;
+}
+
+bool PipelineCache::OfferAdoptedPipeline(uint64_t key, vk::Pipeline pipeline) {
+	if (!m_adopt || key == 0 || pipeline == nullptr) return false;
+	std::scoped_lock lock(m_adopt_mutex);
+	if (m_adopted.size() >= m_adopt_max || m_adopted.contains(key)) {
+		m_adopt_refused.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	m_adopted.emplace(key, pipeline);
+	m_adopt_offered.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+std::string PipelineCache::AdoptReport() {
+	size_t waiting = 0;
+	{
+		std::scoped_lock lock(m_adopt_mutex);
+		waiting = m_adopted.size();
+	}
+	return fmt::format("adopted pipelines: {} kept from the replay, {} taken by draws, {} waiting, {} not kept "
+	                   "(KYTY_PIPELINE_ADOPT_MAX {} or a duplicate)",
+	                   m_adopt_offered.load(), m_adopt_taken.load(), waiting, m_adopt_refused.load(), m_adopt_max);
+}
+
 void PipelineCache::InitializePipelineJournal() {
 	const bool journal = EnvU64("KYTY_PIPELINE_JOURNAL", 0) != 0;
 	const bool list    = m_list != nullptr && !m_list->pipelines.empty();
 	if ((!journal && !list) || m_known == nullptr) return;
+	m_adopt_max = std::min<uint64_t>(EnvU64("KYTY_PIPELINE_ADOPT_MAX", 12000), 1u << 20u);
+	m_adopt     = EnvU64("KYTY_PIPELINE_ADOPT", 0) != 0 && m_adopt_max != 0;
+	if (m_adopt) {
+		PipelineCacheLog("Pipeline journal: the replay keeps up to {} built pipelines for the draws that need "
+		                 "them, known ones included (KYTY_PIPELINE_ADOPT)",
+		                 m_adopt_max);
+	}
 	const auto verify = EnvU64("KYTY_PIPELINE_JOURNAL_VERIFY", 0);
 	m_journal_replay  = std::make_unique<JournalReplay>(*this, verify);
 	auto& replay      = *m_journal_replay;
@@ -7302,6 +7440,8 @@ PipelineCache::~PipelineCache() {
 		                 skip.skipped_draws, skip.requested, skip.compile_ns / 1000000, skip.published,
 		                 skip.ready_in_wait, skip.not_queued);
 	}
+	if (const auto feedback = PipelineFeedback::Report(); !feedback.empty()) PipelineCacheLog("{} (exit)", feedback);
+	if (m_adopt) PipelineCacheLog("Pipeline journal: {}", AdoptReport());
 	LogCompileTotals();
 	if (m_program_disk != nullptr) {
 		const auto stats = m_program_disk->GetStats();
@@ -7326,6 +7466,14 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	{
+		std::scoped_lock lock(m_adopt_mutex);
+		for (const auto& [key, pipeline]: m_adopted) {
+			(void)key;
+			m_graphics.device.destroyPipeline(pipeline, nullptr);
+		}
+		m_adopted.clear();
+	}
 	if (m_fast_first != nullptr) {
 		// Replaced unoptimized pipelines still waiting for their retirement age; the optimized
 		// builds that replaced them were destroyed with their entries above.
@@ -7815,7 +7963,19 @@ void PipelineCache::InitializeShaderPrecompile() {
 	m_program_cache->rt_prewarm = [this](const ShaderComputeInputInfo& info, const ShaderProgram& program) {
 		PrewarmComputePipeline(info, program);
 	};
-	replay.log         = [](const std::string& message) { PipelineCacheLog("{}", message); };
+	replay.log = [](const std::string& message) {
+		if (!PipelineFeedback::Enabled()) {
+			PipelineCacheLog("{}", message);
+			return;
+		}
+		// Where the replay's time goes (all program work of the process so far, game included).
+		const auto& t = g_compile_totals;
+		PipelineCacheLog("{} | programs {}: disk hits {} sources {} permutations (decode {:.0f} ms), translated {} "
+		                 "({:.0f} ms), emit {:.0f} ms, module {:.0f} ms",
+		                 message, t.programs.load(), t.disk_source_hits.load(), t.disk_permutation_hits.load(),
+		                 LoadMs(t.disk_load_ns), t.translations.load(), LoadMs(t.translate_ns), LoadMs(t.emit_ns),
+		                 LoadMs(t.module_ns));
+	};
 	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
 	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
 	    *m_shader_journal, std::move(replay),
@@ -9385,12 +9545,20 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 			GraphicsPipelineCreateHook probe_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 			                                            std::span<const uint32_t>         layout_signature,
 			                                            vk::Pipeline*                     pipeline) {
+				if (m_adopt) {
+					probed_content = DescribeGraphicsPipeline(info, layout_signature);
+					if (auto adopted = TakeAdoptedPipeline(probed_content.key); adopted != nullptr) {
+						PipelineFeedback::NoteAdopted(PipelineFeedback::Path::Probe);
+						*pipeline = adopted;
+						return vk::Result::eSuccess;
+					}
+				}
 				auto probe_info = info;
 				probe_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-				const auto made =
-				    m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &probe_info, nullptr, pipeline);
+				const auto made = PipelineFeedback::CreateGraphics(m_graphics.device, m_driver_cache, probe_info,
+				                                                   pipeline, PipelineFeedback::Path::Probe);
 				if (made == vk::Result::eSuccess && *pipeline != nullptr && keyed_probe) {
-					probed_content = DescribeGraphicsPipeline(info, layout_signature);
+					if (probed_content.key == 0) probed_content = DescribeGraphicsPipeline(info, layout_signature);
 					NoteKnownPipeline(probed_content.key);
 				}
 				return made;
@@ -9463,6 +9631,14 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 				                 m_skip_probe_hits.load(std::memory_order_relaxed),
 				                 m_skip_probe_misses.load(std::memory_order_relaxed),
 				                 m_skip_probe_ns.load(std::memory_order_relaxed) / 1000000);
+			}
+			static uint64_t feedback_ns = 0;
+			if (now - feedback_ns >= 10'000'000'000ull) {
+				feedback_ns = now;
+				if (const auto feedback = PipelineFeedback::Report(); !feedback.empty()) {
+					PipelineCacheLog("{}", feedback);
+				}
+				if (m_adopt) PipelineCacheLog("Pipeline journal: {}", AdoptReport());
 			}
 		};
 		if (poll == PrefetchState::Poll::Pending) {
@@ -9563,8 +9739,14 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	} else if (keyed && !prefetched) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
-			content           = DescribeGraphicsPipeline(info, layout_signature);
-			const auto result = m_graphics.device.createGraphicsPipelines(m_driver_cache, 1, &info, nullptr, pipeline);
+			content = DescribeGraphicsPipeline(info, layout_signature);
+			if (auto adopted = TakeAdoptedPipeline(content.key); adopted != nullptr) {
+				PipelineFeedback::NoteAdopted(PipelineFeedback::Path::Sync);
+				*pipeline = adopted;
+				return vk::Result::eSuccess;
+			}
+			const auto result = PipelineFeedback::CreateGraphics(m_graphics.device, m_driver_cache, info, pipeline,
+			                                                     PipelineFeedback::Path::Sync);
 			if (result == vk::Result::eSuccess) NoteKnownPipeline(content.key);
 			return result;
 		};
