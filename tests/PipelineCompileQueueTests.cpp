@@ -38,6 +38,20 @@ int main() {
 	priority.Stop();
 	if (order != std::vector<int> {3, 1, 2}) return 8;
 
+	// Urgent work (a dispatch waits for it) goes first and is accepted past the limit.
+	std::promise<void> entered2, unblock2;
+	auto unblocked2 = unblock2.get_future().share();
+	std::vector<int> urgent_order;
+	PipelineCompileQueue urgent(1, 2);
+	urgent.Submit([&] { entered2.set_value(); unblocked2.wait(); });
+	entered2.get_future().wait();
+	if (!urgent.Submit([&] { urgent_order.push_back(1); }, 1)) return 9;
+	if (urgent.Submit([&] { urgent_order.push_back(2); }, 2)) return 10; // full
+	if (!urgent.Submit([&] { urgent_order.push_back(3); }, 3, true)) return 11;
+	unblock2.set_value();
+	urgent.Stop();
+	if (urgent_order != std::vector<int> {3, 1}) return 12;
+
 	// Shutdown drains queued work, including an exception published through packaged_task.
 	std::atomic<int> drained {0};
 	auto failure = std::make_shared<std::packaged_task<void()>>([] { throw std::runtime_error("driver failure"); });
@@ -49,6 +63,6 @@ int main() {
 	}
 	if (drained != 32) return 6;
 	try { result.get(); return 7; } catch (const std::runtime_error&) {}
-	std::puts("Pipeline compiler: parallelism, bounded admission, drain, shutdown and error publication passed");
+	std::puts("Pipeline compiler: parallelism, bounded admission, urgent work, drain, shutdown and error publication passed");
 	return 0;
 }

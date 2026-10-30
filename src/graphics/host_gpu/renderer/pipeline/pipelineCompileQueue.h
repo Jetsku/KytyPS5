@@ -30,11 +30,16 @@ public:
 	PipelineCompileQueue(const PipelineCompileQueue&) = delete;
 	PipelineCompileQueue& operator=(const PipelineCompileQueue&) = delete;
 
-	bool Submit(std::function<void()> task, uint64_t ticket = 0) {
+	// `urgent`: work a dispatch is waiting for; it goes first and is accepted past the limit.
+	bool Submit(std::function<void()> task, uint64_t ticket = 0, bool urgent = false) {
 		{
 			std::lock_guard lock(m_mutex);
-			if (m_stopping || m_outstanding >= m_limit) return false;
-			m_tasks.push_back({ticket, std::move(task)});
+			if (m_stopping || (!urgent && m_outstanding >= m_limit)) return false;
+			if (urgent) {
+				m_tasks.push_front({ticket, std::move(task)});
+			} else {
+				m_tasks.push_back({ticket, std::move(task)});
+			}
 			++m_outstanding;
 		}
 		m_wake.notify_one();

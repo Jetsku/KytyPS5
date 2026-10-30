@@ -21,6 +21,7 @@ layout(push_constant) uniform Push {
 	uint     record_dword; // lane 0 of the record-index register
 	uint     records;
 	uint     targets;
+	uint64_t lanes;   // KYTY_SHADER_CALLS_SPLIT_STATS: targets + 2 lane counts (per slot, unrouted, all), or 0
 } p;
 
 shared uint seen[32];
@@ -39,11 +40,17 @@ void main() {
 	const uint exec  = state.w[lane < 32u ? p.exec_lo : p.exec_hi];
 	if (((exec >> (lane & 31u)) & 1u) != 0u) {
 		const uint record = state.w[p.record_dword + lane];
+		uint       routed = p.targets; // no callee slot: the lane resumes without the call
 		if (record < p.records) {
 			const uint slot = Words(p.map).w[record];
 			if (slot < p.targets && slot < 1024u) {
 				atomicOr(seen[slot >> 5u], 1u << (slot & 31u));
+				routed = slot;
 			}
+		}
+		if (p.lanes != 0ul) {
+			atomicAdd(Words(p.lanes).w[routed], 1u);
+			atomicAdd(Words(p.lanes).w[p.targets + 1u], 1u);
 		}
 	}
 	barrier();

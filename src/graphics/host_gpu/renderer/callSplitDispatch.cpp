@@ -19,7 +19,9 @@
 #include <chrono>
 #include <cstring>
 #include <fmt/format.h>
+#include <map>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 // KYTY_SHADER_CALLS_SPLIT (shader/recompiler/CallSplit.h): a dispatch of a kernel with call loops
@@ -49,8 +51,9 @@ struct BinPush {
 	uint32_t record_dword;
 	uint32_t records;
 	uint32_t targets;
+	uint64_t lanes; // KYTY_SHADER_CALLS_SPLIT_STATS: per-slot lane counts, or 0
 };
-static_assert(sizeof(BinPush) == 72);
+static_assert(sizeof(BinPush) == 80);
 
 constexpr uint64_t Align(uint64_t value) {
 	return (value + 255u) & ~uint64_t {255};
@@ -61,6 +64,7 @@ struct Layout {
 	uint64_t              state  = 0;
 	std::vector<uint64_t> args;
 	std::vector<uint64_t> lists;
+	std::vector<uint64_t> lanes;       // per site: targets + 2 lane counts (stats)
 	uint64_t              control = 0; // first args byte (cleared each dispatch)
 	uint64_t              size    = 0;
 };
@@ -74,6 +78,10 @@ Layout MakeLayout(const CallSplit::Run& run, uint32_t waves) {
 	for (const auto& site: run.sites) {
 		layout.args.push_back(at);
 		at += Align((site.callees.size() + 1u) * 12u);
+	}
+	for (const auto& site: run.sites) {
+		layout.lanes.push_back(at);
+		at += Align((site.callees.size() + 2u) * 4u);
 	}
 	const auto control_end = at;
 	for (const auto& site: run.sites) {
@@ -102,6 +110,12 @@ struct Totals {
 	std::atomic<uint64_t> stat_present {0};     // callee slots with at least one wave
 	std::atomic<uint64_t> stat_slots {0};       // callee slots dispatched
 	std::atomic<uint64_t> sparse_skipped {0};   // callee passes left out: no waves last time
+	// Lanes at the sites (stats): all, with no callee slot (record out of range or no target),
+	// and in slots whose callee pass was left out (sparse) or did not run (not ready / unusable).
+	std::atomic<uint64_t> stat_lanes {0};
+	std::atomic<uint64_t> stat_lanes_unrouted {0};
+	std::atomic<uint64_t> stat_lanes_sparse {0};
+	std::atomic<uint64_t> stat_lanes_not_run {0};
 };
 Totals g_totals;
 
@@ -125,6 +139,45 @@ bool StatsEnabled() {
 bool SparseEnabled() {
 	static const bool enabled = EnvOn("KYTY_SHADER_CALLS_SPLIT_SPARSE", true);
 	return enabled;
+}
+
+// Why one program of a chain did not run (the RT status line names what held chains wait on).
+enum class Wait { None, Planning, Unusable, Translating, Building };
+
+const char* WaitText(Wait wait) {
+	switch (wait) {
+		case Wait::Planning: return "being planned";
+		case Wait::Unusable: return "unusable";
+		case Wait::Translating: return "translating";
+		case Wait::Building: return "pipeline building";
+		case Wait::None: break;
+	}
+	return "ready";
+}
+
+// The guest shader as the status line names it: its first four hex digits (6d9e, 208e).
+std::string ShortHash(uint64_t hash) {
+	return fmt::format("{:04x}", hash >> 48u);
+}
+
+// What the chains of the last 10 s waited on (the RT status line).
+struct Interval {
+	std::mutex                         mutex;
+	uint64_t                           chains   = 0; // split dispatches
+	uint64_t                           complete = 0; // chains that ran every step
+	uint64_t                           held     = 0;
+	uint64_t                           skipped  = 0; // stopped at an R_0 / R_a that was not ready
+	uint64_t                           partial  = 0; // ran with a needed callee missing
+	std::map<std::string, uint64_t>    waiting;      // "6d9e site 1 callee 0x..: pipeline building" -> count
+	bool                               announced_ready = false;
+};
+Interval g_interval;
+
+void NoteWait(uint64_t hash, uint32_t site, const char* program, uint64_t target, Wait wait) {
+	std::string key = target != 0 ? fmt::format("{} site {} callee 0x{:x}: {}", ShortHash(hash), site, target, WaitText(wait))
+	                              : fmt::format("{} {}: {}", ShortHash(hash), program, WaitText(wait));
+	std::scoped_lock lock(g_interval.mutex);
+	g_interval.waiting[key]++;
 }
 
 } // namespace
@@ -234,6 +287,81 @@ struct RenderExecutor::CallSplitState {
 	std::unordered_map<uint64_t, std::unique_ptr<Buffer>> buffers;
 };
 
+namespace {
+
+// Every 10 s (with the split totals): whether the ray-tracing shaders are compiled. Example:
+//   RT: pipelines ready 6d9e 41/43, 208e 40/40; callee programs planned 118/120 (2 being planned);
+//   background translations: 3 queued, 212 done (...); chains in the last 10 s: 192 ran (12 with
+//   callees not ready: ...), 0 held, 0 skipped (waiting on: 6d9e site 1 callee 0x11a2b3c400:
+//   pipeline building x12)
+// and once nothing is pending and every chain of the interval completed: "RT shaders ready".
+void LogRtStatus(PipelineCache& pipelines) {
+	const auto rt       = pipelines.GetRtPipelineStatus();
+	const auto plan     = CallSplit::Planner::Instance().GetStatus();
+	const auto expanded = PipelineCache::GetCallTranslationTotals();
+	uint64_t   building = 0;
+	std::string ready;
+	for (const auto& shader: rt) {
+		building += shader.building;
+		ready += fmt::format("{}{} {}/{}{}", ready.empty() ? "" : ", ", ShortHash(shader.shader_hash), shader.ready,
+		                     shader.requested, shader.failed != 0 ? fmt::format(" ({} failed)", shader.failed) : "");
+	}
+	const auto translating = expanded.queued - std::min(expanded.finished, expanded.queued);
+	uint64_t   chains = 0, complete = 0, held = 0, skipped = 0, partial = 0;
+	std::string waiting;
+	bool        announce_ready = false, announce_again = false;
+	{
+		std::scoped_lock lock(g_interval.mutex);
+		chains   = g_interval.chains;
+		complete = g_interval.complete;
+		held     = g_interval.held;
+		skipped  = g_interval.skipped;
+		partial  = g_interval.partial;
+		std::vector<std::pair<uint64_t, std::string>> top;
+		for (const auto& [what, count]: g_interval.waiting) top.emplace_back(count, what);
+		std::ranges::sort(top, std::greater {});
+		for (size_t i = 0; i < top.size() && i < 4u; i++) {
+			waiting += fmt::format("{}{} x{}", i == 0 ? "" : "; ", top[i].second, top[i].first);
+		}
+		if (top.size() > 4u) waiting += fmt::format("; {} more", top.size() - 4u);
+		const bool pending = building != 0 || translating != 0 || plan.planning != 0 || plan.pending != 0 ||
+		                     held != 0 || skipped != 0 || !g_interval.waiting.empty();
+		if (!pending && complete != 0 && !g_interval.announced_ready) {
+			g_interval.announced_ready = true;
+			announce_ready             = true;
+		} else if (pending && g_interval.announced_ready) {
+			g_interval.announced_ready = false;
+			announce_again             = true;
+		}
+		g_interval.chains = g_interval.complete = g_interval.held = g_interval.skipped = g_interval.partial = 0;
+		g_interval.waiting.clear();
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "RT: pipelines ready {}; callee programs planned {}/{}{}{}; background translations: {} queued, {} done "
+	    "({:.1f} M words, {:.1f} s); chains in the last 10 s: {} ran{}, {} held, {} skipped{}\n",
+	    ready.empty() ? std::string("none requested") : ready, plan.built, plan.targets,
+	    plan.pending != 0 ? fmt::format(" ({} being planned)", plan.pending) : std::string(),
+	    plan.unusable != 0 ? fmt::format(" ({} unusable: their lanes resume without the call)", plan.unusable)
+	                       : std::string(),
+	    translating, expanded.finished, static_cast<double>(expanded.words) / 1.0e6,
+	    static_cast<double>(expanded.ms) / 1.0e3, complete,
+	    partial != 0 ? fmt::format(" ({} with callees not ready: those lanes resumed unshaded)", partial)
+	                 : std::string(),
+	    held, skipped,
+	    waiting.empty() ? std::string() : " (waiting on: " + waiting + ")"));
+	(void)chains;
+	if (announce_ready) {
+		Log::WriteToConsoleAndLog(
+		    "RT shaders ready: every ray-tracing pipeline and callee program the game used so far is compiled; "
+		    "reflections are complete from here on (new areas can still bring new materials)\n");
+	} else if (announce_again) {
+		Log::WriteToConsoleAndLog("RT: new ray-tracing shaders are compiling (new materials); reflections may "
+		                          "lag or have gaps until the next \"RT shaders ready\"\n");
+	}
+}
+
+} // namespace
+
 void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComputeInputInfo& pristine,
                                        const std::shared_ptr<const void>& run_pointer,
                                        const HW::ComputeShaderInfo& cs_regs,
@@ -255,17 +383,20 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 
 	// One program of the chain: its preparation through the pipeline cache as a dispatch of the
 	// kernel, then the dispatch (direct: the kernel's workgroups; indirect: a bin pass's command).
-	const auto dispatch = [&](const CallSplit::Code& code, uint64_t list, const vk::Buffer* indirect,
+	Wait       last_wait = Wait::None; // why the latest dispatch() returned false
+	const auto dispatch  = [&](const CallSplit::Code& code, uint64_t list, const vk::Buffer* indirect,
 	                          uint64_t indirect_offset) {
 		auto info = pristine;
 		PipelineCache::SelectCallSplitCode(&code);
 		const auto program_handle = pipelines.GetComputeProgram(cs_regs, sh_regs, info, m_compute_prep);
 		PipelineCache::SelectCallSplitCode(nullptr);
 		if (!program_handle) {
+			last_wait = Wait::Translating;
 			return false;
 		}
 		auto* pipeline = pipelines.TryGetComputePipeline(info, program_handle);
 		if (pipeline == nullptr) {
+			last_wait = Wait::Building;
 			ResetBindings();
 			return false;
 		}
@@ -375,19 +506,25 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		uint64_t bytes = 0;
 		for (const auto& site: run.sites) {
 			readback_at.push_back(bytes);
-			bytes += Align((site.callees.size() + 1u) * 12u);
+			bytes += Align((site.callees.size() + 1u) * 12u) + Align((site.callees.size() + 2u) * 4u);
 		}
 		readback = split.TakeReadback(bytes);
 	}
-	const bool started = dispatch(*run.start, 0, nullptr, 0);
+	const auto shader_hash = run.hash;
+	bool       chain_held  = false;
+	bool       chain_partial = false; // resumed although a needed callee did not run
+	const bool started     = dispatch(*run.start, 0, nullptr, 0);
 	note("R_0", started);
 	if (!started) {
 		g_totals.skipped.fetch_add(1, std::memory_order_relaxed);
+		NoteWait(shader_hash, 0, "R_0", 0, last_wait);
 	} else {
 		g_totals.started.fetch_add(1, std::memory_order_relaxed);
 	}
 	bool     go     = started;
 	uint32_t binned = 0; // sites whose bin pass ran (their counts are read back)
+	// Per binned site and callee slot: 0 ran, 1 left out (sparse), 2 did not run (stats).
+	std::vector<std::vector<uint8_t>> slot_outcome;
 	for (uint32_t k = 1; go && k <= run.sites.size(); k++) {
 		const auto& site    = run.sites[k - 1u];
 		const auto  targets = static_cast<uint32_t>(site.callees.size());
@@ -412,6 +549,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		push.record_dword = site.record_dword;
 		push.records      = static_cast<uint32_t>(site.record_slots.size());
 		push.targets      = targets;
+		push.lanes        = StatsEnabled() ? address + layout.lanes[k - 1u] : 0u;
 		buffer.BeginEmission();
 		buffer.BindPipeline(vk::PipelineBindPoint::eCompute, split.pipeline);
 		{
@@ -426,19 +564,29 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead,
 			                            BarrierOrigin::IndirectArgs);
 			buffer.BeginEmission();
-			const vk::BufferCopy region {layout.args[k - 1u], readback_at[k - 1u], (targets + 1u) * 12u};
-			buffer.Sink().copyBuffer(state.Handle(), readback->Handle(), 1, &region);
+			const vk::BufferCopy regions[2] = {
+			    {layout.args[k - 1u], readback_at[k - 1u], (targets + 1u) * 12u},
+			    {layout.lanes[k - 1u], readback_at[k - 1u] + Align((targets + 1u) * 12u), (targets + 2u) * 4u}};
+			buffer.Sink().copyBuffer(state.Handle(), readback->Handle(), StatsEnabled() ? 2u : 1u, regions);
 		}
 		binned = k;
+		slot_outcome.emplace_back(targets, uint8_t {0});
 		const auto handle = state.Handle();
 		for (uint32_t t = 0; t < targets; t++) {
 			if (k - 1u < present.size() && t < present[k - 1u].size() && present[k - 1u][t] == 0u) {
 				g_totals.sparse_skipped.fetch_add(1, std::memory_order_relaxed);
+				slot_outcome.back()[t] = 1u;
 				continue;
 			}
 			if (site.callees[t] == nullptr) {
 				g_totals.skipped_callees.fetch_add(1, std::memory_order_relaxed);
-				incomplete |= needed[t] && t < site.pending.size() && site.pending[t];
+				slot_outcome.back()[t] = 2u;
+				const bool pending = t < site.pending.size() && site.pending[t];
+				incomplete |= needed[t] && pending;
+				if (needed[t]) {
+					NoteWait(shader_hash, k, nullptr, t < site.targets.size() ? site.targets[t] : t + 1u,
+					         pending ? Wait::Planning : Wait::Unusable);
+				}
 				continue;
 			}
 			const bool ran = dispatch(*site.callees[t], address + layout.lists[k - 1u] + uint64_t {t} * waves * 4u,
@@ -448,21 +596,28 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 				g_totals.callee_dispatches.fetch_add(1, std::memory_order_relaxed);
 			} else {
 				g_totals.skipped_callees.fetch_add(1, std::memory_order_relaxed);
+				slot_outcome.back()[t] = 2u;
 				incomplete |= needed[t];
+				if (needed[t]) {
+					NoteWait(shader_hash, k, nullptr, t < site.targets.size() ? site.targets[t] : t + 1u, last_wait);
+				}
 			}
 		}
 		to_compute(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
-		// KYTY_SHADER_CALLS_SPLIT_PARTIAL=1 resumes while a callee a record names is still being planned
-		// or compiled (its lanes then keep their pre-call values). By default the chain stops here:
-		// the kernel's outputs keep their previous contents until every such callee is ready.
-		static const bool partial = [] {
-			const auto* value = std::getenv("KYTY_SHADER_CALLS_SPLIT_PARTIAL");
-			return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
-		}();
+		// KYTY_SHADER_CALLS_SPLIT_PARTIAL (default on) resumes while a callee a record names is still
+		// being planned or compiled: its lanes keep their pre-call values (the kernel's "no material"
+		// result), every other lane is shaded. KYTY_SHADER_CALLS_SPLIT_PARTIAL=0 stops the chain here
+		// instead, which does not keep the outputs as they were: R_0 has already written the waves that
+		// did not reach the site, and the suspended ones are never written, so Miles Morales'
+		// reflection buffer showed scattered fragments of stale data while callee pipelines built
+		// (minutes with a fresh cache).
+		static const bool partial = EnvOn("KYTY_SHADER_CALLS_SPLIT_PARTIAL", true);
+		chain_partial |= incomplete;
 		if (incomplete && !partial) {
 			g_totals.held.fetch_add(1, std::memory_order_relaxed);
 			note("held", false);
-			go = false;
+			chain_held = true;
+			go         = false;
 			break;
 		}
 		const bool resumed =
@@ -472,6 +627,9 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		note(k == 1 ? "bin1 R_a1" : "bin R_a", resumed);
 		if (!resumed) {
 			g_totals.skipped.fetch_add(1, std::memory_order_relaxed);
+			if (site.resume != nullptr) {
+				NoteWait(shader_hash, k, k == 1 ? "R_a1" : "R_a2+", 0, last_wait);
+			}
 			go = false;
 		} else {
 			g_totals.resumed.fetch_add(1, std::memory_order_relaxed);
@@ -483,9 +641,10 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			for (uint32_t k = 0; k < binned; k++) counts.push_back(static_cast<uint32_t>(run.sites[k].callees.size()));
 			auto*          owner  = &split;
 			const uint64_t kernel = run.kernel;
+			const bool lanes = StatsEnabled();
 			m_context.GetCommandScheduler().DeferOperation(
 			    [owner, readback, counts = std::move(counts), at = std::move(readback_at), waves, kernel,
-			     sparse]() mutable {
+			     sparse, lanes, outcome = std::move(slot_outcome)]() mutable {
 				    if (!readback->IsCoherent()) readback->Invalidate(0, readback->Size());
 				    const auto bytes = readback->Mapped();
 				    for (size_t k = 0; k < counts.size(); k++) {
@@ -504,11 +663,36 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 					    g_totals.stat_callee_waves.fetch_add(callee_waves, std::memory_order_relaxed);
 					    g_totals.stat_present.fetch_add(present, std::memory_order_relaxed);
 					    g_totals.stat_slots.fetch_add(counts[k], std::memory_order_relaxed);
+					    if (lanes) {
+						    const auto* l = reinterpret_cast<const uint32_t*>(
+						        bytes.data() + at[k] + Align((counts[k] + 1u) * 12u));
+						    uint64_t sparse_lanes = 0, not_run = 0;
+						    for (uint32_t t = 0; t < counts[k] && t < outcome[k].size(); t++) {
+							    if (outcome[k][t] == 1u) sparse_lanes += l[t];
+							    if (outcome[k][t] == 2u) not_run += l[t];
+						    }
+						    g_totals.stat_lanes.fetch_add(l[counts[k] + 1u], std::memory_order_relaxed);
+						    g_totals.stat_lanes_unrouted.fetch_add(l[counts[k]], std::memory_order_relaxed);
+						    g_totals.stat_lanes_sparse.fetch_add(sparse_lanes, std::memory_order_relaxed);
+						    g_totals.stat_lanes_not_run.fetch_add(not_run, std::memory_order_relaxed);
+					    }
 				    }
 				    owner->ReturnReadback(std::move(readback));
 			    });
 		} else {
 			split.ReturnReadback(std::move(readback));
+		}
+	}
+	{
+		std::scoped_lock lock(g_interval.mutex);
+		g_interval.chains++;
+		if (go) {
+			g_interval.complete++;
+			g_interval.partial += chain_partial ? 1u : 0u;
+		} else if (chain_held) {
+			g_interval.held++;
+		} else {
+			g_interval.skipped++;
 		}
 	}
 	// Every 10 s: what the chains ran so far (whether the callee passes execute in game).
@@ -518,7 +702,16 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		                     .count();
 		auto       last = g_totals.logged_at.load(std::memory_order_relaxed);
 		if (now - last >= 10 && g_totals.logged_at.compare_exchange_strong(last, now)) {
-			Log::WriteToConsoleAndLog(fmt::format(
+			// The raw totals: console with KYTY_SHADER_CALLS_SPLIT_STATS, else the log file only (the
+			// "RT:" line below is the console's summary).
+			const auto write = [](const std::string& text) {
+				if (StatsEnabled()) {
+					Log::WriteToConsoleAndLog(text);
+				} else {
+					Log::Write(text);
+				}
+			};
+			write(fmt::format(
 			    "KYTY_SHADER_CALLS_SPLIT: totals: {} split dispatches, {} R_0 ran, {} R_a ran, {} callee "
 			    "passes ran, {} callee passes skipped, {} left out (sparse), {} steps skipped, {} chains held for "
 			    "callees\n",
@@ -527,7 +720,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			    g_totals.sparse_skipped.load(), g_totals.skipped.load(),
 			    g_totals.held.load()));
 			if (const auto sites = g_totals.stat_sites.load(); sites != 0) {
-				Log::WriteToConsoleAndLog(fmt::format(
+				write(fmt::format(
 				    "KYTY_SHADER_CALLS_SPLIT: stats over {} site passes: {} of {} waves suspended ({:.3f}%), {:.1f} callee "
 				    "waves per suspended wave, {:.1f} of {:.1f} callee slots have waves\n",
 				    sites, g_totals.stat_suspended.load(), g_totals.stat_waves.load(),
@@ -537,7 +730,17 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 				        static_cast<double>(std::max<uint64_t>(g_totals.stat_suspended.load(), 1u)),
 				    static_cast<double>(g_totals.stat_present.load()) / static_cast<double>(sites),
 				    static_cast<double>(g_totals.stat_slots.load()) / static_cast<double>(sites)));
+				if (const auto lanes = g_totals.stat_lanes.load(); lanes != 0) {
+					const auto pct = [&](uint64_t n) { return 100.0 * static_cast<double>(n) / static_cast<double>(lanes); };
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "KYTY_SHADER_CALLS_SPLIT: lanes at the sites: {}; resumed without their call: {} with no callee "
+					    "slot ({:.2f}%), {} left out (sparse, {:.2f}%), {} whose callee did not run ({:.2f}%)\n",
+					    lanes, g_totals.stat_lanes_unrouted.load(), pct(g_totals.stat_lanes_unrouted.load()),
+					    g_totals.stat_lanes_sparse.load(), pct(g_totals.stat_lanes_sparse.load()),
+					    g_totals.stat_lanes_not_run.load(), pct(g_totals.stat_lanes_not_run.load())));
+				}
 			}
+			LogRtStatus(pipelines);
 		}
 	}
 	if (ordinal < log_limit) {

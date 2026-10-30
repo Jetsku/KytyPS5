@@ -1479,6 +1479,12 @@ static bool ExpandComputeCalls(ShaderParams& params, const ShaderComputeInputInf
 	return true;
 }
 
+// The background translations of CallTranslations (PipelineCache::GetCallTranslationTotals).
+struct CallTranslationCounters {
+	std::atomic<uint64_t> queued {0}, finished {0}, words {0}, ms {0}, logged {0};
+};
+static CallTranslationCounters g_call_translation_totals;
+
 // KYTY_SHADER_CALLS_ASYNC (default on): an expanded call program can be large (Miles Morales'
 // ray-tracing kernels: about 160K words) and its translation takes seconds, so it is translated on
 // a background thread and its dispatches are skipped until the translation is ready; the compile
@@ -1528,6 +1534,7 @@ public:
 			std::scoped_lock lock(m_mutex);
 			if (!m_entries.try_emplace(id).second) return;
 			m_jobs.push_back(std::move(job));
+			g_call_translation_totals.queued.fetch_add(1, std::memory_order_relaxed);
 			// KYTY_SHADER_CALLS_THREADS (default 3): call-split programs come in hundreds.
 			static const size_t threads = [] {
 				const auto* value = std::getenv("KYTY_SHADER_CALLS_THREADS");
@@ -1599,10 +1606,34 @@ private:
 			const auto ms       = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - begin)
 			                    .count();
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "KYTY_SHADER_CALLS: CS shader 0x{:016x}: expansion of {} words translated in the "
-			    "background in {} ms{}.\n",
-			    job->hash, job->code.size(), ms, result.skip_dispatch ? " (its dispatches are skipped)" : ""));
+			// The first few go to the console; the rest (call-split programs come in hundreds) only to
+			// the log file, counted in the 10 s "RT:" status line (callSplitDispatch.cpp).
+			// KYTY_SHADER_CALLS_LOG=1 prints every one to the console.
+			{
+				static const bool every = [] {
+					const auto* value = std::getenv("KYTY_SHADER_CALLS_LOG");
+					return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+				}();
+				constexpr uint64_t ConsoleLines = 4;
+				const auto         line         = fmt::format(
+                    "KYTY_SHADER_CALLS: CS shader 0x{:016x}: expansion of {} words translated in the "
+                    "background in {} ms{}.\n",
+                    job->hash, job->code.size(), ms, result.skip_dispatch ? " (its dispatches are skipped)" : "");
+				const auto n = g_call_translation_totals.logged.fetch_add(1, std::memory_order_relaxed);
+				if (every || result.skip_dispatch || n < ConsoleLines) {
+					Log::WriteToConsoleAndLog(line);
+				} else {
+					Log::Write(line);
+				}
+				if (!every && n + 1u == ConsoleLines) {
+					Log::WriteToConsoleAndLog(
+					    "KYTY_SHADER_CALLS: further background translations go to the log file only; the "
+					    "\"RT:\" status line counts them every 10 s (KYTY_SHADER_CALLS_LOG=1 prints each)\n");
+				}
+				g_call_translation_totals.words.fetch_add(job->code.size(), std::memory_order_relaxed);
+				g_call_translation_totals.ms.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
+				g_call_translation_totals.finished.fetch_add(1, std::memory_order_relaxed);
+			}
 			// A callee that keeps it from translating is left out of the next expansions.
 			if (result.skip_dispatch && result.skip_pc != UINT32_MAX && job->bodies != nullptr) {
 				for (const auto& body: *job->bodies) {
@@ -5658,6 +5689,7 @@ struct PipelineCache::RtState {
 		bool                                       asked        = false; // a dispatch has asked
 		bool                                       consumed     = false; // published or failed
 		bool                                       logged_skip  = false;
+		bool                                       promoted     = false; // moved ahead of prewarm builds
 		// KYTY_COMPUTE_BACKGROUND_WORDS: a huge compute program, not a software RT kernel (its
 		// failure does not turn software RT off; its module is pinned while it builds).
 		bool                                       huge         = false;
@@ -5670,6 +5702,13 @@ struct PipelineCache::RtState {
 		vk::Result                    result = vk::Result::eSuccess;
 	};
 
+	// KYTY_RT_PIPELINE_THREADS (default 4, at most 8): the background builders. A software RT
+	// pipeline takes about 3 s to build (Miles Morales: some 200 call-split programs for a city
+	// area, so two builders kept its reflections waiting for minutes with a fresh cache).
+	static size_t BuildThreads() {
+		return static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 4), 1, 8));
+	}
+
 	static uint32_t WaitBudgetMs() {
 		if (EnvU64("KYTY_RT_PIPELINE_ASYNC", 1) == 0) return UINT32_MAX;
 		return static_cast<uint32_t>(std::min<uint64_t>(EnvU64("KYTY_RT_PIPELINE_WAIT_MS", 250), 600000));
@@ -5677,12 +5716,11 @@ struct PipelineCache::RtState {
 
 	explicit RtState(PipelineCache& owner)
 	    : cache(owner), wait_ms(WaitBudgetMs()),
-	      queue(static_cast<size_t>(std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 2), 1, 4)), 64,
-	            Common::PlaceCurrentThreadCold) {
+	      queue(BuildThreads(), 64, Common::PlaceCurrentThreadCold) {
 		PipelineCacheLog("Software RT pipelines: built on {} background thread(s); a dispatch waits at most {} "
 		                 "for its kernel's pipeline, then is skipped until it is ready "
 		                 "(KYTY_RT_PIPELINE_WAIT_MS; KYTY_RT_PIPELINE_ASYNC=0 waits for it)",
-		                 std::clamp<uint64_t>(EnvU64("KYTY_RT_PIPELINE_THREADS", 2), 1, 4),
+		                 BuildThreads(),
 		                 wait_ms == UINT32_MAX ? std::string("for ever") : std::to_string(wait_ms) + " ms");
 	}
 
@@ -5723,9 +5761,11 @@ struct PipelineCache::RtState {
 	}
 
 	// Under `mutex`. The job of kernel `id`, started when new; null when the queue refused it.
-	// huge: a huge compute program (KYTY_COMPUTE_BACKGROUND_WORDS), not an RT kernel.
+	// huge: a huge compute program (KYTY_COMPUTE_BACKGROUND_WORDS), not an RT kernel. urgent: a
+	// dispatch needs it now (not a prewarm of the shader precompile): it is built next, and the
+	// queue's limit (full of prewarm builds) does not refuse it.
 	Job* Request(uint64_t id, const ShaderComputeInputInfo& input, const ShaderProgram& program,
-	             bool huge = false) {
+	             bool huge = false, bool urgent = false) {
 		if (const auto found = jobs.find(id); found != jobs.end()) return &found->second;
 		// A huge program's module could be destroyed with its program while it builds: pinned.
 		if (huge && !g_shader_modules.PinModule(program.module)) return nullptr;
@@ -5777,7 +5817,7 @@ struct PipelineCache::RtState {
                 if (huge) g_shader_modules.Unpin(cache.m_graphics.device, module);
                 promise->set_value(std::move(built));
             },
-            job.ticket);
+            job.ticket, urgent);
 		if (!queued) {
 			queued_builds.Sub();
 			jobs.erase(id);
@@ -5890,6 +5930,36 @@ struct PipelineCache::RtState {
 			                 static_cast<double>(totals_now.build_ns) / 1.0e6,
 			                 static_cast<double>(totals_now.max_build_ns) / 1.0e6);
 		}
+	}
+
+	// Per guest shader: the RT jobs requested, ready (published, or built and waiting for the CP to
+	// publish it), still building, and failed (the RT status line).
+	std::vector<RtShaderPipelines> Status() {
+		std::vector<RtShaderPipelines> out;
+		std::scoped_lock               lock(mutex);
+		for (const auto& [id, job]: jobs) {
+			(void)id;
+			if (job.huge) continue;
+			auto found = std::ranges::find(out, job.shader_hash, &RtShaderPipelines::shader_hash);
+			if (found == out.end()) {
+				out.push_back({.shader_hash = job.shader_hash});
+				found = out.end() - 1;
+			}
+			found->requested++;
+			const bool done =
+			    job.future.valid() && job.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+			if (!done) {
+				found->building++;
+				continue;
+			}
+			const auto& built = job.future.get();
+			if (built == nullptr || !built->error.empty()) {
+				found->failed++;
+			} else {
+				found->ready++;
+			}
+		}
+		return out;
 	}
 
 	struct AtomicTotals {
@@ -9422,6 +9492,16 @@ PipelineCache::RtPipelineTotals PipelineCache::GetRtPipelineTotals() const {
 	return m_rt != nullptr ? m_rt->Totals() : RtPipelineTotals {};
 }
 
+std::vector<PipelineCache::RtShaderPipelines> PipelineCache::GetRtPipelineStatus() const {
+	return m_rt != nullptr ? m_rt->Status() : std::vector<RtShaderPipelines> {};
+}
+
+PipelineCache::CallTranslationTotals PipelineCache::GetCallTranslationTotals() {
+	const auto get = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+	return {get(g_call_translation_totals.queued), get(g_call_translation_totals.finished),
+	        get(g_call_translation_totals.words), get(g_call_translation_totals.ms)};
+}
+
 void PipelineCache::PrewarmComputePipeline(const ShaderComputeInputInfo& input_info,
                                            const ShaderProgram&          compute_program) {
 	if (!compute_program || input_info.stage.program == nullptr) return;
@@ -9487,7 +9567,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	uint64_t                                            shader_hash = input_info.stage.program->shader_hash;
 	{
 		std::scoped_lock lock(rt.mutex);
-		auto*            job = rt.Request(id, input_info, compute_program, huge);
+		auto*            job = rt.Request(id, input_info, compute_program, huge, !huge);
 		if (job == nullptr) {
 			if (huge) {
 				// Queue full (or the module is going): built here, as without the switch.
@@ -9504,6 +9584,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 		}
 		first       = !job->asked;
 		job->asked  = true;
+		// A prewarmed build a dispatch now waits for: ahead of the prewarm builds queued before it
+		// (the shader precompile queues hundreds of RT programs of other areas).
+		if (!huge && !job->promoted) {
+			job->promoted = true;
+			rt.queue.Promote(job->ticket);
+		}
 		future      = job->future;
 		ticket      = job->ticket;
 	}

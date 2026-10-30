@@ -554,6 +554,35 @@ void Planner::PlanTarget(uint64_t id, uint32_t site, uint64_t target) {
 	plan.state[found->second].unusable = result == nullptr;
 }
 
+Planner::Status Planner::GetStatus() {
+	std::scoped_lock lock(m_mutex);
+	Status           status;
+	status.jobs = static_cast<uint32_t>(m_jobs.size());
+	for (const auto& [id, kernel]: m_kernels) {
+		(void)id;
+		switch (kernel.state) {
+			case Kernel::State::Planning: status.planning++; break;
+			case Kernel::State::Failed: status.failed++; break;
+			case Kernel::State::Ready:
+				status.ready++;
+				for (const auto& site: kernel.sites) {
+					for (const auto& target: site.state) {
+						status.targets++;
+						if (target.code != nullptr) {
+							status.built++;
+						} else if (target.unusable) {
+							status.unusable++;
+						} else {
+							status.pending++;
+						}
+					}
+				}
+				break;
+		}
+	}
+	return status;
+}
+
 Planner::Result Planner::Plan(std::span<const uint32_t> code, uint64_t base,
                               const CompileOptions& options, const ShaderComputeInputInfo& info,
                               const Decoder::ShaderCodeReader& read, Run& run) {
@@ -645,6 +674,7 @@ Planner::Result Planner::Plan(std::span<const uint32_t> code, uint64_t base,
 	}
 	run        = {};
 	run.kernel = id;
+	run.hash   = kernel.hash;
 	run.start  = kernel.start;
 	run.wave_dwords = kernel.layouts.WaveDwords();
 	for (uint32_t s = 0; s < kernel.sites.size(); s++) {
@@ -652,6 +682,7 @@ Planner::Result Planner::Plan(std::span<const uint32_t> code, uint64_t base,
 		const auto& layout = kernel.layouts.sites[s];
 		auto&       site   = run.sites.emplace_back();
 		site.resume        = plan.resume;
+		site.targets       = plan.targets;
 		for (const auto& state: plan.state) {
 			site.callees.push_back(state.code);
 			site.pending.push_back(state.code == nullptr && !state.unusable);

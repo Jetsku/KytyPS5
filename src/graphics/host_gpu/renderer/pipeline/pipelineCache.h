@@ -21,6 +21,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -374,6 +375,19 @@ public:
 		uint64_t wait_ns = 0, build_ns = 0, max_build_ns = 0;
 	};
 	[[nodiscard]] RtPipelineTotals GetRtPipelineTotals() const;
+	// The background RT pipeline jobs right now (the RT status line, callSplitDispatch.cpp): per
+	// guest shader, the pipelines requested, ready (published or built), building and failed.
+	struct RtShaderPipelines {
+		uint64_t shader_hash = 0;
+		uint32_t requested = 0, ready = 0, building = 0, failed = 0;
+	};
+	[[nodiscard]] std::vector<RtShaderPipelines> GetRtPipelineStatus() const;
+	// KYTY_SHADER_CALLS background translations (call expansions and call-split programs): queued
+	// and finished so far, and the code words and milliseconds of the finished ones.
+	struct CallTranslationTotals {
+		uint64_t queued = 0, finished = 0, words = 0, ms = 0;
+	};
+	[[nodiscard]] static CallTranslationTotals GetCallTranslationTotals();
 
 	// Process-wide totals of the program caches (tests and diagnostics): permutations created
 	// (emitted or reloaded), TranslateProgram runs, and the persistent program cache's reloads and

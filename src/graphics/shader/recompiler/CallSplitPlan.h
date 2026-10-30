@@ -65,12 +65,14 @@ struct Run {
 		std::shared_ptr<const Code>              resume;
 		std::vector<std::shared_ptr<const Code>> callees;
 		std::vector<bool>                        pending; // per callee: not planned yet (null code)
+		std::vector<uint64_t>                    targets; // per callee: its guest address (status line)
 		std::vector<uint32_t>                    record_slots;
 		uint32_t                                 exec_lo_slot  = 0; // uniform dwords
 		uint32_t                                 exec_hi_slot  = 0;
 		uint32_t                                 record_dword  = 0; // the record VGPR's lane 0
 	};
 	uint64_t                    kernel = 0;
+	uint64_t                    hash   = 0; // the guest shader (status line)
 	std::shared_ptr<const Code> start;
 	std::vector<SiteRun>        sites;
 	uint32_t                    wave_dwords = 0;
@@ -88,6 +90,16 @@ public:
 	// loops (or splitting failed), Pending while its plan is built, Ready with `run`.
 	Result Plan(std::span<const uint32_t> code, uint64_t base, const CompileOptions& options,
 	            const ShaderComputeInputInfo& info, const Decoder::ShaderCodeReader& read, Run& run);
+
+	// What the planner holds right now (the RT status line): split kernels still planning, ready
+	// or failed, and over the ready ones' sites the callee targets whose code is built, still being
+	// planned, or unusable (their lanes resume without the call).
+	struct Status {
+		uint32_t planning = 0, ready = 0, failed = 0;
+		uint32_t targets = 0, built = 0, pending = 0, unusable = 0;
+		uint32_t jobs = 0; // planning jobs queued
+	};
+	Status GetStatus();
 
 	static Planner& Instance();
 	static bool     Enabled();
