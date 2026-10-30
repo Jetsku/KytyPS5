@@ -1239,6 +1239,55 @@ void TestFlexibleNoCoalescePreservesBoundaries() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// The committed parts of a range with holes in its mappings: what a GPU write over sparse memory
+// lands in (KYTY_SPARSE_FILLS, KYTY_SPARSE_WRITES); the clamp stops at the first hole.
+void TestCommittedSpansAcrossHoles() {
+	const char* test = "CommittedSpansAcrossHoles";
+	void*       addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&addr, SceKernelPageSize * 4, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	for (const uint64_t page: {uint64_t {0}, uint64_t {2}}) {
+		void* fixed = reinterpret_cast<void*>(base + SceKernelPageSize * page);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+		            &fixed, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "span"),
+		        "KernelMapNamedFlexibleMemory(fixed)");
+	}
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSizeQuiet(base, SceKernelPageSize * 4) ==
+	          SceKernelPageSize,
+	      "the clamp did not stop at the first hole");
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	Check(test,
+	      Libs::LibKernel::Memory::CommittedSpans(base, SceKernelPageSize * 4, 8, &spans) &&
+	          spans.size() == 2 && spans[0].first == base && spans[0].second == SceKernelPageSize &&
+	          spans[1].first == base + SceKernelPageSize * 2 && spans[1].second == SceKernelPageSize,
+	      "the committed spans are not the two mapped pages");
+	Check(test,
+	      Libs::LibKernel::Memory::CommittedSpans(base + SceKernelPageSize, SceKernelPageSize * 2, 8,
+	                                              &spans) &&
+	          spans.size() == 1 && spans[0].first == base + SceKernelPageSize * 2,
+	      "a range starting in a hole lost its mapped page");
+	Check(test,
+	      !Libs::LibKernel::Memory::CommittedSpans(base, SceKernelPageSize * 4, 1, &spans) &&
+	          spans.empty(),
+	      "more spans than asked for were not refused");
+	Check(test,
+	      Libs::LibKernel::Memory::CommittedExtent(base, SceKernelPageSize * 4) ==
+	              SceKernelPageSize * 3 &&
+	          Libs::LibKernel::Memory::CommittedExtent(base + SceKernelPageSize,
+	                                                   SceKernelPageSize * 2) == SceKernelPageSize * 2 &&
+	          Libs::LibKernel::Memory::CommittedExtent(base + SceKernelPageSize, SceKernelPageSize) == 0 &&
+	          Libs::LibKernel::Memory::CommittedExtent(base + SceKernelPageSize * 3, SceKernelPageSize) == 0,
+	      "the committed extent does not end at the last mapped byte");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 4),
+	        "KernelMunmap(cleanup)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleMemoryReuseIsZeroFilled() {
 	const char* test     = "FlexibleMemoryReuseIsZeroFilled";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -5268,6 +5317,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleMemoryUsesSharedBacking);
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
+	RunTest(TestCommittedSpansAcrossHoles);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackExitLifecycle);

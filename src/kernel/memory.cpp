@@ -643,6 +643,44 @@ public:
 		return ClampRangeSizeUnlocked(virtual_addr, size, ClampRangeMemoEnabled());
 	}
 
+	// The committed parts of [start, start + size), adjacent ranges merged, in order. False (and
+	// none) when there are more than max_spans.
+	bool CommittedSpans(uint64_t start, uint64_t size, size_t max_spans,
+	                    std::vector<std::pair<uint64_t, uint64_t>>* spans) {
+		spans->clear();
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return true;
+		}
+		const auto        end = start + size;
+		Common::LockGuard lock(m_mutex);
+		auto              next = std::upper_bound(
+            m_ranges.begin(), m_ranges.end(), start,
+            [](uint64_t value, const Range& candidate) { return value < candidate.start; });
+		if (next != m_ranges.begin()) {
+			--next;
+		}
+		for (; next != m_ranges.end() && next->start < end; ++next) {
+			if (!IsCommittedRangeType(next->type) || next->size == 0) {
+				continue;
+			}
+			const auto from = std::max(start, next->start);
+			const auto to   = std::min(end, End(next->start, next->size));
+			if (from >= to) {
+				continue;
+			}
+			if (!spans->empty() && spans->back().first + spans->back().second == from) {
+				spans->back().second += to - from;
+				continue;
+			}
+			if (spans->size() >= max_spans) {
+				spans->clear();
+				return false;
+			}
+			spans->emplace_back(from, to - from);
+		}
+		return true;
+	}
+
 	// The generation every change advances before it starts (acquire): an unchanged value later
 	// means every ClampRangeSize answer made after this read still holds.
 	[[nodiscard]] uint64_t Generation() const noexcept {
@@ -1882,6 +1920,24 @@ bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 
 uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
+}
+
+bool CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
+                    std::vector<std::pair<uint64_t, uint64_t>>* spans) {
+	EXIT_IF(spans == nullptr);
+	if (g_virtual_ranges == nullptr) {
+		spans->assign(1, {vaddr, size});
+		return true;
+	}
+	return g_virtual_ranges->CommittedSpans(vaddr, size, max_spans, spans);
+}
+
+uint64_t CommittedExtent(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!CommittedSpans(vaddr, size, SIZE_MAX, &spans) || spans.empty()) {
+		return 0;
+	}
+	return spans.back().first + spans.back().second - vaddr;
 }
 
 uint64_t VirtualRangesGeneration() noexcept {

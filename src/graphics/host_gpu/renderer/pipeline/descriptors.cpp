@@ -3145,6 +3145,38 @@ static void NoteBufferOutOfBoundsMode(const ShaderBufferResource& descriptor, ui
 	     descriptor.NumRecords(), address);
 }
 
+// KYTY_SPARSE_WRITES=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 cb543d499): a
+// written buffer binding over memory with holes in its mappings (sparse memory: 64 KB pages mapped
+// only where needed) is bound from its base to the end of its last mapped byte, instead of up to
+// its first hole (or as empty when its first page is a hole). The guest GPU's stores land in every
+// mapped page; those to a hole stay in the cached buffer and are never written back. Up to 1 GB and
+// the device's storage-buffer range; `clamped` otherwise. GT7 clears a sparse depth map with a
+// compute fill over the whole range.
+static uint64_t SparseWriteSize(uint64_t shader, uint64_t address, uint64_t requested,
+                                uint64_t clamped, uint64_t limit) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_WRITES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || address == 0) {
+		return clamped;
+	}
+	const auto extent = Libs::LibKernel::Memory::CommittedExtent(address, requested);
+	if (extent <= clamped || extent > std::min(limit, uint64_t {1} << 30u)) {
+		return clamped;
+	}
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> logged;
+	std::lock_guard                                lock(mutex);
+	if (logged.size() < 32 && logged.insert({shader, address}).second) {
+		LOGF("RenderExecutor: shader %016" PRIx64 " writes 0x%016" PRIx64 "+0x%" PRIx64
+		     " over memory with holes: bound to its last mapped byte, 0x%" PRIx64
+		     " (up to the first hole it was 0x%" PRIx64 "; KYTY_SPARSE_WRITES)\n",
+		     shader, address, requested, extent, clamped);
+	}
+	return extent;
+}
+
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -3213,6 +3245,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 					NoteBufferRangeFix("finite range across sparse holes", serial_address, serial_size,
 					                   requested_size);
 					serial_size = requested_size;
+				}
+				if (serial_size != requested_size && program.info.buffers[i].written) {
+					serial_size = SparseWriteSize(program.shader_hash, serial_address, requested_size,
+					                              serial_size, unbounded_read_limit);
 				}
 				if (serial_size == 0) {
 					// An unmapped V# (typically left over from a skipped shader's output): bind
@@ -3578,6 +3614,65 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	CommitStats::StepMark(CommitStats::Step::RbTables);
 }
 
+// KYTY_SPARSE_HOLES=1 (TextureCache::ResetUnmappedDepth): after a stage's views are acquired (and
+// their images refreshed), each image it samples with a depth comparison has its unmapped blocks
+// reset to the depth that passes the comparison: 1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL. None
+// for other functions, bindless samplers, or samplers of one image that disagree.
+static void ResetSparseDepthHoles(TextureCache& texture_cache, const PreparedBindings& prepared) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_HOLES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || prepared.runtime == nullptr || !*prepared.runtime) {
+		return;
+	}
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	const auto& images   = prepared.images;
+	for (uint32_t i = 0; i < program.info.images.size() && i < images.size(); i++) {
+		if (!program.info.images[i].depth_compare ||
+		    images[i].desc.type == TextureCache::BindingType::Storage) {
+			continue;
+		}
+		std::optional<float> depth;
+		bool                 usable = true;
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != i || pair.sampler >= program.info.samplers.size()) {
+				continue;
+			}
+			const auto& sampler = program.info.samplers[pair.sampler];
+			if (!sampler.depth_compare) {
+				continue;
+			}
+			if (sampler.bindless || sampler.snapshot_index >= snapshot.samplers.size()) {
+				usable = false;
+				break;
+			}
+			float passing = 0.0f;
+			switch (DecodeNativeDescriptor<ShaderSamplerResource>(snapshot.samplers[sampler.snapshot_index])
+			            .DepthCompareFunc()) {
+				case 1: // LESS
+				case 3: // LEQUAL
+					passing = 1.0f;
+					break;
+				case 4: // GREATER
+				case 6: // GEQUAL
+					passing = 0.0f;
+					break;
+				default: usable = false; break;
+			}
+			if (!usable || (depth.has_value() && *depth != passing)) {
+				usable = false;
+				break;
+			}
+			depth = passing;
+		}
+		if (usable && depth.has_value()) {
+			texture_cache.ResetUnmappedDepth(images[i].image_id, *depth);
+		}
+	}
+}
+
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -3586,6 +3681,13 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// KYTY_SPARSE_HOLES: once the views are acquired (and their images refreshed), on every exit,
+	// for draws and dispatches alike.
+	struct SparseDepthHolesOnExit {
+		TextureCache&           cache;
+		const PreparedBindings& bindings;
+		~SparseDepthHolesOnExit() { ResetSparseDepthHoles(cache, bindings); }
+	} sparse_depth_holes {texture_cache, prepared};
 	// KYTY_DRAW_SEQUENCE_FAST (textures): when every binding would get TryAcquireView's hit and
 	// nothing else (TextureBindingMemo::TryRepeatViews, one texture-cache lock for the stage).
 	bool verify_views = false;

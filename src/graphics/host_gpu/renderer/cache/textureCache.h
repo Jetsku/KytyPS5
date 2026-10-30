@@ -37,6 +37,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class Buffer;
+class NanScrubber;
 class BufferCache;
 
 // KYTY_META_CLEAR_COVER / KYTY_META_TRACE (textureCache.cpp).
@@ -194,6 +195,18 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// KYTY_SPARSE_HOLES=1 (default off; adapted from usa-ratt/KytyPS5-GT7 89be9768d): a depth image
+	// over memory only partly mapped (sparse, in 64 KB blocks), sampled with a depth comparison,
+	// has the texels of its unmapped blocks reset to `empty`, the depth that passes the comparison
+	// (1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL), once each time its contents change. The
+	// console drops the writes that land there and reports reads there as not resident, which the
+	// shaders sampling such shadow maps take as lit. Without it the host's texels there, drawn
+	// into, shadow the ground in noisy patches with straight edges (GT7).
+	void               ResetUnmappedDepth(ImageId id, float empty);
+	// KYTY_NAN_SCRUB=1 (textureCache.cpp), GPU thread, at a guest flip's preparation: one changed
+	// GPU-written B10G11R11 or half-float array of six layers or more has its texels that are not
+	// finite rewritten (a NaN to zero, an infinity to the largest finite value).
+	void               RunNanScrub();
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// KYTY_IMAGE_EXACT_RANGE_INVALIDATE (default off; =1 on, =count dry run): when a GPU buffer
@@ -464,6 +477,13 @@ private:
 	void                        PlaceBindingView(const ImageDesc& desc, ImageId& result, bool loop_own,
 	                                             int32_t& view_mip, int32_t& view_layer) const;
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// KYTY_GUEST_HASH_IMAGES_KB: small linear images the CPU writes, compared with their guest bytes
+	// once per guest submission instead of trusting the page tracking alone.
+	[[nodiscard]] bool          ChecksGuestContent(const Image& image);
+	void                        RefreshByContent(ImageId id, RefreshIntent intent);
+	// KYTY_PENDING_FILLS (BufferCache::FillOfNewImage), caller holds m_lock: a fresh target made
+	// inside a known GPU fill is cleared to it; false when nothing was done (the caller uploads).
+	bool                        ClearFromKnownFill(ImageId id);
 	void                        RefreshImage(ImageId id,
 	                                         RefreshIntent intent = RefreshIntent::Read);
 	// `noop` (optional): how the decision can be repeated (MetadataNoop), reset first.
@@ -926,6 +946,21 @@ private:
 	[[nodiscard]] uint64_t PageVersion(uint64_t page) const noexcept {
 		return m_page_versions ? m_page_versions[page] : 0;
 	}
+
+	// KYTY_NAN_SCRUB: the arrays the GPU wrote (by address), when each was last scrubbed (content
+	// serial, frame), the round-robin position, the last frame a scrub ran, its pipeline and scratch.
+	struct NanScrubCandidate {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t serial  = UINT64_MAX;
+		uint64_t frame   = 0;
+	};
+	void                           NoteNanScrubCandidate(const Image& image);
+	std::vector<NanScrubCandidate> m_nan_candidates;
+	size_t                         m_nan_next  = 0;
+	uint64_t                       m_nan_frame = UINT64_MAX;
+	std::unique_ptr<NanScrubber>   m_nan_scrubber;
+	std::shared_ptr<Buffer>        m_nan_scratch;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

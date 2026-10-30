@@ -13,6 +13,8 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/host_gpu/renderer/image/nanScrubber.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
@@ -3632,6 +3634,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
+static bool HashGuestBytes(uint64_t address, uint64_t size, uint64_t& hash);
+
 void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -3648,6 +3652,11 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	// KYTY_PENDING_FILLS: a fresh target inside a GPU fill starts as the fill.
+	if (upload && !image.WasEverUploaded() && BufferCache::PendingFillsEnabled() &&
+	    ClearFromKnownFill(id)) {
+		return;
+	}
 	bool       guest_refresh = false;
 	// KYTY_IMAGE_PARTIAL_GPU_WRITE: only GPU buffer writes over known ranges changed the image's
 	// bytes; it moves bytes through the buffer for those ranges only (UploadGpuWrittenRanges).
@@ -3711,21 +3720,34 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		// KYTY_LIGHT_GRID_CAP: a light grid is uploaded here, from bytes it can repair.
 		const bool light_grid = LightGridCapEnabled() && image.FullyResident() &&
 		                        IsLightGridShape(image.info);
-		if (!partial.done && (light_grid || !TryAsyncFullUpload(image))) {
+		// KYTY_GUEST_HASH_IMAGES_KB: the guest bytes are hashed before they are staged (a CPU write
+		// between the two leaves the hash older than the upload, so the next comparison uploads once
+		// more rather than missing it), and the upload takes them whatever buffer covers them.
+		uint64_t   guest_hash = 0;
+		const bool hash_guest = !partial.done && image.FullyResident() && ChecksGuestContent(image) &&
+		                        HashGuestBytes(live.address, live.size, guest_hash);
+		image.content_hash_valid = false;
+		if (!partial.done && (light_grid || hash_guest || !TryAsyncFullUpload(image))) {
 			const bool cached_source = m_buffer_cache.IsRegionRegistered(live.address, live.size) ||
 			                           m_buffer_cache.IsRegionGpuModified(live.address, live.size);
 			Profiler::CountFrameEvent(cached_source ? Profiler::FrameEvent::TextureUploadBytesBuffer
 			                                        : Profiler::FrameEvent::TextureUploadBytesStaging,
 			                          live.size);
 			const auto [source, source_offset] =
-			    m_buffer_cache.ObtainBufferForImage(live.address, live.size);
+			    hash_guest ? m_buffer_cache.StageGuestBytesForImage(live.address, live.size)
+			               : m_buffer_cache.ObtainBufferForImage(live.address, live.size);
 			if (source == nullptr) {
 				EXIT("TextureCache: failed to obtain image upload source\n");
 			}
-			if (light_grid && !cached_source) {
+			if (light_grid && (hash_guest || !cached_source)) {
 				RepairLightGridUpload(image, *source, source_offset);
 			}
 			UploadImage(image, *source, source_offset);
+			if (hash_guest) {
+				image.content_hash             = guest_hash;
+				image.content_hash_valid       = true;
+				image.content_check_submission = SyncEpoch::CurrentSubmission();
+			}
 		}
 		const auto uploaded = partial.done ? partial.bytes : live.size;
 		image.residency_refresh = false;
@@ -5052,11 +5074,304 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 }
 
 // TextureBindingMemo::RefreshIsNoOp mirrors when this is a no-op; keep them in sync.
+// KYTY_GUEST_HASH_IMAGES_KB=N (default 0: off; adapted from usa-ratt/KytyPS5-GT7 1a344cd80, whose
+// default is 256): linear images up to N KiB that the GPU neither wrote nor covers with its writes
+// are compared with their guest bytes (a hash) the first time each guest submission refreshes them,
+// and uploaded again, straight from guest memory, when the bytes changed. What the game wrote
+// before submitting is then visible to all of that submission's commands, as on the console. The
+// page tracking alone misses CPU writes to an image's first and last pages once a write next to the
+// image untracked them, and an upload from a cached buffer over the range is only as fresh as that
+// buffer: GT7's light grids, rewritten by the CPU every frame in memory shared with other data,
+// were found stale (dark screen tiles in tunnels and at night).
+static uint64_t GuestHashImageBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GUEST_HASH_IMAGES_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
+	}();
+	return bytes;
+}
+
+// KYTY_GUEST_HASH_TILED_KB=N (default 0: off; the experiment of usa-ratt/KytyPS5-GT7 95b1f059f):
+// the same per-submission guest-byte check for tiled images up to N KiB.
+static uint64_t GuestHashTiledBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GUEST_HASH_TILED_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
+	}();
+	return bytes;
+}
+
+// KYTY_GUEST_HASH_IMAGES_KB: the hash of the guest bytes of [address, address + size); false when
+// they cannot be read.
+static bool HashGuestBytes(uint64_t address, uint64_t size, uint64_t& hash) {
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	if (size == 0 || !Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		return false;
+	}
+	hash = XXH3_64bits(bytes.data(), static_cast<size_t>(size));
+	return true;
+}
+
+bool TextureCache::ClearFromKnownFill(ImageId id) {
+	auto&       image = m_slot_images[id];
+	const auto& info  = image.info;
+	// A target the binding is about to write, made from scratch: a texture may hold what the CPU
+	// wrote into memory a fill's holes left unmapped (those stores are not seen); a target's bytes
+	// are the GPU's.
+	if (image.depth_id || image.backing.image == nullptr || info.samples != 1 ||
+	    image.backing.samples != 1 || info.data.Empty() || info.IsVolume() || info.HasStencil() ||
+	    !(image.usage.render_target || image.usage.depth_target) || image.usage.texture ||
+	    image.usage.storage || image.usage.video_out ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	uint32_t value = 0;
+	if (!m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, false)) {
+		return false;
+	}
+	vk::ClearValue       clear {};
+	vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor;
+	if (info.IsDepth()) {
+		aspect = ImageViewOps::DepthAspectMask(image.backing.format);
+		if (info.pixel_format == vk::Format::eD16Unorm) {
+			// Two texels a dword: both the same.
+			if ((value >> 16u) != (value & 0xffffu)) {
+				return false;
+			}
+			clear.depthStencil.depth = static_cast<float>(value & 0xffffu) / 65535.0f;
+		} else if (!DecodePackedDepthClear(info.pixel_format, value, clear.depthStencil.depth)) {
+			return false;
+		}
+		clear.depthStencil.stencil = 0;
+	} else if (!DecodeColorDwordFill(info.pixel_format, value, clear.color)) {
+		return false;
+	}
+	if (!ClearImage(m_scheduler.Current(), id, image.backing.format,
+	                {aspect, 0, info.resources.levels, 0, image.backing.layers}, clear,
+	                "pending-fill")) {
+		return false;
+	}
+	(void)m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, true);
+	static std::atomic<uint64_t> cleared {0};
+	if (const auto count = cleared.fetch_add(1, std::memory_order_relaxed) + 1;
+	    count <= 32 || std::has_single_bit(count)) {
+		LOGF("TextureCache: %s 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u mips %u created inside "
+		     "a GPU fill with 0x%08x: starts as the fill, not as its memory (%" PRIu64
+		     " so far; KYTY_PENDING_FILLS)\n",
+		     info.IsDepth() ? "depth target" : "render target", info.data.address, info.data.size,
+		     info.extent.width, info.extent.height, info.resources.layers, info.resources.levels,
+		     value, count);
+	}
+	return true;
+}
+
+// KYTY_NAN_SCRUB=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 9bbca0635 and the
+// scan of c5511faad, without its NaN-count diagnostics): the B10G11R11 and half-float arrays of six
+// layers or more that the GPU writes (light probes, cube maps), up to KYTY_NAN_SCRUB_MB (default
+// 64) in all their mips, have their texels that are not finite rewritten on the GPU at a frame end
+// (one image a frame, each at most every 30 frames and only once it changed): a NaN becomes zero,
+// an infinity the largest finite value, what the guest GPU stores for a value out of range. A probe
+// relit every frame from its last value keeps such texels for good, and the surfaces that reflect
+// it shade black or NaN, which the temporal and blur passes spread (GT7).
+static bool NanScrubEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NAN_SCRUB");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static uint64_t NanScrubMaxBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_NAN_SCRUB_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
+	}();
+	return bytes;
+}
+
+// The scrub's packing of an image's host format and its bytes per texel; nullopt for others.
+static std::optional<std::pair<NanScrubber::Packing, uint32_t>> NanScrubFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32: return std::pair {NanScrubber::Packing::B10G11R11, 4u};
+		case vk::Format::eR16G16Sfloat: return std::pair {NanScrubber::Packing::TwoHalves, 4u};
+		case vk::Format::eR16G16B16A16Sfloat: return std::pair {NanScrubber::Packing::TwoHalves, 8u};
+		default: return std::nullopt;
+	}
+}
+
+// The bytes of every mip of `image`, tightly packed (0 when it is not eligible for the scrub).
+static uint64_t NanScrubBytes(const Image& image) {
+	const auto&    backing      = image.backing;
+	const auto     format       = NanScrubFormat(backing.format);
+	constexpr auto TransferBoth = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	if (!format || backing.image == nullptr || backing.layers < 6u ||
+	    backing.image_type != vk::ImageType::e2D || backing.samples != 1 || image.depth_id ||
+	    image.info.IsDepth() || !image.FullyResident() || (backing.usage & TransferBoth) != TransferBoth) {
+		return 0;
+	}
+	uint64_t total = 0;
+	for (uint32_t mip = 0; mip < std::max(backing.mip_levels, 1u); mip++) {
+		total += uint64_t {std::max(backing.extent.width >> mip, 1u)} *
+		         std::max(backing.extent.height >> mip, 1u) * backing.layers * format->second;
+	}
+	return total <= NanScrubMaxBytes() ? total : 0;
+}
+
+void TextureCache::NoteNanScrubCandidate(const Image& image) {
+	if (!NanScrubEnabled() || image.info.data.Empty() || NanScrubBytes(image) == 0) {
+		return;
+	}
+	const auto address = image.info.data.address;
+	if (std::ranges::any_of(m_nan_candidates,
+	                        [address](const NanScrubCandidate& c) { return c.address == address; })) {
+		return;
+	}
+	if (m_nan_candidates.size() >= 256) {
+		m_nan_candidates.erase(m_nan_candidates.begin());
+	}
+	m_nan_candidates.push_back({address, image.info.data.size, UINT64_MAX, 0});
+}
+
+void TextureCache::RunNanScrub() {
+	if (!NanScrubEnabled()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       frame = m_frame.load(std::memory_order_relaxed);
+	if (frame == m_nan_frame || m_nan_candidates.empty() || !m_scheduler.Active()) {
+		return;
+	}
+	m_nan_frame = frame;
+	if (m_nan_scrubber == nullptr) {
+		m_nan_scrubber = std::make_unique<NanScrubber>(m_graphics);
+	}
+	if (!m_nan_scrubber->Valid()) {
+		return;
+	}
+	for (size_t tries = 0; tries < m_nan_candidates.size();) {
+		m_nan_next      = (m_nan_next + 1) % m_nan_candidates.size();
+		auto& candidate = m_nan_candidates[m_nan_next];
+		Image* image    = nullptr;
+		for (const auto id: FindImagesInRegion(candidate.address, candidate.size, false)) {
+			auto* found = m_slot_images.try_get(id);
+			if (found != nullptr && found->registered && found->info.data.address == candidate.address &&
+			    NanScrubBytes(*found) != 0) {
+				image = found;
+				break;
+			}
+		}
+		if (image == nullptr) {
+			// Gone: forget it.
+			m_nan_candidates.erase(m_nan_candidates.begin() + static_cast<std::ptrdiff_t>(m_nan_next));
+			if (m_nan_candidates.empty()) {
+				return;
+			}
+			m_nan_next = (m_nan_next + m_nan_candidates.size() - 1) % m_nan_candidates.size();
+			continue;
+		}
+		tries++;
+		if ((candidate.frame != 0 && frame - candidate.frame < 30) ||
+		    image->ContentSerial() == candidate.serial) {
+			continue;
+		}
+		const auto  total   = NanScrubBytes(*image);
+		const auto  format  = NanScrubFormat(image->backing.format);
+		const auto& backing = image->backing;
+		std::vector<vk::BufferImageCopy> regions;
+		uint64_t                         offset = 0;
+		for (uint32_t mip = 0; mip < std::max(backing.mip_levels, 1u); mip++) {
+			const uint32_t      width  = std::max(backing.extent.width >> mip, 1u);
+			const uint32_t      height = std::max(backing.extent.height >> mip, 1u);
+			vk::BufferImageCopy region {};
+			region.bufferOffset     = offset;
+			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, backing.layers};
+			region.imageExtent      = vk::Extent3D {width, height, 1};
+			regions.push_back(region);
+			offset += uint64_t {width} * height * backing.layers * format->second;
+		}
+		if (m_nan_scratch == nullptr || m_nan_scratch->Size() < total) {
+			// The previous one stays alive in the deferred release of the scrub that used it.
+			m_nan_scratch = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+			                                         AllFlags, Common::AlignUp(total, uint64_t {4} << 20u));
+		}
+		image->Download(regions, m_nan_scratch->Handle(), 0, total);
+		m_nan_scrubber->Scrub(m_scheduler.Current(), m_nan_scratch->Handle(), 0, total, format->first);
+		image->Upload(regions, m_nan_scratch->Handle(), 0, total);
+		m_scheduler.DeferOperation([scratch = m_nan_scratch] {});
+		candidate.serial = image->ContentSerial();
+		candidate.frame  = frame;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("TextureCache: NaN scrub of 0x%012" PRIx64 " %ux%u, %u layers, %u mips, format %d "
+			     "(KYTY_NAN_SCRUB)\n",
+			     candidate.address, backing.extent.width, backing.extent.height, backing.layers,
+			     backing.mip_levels, static_cast<int>(backing.format));
+		}
+		return;
+	}
+}
+
+bool TextureCache::ChecksGuestContent(const Image& image) {
+	const auto& info  = image.info;
+	const auto  limit = info.IsTiled() ? GuestHashTiledBytes() : GuestHashImageBytes();
+	return limit != 0 && !info.data.Empty() && info.data.size <= limit &&
+	       info.samples == 1 && !image.depth_id && !info.IsDepth() &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed && image.FullyResident() &&
+	       !image.IsGpuModified() && !image.IsBufferModified() &&
+	       !m_buffer_cache.IsRegionGpuModified(info.data.address, info.data.size);
+}
+
+void TextureCache::RefreshByContent(ImageId id, RefreshIntent intent) {
+	auto&      image = m_slot_images[id];
+	const auto range = image.info.data;
+	TrackImage(id);
+	const auto submission = SyncEpoch::CurrentSubmission();
+	if (image.content_check_submission == submission && !image.IsCpuDirty()) {
+		return;
+	}
+	uint64_t hash = 0;
+	if (!HashGuestBytes(range.address, range.size, hash)) {
+		image.content_hash_valid = false;
+		RefreshImage(id, intent);
+		return;
+	}
+	image.content_check_submission = submission;
+	if (hash == image.content_hash) {
+		// The GPU holds these bytes already, whatever the tracking marked.
+		if (image.IsDefinitelyCpuDirty()) {
+			image.RefreshComplete();
+		} else if (image.IsMaybeCpuDirty()) {
+			image.ClearMaybeCpuDirty();
+		}
+		return;
+	}
+	if (!image.IsDefinitelyCpuDirty()) {
+		// What this check is for: the first few, then every 1000th.
+		static std::atomic<uint64_t> unseen {0};
+		if (const auto count = unseen.fetch_add(1, std::memory_order_relaxed) + 1;
+		    count <= 16 || count % 1000 == 0) {
+			LOGF("TextureCache: guest bytes of 0x%012" PRIx64 "+0x%" PRIx64
+			     " (%ux%u, %u layers) changed unseen by the page tracking%s: uploaded again (%" PRIu64
+			     " so far; KYTY_GUEST_HASH_IMAGES_KB)\n",
+			     range.address, range.size, image.info.extent.width, image.info.extent.height,
+			     image.info.resources.layers,
+			     image.IsMaybeCpuDirty() ? " (a neighbour's write marked it maybe-dirty)" : "", count);
+		}
+	}
+	image.MarkResidencyDirty();
+	InitializeImage(id, intent);
+}
+
 void TextureCache::RefreshImage(ImageId id, RefreshIntent intent) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
+		return;
+	}
+	if (image.content_hash_valid && ChecksGuestContent(image)) {
+		RefreshByContent(id, intent);
 		return;
 	}
 	TrackImage(id);
@@ -6071,6 +6386,14 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	// KYTY_GUEST_HASH_IMAGES_KB: the GPU's pixels from now on, not the guest bytes an upload took.
+	image.content_hash_valid = false;
+	NoteNanScrubCandidate(image); // KYTY_NAN_SCRUB
+	// KYTY_PENDING_FILLS: its pixels are newer than a fill of its memory, so an image made there
+	// later must not start as that fill (ClearFromKnownFill).
+	if (!image.depth_id && !image.info.data.Empty()) {
+		m_buffer_cache.ForgetFillsUnder(image.info.data.address, image.info.data.size);
+	}
 	if (AliasBytesEnabled() && !image.depth_id && !image.info.data.Empty()) {
 		// Single owner per byte: this write takes the claimed bytes (the whole image, or the
 		// blocks under a draw's scissor) from every other image, which keeps the rest of its
@@ -6175,6 +6498,123 @@ bool StencilPlaneFillClearEnabled() {
 		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
+}
+
+void TextureCache::ResetUnmappedDepth(ImageId id, float empty) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_HOLES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || !id) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            found = m_slot_images.try_get(id);
+	if (found == nullptr || found->sparse_checked_serial == found->ContentSerial()) {
+		return;
+	}
+	auto&       image           = *found;
+	const auto& info            = image.info;
+	image.sparse_checked_serial = image.ContentSerial();
+	const auto     format       = image.backing.format;
+	const uint32_t bytes        = format == vk::Format::eD16Unorm    ? 2u
+	                              : format == vk::Format::eD32Sfloat ? 4u
+	                                                                 : 0u;
+	constexpr uint64_t BlockBytes = 0x10000u;
+	if (bytes == 0 || image.backing.image == nullptr || image.depth_id || info.data.Empty() ||
+	    info.tile_mode != Prospero::TileMode::kDepth || info.HasStencil() || info.IsVolume() ||
+	    info.resources.levels != 1 || info.resources.layers != 1 || image.backing.samples != 1 ||
+	    image.backing.mip_levels != 1 || (info.data.address % BlockBytes) != 0 ||
+	    !(image.backing.usage & vk::ImageUsageFlagBits::eTransferDst)) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!Libs::LibKernel::Memory::CommittedSpans(info.data.address, info.data.size, 1u << 20u,
+	                                             &spans)) {
+		return;
+	}
+	uint64_t committed = 0;
+	for (const auto& span: spans) {
+		committed += span.second;
+	}
+	if (committed >= info.data.size) {
+		return; // all mapped: the common case
+	}
+	TileBlockLayout block {};
+	if (!TileGetBlockLayout(TileBlockFamily::Depth64KB, bytes, block) ||
+	    block.block_size != BlockBytes || block.block_depth != 1 || block.block_width == 0 ||
+	    block.block_height == 0) {
+		return;
+	}
+	const uint32_t width          = std::max(image.backing.extent.width, 1u);
+	const uint32_t height         = std::max(image.backing.extent.height, 1u);
+	const uint32_t blocks_per_row = (width + block.block_width - 1u) / block.block_width;
+	const uint32_t block_rows     = (height + block.block_height - 1u) / block.block_height;
+	const uint64_t blocks         = uint64_t {blocks_per_row} * block_rows;
+	if (blocks * BlockBytes > info.data.size) {
+		return; // not the layout assumed here (64 KB blocks, row by row)
+	}
+	// Whether each block is mapped: any byte of it is (a block partly mapped keeps its texels).
+	std::vector<bool> mapped(blocks, false);
+	for (const auto& [start, size]: spans) {
+		const uint64_t first = (start - info.data.address) / BlockBytes;
+		const uint64_t end   = std::min<uint64_t>(
+            (start + size - info.data.address + BlockBytes - 1u) / BlockBytes, blocks);
+		for (uint64_t b = first; b < end; b++) {
+			mapped[b] = true;
+		}
+	}
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         largest = 0;
+	uint64_t                         holes   = 0;
+	for (uint32_t row = 0; row < block_rows; row++) {
+		for (uint32_t column = 0; column < blocks_per_row;) {
+			if (mapped[uint64_t {row} * blocks_per_row + column]) {
+				column++;
+				continue;
+			}
+			uint32_t end = column;
+			while (end < blocks_per_row && !mapped[uint64_t {row} * blocks_per_row + end]) {
+				end++;
+			}
+			holes += end - column;
+			const uint32_t      x = column * block.block_width;
+			const uint32_t      y = row * block.block_height;
+			vk::BufferImageCopy region {};
+			region.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+			region.imageOffset      = vk::Offset3D {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
+			region.imageExtent      = vk::Extent3D {std::min(end * block.block_width, width) - x,
+                                               std::min(block.block_height, height - y), 1};
+			largest = std::max<uint64_t>(largest, uint64_t {region.imageExtent.width} *
+			                                          region.imageExtent.height * bytes);
+			regions.push_back(region);
+			column = end;
+		}
+	}
+	if (regions.empty()) {
+		return;
+	}
+	// One passing-depth source for every region (each reads it from its start).
+	const uint64_t source_size = Common::AlignUp(largest, uint64_t {4});
+	auto           source      = std::make_shared<Buffer>(
+        m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+        vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc, source_size);
+	const uint32_t empty_word =
+	    bytes == 2u ? (empty >= 1.0f ? 0xffffffffu : 0u) : std::bit_cast<uint32_t>(empty);
+	source->Fill(0, source_size, empty_word);
+	image.Upload(regions, source->Handle(), 0, source_size);
+	m_scheduler.DeferOperation([source] {});
+	image.sparse_checked_serial = image.ContentSerial();
+	static std::mutex                   logged_mutex;
+	static std::unordered_set<uint64_t> logged;
+	std::lock_guard                     logged_lock(logged_mutex);
+	if (logged.size() < 32 &&
+	    logged.insert(info.data.address ^ (uint64_t {width} << 40u) ^ (holes << 20u)).second) {
+		LOGF("Sparse depth: 0x%012" PRIx64 " %ux%u: %" PRIu64 " of %" PRIu64
+		     " 64 KB blocks unmapped, reset to depth %.1f (%zu regions; KYTY_SPARSE_HOLES)\n",
+		     info.data.address, width, height, holes, blocks, static_cast<double>(empty),
+		     regions.size());
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -7775,6 +8215,8 @@ void TextureCache::InvalidateCleanImageProofs(uint64_t address, uint64_t size,
 }
 
 void TextureCache::MarkImageGpuModified(Image& image) {
+	// KYTY_GUEST_HASH_IMAGES_KB: the GPU's pixels from now on, not the guest bytes an upload took.
+	image.content_hash_valid = false;
 	if (HangTrace::CpWatch(image.info.data.address, image.info.data.size)) {
 		HangTrace::CpEvent event;
 		event.event   = "gpuwrite-image";

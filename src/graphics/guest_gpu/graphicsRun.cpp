@@ -1943,6 +1943,8 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::FlipPreparation:
+			// KYTY_NAN_SCRUB (default off): one light-probe array a frame end.
+			m_renderer.GetTextureCache().RunNanScrub();
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;

@@ -219,7 +219,27 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// The guest bytes of a range, staged for an image upload whatever buffer covers them (the
+	// caller knows the GPU wrote none of them; ObtainBufferForImage copies from such a buffer).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageGuestBytesForImage(uint64_t vaddr, uint64_t size);
+	// KYTY_PENDING_FILLS=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 bdab60022): a
+	// GPU fill (FillBuffer's GPU path, or a compute shader's uniform fill, both recorded as known
+	// fills) that found no image still holds for its range, the bytes of it that were not mapped
+	// then among them: a render or depth target created later inside it starts as the fill
+	// (TextureCache::ClearFromKnownFill) instead of what its memory holds then.
+	[[nodiscard]] static bool PendingFillsEnabled();
+	// GPU thread, for a target made over [vaddr, vaddr + size): the dword of the known fill that
+	// holds all of it, when the mapped bytes of it are all still GPU-written. `take` forgets the
+	// range from the fill, which keeps the rest of it for other images.
+	[[nodiscard]] bool FillOfNewImage(uint64_t vaddr, uint64_t size, uint32_t& value, bool take);
+	// KYTY_PENDING_FILLS: a write over [vaddr, vaddr + size) the other paths do not see (an image's
+	// GPU write, a CPU-path fill or copy), newer than the fills there.
+	void ForgetFillsUnder(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// GPU thread, KYTY_SPARSE_FILLS: a GPU fill of the mapped `spans` of a range with holes in its
+	// mappings (a compute shader's fill of sparse memory), as the hardware's writes land there;
+	// the holes, where the hardware drops the writes, are left alone.
+	void FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans, uint32_t value);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
 	// at its position in the GPU timeline and returns true; false leaves it to the CPU write.
 	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);
@@ -684,7 +704,22 @@ private:
 	// image: another thread's read made them current between the fault and now. The access then
 	// needs nothing (a write only its CPU-dirty transition), instead of a download of the window's
 	// other GPU-written ranges that it waits for. False when the switch is off.
+	// With KYTY_FAULT_PAGE_LIFT=1 also true when TryLiftFaultPages lifted the pages.
 	[[nodiscard]] bool FaultPagesCurrent(uint64_t page_begin, uint64_t page_end);
+	// KYTY_FAULT_PAGE_LIFT=1 (default off; adapted from usa-ratt/KytyPS5-GT7 6f3465806), GPU
+	// thread: the faulting pages are still protected as GPU-written but hold no GPU-written bytes,
+	// no bytes of a readback or publication still to land, no GPU-written image, and no address-
+	// writing shader is still running. Their protection is lifted (UnmarkRegionAsGpuModified)
+	// without a download, and true is returned. Without it the fault copies the window's other
+	// GPU-written ranges and waits for their writer.
+	[[nodiscard]] bool TryLiftFaultPages(uint64_t page_begin, uint64_t page_end);
+	// KYTY_CLEAN_READ=1 (default off; adapted from usa-ratt/KytyPS5-GT7 19b6c5cfb), GPU thread: a
+	// guest load of [vaddr, vaddr + size) faulted on a page protected because the GPU wrote other
+	// bytes of it. When none of these bytes is GPU-written, on its way back from the GPU (pending
+	// publication, early release), in a GPU-written image, or within reach of a running address-
+	// writing shader, copies them from guest memory into `data` and returns true: the fault
+	// handler completes the load with them and the page stays protected.
+	[[nodiscard]] bool TryReadCleanBytes(uint64_t vaddr, uint64_t size, void* data);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
