@@ -1335,6 +1335,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		split.emplace();
 		const bool parsed = CallSplit::DecodeHeader(
 		    std::span(code).subspan(first.secondary_offset, first.word_count - 1u), split->header);
+		// CallSplitPlan BuildCode: header, then for a resume program (entry site k) one S_BRANCH, then
+		// the canonical guest code. Callee programs carry no S_GETPC_B64 (ExpandShaderCalls turns
+		// each into moves of its guest value), so the offset only matters for the others.
+		split->guest_pc_offset =
+		    (first.word_count + (split->header.entry_site != 0u ? 1u : 0u)) * static_cast<uint32_t>(sizeof(uint32_t));
 		for (const auto& inst: decoded.instructions) {
 			if (inst.opcode != Decoder::Opcode::S_KYTY_CALL_STATE) continue;
 			const auto op = static_cast<Decoder::CallStateOp>(inst.offset);

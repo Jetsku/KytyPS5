@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CallSplit.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
@@ -275,9 +276,14 @@ void Translator::S_INST_PREFETCH() {
 }
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
+	// In a call-split program the guest code sits behind the split header: the guest pc is the
+	// program pc minus that prefix (CallSplit::Translation::guest_pc_offset).
+	uint64_t pc = inst.pc;
+	if (const auto* split = CallSplit::Current(); split != nullptr && pc >= split->guest_pc_offset) {
+		pc -= split->guest_pc_offset;
+	}
 	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
-	const auto address = IR::U64(
-	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	const auto address = IR::U64(ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(pc + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}
