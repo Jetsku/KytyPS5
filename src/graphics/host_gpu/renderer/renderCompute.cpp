@@ -66,6 +66,18 @@ namespace Libs::Graphics {
 static std::atomic<uint64_t> g_overlap_direct {0}, g_overlap_pairs {0}, g_overlap_taken {0},
     g_overlap_indirect {0}, g_overlap_empty_indirect {0};
 static Live::Switch g_skip_empty_indirect("KYTY_SKIP_EMPTY_INDIRECT", Live::ParseDefaultOn);
+// KYTY_INDIRECT_THREADS_GPU=1 (default off, live; GT7 fork 633e00962): DISPATCH_INDIRECT with the
+// thread-dimension initiator carries thread counts, not workgroup counts. The command processor
+// reads them on the CPU and dispatches directly, but the previous dispatch usually writes them on
+// the GPU, so each read drains the GPU. With the switch the dispatch stays indirect: the dispatch
+// guard's pass (dispatchGuard.h) converts the counts to workgroup counts on the GPU and keeps a copy
+// of the thread counts, which the shader reads through a device address to bound its lanes
+// (ShaderComputeInputInfo::dispatch_dimensions_indirect).
+static Live::Switch g_indirect_threads_gpu("KYTY_INDIRECT_THREADS_GPU", Live::ParseDefaultOff);
+
+bool RenderExecutor::IndirectThreadsOnGpu() {
+	return g_indirect_threads_gpu.On();
+}
 static std::atomic<int64_t> g_overlap_last_print_ns {0};
 
 // KYTY_DISPATCH_TRACE=<hash>[,<hash>...] or all (hexadecimal guest shader hashes, diagnostic): logs the
@@ -474,9 +486,125 @@ static bool TryFillMappedParts(RenderContext& context, const ShaderComputeInputI
 	return true;
 }
 
+// KYTY_PATTERN_FILLS=1 (default off; GT7 fork 83707d403): the SDK's buffer fill compute shader is
+// recognized from its guest code (compared once a program) instead of only by GT7's hash
+// (KYTY_STENCIL_PLANE_FILL_CLEAR). With 64 threads a group, invocation i stores pattern[i & 3]
+// (user data s4..s7) to element i of the V# in s[0:3] while i < s8, with buffer_store_format_x;
+// each invocation picks its word with v_movrels, which keeps it out of AnalyzeUniformFill. A fill
+// of one word whose range is exactly an image's memory clears that image on the GPU
+// (ClearImageFromBuffer; a stencil plane needs KYTY_STENCIL_PLANE_FILL_CLEAR too).
+constexpr std::array<uint32_t, 23> SdkPatternFillCode {
+    0xbfa00001u,              // s_inst_prefetch 0x1
+    0xd7460004u, 0x04010c09u, // v_lshl_add_u32 v4, s9, 6, v0
+    0x7e000204u,              // v_mov_b32 v0, s4
+    0x7e020205u,              // v_mov_b32 v1, s5
+    0x7e040206u,              // v_mov_b32 v2, s6
+    0x7e060207u,              // v_mov_b32 v3, s7
+    0x7da80808u,              // v_cmpx_gt_u32 s8, v4
+    0xbf88000du,              // s_cbranch_execz (to s_endpgm)
+    0x360a0883u,              // v_and_b32 v5, 3, v4
+    0xbe84047eu,              // s_mov_b64 s[4:5], exec
+    0xbe86047eu,              // s_mov_b64 s[6:7], exec
+    0x7e100505u,              // v_readfirstlane_b32 s8, v5
+    0x7da40a08u,              // v_cmpx_eq_u32 s8, v5
+    0xbefc0308u,              // s_mov_b32 m0, s8
+    0x7e0c8700u,              // v_movrels_b32 v6, v0
+    0x8a867e06u,              // s_andn2_b64 s[6:7], s[6:7], exec
+    0xbefe0406u,              // s_mov_b64 exec, s[6:7]
+    0xbf85fff9u,              // s_cbranch_scc1 (to v_readfirstlane_b32)
+    0xbefe0404u,              // s_mov_b64 exec, s[4:5]
+    0xe0102000u, 0x80000604u, // buffer_store_format_x v6, v4, s[0:3], 0 idxen
+    0xbf810000u,              // s_endpgm
+};
+
+static bool PatternFillsOn() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PATTERN_FILLS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Whether the guest code at `code_address` (the program `shader_hash` was made from) is the SDK's
+// pattern fill: compared once a program.
+static bool IsSdkPatternFillCode(uint64_t shader_hash, uint64_t code_address) {
+	static std::mutex                         mutex;
+	static std::unordered_map<uint64_t, bool> checked;
+	std::scoped_lock                          lock(mutex);
+	if (const auto found = checked.find(shader_hash); found != checked.end()) {
+		return found->second;
+	}
+	std::array<uint32_t, SdkPatternFillCode.size()> code {};
+	const bool match = code_address != 0 &&
+	                   LibKernel::Memory::TryReadBacking(code_address, code.data(), sizeof(code)) &&
+	                   code == SdkPatternFillCode;
+	if (checked.size() < 65536) {
+		checked.emplace(shader_hash, match);
+	}
+	if (match) {
+		LOGF("Dispatch: cs %016" PRIx64 " at 0x%012" PRIx64
+		     " is the SDK's pattern fill (KYTY_PATTERN_FILLS): a fill of one word clears the image "
+		     "whose memory it fills\n",
+		     shader_hash, code_address);
+	}
+	return match;
+}
+
+// The SDK's pattern fill of one word in this dispatch: its address, byte size and word (as the
+// fork's ResolveSdkPatternFill: the first min(s8, invocations, records) dwords of a plain dword
+// array bounded by index, a one-dimensional dispatch of 64-thread groups).
+static bool ResolveSdkPatternFill(const ShaderComputeInputInfo& input, uint64_t code_address,
+                                  uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                  uint32_t mode, uint64_t& address, uint64_t& size,
+                                  uint32_t& word) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	// Its one buffer is stored to and never read; s9 is the group's index (after 9 user SGPRs).
+	if (!PatternFillsOn() || code_address == 0 || program.info.buffers.size() != 1 ||
+	    resources.buffers.size() != 1 || !program.info.buffers[0].written ||
+	    program.info.buffers[0].read || program.info.buffers[0].atomic ||
+	    !program.info.images.empty() || program.user_data_base != 0 ||
+	    resources.user_data.size() < 9 || input.workgroup_register != 9 || !input.group_id[0] ||
+	    input.threads_num[0] != 64 || input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || group_x == 0 || group_y != 1 ||
+	    group_z != 1) {
+		return false;
+	}
+	const auto& user = resources.user_data;
+	if (user[5] != user[4] || user[6] != user[4] || user[7] != user[4]) {
+		return false; // a pattern of more than one word
+	}
+	const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[0]);
+	// The V# bound for its store is the one in s[0:3].
+	ShaderBufferResource user_vsharp {};
+	std::copy_n(user.begin(), 4, user_vsharp.fields);
+	const auto format = descriptor.Format();
+	if (user_vsharp.Base48() != descriptor.Base48() || user_vsharp.Stride() != descriptor.Stride() ||
+	    user_vsharp.NumRecords() != descriptor.NumRecords() ||
+	    user_vsharp.RawFormat() != descriptor.RawFormat() || descriptor.Stride() != 4 ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    descriptor.Base48() == 0 || descriptor.OutOfBounds() > 1 || descriptor.Type() != 0 ||
+	    (format != Prospero::BufferFormat::k32UInt && format != Prospero::BufferFormat::k32SInt &&
+	     format != Prospero::BufferFormat::k32Float)) {
+		return false;
+	}
+	const uint64_t elements = std::min(
+	    {uint64_t {user[8]}, uint64_t {group_x} * 64u, uint64_t {descriptor.NumRecords()}});
+	if (elements == 0 || elements * 4u > UINT32_MAX ||
+	    !GuestRange {descriptor.Base48(), elements * 4u}.Valid() ||
+	    !IsSdkPatternFillCode(program.shader_hash, code_address)) {
+		return false;
+	}
+	address = descriptor.Base48();
+	size    = elements * 4u;
+	word    = user[4];
+	return true;
+}
+
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                 CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+                                                uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                                uint64_t code_address) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -540,6 +668,23 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			if (MetaTraceAddress() == pattern_buffer.Base48() && MetaTraceLine()) {
 				LOGF("MetaTrace: pattern fill 0x%" PRIx64 " size 0x%" PRIx64 " value 0x%08x: image clear\n",
 				     pattern_buffer.Base48(), bytes, resources.user_data[4]);
+			}
+			return true;
+		}
+	}
+	// KYTY_PATTERN_FILLS: the same SDK fill shader recognized from its code, in any title.
+	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::None) {
+		uint64_t pattern_address = 0;
+		uint64_t pattern_size    = 0;
+		uint32_t pattern_word    = 0;
+		if (ResolveSdkPatternFill(input, code_address, group_x, group_y, group_z, mode,
+		                          pattern_address, pattern_size, pattern_word) &&
+		    cache.ClearImageFromBuffer(command, pattern_address, pattern_size, pattern_word)) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("Dispatch: the SDK's pattern fill 0x%012" PRIx64 "+0x%" PRIx64
+				     " with 0x%08x clears an image (KYTY_PATTERN_FILLS)\n",
+				     pattern_address, pattern_size, pattern_word);
 			}
 			return true;
 		}
@@ -847,7 +992,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		return;
 	}
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
+	                                thread_group_z, mode, cs_regs.cs_regs.data_addr)) {
 		ResetBindings();
 		return;
 	}
@@ -1161,8 +1306,10 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	KYTY_GPU_OP_SITE("dispatch.indirect");
 	g_overlap_indirect.fetch_add(1, std::memory_order_relaxed);
 	const CpGaps::Scope gap(CpGaps::Cat::DispatchOp);
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	// KYTY_INDIRECT_THREADS_GPU: the arguments are thread counts (the command processor sends these
+	// here only with the switch on).
+	const bool thread_counts = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopReadyOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -1175,7 +1322,9 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
+	input_info.async_compute                = async_compute;
+	input_info.dispatch_thread_dimensions   = thread_counts;
+	input_info.dispatch_dimensions_indirect = thread_counts;
 	CpGaps::Phase(CpGaps::Cat::DispatchProgram);
 	ShaderProgram compute_program;
 	// KYTY_DRAW_PREP_DISPATCH (drawPrep.h): as in DispatchDirect, from no workgroup counts.
@@ -1194,7 +1343,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	if (step != nullptr) {
 		PipelineCache::SelectCallSplitCode(step->code);
 	}
-	if (step == nullptr && prepared != nullptr && !async_compute &&
+	if (step == nullptr && prepared != nullptr && !async_compute && !thread_counts &&
 	    DrawPrep::ValidateDispatch(*prepared, input_info)) {
 		if (DrawPrep::VerifyMode() != 0) {
 			auto serial_prep = std::make_unique<PipelineCache::StagePrep>();
@@ -1221,6 +1370,15 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 			input_info.workgroup_counts[0] = args.x;
 			input_info.workgroup_counts[1] = args.y;
 			input_info.workgroup_counts[2] = args.z;
+			if (thread_counts) {
+				const uint32_t local[3] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+				                           cs_regs.cs_regs.num_thread_z};
+				for (uint32_t i = 0; i < 3u; i++) {
+					const auto threads = input_info.workgroup_counts[i];
+					input_info.workgroup_counts[i] =
+					    threads == 0 ? 0u : (threads - 1u) / std::max(local[i], 1u) + 1u;
+				}
+			}
 			return true;
 		};
 		bool counts_read = false;
@@ -1342,11 +1500,21 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	DispatchGuard::Slot guard_slot {};
-	if (DispatchGuard::Enabled()) {
+	const bool          guard_checks = DispatchGuard::Enabled();
+	if (guard_checks || thread_counts) {
 		if (m_dispatch_guard == nullptr) {
 			m_dispatch_guard = std::make_unique<DispatchGuard>(m_context);
 		}
 		guard_slot = m_dispatch_guard->Reserve();
+	}
+	if (thread_counts && program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		// KYTY_INDIRECT_THREADS_GPU: the dispatch-thread dwords hold the address of the slot's copy
+		// of the thread counts (written by the guard pass below), which bounds the lanes.
+		const auto threads = m_dispatch_guard->SlotThreads(guard_slot);
+		const auto dword   = program.bindings.dispatch_thread_dword;
+		bindings.shader_data[dword]      = static_cast<uint32_t>(threads);
+		bindings.shader_data[dword + 1u] = static_cast<uint32_t>(threads >> 32u);
+		bindings.shader_data[dword + 2u] = 0u;
 	}
 	RebindBuffers(bindings);
 	// KYTY_REBIND_AFTER_JOIN: the bindings' lookups joined the argument buffer (or one another's).
@@ -1368,8 +1536,14 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	vk::Buffer dispatch_buffer = args_buffer->Handle();
 	uint64_t   dispatch_offset = args_offset;
 	if (guard_slot.buffer) {
+		std::array<uint32_t, 3> local_size {0, 0, 0};
+		if (thread_counts) {
+			local_size = {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+			              std::max(cs_regs.cs_regs.num_thread_y, 1u),
+			              std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+		}
 		m_dispatch_guard->Record(buffer, guard_slot, args_buffer->Handle(), args_offset,
-		                         program.shader_hash);
+		                         program.shader_hash, local_size, guard_checks);
 		dispatch_buffer = guard_slot.buffer;
 		dispatch_offset = guard_slot.offset;
 	}

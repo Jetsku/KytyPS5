@@ -261,6 +261,50 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	// KYTY_DROP_RELEASED (memory.cpp; GT7 fork 7717116d8): gives the host memory behind
+	// [backing_offset, +size) back to the system. The guest released it, so its contents are no
+	// longer needed (a later direct allocation reads undefined bytes, as on the console; flexible
+	// allocations zero theirs, ZeroRange). Committed pages stay committed;
+	// Windows only drops them from RAM (DiscardVirtualMemory, or a working-set trim where that is
+	// refused). Returns the bytes handed back.
+	uint64_t DropRange(uint64_t backing_offset, uint64_t size) {
+		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
+			return 0;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		using discard_func_t      = DWORD(WINAPI*)(PVOID, SIZE_T);
+		static const auto discard = reinterpret_cast<discard_func_t>(
+		    GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory"));
+		std::lock_guard lock(m_mutex);
+		uint64_t        dropped = 0;
+		const auto      end     = backing_offset + size;
+		while (backing_offset < end) {
+			MEMORY_BASIC_INFORMATION info {};
+			auto* current = m_backing_base + backing_offset;
+			if (VirtualQuery(current, &info, sizeof(info)) != sizeof(info)) {
+				break;
+			}
+			const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+			const auto bytes =
+			    std::min(end - backing_offset, region_end - reinterpret_cast<uint64_t>(current));
+			if (bytes == 0) {
+				break;
+			}
+			// Reserved (never committed, KYTY_GUEST_BACKING_LAZY_COMMIT) pages hold nothing.
+			if (info.State == MEM_COMMIT) {
+				if (discard == nullptr || discard(current, bytes) != ERROR_SUCCESS) {
+					(void)VirtualUnlock(current, bytes);
+				}
+				dropped += bytes;
+			}
+			backing_offset += bytes;
+		}
+		return dropped;
+#else
+		return 0;
+#endif
+	}
+
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
@@ -1245,6 +1289,10 @@ public:
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);
+	}
+
+	uint64_t DropBacking(uint64_t backing_offset, uint64_t size) {
+		return m_backing->DropRange(backing_offset, size);
 	}
 
 	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {

@@ -437,6 +437,9 @@ private:
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
+	// KYTY_GPU_INSTANCE_COUNT: the guest address of the instance count NumInstances would read
+	// when the newest pending native indirect draw decides it alone (no count buffer), else 0.
+	[[nodiscard]] uint64_t GpuInstanceCountAddress() const;
 	// Draw-prep (drawPrep.h): the engine of the graphics processor, created on first use when
 	// KYTY_DRAW_PREP (or the S0 histogram) is enabled; null otherwise.
 	[[nodiscard]] DrawPrep::Engine* DrawPrepEngine();

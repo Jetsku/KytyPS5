@@ -63,9 +63,10 @@ namespace Libs::Graphics {
 
 namespace {
 
-// KYTY_WIDE_FILL_CLEAR=1 (default off, live): see the fill-to-clear conversion below.
+// KYTY_WIDE_FILL_CLEAR=1 or 2 (default off, live): see the fill-to-clear conversion below.
 Live::Switch g_wide_fill_clear("KYTY_WIDE_FILL_CLEAR", [](const char* value) -> int64_t {
-	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
+	if (value == nullptr) return 0;
+	return std::strcmp(value, "1") == 0 ? 1 : std::strcmp(value, "2") == 0 ? 2 : 0;
 });
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
@@ -6707,11 +6708,13 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
 		// KYTY_WIDE_FILL_CLEAR (default off, live): a fill of an image with 64- or 128-bit texels is a clear
 		// too; otherwise only a zero RGBA16F fill and the 32-bit formats are.
-		const bool wide_fill = g_wide_fill_clear.Get() != 0;
+		// KYTY_WIDE_FILL_CLEAR=2 (GT7 fork 83707d403): the fill words of more formats (DecodeFillWord).
+		const auto wide_fill = g_wide_fill_clear.Get();
 		// KYTY_10_11_11_RED: the fill word is in the guest's layout.
 		const auto host_clear = GuestColorWordToHost(packed_clear, image.info.GetColorTransform());
-		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
-		                : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
+		if (!(wide_fill == 2   ? DecodeFillWord(image.info.pixel_format, host_clear, clear.color)
+		      : wide_fill == 1 ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
+		                       : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
 			return false;
 		}
 	} else {

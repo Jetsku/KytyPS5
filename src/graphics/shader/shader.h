@@ -237,6 +237,10 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	// Last before the runtime field: the fields above keep the offsets older shader journals and
 	// pipeline lists stored.
 	bool               async_compute              = false;
+	// KYTY_INDIRECT_THREADS_GPU: a thread-dimension DISPATCH_INDIRECT whose thread counts the
+	// shader reads from GPU memory; the dispatch-thread shader data dwords hold their device
+	// address instead of the counts. In the padding before the runtime field (stored size kept).
+	bool               dispatch_dimensions_indirect = false;
 	ShaderStageRuntime stage;
 };
 

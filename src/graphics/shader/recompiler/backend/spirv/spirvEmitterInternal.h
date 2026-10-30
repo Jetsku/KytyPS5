@@ -295,6 +295,9 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);
+// KYTY_INDIRECT_THREADS_GPU: a thread-dimension compute dispatch whose counts the shader reads
+// from GPU memory (ShaderComputeInputInfo::dispatch_dimensions_indirect).
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
 uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);

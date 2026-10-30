@@ -16979,6 +16979,8 @@ public:
       uint32_t mode;
       uint32_t expected_threads;
       bool transfer = false;
+      // KYTY_INDIRECT_THREADS_GPU on: thread counts converted on the GPU (GT7 fork 633e00962).
+      bool threads_gpu = false;
     };
     constexpr std::array cases{
         DispatchCase{{2, 1, 1}, 0x41u, 8},
@@ -16987,6 +16989,12 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        DispatchCase{{6, 1, 1}, 0x61u, 6, false, true},
+        DispatchCase{{0, 1, 1}, 0x61u, 0, false, true},
+    };
+    const auto set_threads_gpu = [](bool on) {
+      Live::Testing::StageText(on ? "KYTY_INDIRECT_THREADS_GPU=1\n" : "KYTY_INDIRECT_THREADS_GPU=\n");
+      Live::OnCpFlip();
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -17100,6 +17108,10 @@ public:
                              .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
+        set_threads_gpu(test.threads_gpu);
+        Require(name, "thread-count switch",
+                Libs::Graphics::RenderExecutor::IndirectThreadsOnGpu() == test.threads_gpu,
+                "KYTY_INDIRECT_THREADS_GPU did not follow the live change");
         const auto tick = scheduler.CurrentTick();
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),
@@ -17114,6 +17126,11 @@ public:
           Require(name, "offset indirect packet",
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
+        }
+        set_threads_gpu(false);
+        if (test.threads_gpu) {
+          Require(name, "asynchronous thread-count dispatch", scheduler.CurrentTick() == tick,
+                  "thread-count arguments caused a host submission or readback");
         }
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
@@ -22058,6 +22075,45 @@ public:
               DecodeColorDwordFill(vk::Format::eR32G32Sfloat, 0x3f800000u, clear) &&
                   clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,
               "a repeated DWORD fill was decoded as a two-register clear");
+      // KYTY_WIDE_FILL_CLEAR=2 (GT7 fork 83707d403): fill words of more formats.
+      Require(name, "R8 fill word",
+              DecodeFillWord(vk::Format::eR8Uint, 0x07070707u, clear) && clear.uint32[0] == 7u &&
+                  !DecodeFillWord(vk::Format::eR8Uint, 0x07070708u, clear),
+              "an R8 fill word was not decoded by its repeated byte");
+      Require(name, "RG8 fill word",
+              DecodeFillWord(vk::Format::eR8G8Uint, 0x02010201u, clear) && clear.uint32[0] == 1u &&
+                  clear.uint32[1] == 2u && !DecodeFillWord(vk::Format::eR8G8Uint, 0x02010203u, clear),
+              "an R8G8 fill word was not decoded by its repeated half-word");
+      Require(name, "RG16 fill word",
+              DecodeFillWord(vk::Format::eR16G16Uint, 0x00050003u, clear) && clear.uint32[0] == 3u &&
+                  clear.uint32[1] == 5u,
+              "an R16G16 fill word was not decoded per channel");
+      Require(name, "RGBA16 unorm fill word",
+              DecodeFillWord(vk::Format::eR16G16B16A16Unorm, 0xffff0000u, clear) &&
+                  clear.float32[0] == 0.0f && clear.float32[1] == 1.0f && clear.float32[2] == 0.0f &&
+                  clear.float32[3] == 1.0f,
+              "an RGBA16 unorm fill word did not repeat its two channels");
+      Require(name, "RGBA8 uint fill word",
+              DecodeFillWord(vk::Format::eR8G8B8A8Uint, 0x04030201u, clear) && clear.uint32[0] == 1u &&
+                  clear.uint32[3] == 4u,
+              "an RGBA8 uint fill word was not decoded per byte");
+      Require(name, "half fill words",
+              DecodeFillWord(vk::Format::eR16G16Sfloat, 0xbc003c00u, clear) &&
+                  clear.float32[0] == 1.0f && clear.float32[1] == -1.0f &&
+                  !DecodeFillWord(vk::Format::eR16G16Sfloat, 0x00013c00u, clear) &&
+                  !DecodeFillWord(vk::Format::eR16G16B16A16Sfloat, 0x7c003c00u, clear),
+              "half fill words with denormals or infinities were cleared, or normal ones not");
+      Require(name, "float fill words",
+              DecodeFillWord(vk::Format::eR32Sfloat, 0x3f800000u, clear) && clear.float32[0] == 1.0f &&
+                  !DecodeFillWord(vk::Format::eR32Sfloat, 0x00000001u, clear) &&
+                  !DecodeFillWord(vk::Format::eR32G32B32A32Sfloat, 0x7fc00000u, clear),
+              "float fill words with denormals or NaNs were cleared, or normal ones not");
+      Require(name, "zero fill word",
+              DecodeFillWord(vk::Format::eA1R5G5B5UnormPack16, 0u, clear) &&
+                  !DecodeFillWord(vk::Format::eA1R5G5B5UnormPack16, 1u, clear) &&
+                  !DecodeFillWord(vk::Format::eBc1RgbaUnormBlock, 0u, clear) &&
+                  !DecodeFillWord(vk::Format::eD32Sfloat, 0u, clear),
+              "a zero fill word of an uncompressed color format was not a clear, or another was");
     }
     struct UintCase {
       vk::Format format;

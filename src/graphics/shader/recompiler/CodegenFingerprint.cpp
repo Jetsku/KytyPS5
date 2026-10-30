@@ -154,6 +154,15 @@ std::vector<uint8_t> CodegenFingerprint() {
 		b.Text("indirect_format_count");
 		b.Text(std::to_string(Spirv::IndirectFormatCountAddress()));
 	}
+	// KYTY_COHERENT_LOAD_MODE / _ACQUIRE: coherent loads made otherwise than as plain loads.
+	if (const auto mode = Spirv::GetCoherentLoadMode(); mode != Spirv::CoherentLoadMode::Plain) {
+		b.Text("coherent_load");
+		b.Text(Spirv::CoherentLoadModeName(mode));
+	}
+	// KYTY_MESH_LAYER: mesh modules without their Layer output.
+	if (Spirv::GetHostMeshLayerDrop()) {
+		b.Text("mesh_layer_drop");
+	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}

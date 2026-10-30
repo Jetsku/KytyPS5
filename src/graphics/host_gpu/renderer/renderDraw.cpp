@@ -76,6 +76,19 @@
 
 namespace Libs::Graphics {
 
+// KYTY_GPU_INSTANCE_COUNT=1 (default off, live; GT7 fork dcac2bb4f): a draw without its own
+// instance count inherits the one a native indirect draw left in GPU memory. The command processor
+// read it there (NumInstances), which drains the GPU; with the switch, when the newest native
+// indirect draw decides the count alone, a vertex-pipeline draw becomes a one-record indirect draw
+// whose instance count the GPU copies from the guest record. Mesh pipelines and quad lists still
+// read it on the CPU.
+static Live::Switch g_gpu_instance_count("KYTY_GPU_INSTANCE_COUNT", Live::ParseDefaultOff);
+static std::atomic<uint64_t> g_gpu_instance_draws {0};
+
+bool RenderExecutor::GpuInstanceCountEnabled() {
+	return g_gpu_instance_count.On();
+}
+
 static bool MeshRestartEnabled() {
 	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
 	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
@@ -1319,6 +1332,9 @@ struct DrawEmitInfo {
 	// (meshIndirect.h) with these inputs.
 	bool                 mesh_indirect = false;
 	MeshIndirect::Inputs mesh_inputs;
+	// KYTY_GPU_INSTANCE_COUNT: nonzero, a vertex-pipeline draw whose instance count the GPU
+	// copies from this guest dword into a one-record indirect draw (draw.instance_count unused).
+	uint64_t gpu_instance_address = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -4401,6 +4417,9 @@ static CommitStats::DrawShape MakeCommitShape(
 	}
 	words.Add(draw.index_count);
 	words.Add(draw.instance_count);
+	// KYTY_GPU_INSTANCE_COUNT: instance_count is a placeholder; the GPU reads the count there.
+	words.Add(static_cast<uint32_t>(emit.gpu_instance_address));
+	words.Add(static_cast<uint32_t>(emit.gpu_instance_address >> 32u));
 	words.Add(static_cast<uint32_t>(emit.vertex_offset));
 	words.Add(emit.first_vertex);
 	words.Add(emit.first_instance);
@@ -4753,6 +4772,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto* indirect = emit.indirect;
 	EXIT_IF(indirect != nullptr && mesh_active && !mesh_indirect);
+	EXIT_IF(emit.gpu_instance_address != 0 && (mesh_active || indirect != nullptr));
+	if (emit.gpu_instance_address != 0) {
+		// Acquired before the bindings resolve, as the indirect records below.
+		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_instance_address, sizeof(uint32_t),
+		                                              false);
+	}
 	if (indirect != nullptr) {
 		// ObtainBuffer can merge cache buffers, which must not retire buffers that the shader
 		// bindings below already resolved. Acquire the argument, count and whole index ranges
@@ -4850,6 +4875,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (indirect != nullptr) {
 		indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
 	}
+	// KYTY_GPU_INSTANCE_COUNT: a one-record indirect draw in the stream ring with the known counts
+	// and offsets (still preparation: the ring may wait here); the GPU copies the instance count in
+	// right before the draw.
+	vk::Buffer     instance_record        = nullptr;
+	vk::DeviceSize instance_record_offset = 0;
+	if (emit.gpu_instance_address != 0) {
+		auto&          stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		const uint32_t record[5] {draw.index_count, 0u,
+		                          draw.IsIndexed() ? 0u : emit.first_vertex,
+		                          draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                                           : emit.first_instance,
+		                          emit.first_instance};
+		instance_record        = stream.Handle();
+		instance_record_offset = stream.Copy(record, draw.IsIndexed() ? 20u : 16u, 16u);
+	}
 	CommitStats::StepMark(CommitStats::Step::IndexPrepare);
 	CommitStats::Mark(CommitStats::Phase::VertexIndex);
 	if (draw.IsIndexed()) {
@@ -4862,8 +4902,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// bindings, which are made again after it (their reservations follow the image identities).
 	// KYTY_DRAW_RUN_INDIRECT: an indirect continuation also needs the argument barrier of this
 	// rendering instance (recording one ends rendering, which a continuation never does).
+	// KYTY_GPU_INSTANCE_COUNT: its copy ends rendering too.
 	const bool run_indirect_barrier =
-	    indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering;
+	    (indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering) ||
+	    instance_record;
 	// KYTY_DRAW_RUN_TARGETS: kept targets whose attachments changed during the buffer work are
 	// resolved now, with the same repeated binding work as a continuation's fallback.
 	const bool targets_late = m_run_targets_kept &&
@@ -5240,6 +5282,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x400u);
 	}
+	// KYTY_GPU_INSTANCE_COUNT: the GPU copies the instance count into the prepared record (outside
+	// rendering).
+	if (instance_record) {
+		const auto [source, source_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    emit.gpu_instance_address, sizeof(uint32_t), false);
+		EXIT_IF(source == nullptr);
+		m_context.GetCommandScheduler().EndRendering();
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllCommands,
+		                            vk::AccessFlagBits2::eMemoryWrite,
+		                            vk::PipelineStageFlagBits2::eCopy,
+		                            vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+		                            BarrierOrigin::IndirectArgs);
+		const vk::BufferCopy copy {source_offset, instance_record_offset + sizeof(uint32_t),
+		                           sizeof(uint32_t)};
+		buffer.Sink().copyBuffer(source->Handle(), instance_record, 1, &copy);
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eCopy,
+		                            vk::AccessFlagBits2::eTransferWrite,
+		                            vk::PipelineStageFlagBits2::eDrawIndirect,
+		                            vk::AccessFlagBits2::eIndirectCommandRead,
+		                            BarrierOrigin::IndirectArgs);
+		g_gpu_instance_draws.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (indirect != nullptr) {
 		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
 		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
@@ -5357,6 +5421,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	} else if (indirect != nullptr) {
 		EmitIndirectDraw(vk_buffer, *indirect, indirect_buffers);
+	} else if (instance_record) {
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(instance_record, instance_record_offset, 1, 20u);
+		} else {
+			vk_buffer.drawIndirect(instance_record, instance_record_offset, 1, 16u);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -5615,6 +5685,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
+// KYTY_GPU_INSTANCE_COUNT: the inherited instance count read on the CPU after all (mesh pipelines,
+// quad lists), synchronizing its GPU write; 0 when it cannot be read.
+static uint32_t ReadInheritedInstances(RenderContext& context, uint64_t address) {
+	uint32_t instances = 0;
+	if (!context.SynchronizeGpuBackingForRead(address, sizeof(instances)) ||
+	    !LibKernel::Memory::TryReadBacking(address, &instances, sizeof(instances))) {
+		return 0;
+	}
+	return instances;
+}
+
+// KYTY_GPU_INSTANCE_COUNT: whether a draw inheriting its instance count reads it on the GPU (vertex
+// pipelines, primitive types drawn with one command, not a depth-to-colour copy).
+static bool GpuInstanceCountApplies(CommandBuffer& buffer, const HW::UserConfig& ucfg,
+                                    const DrawRenderState& state) {
+	return state.vertex_info[0].stage.program->stage != ShaderType::Mesh &&
+	       ucfg.GetPrimType() != Prospero::PrimitiveType::kQuadListLegacy &&
+	       !buffer.GetRegisters().GetRenderControl().copy_depth_to_color;
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_GPU_OP_SITE("draw.index");
@@ -5722,6 +5812,17 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	// KYTY_GPU_INSTANCE_COUNT: the inherited instance count, on the GPU or read here after all.
+	uint64_t gpu_instance_address = args.gpu_instance_address;
+	if (gpu_instance_address != 0 && !GpuInstanceCountApplies(buffer, ucfg, state)) {
+		draw.instance_count  = ReadInheritedInstances(m_context, gpu_instance_address);
+		gpu_instance_address = 0;
+		if (draw.instance_count == 0) {
+			m_mrt_split_slots = 0;
+			ResetBindings();
+			return;
+		}
+	}
 
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source,
 	    MeshRestartEnabled() && state.vertex_info[0].stage.program->stage == ShaderType::Mesh);
@@ -5767,6 +5868,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	emit.gpu_instance_address = gpu_instance_address;
 
 	CommitStats::StepMark(CommitStats::Step::Restart);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
@@ -5854,7 +5956,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	RunDrawChecks(buffer, ucfg, m_binding_plan);
 	CommitStats::StepMark(CommitStats::Step::DrawChecks);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
@@ -5875,6 +5977,17 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
+	}
+	// KYTY_GPU_INSTANCE_COUNT: the inherited instance count, on the GPU or read here after all.
+	uint64_t gpu_instance_address = args.gpu_instance_address;
+	if (gpu_instance_address != 0 && !GpuInstanceCountApplies(buffer, ucfg, state)) {
+		draw.instance_count  = ReadInheritedInstances(m_context, gpu_instance_address);
+		gpu_instance_address = 0;
+		if (draw.instance_count == 0) {
+			m_mrt_split_slots = 0;
+			ResetBindings();
+			return;
+		}
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
@@ -5901,6 +6014,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	emit.gpu_instance_address = gpu_instance_address;
 
 	DrawIndexBufferSource index_source {};
 	CommitStats::StepMark(CommitStats::Step::Restart);

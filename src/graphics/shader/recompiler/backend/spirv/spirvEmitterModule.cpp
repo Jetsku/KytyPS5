@@ -33,10 +33,17 @@ void NoteMissingComputeDerivatives(uint64_t shader_hash) {
 
 } // namespace
 
+bool DispatchDimensionsIndirect(const EmitterState& state) {
+	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
+	       state.input_info.compute->dispatch_dimensions_indirect &&
+	       state.program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+}
+
 bool UsesPhysicalAddresses(const EmitterState& state) {
 	// Guest address accesses (DMA), or a mesh program that may read its draw dwords from a native
-	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params).
-	return state.program.info.uses_dma ||
+	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params), or a compute program
+	// that reads its thread counts through a device address (KYTY_INDIRECT_THREADS_GPU).
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
 	       state.program.bindings.call_state_dword != IR::PushData::NoStart ||
 	       (state.program.stage == ShaderType::Mesh && GetCodegenOptions().mesh_indirect_params);
 }
