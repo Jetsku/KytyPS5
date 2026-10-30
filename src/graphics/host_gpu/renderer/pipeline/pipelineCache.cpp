@@ -8618,6 +8618,34 @@ std::shared_ptr<const void> PipelineCache::TakeCallSplitRun() {
 	return std::exchange(t_split_run, nullptr);
 }
 
+// KYTY_SKIP_SHADER_HASHES="hash,hash,..." (hex, default empty; usa-ratt/KytyPS5-GT7's skip list,
+// compute only here): the dispatches of these guest compute shaders are skipped, as a compute
+// program that fails to build is. A measurement aid (what one pass costs), not for presets.
+static bool SkipComputeShaderRequested(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		if (const char* value = std::getenv("KYTY_SKIP_SHADER_HASHES"); value != nullptr) {
+			std::string_view list(value);
+			size_t           start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.push_back(std::strtoull(std::string(list.substr(start, end - start)).c_str(),
+					                               nullptr, 16));
+				}
+				start = end + 1;
+			}
+		}
+		for (const auto hash: result) {
+			PipelineCacheLog("Skip list: the dispatches of compute shader 0x{:016x} are skipped "
+			                 "(KYTY_SKIP_SHADER_HASHES)",
+			                 hash);
+		}
+		return result;
+	}();
+	return !hashes.empty() && std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
@@ -8626,6 +8654,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	std::optional<CpGaps::Scope> prepare_gap;
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
 	auto              params      = PrepareProgram(regs, sh, input_info);
+	if (SkipComputeShaderRequested(params.hash)) {
+		return {};
+	}
 	if (!ExpandComputeCalls(params, input_info)) {
 		return {};
 	}
