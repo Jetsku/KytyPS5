@@ -30,6 +30,11 @@ private:
 	Decoder::Operand ScalarDestinationOperand(const Decoder::Operand& operand, uint32_t offset);
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
+	// KYTY_PS_EXEC_WORDS (upstream 5429888d4): a pixel shader's EXEC/VCC words leave out helper
+	// lanes the per-lane EXEC keeps enabled for derivatives.
+	[[nodiscard]] bool     ExecWordsExcludeHelpers() const;
+	// The words of a lane mask: the ballot; with the switch, helper lanes only where EXEC has them.
+	std::array<IR::U32, 2> VectorMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);

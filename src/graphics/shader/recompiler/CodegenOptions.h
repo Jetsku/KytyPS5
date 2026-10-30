@@ -563,6 +563,10 @@ struct CodegenOptions {
 	// are uvec4 / ivec4 (ShaderPixelInputInfo::target_uint_mask / target_sint_mask); compressed
 	// SINT exports sign-extend. Off: only 32-bit UINT exports (mode 7) are integer, as before.
 	bool ps_integer_outputs = false;
+	// KYTY_PS_EXEC_WORDS=1 (adapted from upstream 5429888d4): a pixel shader's EXEC and VCC words
+	// leave out the helper lanes the per-lane EXEC keeps for derivatives: the entry words are the
+	// live lanes, VALU masks are limited to the EXEC words, SAVEEXEC combines the words bitwise.
+	bool ps_exec_words = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;
