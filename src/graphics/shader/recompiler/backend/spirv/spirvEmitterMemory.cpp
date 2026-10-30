@@ -421,10 +421,36 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	    });
 }
 
+// A coherent (GLC/DLC) load of a 32-bit word as GetCoherentLoadMode asks (SpirvEmitter.h).
+static uint32_t EmitCoherentWordLoad(EmitterState& state, uint32_t pointer) {
+	const auto mode  = GetCoherentLoadMode();
+	const auto value = state.builder.AllocateId();
+	if (mode == CoherentLoadMode::Acquire || mode == CoherentLoadMode::Relaxed) {
+		const uint32_t semantics =
+		    mode == CoherentLoadMode::Acquire
+		        ? static_cast<uint32_t>(spv::MemorySemanticsAcquireMask |
+		                                spv::MemorySemanticsUniformMemoryMask)
+		        : static_cast<uint32_t>(spv::MemorySemanticsMaskNone);
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, semantics));
+		return value;
+	}
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessVolatileMask);
+	if (mode == CoherentLoadMode::Barrier) {
+		EmitDeviceAtomicMemoryBarrier(state);
+	}
+	return value;
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
-	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if (resource.memory_access != spv::MemoryAccessMaskNone &&
+	    GetCoherentLoadMode() != CoherentLoadMode::Plain) {
+		return EmitCoherentWordLoad(ctx.state, pointer);
+	}
+	const auto value = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
 	return value;
@@ -2941,15 +2967,20 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
+	// KYTY_COHERENT_LOAD_MODE / _ACQUIRE: a coherent scalar load as the vector ones (not Plain).
+	const bool coherent = access.memory_access != spv::MemoryAccessMaskNone &&
+	                      GetCoherentLoadMode() != CoherentLoadMode::Plain;
+	const auto load = [&](uint32_t pointer) {
+		return coherent ? EmitCoherentWordLoad(state, pointer)
+		                : EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+	};
 	if (DeviceChecksDwordLoad(access)) {
-		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
-		                     state, EmitMemoryElementPointer(state, access, element)));
+		ctx.Define(inst, load(EmitMemoryElementPointer(state, access, element)));
 		return;
 	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           return load(EmitMemoryElementPointer(state, access, element));
 	           }));
 }
 

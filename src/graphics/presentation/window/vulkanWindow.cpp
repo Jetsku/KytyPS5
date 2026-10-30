@@ -53,6 +53,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -1075,6 +1076,32 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		ShaderRecompiler::Spirv::SetHostBufferPairAtomics(pairs);
 		LOGF("Vulkan buffer pair atomics: %s (storage offset alignment %" PRIu64 ")\n",
 		     pairs ? "yes" : "no", static_cast<uint64_t>(alignment));
+	}
+	// KYTY_COHERENT_LOAD_ACQUIRE=auto (GT7 fork 171338e72): NVIDIA reloads coherent loads without a
+	// barrier, AMD's drivers need one (SpirvEmitter.h).
+	{
+		constexpr uint32_t NvidiaVendorId = 0x10deu;
+		ShaderRecompiler::Spirv::SetCoherentLoadVendorDefault(properties2.properties.vendorID !=
+		                                                      NvidiaVendorId);
+		const auto mode = ShaderRecompiler::Spirv::GetCoherentLoadMode();
+		if (mode != ShaderRecompiler::Spirv::CoherentLoadMode::Plain) {
+			LOGF("Vulkan coherent loads: made as %s (KYTY_COHERENT_LOAD_MODE / _ACQUIRE)\n",
+			     ShaderRecompiler::Spirv::CoherentLoadModeName(mode));
+		}
+	}
+	// KYTY_MESH_LAYER=drop|amd (default keep; GT7 fork 67d59fe29): mesh shaders without their Layer
+	// output, on any GPU or on an AMD GPU only, whose Windows driver crashed making those pipelines.
+	{
+		constexpr uint32_t AmdVendorId = 0x1002u;
+		const char*        value       = std::getenv("KYTY_MESH_LAYER");
+		const std::string_view setting(value != nullptr ? value : "");
+		const bool drop = setting == "drop" ||
+		                  (setting == "amd" && properties2.properties.vendorID == AmdVendorId);
+		ShaderRecompiler::Spirv::SetHostMeshLayerDrop(drop);
+		if (drop || !setting.empty()) {
+			LOGF("Mesh shaders: their Layer output is %s (KYTY_MESH_LAYER=%s)\n",
+			     drop ? "left out" : "kept", value);
+		}
 	}
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =
