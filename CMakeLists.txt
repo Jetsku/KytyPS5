@@ -2700,6 +2700,10 @@ add_custom_target(kyty_trophy_sound
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
+# Reference game patches (ETAHen/GoldHEN JSON, the --game-patch format): installed to patches/, not
+# applied. To use one, copy it to _Patches/<title id>.json next to the launcher (the plan the launcher
+# passes); the loader checks the title, version, process and each write's original bytes first.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/patches/" DESTINATION patches FILES_MATCHING PATTERN "*.json")
 
 add_custom_target(kyty_touch_cursors
 	COMMAND ${CMAKE_COMMAND} -E copy_directory

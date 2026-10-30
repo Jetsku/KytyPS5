@@ -1,0 +1,19 @@
+{
+  "name": "Gran Turismo 7 - 1080p internal rendering",
+  "id": "PPSA01317",
+  "version": "01.710.000",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Render at 1920x1080 instead of 3840x2160",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0xC7DFD2",
+          "off": "0FB605687A6905488B0B",
+          "on": "B8010000009090488B0B"
+        }
+      ]
+    }
+  ]
+}

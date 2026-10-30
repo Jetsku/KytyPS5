@@ -1,0 +1,89 @@
+{
+  "name": "Gran Turismo 7 - 1440p internal rendering (power-saver profile)",
+  "id": "PPSA01317",
+  "version": "01.710.000",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Render at 2560x1440 with the power-saver profile",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0xC7DFD2",
+          "off": "0FB605687A6905488B0B",
+          "on": "B8010000009090488B0B"
+        },
+        {
+          "offset": "0x9438F1",
+          "off": "C705A1483D0580070000",
+          "on": "C705A1483D05000A0000"
+        },
+        {
+          "offset": "0x9438FB",
+          "off": "C7059B483D0538040000",
+          "on": "C7059B483D05A0050000"
+        },
+        {
+          "offset": "0x943905",
+          "off": "BB80070000",
+          "on": "BB000A0000"
+        },
+        {
+          "offset": "0x94390A",
+          "off": "41BE38040000",
+          "on": "41BEA0050000"
+        },
+        {
+          "offset": "0xCA1A12",
+          "off": "C7058067070580070000",
+          "on": "C70580670705000A0000"
+        },
+        {
+          "offset": "0xCA1A1C",
+          "off": "C7057A67070538040000",
+          "on": "C7057A670705A0050000"
+        },
+        {
+          "offset": "0x943648",
+          "off": "C705BE6F9D0538040000",
+          "on": "C705BE6F9D05A0050000"
+        },
+        {
+          "offset": "0xC7D96C",
+          "off": "4169C680070000",
+          "on": "4169C6000A0000"
+        },
+        {
+          "offset": "0xC7D973",
+          "off": "4169CE38040000",
+          "on": "4169CEA0050000"
+        },
+        {
+          "offset": "0x1A3A252",
+          "off": "B880070000",
+          "on": "B8000A0000"
+        },
+        {
+          "offset": "0x1A3A25C",
+          "off": "B938040000",
+          "on": "B9A0050000"
+        },
+        {
+          "offset": "0x11C06F",
+          "off": "41BD38040000",
+          "on": "41BDA0050000"
+        },
+        {
+          "offset": "0x5CC73D0",
+          "off": "8007000038040000",
+          "on": "000A0000A0050000"
+        },
+        {
+          "offset": "0x5D1819C",
+          "off": "8007000038040000",
+          "on": "000A0000A0050000"
+        }
+      ]
+    }
+  ]
+}
