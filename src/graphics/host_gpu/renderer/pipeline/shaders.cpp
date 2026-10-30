@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/aaMaskCoverage.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
@@ -713,8 +714,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 		result = (*create_hook)(pipeline_info, layout_signature, &pipeline.pipeline);
 	} else {
-		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-		                                                 &pipeline.pipeline);
+		result = PipelineFeedback::CreateGraphics(graphics.device, driver_cache, pipeline_info, &pipeline.pipeline,
+		                                          PipelineFeedback::Path::Sync);
 	}
 	Profiler::AddFrameWait(Profiler::FrameWait::GraphicsPipelineDriver, 1,
 	                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

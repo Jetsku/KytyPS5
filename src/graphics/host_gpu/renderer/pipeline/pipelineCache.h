@@ -18,7 +18,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -536,6 +538,21 @@ private:
 	// cache alone on this thread (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
 	bool                           m_skip_probe = false;
 	std::atomic<uint64_t>          m_skip_probe_hits {0}, m_skip_probe_misses {0}, m_skip_probe_ns {0};
+	// KYTY_PIPELINE_ADOPT=1 (default off; upstream ec8b75b24's boot prewarm, adapted): pipelines the
+	// journal replay built are kept by content key (GraphicsContent::key) instead of destroyed, and a
+	// draw whose create info has that key takes the object instead of calling the driver. At most
+	// KYTY_PIPELINE_ADOPT_MAX (default 12000) wait; the rest are destroyed as before. Guarded by
+	// m_adopt_mutex; the objects not taken are destroyed with the cache.
+	bool                                     m_adopt     = false;
+	uint64_t                                 m_adopt_max = 0;
+	std::mutex                               m_adopt_mutex;
+	std::unordered_map<uint64_t, vk::Pipeline> m_adopted;
+	std::atomic<uint64_t>                    m_adopt_offered {0}, m_adopt_taken {0}, m_adopt_refused {0};
+	// The adopted pipeline with this content key (removed from the set), or null.
+	[[nodiscard]] vk::Pipeline TakeAdoptedPipeline(uint64_t key);
+	// Keeps a replay-built pipeline for adoption; false (the caller destroys it) when off or full.
+	[[nodiscard]] bool OfferAdoptedPipeline(uint64_t key, vk::Pipeline pipeline);
+	[[nodiscard]] std::string AdoptReport();
 	Pipeline* GetGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                  std::span<const ShaderVertexInputInfo> vertex_info,
 	                                  CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
