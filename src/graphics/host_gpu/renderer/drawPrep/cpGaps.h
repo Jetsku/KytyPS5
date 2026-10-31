@@ -283,8 +283,32 @@ struct ThreadState {
 	Ledger                           ledger;
 	double                           ticks_per_ns = 1.0;
 	std::array<uint64_t, EventCount> events {};
+	// KYTY_CP_GAP_CPU=1: inclusive thread CPU cycles and wall TSC ticks of the outermost scope of
+	// each category in CpuCats (commits, faults, drains, service commands, draw ops), so the line
+	// tells how much of their wall time the thread was on a processor.
+	std::array<uint64_t, CatCount> cpu_cycles {};
+	std::array<uint64_t, CatCount> cpu_wall {};
+	std::array<uint32_t, CatCount> cpu_depth {};
 };
 inline constinit thread_local ThreadState* t_state = nullptr;
+
+// KYTY_CP_GAP_CPU (diagnostic, default off; needs KYTY_CP_GAP_STATS=1).
+[[nodiscard]] inline bool CpuEnabled() noexcept {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_GAP_CPU");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// The calling thread's CPU cycles (set by AttachThread on the GPU thread; null elsewhere).
+inline uint64_t (*g_thread_cycles)() noexcept = nullptr;
+[[nodiscard]] inline uint64_t ThreadCycles() noexcept {
+	return g_thread_cycles != nullptr ? g_thread_cycles() : 0;
+}
+[[nodiscard]] constexpr bool CpuCat(Cat cat) noexcept {
+	return cat == Cat::Commit || cat == Cat::Fault || cat == Cat::GpuWaitDrain ||
+	       cat == Cat::Service || cat == Cat::DrawOp || cat == Cat::HeadWaitDeep;
+}
 
 class Scope {
 public:
@@ -292,20 +316,42 @@ public:
 		if (Enabled()) [[unlikely]] {
 			m_state = t_state;
 			if (m_state != nullptr) {
-				m_state->ledger.Enter(cat, Tsc());
+				const auto now = Tsc();
+				m_state->ledger.Enter(cat, now);
+				if (CpuCat(cat) && CpuEnabled()) {
+					m_cat_seen = cat;
+					if (m_state->cpu_depth[static_cast<size_t>(cat)]++ == 0) {
+						m_cat    = cat;
+						m_cycles = ThreadCycles();
+						m_tsc    = now;
+					}
+				}
 			}
 		}
 	}
 	~Scope() {
 		if (m_state != nullptr) [[unlikely]] {
-			m_state->ledger.Exit(Tsc());
+			const auto now = Tsc();
+			m_state->ledger.Exit(now);
+			if (m_tsc != 0) {
+				const auto i = static_cast<size_t>(m_cat);
+				m_state->cpu_cycles[i] += ThreadCycles() - m_cycles;
+				m_state->cpu_wall[i] += now - m_tsc;
+			}
+			if (m_cat_seen != Cat::Count) {
+				m_state->cpu_depth[static_cast<size_t>(m_cat_seen)]--;
+			}
 		}
 	}
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 
 private:
-	ThreadState* m_state = nullptr;
+	ThreadState* m_state    = nullptr;
+	Cat          m_cat      = Cat::Count;
+	Cat          m_cat_seen = Cat::Count;
+	uint64_t     m_cycles   = 0;
+	uint64_t     m_tsc      = 0;
 };
 
 // The innermost scope continues as `cat` (dispatch phases).

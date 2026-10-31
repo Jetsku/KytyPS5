@@ -7,7 +7,39 @@
 #include <string>
 #include <utility>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace Libs::Graphics::CpGaps {
+
+static uint64_t QueryCycles() noexcept {
+#if defined(_WIN32)
+	ULONG64 cycles = 0;
+	QueryThreadCycleTime(GetCurrentThread(), &cycles);
+	return cycles;
+#else
+	return 0;
+#endif
+}
+
+// The calling thread's user + kernel CPU time in ns.
+static uint64_t ThreadCpuNs() noexcept {
+#if defined(_WIN32)
+	FILETIME c {}, e {}, k {}, u {};
+	if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+	const auto t = [](const FILETIME& f) { return (static_cast<uint64_t>(f.dwHighDateTime) << 32u) | f.dwLowDateTime; };
+	return (t(k) + t(u)) * 100u;
+#else
+	return 0;
+#endif
+}
 
 const char* CatName(Cat cat) noexcept {
 	static constexpr const char* names[] = {
@@ -121,6 +153,22 @@ void Print(ThreadState& state, Report& report, uint64_t now_ns, uint64_t now_tsc
 		std::snprintf(text, sizeof(text), " | overflows %" PRIu64, ledger.Overflows());
 		line += text;
 	}
+	if (CpuEnabled()) {
+		static uint64_t last_cpu_ns = 0;
+		const auto      cpu_ns      = ThreadCpuNs();
+		std::snprintf(text, sizeof(text), " | cp-cpu %.2f ms/f, cpu/wall incl:",
+		              last_cpu_ns != 0 ? static_cast<double>(cpu_ns - last_cpu_ns) * 1e-6 / frames : 0.0);
+		line += text;
+		last_cpu_ns = cpu_ns;
+		for (size_t i = 0; i < CatCount; i++) {
+			if (state.cpu_wall[i] == 0) continue;
+			std::snprintf(text, sizeof(text), " %s %.2f/%.2f", CatName(static_cast<Cat>(i)),
+			              static_cast<double>(state.cpu_cycles[i]) * ms_tick, static_cast<double>(state.cpu_wall[i]) * ms_tick);
+			line += text;
+		}
+		state.cpu_cycles = {};
+		state.cpu_wall   = {};
+	}
 	std::printf("%s\n", line.c_str());
 	std::fflush(stdout);
 	ledger.ResetTotals();
@@ -149,6 +197,7 @@ void AttachThread() {
 	report.start_ns    = ns1;
 	report.start_tsc   = tsc1;
 	t_state            = &state;
+	g_thread_cycles    = &QueryCycles;
 	std::printf("CpGaps: command-processor time accounting on (KYTY_CP_GAP_STATS), TSC %.3f GHz\n",
 	            state.ticks_per_ns);
 	std::fflush(stdout);
