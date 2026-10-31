@@ -267,15 +267,18 @@ private:
 
 // Below-normal priority for the calling thread (background compile workers; Windows only).
 void LowerCurrentThreadPriority();
+// CPU time (user + kernel) of the calling thread so far, in nanoseconds (0 where unsupported).
+[[nodiscard]] uint64_t CurrentThreadCpuNs();
 
 // Replays journal entries on worker threads.
 class ShaderPrecompiler {
 public:
 	enum class Outcome : uint8_t {
-		Compiled, // translated, emitted or reloaded, and published
+		Compiled, // translated or emitted, and published
 		Present,  // already published (the game or an earlier entry got there first)
 		Skipped,  // not replayable (stale input, skip-dispatch program, declined)
 		Failed,
+		Reloaded, // reloaded from the persistent program cache and published (no translation)
 	};
 	using CompileFn = std::function<Outcome(const ShaderJournal::Source&, const ShaderJournal::Entry&)>;
 
@@ -290,6 +293,11 @@ public:
 		// source, from the constructor. The software ray-tracing kernels use it: their pipelines
 		// take seconds to build and the game needs them at its first lighting pass.
 		std::function<bool(const ShaderJournal::Source&)> priority_source;
+		// Entries this accepts (an earlier run's draws bound them) come next, in file order, then the
+		// rest in file order; with replay_unused false the rest is not replayed at all. Called once
+		// per entry, from the constructor.
+		std::function<bool(const ShaderJournal::Source&, const ShaderJournal::Entry&)> used_entry;
+		bool replay_unused = true;
 		// Called on each worker thread when it starts (name, priority).
 		std::function<void(uint32_t worker)> thread_init;
 		std::function<void(const std::string&)> log;
@@ -299,6 +307,8 @@ public:
 		// A progress line after this many percent and at least this many nanoseconds.
 		uint32_t progress_percent = 10;
 		uint64_t progress_ns      = 5'000'000'000ull;
+		// The lines also give the workers' CPU time (summed per entry from thread times; Windows).
+		bool     measure_cpu      = false;
 	};
 
 	struct Progress {
@@ -308,6 +318,8 @@ public:
 		uint64_t present  = 0;
 		uint64_t skipped  = 0;
 		uint64_t failed   = 0;
+		uint64_t reloaded = 0;
+		uint64_t cpu_ns   = 0; // measure_cpu
 		bool     finished = false;
 	};
 
@@ -326,6 +338,7 @@ public:
 private:
 	void Worker(uint32_t index);
 	void NoteDone(ShaderPrecompiler::Outcome outcome);
+	[[nodiscard]] std::string Counts() const;
 
 	const ShaderJournal& m_journal;
 	Settings             m_settings;
@@ -333,11 +346,14 @@ private:
 	uint64_t             m_total = 0;
 	uint64_t             m_begin_ns = 0;
 
-	// Replay order (indices into the journal's entries) when priority_source reordered them.
+	// Replay order (indices into the journal's entries) when priority_source or used_entry reordered
+	// or dropped them.
 	std::vector<uint32_t> m_order;
+	uint64_t              m_used_entries = 0; // entries used_entry accepted
 	std::atomic<uint64_t> m_next {0};
 	std::atomic<bool>     m_stop {false};
-	std::atomic<uint64_t> m_done {0}, m_compiled {0}, m_present {0}, m_skipped {0}, m_failed {0};
+	std::atomic<uint64_t> m_done {0}, m_compiled {0}, m_present {0}, m_skipped {0}, m_failed {0}, m_reloaded {0};
+	std::atomic<uint64_t> m_cpu_ns {0};
 	std::atomic<uint32_t> m_workers_running {0};
 
 	mutable std::mutex      m_mutex; // progress reporting

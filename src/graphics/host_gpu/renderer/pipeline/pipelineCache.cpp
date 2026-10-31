@@ -376,6 +376,82 @@ struct CompileTotals {
 };
 CompileTotals g_compile_totals;
 
+// KYTY_SHADER_PRECOMPILE_STATS=1: permutations the precompile replay published, distinct
+// permutations draws and dispatches bound (ProgramCache::Bind) and how many of those the replay had
+// published, and the replay threads' CompileSPV phase times.
+struct PermutationUse {
+	std::atomic<uint64_t> replayed {0};
+	std::atomic<uint64_t> bound {0};
+	std::atomic<uint64_t> replay_bound {0};
+	std::atomic<uint64_t> spv_calls {0}, spv_shrink_ns {0}, spv_validated {0}, spv_validate_ns {0};
+	std::atomic<uint64_t> spv_validate_skipped {0}, spv_create_ns {0};
+};
+PermutationUse g_permutation_use;
+
+// KYTY_SHADER_PRECOMPILE_USED=1: the permutation identities (PermutationIdentity, the
+// translator-independent inputs) that draws and dispatches bound, in any run, kept in
+// <journal>.used (a header, then 8-byte identities appended as permutations are first bound; a
+// torn tail is dropped by the next load, which rewrites the file). The precompile replay takes these
+// entries first (ShaderPrecompiler::Settings::used_entry).
+class UsedPermutations {
+public:
+	static constexpr char Magic[16] = "KYTY PERMUSED 1";
+
+	uint64_t Open(const std::filesystem::path& path) {
+		std::scoped_lock lock(m_mutex);
+		if (m_file != nullptr) return m_known.size();
+		std::vector<uint8_t> bytes;
+		if (std::FILE* in = std::fopen(Common::PathToString(path).c_str(), "rb"); in != nullptr) {
+			std::array<uint8_t, 65536> chunk {};
+			for (size_t got; (got = std::fread(chunk.data(), 1, chunk.size(), in)) != 0;) {
+				bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
+			}
+			std::fclose(in);
+		}
+		if (bytes.size() >= sizeof(Magic) && std::memcmp(bytes.data(), Magic, sizeof(Magic)) == 0) {
+			for (size_t at = sizeof(Magic); at + sizeof(uint64_t) <= bytes.size(); at += sizeof(uint64_t)) {
+				uint64_t identity = 0;
+				std::memcpy(&identity, bytes.data() + at, sizeof(identity));
+				m_known.insert(identity);
+			}
+		}
+		m_loaded = m_known.size();
+		m_file   = std::fopen(Common::PathToString(path).c_str(), "wb");
+		if (m_file == nullptr) return m_loaded;
+		std::fwrite(Magic, 1, sizeof(Magic), m_file);
+		for (const auto identity: m_known) std::fwrite(&identity, sizeof(identity), 1, m_file);
+		std::fflush(m_file);
+		m_enabled.store(true, std::memory_order_release);
+		return m_loaded;
+	}
+	[[nodiscard]] bool Enabled() const { return m_enabled.load(std::memory_order_relaxed); }
+	// Loaded from the file (before this run added any).
+	[[nodiscard]] bool WasUsed(uint64_t identity) const {
+		std::scoped_lock lock(m_mutex);
+		return m_known.contains(identity);
+	}
+	void Add(uint64_t identity) {
+		std::scoped_lock lock(m_mutex);
+		if (!m_known.insert(identity).second || m_file == nullptr) return;
+		m_added++;
+		std::fwrite(&identity, sizeof(identity), 1, m_file);
+		std::fflush(m_file);
+	}
+	[[nodiscard]] uint64_t Added() const {
+		std::scoped_lock lock(m_mutex);
+		return m_added;
+	}
+
+private:
+	mutable std::mutex           m_mutex;
+	std::unordered_set<uint64_t> m_known;
+	uint64_t                     m_loaded = 0;
+	uint64_t                     m_added  = 0;
+	std::FILE*                   m_file   = nullptr;
+	std::atomic<bool>            m_enabled {false};
+};
+UsedPermutations g_used_permutations;
+
 void AtomicMax(std::atomic<uint64_t>& target, uint64_t value) {
 	auto current = target.load(std::memory_order_relaxed);
 	while (value > current &&
@@ -2341,6 +2417,12 @@ struct PipelineCache::Permutation {
 	ShaderProgram                                plain;
 	// Position in the owning source's PermutationList, fixed when it is published.
 	uint32_t                                     index = 0;
+	// Bit 0: published by the precompile replay; bit 1: bound by a draw or dispatch (atomic_ref;
+	// KYTY_SHADER_PRECOMPILE_STATS counts, g_permutation_use).
+	mutable uint8_t                              use = 0;
+	// PermutationIdentity, set before publication when KYTY_SHADER_PRECOMPILE_USED records first
+	// binds (0 otherwise).
+	uint64_t                                     identity = 0;
 };
 
 // Program preparation is split into a shared lookup (FindSource), a pure per-draw
@@ -2607,6 +2689,8 @@ struct PipelineCache::ProgramCache {
 		std::array<LookupMemo, LookupMemoStages> memos;
 		// CompileAndPublish sets it when it published a new permutation (the caller clears it).
 		bool                 published_new = false;
+		// ... and whether that permutation was reloaded from the persistent program cache.
+		bool                 published_from_disk = false;
 	};
 
 	static bool LookupMemoEnabled() {
@@ -3205,9 +3289,25 @@ struct PipelineCache::ProgramCache {
 		return overflow < list.Overflow().size() ? list.Overflow()[overflow].get() : nullptr;
 	}
 
+	// The first bind of a permutation by a draw or dispatch (g_permutation_use): one relaxed byte load
+	// per bind after that.
+	static void NoteBound(const Permutation& permutation) {
+		std::atomic_ref<uint8_t> use(permutation.use);
+		if ((use.load(std::memory_order_relaxed) & 2u) != 0) return;
+		const auto before = use.fetch_or(2u, std::memory_order_relaxed);
+		if ((before & 2u) != 0) return;
+		if (permutation.identity != 0 && g_used_permutations.Enabled()) {
+			g_used_permutations.Add(permutation.identity);
+		}
+		g_permutation_use.bound.fetch_add(1, std::memory_order_relaxed);
+		if ((before & 1u) != 0) g_permutation_use.replay_bound.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// `note_use`: false for the replay's own bind (rt_prewarm), which is no use by the game.
 	template <typename InputInfo>
 	static ShaderProgram Bind(const Permutation& permutation, InputInfo& input_info,
-	                          StagePrep& prep, uint32_t& push_data_cursor) {
+	                          StagePrep& prep, uint32_t& push_data_cursor, bool note_use = true) {
+		if (note_use) NoteBound(permutation);
 		prep.permutation = &permutation;
 		input_info.stage = {.program = &permutation.program, .resources = &prep.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -4305,6 +4405,15 @@ struct PipelineCache::ProgramCache {
 		const char* reason = source->permutations.Size() == 0 ? "first"
 		                     : same_specialization            ? "push"
 		                                                      : "spec";
+		if (g_used_permutations.Enabled()) {
+			if (specialization_bytes.empty()) {
+				ShaderRecompiler::IR::EncodeSpecialization(prep.specialization, specialization_bytes);
+			}
+			compiled->identity = PermutationIdentity(
+			    static_cast<uint32_t>(key.stage), key.hash, key.user_data_count, key.code_size, options.wave_size,
+			    options.user_data_base, options.plain_mip_stats_variant, push_data_cursor, key.static_state,
+			    specialization_bytes);
+		}
 		const auto& permutation = source->permutations.Append(std::move(*compiled));
 		FinishInFlight(record);
 		lock.unlock();
@@ -4354,7 +4463,8 @@ struct PipelineCache::ProgramCache {
 			check.stored_body        = reloaded->body;
 			SubmitBackgroundCheck(std::move(check));
 		}
-		scratch.published_new = true;
+		scratch.published_new       = true;
+		scratch.published_from_disk = from_disk;
 		if (store) {
 			// The published permutation is immutable; its metadata is encoded from it.
 			std::vector<uint8_t> info;
@@ -4512,21 +4622,28 @@ struct PipelineCache::ProgramCache {
 		    .shader_base = params.Base(),
 		};
 		ShaderReadAttempt attempt;
-		scratch.published_new = false;
+		scratch.published_new       = false;
+		scratch.published_from_disk = false;
 		const auto* published =
 		    CompileAndPublish(params, input_info, entry.push_data_cursor, key, runtime,
 		                      ShaderRecompiler::IR::ThreadEvaluationScratch(), scratch, prep,
 		                      attempt, true, false, true);
 		if (!scratch.published_new) return Outcome::Skipped;
 		g_compile_totals.replayed.fetch_add(1, std::memory_order_relaxed);
+		if (published != nullptr) {
+			const auto before = std::atomic_ref<uint8_t>(published->use).fetch_or(1u, std::memory_order_relaxed);
+			g_permutation_use.replayed.fetch_add(1, std::memory_order_relaxed);
+			// A draw bound it between its publication and here.
+			if ((before & 2u) != 0) g_permutation_use.replay_bound.fetch_add(1, std::memory_order_relaxed);
+		}
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			if (rt_prewarm && published != nullptr && (published->program.info.uses_bvh || prewarm_all_compute)) {
 				uint32_t cursor = entry.push_data_cursor;
-				const auto program = Bind(*published, input_info, prep, cursor);
+				const auto program = Bind(*published, input_info, prep, cursor, false);
 				rt_prewarm(input_info, program);
 			}
 		}
-		return Outcome::Compiled;
+		return scratch.published_from_disk ? Outcome::Reloaded : Outcome::Compiled;
 	}
 
 	// One journal entry compiled and published as the draw that first needed it would have: the
@@ -7317,6 +7434,77 @@ struct PipelineCache::StatsReporter {
 	std::jthread                thread; // last: started once the rest is constructed
 };
 
+// KYTY_SHADER_PRECOMPILE_STATS=1: every 20 s, where the precompile replay's time goes and how much of
+// what it published the game bound (g_permutation_use), with the CompileSPV phase times of the replay
+// threads and of every thread, and the program cache's lookup-side decompression.
+struct PipelineCache::PrecompileStats {
+	explicit PrecompileStats(PipelineCache& owner)
+	    : cache(owner), thread([this](const std::stop_token& stop) { Run(stop); }) {}
+	~PrecompileStats() {
+		thread.request_stop();
+		if (thread.joinable()) thread.join();
+		Log();
+	}
+	PrecompileStats(const PrecompileStats&)            = delete;
+	PrecompileStats& operator=(const PrecompileStats&) = delete;
+
+	void Log() const {
+		const auto  get = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
+		const auto  ms  = [&](const std::atomic<uint64_t>& v) { return static_cast<double>(get(v)) / 1.0e6; };
+		const auto& use = g_permutation_use;
+		ShaderPrecompiler::Progress progress;
+		if (cache.m_shader_precompiler != nullptr) progress = cache.m_shader_precompiler->GetProgress();
+		const auto all = CompileSpvTotals();
+		std::string disk;
+		if (cache.m_program_disk != nullptr) {
+			const auto s = cache.m_program_disk->GetStats();
+			disk = fmt::format("; program cache: {} permutation hits, {} misses, expanded {} in {:.0f} ms", s.permutation_hits,
+			                   s.permutation_misses, s.expanded, static_cast<double>(s.expand_ns) / 1.0e6);
+		}
+		if (g_used_permutations.Enabled()) {
+			disk += fmt::format("; {} bound permutations new to the used file", g_used_permutations.Added());
+		}
+		// What the game itself had to publish (reloaded or emitted on its own threads) and how long
+		// draws waited for programs and pipelines.
+		const auto& t = g_compile_totals;
+		disk += fmt::format("; game-published permutations {} ({} disk permutation hits in all, {} translations); "
+		                    "compile stalls {} totalling {:.1f} ms, worst {:.1f} ms",
+		                    get(t.programs) - std::min(get(t.programs), get(t.replayed)),
+		                    get(t.disk_permutation_hits), get(t.translations), get(t.stalls), ms(t.stall_ns),
+		                    ms(t.stall_max_ns));
+		if (cache.m_skip != nullptr) {
+			disk += fmt::format("; pipeline skip: {} draws skipped", cache.GetSkipTotals().skipped_draws);
+		}
+		PipelineCacheLog(
+		    "Shader precompile stats: replay {}/{} done ({} compiled, {} reloaded, {} present, {} skipped), cpu {:.1f} s; "
+		    "game bound {} distinct permutations, {} of them replay-published ({} of {} replayed bound); replay "
+		    "CompileSPV: {} modules, shrink {:.0f} ms, spirv-val {} in {:.0f} ms, {} known-valid, create {:.0f} ms; "
+		    "all threads CompileSPV: {} modules, shrink {:.0f} ms, spirv-val {} in {:.0f} ms, {} known-valid, create "
+		    "{:.0f} ms{}",
+		    progress.done, progress.total, progress.compiled, progress.reloaded, progress.present, progress.skipped,
+		    static_cast<double>(progress.cpu_ns) / 1.0e9, get(use.bound), get(use.replay_bound), get(use.replay_bound),
+		    get(use.replayed), get(use.spv_calls), ms(use.spv_shrink_ns), get(use.spv_validated),
+		    ms(use.spv_validate_ns), get(use.spv_validate_skipped), ms(use.spv_create_ns), all.calls,
+		    static_cast<double>(all.shrink_ns) / 1.0e6, all.validated, static_cast<double>(all.validate_ns) / 1.0e6,
+		    all.validate_skipped, static_cast<double>(all.create_ns) / 1.0e6, disk);
+	}
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("PrecompileStats");
+		Common::PlaceCurrentThreadCold();
+		std::unique_lock lock(mutex);
+		while (!cv.wait_for(lock, stop, std::chrono::seconds(20), [] { return false; }) &&
+		       !stop.stop_requested()) {
+			Log();
+		}
+	}
+
+	PipelineCache&              cache;
+	std::mutex                  mutex;
+	std::condition_variable_any cv;
+	std::jthread                thread; // last: started once the rest is constructed
+};
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.maintenance8_enabled)),
       m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
@@ -7626,6 +7814,11 @@ void PipelineCache::InitializeProgramDiskCache() {
 			                 default: return "";
 		                 }
 	                 }());
+	// Reloaded permutations skip spirv-val of their shrunk modules once a run has validated the same
+	// words (vulkanCommon.h); next to the program file, so a program file per codegen set keeps its own.
+	const auto verdict_path = Common::PathToString(path) + ".shrinkval";
+	const auto verdicts     = UseShrinkVerdictFile(verdict_path);
+	PipelineCacheLog("Program cache: {} known-valid shrunk modules ({})", verdicts, verdict_path);
 }
 
 // Background saver of the driver pipeline cache. The cache used to be written only by the clean
@@ -7914,6 +8107,16 @@ void PipelineCache::InitializeShaderPrecompile() {
 		                 m_shader_journal->Entries().size(), static_cast<double>(stats.load_ns) / 1.0e6,
 		                 stats.damaged_bytes != 0 ? "; damaged tail ignored" : "",
 		                 stats.header_rejected ? "; another device or format, replaced" : "");
+		// KYTY_SHADER_PRECOMPILE_USED=1 (default off): permutations draws bind are recorded in
+		// <journal>.used, and the replay takes the journal entries an earlier run bound first.
+		// KYTY_SHADER_PRECOMPILE_UNUSED=0 (with it) replays only those (once the file names any).
+		if (EnvU64("KYTY_SHADER_PRECOMPILE_USED", 0) != 0) {
+			auto used_path = path;
+			used_path += ".used";
+			m_used_loaded = g_used_permutations.Open(used_path);
+			PipelineCacheLog("Shader precompile: {} permutations bound by earlier runs ({})", m_used_loaded,
+			                 Common::PathToString(used_path));
+		}
 	} else {
 		// The pipeline list alone: a journal object only to hold the replay's input (no file, and the
 		// program cache records nothing into it).
@@ -7977,11 +8180,32 @@ void PipelineCache::InitializeShaderPrecompile() {
 		                 LoadMs(t.module_ns));
 	};
 	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
+	if (g_used_permutations.Enabled()) {
+		replay.used_entry = [](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
+			return g_used_permutations.WasUsed(PermutationIdentity(source, entry));
+		};
+		replay.replay_unused = m_used_loaded == 0 || EnvU64("KYTY_SHADER_PRECOMPILE_UNUSED", 1) != 0;
+	}
+	const bool stats   = CompileSpvStatsEnabled();
+	replay.measure_cpu = stats;
 	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
 	    *m_shader_journal, std::move(replay),
-	    [this](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
-		    return m_program_cache->ReplayEntry(source, entry);
+	    [this, stats](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
+		    if (!stats) return m_program_cache->ReplayEntry(source, entry);
+		    const auto before  = CompileSpvThreadTimes();
+		    const auto outcome = m_program_cache->ReplayEntry(source, entry);
+		    const auto after   = CompileSpvThreadTimes();
+		    auto&      use     = g_permutation_use;
+		    use.spv_calls.fetch_add(after.calls - before.calls, std::memory_order_relaxed);
+		    use.spv_shrink_ns.fetch_add(after.shrink_ns - before.shrink_ns, std::memory_order_relaxed);
+		    use.spv_validated.fetch_add(after.validated - before.validated, std::memory_order_relaxed);
+		    use.spv_validate_ns.fetch_add(after.validate_ns - before.validate_ns, std::memory_order_relaxed);
+		    use.spv_validate_skipped.fetch_add(after.validate_skipped - before.validate_skipped,
+		                                       std::memory_order_relaxed);
+		    use.spv_create_ns.fetch_add(after.create_ns - before.create_ns, std::memory_order_relaxed);
+		    return outcome;
 	    });
+	if (stats) m_precompile_stats = std::make_unique<PrecompileStats>(*this);
 	if (EnvU64("KYTY_SHADER_PRECOMPILE_WAIT", 0) != 0) {
 		// Start-up waits for the replay (the best case of precompiling: tests, measurements).
 		m_shader_precompiler->Wait();
@@ -7991,6 +8215,7 @@ void PipelineCache::InitializeShaderPrecompile() {
 // Stops the replay (entries in progress finish) and drops the loaded journal content; the journal
 // keeps recording until the cache goes.
 void PipelineCache::StopShaderPrecompile() {
+	m_precompile_stats.reset(); // its last line first; it reads the replay's progress
 	if (m_shader_precompiler != nullptr) {
 		m_shader_precompiler->Stop();
 		m_shader_precompiler.reset(); // joins the workers

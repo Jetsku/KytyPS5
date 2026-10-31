@@ -570,6 +570,11 @@ private:
 	// permutations' inputs and the background replay of the entries an earlier run left in it.
 	std::unique_ptr<ShaderJournal>     m_shader_journal;
 	std::unique_ptr<ShaderPrecompiler> m_shader_precompiler;
+	// The 20 s "Shader precompile stats" line (KYTY_SHADER_PRECOMPILE_STATS=1); null when off.
+	struct PrecompileStats;
+	std::unique_ptr<PrecompileStats> m_precompile_stats;
+	// KYTY_SHADER_PRECOMPILE_USED: permutation identities loaded from <journal>.used.
+	uint64_t m_used_loaded = 0;
 	// Bumped whenever a cached pipeline object is replaced (a linked pipeline by its optimized
 	// build), so that per-thread lookup memos do not keep returning the replaced object. Starts in
 	// a range of its own per cache instance, so memos never match another instance.
