@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -18,8 +19,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <map>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -141,6 +144,15 @@ bool SparseEnabled() {
 	return enabled;
 }
 
+// KYTY_SHADER_CALLS_SPLIT_SPARSE_LATEST (live, default off; =1 on; with the sparse rule): a callee
+// slot is recorded only when the latest completed bin pass of its kernel and site gave it waves,
+// not because any earlier one did. A scene keeps naming many materials it used once (Miles Morales:
+// ~130 slots per site stay recorded, ~15 hold waves), and each recorded pass costs a program lookup,
+// its bindings and barriers on the command processor. The cost: when a material comes back after its
+// slot read empty, its lanes resume unshaded until the next counts arrive (a few frames, as for a
+// slot never seen); KYTY_SHADER_CALLS_SPLIT_STATS counts them under "left out (sparse)".
+Live::Switch g_sparse_latest("KYTY_SHADER_CALLS_SPLIT_SPARSE_LATEST", Live::ParseDefaultOff);
+
 // Why one program of a chain did not run (the RT status line names what held chains wait on).
 enum class Wait { None, Planning, Unusable, Translating, Building };
 
@@ -179,6 +191,57 @@ void NoteWait(uint64_t hash, uint32_t site, const char* program, uint64_t target
 	std::scoped_lock lock(g_interval.mutex);
 	g_interval.waiting[key]++;
 }
+// KYTY_SHADER_CALLS_SPLIT_DUMP=<program hash hex>;<folder> (diagnostic): when
+// <folder>\dump.now exists, the next split dispatch of that program copies the whole call-state
+// buffer after every step of its chain and writes the copies plus meta.txt (layouts, targets,
+// record maps) to <folder>\split-<n>\, then deletes dump.now.
+struct DumpConfig {
+	std::vector<uint64_t> hashes;
+	std::filesystem::path folder;
+	bool                  enabled = false;
+};
+const DumpConfig& GetDumpConfig() {
+	static const DumpConfig config = [] {
+		DumpConfig  c;
+		const auto* value = std::getenv("KYTY_SHADER_CALLS_SPLIT_DUMP");
+		if (value == nullptr) return c;
+		const std::string text(value);
+		const auto        semi = text.find(';');
+		if (semi == std::string::npos) return c;
+		size_t at = 0;
+		while (at < semi) {
+			auto comma = text.find(',', at);
+			if (comma == std::string::npos || comma > semi) comma = semi;
+			if (const auto hash = std::strtoull(text.substr(at, comma - at).c_str(), nullptr, 16); hash != 0) {
+				c.hashes.push_back(hash);
+			}
+			at = comma + 1u;
+		}
+		c.folder  = text.substr(semi + 1u);
+		c.enabled = !c.hashes.empty() && !c.folder.empty();
+		return c;
+	}();
+	return config;
+}
+// dump.now arms every listed program once; each dumps its next split dispatch.
+bool DumpTriggered(uint64_t hash) {
+	static std::mutex            mutex;
+	static std::vector<uint64_t> armed;
+	const auto&                  config = GetDumpConfig();
+	if (!config.enabled || std::ranges::find(config.hashes, hash) == config.hashes.end()) return false;
+	std::scoped_lock lock(mutex);
+	std::error_code  ec;
+	const auto       trigger = config.folder / "dump.now";
+	if (std::filesystem::exists(trigger, ec)) {
+		std::filesystem::remove(trigger, ec);
+		armed = config.hashes;
+	}
+	const auto found = std::ranges::find(armed, hash);
+	if (found == armed.end()) return false;
+	armed.erase(found);
+	return true;
+}
+std::atomic<uint32_t> g_dump_ordinal {0};
 
 } // namespace
 
@@ -268,7 +331,9 @@ struct RenderExecutor::CallSplitState {
 		// seen again a few frames later, when the latest counts may not show it).
 		auto& known = sites[site];
 		if (known.size() < bits.size()) known.resize(bits.size(), 0u);
-		for (size_t t = 0; t < bits.size(); t++) known[t] |= bits[t];
+		// KYTY_SHADER_CALLS_SPLIT_SPARSE_LATEST: the latest counts alone, not sticky.
+		const bool latest = g_sparse_latest.On();
+		for (size_t t = 0; t < bits.size(); t++) known[t] = latest ? bits[t] : (known[t] | bits[t]);
 	}
 	std::vector<std::vector<uint8_t>> Present(uint64_t kernel) {
 		std::scoped_lock lock(present_mutex);
@@ -516,7 +581,23 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 	bool       chain_held  = false;
 	bool       chain_partial = false; // resumed although a needed callee did not run
 	const bool started     = dispatch(*run.start, 0, nullptr, 0);
+	const bool dumping = DumpTriggered(run.hash);
+	std::vector<std::pair<std::string, std::shared_ptr<Buffer>>> snapshots;
+	const auto snapshot = [&](std::string name) {
+		if (!dumping) return;
+		auto copy = std::make_shared<Buffer>(m_context.GetGraphics(), m_context.GetCommandScheduler(),
+		                                     MemoryUsage::Download, 0, AllFlags, layout.size);
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eComputeShader,
+		                            vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eCopy,
+		                            vk::AccessFlagBits2::eTransferRead, BarrierOrigin::IndirectArgs);
+		buffer.BeginEmission();
+		const vk::BufferCopy region {0, 0, layout.size};
+		buffer.Sink().copyBuffer(state.Handle(), copy->Handle(), 1, &region);
+		to_compute(vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+		snapshots.emplace_back(std::move(name), std::move(copy));
+	};
 	note("R_0", started);
+	snapshot("0-after-R0");
 	if (!started) {
 		g_totals.skipped.fetch_add(1, std::memory_order_relaxed);
 		NoteWait(shader_hash, 0, "R_0", 0, last_wait);
@@ -579,6 +660,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			if (k - 1u < present.size() && t < present[k - 1u].size() && present[k - 1u][t] == 0u) {
 				g_totals.sparse_skipped.fetch_add(1, std::memory_order_relaxed);
 				slot_outcome.back()[t] = 1u;
+				if (dumping) steps += fmt::format(" C{}:{}(sparse{})", k, t, needed[t] ? ",needed" : "");
 				continue;
 			}
 			if (site.callees[t] == nullptr) {
@@ -590,6 +672,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 					NoteWait(shader_hash, k, nullptr, t < site.targets.size() ? site.targets[t] : t + 1u,
 					         pending ? Wait::Planning : Wait::Unusable);
 				}
+				if (dumping) steps += fmt::format(" C{}:{}(null{})", k, t, needed[t] ? ",needed" : "");
 				continue;
 			}
 			const bool ran = dispatch(*site.callees[t], address + layout.lists[k - 1u] + uint64_t {t} * waves * 4u,
@@ -603,6 +686,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			if (ran && serial) {
 				to_compute(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
 			}
+			if (dumping) steps += fmt::format(" C{}:{}({})", k, t, ran ? "ran" : "not-ready");
 			if (ran) {
 				g_totals.callee_dispatches.fetch_add(1, std::memory_order_relaxed);
 			} else {
@@ -624,6 +708,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		// (minutes with a fresh cache).
 		static const bool partial = EnvOn("KYTY_SHADER_CALLS_SPLIT_PARTIAL", true);
 		chain_partial |= incomplete;
+		snapshot(fmt::format("{}-site{}-after-C", 2u * k - 1u, k));
 		if (incomplete && !partial) {
 			g_totals.held.fetch_add(1, std::memory_order_relaxed);
 			note("held", false);
@@ -636,6 +721,8 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		    dispatch(*site.resume, address + layout.lists[k - 1u] + uint64_t {targets} * waves * 4u, &handle,
 		             layout.args[k - 1u] + uint64_t {targets} * 12u);
 		note(k == 1 ? "bin1 R_a1" : "bin R_a", resumed);
+		if (dumping) steps += fmt::format(" R_a{}({})", k, resumed ? "ran" : "not-ready");
+		snapshot(fmt::format("{}-site{}-after-Ra", 2u * k, k));
 		if (!resumed) {
 			g_totals.skipped.fetch_add(1, std::memory_order_relaxed);
 			if (site.resume != nullptr) {
@@ -645,6 +732,53 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		} else {
 			g_totals.resumed.fetch_add(1, std::memory_order_relaxed);
 		}
+	}
+	if (dumping) {
+		std::string meta = fmt::format("hash 0x{:016x}\nwaves {}\ngroups {} {} {}\nwave_dwords {}\nstate_offset {}\nheader_offset {}\n"
+		                               "size {}\nsteps{}\n",
+		                               run.hash, waves, groups_x, groups_y, groups_z, run.wave_dwords, layout.state,
+		                               layout.header, layout.size, steps);
+		for (size_t s = 0; s < run.sites.size(); s++) {
+			const auto& site = run.sites[s];
+			meta += fmt::format("site {} args_offset {} lists_offset {} record_dword {} exec_lo_slot {} exec_hi_slot {}\n", s + 1u,
+			                    layout.args[s], layout.lists[s], site.record_dword, site.exec_lo_slot, site.exec_hi_slot);
+			if (s < run.layouts.size()) {
+				meta += fmt::format("site {} uniform", s + 1u);
+				for (const auto c: run.layouts[s].uniform) meta += fmt::format(" {}", c);
+				meta += fmt::format("\nsite {} vector_base {} vector", s + 1u, run.layouts[s].VectorBase());
+				for (const auto c: run.layouts[s].vector) meta += fmt::format(" {}", c);
+				meta += "\n";
+			}
+			meta += fmt::format("site {} targets", s + 1u);
+			for (size_t t = 0; t < site.callees.size(); t++) {
+				const auto target = s < run.targets.size() && t < run.targets[s].size() ? run.targets[s][t] : 0u;
+				meta += fmt::format(" {}:0x{:x}:{}", t, target, site.callees[t] != nullptr ? "code" : "null");
+			}
+			meta += fmt::format("\nsite {} record_slots", s + 1u);
+			for (const auto slot: site.record_slots) meta += fmt::format(" {}", static_cast<int32_t>(slot));
+			meta += "\n";
+		}
+		const auto folder =
+		    GetDumpConfig().folder /
+		    fmt::format("split-{}-{:016x}", g_dump_ordinal.fetch_add(1, std::memory_order_relaxed), run.hash);
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_SHADER_CALLS_SPLIT_DUMP: dispatch {} of 0x{:016x}: {} snapshots -> {}\n",
+		                                      ordinal, run.hash, snapshots.size(), folder.string()));
+		m_context.GetCommandScheduler().DeferOperation([folder, meta = std::move(meta),
+		                                                snapshots = std::move(snapshots)]() mutable {
+			std::error_code ec;
+			std::filesystem::create_directories(folder, ec);
+			{
+				std::ofstream out(folder / "meta.txt", std::ios::binary);
+				out << meta;
+			}
+			for (auto& [name, copy]: snapshots) {
+				if (!copy->IsCoherent()) copy->Invalidate(0, copy->Size());
+				const auto    bytes = copy->Mapped();
+				std::ofstream out(folder / (name + ".bin"), std::ios::binary);
+				out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+			}
+			snapshots.clear();
+		});
 	}
 	if (readback != nullptr) {
 		if (started) {

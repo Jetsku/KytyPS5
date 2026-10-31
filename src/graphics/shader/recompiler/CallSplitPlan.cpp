@@ -697,9 +697,11 @@ Planner::Result Planner::Plan(std::span<const uint32_t> code, uint64_t base,
 	run.hash   = kernel.hash;
 	run.start  = kernel.start;
 	run.wave_dwords = kernel.layouts.WaveDwords();
+	run.layouts     = kernel.layouts.sites;
 	for (uint32_t s = 0; s < kernel.sites.size(); s++) {
 		const auto& plan   = kernel.sites[s];
 		const auto& layout = kernel.layouts.sites[s];
+		run.targets.push_back(plan.targets);
 		auto&       site   = run.sites.emplace_back();
 		site.resume        = plan.resume;
 		site.targets       = plan.targets;

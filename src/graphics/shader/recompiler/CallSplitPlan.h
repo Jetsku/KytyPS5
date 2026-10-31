@@ -76,6 +76,9 @@ struct Run {
 	std::shared_ptr<const Code> start;
 	std::vector<SiteRun>        sites;
 	uint32_t                    wave_dwords = 0;
+	// Diagnostics (KYTY_SHADER_CALLS_SPLIT_DUMP): the site layouts and targets.
+	std::vector<SiteLayout>            layouts;
+	std::vector<std::vector<uint64_t>> targets;
 };
 
 class Planner {
