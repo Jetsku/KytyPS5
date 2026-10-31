@@ -1845,6 +1845,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 			    cs_regs, sh_regs, serial_info, *serial_prep);
 			(void)DrawPrep::VerifyDispatch(*prepared, serial_program, serial_info, *serial_prep);
 		}
+		// The prepared program is never a call kernel's (PrepareComputeProgramSpeculative): a run
+		// left on this thread belongs to another dispatch.
+		PipelineCache::DropCallRuns();
 		std::swap(m_compute_prep, prepared->compute_prep);
 		input_info                 = prepared->compute_info;
 		input_info.stage.resources = &m_compute_prep.resources;
@@ -2360,6 +2363,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 			    cs_regs, buffer.GetRegisters().GetShaderRegisters(), serial_info, *serial_prep);
 			(void)DrawPrep::VerifyDispatch(*prepared, serial_program, serial_info, *serial_prep);
 		}
+		PipelineCache::DropCallRuns(); // as in DispatchDirect
 		std::swap(m_compute_prep, prepared->compute_prep);
 		input_info                 = prepared->compute_info;
 		input_info.stage.resources = &m_compute_prep.resources;

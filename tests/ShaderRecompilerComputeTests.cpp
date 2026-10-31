@@ -20986,6 +20986,7 @@ public:
     // The plan, the translations and the pipelines are built in the background: the dispatches
     // before them are skipped or partial.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    uint32_t leaked_runs = 0;
     while (!matched && std::chrono::steady_clock::now() < deadline) {
       attempts++;
       std::memset(reinterpret_cast<void *>(output), 0, 512);
@@ -21004,6 +21005,9 @@ public:
           shaders.SetCsUserSgpr(i, user[i], HW::UserSgprType::Unknown);
         }
         context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 2, 1, 1, 0x41u);
+        // A dispatch skipped while its R_0 translates must not leave its run on the thread: a
+        // later dispatch that skips the lookup (KYTY_DRAW_PREP_DISPATCH) would take it as its own.
+        if (PipelineCache::TakeCallSplitRun() != nullptr) leaked_runs++;
       });
       // Read while the dispatch's memory is mapped (the read synchronizes the GPU's writes).
       for (u32 i = 0; i < stored.size(); i++) {
@@ -21026,6 +21030,8 @@ public:
     for (u32 i = 0; i < 8; i++) text += " " + Hex(stored[i]) + "/" + Hex(expected[i]);
     text += " lane 64: " + Hex(stored[64]) + "/" + Hex(expected[64]);
     Require(name, "split calls", matched, "lanes 0-7 stored/expected:" + text);
+    Require(name, "no split run left after a skipped dispatch", leaked_runs == 0,
+            std::to_string(leaked_runs) + " of " + std::to_string(attempts) + " dispatches left their run");
     {
       // A callee program does not depend on where the game loaded the callee or the kernel (its
       // words, and so its translation and pipeline, are the same in every session): the same

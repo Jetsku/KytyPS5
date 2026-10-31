@@ -241,9 +241,13 @@ public:
 	// KYTY_SHADER_CALLS_SPLIT (recompiler/CallSplit.h): the next GetComputeProgram of this thread
 	// prepares the given split program of the dispatch's kernel instead of its code (null: the
 	// kernel). A GetComputeProgram of a kernel that is split prepares its first program (R_0) and
-	// leaves the dispatch's run (a CallSplit::Run) for TakeCallSplitRun.
+	// leaves the dispatch's run (a CallSplit::Run) for TakeCallSplitRun. A lookup that returns no
+	// program leaves no run: the run belongs to this dispatch, never to a later one.
 	static void SelectCallSplitCode(const void* code);
 	[[nodiscard]] static std::shared_ptr<const void> TakeCallSplitRun();
+	// A dispatch whose program did not come from GetComputeProgram (a draw-prep preparation):
+	// drops any run an earlier lookup of this thread left, so the dispatch cannot take it.
+	static void DropCallRuns();
 	// KYTY_CALL_PARTITIONS: the dispatch's partitions (a ShaderRecompiler::CallPartitionRun), and
 	// the keys a partition program's report set held.
 	[[nodiscard]] static std::shared_ptr<const void> TakePartitionRun();
@@ -434,6 +438,9 @@ public:
 	void ReportRamStats();
 
 private:
+	// GetComputeProgram without the run hygiene (see SelectCallSplitCode).
+	ShaderProgram LookupComputeProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                                   ShaderComputeInputInfo& input_info, StagePrep& stage_prep);
 	struct ProgramCache;
 	struct PipelineDiagnostics;
 	struct DriverCacheSaver;

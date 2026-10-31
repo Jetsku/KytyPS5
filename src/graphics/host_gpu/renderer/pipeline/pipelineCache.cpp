@@ -9765,10 +9765,31 @@ static bool SkipComputeShaderRequested(uint64_t shader_hash) {
 	return !hashes.empty() && std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
 }
 
+void PipelineCache::DropCallRuns() {
+	t_split_run.reset();
+	t_partition_run.reset();
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
                                                StagePrep&                   stage_prep) {
+	auto program = LookupComputeProgram(regs, sh, input_info, stage_prep);
+	if (!program) {
+		// A split kernel whose R_0 is still translating (CallTranslations) or not ready: the
+		// dispatch is skipped, and its run must not reach the next dispatch of this thread. A
+		// draw-prep dispatch (KYTY_DRAW_PREP_DISPATCH) skips this lookup and would take it as its
+		// own: the next kernel then ran the split chain with its registers (its hash and its AGC
+		// scratch size) and the other kernel's split code, and stopped in resource tracking.
+		t_split_run.reset();
+	}
+	return program;
+}
+
+ShaderProgram PipelineCache::LookupComputeProgram(const HW::ComputeShaderInfo& regs,
+                                                  const HW::ShaderRegisters&   sh,
+                                                  ShaderComputeInputInfo&      input_info,
+                                                  StagePrep&                   stage_prep) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	std::optional<CpGaps::Scope> prepare_gap;
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
