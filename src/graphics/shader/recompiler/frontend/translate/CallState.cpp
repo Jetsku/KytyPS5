@@ -253,11 +253,21 @@ void Translator::S_KYTY_CALL_STATE(const Decoder::Instruction& inst) {
 			EXIT_IF(header.entry_site == 0);
 			const auto& layout = header.sites[header.entry_site - 1u];
 			EXIT_IF(split->loaded.size() != layout.vector.size());
-			const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+			// Payload word 1 = shaded only: a lane whose call named another callee ran the skip path
+			// here (its loop flags changed as if it had been called). Its registers stay as loaded, so
+			// the callee pass of its own target still finds it pending, and the callee passes of one
+			// site store disjoint lanes.
+			const bool shaded_only = inst.word_count >= 2u && inst.raw[1] == 1u;
+			const auto shaded      = shaded_only ? ir.GetGotoVariable(IR::SplitShadedVariable) : IR::U1 {};
+			const auto lane        = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 			for (uint32_t j = 0; j < layout.vector.size(); j++) {
+				const auto loaded = IR::U32(split->loaded[j]);
+				auto       value  = ReadCallStateCode(layout.vector[j]);
+				if (shaded_only) {
+					value = ir.Select(shaded, value, loaded);
+				}
 				ir.Emit(IR::ValueOpcode::CallStateStoreChanged,
-				        {CallStateAddress(split->state_base, lane_dword(layout, j, lane)),
-				         ReadCallStateCode(layout.vector[j]), split->loaded[j]});
+				        {CallStateAddress(split->state_base, lane_dword(layout, j, lane)), value, loaded});
 			}
 			return;
 		}
@@ -304,8 +314,12 @@ void Translator::EmitCallSplitAddress(const Decoder::Instruction& inst) {
 		const auto param = [&](uint32_t index) {
 			return IR::U32(ir.Emit(IR::ValueOpcode::CallStateParam, {IR::Value(index)}));
 		};
-		ir.SetScc(ir.LogicalAnd(ir.IEqual(ReadRawU32(lo_operand), param(CallSplit::ParamTargetLo)),
-		                        ir.IEqual(ReadRawU32(hi_operand), param(CallSplit::ParamTargetHi))));
+		const auto match = ir.LogicalAnd(ir.IEqual(ReadRawU32(lo_operand), param(CallSplit::ParamTargetLo)),
+		                                 ir.IEqual(ReadRawU32(hi_operand), param(CallSplit::ParamTargetHi)));
+		// The active lanes are the call's lanes (the waterfall narrowed EXEC to one record's lanes).
+		ir.SetGotoVariable(IR::SplitShadedVariable,
+		                   ir.LogicalOr(ir.GetGotoVariable(IR::SplitShadedVariable), ir.LogicalAnd(ir.GetExec(), match)));
+		ir.SetScc(match);
 		return;
 	}
 	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));

@@ -20593,6 +20593,204 @@ public:
     std::printf("[gpu]     %-32s ok (%u dispatches)\n", name, attempts);
   }
 
+  // KYTY_SHADER_CALLS_SPLIT with waves whose lanes name several callees: wave 0's records are
+  // lane & 1 (two callees), wave 1's lane & 3 (four callees). The callee passes of the site run in
+  // order (KYTY_SHADER_CALLS_SPLIT_SERIAL=1). Each pass runs the waterfall over all of the wave's
+  // lanes, and the lanes of other targets take the skip path, which marks them done: a pass that
+  // stored every lane (KYTY_SHADER_CALLS_SPLIT_SHADED_ONLY=0) left the later callees of the wave
+  // nothing to shade, so only the first callee's lanes got their result.
+  void CheckCallSplitDivergent() {
+    constexpr const char *name = "CallSplitDivergent";
+    constexpr uintptr_t base = 0x0000000207600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t output = base;               // 128 dwords, bound through s[0:3]
+    constexpr uint64_t pointer = base + 0x1000;     // the table V#, at s[4:5]
+    constexpr uint64_t table = base + 0x2000;       // 4 records
+    constexpr uint64_t callees = base + 0x10000;
+    EnsureRuntimeContext();
+
+    static std::vector<u32> code;
+    code.clear();
+    code.push_back(EncodeSmem0(0x02, 72, 2));                // s_load_dwordx4 s[72:75], s[4:5], 0
+    code.push_back(EncodeSmem1(0, 125));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));                // s_waitcnt lgkmcnt(0)
+    code.push_back(EncodeSop2(0x1e, 21, 6, InlineU32(1)));   // s_lshl_b32 s21, s6, 1
+    code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));  // s_add_u32 s21, s21, 1 (1 or 3)
+    code.push_back(EncodeVop2(0x1b, 72, 21, 0));             // v_and_b32 v72, s21, v0
+    AppendVMovLiteral(&code, 1, 999);                        // v1 = 999
+    code.push_back(EncodeVop2(0x1a, 3, InlineU32(10), 0));   // v_lshlrev_b32 v3, 10, v0
+    AppendSMovLiteral(&code, 20, 5);                         // s20 = 5
+    code.push_back(EncodeSop2(0x1e, 7, 6, InlineU32(6)));    // s_lshl_b32 s7, s6, 6
+    // The pending flag is set before the loop is entered, so it is part of the saved state (as in
+    // Miles Morales' kernel), not set again by each callee pass.
+    code.push_back(EncodeVop1(0x01, 5, InlineU32(1)));       // v_mov_b32 v5, 1 (pending)
+    code.push_back(EncodeSop1(0x04, 40, 126));               // s_mov_b64 s[40:41], exec
+    const auto head = code.size();
+    code.push_back(EncodeVopc(0xd5, InlineU32(0), 5));       // v_cmpx_ne_u32 exec, 0, v5
+    const auto exit_branch = code.size();
+    code.push_back(EncodeSopp(0x08, 0));                     // s_cbranch_execz done
+    code.push_back(EncodeVop1(0x02, 48, Vgpr(72)));          // v_readfirstlane_b32 s48, v72
+    code.push_back(EncodeVop1(0x01, 5, InlineU32(1)));       // v_mov_b32 v5, 1
+    code.push_back(EncodeVopc(0xc2, 48, 72));                // v_cmp_eq_u32 vcc, s48, v72
+    code.push_back(EncodeSop1(0x24, 42, 106));               // s_and_saveexec_b64 s[42:43], vcc
+    const auto skip_branch = code.size();
+    code.push_back(EncodeSopp(0x08, 0));                     // s_cbranch_execz next
+    code.push_back(EncodeVop1(0x01, 5, InlineU32(0)));       // v_mov_b32 v5, 0 (done)
+    code.push_back(EncodeSop2(0x1e, 106, 48, InlineU32(4))); // s_lshl_b32 vcc_lo, s48, 4
+    code.push_back(EncodeSmem0(0x0a, 8, 36));                // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
+    code.push_back(EncodeSmem1(0, 106));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));
+    code.push_back(EncodeSMovB32(14, 8));
+    code.push_back(EncodeSMovB32(15, 9));
+    code.push_back(EncodeSMovB32(16, 10));
+    code.push_back(EncodeSMovB32(17, 11));
+    code.push_back(0xbe8e210eu);                             // s_swappc_b64 s[14:15], s[14:15]
+    code[skip_branch] = EncodeSopp(0x08, static_cast<u32>(code.size() - (skip_branch + 1)));
+    code.push_back(EncodeSop1(0x04, 126, 42));               // next: s_mov_b64 exec, s[42:43]
+    const auto back_branch = code.size();
+    code.push_back(EncodeSopp(0x02, static_cast<u32>(static_cast<int32_t>(head) -
+                                                     static_cast<int32_t>(back_branch + 1)) &
+                                        0xffffu));           // s_branch head
+    code[exit_branch] = EncodeSopp(0x08, static_cast<u32>(code.size() - (exit_branch + 1)));
+    code.push_back(EncodeSop1(0x04, 126, 40));               // done: s_mov_b64 exec, s[40:41]
+    code.push_back(EncodeVop2(0x25, 1, Vgpr(1), 3));         // v_add_nc_u32 v1, v1, v3
+    code.push_back(EncodeVop2(0x25, 1, 20, 1));              // v_add_nc_u32 v1, s20, v1
+    code.push_back(EncodeVop2(0x25, 31, 7, 0));              // v_add_nc_u32 v31, s7, v0
+    code.push_back(EncodeVop2(0x1a, 31, InlineU32(2), 31));  // v_lshlrev_b32 v31, 2, v31
+    code.push_back(EncodeMubuf0(0x1c));                      // buffer_store_dword v1, v31, s[0:3] offen
+    code.push_back(EncodeMubuf1(1, 0, 31));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "call-split direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "call-split direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // Callees: data + lane, data, data - lane, data ^ lane.
+    const std::array<std::vector<u32>, 4> functions{
+        std::vector<u32>{EncodeVop2(0x25, 1, 16, 0), EncodeSop1(0x20, 0, 14)},
+        std::vector<u32>{EncodeVop1(0x01, 1, 16), EncodeSop1(0x20, 0, 14)},
+        std::vector<u32>{EncodeVop2(0x26, 1, 16, 0), EncodeSop1(0x20, 0, 14)},
+        std::vector<u32>{EncodeVop2(0x1d, 1, 16, 0), EncodeSop1(0x20, 0, 14)}};
+    for (u32 i = 0; i < functions.size(); i++) {
+      std::memcpy(reinterpret_cast<void *>(callees + i * 0x100u), functions[i].data(),
+                  functions[i].size() * sizeof(u32));
+    }
+    auto *vsharp = reinterpret_cast<u32 *>(pointer);
+    vsharp[0] = static_cast<u32>(table);
+    vsharp[1] = static_cast<u32>(table >> 32u);
+    vsharp[2] = 4u * 16u;
+    vsharp[3] = 0x5204u;
+    auto *records = reinterpret_cast<u32 *>(table);
+    for (u32 i = 0; i < 4; i++) {
+      const uint64_t function = callees + i * 0x100u;
+      records[i * 4 + 0] = static_cast<u32>(function);
+      records[i * 4 + 1] = static_cast<u32>(function >> 32u);
+      records[i * 4 + 2] = 100u * (i + 1u);
+    }
+    std::array<u32, 128> expected{};
+    for (u32 i = 0; i < expected.size(); i++) {
+      const u32 lane = i & 63u;
+      const u32 record = lane & (i < 64u ? 1u : 3u);
+      const u32 data = 100u * (record + 1u);
+      const u32 called = record == 0u   ? data + lane
+                         : record == 1u ? data
+                         : record == 2u ? data - lane
+                                        : data ^ lane;
+      expected[i] = called + (lane << 10u) + 5u;
+    }
+
+    const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+    auto options = saved_options;
+    options.srt_variant_reads = true;
+    options.shader_calls = true;
+    ShaderRecompiler::SetCodegenOptions(options);
+    ShaderRecompiler::CallSplit::Planner::SetEnabledOverride(1);
+    const char *serial_before = std::getenv("KYTY_SHADER_CALLS_SPLIT_SERIAL");
+    const std::string serial_saved = serial_before != nullptr ? serial_before : "";
+    SetEnvironment("KYTY_SHADER_CALLS_SPLIT_SERIAL", "1");
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    std::array<u32, 128> stored{};
+    bool matched = false;
+    uint32_t attempts = 0;
+    // The plan, the translations and the pipelines are built in the background: the dispatches
+    // before them are skipped or partial.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (!matched && std::chrono::steady_clock::now() < deadline) {
+      attempts++;
+      std::memset(reinterpret_cast<void *>(output), 0, 512);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        (void)context.GetBufferCache().FindBuffer(table, BufferCache::CACHING_PAGESIZE);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 6, .tgid_x_en = true});
+        const std::array<u32, 6> user{static_cast<u32>(output), static_cast<u32>(output >> 32u),
+                                      512u, (3u << 28u) | (0x16u << 12u) | 0xfacu,
+                                      static_cast<u32>(pointer), static_cast<u32>(pointer >> 32u)};
+        for (uint32_t i = 0; i < user.size(); i++) {
+          shaders.SetCsUserSgpr(i, user[i], HW::UserSgprType::Unknown);
+        }
+        context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 2, 1, 1, 0x41u);
+      });
+      for (u32 i = 0; i < stored.size(); i++) {
+        stored[i] = reinterpret_cast<volatile u32 *>(output)[i];
+      }
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      matched = stored == expected;
+      if (!matched) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    SetEnvironment("KYTY_SHADER_CALLS_SPLIT_SERIAL", serial_before != nullptr ? serial_saved.c_str() : nullptr);
+    ShaderRecompiler::CallSplit::Planner::SetEnabledOverride(-1);
+    ShaderRecompiler::SetCodegenOptions(saved_options);
+    u32 wrong[2] = {0, 0};
+    std::string text;
+    for (u32 i = 0; i < stored.size(); i++) {
+      if (stored[i] != expected[i]) {
+        wrong[i / 64u]++;
+        if (text.size() < 200) text += " [" + std::to_string(i) + "] " + Hex(stored[i]) + "/" + Hex(expected[i]);
+      }
+    }
+    Require(name, "every callee of a divergent wave", matched,
+            "wrong lanes: two-callee wave " + std::to_string(wrong[0]) + ", four-callee wave " +
+                std::to_string(wrong[1]) + "; stored/expected:" + text);
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "call-split mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "call-split allocation release failed");
+    std::printf("[gpu]     %-32s ok (%u dispatches)\n", name, attempts);
+  }
+
   // The BVH traversal shape through the real pipeline cache: a loop follows `next` pointers
   // through records and stores each record's value. Without KYTY_SRT_VARIANT_READS the record
   // reads are flat SRT slots whose loop-carried addresses no evaluation before the dispatch can
@@ -60969,6 +61167,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--call-split-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckCallSplitDispatch();
+    vulkan.CheckCallSplitDivergent();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--srt-variant-only") == 0) {

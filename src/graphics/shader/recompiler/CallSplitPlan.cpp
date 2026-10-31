@@ -94,6 +94,12 @@ uint32_t KernelReadVgprLimit(const Decoder::Program& decoded) {
 	return limit;
 }
 
+// Read on every build (not cached), so a test can build both variants in one process.
+bool ShadedOnly() {
+	const char* value = std::getenv("KYTY_SHADER_CALLS_SPLIT_SHADED_ONLY");
+	return value == nullptr || value[0] != '0';
+}
+
 } // namespace
 
 bool AnalyzeShape(std::span<const uint32_t> code, const CompileOptions& options, Shape& shape,
@@ -251,7 +257,16 @@ bool BuildCode(const Shape& shape, const Header& layouts, Kind kind, uint32_t si
 	if (kind == Kind::Callee) {
 		const auto& s = shape.sites.at(site - 1u);
 		std::vector<uint32_t> region(original.begin() + s.a / 4u, original.begin() + s.b / 4u);
-		region.push_back(Decoder::EncodeCallStateWord(Decoder::CallStateOp::SaveChanged, 0));
+		// KYTY_SHADER_CALLS_SPLIT_SHADED_ONLY (default on; =0 reverts): store only the lanes that ran
+		// this callee. Without it every lane of the wave is stored, and a lane of another target leaves
+		// this pass marked done by the skip path, so in a wave whose lanes name several callees only
+		// the first callee pass shaded anything (Miles Morales: 65% of the reflection hits black).
+		if (ShadedOnly()) {
+			region.push_back(Decoder::EncodeCallStateWord(Decoder::CallStateOp::SaveChanged, 1));
+			region.push_back(1u);
+		} else {
+			region.push_back(Decoder::EncodeCallStateWord(Decoder::CallStateOp::SaveChanged, 0));
+		}
 		region.push_back(SEndpgm);
 		// The callee is compared with the target the dispatch passes in and the kernel's addresses
 		// are written relative to its shader base: the words hold no guest address, so the program

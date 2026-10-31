@@ -527,6 +527,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 	uint32_t binned = 0; // sites whose bin pass ran (their counts are read back)
 	// Per binned site and callee slot: 0 ran, 1 left out (sparse), 2 did not run (stats).
 	std::vector<std::vector<uint8_t>> slot_outcome;
+	const bool serial = EnvOn("KYTY_SHADER_CALLS_SPLIT_SERIAL", false); // read per dispatch (tests set it)
 	for (uint32_t k = 1; go && k <= run.sites.size(); k++) {
 		const auto& site    = run.sites[k - 1u];
 		const auto  targets = static_cast<uint32_t>(site.callees.size());
@@ -595,6 +596,13 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 			                          &handle, layout.args[k - 1u] + uint64_t {t} * 12u,
 			                          t < site.targets.size() ? site.targets[t] : 0u);
 			note("C", ran);
+			// KYTY_SHADER_CALLS_SPLIT_SERIAL=1 (default off): a barrier after each callee pass, so the
+			// passes of one site run in order. Callee passes store only the lanes they shaded (CallSplitPlan
+			// ShadedOnly), so their stores are disjoint and need no order; the switch makes the order fixed
+			// for tests of a wave with several callees.
+			if (ran && serial) {
+				to_compute(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
+			}
 			if (ran) {
 				g_totals.callee_dispatches.fetch_add(1, std::memory_order_relaxed);
 			} else {
