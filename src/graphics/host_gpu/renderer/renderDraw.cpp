@@ -2321,6 +2321,20 @@ static bool SkipOcclusionVisibleEnabled() {
 	return on;
 }
 
+// KYTY_CP_PIPELINE_PREFETCH_SKIP=1 (default off): the command processor does not request the
+// draw's pipeline early (PipelineCache::PrefetchGraphicsPipeline before the bindings) when the
+// draw has no planned pipeline. The prefetch is only a compile hint: the lookup after the bindings
+// (TryGetGraphicsPipeline) builds the same key, finds the pipeline or requests its compile. With a
+// warm pipeline cache the early request only built and looked up the key a second time (GT7 title:
+// ~0.34 us of a ~6.3 us commit). DrawPrep workers still prefetch while planning (PlanPipeline).
+static bool CpPipelinePrefetchSkipped() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_CP_PIPELINE_PREFETCH_SKIP");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
 static void NoteSkippedOcclusionDraw(RenderContext& context, CommandBuffer& buffer) {
 	if (!SkipOcclusionVisibleEnabled()) return;
 	auto& occlusion = context.GetOcclusionCounter();
@@ -4687,7 +4701,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	// CommitStats: image transitions recorded while this draw is committed.
 	const auto stats_transitions = CommitStats::Enabled() ? Image::RecordedTransitions() : uint64_t {0};
-	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() &&
+	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() && !CpPipelinePrefetchSkipped() &&
 	    (m_binding_plan == nullptr || m_binding_plan->pipeline == nullptr)) {
 		const CommitStats::SubScope prefetch_scope(CommitStats::Sub::Prefetch);
 		m_context.GetPipelineCache().PrefetchGraphicsPipeline(

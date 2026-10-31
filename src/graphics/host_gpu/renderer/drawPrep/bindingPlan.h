@@ -99,6 +99,8 @@ struct BindingTotals {
 	std::atomic<uint64_t> pipeline_abstains {0};
 	std::atomic<uint64_t> pipeline_busy {0};
 	std::atomic<uint64_t> pipeline_fallbacks {0};
+	// Pipeline abstains by reason: topology, index size, restart, targets, unsupported key, absent.
+	std::array<std::atomic<uint64_t>, 6> pipeline_abstain_reasons {};
 	std::atomic<uint64_t> verify_checks {0};
 	std::atomic<uint64_t> verify_mismatches {0};
 };

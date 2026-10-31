@@ -309,8 +309,11 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 	              BindingPlan& plan, bool prefetch_only = false) {
 	using E = Profiler::FrameEvent;
 	// Rare (a pipeline not created yet, the map lock busy): shared totals are fine here.
-	const auto abstain = [prefetch_only](E event) {
+	const auto abstain = [prefetch_only](E event, size_t reason = 5) {
 		if (prefetch_only) return;
+		if (event != E::DrawPrepBindingAbstainPipelineBusy) {
+			g_binding_totals.pipeline_abstain_reasons[reason].fetch_add(1, std::memory_order_relaxed);
+		}
 		Profiler::CountFrameEvent(event);
 		(event == E::DrawPrepBindingAbstainPipelineBusy ? g_binding_totals.pipeline_busy
 		                                                : g_binding_totals.pipeline_abstains)
@@ -319,13 +322,13 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 	const auto& ctx   = registers.context;
 	const auto& ucfg  = registers.user_config;
 	if (!DrawTopology(ucfg, plan.topology)) {
-		return abstain(E::DrawPrepBindingAbstainPipeline);
+		return abstain(E::DrawPrepBindingAbstainPipeline, 0);
 	}
 	plan.primitive_restart = false;
 	if (index_args != nullptr) {
 		const auto element_size = IndexElementSize(index_args->index_type_and_size);
 		if (element_size == 0) {
-			return abstain(E::DrawPrepBindingAbstainPipeline);
+			return abstain(E::DrawPrepBindingAbstainPipeline, 1);
 		}
 		const bool allow_custom = MeshPrimitiveRestartEnabled() &&
 		                          prepared.vertex_info.stage.program->stage == ShaderType::Mesh;
@@ -333,11 +336,11 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 			case RestartDecision::Disabled: break;
 			case RestartDecision::Enabled: plan.primitive_restart = true; break;
 			case RestartDecision::Scan:
-			case RestartDecision::Unsupported: return abstain(E::DrawPrepBindingAbstainPipeline);
+			case RestartDecision::Unsupported: return abstain(E::DrawPrepBindingAbstainPipeline, 2);
 		}
 	}
 	if (!PredictTargets(*context.graphics, ctx, prepared, plan.targets)) {
-		return abstain(E::DrawPrepBindingAbstainPipeline);
+		return abstain(E::DrawPrepBindingAbstainPipeline, 3);
 	}
 	auto programs = prepared.programs;
 	if (plan.plain_pixel) {
@@ -369,7 +372,7 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 			}
 			return abstain(E::DrawPrepBindingAbstainPipeline);
 		case PipelineCache::PlanLookup::Unsupported:
-			return abstain(E::DrawPrepBindingAbstainPipeline);
+			return abstain(E::DrawPrepBindingAbstainPipeline, 4);
 	}
 }
 

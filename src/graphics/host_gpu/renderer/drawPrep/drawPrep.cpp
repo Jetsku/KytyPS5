@@ -2117,6 +2117,40 @@ void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& dra
 	m_workers->window.Retire();
 }
 
+bool Engine::FenceOverlapEnabled() {
+	static const bool enabled = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_FENCE_OVERLAP");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void Engine::NoteDeferredFence(FenceKind fence_kind) {
+	Profiler::CountFrameEvent(fence_kind == FenceKind::Dispatch
+	                              ? Profiler::FrameEvent::DrawPrepFenceDispatch
+	                              : Profiler::FrameEvent::DrawPrepFenceIndirectDraw);
+	NoteFence();
+}
+
+void Engine::DrainBefore(uint64_t position) {
+	EXIT_IF(!GuestGpu::IsGpuThread() || m_workers == nullptr);
+	auto& window = m_workers->window;
+	if (window.Empty() || window.Head() == position) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepDrains);
+	g_totals.drains.fetch_add(1, std::memory_order_relaxed);
+	while (!window.Empty() && window.Head() != position) {
+		CommitHead();
+	}
+	EXIT_IF(window.Empty());
+}
+
+void Engine::CommitOne() {
+	EXIT_IF(!GuestGpu::IsGpuThread() || m_workers == nullptr || m_workers->window.Empty());
+	CommitHead();
+}
+
 void Engine::Drain() {
 	if (!Pending()) {
 		return;
@@ -2203,6 +2237,37 @@ void PrintDrawPrepSummary() {
 	            static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
 	            fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str(),
 	            dispatches.c_str());
+	if (BindingParts() != 0) {
+		// KYTY_DRAW_PREP_BINDINGS: how many committed plans carried a pipeline the commit could use.
+		auto&           totals = GetBindingTotals();
+		static uint64_t last_plans = 0, last_used = 0, last_pipes = 0, last_abstain = 0,
+		                last_busy = 0, last_fallback = 0;
+		const uint64_t  plans    = totals.plans.load(std::memory_order_relaxed);
+		const uint64_t  used     = totals.used.load(std::memory_order_relaxed);
+		const uint64_t  pipes    = totals.pipelines_used.load(std::memory_order_relaxed);
+		const uint64_t  abstain  = totals.pipeline_abstains.load(std::memory_order_relaxed);
+		const uint64_t  busy     = totals.pipeline_busy.load(std::memory_order_relaxed);
+		const uint64_t  fallback = totals.pipeline_fallbacks.load(std::memory_order_relaxed);
+		std::printf("DrawPrep plans %.0fs: %" PRIu64 " plans committed, %" PRIu64
+		            " used; pipelines: %" PRIu64 " taken, %" PRIu64 " abstained, %" PRIu64
+		            " busy, %" PRIu64 " refused at commit\n",
+		            static_cast<double>(now - last_ns) * 1e-9, plans - last_plans, used - last_used,
+		            pipes - last_pipes, abstain - last_abstain, busy - last_busy,
+		            fallback - last_fallback);
+		last_plans = plans; last_used = used; last_pipes = pipes; last_abstain = abstain;
+		last_busy = busy; last_fallback = fallback;
+		static std::array<uint64_t, 6> last_reasons {};
+		std::string reasons;
+		static const char* const reason_names[6] = {"topology", "index", "restart",
+		                                            "targets",  "key",   "absent"};
+		for (size_t i = 0; i < last_reasons.size(); i++) {
+			const auto value = totals.pipeline_abstain_reasons[i].load(std::memory_order_relaxed);
+			reasons += " " + std::string(reason_names[i]) + "=" + std::to_string(value - last_reasons[i]);
+			last_reasons[i] = value;
+		}
+		std::printf("DrawPrep plan abstains %.0fs:%s\n", static_cast<double>(now - last_ns) * 1e-9,
+		            reasons.c_str());
+	}
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;

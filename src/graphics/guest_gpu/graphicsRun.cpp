@@ -2361,12 +2361,30 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 						    1, std::memory_order_relaxed);
 					}
 				}
-				engine->OnPacket(packet_class, fence_kind);
+				// KYTY_DRAW_PREP_FENCE_OVERLAP: single-record indirect draws and direct dispatches
+				// commit the window from their handler, after publishing their own preparation.
+				const auto opcode_now = (header >> 8u) & 0xffu;
+				const bool overlap =
+				    packet_class == DrawPrep::PacketClass::Fence &&
+				    m_front_mode == FrontMode::Direct && engine->Parallel() &&
+				    DrawPrep::Engine::FenceOverlapEnabled() &&
+				    (((opcode_now == Pm4::IT_DRAW_INDIRECT || opcode_now == Pm4::IT_DRAW_INDEX_INDIRECT) &&
+				      DrawPrep::Engine::IndirectEnabled()) ||
+				     (opcode_now == Pm4::IT_DISPATCH_DIRECT && DrawPrep::DispatchPrepEnabled()));
+				if (overlap) {
+					EXIT_IF(m_fence_overlap);
+					engine->NoteDeferredFence(fence_kind);
+					m_fence_overlap = true;
+				} else {
+					engine->OnPacket(packet_class, fence_kind);
+				}
 			}
 		}
 	}
 	const auto packet_dw =
 	    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+	// KYTY_DRAW_PREP_FENCE_OVERLAP: the handler always consumes the open window.
+	EXIT_IF(m_fence_overlap);
 	EXIT_IF(packet_dw > remaining_dw);
 	if (execution.m_suspended) {
 		// The packet runs again when the stream resumes. A reference front's lockstep packet may
@@ -2931,7 +2949,18 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset,
 		DropSpeculativeSlots();
 	}
 	auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
-	if (prepare) {
+	if (m_fence_overlap) {
+		// KYTY_DRAW_PREP_FENCE_OVERLAP (direct front): prepared behind the pending draws, which are
+		// committed first; the window position is the head when the op executes below.
+		m_fence_overlap = false;
+		const auto position = engine->PublishIndirect(indexed, m_ctx, m_ucfg, m_sh_ctx, [engine] {
+			engine->CommitOne();
+			return true;
+		});
+		engine->DrainBefore(position);
+		op.flags |= CpSeq::IndirectFlagPrepared;
+		op.window = position;
+	} else if (prepare) {
 		const auto position = engine->PublishIndirect(indexed, m_ctx, m_ucfg, m_sh_ctx,
 		                                              [this] { return WaitForWindowSpace(); });
 		if (position != UINT64_MAX) {
@@ -3166,7 +3195,19 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		op.flags |= CpSeq::DispatchFlagSnapshot;
 		op.snapshot = TakeSnapshot();
 	}
-	if (prepare) {
+	if (m_fence_overlap) {
+		// KYTY_DRAW_PREP_FENCE_OVERLAP (direct front): as DrawIndirect.
+		m_fence_overlap = false;
+		const auto position = engine->PublishDispatch(
+		    {thread_group_x, thread_group_y, thread_group_z, mode}, m_ctx, m_ucfg, m_sh_ctx,
+		    [engine] {
+			    engine->CommitOne();
+			    return true;
+		    });
+		engine->DrainBefore(position);
+		op.flags |= CpSeq::DispatchFlagPrepared;
+		op.window = position;
+	} else if (prepare) {
 		const auto position = engine->PublishDispatch(
 		    {thread_group_x, thread_group_y, thread_group_z, mode}, m_ctx, m_ucfg, m_sh_ctx,
 		    [this] { return WaitForWindowSpace(); });
