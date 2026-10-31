@@ -83,6 +83,20 @@ CodegenOptions FromEnvironment() {
 	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
 	options.storage_length_zero =
 	    EnvFlag("KYTY_STORAGE_LENGTH_ZERO", options.storage_length_zero);
+	if (const auto* list = std::getenv("KYTY_BDA_FORCE_SHADERS"); list != nullptr) {
+		std::string_view text(list);
+		while (!text.empty()) {
+			const auto comma = text.find(',');
+			const auto token = std::string(text.substr(0, comma));
+			if (!token.empty()) {
+				options.bda_force_shaders.push_back(std::strtoull(token.c_str(), nullptr, 16));
+			}
+			if (comma == std::string_view::npos) {
+				break;
+			}
+			text.remove_prefix(comma + 1);
+		}
+	}
 	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {
 		options.loop_guard_all = std::strcmp(list, "all") == 0 || std::strcmp(list, "*") == 0;
 		std::string_view text(options.loop_guard_all ? "" : list);

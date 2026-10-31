@@ -188,6 +188,8 @@ public:
 	Tracker(Program& program, bool indirect_scalar_buffers, bool bda_writes)
 	    : m_program(program), m_info(program.info),
 	      m_indirect_scalar_buffers(indirect_scalar_buffers), m_bda_writes(bda_writes) {
+		const auto& force = GetCodegenOptions().bda_force_shaders;
+		m_force_bda       = std::ranges::find(force, program.shader_hash) != force.end();
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -2129,8 +2131,14 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
-			               source)) {
+			// KYTY_BDA_FORCE_SHADERS: the access takes the BDA path even where the V# is a value the
+			// command processor could evaluate.
+			const bool forced = m_force_bda && memory.kind == ResourceKind::Buffer &&
+			                    m_program.stage == ShaderType::Compute &&
+			                    ((m_indirect_scalar_buffers && memory.SupportsIndirectRawLoad(op)) ||
+			                     (m_bda_writes && memory.SupportsIndirectRawWrite(op)));
+			if (forced || !GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
+			                         source)) {
 				// KYTY_SRT_VARIANT_READS: an S_BUFFER_LOAD through a V# the shader computed (e.g. a
 				// BVH instance's record) or any raw vector load through one reads through BDA like
 				// the raw DWORD x2-x4 loads below.
@@ -2364,6 +2372,7 @@ private:
 	bool                                       m_logged_runtime_image = false;
 	bool                                       m_indirect_scalar_buffers = false;
 	bool                                       m_bda_writes              = false;
+	bool                                       m_force_bda               = false;
 	uint32_t                                   m_unresolved_pc = UINT32_MAX;
 
 public:

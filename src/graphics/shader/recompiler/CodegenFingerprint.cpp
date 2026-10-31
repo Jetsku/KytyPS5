@@ -22,11 +22,11 @@ constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Members: 44 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
-// loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
-// lds_limit_override.
+// loop_guard_budget, loop_guard_shaders, bda_force_shaders, dispatcher_cap, rt_node_budget,
+// rt_function, lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 128,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 152,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -85,6 +85,13 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U32(static_cast<uint32_t>(options.loop_guard_shaders.size()));
 	for (const auto hash: options.loop_guard_shaders) {
 		b.U64(hash);
+	}
+	if (!options.bda_force_shaders.empty()) {
+		b.Text("bda_force_shaders");
+		b.U32(static_cast<uint32_t>(options.bda_force_shaders.size()));
+		for (const auto hash: options.bda_force_shaders) {
+			b.U64(hash);
+		}
 	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);

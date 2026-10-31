@@ -302,6 +302,14 @@ struct CodegenOptions {
 	// guarded shaders' results when it fires. Off unless both variables are set.
 	uint32_t              loop_guard_budget = 0;
 	std::vector<uint64_t> loop_guard_shaders;
+	// KYTY_BDA_FORCE_SHADERS=<hash>[,<hash>...] (default none): in these compute programs every raw
+	// buffer access that the BDA path supports goes through BDA, also through V#s the command
+	// processor could evaluate: their V# words become shader-only SRT slots (KYTY_SRT_GPU_FILL
+	// leaves them to the GPU), so the command processor never reads them. For V#s that a compute
+	// pass writes shortly before the listed program runs (Miles Morales' 0x275ffa68d9798b8e), where
+	// reading them on the command processor waits for the GPU every frame. Writes are
+	// KYTY_BDA_WRITES writes (settled per dispatch).
+	std::vector<uint64_t> bda_force_shaders;
 	// KYTY_LOOP_GUARD_SHADERS=all: every shader is guarded (with KYTY_LOOP_GUARD). An exhausted
 	// invocation also records its shader hash (GDS dwords end - LoopGuardHashGdsFromEnd and the one
 	// after), which the "Loop guard" report names: one run finds a shader that never leaves a loop.
