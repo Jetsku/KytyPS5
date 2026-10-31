@@ -1465,8 +1465,69 @@ static bool GpuCleanGate(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+// KYTY_DRAW_PREP_PRIVATE_READS=1 (default off): a clean read (draw-prep worker reads, their commit-
+// time certificate checks, the command processor's clean reads) of bytes in private mappings, which
+// have no backing (the program image: GT7 keeps its shaders and their AGC metadata in it), copies
+// them in place instead of failing. Only ranges the GPU has not mapped (GpuResources::IsMapped): the GPU
+// never writes them, so they are never protected against reads, and the serial path reads them in
+// place anyway.
+// Without it every GT7 stage preparation fails ("backing", ~1/3 of draws at the title, ~45% in
+// races) and runs serially on the command processor.
+static bool PrivateReadsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_PRIVATE_READS");
+		return value != nullptr && (value[0] == '1' || value[0] == '2');
+	}();
+	return enabled;
+}
+
+// Whether every page of the range is readable by the host now (not protected against reads, as the
+// page tracker protects GPU-written pages): the in-place copy then cannot fault.
+static bool HostReadable(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto end = vaddr + size;
+	for (auto at = vaddr; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info) ||
+		    info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 ||
+		    (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+		                     PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) == 0) {
+			return false;
+		}
+		at = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+#else
+	(void)vaddr;
+	(void)size;
+	return false;
+#endif
+}
+
+static bool TryReadPrivate(uint64_t vaddr, void* data, uint64_t size) {
+	if (!PrivateReadsEnabled() || g_guest_address_space == nullptr) {
+		return false;
+	}
+	// GPU-mapped private memory (GT7's program image holds its shader code): none of it may be
+	// GPU-written or waiting for a publication (the lock-free mirror on workers; the command
+	// processor's callers passed the exact gate before).
+	if (g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size)) {
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.IsRegionGpuModifiedRelaxed(vaddr, size) || buffers.HasPendingBackingPublication(vaddr, size)) {
+			return false;
+		}
+	}
+	// KYTY_DRAW_PREP_PRIVATE_READS=2 also checks each page's host protection first (VirtualQuery: slow under
+	// the address-space lock the fault handlers' protection changes take).
+	static const bool check = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_PRIVATE_READS");
+		return value != nullptr && value[0] == '2';
+	}();
+	return (!check || HostReadable(vaddr, size)) && g_guest_address_space->TryReadPrivateInPlace(vaddr, data, size);
+}
+
 static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t size) {
-	return GpuCleanGate(vaddr, size) && TryReadBacking(vaddr, data, size);
+	return GpuCleanGate(vaddr, size) && (TryReadBacking(vaddr, data, size) || TryReadPrivate(vaddr, data, size));
 }
 
 bool BackingInPlaceEnabled() {
@@ -1488,6 +1549,15 @@ static bool TryInspectBacking(uint64_t vaddr, uint64_t size, Inspect& inspect,
 	if (stats != nullptr) {
 		stats->inspected++;
 		stats->locked += locked ? 1u : 0u;
+	}
+	if (!done && PrivateReadsEnabled() && size <= 64u * 1024u * 1024u) {
+		// KYTY_DRAW_PREP_PRIVATE_READS: bytes of private mappings, inspected from a copy.
+		static thread_local std::vector<uint8_t> copy;
+		copy.resize(static_cast<size_t>(size));
+		if (TryReadPrivate(vaddr, copy.data(), size)) {
+			inspect(static_cast<const uint8_t*>(copy.data()));
+			return true;
+		}
 	}
 	return done;
 }
@@ -1649,6 +1719,7 @@ static void NoteDrawPrepBackingDiag(uint64_t vaddr, uint64_t size, uint64_t call
 	struct Site {
 		uint64_t count = 0, size = 0, caller = 0, vaddr = 0;
 		bool     first_byte = false;
+		bool     gpu = false, priv = false;
 	};
 	static std::mutex                               mutex;
 	static std::unordered_map<uint64_t, Site>       sites;
@@ -1664,6 +1735,9 @@ static void NoteDrawPrepBackingDiag(uint64_t vaddr, uint64_t size, uint64_t call
 	site.size       = size;
 	site.vaddr      = vaddr;
 	site.first_byte = first;
+	site.gpu        = g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size);
+	uint8_t probe   = 0;
+	site.priv       = g_guest_address_space != nullptr && g_guest_address_space->TryReadPrivateInPlace(vaddr, &probe, 1);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	site.caller = caller - reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
 #else
@@ -1682,8 +1756,9 @@ static void NoteDrawPrepBackingDiag(uint64_t vaddr, uint64_t size, uint64_t call
 	for (size_t i = 0; i < top.size() && i < 8; i++) {
 		const auto& s = top[i].second;
 		char line[160];
-		std::snprintf(line, sizeof(line), " | %" PRIu64 " x 0x%" PRIx64 "+%" PRIu64 " caller +0x%" PRIx64 "%s",
-		              s.count, s.vaddr, s.size, s.caller, s.first_byte ? " (first byte backed)" : "");
+		std::snprintf(line, sizeof(line), " | %" PRIu64 " x 0x%" PRIx64 "+%" PRIu64 " caller +0x%" PRIx64 "%s%s%s",
+		              s.count, s.vaddr, s.size, s.caller, s.first_byte ? " (first byte backed)" : "",
+		              s.gpu ? " gpu-range" : "", s.priv ? " private" : " not-private");
 		text += line;
 	}
 	std::printf("DrawPrep backing misses 10s:%s\n", text.c_str());
@@ -1717,7 +1792,7 @@ static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vad
 		reads.Fail(failure);
 		return false;
 	}
-	if (!TryReadBacking(vaddr, data, size)) {
+	if (!TryReadBacking(vaddr, data, size) && !TryReadPrivate(vaddr, data, size)) {
 		reads.Fail(DrawPrepBackingFailure(recorder, vaddr, size, caller));
 		return false;
 	}

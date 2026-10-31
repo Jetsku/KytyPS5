@@ -1782,6 +1782,23 @@ private:
 		return vaddr < it->second.vaddr + it->second.size ? it : m_mapped.end();
 	}
 
+public:
+	// KYTY_DRAW_PREP_PRIVATE_READS: the bytes of a range wholly inside private (not backed) mappings
+	// (the program image, runtime allocations), copied in place under the map lock, so no unmap can
+	// race the copy. False when any byte lies outside such a mapping.
+	bool TryReadPrivateInPlace(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
+			return false;
+		}
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), static_cast<size_t>(size));
+		return true;
+	}
+
+private:
 	bool ContainsMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;

@@ -550,7 +550,16 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	uint64_t effective_hash = declared_hash;
-	if (RegisteredShaderCodeEnabled() && DrawPrep::Speculative()) {
+	// KYTY_DRAW_PREP_DECLARED_CODE=1 (default off): a draw-prep preparation of a shader with a
+	// declared (AGC header) hash takes the program by that hash, as the serial path does, without
+	// re-reading and re-hashing its code for the certificate (GT7's shaders are hundreds of KiB each;
+	// with KYTY_DRAW_PREP_PRIVATE_READS their code in the program image is otherwise copied and hashed
+	// for every prepared stage).
+	static const bool declared_code = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_DECLARED_CODE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (RegisteredShaderCodeEnabled() && DrawPrep::Speculative() && !(declared_code && declared_hash != 0)) {
 		// Keep the worker's exact code certificate, including failed-read fallback at commit.
 		const auto certified_hash = HashShaderCodeCertified(code);
 		if (certified_hash != data.code_hash || DrawPrep::SpeculativeFailed()) {
