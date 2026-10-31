@@ -20559,6 +20559,10 @@ public:
       shape_options.stage = ShaderType::Compute;
       shape_options.wave_size = 64;
       shape_options.input_info.compute = &compute;
+      const std::array<u32, 6> shape_user{static_cast<u32>(output), static_cast<u32>(output >> 32u), 512u,
+                                          (3u << 28u) | (0x16u << 12u) | 0xfacu, static_cast<u32>(pointer),
+                                          static_cast<u32>(pointer >> 32u)};
+      shape_options.user_data = shape_user;
       Split::Shape shape;
       std::string failure;
       Require(name, "call-split shape", Split::AnalyzeShape(code, shape_options, shape, failure), failure);
