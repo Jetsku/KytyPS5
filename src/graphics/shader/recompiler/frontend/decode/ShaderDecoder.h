@@ -843,6 +843,8 @@ constexpr uint32_t CallStateSoppOpcode = 0x7fu;
 // offset; the pair becomes the shader base plus the offset (S_MOV_B32 semantics: SCC is kept). With
 // both, a callee program carries neither its callee's nor its kernel's guest address as a literal,
 // so its translation and pipeline are the same in every session wherever the game loaded them.
+// SaveChanged (end of a callee program): no payload stores every lane's changed registers; one payload
+// word 1 stores only the lanes whose call matched the callee (KYTY_SHADER_CALLS_SPLIT_SHADED_ONLY).
 enum class CallStateOp : uint32_t {
 	Header             = 1,
 	Save               = 2,

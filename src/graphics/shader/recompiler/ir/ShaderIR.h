@@ -593,6 +593,9 @@ constexpr uint32_t CallPartitionParamTargetLo = 2;
 constexpr uint32_t CallPartitionParamTargetHi = 3;
 constexpr uint32_t CallPartitionReportSlots   = 512;
 constexpr uint32_t PartitionDropVariable      = 0x7ffffff0u;
+// Call-split callee programs (CallSplitPlan.cpp BuildCode): the lanes whose call matched the callee the
+// dispatch runs (SplitTargetCompare). A shaded-only SaveChanged stores just these lanes.
+constexpr uint32_t SplitShadedVariable        = 0x7ffffff1u;
 // Set by the translation of a program with partition markers (thread of that translation).
 void SetPartitionDropLanes(bool value) noexcept;
 [[nodiscard]] bool PartitionDropLanes() noexcept;
