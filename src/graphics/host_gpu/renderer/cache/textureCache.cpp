@@ -4141,6 +4141,59 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	                                      metadata_base_layer, values, decodable, false);
 }
 
+// KYTY_DCC_GPU_ALIASED=1|2 (default off, read once): images registered over a target's metadata bytes
+// no longer send the metadata inspection to the CPU fallback (a download that drains the GPU: GT7
+// races, ~3.6 a frame at 1-5 ms each, metadata written by a compute dispatch of the same frame) as
+// long as none of them is GPU-modified (its newest bytes would be in the image, not in the buffer
+// the inspection reads) and none is the target itself. The inspection reads and rewrites the
+// metadata through the canonical buffer as a GPU write (ObtainBuffer), which invalidates the images
+// over those bytes as any buffer write does. Other images keep the old path.
+// =2 also accepts GPU-modified images over the metadata (not the target itself), as usa-ratt's GPU
+// clear check does (no aliasing test): GT7 registers an 8.4 MiB image 0x60000 past a 2048x1024 target
+// whose range covers that target's DCC bytes; it is GPU-modified, so =1 keeps that inspection on the
+// CPU (a drain per bind). Accuracy cost: bytes of the metadata such an image wrote and has not
+// written back would be missed by the inspection (the buffer copy is read).
+bool TextureCache::MetadataAliasBlocks(ImageId id, GuestRange range) {
+	const auto images = FindImagesInRegion(range.address, range.size, false);
+	if (images.size() == 0) {
+		return false;
+	}
+	static const int relaxed = [] {
+		const auto* value = std::getenv("KYTY_DCC_GPU_ALIASED");
+		return value == nullptr ? 0 : std::clamp(std::atoi(value), 0, 2);
+	}();
+	if (relaxed == 0) {
+		return true;
+	}
+	for (const auto other: images) {
+		const auto* image = m_slot_images.try_get(other);
+		if (other == id || image == nullptr || (relaxed == 1 && image->IsGpuModified())) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::fprintf(stderr,
+				             "DCC aliased metadata 0x%016" PRIx64 "+0x%" PRIx64 " kept on the CPU path: image "
+				             "data 0x%016" PRIx64 "+0x%" PRIx64 " %s\n",
+				             range.address, range.size, image != nullptr ? image->info.data.address : 0,
+				             image != nullptr ? image->info.data.size : 0,
+				             other == id ? "is the target" : image == nullptr ? "gone" : "is GPU-modified");
+			}
+			return true;
+		}
+	}
+	static std::atomic<uint64_t> accepted {0};
+	if (const auto n = accepted.fetch_add(1, std::memory_order_relaxed) + 1; (n & (n - 1)) == 0) {
+		const auto* image = m_slot_images.try_get(*images.begin());
+		std::fprintf(stderr,
+		             "DCC aliased metadata inspected on the GPU (KYTY_DCC_GPU_ALIASED): %" PRIu64
+		             " times; e.g. metadata 0x%016" PRIx64 "+0x%" PRIx64 " under image data 0x%016" PRIx64
+		             "+0x%" PRIx64 " %ux%u\n",
+		             n, range.address, range.size, image != nullptr ? image->info.data.address : 0,
+		             image != nullptr ? image->info.data.size : 0, image != nullptr ? image->info.extent.width : 0,
+		             image != nullptr ? image->info.extent.height : 0);
+	}
+	return false;
+}
+
 Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
     DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
     uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
@@ -4173,7 +4226,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	};
 	{
 		std::scoped_lock lock {m_lock};
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		if (MetadataAliasBlocks(id, range)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
@@ -4244,7 +4297,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			case Support::Format: return Event::DccFallbackFormat;
 			case Support::Unsupported: return Event::DccFallbackUnsupported;
 		}
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		if (MetadataAliasBlocks(id, range)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		return std::nullopt;

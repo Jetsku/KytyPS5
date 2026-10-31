@@ -1997,6 +1997,19 @@ std::string DescribeAddressForCrash(uint64_t vaddr) {
 	return out;
 }
 
+bool DescribeVirtualRange(uint64_t vaddr, uint64_t* start, uint64_t* size, char* name, uint64_t name_size) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->Query(vaddr, 0, &range)) {
+		return false;
+	}
+	*start = range.start;
+	*size  = range.size;
+	if (name != nullptr && name_size != 0) {
+		std::snprintf(name, static_cast<size_t>(name_size), "%.*s", static_cast<int>(sizeof(range.name)), range.name);
+	}
+	return true;
+}
+
 static bool IsInPrtAperture(uint64_t address, uint64_t size);
 
 // The committed, non-private, GPU-mapped allocation containing vaddr (not sparse/PRT).

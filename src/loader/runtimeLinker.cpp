@@ -772,7 +772,7 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 		HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
 		                                                      : HangTrace::ReadbackKind::FaultRead);
 	}
-	if (Libs::Graphics::FaultCost::MapEnabled()) {
+	if (Libs::Graphics::FaultCost::MapEnabled() || Libs::Graphics::FaultCost::AttribEnabled()) {
 		Libs::Graphics::FaultCost::SetFaultInstruction(info->exception_address);
 	}
 	// The faulting instruction runs again when this handler returns (KYTY_READBACK_SIDE_WRITES),

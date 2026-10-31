@@ -461,6 +461,9 @@ private:
 	[[nodiscard]] bool SafeToSyncIntoBuffer(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
+	// KYTY_DCC_GPU_ALIASED: whether images over a target's metadata keep its inspection on the CPU
+	// (m_lock held).
+	[[nodiscard]] bool          MetadataAliasBlocks(ImageId id, GuestRange range);
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.

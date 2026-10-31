@@ -2273,6 +2273,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
 			CpGaps::Note(is_write ? CpGaps::Event::DrainWrite : CpGaps::Event::DrainOther);
+			const FaultCost::AttribReadbackScope attrib(
+			    vaddr, gpu_thread ? (is_write ? FaultCost::AttribPath::CpWriteDrain : FaultCost::AttribPath::CpReadDrain)
+			                      : (is_write ? FaultCost::AttribPath::GuestWriteDrain
+			                                  : FaultCost::AttribPath::GuestReadDrain));
 			ReadMemoryDrain(vaddr, size, is_write, trace, async);
 		});
 		finish_async();
@@ -2290,7 +2294,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		const auto                    result = TryIssueSideReadback(vaddr, size, issued);
 		if (result == SideIssueResult::Issued) {
 			{
-				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::GpuWaitSideCopy);
+				Profiler::ScopedFrameWait            side_wait(Profiler::FrameWait::GpuWaitSideCopy);
+				const FaultCost::AttribReadbackScope attrib_path(vaddr, FaultCost::AttribPath::CpReadSide);
+				FaultCost::AttribScope               attrib(FaultCost::AttribKind::SideWait, false);
+				attrib.SetAddress(vaddr);
 				CompleteSideReadback(*issued);
 			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadSideCopies);
@@ -2311,6 +2318,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadDrains);
 		CpGaps::Note(CpGaps::Event::DrainGpuThread);
+		const FaultCost::AttribReadbackScope attrib(vaddr, FaultCost::AttribPath::CpReadDrain);
 		ReadMemoryDrain(vaddr, size, false, trace);
 		record(std::nullopt);
 		return;
@@ -2382,6 +2390,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			             : result == SideIssueResult::CurrentWriter ? CpGaps::Event::DrainCurrentWriter
 			             : result == SideIssueResult::Unbounded     ? CpGaps::Event::DrainUnbounded
 			                                                        : CpGaps::Event::DrainOther);
+			const FaultCost::AttribReadbackScope attrib(
+			    vaddr, is_write ? FaultCost::AttribPath::GuestWriteDrain : FaultCost::AttribPath::GuestReadDrain);
 			ReadMemoryDrain(vaddr, size, is_write, trace, async);
 		}
 	};

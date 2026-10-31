@@ -197,6 +197,9 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 [[nodiscard]] bool     IsCommittedSpan(uint64_t vaddr, uint64_t size);
 // The unhandled-fault report: what the kernel and the GPU tracker know about an address.
 [[nodiscard]] std::string DescribeAddressForCrash(uint64_t vaddr);
+// The guest virtual range containing vaddr: start, size and the name the guest gave it (diagnostics).
+[[nodiscard]] bool     DescribeVirtualRange(uint64_t vaddr, uint64_t* start, uint64_t* size, char* name,
+                                            uint64_t name_size);
 // The committed, non-private, GPU-mapped allocation containing vaddr; false for anything else.
 [[nodiscard]] bool     GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
