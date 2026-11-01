@@ -603,6 +603,9 @@ private:
 	uint64_t       m_retry_op         = 0;
 	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
 	bool m_packet_hook = false;
+	// KYTY_DRAW_PREP_FENCE_OVERLAP (drawPrep.h): the packet hook left the window open for this
+	// packet; its handler (DrawIndirect / DispatchDirect) publishes, commits up to and executes it.
+	bool m_fence_overlap = false;
 };
 
 } // namespace Libs::Graphics

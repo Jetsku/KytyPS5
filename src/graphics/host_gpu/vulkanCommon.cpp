@@ -12,14 +12,19 @@
 
 #include <spirv-tools/libspirv.hpp>
 
+#include <xxhash.h>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
@@ -205,27 +210,172 @@ const ShrinkMode& FunctionArrayShrinkMode() {
 	return mode;
 }
 
+// CompileSpvTimes accounting (KYTY_SHADER_PRECOMPILE_STATS=1).
+bool StatsOn() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SHADER_PRECOMPILE_STATS");
+		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint64_t ClockNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+thread_local CompileSpvTimes t_spv_times;
+struct {
+	std::atomic<uint64_t> calls {0}, shrunk {0}, validated {0}, validate_skipped {0};
+	std::atomic<uint64_t> shrink_ns {0}, validate_ns {0}, create_ns {0};
+} g_spv_times;
+
+void AddSpvTimes(const CompileSpvTimes& d) {
+	auto& t = t_spv_times;
+	t.calls += d.calls;
+	t.shrunk += d.shrunk;
+	t.validated += d.validated;
+	t.validate_skipped += d.validate_skipped;
+	t.shrink_ns += d.shrink_ns;
+	t.validate_ns += d.validate_ns;
+	t.create_ns += d.create_ns;
+	g_spv_times.calls.fetch_add(d.calls, std::memory_order_relaxed);
+	g_spv_times.shrunk.fetch_add(d.shrunk, std::memory_order_relaxed);
+	g_spv_times.validated.fetch_add(d.validated, std::memory_order_relaxed);
+	g_spv_times.validate_skipped.fetch_add(d.validate_skipped, std::memory_order_relaxed);
+	g_spv_times.shrink_ns.fetch_add(d.shrink_ns, std::memory_order_relaxed);
+	g_spv_times.validate_ns.fetch_add(d.validate_ns, std::memory_order_relaxed);
+	g_spv_times.create_ns.fetch_add(d.create_ns, std::memory_order_relaxed);
+}
+
+// Shrunk modules known to pass spirv-val (UseShrinkVerdictFile). A verdict is a pure function of
+// the module's words and the validator (its build and SPV_ENV_VULKAN_1_3 with default options), so
+// equal words need no second run. Keys are XXH3-128 of the words.
+class ShrinkVerdicts {
+public:
+	static ShrinkVerdicts& Instance() {
+		static ShrinkVerdicts instance;
+		return instance;
+	}
+
+	uint64_t Open(const std::string& path) {
+		std::scoped_lock lock(m_mutex);
+		if (m_file != nullptr || path.empty()) return m_known.size();
+		const auto header = Header();
+		std::vector<uint8_t> bytes;
+		if (std::FILE* in = std::fopen(path.c_str(), "rb"); in != nullptr) {
+			std::array<uint8_t, 65536> chunk {};
+			for (size_t got; (got = std::fread(chunk.data(), 1, chunk.size(), in)) != 0;) {
+				bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
+			}
+			std::fclose(in);
+		}
+		if (bytes.size() >= header.size() && std::equal(header.begin(), header.end(), bytes.begin())) {
+			for (size_t at = header.size(); at + sizeof(Key) <= bytes.size(); at += sizeof(Key)) {
+				Key key {};
+				std::memcpy(&key, bytes.data() + at, sizeof(Key));
+				m_known.insert(key);
+			}
+		}
+		// Rewritten whole: a torn record at the end (a killed run) or another validator's file is
+		// dropped, and later appends stay aligned.
+		m_file = std::fopen(path.c_str(), "wb");
+		if (m_file == nullptr) return m_known.size();
+		std::fwrite(header.data(), 1, header.size(), m_file);
+		for (const auto& key: m_known) std::fwrite(&key, sizeof(Key), 1, m_file);
+		std::fflush(m_file);
+		m_enabled.store(true, std::memory_order_release);
+		return m_known.size();
+	}
+
+	[[nodiscard]] bool Enabled() const { return m_enabled.load(std::memory_order_acquire); }
+
+	[[nodiscard]] bool Known(std::span<const uint32_t> words) {
+		const auto key = KeyOf(words);
+		std::scoped_lock lock(m_mutex);
+		return m_known.contains(key);
+	}
+
+	void Remember(std::span<const uint32_t> words) {
+		const auto key = KeyOf(words);
+		std::scoped_lock lock(m_mutex);
+		if (!m_known.insert(key).second || m_file == nullptr) return;
+		std::fwrite(&key, sizeof(Key), 1, m_file);
+		std::fflush(m_file);
+	}
+
+private:
+	struct Key {
+		uint64_t low  = 0;
+		uint64_t high = 0;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const { return static_cast<size_t>(key.low ^ (key.high * 31u)); }
+	};
+	static Key KeyOf(std::span<const uint32_t> words) {
+		const auto hash = XXH3_128bits(words.data(), words.size_bytes());
+		return {.low = hash.low64, .high = hash.high64};
+	}
+	// Magic, then the XXH3-64 of the validator's identity (32 bytes in all).
+	static std::array<uint8_t, 32> Header() {
+		std::array<uint8_t, 32> header {};
+		constexpr char          magic[16] = "KYTY SHRINKVAL1";
+		std::memcpy(header.data(), magic, sizeof(magic));
+		const std::string identity = std::string(spvSoftwareVersionDetailsString()) + "; vulkan1.3 default options";
+		const uint64_t    hash     = XXH3_64bits(identity.data(), identity.size());
+		std::memcpy(header.data() + 16, &hash, sizeof(hash));
+		return header;
+	}
+
+	std::mutex                        m_mutex;
+	std::unordered_set<Key, KeyHash>  m_known;
+	std::FILE*                        m_file = nullptr;
+	std::atomic<bool>                 m_enabled {false};
+};
+
 // Returns the rewritten module, or nothing (unchanged or invalid). `declared` / `created`: the
 // module's Function-storage bytes per invocation before and as given to the driver.
 std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint64_t& declared,
                                            uint64_t& created) {
+	const bool            stats       = StatsOn();
+	CompileSpvTimes       times;
+	const auto            shrink_from = stats ? ClockNs() : 0;
 	std::vector<uint32_t> shrunk;
 	const auto            result = SpirvLocalArrays::Shrink(code, shrunk, FunctionArrayShrinkMode().init);
 	declared                     = result.bytes_before;
 	created                      = result.bytes_before;
+	if (stats) times.shrink_ns = ClockNs() - shrink_from;
 	if (!result.changed) {
+		if (stats) AddSpvTimes(times);
 		return {};
 	}
-	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
-	std::string          messages;
-	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&,
-	                                     const char* message) {
-		if (messages.size() < 512) {
-			messages += message;
-			messages += "; ";
+	times.shrunk = 1;
+	auto&       verdicts = ShrinkVerdicts::Instance();
+	const bool  memo     = verdicts.Enabled();
+	std::string messages;
+	bool        valid = memo && verdicts.Known(shrunk);
+	if (valid) {
+		times.validate_skipped = 1;
+	} else {
+		const auto           validate_from = stats ? ClockNs() : 0;
+		spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+		tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&,
+		                                     const char* message) {
+			if (messages.size() < 512) {
+				messages += message;
+				messages += "; ";
+			}
+		});
+		valid = tools.Validate(shrunk);
+		if (stats) {
+			times.validated   = 1;
+			times.validate_ns = ClockNs() - validate_from;
 		}
-	});
-	const bool valid = tools.Validate(shrunk);
+		if (valid && memo) verdicts.Remember(shrunk);
+	}
+	if (stats) AddSpvTimes(times);
 	static std::mutex                   log_mutex;
 	static std::set<std::string>        logged;
 	std::string                         arrays;
@@ -288,9 +438,37 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();
 	vk::ShaderModule module = nullptr;
+	const auto       create_from = StatsOn() ? ClockNs() : 0;
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
+	if (StatsOn()) AddSpvTimes({.calls = 1, .create_ns = ClockNs() - create_from});
 	return module;
+}
+
+bool CompileSpvStatsEnabled() {
+	return StatsOn();
+}
+
+CompileSpvTimes CompileSpvThreadTimes() {
+	return t_spv_times;
+}
+
+CompileSpvTimes CompileSpvTotals() {
+	const auto load = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
+	return {.calls            = load(g_spv_times.calls),
+	        .shrunk           = load(g_spv_times.shrunk),
+	        .validated        = load(g_spv_times.validated),
+	        .validate_skipped = load(g_spv_times.validate_skipped),
+	        .shrink_ns        = load(g_spv_times.shrink_ns),
+	        .validate_ns      = load(g_spv_times.validate_ns),
+	        .create_ns        = load(g_spv_times.create_ns)};
+}
+
+uint64_t UseShrinkVerdictFile(const std::string& path) {
+	if (const auto* value = std::getenv("KYTY_SHRINK_VERDICTS"); value != nullptr && std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return ShrinkVerdicts::Instance().Open(path);
 }
 
 } // namespace Libs::Graphics
