@@ -899,6 +899,8 @@ private:
 	//     the fallback's ClearImage(id) clears it;
 	//  4: video-out bindings (flips): inspected without consuming the keys (the fallback leaves a
 	//     flip's keys as they are), never reused from an earlier inspection.
+	//  8: with 4, also video-out surfaces with DCC compression (GT7's 3840x2160 flips, whose
+	//     fallback was a side readback of their metadata at every flip, on the command processor).
 	// KYTY_DCC_GPU_WIDE_VERIFY=1|exit: for an inspection accepted only through these, also take the
 	// CPU fallback's decision (after a drain) and compare it with the inspection's decision copied
 	// out behind it: "DCC wide verify" mismatches are counted and logged (exit stops).

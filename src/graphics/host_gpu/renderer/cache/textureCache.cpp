@@ -4131,7 +4131,12 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	if (keep_keys && (DccGpuWide() & 4u) == 0) {
 		return Event::DccFallbackBinding;
 	}
-	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+	// KYTY_DCC_GPU_WIDE 8 (with 4): a DCC-compressed video-out surface (GT7's flips) is inspected
+	// too. The fallback decides it from the same bytes and the same way (first key a decodable clear
+	// code and every byte equal to it), whatever the compression of the surface.
+	const bool compressed_flip = keep_keys && (DccGpuWide() & 8u) != 0 &&
+	                             desc.info.metadata.compression != VideoOutCompression::Unsupported;
+	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed && !compressed_flip) {
 		return Event::DccFallbackShape;
 	}
 	// The CPU decoder's result for every clear code under this binding (ClearCodes order).
@@ -4533,7 +4538,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 // paths leave the metadata in a state the other reads the same way, so a change between two
 // inspections is safe.
 int64_t TextureCache::ParseDccGpuWide(const char* value) {
-	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 0) & 7u) : 0;
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 0) & 15u) : 0;
 }
 static Live::Switch g_dcc_gpu_wide("KYTY_DCC_GPU_WIDE", &TextureCache::ParseDccGpuWide);
 

@@ -958,6 +958,16 @@ static uint32_t IdleFlushMinDraws() {
 	return static_cast<uint32_t>(g_idle_flush_draws.Get());
 }
 
+// KYTY_IDLE_FLUSH_AHEAD=<n> (default 0, at most 4; live switch): the idle flush above also submits
+// while the GPU still runs at most n submitted command buffers, so the next one is queued before
+// the GPU drains. Each drained queue costs a restart of ~0.15-0.3 ms between vkQueueSubmit and the
+// GPU start (GT7 title, KYTY_GPU_SPAN_LOG), several times per frame while the frame's cheap early
+// passes are recorded more slowly than the GPU runs them.
+static Live::Switch g_idle_flush_ahead("KYTY_IDLE_FLUSH_AHEAD", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 4ul));
+});
+
 // KYTY_DRAW_FLUSH_INTERVAL / KYTY_DISPATCH_FLUSH_INTERVAL (default 0 = off; strxno/KytyPS5-GT7
 // 1f4ccc4fb, whose own defaults are 16 and 4): submit the recording after that many draws /
 // dispatches in it, whether or not the GPU is idle, so the GPU starts on them earlier and a
@@ -1032,14 +1042,15 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	if (in_pass && m_idle_flush_draws < min_draws * 4u) {
 		return;
 	}
-	auto& master = scheduler.GetMasterSemaphore();
-	if (master.KnownGpuTick() + 1u < current) {
+	auto&          master = scheduler.GetMasterSemaphore();
+	const uint64_t ahead  = 1u + static_cast<uint64_t>(g_idle_flush_ahead.Get()); // KYTY_IDLE_FLUSH_AHEAD
+	if (master.KnownGpuTick() + ahead < current) {
 		// Refresh the timeline value only every few draws (a driver query).
 		if ((m_idle_flush_draws % 4u) != 0) {
 			return;
 		}
 		master.Refresh();
-		if (master.KnownGpuTick() + 1u < current) {
+		if (master.KnownGpuTick() + ahead < current) {
 			return;
 		}
 	}
