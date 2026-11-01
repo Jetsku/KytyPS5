@@ -119,6 +119,12 @@ public:
 	static constexpr uint32_t Placeholders       = ImageArrays * PlaceholderColors;
 	static constexpr uint32_t MaxImagesPerArray  = 65536;
 	static constexpr uint32_t TranslationEntries = 1u << 20u;
+	// KYTY_BINDLESS_TRANSLATION_MI=<n> (default 4, 1..16): translation entries in Mi (the
+	// translation and feedback buffers hold one dword each). Heaps take regions of it and never
+	// give them back; a call table read through record pointers takes 256 Ki keys. With 1 Mi,
+	// Miles Morales' ray-tracing material tables (two call tables, several images each) filled it
+	// and every later heap sampled the placeholder ("translation buffer is full").
+	[[nodiscard]] static uint32_t TranslationCapacity();
 
 	using Heap = BindlessHeap;
 

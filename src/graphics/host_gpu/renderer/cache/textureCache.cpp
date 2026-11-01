@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/watchRange.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/texelImageLookup.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -377,6 +378,11 @@ void ClearTrace(const char* site, const char* outcome, uint64_t metadata, uint64
 	             " %ux%u extra=0x%x\n",
 	             site, outcome, metadata, metadata_size, data, data_size, width, height, extra);
 	std::fflush(stderr);
+}
+
+// KYTY_WATCH_RANGE: texture-cache operations that write an image overlapping a watched range.
+void ImageWatch(const char* what, const Image& image) {
+	if (WatchRange::Enabled()) WatchRange::Note(what, image.info.data.address, image.info.data.size);
 }
 
 bool ColourMetadataTargetsDepth(const char* site, ImageId id, const Image& image) {
@@ -2187,6 +2193,73 @@ void TextureCache::VerifyGpuWrittenRanges(ImageId id, RefreshIntent intent) {
 	});
 }
 
+bool TextureCache::DebugDumpImage(uint64_t address, uint32_t want_width, uint32_t want_height,
+                                  const std::string& prefix) {
+	std::scoped_lock lock {m_lock};
+	ImageId              found {};
+	std::vector<ImageId> exact;
+	std::string          listing;
+	FindImagesInRegion(address, 1, false).ForEach([&](ImageId id) {
+		const auto& image = m_slot_images[id];
+		listing += fmt::format(" [id {} base 0x{:x} {}x{} vk{}{}]", id.index, image.info.data.address,
+		                       image.info.extent.width, image.info.extent.height,
+		                       static_cast<uint32_t>(image.backing.format), image.depth_id ? " depth" : "");
+		if (image.info.data.address != address || image.depth_id) return;
+		if (!found) found = id;
+		if (image.info.extent.width == want_width && image.info.extent.height == want_height) exact.push_back(id);
+	});
+	LOGF("DebugDumpImage 0x%" PRIx64 " want %ux%u:%s\n", address, want_width, want_height, listing.c_str());
+	if (exact.empty() && found) exact.push_back(found);
+	if (exact.empty()) {
+		return false;
+	}
+	bool dumped = false;
+	for (const auto id: exact) {
+		dumped |= DebugDumpOne(id, address, exact.size() > 1 ? fmt::format("{}_i{}", prefix, id.index) : prefix);
+	}
+	return dumped;
+}
+
+bool TextureCache::DebugDumpOne(ImageId found, uint64_t address, const std::string& prefix) {
+	auto&          image  = m_slot_images[found];
+	const auto     format = image.backing.format;
+	const auto     extent = vk::blockExtent(format);
+	const uint32_t bytes  = vk::blockSize(format);
+	if (image.info.samples != 1 || bytes == 0 || extent[0] != 1 || extent[1] != 1 ||
+	    vk::componentCount(format) == 0) {
+		return false;
+	}
+	const uint32_t width  = image.info.extent.width;
+	const uint32_t height = image.info.extent.height;
+	const uint64_t size   = uint64_t {width} * height * bytes;
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageExtent      = vk::Extent3D {width, height, 1};
+	auto buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                       vk::BufferUsageFlagBits::eTransferDst,
+	                                       Common::AlignUp(size, uint64_t {4}));
+	image.Download({&copy, 1}, buffer->Handle(), 0, size);
+	vk::MemoryBarrier2 to_host {};
+	to_host.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &to_host;
+	m_scheduler.Current().HelperSink().pipelineBarrier2(dependency);
+	const auto path = fmt::format("{}_{:x}_{}x{}_vk{}_b{}.raw", prefix, address, width, height,
+	                              static_cast<uint32_t>(format), bytes);
+	m_scheduler.DeferOperation([buffer, size, path] {
+		buffer->Invalidate(0, size);
+		if (std::FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+			std::fwrite(buffer->Mapped().data(), 1, size, file);
+			std::fclose(file);
+		}
+	});
+	return true;
+}
+
 void TextureCache::PrintPartialGpuWriteSummary() {
 	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                           std::chrono::steady_clock::now().time_since_epoch())
@@ -2969,6 +3042,7 @@ const char* TextureCache::TryDirectReinterpret(Image& destination, Image& source
 }
 
 bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const char* context) {
+	ImageWatch(context != nullptr ? context : "image copy destination", m_slot_images[destination_id]);
 	RefreshCopySource(source_id);
 	// Levels the copy does not write must stay valid, and the result is GPU-owned.
 	RequireFullResidency(destination_id);
@@ -3505,6 +3579,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	ImageWatch("image upload", image);
 	// Scratch buffers from the tiler stay alive until this operation's last tick (tiler.h).
 	const TileManager::ScratchHold scratch_hold(m_tiler);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
@@ -3628,6 +3703,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 
 void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 	auto& image = m_slot_images[id];
+	ImageWatch("image initialize", image);
 	if (image.info.data.Empty()) {
 		return;
 	}
@@ -4393,6 +4469,7 @@ void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uin
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer, MetadataNoop* noop) {
+	ImageWatch("image DCC clear materialize", m_slot_images[id]);
 	if (noop != nullptr) {
 		*noop = {};
 	}
@@ -4760,6 +4837,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 
 void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
                                          uint32_t metadata_base_layer, MetadataNoop* noop) {
+	ImageWatch("image CMASK clear materialize", m_slot_images[id]);
 	using Event = Profiler::FrameEvent;
 	if (noop != nullptr) {
 		*noop = {};
@@ -5886,6 +5964,7 @@ bool TextureCache::HasAliasPartner(uint64_t page, ImageId found, const Image& im
 
 void TextureCache::SyncAliasFromOwner(ImageId id) {
 	auto& image = m_slot_images[id];
+	ImageWatch("image alias sync", image);
 	// TextureCache::SyncAliasReturnsAtOnce mirrors this condition.
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
 	    image.info.HasStencil() || image.backing.image == nullptr) {
@@ -6074,6 +6153,7 @@ bool StencilPlaneFillClearEnabled() {
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
 	KYTY_GPU_OP_SITE("texcache.clear_from_buffer");
+	if (WatchRange::Enabled()) WatchRange::Note("image clear from buffer", address, size);
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
@@ -6256,6 +6336,7 @@ bool TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear,
                               const char* site) {
 	KYTY_GPU_OP_SITE("texcache.clear");
+	ImageWatch(site != nullptr ? site : "image clear", m_slot_images[id]);
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: invalid command buffer for an image clear (%s)\n",
 		     site != nullptr ? site : "?");
@@ -6592,6 +6673,7 @@ bool TextureCache::BlocksUnderRect(const Image& image, vk::Rect2D& rect, RangeSe
 }
 
 void TextureCache::TakeOverOwnedBytes(Image& destination, Image& source) {
+	ImageWatch("image take over owned bytes", destination);
 	if (!AliasBytesEnabled() || &destination == &source || destination.depth_id ||
 	    !source.IsGpuModified()) {
 		return;

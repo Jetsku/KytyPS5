@@ -1115,7 +1115,40 @@ void CheckCallTraceReach() {
   std::printf("[bindless] %-32s ok\n", name);
 }
 
+// Miles Morales' sky material samples a cube-array T# (384 faces) with a 2D-array instruction,
+// computing face and slice itself; the GPU reads the cube as its array of faces. Such a heap key
+// must reach the 2D-array binding (it sampled the placeholder: a black reflected sky). The
+// translation buffer must hold the RT call tables' record heaps (1 Mi filled up).
+void CheckCubeOverArrayKey() {
+  const char *name = "cube T# in a 2D-array heap";
+  ShaderTextureResource cube{};
+  cube.fields[0] = 0x11368000u;
+  cube.fields[1] = static_cast<u32>(Prospero::BufferFormat::k16_16_16_16Float) << 20u;
+  cube.fields[3] = static_cast<u32>(Prospero::ImageType::kCube) << 28u;
+  cube.fields[4] = 383u;
+  Require(name, "2D-array binding",
+          BindlessKeyCompatible(cube, ShaderRecompiler::IR::BindlessImages2DArray),
+          "a cube T# was refused by the 2D-array binding");
+  Require(name, "cube binding", BindlessKeyCompatible(cube, ShaderRecompiler::IR::BindlessImagesCube),
+          "a cube T# was refused by the cube binding");
+  Require(name, "2D binding", !BindlessKeyCompatible(cube, ShaderRecompiler::IR::BindlessImages2D),
+          "a cube T# was accepted by the 2D binding");
+  Require(name, "3D binding", !BindlessKeyCompatible(cube, ShaderRecompiler::IR::BindlessImages3D),
+          "a cube T# was accepted by the 3D binding");
+  ShaderTextureResource flat = cube;
+  flat.fields[3] = static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  Require(name, "2D T# in the cube binding",
+          !BindlessKeyCompatible(flat, ShaderRecompiler::IR::BindlessImagesCube),
+          "a 2D T# was accepted by the cube binding");
+  if (std::getenv("KYTY_BINDLESS_TRANSLATION_MI") == nullptr) {
+    Require(name, "translation capacity", BindlessTable::TranslationCapacity() == (4u << 20u),
+            "the default translation buffer is not 4 Mi entries");
+  }
+  std::printf("[bindless] %-32s ok\n", name);
+}
+
 void RunCodegen() {
+  CheckCubeOverArrayKey();
   CheckMilesHeapSample();
   CheckMilesRecordPointer();
   CheckMilesNestedHeap();

@@ -147,6 +147,9 @@ template <typename T>
 	return result;
 }
 
+// Whether a bindless heap entry with this T# can be held by the set-1 image array `binding`
+// (ir/BindlessBindings.h); anything else samples the placeholder.
+[[nodiscard]] bool BindlessKeyCompatible(const ShaderTextureResource& descriptor, uint32_t binding);
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
 [[nodiscard]] bool IsSupportedSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,

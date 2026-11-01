@@ -185,12 +185,12 @@ bool BindlessTable::EnsureCreated() {
 	// directly, while shaders access them at device speed where the device allows. The host
 	// reads the flags from a host-cached snapshot (RecordFeedbackSnapshot).
 	m_translation = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
-	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
+	                                         AllFlags, uint64_t {TranslationCapacity()} * sizeof(uint32_t));
 	m_feedback    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
-	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
+	                                         AllFlags, uint64_t {TranslationCapacity()} * sizeof(uint32_t));
 	m_feedback_snapshot = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download,
 	                                               0, AllFlags,
-	                                               TranslationEntries * sizeof(uint32_t));
+	                                               uint64_t {TranslationCapacity()} * sizeof(uint32_t));
 	if (m_translation->Mapped().empty() || m_feedback->Mapped().empty() ||
 	    m_feedback_snapshot->Mapped().empty()) {
 		LOGF("Bindless table: the translation or feedback buffer is not host-visible\n");
@@ -271,7 +271,7 @@ bool BindlessTable::EnsureCreated() {
 		return false;
 	}
 	LOGF("Bindless table: %u images per array, %u translation entries\n", m_images_per_array,
-	     TranslationEntries);
+	     TranslationCapacity());
 	return true;
 }
 
@@ -513,6 +513,17 @@ static bool BindlessHeapGrowEnabled() {
 	return enabled;
 }
 
+uint32_t BindlessTable::TranslationCapacity() {
+	static const uint32_t entries = [] {
+		uint32_t mi = 4;
+		if (const char* value = std::getenv("KYTY_BINDLESS_TRANSLATION_MI"); value != nullptr && value[0] != '\0') {
+			mi = static_cast<uint32_t>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 1ul, 16ul));
+		}
+		return mi << 20u;
+	}();
+	return entries;
+}
+
 bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	// Headroom so a growing heap rarely moves; a move re-writes the keys resolved so far.
 	const bool grow = BindlessHeapGrowEnabled();
@@ -521,12 +532,12 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	const auto capacity =
 	    grow ? static_cast<uint32_t>(std::min<uint64_t>(
 	               uint64_t {entries} + std::max<uint32_t>(std::min(entries, 1u << 16u), entries / 2u),
-	               TranslationEntries))
+	               TranslationCapacity()))
 	         : std::max(entries, std::min<uint32_t>(entries * 2u, 1u << 16u));
 	const auto old_region  = heap.region;
 	const auto old_entries = heap.entries;
 	if (grow && old_entries != 0 && old_region + old_entries == m_next_region &&
-	    capacity > old_entries && capacity - old_entries <= TranslationEntries - m_next_region) {
+	    capacity > old_entries && capacity - old_entries <= TranslationCapacity() - m_next_region) {
 		// The last region: extend it in place. Keys below old_entries keep their entries and
 		// feedback flags; frames in flight read only those.
 		m_next_region = old_region + capacity;
@@ -549,7 +560,14 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 		     heap.base, heap.binding, heap.region, capacity, old_entries);
 		return true;
 	}
-	if (capacity > TranslationEntries - m_next_region) {
+	if (capacity > TranslationCapacity() - m_next_region) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("Bindless heap region: base=0x%016" PRIx64 " table_offset=%u binding=%u stride=%u needs %u "
+			     "entries, the translation buffer is full (%u of %u used): its keys sample the placeholder\n",
+			     heap.base, heap.table_offset, heap.binding, heap.stride, capacity, m_next_region,
+			     TranslationCapacity());
+		}
 		return false;
 	}
 	heap.region            = m_next_region;

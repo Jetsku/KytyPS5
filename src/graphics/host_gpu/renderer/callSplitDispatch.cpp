@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -24,6 +25,7 @@
 #include <map>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -469,6 +471,40 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		const auto& program  = *info.stage.program;
 		auto&       bindings = m_compute_bindings;
 		PrepareBindings(info.stage, bindings);
+		// KYTY_SHADER_CALLS_SPLIT_TRACE_IMAGES=1 (diagnostic): once per callee target, the images its
+		// callee pass binds (base/format/extent, bindless and runtime flags) and its user data.
+		static const bool trace_images = EnvOn("KYTY_SHADER_CALLS_SPLIT_TRACE_IMAGES", false);
+		if (trace_images && target != 0 && info.stage.resources != nullptr) {
+			static std::mutex             mutex;
+			static std::set<uint64_t>     seen;
+			bool                          first = false;
+			{
+				std::scoped_lock lock(mutex);
+				first = seen.insert(target ^ (run.hash << 1u)).second;
+			}
+			if (first) {
+				std::string text = fmt::format("SplitCalleeImages: kernel 0x{:016x} target 0x{:x}:", run.hash, target);
+				const auto& resources = *info.stage.resources;
+				for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+					const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+					const auto& image = program.info.images[i];
+					text += fmt::format(" | t{}@{:x} dim{}{}{}{}=0x{:x}/f{}/{}x{}x{} raw {:08x} {:08x} {:08x} {:08x}", i,
+					                    image.first_use_pc, static_cast<uint32_t>(image.dimension),
+					                    image.cube ? " cube" : "", image.bindless ? " bindless" : "",
+					                    image.runtime ? " runtime" : "", r.Base40(), static_cast<uint32_t>(r.Format()),
+					                    static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+					                    static_cast<uint32_t>(r.Depth()) + 1u, resources.images[i].dwords[0],
+					                    resources.images[i].dwords[1], resources.images[i].dwords[2],
+					                    resources.images[i].dwords[3]);
+				}
+				for (const auto& heap: resources.bindless_heaps) {
+					text += fmt::format(" | heap image {} base 0x{:x} size 0x{:x} table_offset {} stride {} record_pointer {}",
+					                    heap.image, heap.base, heap.size, heap.table_offset, heap.stride,
+					                    heap.record_pointer == UINT32_MAX ? -1 : static_cast<int64_t>(heap.record_pointer));
+				}
+				LOGF("%s\n", text.c_str());
+			}
+		}
 		if (const auto dword = program.bindings.call_state_dword;
 		    dword != ShaderRecompiler::IR::PushData::NoStart) {
 			const uint64_t header = address + layout.header;

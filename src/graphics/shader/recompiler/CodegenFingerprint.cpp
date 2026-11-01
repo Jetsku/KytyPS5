@@ -142,6 +142,8 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.indirect_format_compact) {
 		b.Text("indirect_format_compact");
+		if (const char* table = std::getenv("KYTY_INDIRECT_FORMAT_COMPACT_TABLE"); table != nullptr) b.Text(table);
+		if (const char* control = std::getenv("KYTY_INDIRECT_FORMAT_COMPACT_CONTROL"); control != nullptr) b.Text(control);
 	}
 	if (options.indirect_format_inline) {
 		b.Text("indirect_format_inline");
@@ -159,6 +161,11 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (const char* count = std::getenv("KYTY_INDIRECT_FORMAT_COUNT"); count != nullptr && count[0] == '1') {
 		b.Text("indirect_format_count");
 		b.Text(std::to_string(Spirv::IndirectFormatCountAddress()));
+		// KYTY_INDIRECT_FORMAT_COMPARE: both decoders, mismatches counted (diagnostic).
+		if (const char* compare = std::getenv("KYTY_INDIRECT_FORMAT_COMPARE"); compare != nullptr && (compare[0] == '1' || compare[0] == '2')) {
+			b.Text("indirect_format_compare");
+			b.Text(compare);
+		}
 	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms

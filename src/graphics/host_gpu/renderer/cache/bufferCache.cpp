@@ -1621,9 +1621,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (ParseEnvU64("KYTY_INDIRECT_FORMAT_COUNT", 0) == 1) {
 		m_format_counts = std::make_unique<Buffer>(
 		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, 128 * sizeof(uint32_t));
-		std::memset(m_format_counts->Mapped().data(), 0, 128 * sizeof(uint32_t));
-		m_format_counts->Flush(0, 128 * sizeof(uint32_t));
+		    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, 256 * sizeof(uint32_t));
+		std::memset(m_format_counts->Mapped().data(), 0, 256 * sizeof(uint32_t));
+		m_format_counts->Flush(0, 256 * sizeof(uint32_t));
 		ShaderRecompiler::Spirv::SetIndirectFormatCountAddress(m_format_counts->BufferDeviceAddress());
 		LOGF("KYTY_INDIRECT_FORMAT_COUNT: counting full-decoder calls per format\n");
 	}
@@ -1764,14 +1764,24 @@ void BufferCache::AdvanceFrame() noexcept {
 	MemoryTracker::SetHotOverride(static_cast<uint32_t>(g_hot_frames_live.Get()),
 	                              static_cast<uint32_t>(g_hot_max_live.Get()));
 	if (m_format_counts != nullptr && ++m_format_count_frames % 600 == 0) {
-		m_format_counts->Invalidate(0, 128 * sizeof(uint32_t));
+		m_format_counts->Invalidate(0, 256 * sizeof(uint32_t));
 		const auto* counts = reinterpret_cast<const uint32_t*>(m_format_counts->Mapped().data());
 		std::string text;
 		for (uint32_t format = 0; format < 128; format++) {
 			if (counts[format] != 0) text += fmt::format(" {}:{}", format, counts[format]);
 		}
-		LOGF("Indirect formats via the full decoder (format:calls, cumulative):%s\n",
-		            text.empty() ? " none" : text.c_str());
+		LOGF("Indirect formats via the full decoder (format:calls, cumulative; with "
+		     "KYTY_INDIRECT_FORMAT_COMPARE: compact/full mismatches):%s\n",
+		     text.empty() ? " none" : text.c_str());
+		// KYTY_INDIRECT_FORMAT_COMPARE: the first mismatch (V# words 0-3, index, voffset, soffset,
+		// compact x/y/z/w, full x/y/z/w) at words 129..143, claimed through word 128.
+		if (counts[128] != 0) {
+			std::string record;
+			for (uint32_t word = 129; word < 144; word++) record += fmt::format(" {:08x}", counts[word]);
+			LOGF("KYTY_INDIRECT_FORMAT_COMPARE first mismatch (V# w0-3, index, voffset, soffset | compact "
+			     "xyzw | full xyzw):%s\n",
+			     record.c_str());
+		}
 		std::fflush(stdout);
 	}
 }

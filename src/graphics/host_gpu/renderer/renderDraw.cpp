@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/watchRange.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
@@ -75,6 +76,8 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+// KYTY_FRAME_TRACE (renderCompute.cpp).
+bool FrameTraceTake();
 
 static bool MeshRestartEnabled() {
 	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
@@ -4396,6 +4399,57 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			LOGF("%s\n", text.c_str());
 		}
+	}
+	if (WatchRange::Enabled()) {
+		WatchRange::SetCurrentOp("draw", state.ps_active && state.ps_input_info.stage.program != nullptr
+		                                     ? state.ps_input_info.stage.program->shader_hash
+		                                     : 0);
+	}
+	// KYTY_FRAME_TRACE (renderCompute.cpp): one line per draw while a frame trace runs.
+	if (FrameTraceTake()) {
+		const auto* ps = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+		std::string text = fmt::format(
+		    "FrameTrace DRAW: frame={} vs=0x{:016x} ps=0x{:016x} n={} inst={}",
+		    static_cast<int>(m_context.GetGpu().GetFrameNum()),
+		    state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+		    ps != nullptr ? ps->shader_hash : 0, draw.index_count, draw.instance_count);
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& info = state.color_info[i].desc.info;
+			text += fmt::format(" | c{}=0x{:x}/vk{}/{}x{}", i, info.data.address,
+			                    static_cast<uint32_t>(info.pixel_format), info.extent.width, info.extent.height);
+		}
+		if (state.depth_info.desc.info.data.address != 0) {
+			text += fmt::format(" | z=0x{:x} test{} write{}", state.depth_info.desc.info.data.address,
+			                    state.depth_info.depth_test_enable ? 1 : 0, state.depth_info.depth_write_enable ? 1 : 0);
+		}
+		if (ps != nullptr && state.ps_input_info.stage.resources != nullptr) {
+			const auto& resources = *state.ps_input_info.stage.resources;
+			for (uint32_t i = 0; i < ps->info.images.size() && i < resources.images.size(); i++) {
+				const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+				text += fmt::format(" | t{}{}@{:x}=0x{:x}/f{}/{}x{}", i, ps->info.images[i].written ? "w" : "", ps->info.images[i].first_use_pc, r.Base40(),
+				                    static_cast<uint32_t>(r.Format()), static_cast<uint32_t>(r.Width5()) + 1u,
+				                    static_cast<uint32_t>(r.Height5()) + 1u);
+			}
+			for (uint32_t i = 0; i < ps->info.images.size() && i < resources.images.size(); i++) {
+				const auto& raw = resources.images[i];
+				if (DecodeNativeDescriptor<ShaderTextureResource>(raw).Base40() == 0) {
+					text += fmt::format(" | t{}raw(n{})={:08x} {:08x} {:08x} {:08x}", i, raw.dword_count, raw.dwords[0],
+					                    raw.dwords[1], raw.dwords[2], raw.dwords[3]);
+				}
+			}
+			if (!resources.gpu_fills.empty()) {
+				text += fmt::format(" | gpufills={}:", resources.gpu_fills.size());
+				for (size_t i = 0; i < resources.gpu_fills.size() && i < 8; i++) {
+					text += fmt::format(" {}@0x{:x}", resources.gpu_fills[i].flat_offset, resources.gpu_fills[i].address);
+				}
+			}
+			for (uint32_t i = 0; i < ps->info.buffers.size() && i < resources.buffers.size(); i++) {
+				const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				text += fmt::format(" | b{}{}=0x{:x}/n{}", i, ps->info.buffers[i].written ? "w" : "", r.Base48(),
+				                    r.NumRecords());
+			}
+		}
+		LOGF("%s\n", text.c_str());
 	}
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run

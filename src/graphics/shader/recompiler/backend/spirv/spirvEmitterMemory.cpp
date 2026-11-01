@@ -1595,19 +1595,40 @@ static void DefineIndirectFormatCompactBody(EmitterState& state, uint32_t functi
 	}
 	const auto table_type = state.builder.Type(spv::OpTypeArray, u32, ConstantU32(state, TableSize));
 	const auto table_init = state.builder.Constant(spv::OpConstantComposite, table_type, entries);
-	const auto table      = state.builder.DefineGlobalVariable(
-        TypePointer(state, spv::StorageClassPrivate, table_type), spv::StorageClassPrivate, table_init);
-	state.builder.AddName(table, "indirect_format_table");
+	// Diagnostics (Miles: the compact decoder alone reads zeros in game, with the full decoder in the
+	// same module it does not): KYTY_INDIRECT_FORMAT_COMPACT_TABLE=function keeps the table in a
+	// Function variable of the decoder instead of a Private global; KYTY_INDIRECT_FORMAT_COMPACT_CONTROL=
+	// inline|dontinline sets the decoder's function control.
+	const char* table_mode   = std::getenv("KYTY_INDIRECT_FORMAT_COMPACT_TABLE");
+	const bool  function_table = table_mode != nullptr && std::strcmp(table_mode, "function") == 0;
+	const char* control_mode = std::getenv("KYTY_INDIRECT_FORMAT_COMPACT_CONTROL");
+	const auto  control =
+	    control_mode == nullptr                       ? spv::FunctionControlMaskNone
+	    : std::strcmp(control_mode, "inline") == 0     ? spv::FunctionControlInlineMask
+	    : std::strcmp(control_mode, "dontinline") == 0 ? spv::FunctionControlDontInlineMask
+	                                                   : spv::FunctionControlMaskNone;
+	const auto table_class = function_table ? spv::StorageClassFunction : spv::StorageClassPrivate;
+	uint32_t   table       = 0;
+	if (!function_table) {
+		table = state.builder.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, table_type),
+		                                           spv::StorageClassPrivate, table_init);
+		state.builder.AddName(table, "indirect_format_table");
+	}
 
 	state.builder.AddName(function_id, "indirect_formatted_load_compact");
-	state.builder.AddFunction(spv::OpFunction, result, function_id, spv::FunctionControlMaskNone,
-	                          function_type);
+	state.builder.AddFunction(spv::OpFunction, result, function_id, control, function_type);
 	std::array<uint32_t, 7> parameters {};
 	for (auto& id: parameters) {
 		id = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpFunctionParameter, u32, id);
 	}
 	EmitLabel(state, state.builder.AllocateId());
+	if (function_table) {
+		table = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, table_type), table,
+		                          spv::StorageClassFunction, table_init);
+		state.builder.AddName(table, "indirect_format_table");
+	}
 	ValueEmitContext ctx(state);
 	const auto [word0, word1, records, word3, index, voffset, soffset] = parameters;
 	const auto constant = [&](uint32_t value) { return ConstantU32(state, value); };
@@ -1643,7 +1664,7 @@ static void DefineIndirectFormatCompactBody(EmitterState& state, uint32_t functi
 	};
 	// Descriptor of the format.
 	const auto entry_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, u32),
+	state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, table_class, u32),
 	                          entry_pointer, table, buffer.format);
 	const auto descriptor = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, u32, descriptor, entry_pointer);
@@ -1802,6 +1823,87 @@ static void DefineIndirectFormatCompactBody(EmitterState& state, uint32_t functi
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+// KYTY_INDIRECT_FORMAT_COMPARE=1 (diagnostic, with KYTY_INDIRECT_FORMAT_COUNT=1): every formatted load
+// through a computed V# calls both the compact decoder and the full one and returns the full one's
+// channels; a mismatch adds 1 to the format's counter and the first one stores its arguments and
+// both results (BufferCache logs them every 600 flips).
+static bool IndirectFormatCompareEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_FORMAT_COMPARE");
+		return value != nullptr && (value[0] == '1' || value[0] == '2');
+	}();
+	return enabled && Spirv::IndirectFormatCountAddress() != 0;
+}
+
+static void DefineIndirectFormatCompareBody(EmitterState& state, uint32_t function_id, uint32_t function_type,
+                                            uint32_t compact, uint32_t full) {
+	const auto u32    = TypeU32(state);
+	const auto result = TypeU32Vector(state, 4);
+	state.builder.AddName(function_id, "indirect_formatted_load_compare");
+	state.builder.AddFunction(spv::OpFunction, result, function_id, spv::FunctionControlMaskNone, function_type);
+	std::array<uint32_t, 7> parameters {};
+	for (auto& id: parameters) {
+		id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, u32, id);
+	}
+	EmitLabel(state, state.builder.AllocateId());
+	const auto call = [&](uint32_t function) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, result, value, function,
+		                          std::span<const uint32_t>(parameters));
+		return value;
+	};
+	const auto a     = call(compact);
+	const auto b     = call(full);
+	const auto equal = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBoolVector(state, 4), equal, a, b);
+	const auto all = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAll, TypeBool(state), all, equal);
+	const auto mismatch = Unary(state, spv::OpLogicalNot, TypeBool(state), all);
+	const auto counters = Spirv::IndirectFormatCountAddress();
+	const auto pointer_at = [&](uint32_t byte_offset_id) {
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), ConstantU64(state, counters),
+		                            Unary(state, spv::OpUConvert, TypeU64(state), byte_offset_id));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+		return pointer;
+	};
+	(void)EmitValueOrZeroIfCondition(state, mismatch, [&]() {
+		const auto format = EmitBitFieldUExtract(state, parameters[3], ConstantU32(state, 12), ConstantU32(state, 7));
+		const auto added  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, u32, added,
+		                          pointer_at(Binary(state, spv::OpShiftLeftLogical, u32, format, ConstantU32(state, 2))),
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, 1));
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicCompareExchange, u32, old, pointer_at(ConstantU32(state, 128u * 4u)),
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1),
+		                          ConstantU32(state, 0));
+		(void)EmitValueOrZeroIfCondition(state, Binary(state, spv::OpIEqual, TypeBool(state), old, ConstantU32(state, 0)),
+		                                 [&]() {
+			std::array<uint32_t, 15> words {};
+			for (uint32_t i = 0; i < 7u; ++i) words[i] = parameters[i];
+			for (uint32_t i = 0; i < 4u; ++i) {
+				words[7u + i] = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, u32, words[7u + i], a, i);
+				words[11u + i] = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, u32, words[11u + i], b, i);
+			}
+			for (uint32_t i = 0; i < 15u; ++i) {
+				state.builder.AddFunction(spv::OpStore, pointer_at(ConstantU32(state, (129u + i) * 4u)), words[i],
+				                          spv::MemoryAccessAlignedMask, 4u);
+			}
+			return ConstantU32(state, 0);
+		});
+		return ConstantU32(state, 0);
+	});
+	// KYTY_INDIRECT_FORMAT_COMPARE=2: the compact decoder's channels are returned instead.
+	const char* mode = std::getenv("KYTY_INDIRECT_FORMAT_COMPARE");
+	state.builder.AddFunction(spv::OpReturnValue, mode != nullptr && mode[0] == '2' ? a : b);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
 void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	bool used = false;
 	for (const auto* block: state.program.blocks) {
@@ -1827,6 +1929,16 @@ void DefineIndirectFormatFunctionImpl(EmitterState& state) {
 	const auto function_type =
 	    state.builder.Type(spv::OpTypeFunction, result, std::span<const uint32_t>(parameter_types));
 	const auto& options = GetCodegenOptions();
+	if (IndirectFormatCompareEnabled()) {
+		const auto compact = state.builder.AllocateId();
+		DefineIndirectFormatCompactBody(state, compact, function_type);
+		const auto full = state.builder.AllocateId();
+		DefineIndirectFormatFunctionBody(state, full, "indirect_formatted_load", spv::FunctionControlMaskNone,
+		                                 function_type, {}, 0u);
+		state.indirect_format_function = state.builder.AllocateId();
+		DefineIndirectFormatCompareBody(state, state.indirect_format_function, function_type, compact, full);
+		return;
+	}
 	if (options.indirect_format_compact) {
 		state.indirect_format_function = state.builder.AllocateId();
 		DefineIndirectFormatCompactBody(state, state.indirect_format_function, function_type);

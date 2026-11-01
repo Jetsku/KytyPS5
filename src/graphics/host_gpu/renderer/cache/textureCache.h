@@ -138,6 +138,15 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	// `record` (optional): filled as described at RepeatLookup.
+	// Diagnostic (KYTY_DUMP_CS_IMAGES, renderCompute.cpp): records a copy of mip 0 / layer 0 of the
+	// colour image whose guest base is `address` into a download buffer and, once the tick
+	// completed, writes its texels to <prefix>_<address>_<w>x<h>_vk<format>_b<bytes>.raw. Returns
+	// false when no such image is cached (or it is a depth/MSAA/compressed image). GPU thread, at
+	// an emission safe point.
+	// width/height 0: any extent; otherwise an image of that extent is preferred.
+	bool DebugDumpImage(uint64_t address, uint32_t width, uint32_t height, const std::string& prefix);
+	// One image of DebugDumpImage (m_lock held).
+	bool DebugDumpOne(ImageId id, uint64_t address, const std::string& prefix);
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      RepeatLookup* record = nullptr);
 	// The lookup `record` describes, repeated for the same `desc` and `exact_format` (the caller

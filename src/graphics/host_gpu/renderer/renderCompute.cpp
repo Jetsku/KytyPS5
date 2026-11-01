@@ -48,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
@@ -71,9 +72,13 @@ static std::atomic<int64_t> g_overlap_last_print_ns {0};
 // KYTY_DISPATCH_TRACE=<hash>[,<hash>...] or all (hexadecimal guest shader hashes, diagnostic): logs the
 // first KYTY_DISPATCH_TRACE_LIMIT (default 64) dispatches of each listed program: tick, groups or
 // indirect argument address (with the argument bytes guest memory holds and whether a GPU write of
-// them is pending), the first 16 user SGPRs and the bound buffers.
+// them is pending), the first 16 user SGPRs, the bound buffers and the bound images.
+// KYTY_DISPATCH_TRACE_IMAGE=<hex base>[,<hex base>...] (diagnostic): also traces every dispatch of any
+// program that binds an image or buffer with one of those base addresses (who writes or reads a
+// render target), within the same per-program limit.
 struct DispatchTraceRequest {
 	std::vector<uint64_t> hashes;
+	std::vector<uint64_t> bases;
 	uint32_t              limit = 64;
 };
 static const DispatchTraceRequest& DispatchTrace() {
@@ -93,6 +98,16 @@ static const DispatchTraceRequest& DispatchTrace() {
 				text.remove_prefix(comma + 1);
 			}
 		}
+		if (const auto* value = std::getenv("KYTY_DISPATCH_TRACE_IMAGE"); value != nullptr) {
+			std::string_view text(value);
+			while (!text.empty()) {
+				const auto comma = text.find(',');
+				const auto item  = std::string(text.substr(0, comma));
+				if (!item.empty()) parsed.bases.push_back(std::strtoull(item.c_str(), nullptr, 16));
+				if (comma == std::string_view::npos) break;
+				text.remove_prefix(comma + 1);
+			}
+		}
 		if (const auto* value = std::getenv("KYTY_DISPATCH_TRACE_LIMIT"); value != nullptr) {
 			parsed.limit = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
 		}
@@ -101,15 +116,184 @@ static const DispatchTraceRequest& DispatchTrace() {
 	return request;
 }
 
+// KYTY_DUMP_CS_IMAGES=<hash>:<ordinal>[:<ordinal>...][,<hash>:...];<folder> (diagnostic): after the
+// listed dispatches (0-based, counted per program) of a call-split kernel, every colour image it binds
+// is copied out and written to <folder> as raw linear texels (TextureCache::DebugDumpImage), named
+// cs<hash>_d<ordinal>_t<index>[w]_<address>_<w>x<h>_vk<format>_b<bytes>.raw. Local files only.
+// Without ordinals (<hash>[,<hash>...];<folder>): trigger mode, see below (create <folder>/dump.now).
+// KYTY_DUMP_IMAGE_EXTRA=<hex address>[,...]: also dumped with every KYTY_DUMP_CS_IMAGES dump.
+struct CsImageDump {
+	struct Item {
+		std::string prefix;
+		uint64_t    base   = 0;
+		std::string what;
+		uint32_t    width  = 0;
+		uint32_t    height = 0;
+	};
+	std::vector<Item> items;
+};
+// Collected before the dispatch (a call-split chain reuses the resource state), dumped after it.
+static CsImageDump PlanCsImageDump(const ShaderComputeInputInfo& input_info) {
+	struct Request {
+		std::unordered_map<uint64_t, std::vector<uint32_t>> ordinals;
+		std::string                                         folder;
+	};
+	static const Request request = [] {
+		Request parsed;
+		const char* value = std::getenv("KYTY_DUMP_CS_IMAGES");
+		if (value == nullptr) return parsed;
+		const std::string text(value);
+		const auto        split = text.find(';');
+		if (split == std::string::npos) return parsed;
+		parsed.folder = text.substr(split + 1);
+		std::string_view list(text.data(), split);
+		while (!list.empty()) {
+			const auto comma = list.find(',');
+			std::string item(list.substr(0, comma));
+			char*       rest = nullptr;
+			const auto  hash = std::strtoull(item.c_str(), &rest, 16);
+			auto&       out  = parsed.ordinals[hash];
+			while (rest != nullptr && *rest == ':') {
+				out.push_back(static_cast<uint32_t>(std::strtoul(rest + 1, &rest, 10)));
+			}
+			if (comma == std::string_view::npos) break;
+			list.remove_prefix(comma + 1);
+		}
+		return parsed;
+	}();
+	if (request.ordinals.empty() || input_info.stage.program == nullptr || input_info.stage.resources == nullptr) {
+		return {};
+	}
+	const auto& program = *input_info.stage.program;
+	const auto  wanted  = request.ordinals.find(program.shader_hash);
+	if (wanted == request.ordinals.end()) return {};
+	static std::unordered_map<uint64_t, uint32_t> counts; // GPU thread only
+	const uint32_t ordinal = counts[program.shader_hash]++;
+	if (wanted->second.empty()) {
+		// No ordinals: trigger mode. While <folder>/dump.now exists, the next dispatch of each listed
+		// program is dumped once; the file is removed when every listed program has been dumped.
+		static std::unordered_map<uint64_t, bool> dumped;
+		static uint32_t                           polls = 0;
+		std::error_code                           error;
+		const auto trigger = std::filesystem::path(request.folder) / "dump.now";
+		if ((polls++ & 7u) != 0u && dumped.empty()) return {};
+		if (!std::filesystem::exists(trigger, error)) {
+			dumped.clear();
+			return {};
+		}
+		if (dumped[program.shader_hash]) return {};
+		dumped[program.shader_hash] = true;
+		if (std::ranges::all_of(request.ordinals, [&](const auto& item) { return dumped[item.first]; })) {
+			std::filesystem::remove(trigger, error);
+		}
+	} else if (std::ranges::find(wanted->second, ordinal) == wanted->second.end()) {
+		return {};
+	}
+	CsImageDump dump;
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto r = DecodeNativeDescriptor<ShaderTextureResource>(input_info.stage.resources->images[i]);
+		dump.items.push_back(
+		    {fmt::format("{}/cs{:016x}_d{}_t{}{}", request.folder, program.shader_hash, ordinal, i,
+		                 program.info.images[i].written ? "w" : ""),
+		     r.Base40(),
+		     fmt::format("CS 0x{:016x} dispatch {} image {}{} fmt {} {}x{}", program.shader_hash, ordinal, i,
+		                 program.info.images[i].written ? " (written)" : "", static_cast<uint32_t>(r.Format()),
+		                 static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u),
+		     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u});
+	}
+	if (const char* extra = std::getenv("KYTY_DUMP_IMAGE_EXTRA"); extra != nullptr) {
+		for (const char* at = extra; *at != '\0';) {
+			char*      rest = nullptr;
+			const auto base = std::strtoull(at, &rest, 16);
+			if (rest == at) break;
+			// <address>@<w>x<h>: prefer the cached image of that extent (aliased targets).
+			uint32_t want_w = 0;
+			uint32_t want_h = 0;
+			if (*rest == '@') {
+				want_w = static_cast<uint32_t>(std::strtoul(rest + 1, &rest, 10));
+				if (*rest == 'x') want_h = static_cast<uint32_t>(std::strtoul(rest + 1, &rest, 10));
+			}
+			dump.items.push_back({fmt::format("{}/cs{:016x}_d{}_x", request.folder, program.shader_hash, ordinal),
+			                      base, fmt::format("CS 0x{:016x} dispatch {} extra", program.shader_hash, ordinal),
+			                      want_w, want_h});
+			at = *rest == ',' ? rest + 1 : rest;
+		}
+	}
+	return dump;
+}
+
+static void RunCsImageDump(RenderContext& context, const CsImageDump& dump) {
+	for (const auto& item: dump.items) {
+		const bool ok = item.base != 0 && context.GetTextureCache().DebugDumpImage(item.base, item.width, item.height, item.prefix);
+		LOGF("KYTY_DUMP_CS_IMAGES: %s base 0x%" PRIx64 ": %s\n", item.what.c_str(), item.base,
+		     ok ? "dumped" : "not cached");
+	}
+}
+
+// KYTY_FRAME_TRACE=<folder>[:<count>] (diagnostic): while <folder>/trace.now exists, the next <count>
+// (default 4000) compute dispatches and draws are logged as "FrameTrace" lines (programs, bound
+// images and buffers, render targets; frameTrace.h), then the file is removed. One frame's producers
+// and readers of any target, in submission order. Local logs only.
+bool FrameTraceTake() {
+	struct Request {
+		std::filesystem::path trigger;
+		uint32_t              count = 4000;
+	};
+	static const Request request = [] {
+		Request parsed;
+		if (const char* value = std::getenv("KYTY_FRAME_TRACE"); value != nullptr && value[0] != '\0') {
+			std::string text(value);
+			// A ':' after the drive letter belongs to the path.
+			if (const auto colon = text.rfind(':'); colon != std::string::npos && colon > 1) {
+				parsed.count = static_cast<uint32_t>(std::strtoul(text.c_str() + colon + 1, nullptr, 10));
+				text.resize(colon);
+			}
+			parsed.trigger = std::filesystem::path(text) / "trace.now";
+		}
+		return parsed;
+	}();
+	if (request.trigger.empty()) return false;
+	static std::atomic<uint32_t> left {0};
+	static std::atomic<uint32_t> polls {0};
+	if (left.load(std::memory_order_relaxed) == 0) {
+		if ((polls.fetch_add(1, std::memory_order_relaxed) & 255u) != 0u) return false;
+		std::error_code error;
+		if (!std::filesystem::exists(request.trigger, error)) return false;
+		std::filesystem::remove(request.trigger, error);
+		LOGF("FrameTrace: start, %u operations\n", request.count);
+		left.store(request.count, std::memory_order_relaxed);
+	}
+	auto value = left.load(std::memory_order_relaxed);
+	while (value != 0 && !left.compare_exchange_weak(value, value - 1, std::memory_order_relaxed)) {
+	}
+	if (value == 1) LOGF("FrameTrace: end\n");
+	return value != 0;
+}
+
 static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& input_info,
                           const uint32_t* groups, uint64_t args_addr) {
 	const auto& request = DispatchTrace();
-	if (request.hashes.empty()) return;
+	const bool  frame   = FrameTraceTake();
+	if (!frame && request.hashes.empty() && request.bases.empty()) return;
 	const auto& program = *input_info.stage.program;
 	// 0 in the list (KYTY_DISPATCH_TRACE=all) traces every program.
 	const bool all     = std::ranges::find(request.hashes, uint64_t {0}) != request.hashes.end();
 	const auto found   = std::ranges::find(request.hashes, program.shader_hash);
-	if (!all && found == request.hashes.end()) return;
+	const auto binds   = [&] {
+		const auto listed = [&](uint64_t base) { return std::ranges::find(request.bases, base) != request.bases.end(); };
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (listed(DecodeNativeDescriptor<ShaderTextureResource>(input_info.stage.resources->images[i]).Base40())) {
+				return true;
+			}
+		}
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (listed(DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]).Base48())) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (!frame && !all && found == request.hashes.end() && (request.bases.empty() || !binds())) return;
 	static std::mutex                             mutex;
 	static std::unordered_map<uint64_t, uint32_t> counts;
 	uint32_t                                      ordinal = 0;
@@ -117,8 +301,9 @@ static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& 
 		std::scoped_lock lock(mutex);
 		ordinal = counts[program.shader_hash]++;
 	}
-	if (ordinal >= request.limit) return;
-	std::string text = fmt::format("DispatchTrace: hash=0x{:016x} #{} tick={} gpu_tick={}",
+	if (!frame && ordinal >= request.limit) return;
+	std::string text = fmt::format("{}: hash=0x{:016x} #{} tick={} gpu_tick={}",
+	                               frame ? "FrameTrace CS" : "DispatchTrace",
 	                               program.shader_hash, ordinal,
 	                               context.GetCommandScheduler().CurrentTick(),
 	                               context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick());
@@ -141,6 +326,18 @@ static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& 
 		    DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]);
 		text += fmt::format(" | b{}{}=0x{:x}/s{}/n{}", i, program.info.buffers[i].written ? "w" : "",
 		                    r.Base48(), r.Stride(), r.NumRecords());
+	}
+	// The images: t<i>[w][s] = written, sampled; base, format, extent, tile mode.
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& image = program.info.images[i];
+		const auto  r =
+		    DecodeNativeDescriptor<ShaderTextureResource>(input_info.stage.resources->images[i]);
+		text += fmt::format(
+		    " | t{}{}{}=0x{:x}/f{}/{}x{}x{}/tile{}", i, image.written ? "w" : "",
+		    image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled ? "s" : "",
+		    r.Base40(), static_cast<uint32_t>(r.Format()), static_cast<uint32_t>(r.Width5()) + 1u,
+		    static_cast<uint32_t>(r.Height5()) + 1u, static_cast<uint32_t>(r.Depth()) + 1u,
+		    static_cast<uint32_t>(r.TileMode()));
 	}
 	LOGF("%s\n", text.c_str());
 }
@@ -520,6 +717,10 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	trace_fill("image clear");
+	if (FrameTraceTake()) {
+		LOGF("FrameTrace FILL: hash=0x%016" PRIx64 " addr=0x%" PRIx64 " size=0x%" PRIx64 " value=0x%08x\n",
+		     program.shader_hash, descriptor.Base48(), size, packed_clear);
+	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
@@ -773,10 +974,17 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	if (auto split = PipelineCache::TakeCallSplitRun(); split != nullptr) {
 		// A kernel with call loops runs as its chain of dispatches (callSplitDispatch.cpp).
 		ResetBindings();
+		if (input_info.stage.program != nullptr && input_info.stage.resources != nullptr) {
+			// KYTY_DISPATCH_TRACE / _IMAGE: split kernels too (their chain never reaches the trace below).
+			const uint32_t traced_groups[3] {thread_group_x, thread_group_y, thread_group_z};
+			TraceDispatch(m_context, input_info, traced_groups, 0);
+		}
 		if (!use_thread_dimensions) {
+			const auto image_dump = PlanCsImageDump(input_info);
 			buffer.EndRendering();
 			DispatchCallSplit(buffer, pristine_info, split, cs_regs, sh_regs, thread_group_x,
 			                  thread_group_y, thread_group_z);
+			RunCsImageDump(m_context, image_dump);
 		}
 		return;
 	}
@@ -995,6 +1203,8 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		const uint32_t traced_groups[3] {thread_group_x, thread_group_y, thread_group_z};
 		TraceDispatch(m_context, input_info, traced_groups, 0);
 	}
+	// KYTY_DUMP_CS_IMAGES: ordinary dispatches too (the bound images after the dispatch).
+	const auto image_dump = PlanCsImageDump(input_info);
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DispatchInitiatorOrderedAppendEnable = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -1023,6 +1233,10 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (!image_dump.items.empty()) {
+		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+		RunCsImageDump(m_context, image_dump);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (!guest_barriers) {

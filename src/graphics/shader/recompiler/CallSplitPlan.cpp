@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -48,6 +49,29 @@ void Log(std::string_view text) {
 std::array<uint64_t, 2> Digest(std::span<const uint32_t> words) {
 	const auto hash = XXH3_128bits(words.data(), words.size_bytes());
 	return {hash.low64, hash.high64};
+}
+
+// KYTY_SHADER_CALLS_SPLIT_CALLEE_DUMP=<folder> (diagnostic, default off): every callee pass program
+// (C pass: the call site region plus the inlined callee) is written there once as
+// callee_<kernel hash>_s<site>_<target>.bin/.txt (code and disassembly). Local files only.
+void DumpCallee(uint64_t hash, uint32_t site, uint64_t target, std::span<const uint32_t> words) {
+	static const char* folder = [] {
+		const char* value = std::getenv("KYTY_SHADER_CALLS_SPLIT_CALLEE_DUMP");
+		return value != nullptr && *value != '\0' ? value : nullptr;
+	}();
+	if (folder == nullptr) return;
+	const auto name = fmt::format("{}/callee_{:016x}_s{}_{:x}", folder, hash, site, target);
+	if (std::FILE* file = std::fopen((name + ".bin").c_str(), "wb"); file != nullptr) {
+		std::fwrite(words.data(), sizeof(uint32_t), words.size(), file);
+		std::fclose(file);
+	}
+	Decoder::Program decoded;
+	Decoder::DecodeProgram(words, decoded, true);
+	const auto text = Decoder::ProgramToString(decoded);
+	if (std::FILE* file = std::fopen((name + ".txt").c_str(), "wb"); file != nullptr) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
 }
 
 std::shared_ptr<const Code> MakeCode(std::vector<uint32_t> words) {
@@ -488,6 +512,7 @@ void Planner::PlanKernel(uint64_t id) {
 			std::shared_ptr<const Code> callee;
 			if (usable[k - 1u][t] && BuildCode(shape, layouts, Kind::Callee, k, false, kernel.original,
 			                                   kernel.base, targets[k - 1u][t], m_read, code, why)) {
+				DumpCallee(kernel.hash, k, targets[k - 1u][t], code);
 				callee = MakeCode(code);
 			}
 			callees[k - 1u].push_back(std::move(callee));
@@ -556,6 +581,7 @@ void Planner::PlanTarget(uint64_t id, uint32_t site, uint64_t target) {
 			why = "its inputs are not in the site's layout";
 		} else if (BuildCode(kernel.shape, kernel.layouts, Kind::Callee, site, false, kernel.original,
 		                     kernel.base, target, m_read, code, why)) {
+			DumpCallee(kernel.hash, site, target, code);
 			result = MakeCode(code);
 		}
 	} else if (why.empty()) {

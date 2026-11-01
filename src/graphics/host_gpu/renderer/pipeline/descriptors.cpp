@@ -2060,7 +2060,13 @@ bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t bindin
 			       binding == ShaderRecompiler::IR::BindlessImages2DArray ||
 			       (binding == ShaderRecompiler::IR::BindlessImages3D &&
 			        ShaderRecompiler::GetCodegenOptions().bindless_3d_as_array);
-		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImagesCube;
+		// A cube T# sampled by a 2D-array instruction reads as the array of its faces (the GPU
+		// addresses by the instruction's dimension; the shader computes face and slice itself, as
+		// Miles Morales' sky material does with its cube array of 384 faces). Bound images do
+		// the same (TextureType).
+		case Prospero::ImageType::kCube:
+			return binding == ShaderRecompiler::IR::BindlessImagesCube ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
 		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
 		default: return false;
 	}
@@ -2172,6 +2178,10 @@ void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 
 } // namespace
 
+bool BindlessKeyCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
+	return BindlessCompatible(descriptor, binding);
+}
+
 uint64_t RenderExecutor::BindlessFrame() const {
 	return static_cast<uint64_t>(m_context.GetGpu().GetFrameNum());
 }
@@ -2240,12 +2250,38 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	heap.settled[key]             = 1;
 	heap.descriptors[key]         = {};
 	if (!ReadBindlessEntry(heap, key, value.dwords.data())) {
+		static const bool log_unreadable = std::getenv("KYTY_BINDLESS_KEY_LOG") != nullptr;
+		static std::atomic<uint32_t> logged = 0;
+		if (log_unreadable && logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("Bindless key: heap 0x%016" PRIx64 " key %u: entry unreadable (placeholder)\n", heap.base, key);
+		}
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	if (!BindlessCompatible(descriptor, heap.binding)) {
+	// A 1D image instruction's heap (it shares the 2D binding) has no view of a 2D texture: such a
+	// key stays on the placeholder instead of reaching an invalid 1D view of a 2D image (a call
+	// table's record T#s, Miles Morales, once their heaps got translation regions).
+	const auto dimension    = heap.resource.dimension;
+	const bool one_d_heap   = dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
+	                          dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+	if (one_d_heap || !BindlessCompatible(descriptor, heap.binding)) {
+		// KYTY_BINDLESS_INCOMPATIBLE_LOG=<n> (diagnostic): the first n keys left on the placeholder
+		// because their T# does not fit the binding's view type.
+		static const uint32_t log_limit = [] {
+			const char* env = std::getenv("KYTY_BINDLESS_INCOMPATIBLE_LOG");
+			return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 0u;
+		}();
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1, std::memory_order_relaxed) < log_limit) {
+			LOGF("Bindless: key %u of heap 0x%016" PRIx64 " (binding %u) incompatible: T# base 0x%" PRIx64
+			     " type %u format %u %ux%u depth %u null %d\n",
+			     key, heap.base, heap.binding, descriptor.Base40(), static_cast<uint32_t>(descriptor.Type()),
+			     static_cast<uint32_t>(descriptor.Format()), static_cast<uint32_t>(descriptor.Width5()) + 1u,
+			     static_cast<uint32_t>(descriptor.Height5()) + 1u, static_cast<uint32_t>(descriptor.Depth()),
+			     descriptor.IsNull() ? 1 : 0);
+		}
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -2326,6 +2362,24 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
 	table.WriteSlot(slot_binding, slot, view, layout);
+	{
+		// KYTY_BINDLESS_KEY_LOG=<n> (diagnostic): the first n keys resolved, with their texture.
+		static const uint32_t log_limit = [] {
+			const char* env = std::getenv("KYTY_BINDLESS_KEY_LOG");
+			return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 0u;
+		}();
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1, std::memory_order_relaxed) < log_limit) {
+			LOGF("Bindless key: heap 0x%016" PRIx64 " key %u binding %u slot %u: T# base 0x%" PRIx64
+			     " type %u format %u %ux%u depth %u mips %u-%u -> image %u (%ux%u vk%u layers %u)\n",
+			     heap.base, key, slot_binding, slot, descriptor.Base40(), static_cast<uint32_t>(descriptor.Type()),
+			     static_cast<uint32_t>(descriptor.Format()), static_cast<uint32_t>(descriptor.Width5()) + 1u,
+			     static_cast<uint32_t>(descriptor.Height5()) + 1u, static_cast<uint32_t>(descriptor.Depth()),
+			     static_cast<uint32_t>(descriptor.BaseLevel()), static_cast<uint32_t>(descriptor.LastLevel()),
+			     binding.image_id.index, image->info.extent.width, image->info.extent.height,
+			     static_cast<uint32_t>(image->backing.format), image->info.resources.layers);
+		}
+	}
 	const uint32_t entry = as_array ? (slot | ShaderRecompiler::IR::BindlessSlotArrayFlag) : slot;
 	heap.slots[key]         = entry;
 	heap.images[key]        = binding.image_id;
@@ -2693,10 +2747,22 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		                                                        : 0;
 		const uint64_t keys_per_record =
 		    use.nested_vsharp != UINT32_MAX && use.nested_keys != 0 ? use.nested_keys : 1u;
+		// KYTY_BINDLESS_RECORD_KEYS=<n> (default 65536; 0 = the whole table, as before): the keys of
+		// a heap read through record pointers (a call table's material records). Each (table,
+		// T# offset, view type) is a heap of its own, and Miles Morales' ray-tracing callees use
+		// dozens of them over two call tables of 273064 records: at 256 Ki keys each they filled the
+		// translation buffer and the rest sampled the placeholder (black sky and hit textures in RT
+		// reflections). The material keys measured stay below 65536; a larger key reads as out of
+		// range ("Bindless out-of-range key").
+		static const uint64_t record_keys = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_RECORD_KEYS");
+			return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : uint64_t {65536};
+		}();
+		const uint64_t key_limit = pointers && record_keys != 0 ? record_keys : uint64_t {1u << 18u};
 		const auto     entries  = static_cast<uint32_t>(std::min<uint64_t>(
             (pointers ? span / std::max(use.stride, 1u) : HeapEntriesInSpan(span, use.stride)) *
                 keys_per_record,
-            1u << 18u));
+            std::min<uint64_t>(key_limit, 1u << 18u)));
 		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
 		                                    entries, resource, use.stride, use.record_pointer,
 		                                    use.nested_vsharp, use.nested_heap, use.nested_keys);
