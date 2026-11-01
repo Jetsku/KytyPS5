@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
+#include "common/hangTrace.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -247,6 +249,66 @@ void NoteStopSlow(Stop stop, uint64_t address) noexcept {
 	}
 }
 
+// KYTY_CP_GAP_SLOW_MS=N (diagnostic, default 0 = off; needs KYTY_CP_GAP_STATS=1): a command-processor
+// frame (guest frame boundary to the next) of N ms or more prints one line, "CpGaps slow frame", with
+// its start on the frame-times clock (KYTY_FRAME_TIMES_LOG's t_us, HangTrace::NowNs) and the
+// categories that took its time (exclusive ms, largest first; the nested ones also inside commits).
+static void NoteSlowFrame(ThreadState& state, uint64_t now_ns) {
+	static const uint64_t slow_ns = [] {
+		const auto* value = std::getenv("KYTY_CP_GAP_SLOW_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) * 1'000'000ull : 0ull;
+	}();
+	if (slow_ns == 0) {
+		return;
+	}
+	static uint64_t                       last_ns = 0;
+	static std::array<uint64_t, CatCount> last_ticks {};
+	static std::array<uint64_t, CatCount> last_in_commit {};
+	auto&                                 ledger = state.ledger;
+	if (now_ns == 0) {
+		// Print reset the totals: the next frame's deltas start from zero (its earlier part is lost).
+		last_ticks     = {};
+		last_in_commit = {};
+		return;
+	}
+	const auto                            frame_ns = last_ns != 0 ? now_ns - last_ns : 0;
+	if (frame_ns >= slow_ns) {
+		ledger.Flush(Tsc());
+		std::array<std::pair<uint64_t, Cat>, CatCount> order {};
+		for (size_t i = 0; i < CatCount; i++) {
+			const auto cat = static_cast<Cat>(i);
+			order[i]       = {ledger.Ticks(cat) - std::min(ledger.Ticks(cat), last_ticks[i]), cat};
+		}
+		std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		const double ms_tick = 1e-6 / state.ticks_per_ns;
+		std::string  line;
+		char         text[160];
+		std::snprintf(text, sizeof(text), "CpGaps slow frame t=%.3f s: %.1f ms |",
+		              static_cast<double>(HangTrace::NowNs() - frame_ns) * 1e-9, static_cast<double>(frame_ns) * 1e-6);
+		line += text;
+		for (size_t i = 0; i < 8 && order[i].first != 0; i++) {
+			std::snprintf(text, sizeof(text), " %s %.1f", CatName(order[i].second),
+			              static_cast<double>(order[i].first) * ms_tick);
+			line += text;
+		}
+		line += " | in commit:";
+		for (size_t i = 0; i < CatCount; i++) {
+			const auto delta = ledger.InCommit(static_cast<Cat>(i)) - std::min(ledger.InCommit(static_cast<Cat>(i)), last_in_commit[i]);
+			if (static_cast<double>(delta) * ms_tick >= 1.0) {
+				std::snprintf(text, sizeof(text), " %s %.1f", CatName(static_cast<Cat>(i)),
+				              static_cast<double>(delta) * ms_tick);
+				line += text;
+			}
+		}
+		std::printf("%s\n", line.c_str());
+	}
+	last_ns = now_ns;
+	for (size_t i = 0; i < CatCount; i++) {
+		last_ticks[i]     = ledger.Ticks(static_cast<Cat>(i));
+		last_in_commit[i] = ledger.InCommit(static_cast<Cat>(i));
+	}
+}
+
 void NoteFrame() {
 	auto* state = t_state;
 	if (state == nullptr) {
@@ -255,6 +317,7 @@ void NoteFrame() {
 	auto& report = GetReport();
 	report.frames++;
 	const auto now_ns = SteadyNs();
+	NoteSlowFrame(*state, now_ns);
 	// KYTY_CP_GAP_STATS_INTERVAL_MS (default 10000): the line's period (shorter for live A/B slots).
 	static const uint64_t interval_ns = [] {
 		const auto* value = std::getenv("KYTY_CP_GAP_STATS_INTERVAL_MS");
@@ -263,6 +326,7 @@ void NoteFrame() {
 	}();
 	if (now_ns - report.start_ns >= interval_ns) {
 		Print(*state, report, now_ns, Tsc());
+		NoteSlowFrame(*state, 0); // the totals were reset: restart the slow-frame baseline
 	}
 }
 

@@ -52,8 +52,15 @@ public:
 	// Inspects one metadata slice and conditionally clears one layer of `image` (single mip) as
 	// the CPU fallback would. The image and canonical metadata buffer must remain alive through
 	// this scheduler tick. metadata_offset must be 4-byte aligned.
+	// keep_keys: the slice's bytes are left as they are after a clear (video-out bindings).
+	// decision_copy: the decision (4 bytes: the clear's group count, 0 = no clear) is copied to it at
+	// decision_offset behind the clear (verification).
 	void RecordSlice(Image& image, vk::Format view_format, uint32_t layer, vk::Buffer metadata,
-	                 uint64_t metadata_offset, uint64_t metadata_size, const ClearValues& values);
+	                 uint64_t metadata_offset, uint64_t metadata_size, const ClearValues& values,
+	                 bool keep_keys = false, vk::Buffer decision_copy = nullptr,
+	                 uint64_t decision_offset = 0);
+	// Push::decodable_mask bit: keep the keys (gpu_dcc_clear.comp).
+	static constexpr uint32_t KeepKeysBit = 0x80000000u;
 
 private:
 	struct Push {

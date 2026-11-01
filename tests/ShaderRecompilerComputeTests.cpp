@@ -695,6 +695,9 @@ struct TextureCacheTestAccess {
   }
   static uint64_t DccGpuRecords(const TextureCache &cache) { return cache.m_gpu_dcc_records; }
   static uint64_t DccCpuFallbacks(const TextureCache &cache) { return cache.m_gpu_dcc_fallbacks; }
+  static const TextureCache::DccWideTotals &DccWideTotals(const TextureCache &cache) {
+    return cache.m_dcc_wide_totals;
+  }
   // Under the lock every page's count equals its owner list's size.
   static bool CountsMatchOwners(TextureCache &cache, uint64_t address, uint64_t size) {
     std::lock_guard lock(cache.m_lock);
@@ -9849,6 +9852,195 @@ public:
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "DCC refresh allocation release failed");
+  }
+
+  // KYTY_DCC_GPU_WIDE=1 (TextureCache::TryMaterializeGpuMetadataClear): the same two-layer DCC
+  // render target as CheckDccGpuRefresh (shader-written metadata, layer 0 a clear code, layer 1
+  // not), with a texture registered over its metadata bytes. Without the switch the native
+  // inspection refuses (metadata aliased) and the CPU fallback drains for the metadata; with it
+  // the inspection runs on the GPU (its verify mode compares every slice's decision with the
+  // fallback's, and stops on a difference). Both must leave the same texels and metadata bytes,
+  // and the aliasing texture must keep its contents.
+  void CheckDccGpuWide() {
+    constexpr const char *name = "DccGpuWide";
+    constexpr uintptr_t base = 0x0000000267000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t color_size = 0x20000; // 128x64, 2 layers, 8 bytes per texel
+    constexpr uint64_t metadata_address = base + 0x40000;
+    constexpr uint64_t metadata_size = 0x2000; // 0x1000 per layer
+    constexpr uint64_t alias_size = 0x8000;    // 64x64, 8 bytes per texel, over the metadata
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "DCC wide allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "DCC wide mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+
+    struct Outcome {
+      std::vector<u32> layer0;
+      std::vector<u32> layer1;
+      std::vector<u32> alias;
+      std::vector<u32> alias_after;
+      std::vector<uint8_t> metadata;
+      bool helper = false;
+      uint64_t records = 0;
+      uint64_t fallbacks = 0;
+      uint64_t wide_aliased = 0;
+      uint64_t verify_checks = 0;
+      uint64_t verify_mismatches = 0;
+    };
+    const u32 push_limit = MaxPushDescriptors();
+    const auto run = [&](bool wide) {
+      for (uint64_t index = 0; index < allocation_size; index++) {
+        memory[index] = static_cast<uint8_t>((index * 23 + index / 4096) & 0xffu);
+      }
+      const PushDescriptorsScope push_descriptors(m_runtime_context, push_limit);
+      SetEnvironment("KYTY_DCC_GPU", "1");
+      SetEnvironment("KYTY_DCC_GPU_REFRESH", "1"); // as the game preset: the target waits for a refresh
+      SetEnvironment("KYTY_DCC_GPU_WIDE", wide ? "1" : nullptr);
+      SetEnvironment("KYTY_DCC_GPU_WIDE_VERIFY", wide ? "exit" : nullptr);
+      const auto context_owner = MakeRenderContext();
+      SetEnvironment("KYTY_DCC_GPU", nullptr);
+      SetEnvironment("KYTY_DCC_GPU_REFRESH", nullptr);
+      SetEnvironment("KYTY_DCC_GPU_WIDE", nullptr);
+      SetEnvironment("KYTY_DCC_GPU_WIDE_VERIFY", nullptr);
+      auto &context = *context_owner;
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &buffers = context.GetBufferCache();
+      const auto gpu_fill = [&](uint64_t address, uint64_t size, uint32_t value) {
+        OnGpuThread(context, [&] {
+          const auto [buffer, offset] = buffers.ObtainBuffer(address, size, true, false);
+          scheduler.Current().Handle().fillBuffer(buffer->Handle(), offset, size, value);
+        });
+      };
+      ImageDesc desc{};
+      desc.type = BindingType::RenderTarget;
+      desc.info.data = {base, color_size};
+      desc.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+      desc.info.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {128, 64, 1};
+      desc.info.resources = {1, 2};
+      desc.info.bytes_per_block = 8;
+      desc.info.samples = 1;
+      desc.info.mip_layout[0] = {0, color_size, 128, 64};
+      desc.view_info.format = vk::Format::eR16G16B16A16Sfloat;
+      desc.view_info.type = vk::ImageViewType::e2DArray;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.layer_count = 2;
+      desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      desc.info.pitch = TileGetRenderTargetPitch(128, 8);
+      desc.info.mip_layout[0].pitch = desc.info.pitch;
+      desc.info.metadata.kind = ImageMetadataKind::Dcc;
+      desc.info.metadata.range = {metadata_address, metadata_size};
+      desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      // A texture over the metadata bytes (GT7 registers images there), from guest memory.
+      ImageDesc alias{};
+      alias.type = BindingType::Texture;
+      alias.info.data = {metadata_address, alias_size};
+      alias.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+      alias.info.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+      alias.info.type = Prospero::ImageType::kColor2D;
+      alias.info.extent = {64, 64, 1};
+      alias.info.resources = {1, 1};
+      alias.info.bytes_per_block = 8;
+      alias.info.samples = 1;
+      alias.info.mip_layout[0] = {0, alias_size, 64, 64};
+      alias.view_info.format = vk::Format::eR16G16B16A16Sfloat;
+      alias.view_info.type = vk::ImageViewType::e2D;
+      alias.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      alias.view_info.layer_count = 1;
+      alias.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      alias.info.pitch = TileGetRenderTargetPitch(64, 8);
+      alias.info.mip_layout[0].pitch = alias.info.pitch;
+      alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto alias_id = OnGpuThread(context, [&] { return cache.FindImage(alias); });
+      Outcome outcome;
+      outcome.alias = ReadCachedTexel(name, context, alias_id, {9, 3, 0}, {1, 1, 1}, 0);
+      gpu_fill(base, color_size, 0x3c003c00u);
+      gpu_fill(metadata_address, 0x1000, 0x40404040u);
+      gpu_fill(metadata_address + 0x1000, 0x1000, 0x12121212u);
+      const auto id = OnGpuThread(context, [&] { return cache.FindImage(desc); });
+      outcome.helper = TextureCacheTestAccess::DccHelperAvailable(cache);
+      outcome.layer0 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 0);
+      outcome.layer1 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 1);
+      // The aliasing texture bound again after the inspection.
+      const auto alias_again = OnGpuThread(context, [&] { return cache.FindImage(alias); });
+      outcome.alias_after = ReadCachedTexel(name, context, alias_again, {9, 3, 0}, {1, 1, 1}, 0);
+      buffers.ReadMemory(metadata_address, metadata_size, false);
+      outcome.metadata.resize(metadata_size);
+      Require(name, "metadata backing",
+              LibKernel::Memory::TryReadBacking(metadata_address, outcome.metadata.data(),
+                                               metadata_size),
+              "the metadata backing could not be read");
+      scheduler.Finish();
+      const auto &totals = TextureCacheTestAccess::DccWideTotals(cache);
+      outcome.wide_aliased = totals.aliased.load();
+      outcome.verify_checks = totals.verify_checks.load();
+      outcome.verify_mismatches = totals.verify_mismatches.load();
+      outcome.records = TextureCacheTestAccess::DccGpuRecords(cache);
+      outcome.fallbacks = TextureCacheTestAccess::DccCpuFallbacks(cache);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      return outcome;
+    };
+
+    const auto native = run(true);
+    const auto fallback = run(false);
+    Require(name, "same texels",
+            native.layer0 == fallback.layer0 && native.layer1 == fallback.layer1 &&
+                fallback.layer0 == std::vector<u32>{0, 0x3c000000u},
+            "the wide native inspection left different texels");
+    Require(name, "same metadata",
+            native.metadata == fallback.metadata &&
+                std::all_of(fallback.metadata.begin(), fallback.metadata.begin() + 0x1000,
+                            [](uint8_t byte) { return byte == 0xffu; }) &&
+                std::all_of(fallback.metadata.begin() + 0x1000, fallback.metadata.end(),
+                            [](uint8_t byte) { return byte == 0x12u; }),
+            "the wide native inspection left different metadata");
+    Require(name, "alias contents",
+            native.alias == fallback.alias && native.alias_after == fallback.alias_after,
+            "the aliasing texture differs between the runs");
+    Require(name, "helper available", native.helper || push_limit < 4,
+            "DccClearHelper stayed off although the device has push descriptors");
+    Require(name, "paths taken",
+            fallback.fallbacks == 1 && fallback.wide_aliased == 0 &&
+                (!native.helper || (native.records == 2 && native.fallbacks == 0 &&
+                                    native.wide_aliased == 2 && native.verify_checks == 2 &&
+                                    native.verify_mismatches == 0)),
+            "the switch did not select the native inspection under an aliasing image (fallback: " +
+                std::to_string(fallback.fallbacks) + " fallbacks, " + std::to_string(fallback.wide_aliased) +
+                " wide; native: " + std::to_string(native.records) + " records, " + std::to_string(native.fallbacks) +
+                " fallbacks, " + std::to_string(native.wide_aliased) + " wide, verify " +
+                std::to_string(native.verify_checks) + "/" + std::to_string(native.verify_mismatches) + ")");
+    std::printf("[gpu]     %-32s ok (native inspection %s)\n", name,
+                native.helper ? "ran" : "unavailable");
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "DCC wide mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "DCC wide allocation release failed");
   }
 
   // KYTY_IMAGE_LRU_SKIP (TextureCache::TouchImage): one script of image touches, GC ticks,
@@ -61637,6 +61829,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDccGpuRefresh();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dcc-gpu-wide-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDccGpuWide();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-lru-skip-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckImageLruSkip();
@@ -62187,6 +62384,7 @@ int main(int argc, char **argv) {
   vulkan.CheckShaderUploadDedup();
   vulkan.CheckGpuWriteImageSkip();
   vulkan.CheckDccGpuRefresh();
+  vulkan.CheckDccGpuWide();
   vulkan.CheckImageLruSkip();
   vulkan.CheckImageTransitSkip();
   vulkan.CheckTrackerGapDetectors();

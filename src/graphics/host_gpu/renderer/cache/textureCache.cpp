@@ -482,6 +482,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 			m_dcc_gpu_refresh_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
 	}
+	m_dcc_gpu_wide      = static_cast<uint32_t>(ParseDccGpuWide(std::getenv("KYTY_DCC_GPU_WIDE")));
+	if (const auto* verify = std::getenv("KYTY_DCC_GPU_WIDE_VERIFY");
+	    verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+		m_dcc_gpu_wide_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -4120,8 +4125,10 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	if (!m_dcc_clear || !m_dcc_clear->Available()) {
 		return Event::DccFallbackDisabled;
 	}
-	// The video-out path does not consume its clear key; keep it on the CPU inspection.
-	if (desc.type == BindingType::VideoOut) {
+	// The video-out path does not consume its clear key; keep it on the CPU inspection, or
+	// (KYTY_DCC_GPU_WIDE 4) inspect it on the GPU without consuming the keys.
+	const bool keep_keys = desc.type == BindingType::VideoOut;
+	if (keep_keys && (DccGpuWide() & 4u) == 0) {
 		return Event::DccFallbackBinding;
 	}
 	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -4138,7 +4145,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 		}
 	}
 	return TryMaterializeGpuMetadataClear(*m_dcc_clear, id, desc, desc.info.metadata.range,
-	                                      metadata_base_layer, values, decodable, false);
+	                                      metadata_base_layer, values, decodable, false, keep_keys);
 }
 
 // KYTY_DCC_GPU_ALIASED=1|2 (default off, read once): images registered over a target's metadata bytes
@@ -4153,15 +4160,17 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 // whose range covers that target's DCC bytes; it is GPU-modified, so =1 keeps that inspection on the
 // CPU (a drain per bind). Accuracy cost: bytes of the metadata such an image wrote and has not
 // written back would be missed by the inspection (the buffer copy is read).
-bool TextureCache::MetadataAliasBlocks(ImageId id, GuestRange range) {
+bool TextureCache::MetadataAliasBlocks(ImageId id, GuestRange range, bool* aliased) {
 	const auto images = FindImagesInRegion(range.address, range.size, false);
 	if (images.size() == 0) {
 		return false;
 	}
-	static const int relaxed = [] {
+	static const int relaxed_env = [] {
 		const auto* value = std::getenv("KYTY_DCC_GPU_ALIASED");
 		return value == nullptr ? 0 : std::clamp(std::atoi(value), 0, 2);
 	}();
+	// KYTY_DCC_GPU_WIDE 1 (textureCache.h): as =2.
+	const int relaxed = (DccGpuWide() & 1u) != 0 ? 2 : relaxed_env;
 	if (relaxed == 0) {
 		return true;
 	}
@@ -4180,8 +4189,12 @@ bool TextureCache::MetadataAliasBlocks(ImageId id, GuestRange range) {
 			return true;
 		}
 	}
+	if (aliased != nullptr) {
+		*aliased = true;
+	}
 	static std::atomic<uint64_t> accepted {0};
-	if (const auto n = accepted.fetch_add(1, std::memory_order_relaxed) + 1; (n & (n - 1)) == 0) {
+	if (const auto n = accepted.fetch_add(1, std::memory_order_relaxed) + 1;
+	    relaxed_env != 0 && (n & (n - 1)) == 0) {
 		const auto* image = m_slot_images.try_get(*images.begin());
 		std::fprintf(stderr,
 		             "DCC aliased metadata inspected on the GPU (KYTY_DCC_GPU_ALIASED): %" PRIu64
@@ -4197,9 +4210,12 @@ bool TextureCache::MetadataAliasBlocks(ImageId id, GuestRange range) {
 Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
     DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
     uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-    bool cmask) {
+    bool cmask, bool keep_keys) {
 	using Event = Profiler::FrameEvent;
 	using Support = DccClearHelper::Support;
+	// KYTY_DCC_GPU_WIDE (textureCache.h): what this inspection was accepted through.
+	bool wide_aliased  = false;
+	bool wide_mismatch = false;
 	const auto& view = desc.view_info;
 	if (!helper.Available()) {
 		return Event::DccFallbackDisabled;
@@ -4226,14 +4242,15 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	};
 	{
 		std::scoped_lock lock {m_lock};
-		if (MetadataAliasBlocks(id, range)) {
+		if (MetadataAliasBlocks(id, range, &wide_aliased)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
 		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
 		// than that one reads the same bytes to the same no-op, for any image or layer; only the
 		// metadata processing is skipped, the caller still refreshes this image normally.
-		bool reusable = true;
+		// Kept keys (video-out) are never retained: a clear they select clears again each time.
+		bool reusable = !keep_keys;
 		for (uint32_t slice = 0; reusable && slice < count; ++slice) {
 			const auto metadata = slice_range(slice);
 			const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
@@ -4259,9 +4276,13 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
+		const bool  exact = image != nullptr && image->info.data == desc.info.data &&
+		                   image->info.extent == desc.info.extent;
+		// KYTY_DCC_GPU_WIDE 2: the image found for the binding, whatever its range and extent; its
+		// whole layer is inspected, as the CPU fallback's ClearImage(id) clears it.
+		wide_mismatch = !exact && (DccGpuWide() & 2u) != 0;
 		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
-		                     image->info.data == desc.info.data &&
-		                     image->info.extent == desc.info.extent;
+		                     (exact || wide_mismatch);
 		if (!matches ||
 		    (!SafeToDownload(*image) && !(refresh_allowed && image->FullyResident()))) {
 			// Which condition refused it (DccImageState* counters, MaterializeDccClear). The
@@ -4285,8 +4306,8 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			}
 			return Event::DccFallbackImageState;
 		}
-		if (image->backing.extent.width != desc.info.extent.width ||
-		    image->backing.extent.height != desc.info.extent.height ||
+		if ((!wide_mismatch && (image->backing.extent.width != desc.info.extent.width ||
+		                        image->backing.extent.height != desc.info.extent.height)) ||
 		    view.base_layer >= image->backing.layers ||
 		    count > image->backing.layers - view.base_layer) {
 			return Event::DccFallbackShape;
@@ -4297,7 +4318,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			case Support::Format: return Event::DccFallbackFormat;
 			case Support::Unsupported: return Event::DccFallbackUnsupported;
 		}
-		if (MetadataAliasBlocks(id, range)) {
+		if (MetadataAliasBlocks(id, range, &wide_aliased)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		return std::nullopt;
@@ -4333,9 +4354,31 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			    std::all_of(bytes, bytes + slice_size, [&](uint8_t byte) { return byte == bytes[0]; });
 		}
 	}
+	// KYTY_DCC_GPU_WIDE_VERIFY: the CPU fallback's decision per slice, from the bytes it would read
+	// (after the same drain), for an inspection accepted only through KYTY_DCC_GPU_WIDE.
+	const bool           wide_used = wide_aliased || wide_mismatch || keep_keys;
+	std::vector<uint8_t> wide_expected;
+	if (wide_used && m_dcc_gpu_wide_verify != 0) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		wide_expected.resize(count);
+		std::vector<uint8_t> bytes(slice_size);
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			if (!LibKernel::Memory::TryReadBacking(slice_range(slice).address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read colour metadata for the wide verification\n");
+			}
+			uint32_t index = 0;
+			while (index < DccClearHelper::ClearCodes.size() && DccClearHelper::ClearCodes[index] != bytes[0]) {
+				index++;
+			}
+			wide_expected[slice] =
+			    index < DccClearHelper::ClearCodes.size() && (decodable & (1u << index)) != 0 &&
+			    std::all_of(bytes.begin(), bytes.end(), [&](uint8_t byte) { return byte == bytes[0]; });
+		}
+	}
 	// Use the canonical buffer and its normal GPU-write tracking. No CPU shadow of the
 	// clear value is trusted. Acquiring it may upload/submit, so hold no texture lock.
-	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, true, false);
+	// Kept keys are only read.
+	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, !keep_keys, false);
 	if (buffer == nullptr) {
 		return Event::DccFallbackUnsupported;
 	}
@@ -4353,12 +4396,38 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	TrackImage(id);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
+		uint8_t*   decisions = nullptr;
+		vk::Buffer decision_buffer {};
+		uint64_t   decision_offset = 0;
+		if (!wide_expected.empty()) {
+			auto& download                 = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+			const auto [mapped, mapped_at] = download.Map(uint64_t {16} * count, 64);
+			if (mapped == nullptr) {
+				EXIT("TextureCache: DCC wide verification exceeds the download ring\n");
+			}
+			download.Commit();
+			decisions       = mapped;
+			decision_buffer = download.Handle();
+			decision_offset = mapped_at;
+		}
 		for (uint32_t slice = 0; slice < count; ++slice) {
 			helper.RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
-			                         offset + slice_size * (first + slice), slice_size, values);
+			                   offset + slice_size * (first + slice), slice_size, values, keep_keys,
+			                   decision_buffer, decision_offset + uint64_t {16} * slice);
+		}
+		if (decisions != nullptr) {
+			RecordDccWideVerify(decisions, decision_offset, std::move(wide_expected), range,
+			                    static_cast<uint32_t>(desc.type));
 		}
 	}
 	CommitGpuWrite(image);
+	if (wide_used) {
+		(keep_keys       ? m_dcc_wide_totals.video_out
+		 : wide_mismatch ? m_dcc_wide_totals.mismatch
+		                 : m_dcc_wide_totals.aliased)
+		    .fetch_add(count, std::memory_order_relaxed);
+		ReportDccWide();
+	}
 	if (refreshed) {
 		m_dcc_refresh_totals.refreshes += count;
 		Profiler::CountFrameEvent(Event::DccGpuRefreshes, count);
@@ -4371,7 +4440,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		m_gpu_dcc_records += count;
 		Profiler::CountFrameEvent(Event::DccGpuRecords, count);
 	}
-	for (uint32_t slice = 0; slice < count; ++slice) {
+	for (uint32_t slice = 0; !keep_keys && slice < count; ++slice) {
 		const auto metadata = slice_range(slice);
 		if (const auto revision =
 		        m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {
@@ -4399,6 +4468,66 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	                   static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type), first,
 	                   count, m_scheduler.CurrentTick());
 	return Event::DccGpuRecords;
+}
+
+// KYTY_DCC_GPU_WIDE (textureCache.h) is also a live switch (common/liveSwitch.h): the mask used is the
+// startup value (read when the cache is created) or'ed with the live value, so live control (A/B) turns
+// bits on and off when the run starts with 0. Every inspection decides with the current mask, and both
+// paths leave the metadata in a state the other reads the same way, so a change between two
+// inspections is safe.
+int64_t TextureCache::ParseDccGpuWide(const char* value) {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 0) & 7u) : 0;
+}
+static Live::Switch g_dcc_gpu_wide("KYTY_DCC_GPU_WIDE", &TextureCache::ParseDccGpuWide);
+
+uint32_t TextureCache::DccGpuWide() const {
+	return m_dcc_gpu_wide | static_cast<uint32_t>(g_dcc_gpu_wide.Get());
+}
+
+void TextureCache::ReportDccWide() {
+	const auto aliased  = m_dcc_wide_totals.aliased.load(std::memory_order_relaxed);
+	const auto mismatch = m_dcc_wide_totals.mismatch.load(std::memory_order_relaxed);
+	const auto flips    = m_dcc_wide_totals.video_out.load(std::memory_order_relaxed);
+	const auto n        = aliased + mismatch + flips;
+	if (n != 0 && (n & (n - 1)) == 0) {
+		std::fprintf(stderr,
+		             "DCC wide (KYTY_DCC_GPU_WIDE=%u): %" PRIu64 " slices inspected on the GPU instead of a "
+		             "drain: %" PRIu64 " under aliasing images, %" PRIu64 " of a differing image, %" PRIu64
+		             " video-out; verify %" PRIu64 " checks, %" PRIu64 " mismatches\n",
+		             DccGpuWide(), n, aliased, mismatch, flips,
+		             m_dcc_wide_totals.verify_checks.load(std::memory_order_relaxed),
+		             m_dcc_wide_totals.verify_mismatches.load(std::memory_order_relaxed));
+	}
+}
+
+void TextureCache::RecordDccWideVerify(const uint8_t* decisions, uint64_t download_offset,
+                                       std::vector<uint8_t> expected, GuestRange range, uint32_t type) {
+	auto& download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	m_scheduler.DeferOperation([this, &download, decisions, download_offset,
+	                            expected = std::move(expected), range, type] {
+		download.Invalidate(download_offset, uint64_t {16} * expected.size());
+		uint32_t wrong = 0;
+		for (size_t slice = 0; slice < expected.size(); ++slice) {
+			uint32_t groups = 0;
+			std::memcpy(&groups, decisions + 16 * slice, sizeof(groups));
+			wrong += (groups != 0) != (expected[slice] != 0) ? 1u : 0u;
+		}
+		m_dcc_wide_totals.verify_checks.fetch_add(expected.size(), std::memory_order_relaxed);
+		if (wrong == 0) {
+			return;
+		}
+		m_dcc_wide_totals.verify_mismatches.fetch_add(wrong, std::memory_order_relaxed);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr,
+			             "DCC wide verify: %u of %zu slice(s) of metadata 0x%016" PRIx64 " size=0x%" PRIx64
+			             " (binding type %u) decided differently from the CPU fallback\n",
+			             wrong, expected.size(), range.address, range.size, type);
+		}
+		if (m_dcc_gpu_wide_verify == 2) {
+			EXIT("DCC wide verify: an inspection differs from the CPU fallback\n");
+		}
+	});
 }
 
 void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,

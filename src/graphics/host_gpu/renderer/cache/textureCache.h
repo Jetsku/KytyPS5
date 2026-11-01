@@ -463,7 +463,8 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	// KYTY_DCC_GPU_ALIASED: whether images over a target's metadata keep its inspection on the CPU
 	// (m_lock held).
-	[[nodiscard]] bool          MetadataAliasBlocks(ImageId id, GuestRange range);
+	// *aliased: images lie over the metadata and were accepted (KYTY_DCC_GPU_WIDE / _ALIASED=2).
+	[[nodiscard]] bool          MetadataAliasBlocks(ImageId id, GuestRange range, bool* aliased = nullptr);
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
@@ -526,7 +527,7 @@ private:
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuMetadataClear(
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-	    bool cmask);
+	    bool cmask, bool keep_keys = false);
 	// KYTY_LIGHT_GRID_CAP: a light grid's staged upload bytes, repaired before the copy is recorded.
 	void RepairLightGridUpload(const Image& image, Buffer& source, uint64_t source_offset);
 	void                        InitializeImage(ImageId id,
@@ -884,6 +885,45 @@ private:
 	void RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
 	                            std::vector<uint8_t> before, std::vector<uint8_t> clears,
 	                            GuestRange range);
+	// KYTY_DCC_GPU_WIDE=<mask> (default 0 = off, needs KYTY_DCC_GPU=1): GPU-written colour metadata
+	// that the native inspection used to refuse, so that the CPU fallback drained the GPU for it
+	// (a command-processor wait for the current recording, ~2 ms each, 6-8 ms per GT7 race frame),
+	// is inspected on the GPU too. The CPU fallback reads the metadata from the buffer cache
+	// (BufferCache::ReadMemory downloads buffer bytes only, never an image's), and the inspection
+	// reads the same buffer bytes in queue order, so both take the same decision; the image layer
+	// cleared and the keys consumed are the ones the fallback's ClearImage + key write would touch.
+	//  1: images registered over the metadata bytes (any, also GPU-modified ones; not the target
+	//     itself) no longer refuse (KYTY_DCC_GPU_ALIASED=2 does the same for DCC only);
+	//  2: the image found for the binding differs from the description (data range or extent, e.g.
+	//     a texture view of a larger target): the image's whole layer is inspected and cleared, as
+	//     the fallback's ClearImage(id) clears it;
+	//  4: video-out bindings (flips): inspected without consuming the keys (the fallback leaves a
+	//     flip's keys as they are), never reused from an earlier inspection.
+	// KYTY_DCC_GPU_WIDE_VERIFY=1|exit: for an inspection accepted only through these, also take the
+	// CPU fallback's decision (after a drain) and compare it with the inspection's decision copied
+	// out behind it: "DCC wide verify" mismatches are counted and logged (exit stops).
+	uint32_t m_dcc_gpu_wide        = 0;
+	int      m_dcc_gpu_wide_verify = 0;
+	[[nodiscard]] uint32_t DccGpuWide() const;
+
+public:
+	[[nodiscard]] static int64_t ParseDccGpuWide(const char* value);
+
+private:
+	struct DccWideTotals {
+		std::atomic<uint64_t> aliased {0};   // inspections accepted with images over the metadata
+		std::atomic<uint64_t> mismatch {0};  // inspections of an image that differs from the binding
+		std::atomic<uint64_t> video_out {0}; // flip inspections (keys kept)
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	DccWideTotals m_dcc_wide_totals;
+	// Caller holds m_lock, after the slices' RecordSlice copied their decisions to `decisions`
+	// (16 bytes per slice, download ring): compares them with the fallback's (`expected`) at
+	// completion.
+	void RecordDccWideVerify(const uint8_t* decisions, uint64_t download_offset, std::vector<uint8_t> expected,
+	                         GuestRange range, uint32_t type);
+	void ReportDccWide();
 	struct GpuWriteSkipTotals {
 		std::atomic<uint64_t> skips {0};
 		std::atomic<uint64_t> verify_checks {0};
