@@ -2029,6 +2029,171 @@ void DumpLargeSpirv(const char* stage_name, uint64_t hash, const std::vector<uin
 	}
 }
 
+// KYTY_SHADER_DUMP=<folder>;<hash>[,<hash>...] or <folder>;all, ';' or '@' (diagnostics, local files only): the
+// selected guest shaders bypass the persistent program cache (dump_ir) and every emitted
+// permutation is written as <folder>/<stage>_<hash>_<spirv hash>.rdna2 (decoded guest code),
+// .ir.txt (native IR and bindings) and .spv. Default off.
+struct ShaderDumpRequest {
+	std::string           folder;
+	std::vector<uint64_t> hashes;
+	bool                  all = false;
+};
+
+const ShaderDumpRequest& ShaderDumpSettings() {
+	static const ShaderDumpRequest request = [] {
+		ShaderDumpRequest parsed;
+		const char*       value = std::getenv("KYTY_SHADER_DUMP");
+		if (value == nullptr) return parsed;
+		const std::string text(value);
+		const auto        split = text.find_first_of(";@");
+		if (split == std::string::npos) return parsed;
+		parsed.folder = text.substr(0, split);
+		std::string list = text.substr(split + 1);
+		if (list == "all") {
+			parsed.all = true;
+			return parsed;
+		}
+		size_t at = 0;
+		while (at < list.size()) {
+			const auto next = list.find(',', at);
+			const auto item = list.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			if (!item.empty()) parsed.hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		return parsed;
+	}();
+	return request;
+}
+
+bool ShaderDumpSelected(uint64_t hash) {
+	const auto& request = ShaderDumpSettings();
+	if (request.folder.empty()) return false;
+	return request.all || std::ranges::find(request.hashes, hash) != request.hashes.end();
+}
+
+void DumpSelectedShader(const char* stage_name, uint64_t hash, const std::string& decoded,
+                        const std::string& ir, const std::vector<uint32_t>& spirv) {
+	if (!ShaderDumpSelected(hash)) return;
+	const auto& request = ShaderDumpSettings();
+	std::error_code error;
+	std::filesystem::create_directories(request.folder, error);
+	const auto spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+	const auto base       = std::filesystem::path(request.folder) /
+	                  fmt::format("{}_{:016x}_{:016x}", stage_name, hash, spirv_hash);
+	const auto write = [&](const char* suffix, const void* data, size_t size) {
+		if (size == 0) return;
+		auto path = base;
+		path += suffix;
+		if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+			std::fwrite(data, 1, size, file);
+			std::fclose(file);
+		}
+	};
+	write(".rdna2", decoded.data(), decoded.size());
+	write(".ir.txt", ir.data(), ir.size());
+	write(".spv", spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+// KYTY_SPIRV_TRY=<flags>@<hash>[,<hash>...][+<flags>@<hashes>...] (diagnostics, default off): the
+// modules given to the driver for the listed guest shaders are edited (the program cache keeps the
+// emitted words). Flags: z drops the SignedZeroInfNanPreserve execution mode and capability; c drops
+// the Coherent decoration of the LDS device buffer (lds_dwords / lds_qwords).
+struct SpirvTryGroup {
+	std::string           flags;
+	std::vector<uint64_t> hashes;
+};
+
+const std::vector<SpirvTryGroup>& SpirvTrySettings() {
+	static const std::vector<SpirvTryGroup> groups = [] {
+		std::vector<SpirvTryGroup> parsed;
+		const char*                value = std::getenv("KYTY_SPIRV_TRY");
+		if (value == nullptr) return parsed;
+		std::string text(value);
+		size_t      at = 0;
+		while (at < text.size()) {
+			auto next = text.find('+', at);
+			auto item = text.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			const auto split = item.find('@');
+			if (split != std::string::npos) {
+				SpirvTryGroup group;
+				group.flags = item.substr(0, split);
+				std::string list = item.substr(split + 1);
+				size_t      p    = 0;
+				while (p < list.size()) {
+					const auto comma = list.find(',', p);
+					const auto h = list.substr(p, comma == std::string::npos ? std::string::npos : comma - p);
+					if (!h.empty()) group.hashes.push_back(std::strtoull(h.c_str(), nullptr, 16));
+					if (comma == std::string::npos) break;
+					p = comma + 1;
+				}
+				parsed.push_back(std::move(group));
+			}
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		return parsed;
+	}();
+	return groups;
+}
+
+std::string SpirvTryFlags(uint64_t hash) {
+	std::string flags;
+	for (const auto& group: SpirvTrySettings()) {
+		if (std::ranges::find(group.hashes, hash) != group.hashes.end()) flags += group.flags;
+	}
+	return flags;
+}
+
+// Edits a copy of `code` per `flags`; empty when nothing changed.
+std::vector<uint32_t> ApplySpirvTry(std::span<const uint32_t> code, const std::string& flags,
+                                    uint64_t hash) {
+	if (flags.empty() || code.size() < 5) return {};
+	const bool drop_szinp    = flags.find('z') != std::string::npos;
+	const bool drop_coherent = flags.find('c') != std::string::npos;
+	std::unordered_set<uint32_t> lds_ids;
+	for (size_t i = 5; i < code.size();) {
+		const uint32_t count = code[i] >> 16u;
+		const uint32_t op    = code[i] & 0xffffu;
+		if (count == 0 || i + count > code.size()) return {};
+		if (op == 5 /* OpName */ && count >= 3) {
+			const char* name = reinterpret_cast<const char*>(&code[i + 2]);
+			const auto  max  = (count - 2) * 4;
+			const std::string_view text(name, strnlen(name, max));
+			if (text == "lds_dwords" || text == "lds_qwords") lds_ids.insert(code[i + 1]);
+		}
+		i += count;
+	}
+	std::vector<uint32_t> out(code.begin(), code.begin() + 5);
+	out.reserve(code.size());
+	uint32_t removed = 0;
+	for (size_t i = 5; i < code.size();) {
+		const uint32_t count = code[i] >> 16u;
+		const uint32_t op    = code[i] & 0xffffu;
+		bool           drop  = false;
+		if (drop_szinp && op == 16 /* OpExecutionMode */ && count >= 3 && code[i + 2] == 4461) drop = true;
+		if (drop_szinp && op == 17 /* OpCapability */ && count == 2 && code[i + 1] == 4466) drop = true;
+		if (drop_coherent && op == 71 /* OpDecorate */ && count == 3 && code[i + 2] == 23 &&
+		    lds_ids.contains(code[i + 1])) {
+			drop = true;
+		}
+		if (drop) {
+			removed++;
+		} else {
+			out.insert(out.end(), code.begin() + static_cast<std::ptrdiff_t>(i),
+			           code.begin() + static_cast<std::ptrdiff_t>(i + count));
+		}
+		i += count;
+	}
+	if (removed == 0) return {};
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+		LOGF("KYTY_SPIRV_TRY: shader 0x%016" PRIx64 " flags %s: %u instructions removed\n", hash,
+		     flags.c_str(), removed);
+	}
+	return out;
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -2828,6 +2993,11 @@ struct PipelineCache::ProgramCache {
 		times.emit_ns     = CompileClockNs() - emit_begin;
 		times.spirv_words = result.spirv.size();
 		DumpLargeSpirv(stage_name, options.shader_hash, result.spirv);
+		DumpSelectedShader(stage_name, options.shader_hash, result.decoded_dump, result.ir_dump,
+		                   result.spirv);
+		if (!result.spirv_plain.empty()) {
+			DumpSelectedShader("psplain", options.shader_hash, {}, {}, result.spirv_plain);
+		}
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
@@ -2871,11 +3041,15 @@ struct PipelineCache::ProgramCache {
 
 		const auto       module_begin = CompileClockNs();
 		vk::ShaderModule module       = nullptr;
+		// KYTY_SPIRV_TRY: the driver gets an edited copy of the listed shaders' modules.
+		const auto try_flags = SpirvTryFlags(options.shader_hash);
+		auto       tried     = ApplySpirvTry(emitted.spirv, try_flags, options.shader_hash);
+		const auto& driver_spirv = tried.empty() ? emitted.spirv : tried;
 		{
 			KYTY_PROFILER_BLOCK("Shader::CreateModule");
-			module = CompileSPV(emitted.spirv, device);
+			module = CompileSPV(driver_spirv, device);
 		}
-		g_shader_modules.Add(module, emitted.spirv);
+		g_shader_modules.Add(module, driver_spirv);
 		times.module_ns = CompileClockNs() - module_begin;
 		EXIT_IF(module == nullptr);
 		// KYTY_EQAA_MIXED on NV mixed samples: a pixel shader that shades per sample gets a
@@ -2928,9 +3102,11 @@ struct PipelineCache::ProgramCache {
 					     options.dump_label, options.shader_hash);
 				}
 			}
-			const auto plain_module = CompileSPV(emitted.spirv_plain, device);
+			auto        plain_tried  = ApplySpirvTry(emitted.spirv_plain, try_flags, options.shader_hash);
+			const auto& plain_driver = plain_tried.empty() ? emitted.spirv_plain : plain_tried;
+			const auto  plain_module = CompileSPV(plain_driver, device);
 			EXIT_IF(plain_module == nullptr);
-			g_shader_modules.Add(plain_module, emitted.spirv_plain);
+			g_shader_modules.Add(plain_module, plain_driver);
 			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 			if (options.stage == ShaderType::Pixel) {
 				AaMaskCoverage::Register(plain_id, options.shader_hash, emitted.spirv_plain);
@@ -3952,6 +4128,7 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		if (ShaderDumpSelected(params.hash)) options.dump_ir = true; // KYTY_SHADER_DUMP
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.plain_mip_stats_variant =
@@ -4069,7 +4246,7 @@ struct PipelineCache::ProgramCache {
 					job->options            = options;
 					job->options.user_data  = job->user_data;
 					job->options.back_code  = job->back_code;
-					job->options.dump_ir    = false;
+					job->options.dump_ir    = ShaderDumpSelected(params.hash);
 					job->options.early_dump = false;
 					ShaderStageInputInfo job_input {};
 					if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {

@@ -3027,6 +3027,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
+		if (program.stage == ShaderType::Pixel && TextureCache::LightGridProbeEnabled()) {
+			for (uint32_t i = 0; i < count; i++) {
+				const auto& resource = program.info.images[i];
+				const auto& binding  = prepared.images[i];
+				if (!resource.written && binding.image_id &&
+				    binding.desc.info.pixel_format == vk::Format::eR32G32Uint &&
+				    binding.desc.info.resources.layers > 1) {
+					TextureCache::ProbeLightGrid(binding.desc.info, program.shader_hash);
+				}
+			}
+		}
 		if (program.stage == ShaderType::Pixel && TextureCache::LightGridCapEnabled()) {
 			// KYTY_LIGHT_GRID_CAP (usa-ratt/KytyPS5-GT7 ecef51e59): a pixel shader's light grid
 			// has its later uploads checked (TextureCache::NoteLightGridShape).

@@ -281,6 +281,17 @@ public:
 	// comes from guest bytes (not from a GPU-written cache buffer). Any thread.
 	[[nodiscard]] static bool LightGridCapEnabled();
 	static void NoteLightGridShape(const ImageInfo& info);
+	// KYTY_LIGHT_GRID_PROBE=1 (diagnostics, default off): every light grid a pixel shader binds
+	// (descriptors.cpp) has its guest bytes scanned at bind time and logged (garbage cells, the
+	// largest and summed light counts). Any thread.
+	[[nodiscard]] static bool LightGridProbeEnabled();
+	// KYTY_LIGHT_GRID_GUEST=1 (default off; needs KYTY_LIGHT_GRID_CAP): a light grid's image is
+	// compared with its guest bytes once per guest submission and uploaded from them (repaired)
+	// when they changed, even when GPU writes of other data covered the grid's memory, which
+	// otherwise makes the refresh take the stale GPU-written bytes of the buffer cache.
+	[[nodiscard]] static bool LightGridGuestEnabled();
+	[[nodiscard]] static bool LightGridGuestApplies(const Image& image);
+	static void ProbeLightGrid(const ImageInfo& info, uint64_t shader_hash);
 	void RunGarbageCollector();
 	// KYTY_BINDLESS_GUEST_DROP_FRAMES: no heap key refers to this bindless image any more (the
 	// guest replaced or cleared its entries): free it once no draw has used it for that many

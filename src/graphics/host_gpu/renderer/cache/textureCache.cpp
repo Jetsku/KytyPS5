@@ -2661,6 +2661,58 @@ void TextureCache::NoteLightGridShape(const ImageInfo& info) {
 	}
 }
 
+bool TextureCache::LightGridProbeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIGHT_GRID_PROBE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void TextureCache::ProbeLightGrid(const ImageInfo& info, uint64_t shader_hash) {
+	if (!LightGridFormat(info)) {
+		return;
+	}
+	const auto range = info.data;
+	thread_local std::vector<uint8_t> guest;
+	guest.resize(static_cast<size_t>(range.size));
+	if (!LibKernel::Memory::TryReadBacking(range.address, guest.data(), range.size)) {
+		return;
+	}
+	const auto row     = std::max(info.pitch, info.extent.width);
+	const auto layers  = info.resources.layers;
+	const auto garbage = ScanLightGrid(guest.data(), range.size, info.extent.width,
+	                                   info.extent.height, layers, row, false);
+	// Largest count and the sum of counts (low 16 bits of each cell's second word).
+	uint32_t       most = 0;
+	uint64_t       sum  = 0;
+	const uint64_t layer_bytes = layers != 0 ? range.size / layers : 0;
+	for (uint32_t l = 0; l < layers; l++) {
+		for (uint32_t y = 0; y < info.extent.height; y++) {
+			for (uint32_t x = 0; x < info.extent.width; x++) {
+				const uint64_t at = l * layer_bytes + (static_cast<uint64_t>(y) * row + x) * 8u + 4u;
+				if (at + 4u > guest.size()) continue;
+				uint32_t packed = 0;
+				std::memcpy(&packed, guest.data() + at, sizeof(packed));
+				most = std::max(most, packed & 0xffffu);
+				sum += packed & 0xffffu;
+			}
+		}
+	}
+	static std::atomic<uint64_t> probes {0};
+	static std::atomic<uint64_t> bad {0};
+	const auto n = probes.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto b = garbage != 0 ? bad.fetch_add(1, std::memory_order_relaxed) + 1
+	                            : bad.load(std::memory_order_relaxed);
+	if ((garbage != 0 && (b <= 64 || b % 256 == 0)) || n <= 16 || n % 4096 == 0) {
+		LOGF("LightGridProbe: ps 0x%016" PRIx64 " grid 0x%012" PRIx64 "+0x%" PRIx64
+		     " (%ux%u, %u layers, pitch %u): guest bytes %u cells > %u lights, max %u, sum %" PRIu64
+		     " (probe %" PRIu64 ", %" PRIu64 " with garbage)\n",
+		     shader_hash, range.address, range.size, info.extent.width, info.extent.height, layers,
+		     info.pitch, garbage, LightGridMostLights, most, sum, n, b);
+	}
+}
+
 void TextureCache::RepairLightGridUpload(const Image& image, Buffer& source,
                                          uint64_t source_offset) {
 	const auto& info  = image.info;
@@ -5557,8 +5609,26 @@ void TextureCache::RunNanScrub() {
 	}
 }
 
+bool TextureCache::LightGridGuestEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIGHT_GRID_GUEST");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool TextureCache::LightGridGuestApplies(const Image& image) {
+	return LightGridGuestEnabled() && LightGridCapEnabled() && IsLightGridShape(image.info) &&
+	       image.FullyResident() && !image.IsGpuModified() && !image.depth_id;
+}
+
 bool TextureCache::ChecksGuestContent(const Image& image) {
 	const auto& info  = image.info;
+	// KYTY_LIGHT_GRID_GUEST: a light grid is checked against (and uploaded from) its guest bytes
+	// even where GPU writes to other data shared its memory.
+	if (LightGridGuestApplies(image)) {
+		return true;
+	}
 	const auto  limit = info.IsTiled() ? GuestHashTiledBytes() : GuestHashImageBytes();
 	return limit != 0 && !info.data.Empty() && info.data.size <= limit &&
 	       info.samples == 1 && !image.depth_id && !info.IsDepth() &&
