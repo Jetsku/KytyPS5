@@ -1758,6 +1758,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
 	ForgetKnownFills(vaddr, size);
+	NoteMetadataWrite(vaddr, size);
 	const auto flush = [this, vaddr, size] { ReadMemory(vaddr, size, true); };
 	if (!write_fault) {
 		m_memory_tracker.InvalidateRegion(vaddr, size, flush);
@@ -3341,7 +3342,58 @@ void BufferCache::CompleteAllSideReadbacks() {
 	}
 }
 
+void BufferCache::WatchMetadata(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A bound on the watches kept: past it they start again (every range then inspects once more).
+	constexpr size_t MaxWatches = 4096;
+	std::scoped_lock lock(m_metadata_watch_mutex);
+	if (m_metadata_watches.size() >= MaxWatches) {
+		m_metadata_watches.clear();
+		m_metadata_watch_span = 0;
+	}
+	// Other watches over the range go: the range is current as inspected now.
+	for (auto it = m_metadata_watches.lower_bound(vaddr >= m_metadata_watch_span ? vaddr - m_metadata_watch_span : 0);
+	     it != m_metadata_watches.end() && it->first < vaddr + size;) {
+		if (it->second.end > vaddr && it->first != vaddr) {
+			it = m_metadata_watches.erase(it);
+		} else {
+			++it;
+		}
+	}
+	m_metadata_watches[vaddr] = {vaddr + size, false};
+	m_metadata_watch_span     = std::max(m_metadata_watch_span, size);
+	m_metadata_watch_count.store(m_metadata_watches.size(), std::memory_order_relaxed);
+}
+
+bool BufferCache::MetadataUnwritten(uint64_t vaddr, uint64_t size) {
+	{
+		std::scoped_lock lock(m_metadata_watch_mutex);
+		const auto       found = m_metadata_watches.find(vaddr);
+		if (found == m_metadata_watches.end() || found->second.end != vaddr + size || found->second.written) {
+			return false;
+		}
+	}
+	return !m_memory_tracker.IsRegionCpuModified(vaddr, size);
+}
+
+void BufferCache::NoteMetadataWrite(uint64_t vaddr, uint64_t size) {
+	if (m_metadata_watch_count.load(std::memory_order_relaxed) == 0 || size == 0) {
+		return;
+	}
+	const auto       end = vaddr + size < vaddr ? UINT64_MAX : vaddr + size;
+	std::scoped_lock lock(m_metadata_watch_mutex);
+	for (auto it = m_metadata_watches.lower_bound(vaddr >= m_metadata_watch_span ? vaddr - m_metadata_watch_span : 0);
+	     it != m_metadata_watches.end() && it->first < end; ++it) {
+		if (it->second.end > vaddr) {
+			it->second.written = true;
+		}
+	}
+}
+
 void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
+	NoteMetadataWrite(vaddr, size);
 	if (m_side == nullptr) {
 		return;
 	}
@@ -3697,6 +3749,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
+	// An upload of CPU-dirty bytes over watched metadata changes it (MetadataUnwritten).
+	if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0 &&
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		NoteMetadataWrite(vaddr, size);
+	}
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
 	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
 	// GPU-written images; the BDA hot-pass verification scans in full.
@@ -5621,6 +5678,8 @@ std::optional<BufferContentRevision> BufferCache::GetContentRevision(uint64_t va
 
 void BufferCache::InvalidateContentRevisions() {
 	EXIT_IF(!GuestGpu::IsGpuThread() || m_content_revision_epoch == UINT64_MAX);
+	// Unbounded GPU writes may change any watched metadata byte.
+	NoteMetadataWrite(0, UINT64_MAX);
 	// Unbounded GPU writes follow; retire clean-read verdicts along with the revisions.
 	CleanVerdict::Invalidate(0, UINT64_MAX, Coherence::Source::ContentRevisions);
 	++m_content_revision_epoch;

@@ -788,6 +788,27 @@ private:
 	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
 	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
 	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);
+
+public:
+	// Colour metadata watches (KYTY_DCC_GPU_WIDE, TextureCache::TryMaterializeGpuMetadataClear; after
+	// usa-ratt/KytyPS5-GT7's WatchMetadata): WatchMetadata starts watching [vaddr, vaddr + size) as
+	// written by nothing since; any GPU write noted for the buffer cache (NoteBufferContentWrite),
+	// an upload of CPU-dirty bytes, a CPU-side invalidation or an unbounded GPU write over it marks it
+	// written. MetadataUnwritten: the exact range is watched, unwritten and not CPU-modified now.
+	// Byte-exact, unlike a buffer's content revision (any write anywhere in the buffer).
+	void               WatchMetadata(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool MetadataUnwritten(uint64_t vaddr, uint64_t size);
+
+private:
+	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
+	struct MetadataWatch {
+		uint64_t end     = 0;
+		bool     written = false;
+	};
+	std::mutex                        m_metadata_watch_mutex;
+	std::map<uint64_t, MetadataWatch> m_metadata_watches; // by first byte
+	uint64_t                          m_metadata_watch_span = 0;
+	std::atomic<size_t>               m_metadata_watch_count {0};
 	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
 	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
 	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,

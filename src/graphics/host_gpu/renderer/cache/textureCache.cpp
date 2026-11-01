@@ -4216,6 +4216,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	// KYTY_DCC_GPU_WIDE (textureCache.h): what this inspection was accepted through.
 	bool wide_aliased  = false;
 	bool wide_mismatch = false;
+	bool watch_reused  = false; // reused only through the metadata watch (KYTY_DCC_GPU_WIDE)
 	const auto& view = desc.view_info;
 	if (!helper.Available()) {
 		return Event::DccFallbackDisabled;
@@ -4250,22 +4251,75 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		// than that one reads the same bytes to the same no-op, for any image or layer; only the
 		// metadata processing is skipped, the caller still refreshes this image normally.
 		// Kept keys (video-out) are never retained: a clear they select clears again each time.
-		bool reusable = !keep_keys;
+		// KYTY_DCC_GPU_WIDE also takes a slice nothing wrote since its inspection (byte-exact
+		// watch, BufferCache::MetadataUnwritten) as unchanged: the buffer's content revision moves
+		// with any write anywhere in the buffer, and every binding would inspect again.
+		bool       reusable = !keep_keys;
+		const bool watched  = DccGpuWide() != 0;
 		for (uint32_t slice = 0; reusable && slice < count; ++slice) {
 			const auto metadata = slice_range(slice);
 			const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
 			const auto found    = m_gpu_dcc_inspections.find(metadata.address);
-			reusable = revision && found != m_gpu_dcc_inspections.end() &&
-			           found->second.metadata == metadata && found->second.revision == *revision &&
-			           (decodable & ~found->second.decodable_mask) == 0;
+			const bool same     = found != m_gpu_dcc_inspections.end() && found->second.metadata == metadata &&
+			                  (decodable & ~found->second.decodable_mask) == 0;
+			const bool by_revision = same && revision && found->second.revision == *revision;
+			const bool by_watch =
+			    same && !by_revision && watched && m_buffer_cache.MetadataUnwritten(metadata.address, metadata.size);
+			watch_reused |= by_watch;
+			reusable = by_revision || by_watch;
 		}
-		if (reusable) {
+		// KYTY_DCC_GPU_WIDE_VERIFY: a reuse through the watch is checked below against the bytes
+		// (after a drain): a retained inspection left them deciding "no clear" (consumed keys,
+		// nonuniform bytes or a rejected code); a clear there means the watch missed a write.
+		if (reusable && !(watch_reused && m_dcc_gpu_wide_verify != 0)) {
 			if (!cmask) {
 				m_gpu_dcc_reuses += count;
 				Profiler::CountFrameEvent(Event::DccGpuReuses, count);
 			}
 			return Event::DccGpuReuses;
 		}
+	}
+	if (watch_reused && m_dcc_gpu_wide_verify != 0) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		std::vector<uint8_t> bytes(slice_size);
+		uint32_t             wrong = 0;
+		bool                 all   = true;
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			if (!LibKernel::Memory::TryReadBacking(slice_range(slice).address, bytes.data(), bytes.size())) {
+				all = false;
+				break;
+			}
+			uint32_t index = 0;
+			while (index < DccClearHelper::ClearCodes.size() && DccClearHelper::ClearCodes[index] != bytes[0]) {
+				index++;
+			}
+			wrong += index < DccClearHelper::ClearCodes.size() && (decodable & (1u << index)) != 0 &&
+			                 std::all_of(bytes.begin(), bytes.end(), [&](uint8_t byte) { return byte == bytes[0]; })
+			             ? 1u
+			             : 0u;
+		}
+		if (all) {
+			m_dcc_wide_totals.verify_checks.fetch_add(count, std::memory_order_relaxed);
+			if (wrong == 0) {
+				if (!cmask) {
+					m_gpu_dcc_reuses += count;
+					Profiler::CountFrameEvent(Event::DccGpuReuses, count);
+				}
+				return Event::DccGpuReuses;
+			}
+			m_dcc_wide_totals.verify_mismatches.fetch_add(wrong, std::memory_order_relaxed);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "DCC wide verify: %u slice(s) of metadata 0x%016" PRIx64
+				             " reused through the watch hold a clear (a write the watch missed)\n",
+				             wrong, range.address);
+			}
+			if (m_dcc_gpu_wide_verify == 2) {
+				EXIT("DCC wide verify: a watched metadata reuse missed a write\n");
+			}
+		}
+		// Not reused: inspected below as usual.
 	}
 	if (ImageRangeOverlaps(range, desc.info.data)) {
 		return Event::DccFallbackMetadataAliased;
@@ -4451,6 +4505,9 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			}
 			m_gpu_dcc_inspections.insert_or_assign(
 			    metadata.address, GpuDccInspection {metadata, *revision, decodable});
+			if (DccGpuWide() != 0) {
+				m_buffer_cache.WatchMetadata(metadata.address, metadata.size);
+			}
 		} else {
 			m_gpu_dcc_inspections.erase(metadata.address);
 		}
