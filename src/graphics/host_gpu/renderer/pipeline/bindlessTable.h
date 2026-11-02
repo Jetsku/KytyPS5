@@ -235,6 +235,13 @@ public:
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.
 	void OnImageUnregistered(ImageId id);
+	// KYTY_BINDLESS_UNMAP_RERESOLVE: the keys OnImageUnregistered sent back to pending, of heap,
+	// to settle again without waiting for a shader to flag them; taken (cleared) by the call.
+	void TakeReresolve(const Heap* heap, std::vector<uint32_t>& keys);
+	// KYTY_BINDLESS_UNMAP_RERESOLVE (live, default on): the guest unmaps part of a streamed texture,
+	// the texture cache frees the image, and its keys went back to pending until a shader flagged
+	// them and the flag came round (several frames of placeholder, on alternate call tables).
+	[[nodiscard]] static bool UnmapReresolve();
 	// Keys made pending because the texture cache dropped their image (statistics; reset on read).
 	[[nodiscard]] uint64_t TakeUnregisteredKeys() noexcept {
 		return std::exchange(m_unregistered_keys, 0);
@@ -298,6 +305,8 @@ private:
 	std::atomic<uint64_t> m_watch_high {0};
 	std::atomic<uint64_t> m_watch_generation {1};
 	uint64_t              m_unregistered_keys = 0;
+	std::mutex                                 m_reresolve_mutex;
+	std::vector<std::pair<const Heap*, uint32_t>> m_reresolve;
 	std::deque<Heap>      m_heaps;
 	// Released slots per array, with the tick after which no command buffer reads them, and per
 	// slot whether it waits there (FreeSlot keeps each slot on the list once).

@@ -1085,8 +1085,31 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		std::erase(heap->resolved, id);
 		heap->checked_generation = 0;
 		m_unregistered_keys++;
+		if (UnmapReresolve()) {
+			std::scoped_lock lock {m_reresolve_mutex};
+			if (m_reresolve.size() < (1u << 16u)) m_reresolve.emplace_back(heap, key);
+		}
 	}
 	m_image_refs.erase(found);
+}
+
+// KYTY_BINDLESS_UNMAP_RERESOLVE=0 (live, default 1): see bindlessTable.h.
+static Live::Switch g_unmap_reresolve("KYTY_BINDLESS_UNMAP_RERESOLVE", [](const char* value) -> int64_t {
+	return value == nullptr || value[0] != '0' ? 1 : 0;
+});
+
+bool BindlessTable::UnmapReresolve() {
+	return g_unmap_reresolve.Get() != 0;
+}
+
+void BindlessTable::TakeReresolve(const Heap* heap, std::vector<uint32_t>& keys) {
+	keys.clear();
+	std::scoped_lock lock {m_reresolve_mutex};
+	std::erase_if(m_reresolve, [&](const auto& item) {
+		if (item.first != heap) return false;
+		keys.push_back(item.second);
+		return true;
+	});
 }
 
 bool BindlessTable::RuntimeImagesEnabled() {

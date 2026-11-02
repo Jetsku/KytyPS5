@@ -1932,6 +1932,7 @@ struct BindlessEngineStats {
 	std::atomic<uint64_t> record_unfilled {0}; // record keys read with a null pointer or an all-zero T#
 	std::atomic<uint64_t> record_filled {0};   // unfilled records found filled on a later read
 	std::atomic<uint64_t> host_ns {0};         // CPU time in ResolveBindlessRequests + ProcessRecordHeap
+	std::atomic<uint64_t> reresolved {0};      // keys settled again after their image was freed
 };
 BindlessEngineStats g_bindless_engine_stats;
 // Per call table (record heaps): keys taken from feedback and keys settled on a slot (GPU thread).
@@ -2234,11 +2235,11 @@ void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 	const auto scans   = table.TakeScanCounts();
 	LOGF("Bindless engine stats: frame=%" PRIu64 " syncs=%" PRIu64 " written=%" PRIu64
 	     " KiB view=%" PRIu64 " resource=%" PRIu64 " resettled=%" PRIu64 " requested=%" PRIu64
-	     " unregistered_keys=%" PRIu64 " kept_old=%" PRIu64 " record_retries=%" PRIu64 " record_unfilled=%" PRIu64 " record_filled=%" PRIu64 " host_ms=%.1f snapshot_words=%u snapshot_kib=%" PRIu64 " flagged_chunks=%" PRIu64 " scanned=%" PRIu64 " nonzero=%" PRIu64 "\n",
+	     " unregistered_keys=%" PRIu64 " kept_old=%" PRIu64 " record_retries=%" PRIu64 " record_unfilled=%" PRIu64 " record_filled=%" PRIu64 " reresolved=%" PRIu64 " host_ms=%.1f snapshot_words=%u snapshot_kib=%" PRIu64 " flagged_chunks=%" PRIu64 " scanned=%" PRIu64 " nonzero=%" PRIu64 "\n",
 	     frame, stats.syncs.exchange(0), stats.written_bytes.exchange(0) >> 10u,
 	     stats.view_changes.exchange(0), stats.resource_changes.exchange(0),
 	     stats.resettled.exchange(0), stats.requested.exchange(0), table.TakeUnregisteredKeys(),
-	     stats.kept_old.exchange(0), stats.record_retries.exchange(0), stats.record_unfilled.exchange(0), stats.record_filled.exchange(0), static_cast<double>(stats.host_ns.exchange(0)) / 1e6, table.UsedEntries(), traffic.first >> 10u, traffic.second, scans.first, scans.second);
+	     stats.kept_old.exchange(0), stats.record_retries.exchange(0), stats.record_unfilled.exchange(0), stats.record_filled.exchange(0), stats.reresolved.exchange(0), static_cast<double>(stats.host_ns.exchange(0)) / 1e6, table.UsedEntries(), traffic.first >> 10u, traffic.second, scans.first, scans.second);
 }
 
 } // namespace
@@ -2826,6 +2827,23 @@ uint32_t RenderExecutor::ResolveFlaggedKeys(BindlessHeap& heap, uint32_t budget,
 	return resolved;
 }
 
+// KYTY_BINDLESS_UNMAP_RERESOLVE: keys whose image the texture cache freed (a partial unmap of a
+// streamed texture) are settled again at once, from the T# they were settled from (re-read), instead
+// of sampling the placeholder until a shader flags them and the flag comes round.
+void RenderExecutor::ReresolveUnregisteredKeys(BindlessHeap& heap) {
+	if (!BindlessTable::UnmapReresolve()) {
+		return;
+	}
+	auto& table = m_context.GetBindlessTable();
+	table.TakeReresolve(&heap, m_bindless_reresolve);
+	for (const auto key: m_bindless_reresolve) {
+		if (key >= heap.settled.size() || heap.settled[key] != 0) {
+			continue; // settled again meanwhile
+		}
+		const bool ok = ResolveBindlessKey(heap, key);
+		g_bindless_engine_stats.reresolved.fetch_add(ok ? 1u : 0u, std::memory_order_relaxed);
+	}
+}
 void RenderExecutor::ProcessRecordHeap(BindlessHeap& heap) {
 	const BindlessHostTimer timer;
 	const auto              frame = BindlessFrame();
@@ -2847,6 +2865,7 @@ void RenderExecutor::ProcessRecordHeap(BindlessHeap& heap) {
 	}
 	if (heap.processed_frame != frame) {
 		heap.processed_frame = frame;
+		ReresolveUnregisteredKeys(heap);
 		auto spent           = RetryBindlessRecords(&heap, frame, m_bindless_budget_left);
 		m_bindless_budget_left -= std::min(m_bindless_budget_left, spent);
 		spent = RevalidateBindlessHeap(heap, m_bindless_budget_left);
@@ -2958,6 +2977,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 		if (heap.record_pointer != UINT32_MAX && !heap.runtime && BindlessRecordLazy()) {
 			continue; // ProcessRecordHeap, at the heap's first use in the frame
 		}
+		ReresolveUnregisteredKeys(heap);
 		const auto before = requested;
 		resolved += ResolveFlaggedKeys(heap, Budget - std::min(Budget, resolved), &requested);
 		if (log_frame) {

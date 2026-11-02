@@ -1135,6 +1135,8 @@ private:
 	// KYTY_BINDLESS_RECORD_LAZY: a record pointer heap's requests, growth, retries and revalidation,
 	// at its first use in a frame (its call table is the one in use, not one being rebuilt).
 	void ProcessRecordHeap(BindlessHeap& heap);
+	void ReresolveUnregisteredKeys(BindlessHeap& heap);
+	std::vector<uint32_t> m_bindless_reresolve;
 	uint32_t RetryBindlessRecords(BindlessHeap* heap, uint64_t frame, uint32_t budget);
 	uint32_t ResolveFlaggedKeys(BindlessHeap& heap, uint32_t budget, uint32_t* requested);
 	uint32_t m_bindless_budget_left     = 0;
