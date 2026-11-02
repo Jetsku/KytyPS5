@@ -172,18 +172,29 @@ static CsImageDump PlanCsImageDump(const ShaderComputeInputInfo& input_info) {
 	if (wanted->second.empty()) {
 		// No ordinals: trigger mode. While <folder>/dump.now exists, the next dispatch of each listed
 		// program is dumped once; the file is removed when every listed program has been dumped.
-		static std::unordered_map<uint64_t, bool> dumped;
-		static uint32_t                           polls = 0;
-		std::error_code                           error;
+		// A number in dump.now (e.g. 6) dumps that many consecutive dispatches of each listed program.
+		static std::unordered_map<uint64_t, uint32_t> dumped;
+		static uint32_t                               polls = 0;
+		static uint32_t                               want  = 0;
+		std::error_code                               error;
 		const auto trigger = std::filesystem::path(request.folder) / "dump.now";
 		if ((polls++ & 7u) != 0u && dumped.empty()) return {};
 		if (!std::filesystem::exists(trigger, error)) {
 			dumped.clear();
+			want = 0;
 			return {};
 		}
-		if (dumped[program.shader_hash]) return {};
-		dumped[program.shader_hash] = true;
-		if (std::ranges::all_of(request.ordinals, [&](const auto& item) { return dumped[item.first]; })) {
+		if (want == 0) {
+			want = 1;
+			if (std::FILE* file = std::fopen(trigger.string().c_str(), "rb"); file != nullptr) {
+				unsigned value = 0;
+				if (std::fscanf(file, "%u", &value) == 1 && value > 0) want = std::min(value, 64u);
+				std::fclose(file);
+			}
+		}
+		if (dumped[program.shader_hash] >= want) return {};
+		dumped[program.shader_hash]++;
+		if (std::ranges::all_of(request.ordinals, [&](const auto& item) { return dumped[item.first] >= want; })) {
 			std::filesystem::remove(trigger, error);
 		}
 	} else if (std::ranges::find(wanted->second, ordinal) == wanted->second.end()) {

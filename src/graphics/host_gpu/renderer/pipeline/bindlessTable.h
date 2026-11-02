@@ -75,6 +75,8 @@ struct BindlessHeap {
 	std::vector<std::array<uint32_t, 8>> descriptors;
 	std::vector<ImageId>                 images;
 	uint32_t                             revalidate_cursor = 0; // next key to compare
+	uint64_t                             processed_frame    = UINT64_MAX; // record heaps: last ProcessRecordHeap
+	uint64_t                             processed_snapshot = 0; // record heaps: snapshot serial taken
 	// What RenderExecutor::CommitBindings last checked: g_bindless_state_generation then, and
 	// how many resolved images. Unchanged since, only the images resolved after need a look.
 	uint64_t checked_generation = 0;
@@ -173,6 +175,9 @@ public:
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
 	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
+	// KYTY_BINDLESS_WATCH_KEY: the watched key's translation and slot view in every heap.
+	void DebugWatchReport(uint64_t frame);
+	[[nodiscard]] static uint32_t WatchKey();
 	// The host reads the feedback flags from a copy in host-cached memory. The feedback buffer
 	// itself is device memory, and reading every key of three heaps from it uncached took a
 	// fifth of the GPU thread. Records that copy at the current point of the command stream.
@@ -180,12 +185,22 @@ public:
 	[[nodiscard]] bool SnapshotRecorded() const noexcept { return m_snapshot_tick != 0; }
 	// Whether the GPU has executed the recorded copy; never waits.
 	[[nodiscard]] bool SnapshotReady();
-	void               ConsumeSnapshot() noexcept { m_snapshot_tick = 0; }
+	// The recorded snapshot is the one read from now on; its chunk summary picks the chunks the next
+	// snapshot copies.
+	void               ConsumeSnapshot();
+	// Snapshot traffic since the last call (diagnostics): bytes copied, flagged chunks.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> TakeSnapshotTraffic() noexcept {
+		return {std::exchange(m_copied_bytes, 0), std::exchange(m_flagged_chunks, 0)};
+	}
+	[[nodiscard]] std::pair<uint64_t, uint64_t> TakeScanCounts() noexcept {
+		return {std::exchange(m_scanned_words, 0), std::exchange(m_nonzero_words, 0)};
+	}
 	// Pending keys flagged in the snapshot; their flags are cleared.
 	void TakeRequests(const Heap& heap, std::vector<uint32_t>& keys);
 	// Diagnostics: feedback word 0 (the last out-of-range key, top bit set) in the snapshot,
 	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
+	[[nodiscard]] uint32_t UsedEntries() const noexcept { return m_next_region; }
 	void                   AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;
@@ -295,7 +310,25 @@ private:
 	uint32_t                                m_images_per_array = 0;
 	std::unique_ptr<Buffer>                 m_translation;
 	std::unique_ptr<Buffer>                 m_feedback;
-	std::unique_ptr<Buffer>                 m_feedback_snapshot;
+	std::array<std::unique_ptr<Buffer>, 2>  m_feedback_snapshots;
+	uint32_t                                m_snapshot_record = 0; // index the next snapshot is copied to
+	uint32_t                                m_snapshot_read   = 1; // index the host reads
+	std::vector<uint32_t>                   m_copy_chunks;      // flagged chunks for the next copy
+	std::vector<uint32_t>                   m_inflight_chunks;  // chunks in the recorded snapshot
+	struct PendingChunk {
+		uint64_t                                                          serial = 0;
+		std::array<uint32_t, 1u << ShaderRecompiler::IR::BindlessFeedbackChunkShift> words {};
+	};
+	std::unordered_map<uint32_t, PendingChunk> m_pending_chunks; // copied chunks whose flags wait for their heap
+	uint64_t                                m_snapshot_serial = 0;
+	static constexpr uint32_t MaxCopyChunks = 2048;
+	static constexpr uint32_t SnapshotWords =
+	    ShaderRecompiler::IR::BindlessFeedbackFirstRegion + (MaxCopyChunks << ShaderRecompiler::IR::BindlessFeedbackChunkShift);
+	std::vector<vk::BufferCopy>             m_copy_regions;
+	uint64_t                                m_copied_bytes   = 0;
+	uint64_t                                m_flagged_chunks = 0;
+	uint64_t                                m_scanned_words  = 0;
+	uint64_t                                m_nonzero_words  = 0;
 	std::unique_ptr<Buffer>                 m_runtime_table;
 	std::unique_ptr<Buffer>                 m_runtime_requests;
 	std::unique_ptr<Buffer>                 m_runtime_requests_snapshot;

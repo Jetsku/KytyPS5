@@ -1141,8 +1141,8 @@ void CheckCubeOverArrayKey() {
           !BindlessKeyCompatible(flat, ShaderRecompiler::IR::BindlessImagesCube),
           "a 2D T# was accepted by the cube binding");
   if (std::getenv("KYTY_BINDLESS_TRANSLATION_MI") == nullptr) {
-    Require(name, "translation capacity", BindlessTable::TranslationCapacity() == (4u << 20u),
-            "the default translation buffer is not 4 Mi entries");
+    Require(name, "translation capacity", BindlessTable::TranslationCapacity() == (24u << 20u),
+            "the default translation buffer is not 24 Mi entries");
   }
   std::printf("[bindless] %-32s ok\n", name);
 }

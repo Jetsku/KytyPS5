@@ -57,6 +57,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
@@ -1926,8 +1927,23 @@ struct BindlessEngineStats {
 	std::atomic<uint64_t> resettled {0};
 	std::atomic<uint64_t> requested {0}; // keys draws asked for through feedback
 	std::atomic<uint64_t> kept_old {0};  // changed T# not resolvable yet: the old view stays
+	std::atomic<uint64_t> record_retries {0}; // record T# not written yet (KYTY_BINDLESS_RECORD_RETRY)
+	std::atomic<uint64_t> record_unfilled {0}; // record keys read with a null pointer or an all-zero T#
+	std::atomic<uint64_t> record_filled {0};   // unfilled records found filled on a later read
+	std::atomic<uint64_t> host_ns {0};         // CPU time in ResolveBindlessRequests + ProcessRecordHeap
 };
 BindlessEngineStats g_bindless_engine_stats;
+
+// Adds the scope's CPU time to BindlessEngineStats::host_ns (logged with KYTY_BINDLESS_HEAP_STATS).
+struct BindlessHostTimer {
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	~BindlessHostTimer() {
+		g_bindless_engine_stats.host_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                              std::chrono::steady_clock::now() - start)
+		                                              .count()),
+		                                          std::memory_order_relaxed);
+	}
+};
 
 // KYTY_BINDLESS_ENGINE_VERIFY=1 (with the engine method): the rolling scan keeps running and logs
 // every rewritten entry the write watch did not report.
@@ -2166,14 +2182,16 @@ void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 		     sampled_textures, all >> 20u, resident >> 20u, sampled >> 20u, settled, view_changes,
 		     resource_changes, mip_stats);
 	}
-	auto& stats = g_bindless_engine_stats;
+	auto&      stats   = g_bindless_engine_stats;
+	const auto traffic = table.TakeSnapshotTraffic();
+	const auto scans   = table.TakeScanCounts();
 	LOGF("Bindless engine stats: frame=%" PRIu64 " syncs=%" PRIu64 " written=%" PRIu64
 	     " KiB view=%" PRIu64 " resource=%" PRIu64 " resettled=%" PRIu64 " requested=%" PRIu64
-	     " unregistered_keys=%" PRIu64 " kept_old=%" PRIu64 "\n",
+	     " unregistered_keys=%" PRIu64 " kept_old=%" PRIu64 " record_retries=%" PRIu64 " record_unfilled=%" PRIu64 " record_filled=%" PRIu64 " host_ms=%.1f snapshot_words=%u snapshot_kib=%" PRIu64 " flagged_chunks=%" PRIu64 " scanned=%" PRIu64 " nonzero=%" PRIu64 "\n",
 	     frame, stats.syncs.exchange(0), stats.written_bytes.exchange(0) >> 10u,
 	     stats.view_changes.exchange(0), stats.resource_changes.exchange(0),
 	     stats.resettled.exchange(0), stats.requested.exchange(0), table.TakeUnregisteredKeys(),
-	     stats.kept_old.exchange(0));
+	     stats.kept_old.exchange(0), stats.record_retries.exchange(0), stats.record_unfilled.exchange(0), stats.record_filled.exchange(0), static_cast<double>(stats.host_ns.exchange(0)) / 1e6, table.UsedEntries(), traffic.first >> 10u, traffic.second, scans.first, scans.second);
 }
 
 } // namespace
@@ -2242,6 +2260,11 @@ static bool ReadBindlessEntry(const BindlessHeap& heap, uint32_t key, uint32_t* 
 	return LibKernel::Memory::TryReadBacking(address + heap.table_offset, words, 32u);
 }
 
+// KYTY_BINDLESS_RECORD_RETRY (live; ResolveBindlessKey).
+static Live::Switch g_bindless_record_retry("KYTY_BINDLESS_RECORD_RETRY", [](const char* value) -> int64_t {
+	return value == nullptr || value[0] != '0' ? 1 : 0;
+});
+
 bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	auto&                                 table = m_context.GetBindlessTable();
 	ShaderRecompiler::IR::DescriptorValue value {};
@@ -2249,7 +2272,58 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	m_bindless_transient_failure  = false;
 	heap.settled[key]             = 1;
 	heap.descriptors[key]         = {};
+	// KYTY_BINDLESS_WATCH_KEY: each resolve of that key, with its T# address (behind the record
+	// pointer), whether the GPU wrote it, the words read and the outcome.
+	const bool watched = key == BindlessTable::WatchKey();
+	const auto watch   = [&](const char* outcome) {
+		if (!watched) return;
+		uint64_t address = 0;
+		if (heap.record_pointer != UINT32_MAX && heap.nested_vsharp == UINT32_MAX) {
+			std::array<uint32_t, 2> pointer {};
+			if (LibKernel::Memory::TryReadBacking(heap.base + uint64_t {key} * heap.stride + heap.record_pointer,
+			                                      pointer.data(), 8u)) {
+				address = (static_cast<uint64_t>(pointer[0]) | (static_cast<uint64_t>(pointer[1] & 0xffffu) << 32u)) +
+				          heap.table_offset;
+			}
+		}
+		const bool dirty = address != 0 && m_context.GetBufferCache().HasGpuDirtyBytes(address, 32u);
+		LOGF("Bindless watch resolve: frame=%" PRIu64 " heap 0x%" PRIx64 "+%u b%u key %u T# at 0x%" PRIx64
+		     "%s words %08x %08x %08x %08x %08x %08x %08x %08x: %s\n",
+		     BindlessFrame(), heap.base, heap.table_offset, heap.binding, key, address, dirty ? " (gpu-dirty)" : "",
+		     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3], value.dwords[4], value.dwords[5],
+		     value.dwords[6], value.dwords[7], outcome);
+	};
+	struct WatchExit {
+		const decltype(watch)& log;
+		const char*            outcome = "resolved";
+		~WatchExit() { log(outcome); }
+	} watch_exit {watch};
+	// KYTY_BINDLESS_RECORD_RETRY=0 (default 1, live): a record pointer heap's key whose pointer is null or
+	// unreadable, or whose T# reads as all zeros, may be a record the guest has not filled yet rather
+	// than a final answer. The key samples the placeholder (or keeps its old view, ResettleBindlessKey)
+	// and is read again 4, 8, 16, 32 and 64 frames later (m_bindless_record_retry); its descriptor is
+	// left as zeros, so revalidation also catches a T# written later. Miles Morales rebuilds its two
+	// ping-pong call tables with new material pointers; the T# behind a moved pointer read as zeros,
+	// the key stayed on the placeholder (revalidation compared against the stored zeros only when its
+	// window came round), and the RT reflection of the sky went dark in every other frame.
+	const bool record_retry = g_bindless_record_retry.Get() != 0;
+	m_bindless_record_unfilled = false;
+	const auto not_written_yet = [&](const char* outcome) {
+		watch_exit.outcome           = outcome;
+		heap.descriptors[key]        = {};
+		m_bindless_transient_failure = true;
+		m_bindless_record_unfilled   = true;
+		table.SetTranslation(heap, key, 0u);
+		QueueBindlessRecordRetry(heap, key, m_bindless_record_attempt);
+		return false;
+	};
+	const bool record_heap = heap.record_pointer != UINT32_MAX && !heap.runtime;
 	if (!ReadBindlessEntry(heap, key, value.dwords.data())) {
+		if (record_heap) g_bindless_engine_stats.record_unfilled.fetch_add(1, std::memory_order_relaxed);
+		if (record_retry && record_heap) {
+			return not_written_yet("unreadable (retry later)");
+		}
+		watch_exit.outcome = "unreadable";
 		static const bool log_unreadable = std::getenv("KYTY_BINDLESS_KEY_LOG") != nullptr;
 		static std::atomic<uint32_t> logged = 0;
 		if (log_unreadable && logged.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -2257,6 +2331,11 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 		}
 		table.SetTranslation(heap, key, 0u);
 		return false;
+	}
+	if (record_heap &&
+	    std::ranges::all_of(value.dwords.begin(), value.dwords.begin() + 8, [](uint32_t w) { return w == 0u; })) {
+		g_bindless_engine_stats.record_unfilled.fetch_add(1, std::memory_order_relaxed);
+		if (record_retry) return not_written_yet("zero T# (retry later)");
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -2282,6 +2361,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 			     static_cast<uint32_t>(descriptor.Height5()) + 1u, static_cast<uint32_t>(descriptor.Depth()),
 			     descriptor.IsNull() ? 1 : 0);
 		}
+		watch_exit.outcome = one_d_heap ? "1D heap" : "incompatible";
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -2315,6 +2395,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 		if (texture_cache.HeapExtentHeld(desc.info, conversion)) {
 			heap.settled[key]            = 0;
 			m_bindless_transient_failure = true;
+			watch_exit.outcome           = "held extent";
 			table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 			static std::atomic<uint32_t> reported = 0;
 			if (reported.fetch_add(1) < 8) {
@@ -2329,6 +2410,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	ResolveTexture(resource, value, binding);
 	auto* image         = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
+		watch_exit.outcome = "no image";
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -2340,16 +2422,19 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 		// outlive it, since its unregistration is over. The key is asked for again next frame.
 		heap.settled[key]            = 0;
 		m_bindless_transient_failure = true;
+		watch_exit.outcome           = "image dropped";
 		table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 		return false;
 	}
 	if (image == nullptr || view == nullptr) {
+		watch_exit.outcome = "no view";
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	const auto slot = table.AllocateSlot(slot_binding);
 	if (slot == 0) {
 		m_bindless_transient_failure = true;
+		watch_exit.outcome           = "no slot";
 		static std::atomic<uint32_t> reported = 0;
 		if (reported.fetch_add(1) < 8) {
 			LOGF("Bindless: binding %u has no free slot (%u per array); key %u of heap 0x%016" PRIx64
@@ -2396,6 +2481,19 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	return true;
 }
 
+static uint64_t BindlessRecordRetryId(const BindlessHeap& heap, uint32_t key) {
+	return (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&heap)) << 20u) ^ key;
+}
+
+void RenderExecutor::QueueBindlessRecordRetry(BindlessHeap& heap, uint32_t key, uint32_t attempt) {
+	constexpr uint32_t Attempts = 5; // after 4, 8, 16, 32 and 64 frames
+	if (attempt >= Attempts || !m_bindless_record_queued.insert(BindlessRecordRetryId(heap, key)).second) {
+		return;
+	}
+	m_bindless_record_retry.push_back({&heap, key, attempt, BindlessFrame() + (4ull << attempt)});
+	g_bindless_engine_stats.record_retries.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool RenderExecutor::ResettleBindlessKey(BindlessHeap& heap, uint32_t key) {
 	auto& table         = m_context.GetBindlessTable();
 	auto& texture_cache = m_context.GetTextureCache();
@@ -2420,14 +2518,15 @@ bool RenderExecutor::ResettleBindlessKey(BindlessHeap& heap, uint32_t key) {
 		heap.slots[key]   = old_slot;
 		heap.images[key]  = old_image;
 		heap.settled[key] = 1;
-		// The old T#: the key stays "changed" for the retry below.
-		heap.descriptors[key] = old_descriptor;
+		// The old T#: the key stays "changed" for the retry below. An unfilled record keeps zeros
+		// (revalidation sees the T# once written) and is read again by m_bindless_record_retry.
+		heap.descriptors[key] = m_bindless_record_unfilled ? std::array<uint32_t, 8> {} : old_descriptor;
 		if (std::find(heap.resolved.begin(), heap.resolved.end(), old_image) == heap.resolved.end()) {
 			heap.resolved.push_back(old_image);
 		}
 		table.AddImageReference(old_image, heap, key);
 		table.SetTranslation(heap, key, old_slot);
-		if (std::find(m_bindless_retry.begin(), m_bindless_retry.end(),
+		if (!m_bindless_record_unfilled && std::find(m_bindless_retry.begin(), m_bindless_retry.end(),
 		              std::pair<BindlessHeap*, uint32_t> {&heap, key}) == m_bindless_retry.end()) {
 			m_bindless_retry.emplace_back(&heap, key);
 		}
@@ -2519,6 +2618,19 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	stats.resettled.fetch_add(resettled, std::memory_order_relaxed);
 }
 
+// KYTY_BINDLESS_RECORD_LAZY=0 (default 1): record pointer heaps are handled with the others once a
+// frame (at its first bindless dispatch). On, each is handled at its own first use in the frame
+// (ProcessRecordHeap): Miles Morales alternates two call tables and rebuilds the idle one while the
+// GPU works through the other, so reading the idle table's records then saw records half written
+// (all-zero T#s behind new pointers) and settled keys from them.
+static bool BindlessRecordLazy() {
+	static const bool lazy = [] {
+		const char* env = std::getenv("KYTY_BINDLESS_RECORD_LAZY");
+		return env == nullptr || env[0] != '0';
+	}();
+	return lazy;
+}
+
 uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	KYTY_PROFILER_FUNCTION();
 	// With the engine method only record pointer heaps are compared here: the write watch sees
@@ -2535,14 +2647,26 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	// the rest of the run. Each frame a window of every heap is read back in one go and compared;
 	// a changed key is settled again into a new slot, and an image no key refers to any more is
 	// unpinned, so the cache can collect it. A heap of 64 Ki keys is covered in 32 frames.
-	constexpr uint32_t Window   = 2048;
-	auto&              table    = m_context.GetBindlessTable();
-	uint32_t           resolved = 0;
+	auto&    table    = m_context.GetBindlessTable();
+	uint32_t resolved = 0;
 	for (auto& heap: table.Heaps()) {
+		const bool pointers = heap.record_pointer != UINT32_MAX;
+		if (heap.runtime || (pointers_only && !pointers) || (pointers && BindlessRecordLazy())) {
+			continue; // record heaps: ProcessRecordHeap
+		}
+		resolved += RevalidateBindlessHeap(heap, budget - std::min(budget, resolved));
+	}
+	return resolved;
+}
+
+uint32_t RenderExecutor::RevalidateBindlessHeap(BindlessHeap& heap, uint32_t budget) {
+	constexpr uint32_t Window   = 2048;
+	uint32_t           resolved = 0;
+	{
 		const auto keys     = static_cast<uint32_t>(heap.settled.size());
 		const bool pointers = heap.record_pointer != UINT32_MAX;
-		if (keys == 0 || heap.runtime || (pointers_only && !pointers)) {
-			continue;
+		if (keys == 0 || heap.runtime) {
+			return 0;
 		}
 		const uint32_t begin = heap.revalidate_cursor < keys ? heap.revalidate_cursor : 0u;
 		const uint32_t count = std::min(pointers ? Window / 8u : Window, keys - begin);
@@ -2585,8 +2709,89 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	return resolved;
 }
 
+// KYTY_BINDLESS_RECORD_RETRY: unfilled records whose time has come (of heap, or of every heap for
+// nullptr) are read again; a T# written meanwhile is settled (the key keeps its old view if that
+// fails), a record still unfilled waits twice as long, up to the last attempt.
+uint32_t RenderExecutor::RetryBindlessRecords(BindlessHeap* heap, uint64_t frame, uint32_t budget) {
+	uint32_t resolved = 0;
+	if (m_bindless_record_retry.empty()) {
+		return 0;
+	}
+	auto due = std::move(m_bindless_record_retry);
+	m_bindless_record_retry.clear();
+	for (const auto& retry: due) {
+		if ((heap != nullptr && retry.heap != heap) || retry.due > frame || resolved >= budget) {
+			m_bindless_record_retry.push_back(retry);
+			continue;
+		}
+		m_bindless_record_queued.erase(BindlessRecordRetryId(*retry.heap, retry.key));
+		std::array<uint32_t, 8> words {};
+		const bool filled = ReadBindlessEntry(*retry.heap, retry.key, words.data()) &&
+		                    std::ranges::any_of(words, [](uint32_t w) { return w != 0u; });
+		if (!filled) {
+			QueueBindlessRecordRetry(*retry.heap, retry.key, retry.attempt + 1u);
+			continue;
+		}
+		if (words == retry.heap->descriptors[retry.key] && retry.heap->settled[retry.key] != 0) {
+			continue; // settled from this T# meanwhile
+		}
+		m_bindless_record_attempt = retry.attempt + 1u;
+		resolved += ResettleBindlessKey(*retry.heap, retry.key) ? 1u : 0u;
+		m_bindless_record_attempt = 0;
+		g_bindless_engine_stats.record_filled.fetch_add(1, std::memory_order_relaxed);
+	}
+	return resolved;
+}
+
+// The flagged keys of one heap (from the snapshot consumed this frame), within the budget.
+uint32_t RenderExecutor::ResolveFlaggedKeys(BindlessHeap& heap, uint32_t budget, uint32_t* requested) {
+	auto&    table    = m_context.GetBindlessTable();
+	uint32_t resolved = 0;
+	m_bindless_requests.clear();
+	table.TakeRequests(heap, m_bindless_requests);
+	*requested += static_cast<uint32_t>(m_bindless_requests.size());
+	for (const auto key: m_bindless_requests) {
+		if (heap.settled[key] != 0) {
+			continue;
+		}
+		if (resolved >= budget) {
+			break; // still pending: the next frame flags it again
+		}
+		resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+	}
+	return resolved;
+}
+
+void RenderExecutor::ProcessRecordHeap(BindlessHeap& heap) {
+	const BindlessHostTimer timer;
+	const auto              frame = BindlessFrame();
+	constexpr uint32_t      Budget = 128;
+	if (m_bindless_budget_frame != frame) {
+		m_bindless_budget_frame = frame;
+		if (m_bindless_frame != frame) {
+			m_bindless_budget_left = Budget; // no snapshot consumed this frame (yet)
+		}
+	}
+	// The flags of each consumed snapshot once: the two call tables are used in alternate frames,
+	// and a snapshot is not consumed every frame.
+	if (heap.processed_snapshot != m_bindless_snapshot_serial) {
+		heap.processed_snapshot = m_bindless_snapshot_serial;
+		uint32_t   requested    = 0;
+		const auto spent        = ResolveFlaggedKeys(heap, m_bindless_budget_left, &requested);
+		g_bindless_engine_stats.requested.fetch_add(requested, std::memory_order_relaxed);
+		m_bindless_budget_left -= std::min(m_bindless_budget_left, spent);
+	}
+	if (heap.processed_frame != frame) {
+		heap.processed_frame = frame;
+		auto spent           = RetryBindlessRecords(&heap, frame, m_bindless_budget_left);
+		m_bindless_budget_left -= std::min(m_bindless_budget_left, spent);
+		spent = RevalidateBindlessHeap(heap, m_bindless_budget_left);
+		m_bindless_budget_left -= std::min(m_bindless_budget_left, spent);
+	}
+}
 void RenderExecutor::ResolveBindlessRequests() {
 	KYTY_PROFILER_FUNCTION();
+	const BindlessHostTimer timer;
 	const auto frame = BindlessFrame();
 	if (frame == m_bindless_frame) {
 		return;
@@ -2604,10 +2809,15 @@ void RenderExecutor::ResolveBindlessRequests() {
 		return;
 	}
 	table.ConsumeSnapshot();
+	m_bindless_snapshot_serial++;
+	table.DebugWatchReport(frame);
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget    = 128;
 	uint32_t           resolved  = RevalidateBindlessKeys(Budget);
 	uint32_t           requested = 0;
+	if (!BindlessRecordLazy()) {
+		resolved += RetryBindlessRecords(nullptr, frame, Budget - std::min(Budget, resolved));
+	}
 	// Keys that kept their old view (ResettleBindlessKey): their new T# is tried again.
 	if (!m_bindless_retry.empty()) {
 		auto retry = std::move(m_bindless_retry);
@@ -2628,8 +2838,13 @@ void RenderExecutor::ResolveBindlessRequests() {
 	static std::atomic<uint32_t> frames_logged = 0;
 	const bool                   log_frame     = frames_logged.fetch_add(1) < 12;
 	if (const auto word0 = table.TakeWordZero(); word0 != 0) {
+		// KYTY_BINDLESS_OOR_LOG=<n> (default 64): how many of these lines are logged.
+		static const uint32_t        keys_limit  = [] {
+			const char* env = std::getenv("KYTY_BINDLESS_OOR_LOG");
+			return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 64u;
+		}();
 		static std::atomic<uint32_t> keys_logged = 0;
-		if (keys_logged.fetch_add(1) < 64) {
+		if (keys_logged.fetch_add(1) < keys_limit) {
 			LOGF("Bindless out-of-range key: frame=%" PRIu64 " key=%u (0x%08x)\n", frame,
 			     word0 & 0x7fffffffu, word0);
 		}
@@ -2676,23 +2891,17 @@ void RenderExecutor::ResolveBindlessRequests() {
 		}
 	}
 	for (auto& heap: table.Heaps()) {
-		m_bindless_requests.clear();
-		table.TakeRequests(heap, m_bindless_requests);
-		requested += static_cast<uint32_t>(m_bindless_requests.size());
-		if (log_frame) {
-			LOGF("Bindless feedback: frame=%" PRIu64 " binding=%u region=%u flagged=%zu\n", frame,
-			     heap.binding, heap.region, m_bindless_requests.size());
+		if (heap.record_pointer != UINT32_MAX && !heap.runtime && BindlessRecordLazy()) {
+			continue; // ProcessRecordHeap, at the heap's first use in the frame
 		}
-		for (const auto key: m_bindless_requests) {
-			if (heap.settled[key] != 0) {
-				continue;
-			}
-			if (resolved >= Budget) {
-				break; // still pending: the next frame flags it again
-			}
-			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+		const auto before = requested;
+		resolved += ResolveFlaggedKeys(heap, Budget - std::min(Budget, resolved), &requested);
+		if (log_frame) {
+			LOGF("Bindless feedback: frame=%" PRIu64 " binding=%u region=%u flagged=%u\n", frame, heap.binding,
+			     heap.region, requested - before);
 		}
 	}
+	m_bindless_budget_left = Budget - std::min(Budget, resolved);
 	g_bindless_engine_stats.requested.fetch_add(requested, std::memory_order_relaxed);
 	static std::atomic<uint32_t> logged = 0;
 	if (requested != 0 && logged.fetch_add(1) < 64) {
@@ -2702,6 +2911,43 @@ void RenderExecutor::ResolveBindlessRequests() {
 	LogBindlessHeapStats(table, frame);
 	table.RecordFeedbackSnapshot();
 	m_bindless_snapshot_frame = frame;
+}
+
+// KYTY_BINDLESS_USE_LOG=<trigger file>[|<count>] (diagnostic): once the trigger file exists, the
+// next <count> (default 2000) bindless heap uses are logged ("Bindless use": frame, program, heap
+// address and size, the region and entry count patched, or NO HEAP), then the file is removed.
+static bool BindlessPatchLogTake() {
+	struct Request {
+		std::string path;
+		uint32_t    count = 2000;
+	};
+	static const Request request = [] {
+		Request parsed;
+		if (const char* value = std::getenv("KYTY_BINDLESS_USE_LOG"); value != nullptr && value[0] != '\0') {
+			std::string text(value);
+			if (const auto bar = text.find('|'); bar != std::string::npos) {
+				parsed.count = static_cast<uint32_t>(std::strtoul(text.c_str() + bar + 1, nullptr, 10));
+				text.resize(bar);
+			}
+			parsed.path = text;
+		}
+		return parsed;
+	}();
+	if (request.path.empty()) return false;
+	static std::atomic<uint32_t> left {0};
+	static std::atomic<uint32_t> polls {0};
+	if (left.load(std::memory_order_relaxed) == 0) {
+		if ((polls.fetch_add(1, std::memory_order_relaxed) & 255u) != 0u) return false;
+		std::error_code error;
+		if (!std::filesystem::exists(request.path, error)) return false;
+		std::filesystem::remove(request.path, error);
+		LOGF("Bindless use log: start, %u uses\n", request.count);
+		left.store(request.count, std::memory_order_relaxed);
+	}
+	auto value = left.load(std::memory_order_relaxed);
+	while (value != 0 && !left.compare_exchange_weak(value, value - 1, std::memory_order_relaxed)) {
+	}
+	return value != 0;
 }
 
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
@@ -2747,30 +2993,42 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		                                                        : 0;
 		const uint64_t keys_per_record =
 		    use.nested_vsharp != UINT32_MAX && use.nested_keys != 0 ? use.nested_keys : 1u;
-		// KYTY_BINDLESS_RECORD_KEYS=<n> (default 65536; 0 = the whole table, as before): the keys of
-		// a heap read through record pointers (a call table's material records). Each (table,
-		// T# offset, view type) is a heap of its own, and Miles Morales' ray-tracing callees use
-		// dozens of them over two call tables of 273064 records: at 256 Ki keys each they filled the
-		// translation buffer and the rest sampled the placeholder (black sky and hit textures in RT
-		// reflections). The material keys measured stay below 65536; a larger key reads as out of
-		// range ("Bindless out-of-range key").
+		// KYTY_BINDLESS_RECORD_KEYS=<n> (default 0 = the whole table, up to 512 Ki keys): the keys of a
+		// heap read through record pointers (a call table's material records). Each (table, T# offset,
+		// view type) is a heap of its own; Miles Morales' ray-tracing callees use about fifty of them
+		// over two call tables of 273064 records, and sample material keys up to at least 151749
+		// (H view over the river): with 65536 keys per heap those samples read the out-of-range
+		// placeholder (black), in some frames and not others. The whole table needs the larger
+		// translation buffer (KYTY_BINDLESS_TRANSLATION_MI, default 16).
 		static const uint64_t record_keys = [] {
 			const char* value = std::getenv("KYTY_BINDLESS_RECORD_KEYS");
-			return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : uint64_t {65536};
+			return value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 0) : uint64_t {0};
 		}();
-		const uint64_t key_limit = pointers && record_keys != 0 ? record_keys : uint64_t {1u << 18u};
-		const auto     entries  = static_cast<uint32_t>(std::min<uint64_t>(
-            (pointers ? span / std::max(use.stride, 1u) : HeapEntriesInSpan(span, use.stride)) *
-                keys_per_record,
-            std::min<uint64_t>(key_limit, 1u << 18u)));
+		const uint64_t key_cap   = pointers ? uint64_t {1u << 19u} : uint64_t {1u << 18u};
+		const uint64_t key_limit = pointers && record_keys != 0 ? std::min(record_keys, key_cap) : key_cap;
+		const auto     entries   = static_cast<uint32_t>(std::min<uint64_t>(
+            (pointers ? span / std::max(use.stride, 1u) : HeapEntriesInSpan(span, use.stride)) * keys_per_record,
+            key_limit));
 		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
 		                                    entries, resource, use.stride, use.record_pointer,
 		                                    use.nested_vsharp, use.nested_heap, use.nested_keys);
+		if (BindlessPatchLogTake()) {
+			LOGF("Bindless use: frame=%" PRIu64 " hash=0x%016" PRIx64 " image=%u base=0x%" PRIx64
+			     " size=0x%" PRIx64 " offset=%u stride=%u record_pointer=%d entries=%u -> %s region=%u "
+			     "heap_entries=%u\n",
+			     BindlessFrame(), program.shader_hash, use.image, use.base, use.size, use.table_offset,
+			     use.stride, use.record_pointer == UINT32_MAX ? -1 : static_cast<int>(use.record_pointer),
+			     entries, heap == nullptr ? "NO HEAP" : "heap", heap != nullptr ? heap->region : 0u,
+			     heap != nullptr ? heap->entries : 0u);
+		}
 		if (heap == nullptr) {
 			continue; // region 0, count 0: every key samples the placeholder
 		}
 		if (BindlessEngineEnabled() && table.NeedsWatch(*heap)) {
 			table.WatchHeap(*heap);
+		}
+		if (pointers && BindlessRecordLazy()) {
+			ProcessRecordHeap(*heap);
 		}
 		prepared.bindless_patches.push_back(
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
@@ -3480,6 +3738,17 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				if (static_cast<size_t>(offset) + 1u < m_bindless_srt.size()) {
 					m_bindless_srt[offset]      = region;
 					m_bindless_srt[offset + 1u] = entries;
+				}
+				// A GPU fill of a patched word would overwrite the region or entry count.
+				for (const auto& fill: snapshot.gpu_fills) {
+					if (fill.flat_offset == offset || fill.flat_offset == offset + 1u) {
+						static std::atomic<uint32_t> reported {0};
+						if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+							LOGF("Bindless patch: hash=0x%016" PRIx64 " offset=%u is overwritten by a GPU fill "
+							     "(word %u from 0x%" PRIx64 ")\n",
+							     program.shader_hash, offset, fill.flat_offset, fill.address);
+						}
+					}
 				}
 				// The first 256 distinct patches are logged; after that no draw takes the lock.
 				static std::atomic<bool>            logging_done = false;

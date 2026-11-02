@@ -124,7 +124,8 @@ void BindlessTable::Destroy() {
 	}
 	m_translation.reset();
 	m_feedback.reset();
-	m_feedback_snapshot.reset();
+	m_feedback_snapshots[0].reset();
+	m_feedback_snapshots[1].reset();
 	m_runtime_table.reset();
 	m_runtime_requests.reset();
 	m_runtime_requests_snapshot.reset();
@@ -188,11 +189,13 @@ bool BindlessTable::EnsureCreated() {
 	                                         AllFlags, uint64_t {TranslationCapacity()} * sizeof(uint32_t));
 	m_feedback    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 0,
 	                                         AllFlags, uint64_t {TranslationCapacity()} * sizeof(uint32_t));
-	m_feedback_snapshot = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download,
-	                                               0, AllFlags,
-	                                               uint64_t {TranslationCapacity()} * sizeof(uint32_t));
+	// Two snapshots: the host reads the one consumed while the next is being copied.
+	for (auto& snapshot: m_feedback_snapshots) {
+		snapshot = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags,
+		                                    uint64_t {SnapshotWords} * sizeof(uint32_t));
+	}
 	if (m_translation->Mapped().empty() || m_feedback->Mapped().empty() ||
-	    m_feedback_snapshot->Mapped().empty()) {
+	    m_feedback_snapshots[0]->Mapped().empty() || m_feedback_snapshots[1]->Mapped().empty()) {
 		LOGF("Bindless table: the translation or feedback buffer is not host-visible\n");
 		Destroy();
 		m_creation_failed = true;
@@ -205,11 +208,14 @@ bool BindlessTable::EnsureCreated() {
 	std::fill(m_translation->Mapped().begin(), m_translation->Mapped().end(), uint8_t {0});
 	reinterpret_cast<uint32_t*>(m_translation->Mapped().data())[0] = 1u;
 	std::fill(m_feedback->Mapped().begin(), m_feedback->Mapped().end(), uint8_t {0});
-	std::fill(m_feedback_snapshot->Mapped().begin(), m_feedback_snapshot->Mapped().end(),
-	          uint8_t {0});
 	m_translation->Flush(0, m_translation->Size());
 	m_feedback->Flush(0, m_feedback->Size());
-	m_feedback_snapshot->Flush(0, m_feedback_snapshot->Size());
+	for (auto& snapshot: m_feedback_snapshots) {
+		std::fill(snapshot->Mapped().begin(), snapshot->Mapped().end(), uint8_t {0});
+		snapshot->Flush(0, snapshot->Size());
+	}
+	m_pending_chunks.clear();
+	m_next_region = ShaderRecompiler::IR::BindlessFeedbackFirstRegion;
 	SetVulkanObjectNameF(m_graphics.device, m_translation->Handle(), "Bindless Translation");
 	SetVulkanObjectNameF(m_graphics.device, m_feedback->Handle(), "Bindless Feedback");
 
@@ -513,11 +519,27 @@ static bool BindlessHeapGrowEnabled() {
 	return enabled;
 }
 
+// KYTY_BINDLESS_WATCH_KEY=<key> (diagnostic): every translation change of that key in any heap,
+// and every descriptor write to a slot it was given, is logged (at most 4000 lines).
+static uint32_t BindlessWatchKey() {
+	static const uint32_t key = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_WATCH_KEY");
+		return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+		                                            : UINT32_MAX;
+	}();
+	return key;
+}
+static std::vector<std::pair<uint32_t, uint32_t>> g_watched_slots; // (binding, slot), GPU thread
+static bool BindlessWatchLogTake() {
+	static std::atomic<uint32_t> lines {0};
+	return lines.fetch_add(1, std::memory_order_relaxed) < 4000;
+}
+
 uint32_t BindlessTable::TranslationCapacity() {
 	static const uint32_t entries = [] {
-		uint32_t mi = 4;
+		uint32_t mi = 24;
 		if (const char* value = std::getenv("KYTY_BINDLESS_TRANSLATION_MI"); value != nullptr && value[0] != '\0') {
-			mi = static_cast<uint32_t>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 1ul, 16ul));
+			mi = static_cast<uint32_t>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 1ul, 32ul));
 		}
 		return mi << 20u;
 	}();
@@ -607,7 +629,8 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 		    heap.stride == stride && heap.record_pointer == record_pointer &&
 		    heap.nested_vsharp == nested_vsharp && heap.nested_heap == nested_heap &&
 		    heap.nested_keys == nested_keys) {
-			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
+			// A heap that cannot grow keeps its region (keys beyond it read as out of range).
+			if (entries > heap.entries && !AllocateRegion(heap, entries) && heap.entries == 0) {
 				return nullptr;
 			}
 			heap.guest_entries = std::max(heap.guest_entries, entries);
@@ -678,6 +701,13 @@ void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
 
 void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view,
                               vk::ImageLayout layout) {
+	if (!g_watched_slots.empty() &&
+	    std::ranges::find(g_watched_slots, std::pair {binding, slot}) != g_watched_slots.end()) [[unlikely]] {
+		if (BindlessWatchLogTake()) {
+			LOGF("Bindless watch: slot %u/%u <- %s view %p\n", binding, slot,
+			     IsPlaceholder(view) ? "placeholder" : "image", static_cast<void*>(static_cast<VkImageView>(view)));
+		}
+	}
 	const vk::DescriptorImageInfo info {nullptr, view, layout};
 	vk::WriteDescriptorSet        write {};
 	write.dstSet          = m_set;
@@ -771,7 +801,49 @@ bool BindlessTable::ReleaseViews(std::span<const CachedImageView> views) {
 	return held;
 }
 
+uint32_t BindlessTable::WatchKey() {
+	return BindlessWatchKey();
+}
+
+void BindlessTable::DebugWatchReport(uint64_t frame) {
+	const auto key = BindlessWatchKey();
+	if (key == UINT32_MAX || m_translation == nullptr) return;
+	static uint32_t calls = 0;
+	if ((calls++ % 16u) != 0u) return;
+	const auto* translation = reinterpret_cast<const uint32_t*>(m_translation->Mapped().data());
+	std::string text;
+	for (const auto& heap: m_heaps) {
+		if (key >= heap.entries || heap.runtime) continue;
+		const auto value = translation[heap.region + key];
+		if (value == ShaderRecompiler::IR::BindlessPending) continue;
+		std::string view = "-";
+		if (value != 0) {
+			const auto binding = SlotBinding(heap, value);
+			const auto slot    = SlotIndex(value);
+			const auto& views  = m_slot_views[binding < ImageArrays ? binding : 0];
+			view = slot < views.size() ? (views[slot] ? "image" : "placeholder/none") : "unset";
+			view += fmt::format(" heap.slots={:x}", heap.slots.size() > key ? heap.slots[key] : 0u);
+		}
+		text += fmt::format(" | 0x{:x}+{} b{} r{}: 0x{:x} {}", heap.base, heap.table_offset, heap.binding, heap.region,
+		                    value, view);
+	}
+	if (BindlessWatchLogTake()) LOGF("Bindless watch report: frame=%" PRIu64 "%s\n", frame, text.c_str());
+}
+
 void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {
+	if (key == BindlessWatchKey()) [[unlikely]] {
+		if (BindlessWatchLogTake()) {
+			LOGF("Bindless watch: heap 0x%" PRIx64 "+%u binding %u key %u translation %u -> 0x%x (slot %u/%u)\n",
+			     heap.base, heap.table_offset, heap.binding, key,
+			     reinterpret_cast<const uint32_t*>(m_translation->Mapped().data())[heap.region + key], slot,
+			     slot == ShaderRecompiler::IR::BindlessPending ? 0u : SlotBinding(heap, slot),
+			     slot == ShaderRecompiler::IR::BindlessPending ? 0u : SlotIndex(slot));
+		}
+		if (slot != ShaderRecompiler::IR::BindlessPending && slot != 0u) {
+			const std::pair entry {SlotBinding(heap, slot), SlotIndex(slot)};
+			if (std::ranges::find(g_watched_slots, entry) == g_watched_slots.end()) g_watched_slots.push_back(entry);
+		}
+	}
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
 	translation[heap.region + key] = slot;
 	m_translation->Flush((heap.region + key) * sizeof(uint32_t), sizeof(uint32_t));
@@ -785,13 +857,18 @@ void BindlessTable::RecordFeedbackSnapshot() {
 	if (command.IsInvalid()) {
 		return;
 	}
-	// Regions are allocated contiguously after word 0, so one copy covers every heap.
+	// Word 0 and the chunk summary words are copied every time; of the heaps' regions only the chunks
+	// whose summary word was set in the snapshot consumed last (ConsumeSnapshot): a frame's flags are
+	// a few chunks of a translation buffer of up to 16 Mi entries. Then the summary is cleared.
+	using ShaderRecompiler::IR::BindlessFeedbackChunkShift;
+	using ShaderRecompiler::IR::BindlessFeedbackFirstRegion;
 	const vk::DeviceSize size = vk::DeviceSize {m_next_region} * sizeof(uint32_t);
 	command.EndRendering();
 	const auto              sink = command.HelperSink();
+	auto&                   snapshot_buffer = *m_feedback_snapshots[m_snapshot_record];
 	vk::BufferMemoryBarrier flags_written {};
 	flags_written.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
-	flags_written.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	flags_written.dstAccessMask       = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
 	flags_written.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	flags_written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	flags_written.buffer              = m_feedback->Handle();
@@ -800,14 +877,49 @@ void BindlessTable::RecordFeedbackSnapshot() {
 	sink.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                     vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &flags_written, 0,
 	                     nullptr);
-	const vk::BufferCopy copy {0, 0, size};
-	sink.copyBuffer(m_feedback->Handle(), m_feedback_snapshot->Handle(), 1, &copy);
+	m_copy_regions.clear();
+	m_copy_regions.push_back({0, 0, vk::DeviceSize {BindlessFeedbackFirstRegion} * sizeof(uint32_t)});
+	// The flagged chunks are packed after the summary in the snapshot (chunk i at FirstRegion + i * 1024).
+	if (m_copy_chunks.size() > MaxCopyChunks) {
+		m_copy_chunks.resize(MaxCopyChunks); // the rest are flagged again by the next sample of their keys
+	}
+	for (size_t i = 0; i < m_copy_chunks.size(); i++) {
+		const uint64_t begin = std::max<uint64_t>(uint64_t {m_copy_chunks[i]} << BindlessFeedbackChunkShift, BindlessFeedbackFirstRegion);
+		const uint64_t end   = std::min<uint64_t>((uint64_t {m_copy_chunks[i]} + 1u) << BindlessFeedbackChunkShift, m_next_region);
+		const uint64_t dst   = BindlessFeedbackFirstRegion + (uint64_t {i} << BindlessFeedbackChunkShift);
+		if (begin < end) {
+			m_copy_regions.push_back({begin * sizeof(uint32_t), dst * sizeof(uint32_t), (end - begin) * sizeof(uint32_t)});
+		}
+	}
+	sink.copyBuffer(m_feedback->Handle(), snapshot_buffer.Handle(), static_cast<uint32_t>(m_copy_regions.size()),
+	                m_copy_regions.data());
+	m_copied_bytes += [&] {
+		uint64_t bytes = 0;
+		for (const auto& region: m_copy_regions) bytes += region.size;
+		return bytes;
+	}();
+	// The summary is cleared after the copy read it (and before any later shader sets it again).
+	vk::BufferMemoryBarrier copied = flags_written;
+	copied.srcAccessMask           = vk::AccessFlagBits::eTransferRead;
+	copied.dstAccessMask           = vk::AccessFlagBits::eTransferWrite;
+	copied.size                    = vk::DeviceSize {BindlessFeedbackFirstRegion} * sizeof(uint32_t);
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+	                     nullptr, 1, &copied, 0, nullptr);
+	sink.fillBuffer(m_feedback->Handle(), sizeof(uint32_t),
+	                vk::DeviceSize {BindlessFeedbackFirstRegion - 1u} * sizeof(uint32_t), 0u);
+	vk::BufferMemoryBarrier cleared = copied;
+	cleared.srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
+	cleared.dstAccessMask           = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 0,
+	                     nullptr, 1, &cleared, 0, nullptr);
 	auto snapshot_written          = flags_written;
 	snapshot_written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	snapshot_written.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	snapshot_written.buffer        = m_feedback_snapshot->Handle();
+	snapshot_written.buffer        = snapshot_buffer.Handle();
 	sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
 	                     0, nullptr, 1, &snapshot_written, 0, nullptr);
+	m_inflight_chunks.swap(m_copy_chunks);
+	m_copy_chunks.clear();
 	if (m_runtime_requests != nullptr) {
 		// KYTY_RUNTIME_IMAGES: the request buffer, at the same point.
 		auto requests_written   = flags_written;
@@ -832,29 +944,82 @@ bool BindlessTable::SnapshotReady() {
 	return m_snapshot_tick != 0 && m_scheduler.IsFree(m_snapshot_tick);
 }
 
-void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) {
-	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
-	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
-	m_feedback_snapshot->Invalidate(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
-	bool cleared = false;
-	for (uint32_t key = 0; key < heap.entries; key++) {
-		if (snapshot[heap.region + key] == 1u) {
-			// A flag the GPU sets again after the snapshot may be lost here; a key that is
-			// still pending is flagged again by the next draw that samples it.
-			feedback[heap.region + key] = 0;
-			keys.push_back(key);
-			cleared = true;
+void BindlessTable::ConsumeSnapshot() {
+	using ShaderRecompiler::IR::BindlessFeedbackChunkShift;
+	using ShaderRecompiler::IR::BindlessFeedbackFirstRegion;
+	using ShaderRecompiler::IR::BindlessFeedbackSummary;
+	constexpr uint32_t ChunkWords = 1u << BindlessFeedbackChunkShift;
+	m_snapshot_tick = 0;
+	m_snapshot_read = m_snapshot_record;
+	m_snapshot_record ^= 1u;
+	m_snapshot_serial++;
+	auto&       snapshot = *m_feedback_snapshots[m_snapshot_read];
+	const auto* words    = reinterpret_cast<const uint32_t*>(snapshot.Mapped().data());
+	snapshot.Invalidate(0, snapshot.Size());
+	// The chunks copied into it wait on the host until their heap takes its flags (a call table's
+	// heaps are used in every other frame, and a snapshot is consumed more often).
+	for (size_t i = 0; i < m_inflight_chunks.size(); i++) {
+		auto& pending  = m_pending_chunks[m_inflight_chunks[i]];
+		pending.serial = m_snapshot_serial;
+		std::copy_n(words + BindlessFeedbackFirstRegion + i * ChunkWords, ChunkWords, pending.words.begin());
+	}
+	m_inflight_chunks.clear();
+	std::erase_if(m_pending_chunks, [&](const auto& item) { return item.second.serial + 64u < m_snapshot_serial; });
+	// The chunks flagged in this snapshot are copied with the next one.
+	const uint32_t chunks = (m_next_region + ChunkWords - 1u) >> BindlessFeedbackChunkShift;
+	m_copy_chunks.clear();
+	for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+		if (words[BindlessFeedbackSummary + chunk] != 0u) {
+			m_copy_chunks.push_back(chunk);
 		}
 	}
-	if (cleared) {
-		m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
-	}
+	m_flagged_chunks += m_copy_chunks.size();
 }
 
+void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) {
+	using ShaderRecompiler::IR::BindlessFeedbackChunkShift;
+	if (heap.entries == 0 || m_pending_chunks.empty()) {
+		return;
+	}
+	auto*          feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	const uint32_t first    = heap.region >> BindlessFeedbackChunkShift;
+	const uint32_t last     = (heap.region + heap.entries - 1u) >> BindlessFeedbackChunkShift;
+	for (uint32_t chunk = first; chunk <= last; chunk++) {
+		const auto found = m_pending_chunks.find(chunk);
+		if (found == m_pending_chunks.end()) {
+			continue; // no flag was raised in it
+		}
+		auto&          words = found->second.words;
+		const uint32_t base  = chunk << BindlessFeedbackChunkShift;
+		const uint32_t begin = std::max(heap.region, base);
+		const uint32_t end   = std::min(heap.region + heap.entries, base + (1u << BindlessFeedbackChunkShift));
+		bool cleared = false;
+		m_scanned_words += end - begin;
+		for (uint32_t word = begin; word < end; word++) {
+			const auto value = words[word - base];
+			if (value != 0u) m_nonzero_words++;
+			words[word - base] = 0;
+			if (value == 1u) {
+				// A flag the GPU sets again after the snapshot may be lost here; a key that is
+				// still pending is flagged again by the next draw that samples it.
+				feedback[word] = 0;
+				keys.push_back(word - heap.region);
+				cleared = true;
+			}
+		}
+		if (cleared) {
+			m_feedback->Flush(vk::DeviceSize {begin} * sizeof(uint32_t), vk::DeviceSize {end - begin} * sizeof(uint32_t));
+		}
+		if (std::ranges::all_of(words, [](uint32_t w) { return w == 0u; })) {
+			m_pending_chunks.erase(found);
+		}
+	}
+}
 uint32_t BindlessTable::TakeWordZero() {
-	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
-	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
-	m_feedback_snapshot->Invalidate(0, sizeof(uint32_t));
+	auto&       snapshot_buffer = *m_feedback_snapshots[m_snapshot_read];
+	const auto* snapshot        = reinterpret_cast<const uint32_t*>(snapshot_buffer.Mapped().data());
+	auto*       feedback        = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	snapshot_buffer.Invalidate(0, sizeof(uint32_t));
 	const auto value = snapshot[0];
 	if (value != 0) {
 		feedback[0] = 0;
@@ -862,7 +1027,6 @@ uint32_t BindlessTable::TakeWordZero() {
 	}
 	return value;
 }
-
 void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 	m_image_refs[ImageKey(id)].emplace_back(&heap, key);
 }

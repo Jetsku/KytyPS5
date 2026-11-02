@@ -1131,6 +1131,15 @@ private:
 	bool ResettleBindlessKey(BindlessHeap& heap, uint32_t key);
 	// KYTY_BINDLESS_ENGINE=0: the rolling scan of every heap's entries (budget: keys per frame).
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
+	uint32_t RevalidateBindlessHeap(BindlessHeap& heap, uint32_t budget);
+	// KYTY_BINDLESS_RECORD_LAZY: a record pointer heap's requests, growth, retries and revalidation,
+	// at its first use in a frame (its call table is the one in use, not one being rebuilt).
+	void ProcessRecordHeap(BindlessHeap& heap);
+	uint32_t RetryBindlessRecords(BindlessHeap* heap, uint64_t frame, uint32_t budget);
+	uint32_t ResolveFlaggedKeys(BindlessHeap& heap, uint32_t budget, uint32_t* requested);
+	uint32_t m_bindless_budget_left     = 0;
+	uint64_t m_bindless_budget_frame    = UINT64_MAX;
+	uint64_t m_bindless_snapshot_serial = 0; // snapshots consumed
 	// Engine method, E5 (CommitBindings): the stage's bindless images in a read-only layout.
 	void MakeBindlessImagesReadable(std::span<BindlessHeap* const> heaps, vk::CommandBuffer target);
 	[[nodiscard]] uint64_t BindlessFrame() const;
@@ -1138,6 +1147,19 @@ private:
 	std::vector<std::pair<BindlessHeap*, uint32_t>> m_bindless_retry;
 	// ResolveBindlessKey's last failure may pass (an image being dropped, a full array).
 	bool m_bindless_transient_failure = false;
+	// KYTY_BINDLESS_RECORD_RETRY: the last ResolveBindlessKey read an unfilled record (null pointer or
+	// all-zero T#); such keys are read again after a few frames (m_bindless_record_retry).
+	bool m_bindless_record_unfilled = false;
+	struct BindlessRecordRetry {
+		BindlessHeap* heap    = nullptr;
+		uint32_t      key     = 0;
+		uint32_t      attempt = 0;
+		uint64_t      due     = 0;
+	};
+	std::vector<BindlessRecordRetry> m_bindless_record_retry;
+	uint32_t                         m_bindless_record_attempt = 0; // of the key being retried
+	std::unordered_set<uint64_t>     m_bindless_record_queued;
+	void QueueBindlessRecordRetry(BindlessHeap& heap, uint32_t key, uint32_t attempt);
 	std::unordered_set<uint64_t>               m_bindless_surveyed; // base ^ table offset << 48
 	uint64_t                                   m_bindless_frame          = UINT64_MAX;
 	uint64_t                                   m_bindless_snapshot_frame = 0;

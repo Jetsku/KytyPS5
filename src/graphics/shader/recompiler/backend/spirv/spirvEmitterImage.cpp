@@ -1136,6 +1136,19 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 		                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
 		                          index);
 		state.builder.AddFunction(spv::OpStore, pointer, flag);
+		// A raised flag also marks its 1024-entry chunk in the summary words after word 0
+		// (IR::BindlessFeedbackSummary), so the host copies and scans only marked chunks.
+		const auto raised = Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
+		EmitIfCondition(state, raised, [&]() {
+			const auto chunk = Binary(state, spv::OpShiftRightLogical, TypeU32(state), index,
+			                          ConstantU32(state, IR::BindlessFeedbackChunkShift));
+			const auto word  = Binary(state, spv::OpIAdd, TypeU32(state), chunk,
+			                          ConstantU32(state, IR::BindlessFeedbackSummary));
+			const auto mark  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), mark,
+			                          state.bindless_feedback_variable, ConstantU32(state, 0), word);
+			state.builder.AddFunction(spv::OpStore, mark, ConstantU32(state, 1u));
+		});
 	}
 	state.bindless_translation_raw = raw;
 	const auto slot = state.builder.AllocateId();
@@ -1288,6 +1301,14 @@ static uint32_t RuntimeImageSlot(ValueEmitContext& ctx, const IR::ImageResource&
 			RuntimeStoreWord(
 			    state, state.bindless_feedback_variable, entry,
 			    Select(state, u32, pending, ConstantU32(state, 1), ConstantU32(state, 0)));
+			// The chunk's summary word (IR::BindlessFeedbackSummary), as for a heap key.
+			EmitIfCondition(state, pending, [&]() {
+				const auto chunk = Binary(state, spv::OpShiftRightLogical, u32, entry,
+				                          ConstantU32(state, IR::BindlessFeedbackChunkShift));
+				RuntimeStoreWord(state, state.bindless_feedback_variable,
+				                 Binary(state, spv::OpIAdd, u32, chunk, ConstantU32(state, IR::BindlessFeedbackSummary)),
+				                 ConstantU32(state, 1));
+			});
 		});
 	}
 	EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, found), [&]() {

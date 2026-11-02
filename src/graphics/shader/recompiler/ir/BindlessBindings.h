@@ -47,6 +47,14 @@ inline constexpr uint32_t RuntimeImageRequestBufferWords =
 inline constexpr uint32_t BindlessPending = 0xffffffffu;
 // The placeholder slot pending keys sample (slots 0-2 of each image array are placeholders).
 inline constexpr uint32_t BindlessPendingSlot = 2;
+// Feedback buffer: word 0 (an out-of-range key), then one summary word per chunk of
+// 2^BindlessFeedbackChunkShift entries that a shader set when it raised a flag in that chunk, then the
+// heaps' regions. The host copies and scans only the chunks marked (BindlessTable).
+inline constexpr uint32_t BindlessFeedbackSummary    = 1;
+inline constexpr uint32_t BindlessFeedbackChunkShift = 10;
+inline constexpr uint32_t BindlessFeedbackMaxEntries = 32u << 20u; // the largest translation buffer
+inline constexpr uint32_t BindlessFeedbackChunks     = BindlessFeedbackMaxEntries >> BindlessFeedbackChunkShift;
+inline constexpr uint32_t BindlessFeedbackFirstRegion = BindlessFeedbackSummary + BindlessFeedbackChunks;
 // KYTY_BINDLESS_3D_AS_ARRAY (CodegenOptions::bindless_3d_as_array): in a 3D binding's region, the
 // key's T# is a 2D or 2D-array texture, held in the 2D-array binding at the slot in the low bits.
 // The hardware addresses by the T# type, not the instruction's dimension, so a 3D sample of it
