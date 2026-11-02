@@ -934,6 +934,34 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// KYTY_GUEST_ASSERT_CONTINUE=1 (default 0; on in the PPSA26344 title preset): a guest INT 0x41
+	// (CD 41, the debug break a game's assert handler executes after printing the message; on
+	// Windows a general-protection fault with address ~0) is stepped over and the guest continues
+	// as without a debugger. Ghost of Yotei 02.002 asserts in its audio curve code
+	// ("!(isnan(inputValue) || isinf(inputValue))") on the Digital Deluxe bonus screen.
+	static const bool assert_continue = [] {
+		const auto* value = std::getenv("KYTY_GUEST_ASSERT_CONTINUE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (assert_continue && info->native_context != nullptr &&
+	    info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    DescribeCodeAddress(info->exception_address).starts_with("no module") &&
+	    IsReadableRange(info->exception_address, 2)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+		if (code[0] == 0xcdu && code[1] == 0x41u) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Guest assert trap (INT 0x41) at 0x{:016x} stepped over "
+				    "(KYTY_GUEST_ASSERT_CONTINUE)\n",
+				    info->exception_address));
+			}
+			static_cast<CONTEXT*>(info->native_context)->Rip += 2;
+			return true;
+		}
+	}
+#endif
 	if (TryHandleGuestAccessFault(exception_info)) {
 		return true;
 	}

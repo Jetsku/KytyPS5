@@ -1649,8 +1649,36 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info, bool* unsupported) {
-	const auto& sh        = context.GetShaderRegisters();
-	const auto  local     = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+	const auto& sh = context.GetShaderRegisters();
+	// Ghost of Yotei 02.002 issues patch draws whose hull program address is 0. A set with a stage
+	// the shader map does not hold has its patch draws skipped (KYTY_SKIP_INVALID, as below)
+	// instead of ending the emulator in the lookup.
+	if (unsupported != nullptr && Common::SkipInvalidEnabled() && !DrawPrep::Speculative()) {
+		bool missing = false;
+		{
+			std::scoped_lock lock(g_shader_map_mutex);
+			for (const auto addr: {regs.ls_regs.data_addr, regs.hs_regs.data_addr,
+			                       regs.es_regs.data_addr}) {
+				missing = missing || g_shader_map == nullptr || !g_shader_map->contains(addr);
+			}
+		}
+		if (missing) {
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::scoped_lock                    lock(logged_mutex);
+			if (logged.size() < 64u &&
+			    logged.insert(regs.ls_regs.data_addr ^ (regs.hs_regs.data_addr << 1u) ^
+			                  (regs.es_regs.data_addr << 2u))
+			        .second) {
+				LOGF("Tessellation: LS 0x%016" PRIx64 " / HS 0x%016" PRIx64 " / TES 0x%016" PRIx64
+				     ": a stage is not a registered shader, its patch draws are skipped\n",
+				     regs.ls_regs.data_addr, regs.hs_regs.data_addr, regs.es_regs.data_addr);
+			}
+			*unsupported = true;
+			return {};
+		}
+	}
+	const auto local      = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	if (unsupported != nullptr) *unsupported = false;
