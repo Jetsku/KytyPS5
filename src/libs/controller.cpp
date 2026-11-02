@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace Libs::Controller {
@@ -236,17 +237,26 @@ static int TriggerTravel(const ControllerState& state, Axis axis) {
 // KYTY_PAD_SCRIPT="20:cross,24:cross,f1200:options" (default unset): unattended button presses
 // inside the emulated pad, OR-ed into the real input. "<s>:<button>" fires at <s> seconds (may be
 // fractional) after pad initialization, "f<n>:<button>" at guest flip <n>. Buttons: cross, circle,
-// square, triangle, options, up, down, left, right, l1, r1.
+// square, triangle, options, up, down, left, right, l1, r1, l2, r2 (l2/r2 at full travel).
+// Analogue sticks: "lstick=<x>/<y>" or "rstick=<x>/<y>" (0..255 per axis, 128 = centre, y 0 = up).
+// Any entry may end in ":<ms>", the hold time (default 300 ms), e.g. "40:lstick=128/0:2500,41:r2:2000"
+// holds the left stick up for 2.5 s and R2 for 2 s. While several entries hold one stick, the latest
+// fired wins.
 // KYTY_PAD_TRIGGER_FILE=<path> (default unset): while the game reads the pad, the file is polled
-// every 250 ms; when it exists, the buttons it names (separated by commas or spaces) are pressed
-// at once and the file is deleted, so a test runner can press when it sees a prompt.
-// Each press is held for 300 ms. Host input and window focus are never touched.
+// every 250 ms; when it exists, the entries it names without a time ("cross", "lstick=128/0:2000",
+// separated by commas or spaces) fire at once and the file is deleted, so a test runner can press
+// when it sees a prompt. Host input and window focus are never touched.
 namespace {
 
 struct PadScriptEvent {
 	bool     by_flip  = false;
 	double   at       = 0.0;
 	uint32_t button   = 0;
+	// 0 = none, 1 = left stick, 2 = right stick (stick_x/stick_y).
+	uint8_t  stick    = 0;
+	uint8_t  stick_x  = 128;
+	uint8_t  stick_y  = 128;
+	uint64_t hold_us  = 300000;
 	bool     fired    = false;
 	uint64_t fired_us = 0;
 };
@@ -269,7 +279,8 @@ uint32_t PadScriptButton(const char* name, size_t len) {
 	               {"square", PAD_BUTTON_SQUARE}, {"triangle", PAD_BUTTON_TRIANGLE},
 	               {"options", PAD_BUTTON_OPTIONS}, {"up", PAD_BUTTON_UP},
 	               {"down", PAD_BUTTON_DOWN}, {"left", PAD_BUTTON_LEFT},
-	               {"right", PAD_BUTTON_RIGHT}, {"l1", PAD_BUTTON_L1}, {"r1", PAD_BUTTON_R1}};
+	               {"right", PAD_BUTTON_RIGHT}, {"l1", PAD_BUTTON_L1}, {"r1", PAD_BUTTON_R1},
+	               {"l2", PAD_BUTTON_L2}, {"r2", PAD_BUTTON_R2}};
 	for (const auto& b: BUTTONS) {
 		if (std::strlen(b.name) == len && std::strncmp(b.name, name, len) == 0) {
 			return b.button;
@@ -278,23 +289,55 @@ uint32_t PadScriptButton(const char* name, size_t len) {
 	return 0;
 }
 
+// One action without its time: "<button>[:<ms>]" or "lstick=<x>/<y>[:<ms>]" / "rstick=...".
+// False for anything else (the event is then left without a button and stick).
+bool PadScriptParseAction(const char* p, size_t len, PadScriptEvent* event) {
+	const std::string text(p, len);
+	std::string       name = text;
+	if (const auto colon = text.find(':'); colon != std::string::npos) {
+		char*      end = nullptr;
+		const auto ms  = std::strtod(text.c_str() + colon + 1, &end);
+		if (end == text.c_str() + colon + 1 || *end != '\0' || !(ms > 0.0) || ms > 600000.0) return false;
+		event->hold_us = static_cast<uint64_t>(ms * 1000.0);
+		name.resize(colon);
+	}
+	if (name.starts_with("lstick=") || name.starts_with("rstick=")) {
+		char*      end = nullptr;
+		const auto x   = std::strtol(name.c_str() + 7, &end, 10);
+		if (end == name.c_str() + 7 || *end != '/') return false;
+		const char* y_text = end + 1;
+		const auto  y      = std::strtol(y_text, &end, 10);
+		if (end == y_text || *end != '\0' || x < 0 || x > 255 || y < 0 || y > 255) return false;
+		event->stick   = name[0] == 'l' ? 1 : 2;
+		event->stick_x = static_cast<uint8_t>(x);
+		event->stick_y = static_cast<uint8_t>(y);
+		return true;
+	}
+	event->button = PadScriptButton(name.data(), name.size());
+	return event->button != 0;
+}
+
+// One KYTY_PAD_SCRIPT entry: "<s>:<action>" or "f<n>:<action>".
+bool PadScriptParseEntry(const char* p, size_t len, PadScriptEvent* event) {
+	const char* end   = p + len;
+	const char* colon = static_cast<const char*>(std::memchr(p, ':', len));
+	if (colon == nullptr) return false;
+	event->by_flip = *p == 'f' || *p == 'F';
+	event->at      = std::strtod(event->by_flip ? p + 1 : p, nullptr);
+	return PadScriptParseAction(colon + 1, static_cast<size_t>(end - colon - 1), event);
+}
+
 void PadScriptInit() {
 	g_pad_start_us    = PadScriptNowUs();
 	const char* value = std::getenv("KYTY_PAD_SCRIPT");
 	for (const char* p = value; p != nullptr && *p != '\0';) {
 		const char* end   = std::strchr(p, ',');
 		const char* next  = end != nullptr ? end + 1 : p + std::strlen(p);
-		const char* colon = std::strchr(p, ':');
 		if (end == nullptr) {
 			end = next;
 		}
 		PadScriptEvent event;
-		if (colon != nullptr && colon < end) {
-			event.by_flip = *p == 'f' || *p == 'F';
-			event.at      = std::strtod(event.by_flip ? p + 1 : p, nullptr);
-			event.button  = PadScriptButton(colon + 1, static_cast<size_t>(end - colon - 1));
-		}
-		if (event.button != 0) {
+		if (PadScriptParseEntry(p, static_cast<size_t>(end - p), &event)) {
 			g_pad_script.push_back(event);
 		} else {
 			LOGF("Kyty: KYTY_PAD_SCRIPT: ignored entry '%.*s'\n", static_cast<int>(end - p), p);
@@ -332,9 +375,8 @@ void PadScriptPollTrigger(uint64_t now) {
 		const auto len = std::strcspn(p, ", \t\r\n");
 		if (len != 0) {
 			PadScriptEvent event;
-			event.at     = at;
-			event.button = PadScriptButton(p, len);
-			if (event.button != 0) {
+			event.at = at;
+			if (PadScriptParseAction(p, len, &event)) {
 				g_pad_script.push_back(event);
 			}
 		}
@@ -342,18 +384,18 @@ void PadScriptPollTrigger(uint64_t now) {
 	}
 }
 
-uint32_t PadScriptButtons() {
-	if (g_pad_script.empty() && g_pad_trigger == nullptr) {
-		return 0;
-	}
-	constexpr uint64_t HOLD_US = 300000;
-	Common::LockGuard  lock(g_pad_script_mutex);
-	const uint64_t     now  = PadScriptNowUs();
-	const uint64_t     flip = g_pad_flips.load(std::memory_order_relaxed);
-	if (g_pad_trigger != nullptr) {
-		PadScriptPollTrigger(now);
-	}
-	uint32_t held = 0;
+struct PadScriptHeld {
+	uint32_t buttons = 0;
+	// Per stick (left, right): whether held, and x/y.
+	std::array<bool, 2>    stick {};
+	std::array<uint8_t, 2> x {};
+	std::array<uint8_t, 2> y {};
+};
+
+// The controls held at <now_us> (pad-script clock) and guest flip <flip>; fires due events.
+PadScriptHeld PadScriptHeldAt(uint64_t now, uint64_t flip) {
+	PadScriptHeld held;
+	uint64_t      stick_fired[2] {};
 	for (auto& event: g_pad_script) {
 		if (!event.fired) {
 			const bool due = event.by_flip
@@ -364,14 +406,51 @@ uint32_t PadScriptButtons() {
 			}
 			event.fired    = true;
 			event.fired_us = now;
-			LOGF("Kyty: KYTY_PAD_SCRIPT press 0x%05x at %.2f s, guest flip %llu\n", event.button,
+			LOGF("Kyty: KYTY_PAD_SCRIPT press 0x%05x stick %u (%u,%u) for %llu ms at %.2f s, guest flip %llu\n",
+			     event.button, event.stick, event.stick_x, event.stick_y,
+			     static_cast<unsigned long long>(event.hold_us / 1000),
 			     static_cast<double>(now - g_pad_start_us) / 1e6, static_cast<unsigned long long>(flip));
 		}
-		if (now - event.fired_us < HOLD_US) {
-			held |= event.button;
+		if (now - event.fired_us >= event.hold_us) {
+			continue;
+		}
+		held.buttons |= event.button;
+		if (event.stick != 0) {
+			const int s = event.stick - 1;
+			// The latest fired entry wins.
+			if (!held.stick[s] || event.fired_us >= stick_fired[s]) {
+				held.stick[s]  = true;
+				held.x[s]      = event.stick_x;
+				held.y[s]      = event.stick_y;
+				stick_fired[s] = event.fired_us;
+			}
 		}
 	}
 	return held;
+}
+
+// Scripted controls override the real sticks and add to the buttons; l2/r2 also set full travel.
+void PadScriptApply(PadData* data) {
+	if (g_pad_script.empty() && g_pad_trigger == nullptr) {
+		return;
+	}
+	Common::LockGuard lock(g_pad_script_mutex);
+	const uint64_t    now = PadScriptNowUs();
+	if (g_pad_trigger != nullptr) {
+		PadScriptPollTrigger(now);
+	}
+	const auto held = PadScriptHeldAt(now, g_pad_flips.load(std::memory_order_relaxed));
+	data->buttons |= held.buttons;
+	if ((held.buttons & PAD_BUTTON_L2) != 0) data->analog_buttons_l2 = 255;
+	if ((held.buttons & PAD_BUTTON_R2) != 0) data->analog_buttons_r2 = 255;
+	if (held.stick[0]) {
+		data->left_stick_x = held.x[0];
+		data->left_stick_y = held.y[0];
+	}
+	if (held.stick[1]) {
+		data->right_stick_x = held.x[1];
+		data->right_stick_y = held.y[1];
+	}
 }
 
 } // namespace
@@ -386,7 +465,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons | PadScriptButtons();
+	data->buttons           = state.buttons;
 	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
 	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
 	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
@@ -415,6 +494,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
 	data->device_unique_data_len = 0;
+	PadScriptApply(data);
 }
 
 // In cycle order, starting at the PS5 default.

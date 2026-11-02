@@ -619,10 +619,63 @@ void TestTriggerEffectState() {
 	GetTriggerEffectState(state);
 	Check(state[0] == 7, "muting trigger effects changed the reported state");
 }
+
+// KYTY_PAD_SCRIPT entries: buttons, l2/r2, held sticks and hold times.
+void TestPadScriptEntries() {
+	const auto parse = [](const char* text, PadScriptEvent* event) {
+		*event = {};
+		return PadScriptParseEntry(text, std::strlen(text), event);
+	};
+	PadScriptEvent e;
+	Check(parse("20:cross", &e) && e.button == PAD_BUTTON_CROSS && e.at == 20.0 && !e.by_flip &&
+	          e.hold_us == 300000 && e.stick == 0,
+	      "a plain press did not parse with the default hold");
+	Check(parse("f1200:r2:2000", &e) && e.button == PAD_BUTTON_R2 && e.by_flip && e.at == 1200.0 &&
+	          e.hold_us == 2000000,
+	      "a timed R2 hold did not parse");
+	Check(parse("40.5:lstick=128/0:2500", &e) && e.stick == 1 && e.stick_x == 128 && e.stick_y == 0 &&
+	          e.button == 0 && e.hold_us == 2500000 && e.at == 40.5,
+	      "a held left stick did not parse");
+	Check(parse("1:rstick=255/128", &e) && e.stick == 2 && e.stick_x == 255 && e.hold_us == 300000,
+	      "a right stick push did not parse");
+	Check(!parse("1:lstick=300/0", &e) && !parse("1:lstick=12", &e) && !parse("1:cross:0", &e) &&
+	          !parse("1:cross:x", &e) && !parse("cross", &e) && !parse("1:l3", &e),
+	      "a malformed entry parsed");
+	PadScriptEvent action;
+	Check(PadScriptParseAction("lstick=0/128:900", 16, &action) && action.stick == 1 && action.stick_x == 0 &&
+	          action.hold_us == 900000,
+	      "a trigger-file stick action did not parse");
+
+	// Holds: the stick entry fired last wins while both hold; l2/r2 count as buttons.
+	g_pad_script.clear();
+	g_pad_start_us = 0;
+	PadScriptEvent up;
+	parse("1:lstick=128/0:3000", &up);
+	PadScriptEvent left;
+	parse("2:lstick=0/128:500", &left);
+	PadScriptEvent r2;
+	parse("1.5:r2:1000", &r2);
+	g_pad_script = {up, left, r2};
+	auto held = PadScriptHeldAt(500000, 0);
+	Check(!held.stick[0] && held.buttons == 0, "an entry held before its time");
+	held = PadScriptHeldAt(1600000, 0);
+	Check(held.stick[0] && held.y[0] == 0 && held.buttons == PAD_BUTTON_R2, "the stick and R2 holds were missing");
+	held = PadScriptHeldAt(2100000, 0);
+	Check(held.stick[0] && held.x[0] == 0 && held.y[0] == 128, "the later stick entry did not win");
+	held = PadScriptHeldAt(2700000, 0);
+	Check(held.stick[0] && held.y[0] == 0 && held.buttons == 0, "expired holds stayed or the earlier stick was lost");
+	// Holds count from the poll that fired them (1.6 s here).
+	held = PadScriptHeldAt(4500000, 0);
+	Check(held.stick[0], "a stick hold ended early");
+	held = PadScriptHeldAt(4700000, 0);
+	Check(!held.stick[0], "a stick hold outlived its time");
+	g_pad_script.clear();
+}
 } // namespace
 
 int main() {
 	Config::Initialize();
+	TestPadScriptEntries();
 	TestPlayerUserIds();
 	TestPadPortOwnership();
 	TestSettingCycles();
