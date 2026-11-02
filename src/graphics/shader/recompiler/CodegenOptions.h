@@ -266,6 +266,12 @@ struct CodegenOptions {
 	// DontInline function (device loss in huge RT kernels) and a small inlined copy per call site
 	// (driver compile memory). Takes precedence over KYTY_INDIRECT_FORMAT_FAST / _INLINE.
 	bool indirect_format_compact = false;
+	// KYTY_INDIRECT_RAW_OUTLINE=1 (default 0): each raw BUFFER_LOAD through a V# the shader computed
+	// (ResourceKind::IndirectBuffer, unformatted) calls one DontInline function per load shape that
+	// decodes the V#, checks the range and reads through BDA, instead of inlining ~200 SPIR-V words per
+	// dword at every load (adapted from Erlou93/KytyPS5-Yotei F1, indirect_raw_dword / _x<N>). Same
+	// results. Ghost of Yotei's 0x4ca0cf7e5a0c4757 has ~500 such loads; its driver compile took 65 s.
+	bool indirect_raw_outline = false;
 	// KYTY_INDIRECT_FORMAT_INLINE_HASHES=<hex>[,<hex>...] (default unset): with
 	// KYTY_INDIRECT_FORMAT_FAST, these programs inline the full decoder (as
 	// KYTY_INDIRECT_FORMAT_INLINE does for all), the others keep the fast + DontInline pair.

@@ -196,6 +196,9 @@ struct EmitterState {
 	IR::ImageResource                                image_override {};
 	// The module's decoder of formatted loads through a computed V# (DefineIndirectFormatFunction).
 	uint32_t                                         indirect_format_function      = 0;
+	// KYTY_INDIRECT_RAW_OUTLINE: the module's raw-load functions through a computed V#, by shape
+	// (IndirectRawKey / IndirectRawElementKey in spirvEmitterMemory.cpp).
+	std::map<uint32_t, uint32_t>                     indirect_raw_functions;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
 	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds

@@ -1045,12 +1045,23 @@ struct IndirectBufferAccess {
 	uint32_t raw_index_in_bounds;
 };
 
-IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&       state  = ctx.state;
-	const auto& handle = *inst.Arg(0).ResolveInstruction();
-	const auto word1   = ctx.Arg(handle, 1);
-	const auto records = ctx.Arg(handle, 2);
-	const auto word3   = ctx.Arg(handle, 3);
+// The ADD_TID-adjusted element index of an access through a computed V# (word 3 bit 23).
+uint32_t IndirectBufferIndex(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t word3) {
+	auto&      state = ctx.state;
+	const auto add_tid =
+	    Binary(state, spv::OpINotEqual, TypeBool(state),
+	           EmitBitFieldUExtract(state, word3, ConstantU32(state, 23), ConstantU32(state, 1)),
+	           ConstantU32(state, 0));
+	return Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+	              Select(state, TypeU32(state), add_tid, BufferLane(state), ConstantU32(state, 0)));
+}
+
+// PrepareIndirectBuffer from the V# words and the instruction's operands; `index` already holds the
+// ADD_TID lane. Also the body of the outlined raw loads (KYTY_INDIRECT_RAW_OUTLINE).
+IndirectBufferAccess IndirectBufferFromWords(EmitterState& state, uint32_t word0, uint32_t word1,
+                                             uint32_t records, uint32_t word3, uint32_t index,
+                                             uint32_t voffset, uint32_t soffset, uint32_t immediate,
+                                             bool formatted) {
 	const auto field = [&](uint32_t word, uint32_t first, uint32_t count) {
 		return EmitBitFieldUExtract(state, word, ConstantU32(state, first), ConstantU32(state, count));
 	};
@@ -1059,15 +1070,9 @@ IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst
 	};
 	const auto stride  = field(word1, 16, 14);
 	const auto swizzle = AndCondition(state, nonzero(stride), nonzero(field(word1, 31, 1)));
-	const auto index = Binary(
-	    state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
-	    Select(state, TypeU32(state), nonzero(field(word3, 23, 1)), BufferLane(state),
-	           ConstantU32(state, 0)));
-	const auto soffset = ctx.Arg(inst, 3);
-	const auto address = CalculateBufferAddress(state, index, ctx.Arg(inst, 2), soffset,
-	                                            ctx.Memory(inst).offset, stride, swizzle,
-	                                            field(word3, 21, 2));
-	const auto base        = PackU64(state, ctx.Arg(handle, 0), field(word1, 0, 16));
+	const auto address = CalculateBufferAddress(state, index, voffset, soffset, immediate, stride,
+	                                            swizzle, field(word3, 21, 2));
+	const auto base        = PackU64(state, word0, field(word1, 0, 16));
 	const auto raw_records = Binary(state, spv::OpISub, TypeU32(state), records, soffset);
 	return {
 	    .address          = Binary(state, spv::OpIAdd, TypeU64(state), base,
@@ -1076,7 +1081,7 @@ IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst
 	    .stride           = stride,
 	    .swizzle          = swizzle,
 	    .format           = field(word3, 12, 7),
-	    .selector         = ctx.Memory(inst).formatted ? field(word3, 0, 3) : 0u,
+	    .selector         = formatted ? field(word3, 0, 3) : 0u,
 	    .mode             = field(word3, 28, 2),
 	    .records          = records,
 	    .index_in_bounds  = Binary(state, spv::OpULessThan, TypeBool(state), index, records),
@@ -1084,6 +1089,15 @@ IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst
 	    .raw_records      = raw_records,
 	    .raw_index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, raw_records),
 	};
+}
+
+IndirectBufferAccess PrepareIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto& handle = *inst.Arg(0).ResolveInstruction();
+	const auto  word3  = ctx.Arg(handle, 3);
+	return IndirectBufferFromWords(ctx.state, ctx.Arg(handle, 0), ctx.Arg(handle, 1),
+	                               ctx.Arg(handle, 2), word3, IndirectBufferIndex(ctx, inst, word3),
+	                               ctx.Arg(inst, 2), ctx.Arg(inst, 3), ctx.Memory(inst).offset,
+	                               ctx.Memory(inst).formatted);
 }
 
 // IndirectBufferInBounds with the payload size as a U32 id (KYTY_INDIRECT_FORMAT_COMPACT: the
@@ -1165,9 +1179,10 @@ bool IndirectLoadCoherent(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return GetCodegenOptions().indirect_coherent && ctx.Memory(inst).coherent;
 }
 
-uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
-	auto& state = ctx.state;
-	const auto buffer = PrepareIndirectBuffer(ctx, inst);
+// The dwords of a raw load through a computed V# (each in range and FORMAT valid, else 0).
+uint32_t LoadIndirectBufferAccess(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                                  uint32_t components, bool coherent) {
+	auto&      state        = ctx.state;
 	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
 	                                  ConstantU32(state, 0));
 	const auto base         = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
@@ -1180,9 +1195,58 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		values[component] = EmitValueOrZeroIfCondition(
 		    state, AndCondition(state, valid_format,
 		                        IndirectBufferInBounds(state, buffer, component * 4u, 4u, false)),
-		    [&]() { return LoadBdaDword(ctx, address, IndirectLoadCoherent(ctx, inst)); });
+		    [&]() { return LoadBdaDword(ctx, address, coherent); });
 	}
 	return ConstructU32Composite(state, components, values);
+}
+
+// KYTY_INDIRECT_RAW_OUTLINE: the module's function for a raw load of this shape through a computed
+// V# (DefineIndirectRawFunctions), else 0. Key: the dword count (1-4) of an aligned-dword load
+// (LoadIndirectBuffer), 0x100 | bits (8/16/32) of a single element (LoadIndirectBufferElement);
+// | 0x1000 coherent.
+uint32_t IndirectRawFunction(const EmitterState& state, uint32_t key) {
+	const auto found = state.indirect_raw_functions.find(key);
+	return found == state.indirect_raw_functions.end() ? 0u : found->second;
+}
+
+uint32_t IndirectRawKey(uint32_t components, uint32_t /*bits*/, bool coherent) {
+	return components | (coherent ? 0x1000u : 0u);
+}
+
+uint32_t IndirectRawElementKey(uint32_t bits, bool coherent) {
+	return 0x100u | bits | (coherent ? 0x1000u : 0u);
+}
+
+// A call of an outlined raw load: (word0, word1, records, word3, index with ADD_TID, voffset +
+// immediate, soffset).
+uint32_t CallIndirectRawFunction(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t function,
+                                 uint32_t result_type) {
+	auto&       state  = ctx.state;
+	const auto& handle = *inst.Arg(0).ResolveInstruction();
+	const auto  word3  = ctx.Arg(handle, 3);
+	auto        voffset = ctx.Arg(inst, 2);
+	if (const auto immediate = ctx.Memory(inst).offset; immediate != 0u) {
+		voffset = Binary(state, spv::OpIAdd, TypeU32(state), voffset, ConstantU32(state, immediate));
+	}
+	const std::array<uint32_t, 7> arguments {ctx.Arg(handle, 0), ctx.Arg(handle, 1),
+	                                         ctx.Arg(handle, 2), word3,
+	                                         IndirectBufferIndex(ctx, inst, word3), voffset,
+	                                         ctx.Arg(inst, 3)};
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, result_type, result, function,
+	                          std::span<const uint32_t>(arguments));
+	return result;
+}
+
+uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	if (const auto function =
+	        IndirectRawFunction(state, IndirectRawKey(components, 32u, IndirectLoadCoherent(ctx, inst)));
+	    function != 0u) {
+		return CallIndirectRawFunction(ctx, inst, function, TypeU32Composite(state, components));
+	}
+	return LoadIndirectBufferAccess(ctx, PrepareIndirectBuffer(ctx, inst), components,
+	                                IndirectLoadCoherent(ctx, inst));
 }
 
 // One element of a raw access through a V# the shader computed (ResourceKind::IndirectBuffer):
@@ -1195,13 +1259,11 @@ struct IndirectBufferElement {
 	uint32_t in_bounds = 0; // bool
 };
 
-IndirectBufferElement IndirectBufferElementAccess(ValueEmitContext& ctx, const IR::Inst& inst,
-                                                  uint32_t component_offset, uint32_t payload) {
-	auto&       state   = ctx.state;
-	const auto& handle  = *inst.Arg(0).ResolveInstruction();
-	const auto  word1   = ctx.Arg(handle, 1);
-	const auto  records = ctx.Arg(handle, 2);
-	const auto  word3   = ctx.Arg(handle, 3);
+IndirectBufferElement IndirectBufferElementFromWords(EmitterState& state, uint32_t word0,
+                                                     uint32_t word1, uint32_t records,
+                                                     uint32_t word3, uint32_t index,
+                                                     uint32_t voffset, uint32_t soffset,
+                                                     uint32_t immediate, uint32_t payload) {
 	const auto  field   = [&](uint32_t word, uint32_t first, uint32_t count) {
 		return EmitBitFieldUExtract(state, word, ConstantU32(state, first),
 		                            ConstantU32(state, count));
@@ -1219,12 +1281,7 @@ IndirectBufferElement IndirectBufferElementAccess(ValueEmitContext& ctx, const I
 	const auto stride       = field(word1, 16, 14);
 	const auto swizzle      = AndCondition(state, nonzero(stride), nonzero(field(word1, 31, 1)));
 	const auto index_stride = field(word3, 21, 2);
-	const auto add_tid      = nonzero(field(word3, 23, 1));
-	const auto index =
-	    Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
-	           Select(state, TypeU32(state), add_tid, BufferLane(state), ConstantU32(state, 0)));
-	const auto soffset         = ctx.Arg(inst, 3);
-	const auto base            = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
+	const auto base            = DeviceAddressFromWords(state, word0, field(word1, 0, 16));
 	const auto valid_format    = nonzero(field(word3, 12, 7));
 	const auto mode            = field(word3, 28, 2);
 	const auto index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, records);
@@ -1233,8 +1290,7 @@ IndirectBufferElement IndirectBufferElementAccess(ValueEmitContext& ctx, const I
 	const auto raw_records = Binary(state, spv::OpISub, TypeU32(state), records, soffset);
 	const auto raw_index_in_bounds =
 	    Binary(state, spv::OpULessThan, TypeBool(state), index, raw_records);
-	const auto address = CalculateBufferAddress(state, index, ctx.Arg(inst, 2), soffset,
-	                                            ctx.Memory(inst).offset + component_offset, stride,
+	const auto address = CalculateBufferAddress(state, index, voffset, soffset, immediate, stride,
 	                                            swizzle, index_stride);
 	const auto structured_bounds =
 	    AndCondition(state, index_in_bounds,
@@ -1260,9 +1316,24 @@ IndirectBufferElement IndirectBufferElementAccess(ValueEmitContext& ctx, const I
 	};
 }
 
+IndirectBufferElement IndirectBufferElementAccess(ValueEmitContext& ctx, const IR::Inst& inst,
+                                                  uint32_t component_offset, uint32_t payload) {
+	const auto& handle = *inst.Arg(0).ResolveInstruction();
+	const auto  word3  = ctx.Arg(handle, 3);
+	return IndirectBufferElementFromWords(
+	    ctx.state, ctx.Arg(handle, 0), ctx.Arg(handle, 1), ctx.Arg(handle, 2), word3,
+	    IndirectBufferIndex(ctx, inst, word3), ctx.Arg(inst, 2), ctx.Arg(inst, 3),
+	    ctx.Memory(inst).offset + component_offset, payload);
+}
+
 // One raw BUFFER_LOAD_DWORD/UBYTE/USHORT through a V# the shader computed (KYTY_SRT_VARIANT_READS,
 // ResourceKind::IndirectBuffer), read through BDA; an out-of-range element reads 0.
 uint32_t LoadIndirectBufferElement(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t bits) {
+	const bool coherent = IndirectLoadCoherent(ctx, inst);
+	if (const auto function = IndirectRawFunction(ctx.state, IndirectRawElementKey(bits, coherent));
+	    function != 0u) {
+		return CallIndirectRawFunction(ctx, inst, function, TypeU32(ctx.state));
+	}
 	const auto access = IndirectBufferElementAccess(ctx, inst, 0u, bits / 8u);
 	return LoadBda(ctx, access.guest, access.in_bounds, bits, IndirectLoadCoherent(ctx, inst));
 }
@@ -3360,8 +3431,92 @@ uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
 }
 
+// KYTY_INDIRECT_RAW_OUTLINE: one DontInline function per raw-load shape through a computed V# the
+// program uses (an aligned-dword load of 1-4 dwords, or one 8/16/32-bit element), each the
+// inline path's code on its parameters (word0, word1, records, word3, index with ADD_TID, voffset +
+// immediate, soffset).
+static void DefineIndirectRawFunctions(EmitterState& state) {
+	if (!GetCodegenOptions().indirect_raw_outline || state.bda_pointer_function == 0) {
+		return;
+	}
+	struct Shape {
+		uint32_t components; // 0: one element of `bits`
+		uint32_t bits;
+		bool     coherent;
+	};
+	std::map<uint32_t, Shape> shapes;
+	const bool                coherent_option = GetCodegenOptions().indirect_coherent;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op         = inst.GetOpcode();
+			const auto components = IR::BufferComponentCount(op);
+			if (components == 0u || IR::BufferAccessOf(op) != IR::BufferAccess::Read) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= state.program.memory_info.size()) {
+				continue;
+			}
+			const auto& mem = state.program.memory_info[index];
+			if (mem.kind != IR::ResourceKind::IndirectBuffer || mem.formatted) {
+				continue;
+			}
+			const bool coherent = coherent_option && mem.coherent;
+			if (components == 1u) {
+				const uint32_t bits = inst.GetType() == IR::Type::U8    ? 8u
+				                      : inst.GetType() == IR::Type::U16 ? 16u
+				                                                        : 32u;
+				shapes.emplace(IndirectRawElementKey(bits, coherent), Shape {0u, bits, coherent});
+			}
+			if (components > 1u) {
+				shapes.emplace(IndirectRawKey(components, 32u, coherent),
+				               Shape {components, 32u, coherent});
+			}
+		}
+	}
+	const auto u32 = TypeU32(state);
+	for (const auto& [key, shape]: shapes) {
+		const auto result_type = shape.components == 0u ? u32 : TypeU32Composite(state, shape.components);
+		const std::array<uint32_t, 7> parameter_types {u32, u32, u32, u32, u32, u32, u32};
+		const auto function_type = state.builder.Type(spv::OpTypeFunction, result_type,
+		                                              std::span<const uint32_t>(parameter_types));
+		const auto function = state.builder.AllocateId();
+		std::string name = shape.components == 0u ? "indirect_raw_u" + std::to_string(shape.bits)
+		                                          : "indirect_raw_x" + std::to_string(shape.components);
+		if (shape.coherent) {
+			name += "_coherent";
+		}
+		state.builder.AddName(function, name.c_str());
+		state.builder.AddFunction(spv::OpFunction, result_type, function,
+		                          spv::FunctionControlDontInlineMask, function_type);
+		std::array<uint32_t, 7> parameters {};
+		for (auto& id: parameters) {
+			id = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionParameter, u32, id);
+		}
+		EmitLabel(state, state.builder.AllocateId());
+		ValueEmitContext ctx(state);
+		const auto [word0, word1, records, word3, index, voffset, soffset] = parameters;
+		uint32_t value = 0;
+		if (shape.components == 0u) {
+			const auto access = IndirectBufferElementFromWords(state, word0, word1, records, word3,
+			                                                   index, voffset, soffset, 0u,
+			                                                   shape.bits / 8u);
+			value = LoadBda(ctx, access.guest, access.in_bounds, shape.bits, shape.coherent);
+		} else {
+			const auto buffer = IndirectBufferFromWords(state, word0, word1, records, word3, index,
+			                                            voffset, soffset, 0u, false);
+			value = LoadIndirectBufferAccess(ctx, buffer, shape.components, shape.coherent);
+		}
+		state.builder.AddFunction(spv::OpReturnValue, value);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		state.indirect_raw_functions[key] = function;
+	}
+}
+
 void DefineIndirectFormatFunction(EmitterState& state) {
 	DefineIndirectFormatFunctionImpl(state);
+	DefineIndirectRawFunctions(state);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

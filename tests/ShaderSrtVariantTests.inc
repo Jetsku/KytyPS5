@@ -164,7 +164,10 @@ TestCase ScalarLoadsThroughLoopCarriedRecords() {
 TestCase RawLoadsThroughGpuSelectedDescriptors() {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000128000000ull;
-  enum Load : u32 { Ubyte = 0x08, Sbyte = 0x09, Ushort = 0x0a, Sshort = 0x0b, Dword = 0x0c };
+  enum Load : u32 {
+    Ubyte = 0x08, Sbyte = 0x09, Ushort = 0x0a, Sshort = 0x0b, Dword = 0x0c, X2 = 0x0d, X4 = 0x0e,
+    X3 = 0x0f
+  };
   struct LoadCase {
     u32 op, mode, stride, records, index, voffset, soffset, inst_offset;
     bool idxen, invalid_format = false;
@@ -188,6 +191,12 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
       {Dword, 2, 0, 1, 0, 20, 0, 0, false},   // num_records != 0: no bounds
       {Dword, 2, 0, 0, 0, 0, 0, 0, false},    // num_records == 0: 0
       {Dword, 3, 0, 32, 0, 0, 0, 0, false, true}, // invalid format: 0
+      // Multi-dword loads: each dword has its own range check.
+      {X4, 3, 0, 16, 0, 0, 0, 0, false},      // all four in
+      {X4, 3, 0, 16, 0, 8, 0, 0, false},      // dwords 0-1 in, 2-3 out
+      {X2, 3, 0, 16, 0, 4, 4, 0, false},      // SOFFSET 4: 4 + 8 <= 16 - 4: both in
+      {X3, 0, 8, 3, 1, 0, 0, 4, true},        // structured: offset 4 in, 8 and 12 >= stride: 0
+      {X2, 3, 0, 32, 0, 0, 0, 0, false, true}, // invalid format: 0
   };
   constexpr u32 Count = static_cast<u32>(std::size(cases));
   const auto byte_at = [](u32 i, u32 b) { return static_cast<uint8_t>(0x80u + i * 16u + b * 5u); };
@@ -207,9 +216,11 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
       word |= static_cast<u32>(byte_at(i, b)) << ((b % 4u) * 8u);
     }
   }
+  u32 slot = 0;
   for (u32 i = 0; i < Count; ++i) {
     const u32 selected = Count - 1 - i;
     const auto &input = cases[selected];
+    const u32 dwords = input.op == X2 ? 2u : input.op == X3 ? 3u : input.op == X4 ? 4u : 1u;
     test.initial[64 + i] = selected;
     AppendVMovU32(&test.code, 30, (64 + i) * 4);
     AppendBufferLoadDword(&test.code, 0, 30);
@@ -222,36 +233,43 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
     AppendVMovU32(&test.code, 2, input.idxen ? input.index : input.voffset);
     AppendVMovU32(&test.code, 3, input.voffset);
     test.code.push_back(EncodeMubuf0(input.op, input.inst_offset, input.idxen, true));
-    test.code.push_back(EncodeMubuf1(1, 2, 2, 22)); // v1, s[8:11], v[2:3] or v2, s22
-    AppendStoreVgpr(&test.code, 1, i);
-    // Reference: RDNA2 8.1.5 linear addressing and range checks.
-    const u32 bytes = input.op == Dword ? 4u : (input.op == Ushort || input.op == Sshort) ? 2u : 1u;
-    const u32 offset = input.voffset + input.inst_offset;
-    const u32 record = input.idxen ? input.index * input.stride : 0u;
-    bool in = !input.invalid_format;
-    switch (input.mode) {
-      case 0: in = in && input.index < input.records && offset < input.stride; break;
-      case 1: in = in && input.index < input.records; break;
-      case 2: in = in && input.records != 0; break;
-      default:
-        in = in && input.soffset <= input.records && offset + bytes <= input.records - input.soffset;
-        break;
+    // v1 (one dword) or v[4..7], s[8:11], v[2:3] or v2, s22
+    test.code.push_back(EncodeMubuf1(dwords == 1u ? 1u : 4u, 2, 2, 22));
+    for (u32 c = 0; c < dwords; ++c) {
+      AppendStoreVgpr(&test.code, dwords == 1u ? 1u : 4u + c, slot++);
     }
-    const u32 first = input.soffset + record + offset;
-    u32 value = 0;
-    if (in) {
-      for (u32 b = 0; b < bytes; ++b) {
-        value |= static_cast<u32>(byte_at(selected, first + b)) << (b * 8u);
+    // Reference: RDNA2 8.1.5 linear addressing and range checks, per dword.
+    const u32 bytes = dwords > 1u || input.op == Dword ? 4u
+                      : (input.op == Ushort || input.op == Sshort) ? 2u : 1u;
+    for (u32 c = 0; c < dwords; ++c) {
+      const u32 offset = input.voffset + input.inst_offset + c * 4u;
+      const u32 record = input.idxen ? input.index * input.stride : 0u;
+      bool in = !input.invalid_format;
+      switch (input.mode) {
+        case 0: in = in && input.index < input.records && offset < input.stride; break;
+        case 1: in = in && input.index < input.records; break;
+        case 2: in = in && input.records != 0; break;
+        default:
+          in = in && input.soffset <= input.records && offset + bytes <= input.records - input.soffset;
+          break;
       }
-      if (input.op == Sbyte) value = static_cast<u32>(static_cast<int32_t>(static_cast<int8_t>(value)));
-      if (input.op == Sshort) value = static_cast<u32>(static_cast<int32_t>(static_cast<int16_t>(value)));
+      const u32 first = input.soffset + record + offset;
+      u32 value = 0;
+      if (in) {
+        for (u32 b = 0; b < bytes; ++b) {
+          value |= static_cast<u32>(byte_at(selected, first + b)) << (b * 8u);
+        }
+        if (input.op == Sbyte) value = static_cast<u32>(static_cast<int32_t>(static_cast<int8_t>(value)));
+        if (input.op == Sshort) value = static_cast<u32>(static_cast<int32_t>(static_cast<int16_t>(value)));
+      }
+      test.expected.push_back(value);
     }
-    test.expected.push_back(value);
   }
   AppendEnd(&test.code);
   test.bda_mappings = {{GuestBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_UBYTE,
                   O::BUFFER_LOAD_SBYTE, O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_SSHORT,
+                  O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3, O::BUFFER_LOAD_DWORDX4,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
@@ -1152,6 +1170,17 @@ void RunAll(VulkanHarness *vulkan) {
     RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
     RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
     RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
+    {
+      // KYTY_INDIRECT_RAW_OUTLINE: the same loads through the module's outlined functions.
+      auto outline = skipping;
+      outline.indirect_raw_outline = true;
+      ScopedCodegenOptions outline_scope(outline);
+      auto test = RawLoadsThroughGpuSelectedDescriptors();
+      test.name = "RawLoadsOutlined";
+      test.required_spirv.push_back("indirect_raw_x4");
+      test.required_spirv.push_back("indirect_raw_u8");
+      RunCase(vulkan, test);
+    }
     RunCase(vulkan, FormattedLoadsThroughGpuSelectedDescriptors());
     {
       // KYTY_INDIRECT_FORMAT_COMPACT: the table-driven decoder gives the same channels.
