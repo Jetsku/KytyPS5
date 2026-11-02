@@ -305,6 +305,18 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
+	if (zero && ctx.other_half != nullptr && !ctx.state.split_wave &&
+	    GetCodegenOptions().wave64_active_zero) {
+		// KYTY_WAVE64_ACTIVE_ZERO: "zero" holds when every running host invocation agrees in both
+		// halves; invocations that are not running have no ballot bit (CodegenOptions.h).
+		const auto active      = ctx.Ballot(IR::Value(true));
+		const auto active_word = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), active_word,
+		                              active, 0);
+		const auto low_all  = Binary(ctx.state, spv::OpIEqual, TypeBool(ctx.state), low, active_word);
+		const auto high_all = Binary(ctx.state, spv::OpIEqual, TypeBool(ctx.state), high, active_word);
+		return Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), low_all, high_all);
+	}
 	const auto combined =
 	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
 	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),

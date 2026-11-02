@@ -294,6 +294,14 @@ struct CodegenOptions {
 	// ("computes a descriptor at runtime that has no BDA path"). Exact; only programs that were
 	// skipped change.
 	bool heap_key_mask = false;
+	// KYTY_WAVE64_ACTIVE_ZERO=1 (default 0; on in the PPSA26344 title preset; adapted from
+	// peepostare's YOTEI-BRANCH 9984ebea7): when one host invocation runs both halves of a wave64
+	// (other_half), an EXECZ/VCCZ/SCCZ branch holds when both halves' ballots equal the host
+	// subgroup's active mask instead of all ones. A host subgroup with invocations that are not
+	// running (a partial wave, invocations that already returned) has no ballot bit for them, so the
+	// all-ones compare never held and a loop exiting on such a branch spun forever (a GPU hang).
+	// Identical results when every host invocation is active; one extra ballot per such branch.
+	bool wave64_active_zero = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has

@@ -173,6 +173,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.heap_key_mask) {
 		b.Text("heap_key_mask");
 	}
+	if (options.wave64_active_zero) {
+		b.Text("wave64_active_zero");
+	}
 	if (options.bindless_3d_as_array) {
 		b.Text("bindless_3d_as_array");
 	}
