@@ -2383,6 +2383,12 @@ void RuntimeLinker::Relocate(Program* program) {
 	if (g_invalid_memory == 0) {
 		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory", true);
+		// An internal fault sentinel, not a guest ABI address: the ray tracing driver runtime
+		// (KYTY_RT_HW, initialized before the guest reservation) can own the preferred address.
+		if (g_invalid_memory == 0) {
+			g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+			    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory");
+		}
 		EXIT_NOT_IMPLEMENTED(g_invalid_memory == 0);
 	}
 

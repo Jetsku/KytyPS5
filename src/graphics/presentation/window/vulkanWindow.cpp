@@ -1500,6 +1500,33 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
 	}
+	// KYTY_RT_HW: host ray queries over acceleration structures that mirror the guest BVHs
+	// (NativeRayTracing). Without the features the switch is cleared before any shader compiles.
+	vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure {};
+	vk::PhysicalDeviceRayQueryFeaturesKHR              ray_query {};
+	if (HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	    HasExtension(device_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceAccelerationStructureFeaturesKHR supported_acceleration {};
+		vk::PhysicalDeviceRayQueryFeaturesKHR              supported_query {};
+		supported_acceleration.pNext = &supported_query;
+		vk::PhysicalDeviceFeatures2 rt_query {};
+		rt_query.pNext = &supported_acceleration;
+		physical_device.getFeatures2(&rt_query);
+		if (supported_acceleration.accelerationStructure && supported_query.rayQuery) {
+			acceleration_structure.accelerationStructure = VK_TRUE;
+			ray_query.rayQuery                           = VK_TRUE;
+			acceleration_structure.pNext                 = &ray_query;
+			ray_query.pNext                              = const_cast<void*>(create_info.pNext);
+			create_info.pNext                            = &acceleration_structure;
+			graphics.native_ray_tracing_enabled          = true;
+		}
+	}
+	if (ShaderRecompiler::GetCodegenOptions().rt_hw && !graphics.native_ray_tracing_enabled) {
+		auto options  = ShaderRecompiler::GetCodegenOptions();
+		options.rt_hw = options.rt_hw_verify = false;
+		ShaderRecompiler::SetCodegenOptions(options);
+	}
+	LOGF("Vulkan native ray tracing (KYTY_RT_HW): %s\n", graphics.native_ray_tracing_enabled ? "enabled" : "off");
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1511,6 +1538,102 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		if (graphics.native_ray_tracing_enabled) {
+			// KYTY_RT_HW diagnostics: the extensions and feature structures of the failed device,
+			// and which other extension, left out, lets a device with ray tracing be created.
+			std::string text;
+			for (const auto* name: device_extensions) {
+				text += std::string(name) + " ";
+			}
+			LOGF("vkCreateDevice extensions: %s\n", text.c_str());
+			text.clear();
+			for (const auto* next = static_cast<const vk::BaseInStructure*>(create_info.pNext); next != nullptr;
+			     next = next->pNext) {
+				text += vk::to_string(next->sType) + " ";
+			}
+			LOGF("vkCreateDevice features: %s\n", text.c_str());
+			for (size_t skip = 0; skip < device_extensions.size(); skip++) {
+				const std::string_view name = device_extensions[skip];
+				if (name == VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME || name == VK_KHR_RAY_QUERY_EXTENSION_NAME ||
+				    name == VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) {
+					continue;
+				}
+				auto extensions = device_extensions;
+				extensions.erase(extensions.begin() + static_cast<ptrdiff_t>(skip));
+				auto probe_info                    = create_info;
+				probe_info.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
+				probe_info.ppEnabledExtensionNames = extensions.data();
+				vk::Device probe = nullptr;
+				if (physical_device.createDevice(&probe_info, nullptr, &probe) == vk::Result::eSuccess) {
+					LOGF("vkCreateDevice with ray tracing succeeds without %s\n", device_extensions[skip]);
+					probe.destroy();
+				}
+			}
+			// The same with one feature structure left out of the chain at a time.
+			auto* head = reinterpret_cast<vk::BaseOutStructure*>(const_cast<void*>(create_info.pNext));
+			for (vk::BaseOutStructure *previous = nullptr, *current = head; current != nullptr;
+			     previous = current, current = current->pNext) {
+				auto probe_info = create_info;
+				if (previous == nullptr) {
+					probe_info.pNext = current->pNext;
+				} else {
+					previous->pNext = current->pNext;
+				}
+				vk::Device probe = nullptr;
+				const auto probe_result = physical_device.createDevice(&probe_info, nullptr, &probe);
+				if (previous != nullptr) {
+					previous->pNext = current;
+				}
+				if (probe_result == vk::Result::eSuccess) {
+					LOGF("vkCreateDevice with ray tracing succeeds without %s\n", vk::to_string(current->sType).c_str());
+					probe.destroy();
+				}
+			}
+			// And with the core feature structures only (Vulkan 1.1-1.3 and ray tracing).
+			{
+				std::vector<vk::BaseOutStructure*> kept;
+				for (auto* current = head; current != nullptr; current = current->pNext) {
+					if (current->sType == vk::StructureType::ePhysicalDeviceVulkan11Features ||
+					    current->sType == vk::StructureType::ePhysicalDeviceVulkan12Features ||
+					    current->sType == vk::StructureType::ePhysicalDeviceVulkan13Features ||
+					    current->sType == vk::StructureType::ePhysicalDeviceAccelerationStructureFeaturesKHR ||
+					    current->sType == vk::StructureType::ePhysicalDeviceRayQueryFeaturesKHR) {
+						kept.push_back(current);
+					}
+				}
+				std::vector<vk::BaseOutStructure*> nodes;
+				for (auto* current = head; current != nullptr; current = current->pNext) {
+					nodes.push_back(current);
+				}
+				for (size_t i = 0; i < kept.size(); i++) {
+					kept[i]->pNext = i + 1 < kept.size() ? kept[i + 1] : nullptr;
+				}
+				auto probe_info  = create_info;
+				probe_info.pNext = kept.empty() ? nullptr : kept.front();
+				const std::vector<const char*> core {VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+				                                     VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+				                                     VK_KHR_RAY_QUERY_EXTENSION_NAME,
+				                                     VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
+				probe_info.enabledExtensionCount   = static_cast<uint32_t>(core.size());
+				probe_info.ppEnabledExtensionNames = core.data();
+				vk::Device probe = nullptr;
+				const auto probe_result = physical_device.createDevice(&probe_info, nullptr, &probe);
+				LOGF("vkCreateDevice with ray tracing, core features and extensions only: %s\n",
+				     vk::to_string(probe_result).c_str());
+				if (probe_result == vk::Result::eSuccess) {
+					probe.destroy();
+				}
+				probe_info.pEnabledFeatures = nullptr;
+				const auto bare = physical_device.createDevice(&probe_info, nullptr, &probe);
+				LOGF("... and without VkPhysicalDeviceFeatures: %s\n", vk::to_string(bare).c_str());
+				if (bare == vk::Result::eSuccess) {
+					probe.destroy();
+				}
+				for (size_t i = 0; i < nodes.size(); i++) {
+					nodes[i]->pNext = i + 1 < nodes.size() ? nodes[i + 1] : nullptr;
+				}
+			}
+		}
 		return nullptr;
 	}
 
@@ -2123,6 +2246,15 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 #endif
+		// KYTY_RT_HW: host ray tracing of guest BVHs (NativeRayTracing); off by default.
+		if (ShaderRecompiler::GetCodegenOptions().rt_hw &&
+		    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+		}
 		// S_MEMREALTIME reads a shader clock (KYTY_REALTIME_CLOCK, default on; VulkanCreateDevice).
 		if (ShaderRecompiler::GetCodegenOptions().realtime_clock &&
 		    HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {

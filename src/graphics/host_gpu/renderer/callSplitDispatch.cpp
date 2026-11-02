@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -451,6 +453,7 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 	// One program of the chain: its preparation through the pipeline cache as a dispatch of the
 	// kernel, then the dispatch (direct: the kernel's workgroups; indirect: a bin pass's command).
 	Wait       last_wait = Wait::None; // why the latest dispatch() returned false
+	bool       rt_prepared = false; // KYTY_RT_HW: NativeRayTracing::Prepare ran for this chain
 	// `target`: a callee program's callee (its SplitTargetCompare parameter), 0 for the others.
 	const auto dispatch  = [&](const CallSplit::Code& code, uint64_t list, const vk::Buffer* indirect,
 	                          uint64_t indirect_offset, uint64_t target = 0) {
@@ -522,6 +525,14 @@ void RenderExecutor::DispatchCallSplit(CommandBuffer& buffer, const ShaderComput
 		FindBuffers(bindings);
 		if (program.info.uses_dma) {
 			m_context.PrepareBda();
+		}
+		// KYTY_RT_HW: the host acceleration structures, once per chain (the guest TLAS does not change
+		// between its programs).
+		if (program.info.ray_query_sites != 0 && !rt_prepared && info.stage.resources != nullptr) {
+			rt_prepared = true;
+			PrepareNativeRayTracingDispatch(m_context.GetNativeRayTracing(), buffer.Handle(), program.info,
+			                                info.stage.resources->user_data, m_context.GetGpu().GetFrameNum(),
+		                                [this](uint64_t address, uint64_t size) { return m_context.IsMapped(address, size); });
 		}
 		if (program.info.bda_writes) {
 			m_context.GetBufferCache().PrepareBdaWrites();

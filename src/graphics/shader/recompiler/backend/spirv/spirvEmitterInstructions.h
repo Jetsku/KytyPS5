@@ -290,6 +290,20 @@ inline constexpr auto EmitStoreAddressU32       = EmitStoreMemory;
 // IMAGE_BVH*_INTERSECT_RAY software lowering and stub (spirvEmitterRayTracing.cpp).
 uint32_t              EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhIntersectRayStub(EmitterState& state, uint32_t node_lo);
+// Native ray tracing (KYTY_RT_HW, spirvEmitterRayQuery.cpp).
+uint32_t              EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryMatch(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryFlag(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQuerySave(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryResolve(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryExit(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryKeep(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryKept(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryCount(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  DeclareRayQueryVariables(EmitterState& state);
+void                  InitializeRayQueryVariables(EmitterState& state);
 inline constexpr auto EmitLoadBufferU8          = EmitLoadMemory;
 inline constexpr auto EmitLoadBufferU16         = EmitLoadMemory;
 inline constexpr auto EmitLoadBufferU32         = EmitLoadMemory;

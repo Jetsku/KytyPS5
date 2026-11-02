@@ -90,6 +90,12 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// KYTY_RT_HW: the entry after the last page holds the device address of the native ray tracing
+	// context (NativeRayTracing); guest addresses never reach it (they index pages below
+	// CACHING_NUMPAGES). The page table buffer has room for it (BDA_PAGETABLE_ALLOCATION: one sparse
+	// block more; EnsureBdaPageTableEntry makes it resident in a sparse table).
+	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
+	static constexpr uint64_t BDA_PAGETABLE_ALLOCATION = BDA_PAGETABLE_SIZE + 65536;
 	// Fault buffer layout: the fault bitmap (1 bit per page). With KYTY_BDA_WRITES it grows by the
 	// written-page bitmap of the same shape, the dropped-write counter (writes to pages without a
 	// cache buffer) and the store log (KYTY_BDA_STORE_LOG: a u32 count, then entries of 4 words
@@ -218,6 +224,8 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
+	// The page table entry index (one past the guest pages: NATIVE_RT_CONTEXT_PAGE) has memory.
+	void EnsureBdaPageTableEntry(uint64_t index);
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);

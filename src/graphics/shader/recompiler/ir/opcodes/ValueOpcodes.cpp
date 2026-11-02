@@ -100,6 +100,18 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::CallStateProbe:
 		case ValueOpcode::CallStateReport:
 		case ValueOpcode::Barrier:
+		// The ray queries keep per-lane state between these operations.
+		case ValueOpcode::RayQueryInit:
+		case ValueOpcode::RayQueryNext:
+		case ValueOpcode::RayQueryMatch:
+		case ValueOpcode::RayQueryCandidate:
+		case ValueOpcode::RayQueryFlag:
+		case ValueOpcode::RayQuerySave:
+		case ValueOpcode::RayQueryResolve:
+		case ValueOpcode::RayQueryExit:
+		case ValueOpcode::RayQueryKeep:
+		case ValueOpcode::RayQueryKept:
+		case ValueOpcode::RayQueryCount:
 		case ValueOpcode::SharedMemoryBarrier: return true;
 		default: return false;
 	}

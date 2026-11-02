@@ -587,6 +587,10 @@ int ValidateBvhShaderFiles(int argc, char **argv) {
         info.thread_ids_num = 3;
         info.group_id[0] = info.group_id[1] = info.group_id[2] = true;
         info.workgroup_register = 16;
+        // KYTY_HARNESS_SCRATCH=<dwords per thread> (default 0): programs with scratch accesses.
+        if (const auto *scratch = std::getenv("KYTY_HARNESS_SCRATCH"); scratch != nullptr) {
+          info.scratch_size_dwords = static_cast<uint32_t>(std::strtoul(scratch, nullptr, 10));
+        }
         auto options = MakeCompileOptions(ShaderType::Compute);
         options.input_info.compute = &info;
         options.wave_size = wave;

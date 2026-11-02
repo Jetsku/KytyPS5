@@ -14,6 +14,8 @@
 #include "common/u59Preset.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -116,6 +118,12 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
+	// KYTY_RT_HW: the Windows ray tracing driver runtime needs low virtual addresses that the guest
+	// reservation below would own (vkCreateDevice with ray tracing then fails with
+	// VK_ERROR_INITIALIZATION_FAILED): a temporary ray tracing device initializes it first.
+	if (Libs::Graphics::ShaderRecompiler::GetCodegenOptions().rt_hw) {
+		Libs::Graphics::PrepareNativeRayTracingRuntime(cfg.gpu_index);
+	}
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
 	subsystems.Initialize<Libs::Controller::Lifecycle>();

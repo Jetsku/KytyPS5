@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/watchRange.h"
 #include "common/debugCounters.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -1093,6 +1094,12 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	// KYTY_RT_HW: the host acceleration structures of the program's guest TLAS.
+	if (program.info.ray_query_sites != 0) {
+		PrepareNativeRayTracingDispatch(m_context.GetNativeRayTracing(), buffer.Handle(), program.info,
+		                                input_info.stage.resources->user_data, m_context.GetGpu().GetFrameNum(),
+		                                [this](uint64_t address, uint64_t size) { return m_context.IsMapped(address, size); });
+	}
 	if (program.info.uses_bvh) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
 	}
@@ -1495,6 +1502,12 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	WatchRange::NoteDispatch(program.shader_hash, async_compute, 0, 0, 0, true);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
+	}
+	// KYTY_RT_HW: the host acceleration structures of the program's guest TLAS.
+	if (program.info.ray_query_sites != 0) {
+		PrepareNativeRayTracingDispatch(m_context.GetNativeRayTracing(), buffer.Handle(), program.info,
+		                                input_info.stage.resources->user_data, m_context.GetGpu().GetFrameNum(),
+		                                [this](uint64_t address, uint64_t size) { return m_context.IsMapped(address, size); });
 	}
 	if (program.info.uses_bvh) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);

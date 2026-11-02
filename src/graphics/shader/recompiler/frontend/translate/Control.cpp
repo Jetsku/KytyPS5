@@ -278,7 +278,8 @@ void Translator::S_INST_PREFETCH() {
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	// In a call-split program the guest code sits behind the split header: the guest pc is the
 	// program pc minus that prefix (CallSplit::Translation::guest_pc_offset).
-	uint64_t pc = inst.pc;
+	// The native ray tracing patch moves guest instructions: guest_pc is where this one was.
+	uint64_t pc = inst.guest_pc != UINT32_MAX ? inst.guest_pc : inst.pc;
 	if (const auto* split = CallSplit::Current(); split != nullptr && pc >= split->guest_pc_offset) {
 		pc -= split->guest_pc_offset;
 	}

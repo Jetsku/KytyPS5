@@ -273,6 +273,19 @@ VALUE_OPCODE(BvhIntersectRay, U32x4, AddressResource, U32x4, U32, U32, U32, U32,
 // KYTY_RT_STUB: the "no intersection" result for node pointer (low dword). Opaque on purpose, so
 // traversal code after it is not folded away (which reshapes the CFG the game was compiled to).
 VALUE_OPCODE(BvhIntersectRayStub, U32x4, U32)
+// Native ray tracing (KYTY_RT_HW, RayTracingPatch.h, ir/RayQuery.h); the flags hold the site and
+// the variant. Init: origin xyz, direction xyz, t max, cull mask (f32 bits), TLAS header pair, EXEC.
+VALUE_OPCODE(RayQueryInit, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(RayQueryNext, U32x4)
+VALUE_OPCODE(RayQueryMatch, U1)
+VALUE_OPCODE(RayQueryCandidate, U32)
+VALUE_OPCODE(RayQueryFlag, U1)
+VALUE_OPCODE(RayQuerySave, Void, U32, U32, U32)
+VALUE_OPCODE(RayQueryResolve, Void, U32, U32, U32)
+VALUE_OPCODE(RayQueryExit, Void)
+VALUE_OPCODE(RayQueryKeep, Void, U32)
+VALUE_OPCODE(RayQueryKept, U32)
+VALUE_OPCODE(RayQueryCount, Void, U1)
 VALUE_OPCODE(LoadBufferU8, U8, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU16, U16, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU32, U32, BufferResource, U32, U32, U32, U1)

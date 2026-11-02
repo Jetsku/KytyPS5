@@ -469,6 +469,14 @@ struct CodegenOptions {
 	// [2^k, 2^(k+1)), at end - RtNodeStatsGdsFromEnd - k), reported at flips. A diagnostic for the
 	// budget.
 	bool rt_node_stats = false;
+	// KYTY_RT_HW=1 (default off; needs VK_KHR_ray_query, see NativeRayTracing): compute programs
+	// whose sce::Psr traversal loops RayTracingPatch.h recognizes trace them with host ray queries
+	// over acceleration structures that mirror the guest BVHs (the guest code still decides each
+	// hit). The guest loop stays as the fallback. Cleared at startup when the device cannot.
+	bool rt_hw = false;
+	// KYTY_RT_HW_VERIFY=1 (with KYTY_RT_HW): each patched traversal also runs the guest loop and
+	// counts per ray where the results differ (NativeRayTracing reports the counters).
+	bool rt_hw_verify = false;
 	// KYTY_WAVE32_CLUSTERS=0|auto|force (default auto), see Wave32Clusters. A wave32 vertex, mesh or
 	// pixel program on a host subgroup wider than its wave (AMD: 64 in those stages, which cannot
 	// require 32) shares the subgroup with another guest wave. Without clusters its EXEC, VCC and

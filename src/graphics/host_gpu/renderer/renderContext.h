@@ -113,6 +113,8 @@ private:
 	RenderMutex& m_mutex;
 };
 
+class NativeRayTracing;
+
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext& graphics);
@@ -139,6 +141,8 @@ public:
 	OcclusionCounter&   GetOcclusionCounter() { return m_occlusion_counter; }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
 	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
+	// KYTY_RT_HW (nativeRayTracing.h): created at its first use, on the GPU thread.
+	NativeRayTracing&   GetNativeRayTracing();
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	// Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN, adapted from usa-ratt/KytyPS5-GT7
@@ -222,6 +226,7 @@ private:
 	std::shared_mutex         m_gpu_notify_mutex;
 	GuestGpu*                 m_gpu_notify = nullptr;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
+	std::unique_ptr<NativeRayTracing> m_native_ray_tracing;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
 
