@@ -280,6 +280,14 @@ struct CodegenOptions {
 	// the region of the outer selection externally entered (Wolverine's 0x09161b28ae4039bb). The
 	// copies run the same instructions; nothing after them can tell them apart.
 	bool cfg_clone_exits = false;
+	// KYTY_CFG_CLONE_REGIONS=1 (default 0): before a CFG falls back to the dispatcher loop, a
+	// selection whose region is also entered from outside the selection (a jump into the middle of
+	// an if) gets a private copy of the entered part for the outside predecessors, and
+	// structurization is retried (ShaderCFG.cpp CloneEnteredRegion: loop headers and back-edge
+	// targets are never copied; at most as many instructions as the program has). The copies run
+	// the same instructions. Ghost of Yotei's CS 0x2b6417d1a9a30084 ran as a 158-block dispatcher
+	// loop for ~3 s of GPU time per frame.
+	bool cfg_clone_regions = false;
 	// KYTY_STORAGE_LENGTH_ZERO=1 (default 0): a storage-buffer OpArrayLength of 0 counts as unbounded
 	// (0xffffffff), leaving the bounds check to the device. NVIDIA returns 0 for a binding of 2 GiB or
 	// more (Insomniac binds its whole vertex pool, 3 GiB, through one V#); with this switch the

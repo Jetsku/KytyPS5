@@ -74,6 +74,7 @@ CodegenOptions FromEnvironment() {
 		options.indirect_format_fast = fast[0] != '\0' && std::strcmp(fast, "0") != 0;
 	}
 	options.cfg_clone_exits   = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
+	options.cfg_clone_regions = EnvFlag("KYTY_CFG_CLONE_REGIONS", options.cfg_clone_regions);
 	options.heap_key_mask     = EnvFlag("KYTY_HEAP_KEY_MASK", options.heap_key_mask);
 	options.wave64_active_zero =
 	    EnvFlag("KYTY_WAVE64_ACTIVE_ZERO", options.wave64_active_zero);

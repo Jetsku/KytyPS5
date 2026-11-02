@@ -4065,6 +4065,17 @@ struct PipelineCache::ProgramCache {
 			lock.unlock();
 		}
 
+		// A precompile replay brings the specialization the journal stored, recorded by an earlier
+		// run that may have used other codegen switches (another preset): when its resource counts
+		// do not fit this translation's plan, the entry is skipped (ApplyResourceSpecialization
+		// would stop the emulator; Ghost of Yotei's CS 0x8a7c27138dda831d after a preset change).
+		if (replay && (source->resource_plan.info.buffers.size() != prep.specialization.buffers.size() ||
+		               source->resource_plan.info.images.size() > prep.specialization.images.size())) {
+			lock.lock();
+			FinishInFlight(record);
+			return nullptr;
+		}
+
 		// Only for a source whose plan was reloaded from a stale record (the stored verdict was
 		// not skip-dispatch, a fresh translation is): nothing can be emitted, so the source is
 		// skipped from here on, as a fresh run would skip it.

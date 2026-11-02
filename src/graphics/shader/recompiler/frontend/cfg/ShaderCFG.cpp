@@ -1674,6 +1674,92 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
+// KYTY_CFG_CLONE_REGIONS (CodegenOptions::cfg_clone_regions): set while Structurize retries a
+// graph that failed every other way. A selection region that a block outside the selection
+// also enters (a jump into the middle of an if) then gets a private copy of the entered part
+// for those outside predecessors, instead of failing structurization.
+thread_local bool     g_clone_regions           = false;
+thread_local uint32_t g_clone_instructions_left = 0;
+
+// Copies the blocks of `region` reachable from `entered` (staying inside the region) once and
+// sends the predecessors of `entered` outside the region (other than the header) to the copy.
+// Edges from the copied part to blocks outside it keep their original targets. Refuses loop
+// headers, back-edge targets and indirect branches in the copied part.
+bool CloneEnteredRegion(Graph& graph, uint32_t header_id, const std::vector<uint32_t>& region,
+                        uint32_t entered) {
+	std::vector<uint32_t> shared;
+	std::vector<uint32_t> pending = {entered};
+	while (!pending.empty()) {
+		const auto id = pending.back();
+		pending.pop_back();
+		if (!Contains(region, id) || Contains(shared, id)) {
+			continue;
+		}
+		const auto* block = graph.FindBlock(id);
+		if (block == nullptr) {
+			return false;
+		}
+		shared.push_back(id);
+		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+	}
+	SortUnique(shared);
+	uint32_t instructions = 0;
+	for (const auto id: shared) {
+		const auto* block = graph.FindBlock(id);
+		if (id == header_id || id == graph.entry_block ||
+		    block->terminator.kind == TerminatorKind::IndirectBranch ||
+		    block->terminator.kind == TerminatorKind::Unsupported) {
+			return false;
+		}
+		if (std::ranges::any_of(graph.natural_loops, [&](const auto& loop) { return loop.header == id; }) ||
+		    std::ranges::any_of(graph.back_edges, [&](const auto& edge) { return edge.to == id; })) {
+			return false;
+		}
+		instructions += block->inst_end - block->inst_begin;
+	}
+	if (instructions > g_clone_instructions_left) {
+		return false;
+	}
+	std::vector<uint32_t> outside;
+	for (const auto predecessor: graph.FindBlock(entered)->predecessors) {
+		if (predecessor != header_id && !Contains(region, predecessor)) {
+			AddUnique(outside, predecessor);
+		}
+	}
+	if (outside.empty() ||
+	    std::ranges::any_of(outside, [&](uint32_t id) {
+		    const auto* block = graph.FindBlock(id);
+		    return block == nullptr || block->terminator.kind == TerminatorKind::IndirectBranch;
+	    })) {
+		return false;
+	}
+	g_clone_instructions_left -= instructions;
+
+	const auto base = static_cast<uint32_t>(graph.blocks.size());
+	const auto copy_of = [&](uint32_t id) {
+		const auto at = std::ranges::lower_bound(shared, id);
+		return base + static_cast<uint32_t>(at - shared.begin());
+	};
+	for (const auto id: shared) {
+		BasicBlock copy = *graph.FindBlock(id);
+		copy.id         = copy_of(id);
+		copy.predecessors.clear();
+		copy.dominators.clear();
+		copy.post_dominators.clear();
+		for (const auto target: shared) {
+			ReplaceValue(copy.successors, target, copy_of(target));
+			ReplaceTerminatorTarget(copy.terminator, target, copy_of(target));
+		}
+		graph.blocks.push_back(std::move(copy));
+	}
+	for (const auto id: outside) {
+		auto* block = graph.FindBlock(id);
+		ReplaceValue(block->successors, entered, copy_of(entered));
+		ReplaceTerminatorTarget(block->terminator, entered, copy_of(entered));
+	}
+	return true;
+}
+
 bool SplitOneSelectionMerge(Graph& graph) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
@@ -1718,6 +1804,9 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			       });
 		});
 		if (external != region.end()) {
+			if (g_clone_regions && CloneEnteredRegion(graph, block_id, region, *external)) {
+				return true;
+			}
 			SetFailure(
 			    graph, FailureKind::StructuredControlFlow, block_id,
 			    fmt::format("selection header block {} has externally entered region block {}; "
@@ -2579,6 +2668,21 @@ bool Structurize(Graph& graph) {
 				graph = std::move(structured);
 				return true;
 			}
+		}
+	}
+	if (GetCodegenOptions().cfg_clone_regions && !graph.irreducible && !graph.unsupported) {
+		uint32_t instructions = 0;
+		for (const auto& block: graph.blocks) {
+			instructions += block.inst_end - block.inst_begin;
+		}
+		structured                = graph;
+		g_clone_regions           = true;
+		g_clone_instructions_left = std::max<uint32_t>(instructions, 256u);
+		const bool ok             = StructurizeImpl(structured);
+		g_clone_regions           = false;
+		if (ok) {
+			graph = std::move(structured);
+			return true;
 		}
 	}
 	SetFailure(graph, failure_kind, failure_block, failure_reason);

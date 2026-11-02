@@ -9454,6 +9454,61 @@ void TestNewShaderRecompilerCfgLoopSharedRegion() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// KYTY_CFG_CLONE_REGIONS: Ghost of Yotei's CS 0x2b6417d1a9a30084 has, inside a loop,
+//   A: if (vcc) goto D; B: if (execz) goto F; C: ...; goto E; D: ...; E: ...; F: ...
+// so the region of selection B ({C, E}, merge F) is also entered from D. Without the switch the
+// program falls back to the dispatcher loop; with it, E gets a private copy for D.
+void TestNewShaderRecompilerCfgCloneEnteredRegion() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0),    // 0: loop header
+      EncodeSopc(0x06, 1, 1),    // 1: A
+      EncodeSopp(0x05, 5),       // 2: A -> D (word 8) or B
+      EncodeSopc(0x06, 2, 2),    // 3: B
+      EncodeSopp(0x05, 5),       // 4: B -> F (word 10) or C
+      EncodeSMovB32(3, 129),     // 5: C
+      EncodeSMovB32(4, 129),     // 6
+      EncodeSopp(0x02, 1),       // 7: C -> E (word 9)
+      EncodeSMovB32(6, 129),     // 8: D, falls through to E
+      EncodeSMovB32(7, 129),     // 9: E, falls through to F
+      EncodeSopc(0x06, 8, 8),    // 10: F: loop latch
+      EncodeSopp(0x05, 0xfff4u), // 11: F -> loop header (word 0) or exit
+      EncodeSMovB32(9, 129),     // 12: exit
+      0xbf810000u,
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+
+  auto plain = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const bool plain_structured = ShaderRecompiler::CFG::Structurize(plain);
+  std::printf("clone-regions fixture without the switch: %s (%s)\n",
+              plain_structured ? "structured" : "fails", plain.unsupported_reason.c_str());
+
+  auto options = saved;
+  options.cfg_clone_regions = true;
+  ShaderRecompiler::SetCodegenOptions(options);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_blocks = graph.blocks.size();
+  const auto original_coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
+  Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u,
+        "region cloning changed the loop");
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  uint32_t doubled = 0;
+  for (size_t i = 0; i < coverage.size(); i++) {
+    Check(coverage[i] >= original_coverage[i], "region cloning dropped an instruction");
+    doubled += coverage[i] > original_coverage[i] ? 1u : 0u;
+  }
+  std::printf("clone-regions fixture: blocks %zu -> %zu, copied instructions %u\n",
+              original_blocks, graph.blocks.size(), doubled);
+  Check(doubled >= 1u && doubled <= 2u, "region cloning copied more than block E");
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback, "cloned region still fell back to the dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
+  ShaderRecompiler::SetCodegenOptions(saved);
+}
+
 void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
   // The first selection needs routing at its externally entered common tail.
   // A later loop has the same lexical shared-arm shape, but its exit branches
@@ -16108,6 +16163,10 @@ int main(int argc, char **argv) {
   DefaultEnv("KYTY_MESH_CULL", "full");
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--clone-regions-only") == 0) {
+    TestNewShaderRecompilerCfgCloneEnteredRegion();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--unused-pixel-inputs-only") == 0) {
     const uint32_t code[] = {0xbf810000u};
     ShaderPixelInputInfo pixel{};
@@ -16293,6 +16352,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgAlternatingSharedReturns();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
+  TestNewShaderRecompilerCfgCloneEnteredRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation();
