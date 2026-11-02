@@ -9,11 +9,14 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
+#include <string>
 
 namespace Libs {
 
@@ -166,6 +169,36 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
+
+// KYTY_ENTITLEMENT_GRANT: "all", or labels separated by ',' or ';'. Additional-content labels
+// the title asks for through GetAddcontEntitlementInfo that are not installed are reported as
+// installed unlock keys. Default off (not entitled, as before). Ghost of Yotei 02.002 checks one
+// of them as its base entitlement and otherwise stops at the loading screen.
+static bool EntitlementGranted(const std::string& label) {
+	static const std::string grant = [] {
+		const char* value = std::getenv("KYTY_ENTITLEMENT_GRANT");
+		return std::string(value != nullptr ? value : "");
+	}();
+	if (grant.empty() || grant == "0") {
+		return false;
+	}
+	if (grant == "all" || grant == "1") {
+		return true;
+	}
+	size_t start = 0;
+	while (start <= grant.size()) {
+		const auto end = grant.find_first_of(",;", start);
+		const auto len = (end == std::string::npos ? grant.size() : end) - start;
+		if (len == label.size() && grant.compare(start, len, label) == 0) {
+			return true;
+		}
+		if (end == std::string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return false;
+}
 
 static NpEntitlementAccessAddcontEntitlementInfo
 MakeAddcontInfo(const Loader::AddContentEntry& entry) {
@@ -454,6 +487,21 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 
 	memset(info, 0, sizeof(*info));
 
+	const std::string label(entitlement_label->data,
+	                        strnlen(entitlement_label->data, sizeof(entitlement_label->data)));
+	const bool        granted = EntitlementGranted(label);
+	{
+		// Each label once: shows which entitlement a title checks before a "missing
+		// entitlement" message.
+		static std::mutex            printed_mutex;
+		static std::set<std::string> printed;
+		std::scoped_lock             lock(printed_mutex);
+		if (printed.size() < 256 && printed.insert(label).second) {
+			LOGF("NpEntitlementAccessGetAddcontEntitlementInfo: service_label=%u label='%s'%s\n",
+			     service_label, label.c_str(), granted ? " (granted by KYTY_ENTITLEMENT_GRANT)" : "");
+		}
+	}
+
 	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
 		            sizeof(entitlement_label->data)) == 0) {
@@ -465,6 +513,14 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	if (const auto* entry =
 	        Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data))) {
 		*info = MakeAddcontInfo(*entry);
+		return 0;
+	}
+
+	if (granted) {
+		// An installed unlock key (no extra data, so the title has nothing to mount).
+		std::memcpy(info->entitlement_label.data, label.data(), label.size());
+		info->package_type    = 3; // PSAL
+		info->download_status = 4; // Installed.
 		return 0;
 	}
 

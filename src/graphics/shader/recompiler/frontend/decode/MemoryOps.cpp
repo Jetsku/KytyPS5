@@ -112,7 +112,7 @@ constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
     {0x18u, Opcode::FLAT_STORE_BYTE, 1, 8},     {0x1au, Opcode::FLAT_STORE_SHORT, 1, 16},
     {0x1cu, Opcode::FLAT_STORE_DWORD, 1, 32},   {0x1du, Opcode::FLAT_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::FLAT_STORE_DWORDX4, 4, 32}, {0x1fu, Opcode::FLAT_STORE_DWORDX3, 3, 32},
-    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16},
+    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16},  {0x25u, Opcode::FLAT_LOAD_SHORT_D16_HI, 1, 16},
 };
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
@@ -442,9 +442,10 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst);
-	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16) {
-		// D16 loads reuse partial destinations to preserve the untouched high half.
-		inst.dst.sdwa_sel = 4u;
+	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16 ||
+	    inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI) {
+		// D16 loads reuse partial destinations to preserve the untouched other half.
+		inst.dst.sdwa_sel = inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI ? 5u : 4u;
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	inst.src_count = 1;

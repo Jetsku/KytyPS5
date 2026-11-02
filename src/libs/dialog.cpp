@@ -641,6 +641,22 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     p->size, p->mode, reinterpret_cast<uint64_t>(p->user_msg_param),
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
+		// User message: { int32 button_type; int32 pad; const char* msg; ... }. The text tells why
+		// the game opened the dialog (it is auto-confirmed here, the user never sees it).
+		if (p->user_msg_param != nullptr) {
+			struct UserMessage {
+				int32_t     button_type;
+				int32_t     pad;
+				const char* msg;
+			};
+			const auto* um = static_cast<const UserMessage*>(p->user_msg_param);
+			LOGF("MsgDialog user message (button type %d): %.400s\n", um->button_type,
+			     um->msg != nullptr ? um->msg : "(null)");
+		}
+		if (p->sys_msg_param != nullptr) {
+			LOGF("MsgDialog system message type %d\n",
+			     *static_cast<const int32_t*>(p->sys_msg_param));
+		}
 	}
 
 	g_status = STATUS_FINISHED;

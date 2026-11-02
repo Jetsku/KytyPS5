@@ -777,6 +777,8 @@ enum class Opcode {
 	// offset = sub-operation, secondary_offset = word index of its payload, word_count = 1 + payload.
 	S_KYTY_CALL_STATE,
 	EXP,
+	// Added after EXP so the values of the earlier opcodes stay the same.
+	FLAT_LOAD_SHORT_D16_HI,
 	COUNT
 };
 

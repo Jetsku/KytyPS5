@@ -621,6 +621,50 @@ int ValidateBvhShaderFiles(int argc, char **argv) {
             });
             if (tools.Validate(compiled.spirv)) {
               result = "valid (" + std::to_string(compiled.spirv.size()) + " words)";
+              // KYTY_HARNESS_SPV_STATS=1: the 24 most frequent SPIR-V opcodes (instruction
+              // count and words), to see what a large module is made of.
+              if (const char *stats = std::getenv("KYTY_HARNESS_SPV_STATS");
+                  stats != nullptr && stats[0] == '1') {
+                std::map<uint32_t, std::pair<uint64_t, uint64_t>> histogram;
+                for (size_t at = 5; at < compiled.spirv.size();) {
+                  const uint32_t count = compiled.spirv[at] >> 16u;
+                  auto &entry = histogram[compiled.spirv[at] & 0xffffu];
+                  entry.first++;
+                  entry.second += count;
+                  at += count == 0u ? 1u : count;
+                }
+                std::vector<std::pair<uint64_t, uint32_t>> order;
+                for (const auto &[op, entry] : histogram) order.emplace_back(entry.second, op);
+                std::sort(order.rbegin(), order.rend());
+                for (size_t i = 0; i < order.size() && i < 24u; ++i) {
+                  const auto &entry = histogram[order[i].second];
+                  std::printf("  spv op %u: %llu instructions, %llu words\n", order[i].second,
+                              static_cast<unsigned long long>(entry.first),
+                              static_cast<unsigned long long>(entry.second));
+                }
+                if (stats[1] == 'w') {
+                  // KYTY_HARNESS_SPV_STATS=1w also writes the valid module next to the input.
+                  const auto out_path = path + ".w" + wave_name + "." + mode + ".spv";
+                  if (std::FILE *out = std::fopen(out_path.c_str(), "wb"); out != nullptr) {
+                    std::fwrite(compiled.spirv.data(), sizeof(uint32_t), compiled.spirv.size(),
+                                out);
+                    std::fclose(out);
+                  }
+                }
+                ShaderRecompiler::Decoder::Program decoded;
+                ShaderRecompiler::Decoder::DecodeProgram(code, decoded, true);
+                std::map<std::string, uint32_t> guest;
+                for (const auto &inst : decoded.instructions) {
+                  guest[std::string(magic_enum::enum_name(inst.opcode))]++;
+                }
+                std::vector<std::pair<uint32_t, std::string>> guest_order;
+                for (const auto &[name, n] : guest) guest_order.emplace_back(n, name);
+                std::sort(guest_order.rbegin(), guest_order.rend());
+                for (size_t i = 0; i < guest_order.size() && i < 40u; ++i) {
+                  std::printf("  guest %s: %u\n", guest_order[i].second.c_str(),
+                              guest_order[i].first);
+                }
+              }
             } else {
               result = "INVALID";
               failures++;

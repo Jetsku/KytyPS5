@@ -184,6 +184,7 @@ std::string Snapshot() {
 	    "Kyty hang watchdog v1\nbuild={}\npid={} t_ms={} flips={} cp_submissions={} overflow={}\n",
 	    KYTY_BUILD_LABEL, Pid(), NowMs(), g_flips.load(), g_submissions.load(), g_overflow.load());
 	out += fmt::format("trigger={}\n", g_report_reason.load() == 2   ? "terminal-error"
+	                                   : g_report_reason.load() == 3 ? "periodic"
 	                                   : g_report_reason.load() == 1 ? "stopped-progress"
 	                                                                 : "manual-snapshot");
 	out += "Scope operands: address/resource, expected, observed, mask, aux, start_ms. Values are "
@@ -527,7 +528,10 @@ void StartMonitor(std::string_view trace_directory) {
         reports_value ? std::clamp<uint64_t>(std::strtoull(reports_value, nullptr, 10), 1, 16) : 1);
 	const auto* trigger    = std::getenv("KYTY_HANG_WATCHDOG_TRIGGER");
 	const bool  flips_only = trigger != nullptr && std::strcmp(trigger, "flips") == 0;
-	g_watchdog = std::jthread([timeout, max_reports, flips_only](std::stop_token stop) {
+	// KYTY_HANG_WATCHDOG_TRIGGER=periodic: a report every KYTY_HANG_WATCHDOG_MS whether or not the
+	// guest makes progress (an endless loading screen keeps flipping while a loader thread waits).
+	const bool periodic = trigger != nullptr && std::strcmp(trigger, "periodic") == 0;
+	g_watchdog = std::jthread([timeout, max_reports, flips_only, periodic](std::stop_token stop) {
 		Common::PlaceCurrentThreadCold();
 		try {
 			const auto fresh = [&] {
@@ -538,6 +542,7 @@ void StartMonitor(std::string_view trace_directory) {
 			};
 			StallDetector    detector = fresh();
 			uint32_t         reports  = 0;
+			uint64_t         last_periodic_ms = NowMs();
 			std::unique_lock lock(g_sleep_mutex);
 			for (;;) {
 				const bool terminal = g_terminal_requested.exchange(false);
@@ -547,8 +552,11 @@ void StartMonitor(std::string_view trace_directory) {
 				if (!Enabled() && !terminal)
 					detector = fresh();
 				else if (terminal ||
-				         detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
-					g_report_reason.store(terminal ? 2 : 1);
+				         (periodic ? now - last_periodic_ms >= timeout
+				                   : detector.Poll(now, g_flips.load(), g_submissions.load(),
+				                                   timeout))) {
+					last_periodic_ms = now;
+					g_report_reason.store(terminal ? 2 : periodic ? 3 : 1);
 					reports++;
 					lock.unlock();
 					std::string path;

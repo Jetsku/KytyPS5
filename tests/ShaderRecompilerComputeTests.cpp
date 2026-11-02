@@ -34089,6 +34089,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::FLAT_LOAD_USHORT:
   case Opcode::FLAT_LOAD_SSHORT:
   case Opcode::FLAT_LOAD_SHORT_D16:
+  case Opcode::FLAT_LOAD_SHORT_D16_HI:
   case Opcode::FLAT_LOAD_DWORD:
   case Opcode::FLAT_LOAD_DWORDX2:
   case Opcode::FLAT_LOAD_DWORDX3:
@@ -46682,6 +46683,29 @@ TestCase FlatLoadShortD16AddressSegments() {
   return test;
 }
 
+TestCase GlobalLoadShortD16HiKeepsLowHalf() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, static_cast<u32>(GuestBase) + 2u);
+  AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
+  // GLOBAL_LOAD_SHORT_D16_HI (opcode 0x25) at offsets 0 and -2: the loaded short goes to the
+  // high half, the low half of the destination stays.
+  for (u32 slot : {0u, 1u}) {
+    AppendVMovLiteral(&code, 3, 0x12345678u);
+    code.push_back(EncodeFlat0(0x25, 2u, slot == 0u ? 0u : 0xffeu));
+    code.push_back(EncodeFlat1(3, 0x7d, 0, 20));
+    AppendStoreVgpr(&code, 3, slot);
+  }
+  AppendEnd(&code);
+  TestCase test{"GlobalLoadShortD16HiKeepsLowHalf", code,
+                {0, 0, 0, 0, 0x80017fffu},
+                {0x80015678u, 0x7fff5678u},
+                {O::V_MOV_B32, O::FLAT_LOAD_SHORT_D16_HI, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{GuestBase, 16}};
+  test.decoded_counts = {{"FLAT_LOAD_SHORT_D16_HI", 2}};
+  return test;
+}
 TestCase BranchVccnzUsesCarryProducedWaveMask() {
   using O = ShaderOpcode;
 
@@ -52851,6 +52875,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(GlobalLoadShortD16Captured(32));
   cases.push_back(GlobalLoadShortD16Captured(64));
   AddCase(FlatLoadShortD16AddressSegments);
+  AddCase(GlobalLoadShortD16HiKeepsLowHalf);
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
@@ -60170,6 +60195,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
     RunCase(&vulkan, GlobalLoadShortD16Captured(64));
     RunCase(&vulkan, FlatLoadShortD16AddressSegments());
+    RunCase(&vulkan, GlobalLoadShortD16HiKeepsLowHalf());
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
