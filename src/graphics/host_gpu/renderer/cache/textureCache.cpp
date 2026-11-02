@@ -1284,6 +1284,21 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	                              reason == HangTrace::ImageFreeReason::ResidentIdle)) {
 		return;
 	}
+	// KYTY_BINDLESS_DROP_LOG=<n> (diagnostic): the first n frees of bindless-pinned images, with the
+	// reason (HangTrace::ImageFreeReason) and the image.
+	if (image.bindless_pinned && image.registered) {
+		static const uint32_t drop_log = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_DROP_LOG");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+		}();
+		static std::atomic<uint32_t> dropped {0};
+		if (drop_log != 0 && dropped.fetch_add(1, std::memory_order_relaxed) < drop_log) {
+			LOGF("Bindless drop: image %u reason %u base 0x%" PRIx64 " %ux%u layers %u vk%u gpu_modified %d\n",
+			     id.index, static_cast<uint32_t>(reason), image.info.data.address, image.info.extent.width,
+			     image.info.extent.height, image.info.resources.layers, static_cast<uint32_t>(image.backing.format),
+			     image.IsGpuModified() ? 1 : 0);
+		}
+	}
 	if (VramStats::Enabled() && image.registered) {
 		NoteVramFree(image, reason);
 	}

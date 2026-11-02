@@ -201,6 +201,10 @@ public:
 	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
 	[[nodiscard]] uint32_t UsedEntries() const noexcept { return m_next_region; }
+	// The host-mapped translation buffer (diagnostics).
+	[[nodiscard]] const uint32_t* TranslationWords() const noexcept {
+		return m_translation != nullptr ? reinterpret_cast<const uint32_t*>(m_translation->Mapped().data()) : nullptr;
+	}
 	void                   AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;

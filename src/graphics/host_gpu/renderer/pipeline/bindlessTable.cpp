@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -674,12 +675,13 @@ uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 	return m_next_slot[binding]++;
 }
 
+// KYTY_BINDLESS_SLOT_REUSE=0 (live, default 1): freed slots are not given to other keys.
+static Live::Switch g_bindless_slot_reuse("KYTY_BINDLESS_SLOT_REUSE", [](const char* value) -> int64_t {
+	return value == nullptr || value[0] != '0' ? 1 : 0;
+});
+
 void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
-	static const bool reuse = [] {
-		const char* value = std::getenv("KYTY_BINDLESS_SLOT_REUSE");
-		return value == nullptr || value[0] != '0';
-	}();
-	if (!reuse || binding >= ImageArrays || slot < PlaceholderColors) {
+	if (g_bindless_slot_reuse.Get() == 0 || binding >= ImageArrays || slot < PlaceholderColors) {
 		return;
 	}
 	auto& flags = m_slot_free[binding];
