@@ -69,6 +69,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // KYTY_SPEC_UNMAPPED_NULL: whether a V# base is inside a guest mapping (the binding's test; the V#
 // is nulled when not). Null: off. Set once by the renderer before draws.
 void SetUnmappedBufferProbe(SrtMappedRange probe);
+// KYTY_NULL_BUFFER_SHARE: records the live buffer slots of a journaled permutation as the slots' last
+// live specializations, so a null V# seen first in a later session takes them (Erlou93 M115 seeding).
+void SeedNullBufferShare(uint64_t shader_hash, uint32_t stage, uint32_t user_data_base,
+                         uint32_t user_data_count, const ResourceSpecialization& specialization);
 // Tests: KYTY_MS_DEPTH_SAMPLE0's specialization part (multisample depth T#s read through a
 // single-sample dimension specialize as single-sample images) without the environment.
 void SetMsDepthSample0ForTesting(bool enabled);

@@ -835,10 +835,10 @@ struct NullShareEntry {
 constexpr size_t                         NullShareTableSize = size_t {1} << 15u;
 static std::array<NullShareEntry, NullShareTableSize> g_null_share_table;
 
-static uint64_t NullShareKey(const ResourcePlan& program, uint32_t i) {
-	uint64_t key = program.shader_hash ^ (uint64_t {static_cast<uint32_t>(program.stage)} << 56u) ^
-	               (uint64_t {program.user_data_base} << 40u) ^ (uint64_t {program.user_data_count} << 48u) ^
-	               ((uint64_t {i} + 1u) * 0x9e3779b97f4a7c15ull);
+static uint64_t NullShareKey(uint64_t shader_hash, uint32_t stage, uint32_t user_data_base,
+                             uint32_t user_data_count, uint32_t i) {
+	uint64_t key = shader_hash ^ (uint64_t {stage} << 56u) ^ (uint64_t {user_data_base} << 40u) ^
+	               (uint64_t {user_data_count} << 48u) ^ ((uint64_t {i} + 1u) * 0x9e3779b97f4a7c15ull);
 	key ^= key >> 29u;
 	key *= 0xbf58476d1ce4e5b9ull;
 	key ^= key >> 32u;
@@ -870,6 +870,22 @@ static ResourceSpecialization::Buffer UnpackNullShare(uint64_t v) {
 	};
 }
 
+void SeedNullBufferShare(uint64_t shader_hash, uint32_t stage, uint32_t user_data_base,
+                         uint32_t user_data_count, const ResourceSpecialization& specialization) {
+	for (uint32_t i = 0; i < specialization.buffers.size(); ++i) {
+		const auto& buffer = specialization.buffers[i];
+		// Only live slots: a null V# specializes with stride 0 and no format (zero_stride_oob).
+		if (buffer.zero_stride_oob ||
+		    (buffer.packed_stride == 0u && buffer.descriptor_format == Prospero::BufferFormat::kInvalid)) {
+			continue;
+		}
+		if (auto* slot = NullShareValue(NullShareKey(shader_hash, stage, user_data_base, user_data_count, i), true);
+		    slot != nullptr) {
+			slot->store(PackNullShare(buffer), std::memory_order_relaxed);
+		}
+	}
+}
+
 static bool SpecializeBuffer(const ResourcePlan& program, const BufferResource& buffer,
                              DescriptorValue& descriptor_value,
                              ResourceSpecialization& specialization, uint32_t i) {
@@ -885,7 +901,16 @@ static bool SpecializeBuffer(const ResourcePlan& program, const BufferResource& 
 	// null marker offset, so every access is out of range and a formatted read gives zeros) takes
 	// the last live specialization of its slot, so null and live share one permutation.
 	if (GetCodegenOptions().null_buffer_share && NullShareSlot(buffer)) {
-		const auto key  = NullShareKey(program, i);
+		// A raw slot whose V# has stride 0 and OOB_SELECT 0 is out of range for every access (the
+		// structured check offset >= stride always fails): it reads 0 and drops writes exactly as a
+		// null V#, so it is bound and specialized as one.
+		if (!buffer.formatted && descriptor.OutOfBounds() == 0u &&
+		    (descriptor.PackedStride() & 0x3fffu) == 0u) {
+			descriptor_value.dwords.fill(0);
+			descriptor = {};
+		}
+		const auto key  = NullShareKey(program.shader_hash, static_cast<uint32_t>(program.stage),
+		                                program.user_data_base, program.user_data_count, i);
 		const bool null = std::ranges::all_of(descriptor_value.dwords, [](uint32_t w) { return w == 0u; });
 		if (null) {
 			if (const auto* slot = NullShareValue(key, false); slot != nullptr) {

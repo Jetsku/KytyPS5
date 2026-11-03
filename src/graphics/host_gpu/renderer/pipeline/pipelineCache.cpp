@@ -7673,6 +7673,22 @@ void PipelineCache::InitializeShaderPrecompile() {
 		PipelineCacheLog("Shader precompile: the pipeline list adds {} sources and {} permutations to the replay",
 		                 added.sources, added.entries);
 	}
+	// KYTY_NULL_BUFFER_SHARE: the journaled permutations' live buffer slots seed the share, so the
+	// first null V# of a slot in this session takes the live specialization an earlier session saw.
+	if (ShaderRecompiler::GetCodegenOptions().null_buffer_share && m_shader_journal != nullptr) {
+		const auto& sources = m_shader_journal->Sources();
+		size_t      seeded  = 0;
+		for (const auto& entry: m_shader_journal->Entries()) {
+			if (entry.source >= sources.size()) continue;
+			const auto& source = sources[entry.source];
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			if (!ShaderRecompiler::IR::DecodeSpecialization(entry.specialization, specialization)) continue;
+			ShaderRecompiler::IR::SeedNullBufferShare(source.hash, source.stage, source.user_data_base,
+			                                          source.user_data_count, specialization);
+			seeded++;
+		}
+		PipelineCacheLog("Null buffer share: seeded from {} journaled permutations", seeded);
+	}
 	const bool prepare = m_list != nullptr && m_list->prepare;
 	// KYTY_PIPELINE_COMPUTE_AHEAD=1 (default off; needs KYTY_PIPELINE_PREWARM_COMPUTE and
 	// KYTY_PIPELINE_PREFETCH_PROGRAMS): a compute program prepared ahead of its dispatch gets its

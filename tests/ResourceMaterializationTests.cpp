@@ -549,6 +549,41 @@ void TestNullBufferShare() {
       Check(!(null_spec == live_spec) && null_spec.buffers[0].zero_stride_oob,
             "null share off: the null V# must keep its own specialization");
     }
+    // A raw slot: a live V# with stride 0 and OOB_SELECT 0 (every access out of range) is shared
+    // and bound like a null V#.
+    Program raw_program;
+    raw_program.stage = Libs::Graphics::ShaderType::Compute;
+    raw_program.shader_hash = 0x5ca1ab1e00000001ull;
+    raw_program.srt_plan_complete = true;
+    raw_program.resource_tracking_complete = true;
+    auto &raw_block = AddValueBlock(raw_program);
+    DescriptorSource raw_source;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto &user_data = raw_block.AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+      raw_source.dwords[i] = Value(&user_data);
+    }
+    raw_source.dword_count = 4;
+    raw_program.descriptor_sources.push_back(raw_source);
+    raw_program.info.buffers.push_back({.source = 0, .read = true});
+    const auto raw_plan = ExtractResourcePlan(raw_program);
+    const std::array<uint32_t, 4> raw_live{0x20000u, 12u << 16u, 64u, (77u << 12u) | 0xfacu};
+    const std::array<uint32_t, 4> raw_oob{0x30000u, 0u, 64u, (77u << 12u) | 0xfacu};
+    ResourceSnapshot raw_live_snapshot, raw_oob_snapshot;
+    ResourceSpecialization raw_live_spec, raw_oob_spec;
+    Check(MaterializeResources(raw_plan, SrtRuntime{.user_data = raw_live}, raw_live_snapshot,
+                               raw_live_spec) &&
+              MaterializeResources(raw_plan, SrtRuntime{.user_data = raw_oob}, raw_oob_snapshot,
+                                   raw_oob_spec),
+          "null share: raw materialization failed");
+    if (share) {
+      Check(raw_oob_spec == raw_live_spec &&
+                std::ranges::all_of(raw_oob_snapshot.buffers[0].dwords, [](uint32_t w) { return w == 0u; }),
+            "null share: a stride-0 OOB_SELECT-0 raw V# was not shared as null");
+    } else {
+      Check(raw_oob_spec.buffers[0].zero_stride_oob && raw_oob_snapshot.buffers[0].dwords[0] == 0x30000u,
+            "null share off: the stride-0 raw V# must keep its own specialization and words");
+    }
   }
   SetCodegenOptions(saved);
 }
