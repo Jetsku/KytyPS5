@@ -2732,6 +2732,108 @@ bool TextureCache::CopyStencilPlaneToAlias(ImageId target_id) {
 	return true;
 }
 
+bool TextureCache::StencilStorageShadowEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_STORAGE_SHADOW");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+ImageId TextureCache::StencilStorageShadow(ImageId record_id, bool& shadow) {
+	shadow = false;
+	std::scoped_lock lock {m_lock};
+	const auto* record = m_slot_images.try_get(record_id);
+	if (record == nullptr || !record->depth_id) {
+		return record_id;
+	}
+	const auto  depth_id = record->depth_id;
+	const auto* depth    = m_slot_images.try_get(depth_id);
+	if (depth == nullptr || !SwapsStencilPlanes(*depth) || !StencilPlaneHeld(*record)) {
+		return depth_id;
+	}
+	const auto width  = depth->backing.extent.width;
+	const auto height = depth->backing.extent.height;
+	const auto bytes  = uint64_t {width} * height;
+	for (const auto& [pending_shadow, pending_depth]: m_pending_stencil_shadows) {
+		if (pending_depth == depth_id) {
+			shadow = true; // already holds the stencil for this dispatch
+			return pending_shadow;
+		}
+	}
+	auto  found     = m_stencil_shadows.find(depth_id);
+	auto* shadow_im = found != m_stencil_shadows.end() ? m_slot_images.try_get(found->second) : nullptr;
+	if (shadow_im == nullptr || shadow_im->info.extent.width != width || shadow_im->info.extent.height != height) {
+		if (shadow_im != nullptr) {
+			ReleaseUnregisteredImage(found->second);
+		}
+		ImageInfo info {};
+		info.pixel_format    = vk::Format::eR8Uint;
+		info.guest_format    = Prospero::BufferFormat::k8UInt;
+		info.type            = Prospero::ImageType::kColor2D;
+		info.extent          = {width, height, 1};
+		info.resources       = {1, 1};
+		info.pitch           = width;
+		info.bytes_per_block = 1;
+		info.samples         = 1;
+		info.tile_mode       = Prospero::TileMode::kLinear;
+		info.mip_layout[0]   = {0, bytes, width, height};
+		const auto shadow_id = InsertImage(info);
+		m_stencil_shadows[depth_id] = shadow_id;
+	}
+	const auto shadow_id = m_stencil_shadows[depth_id];
+	if (!m_stencil_alias_staging || m_stencil_alias_staging->Size() < bytes) {
+		if (m_stencil_alias_staging) {
+			m_scheduler.DeferOperation([old = m_stencil_alias_staging] { (void)old; });
+		}
+		m_stencil_alias_staging = std::make_shared<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+		    std::max<uint64_t>(bytes, uint64_t {1920} * 1080));
+	}
+	const auto stencil_copy = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+	const auto color_copy   = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eColor);
+	m_slot_images[depth_id].Download({&stencil_copy, 1}, m_stencil_alias_staging->Handle(), 0, bytes);
+	auto& target               = m_slot_images[shadow_id];
+	target.tick_accessed_last  = m_scheduler.CurrentTick();
+	target.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	target.Upload({&color_copy, 1}, m_stencil_alias_staging->Handle(), 0, bytes);
+	m_pending_stencil_shadows.emplace_back(shadow_id, depth_id);
+	static std::atomic<uint32_t> logged {0};
+	const auto n = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || std::has_single_bit(n)) {
+		LOGF("Stencil storage shadow #%u (KYTY_STENCIL_STORAGE_SHADOW): plane 0x%012" PRIx64
+		     " of depth 0x%012" PRIx64 " %ux%u\n",
+		     n, m_slot_images[record_id].info.data.address, m_slot_images[depth_id].info.data.address, width,
+		     height);
+	}
+	shadow = true;
+	return shadow_id;
+}
+
+void TextureCache::FlushStencilStorageShadows() {
+	std::scoped_lock lock {m_lock};
+	for (const auto& [shadow_id, depth_id]: m_pending_stencil_shadows) {
+		auto* shadow = m_slot_images.try_get(shadow_id);
+		auto* depth  = m_slot_images.try_get(depth_id);
+		if (shadow == nullptr || depth == nullptr || !SwapsStencilPlanes(*depth) ||
+		    depth->backing.extent.width != shadow->info.extent.width ||
+		    depth->backing.extent.height != shadow->info.extent.height) {
+			continue;
+		}
+		const auto width        = shadow->info.extent.width;
+		const auto height       = shadow->info.extent.height;
+		const auto bytes        = uint64_t {width} * height;
+		const auto stencil_copy = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+		const auto color_copy   = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eColor);
+		shadow->Download({&color_copy, 1}, m_stencil_alias_staging->Handle(), 0, bytes);
+		m_slot_images[depth_id].Upload({&stencil_copy, 1}, m_stencil_alias_staging->Handle(), 0, bytes);
+		MarkImageGpuModified(m_slot_images[depth_id]);
+	}
+	m_pending_stencil_shadows.clear();
+	NoteImageStateChange();
+}
+
 ImageId TextureCache::StencilPlaneReader(ImageId record_id, bool& copy) {
 	copy = false;
 	std::scoped_lock lock {m_lock};

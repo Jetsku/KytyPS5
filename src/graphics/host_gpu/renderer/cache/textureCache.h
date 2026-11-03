@@ -289,6 +289,16 @@ public:
 	// overlapping top-left region of the plane (the depth image's stencil aspect, or the plane's
 	// saved copy with KYTY_PRESERVE_STENCIL) is copied into it. True when it copied.
 	[[nodiscard]] static bool StencilAliasCopyEnabled();
+	// KYTY_STENCIL_STORAGE_SHADOW=1 (adapted from Erlou93/KytyPS5-Yotei
+	// WORKAROUND_STENCIL_STORAGE_SHADOW; PPSA26344 preset, default off): a storage view of a depth
+	// image's stencil aspect is invalid Vulkan (no storage usage). The binding gets an R8_UINT
+	// shadow holding the stencil aspect's contents instead; after the dispatch the shadow is copied
+	// back into the stencil aspect (FlushStencilStorageShadows). Single-sample one-layer depth
+	// images whose stencil holds the bound plane only; anything else returns the depth image.
+	[[nodiscard]] static bool StencilStorageShadowEnabled();
+	[[nodiscard]] ImageId StencilStorageShadow(ImageId record_id, bool& shadow);
+	[[nodiscard]] bool HasStencilStorageShadows() const noexcept { return !m_pending_stencil_shadows.empty(); }
+	void FlushStencilStorageShadows();
 	bool CopyStencilPlaneToAlias(ImageId target_id);
 	// KYTY_SUB_EXTENT_COPY=1 (from usa-ratt/KytyPS5-GT7 429692dd3, Franseven's case): a texture
 	// narrower or shorter than the single-sample colour image at its address, with the same guest
@@ -709,6 +719,9 @@ private:
 	std::unordered_map<uint64_t, SavedStencilPlane> m_stencil_planes;
 	uint64_t                                        m_stencil_plane_serial = 0;
 	std::shared_ptr<Buffer>                         m_stencil_alias_staging;
+	// KYTY_STENCIL_STORAGE_SHADOW: shadow image per depth image, and the pairs to copy back.
+	std::unordered_map<ImageId, ImageId>            m_stencil_shadows;
+	std::vector<std::pair<ImageId, ImageId>>        m_pending_stencil_shadows; // shadow, depth
 	// Whether the depth image of a stencil record holds the record's plane (KYTY_PRESERVE_STENCIL).
 	[[nodiscard]] bool StencilPlaneHeld(const Image& record) const;
 	void SwapStencilPlane(ImageId depth_id, uint64_t next_plane);

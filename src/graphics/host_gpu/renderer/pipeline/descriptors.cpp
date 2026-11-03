@@ -1412,7 +1412,18 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		const auto record_id = id;
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
-		if (storage) {
+		if (storage && TextureCache::StencilStorageShadowEnabled()) {
+			bool       shadowed = false;
+			const auto shadow   = texture_cache.StencilStorageShadow(record_id, shadowed);
+			if (shadowed) {
+				id                    = shadow;
+				image                 = &texture_cache.GetImage(id);
+				copy_binding          = true;
+				desc.view_info.format = vk::Format::eR8Uint;
+				desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+			}
+		}
+		if (storage && !copy_binding) {
 			// A storage view of a depth/stencil image's stencil aspect (Erlou: STENCIL_STORAGE_SHADOW).
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
