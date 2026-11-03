@@ -2972,12 +2972,102 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+// KYTY_LDS_ATOMIC_ORDER (adapted from Erlou93/KytyPS5-Yotei M110, EmitAtomic32): DS_ADD_RTN_U32 /
+// DS_SUB_RTN_U32 return their old values in lane order, as the hardware does, for the lanes that address
+// the same dword (Ghost of Yotei's RTGI BVH builder's tree rotations depend on it; with one atomic per
+// invocation in the host's order its parent loops and ray traversal spun). A loop over the distinct
+// dword indices of the subgroup's invocations in this region: the lowest invocation of an index adds
+// (subtracts) the group's total and every invocation gets the old value plus (minus) the exclusive
+// prefix of the lower lanes' values. Every invocation runs every iteration (the exit test is a subgroup
+// minimum); only the atomic itself is conditional. Both halves of a lane_count 2 program are emitted one
+// after the other, so lanes 0..31 come before 32..63. Not for a split wave (its two host subgroups are
+// not ordered against each other) or per-lane LDS slots.
+static uint32_t EmitLaneOrderedLdsAdd(ValueEmitContext& ctx, const IR::Inst& inst,
+                                      const IR::MemoryInfo& mem, uint32_t pointer, uint32_t index) {
+	auto&      s        = ctx.state;
+	const bool sub      = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicISub32;
+	const auto u32      = TypeU32(s);
+	const auto boolean  = TypeBool(s);
+	const auto subgroup = ConstantU32(s, spv::ScopeSubgroup);
+	const auto value    = ctx.Arg(inst, inst.NumArgs() - 2);
+	const auto none     = ConstantU32(s, 0xffffffffu); // no LDS dword index reaches it
+	s.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	const auto entry  = s.current_label;
+	const auto header = s.builder.AllocateId();
+	const auto body   = s.builder.AllocateId();
+	const auto work   = s.builder.AllocateId();
+	const auto cont   = s.builder.AllocateId();
+	const auto merge  = s.builder.AllocateId();
+	const auto pending      = s.builder.AllocateId();
+	const auto old          = s.builder.AllocateId();
+	const auto next_pending = s.builder.AllocateId();
+	const auto next_old     = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(s, header);
+	s.builder.AddFunction(spv::OpPhi, boolean, pending, ConstantBool(s, true), entry, next_pending, cont);
+	s.builder.AddFunction(spv::OpPhi, u32, old, ConstantU32(s, 0), entry, next_old, cont);
+	s.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+	s.builder.AddFunction(spv::OpBranch, body);
+	EmitLabel(s, body);
+	// The smallest index still pending in the subgroup (the same in every invocation); none left: done.
+	const auto chosen = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpGroupNonUniformUMin, u32, chosen, subgroup, spv::GroupOperationReduce,
+	                      Select(s, u32, pending, index, none));
+	// A break to the loop merge needs no selection merge.
+	s.builder.AddFunction(spv::OpBranchConditional, Binary(s, spv::OpIEqual, boolean, chosen, none), merge,
+	                      work);
+	EmitLabel(s, work);
+	const auto mine   = AndCondition(s, pending, Binary(s, spv::OpIEqual, boolean, index, chosen));
+	const auto part   = Select(s, u32, mine, value, ConstantU32(s, 0));
+	const auto total  = s.builder.AllocateId();
+	const auto prefix = s.builder.AllocateId();
+	const auto rank   = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpGroupNonUniformIAdd, u32, total, subgroup, spv::GroupOperationReduce, part);
+	s.builder.AddFunction(spv::OpGroupNonUniformIAdd, u32, prefix, subgroup,
+	                      spv::GroupOperationExclusiveScan, part);
+	s.builder.AddFunction(spv::OpGroupNonUniformIAdd, u32, rank, subgroup, spv::GroupOperationExclusiveScan,
+	                      Select(s, u32, mine, ConstantU32(s, 1), ConstantU32(s, 0)));
+	const auto leader = AndCondition(s, mine, Binary(s, spv::OpIEqual, boolean, rank, ConstantU32(s, 0)));
+	const auto leader_old = EmitValueOrZeroIfCondition(s, leader, [&]() {
+		const auto result = s.builder.AllocateId();
+		s.builder.AddFunction(sub ? spv::OpAtomicISub : spv::OpAtomicIAdd, u32, result, pointer,
+		                      ConstantU32(s, spv::ScopeWorkgroup),
+		                      ConstantU32(s, spv::MemorySemanticsMaskNone), total);
+		return result;
+	});
+	// Only the leader contributes a non-zero term: the sum is its old value.
+	const auto base = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpGroupNonUniformIAdd, u32, base, subgroup, spv::GroupOperationReduce,
+	                      leader_old);
+	const auto lane_old = Binary(s, sub ? spv::OpISub : spv::OpIAdd, u32, base, prefix);
+	s.builder.AddFunction(spv::OpSelect, u32, next_old, mine, lane_old, old);
+	s.builder.AddFunction(spv::OpLogicalAnd, boolean, next_pending, pending,
+	                      Unary(s, spv::OpLogicalNot, boolean, mine));
+	s.builder.AddFunction(spv::OpBranch, cont);
+	EmitLabel(s, cont);
+	s.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(s, merge);
+	(void)mem;
+	return old;
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	const bool  lane_order =
+	    GetCodegenOptions().lds_atomic_order && mem.kind == IR::ResourceKind::Lds &&
+	    (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicIAdd32 ||
+	     inst.GetOpcode() == IR::ValueOpcode::SharedAtomicISub32) &&
+	    inst.HasUses() && !ctx.state.split_wave && !ctx.state.lds_slot_plan &&
+	    ctx.state.lds_storage_class == spv::StorageClassWorkgroup;
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
+		const auto old =
+		    lane_order
+		        ? EmitLaneOrderedLdsAdd(ctx, inst, mem, pointer,
+		                                Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state),
+		                                       DwordIndex(ctx, inst, mem), ConstantU32(ctx.state, 0x3fffu)))
+		        : EmitAtomicOperation(ctx, inst, pointer, scope);
 		if (mem.kind == IR::ResourceKind::Lds) {
 			const auto semantics =
 			    spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(ctx.state);

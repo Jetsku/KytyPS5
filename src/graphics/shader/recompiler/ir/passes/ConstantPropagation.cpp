@@ -768,6 +768,16 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 					}
 				}
 			}
+			// KYTY_KNOWN_BITS_MASKS: an unsigned extract from bit 0 of a value with no bit at or
+			// above the width is the value.
+			if (sets != nullptr && GetCodegenOptions().known_bits_masks &&
+			    inst.GetOpcode() == ValueOpcode::BitFieldUExtract && !IsImmediate(value, Type::U32) &&
+			    IsImmediate(offset, Type::U32) && offset.U32() == 0u && IsImmediate(count, Type::U32) &&
+			    count.U32() >= 1u && count.U32() < 32u &&
+			    (~sets->KnownZeros(value) >> count.U32()) == 0u) {
+				Replace(inst, value);
+				return;
+			}
 			if (!IsImmediate(value, Type::U32) || !IsImmediate(offset, Type::U32) ||
 			    !IsImmediate(count, Type::U32) || offset.U32() > 32u ||
 			    count.U32() > 32u - offset.U32()) {
@@ -988,8 +998,21 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+			if (FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) ||
+			    ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu)) {
+				return;
+			}
+			// KYTY_KNOWN_BITS_MASKS: a constant mask that keeps every bit the other operand can have.
+			if (sets != nullptr && GetCodegenOptions().known_bits_masks) {
+				for (size_t side = 0; side < 2u; side++) {
+					const auto mask  = Arg(inst, side);
+					const auto other = Arg(inst, 1u - side);
+					if (IsImmediate(mask, Type::U32) && !IsImmediate(other, Type::U32) &&
+					    (~sets->KnownZeros(other) & ~mask.U32()) == 0u) {
+						Replace(inst, other);
+						return;
+					}
+				}
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:

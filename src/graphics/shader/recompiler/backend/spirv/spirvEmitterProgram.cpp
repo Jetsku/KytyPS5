@@ -776,6 +776,8 @@ template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, ctx.Label(block));
+	// KYTY_SPLIT_LDS_WRITE_SYNC: a read may reach this block on another path.
+	ctx.state.lds_split_synced = false;
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -785,7 +787,16 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		} else {
 			emitted_non_phi = true;
 		}
-		if (ctx.state.split_wave && SyncsLdsAccess(ctx.state, inst)) {
+		const bool lds_write_sync = ctx.state.split_wave && GetCodegenOptions().split_lds_write_sync &&
+		                            AccessesLds(ctx.state.program, inst);
+		const bool lds_write = lds_write_sync && IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Read;
+		if (lds_write_sync) {
+			// KYTY_SPLIT_LDS_WRITE_SYNC: a write waits for the other half only when this half read the
+			// LDS since the last barrier (it may overwrite what the other half has yet to read).
+			if (lds_write && !ctx.state.lds_split_synced) {
+				EmitWaveBarrier(ctx.state);
+			}
+		} else if (ctx.state.split_wave && SyncsLdsAccess(ctx.state, inst)) {
 			// The guest's lanes ran in lockstep: a lane may read what another lane of its wave
 			// wrote, or overwrite what it read, without waiting. A split wave's halves do not.
 			EmitWaveBarrier(ctx.state);
@@ -798,10 +809,21 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
 			                  inst.GetOpcode() != IR::ValueOpcode::DataCacheInvalidate &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
+				if (half != 0 && ctx.state.lane_share.active && LaneShareReuse(ctx, lane, inst)) {
+					continue;
+				}
 				emit_instruction(lane, inst);
 			}
 		}
 		ctx.state.lane_half = 0;
+		if (lds_write_sync) {
+			// A write is followed by a barrier, so the other half's later reads see it; a read
+			// leaves the halves unsynchronized for the next write.
+			if (lds_write) {
+				EmitWaveBarrier(ctx.state);
+			}
+			ctx.state.lds_split_synced = lds_write;
+		}
 	}
 }
 
@@ -1531,6 +1553,7 @@ void EmitProgram(EmitterState& state) {
 		high.other_half = &ctx;
 		high.half       = 1;
 	}
+	LaneShareClassify(state);
 	std::optional<DispatcherFunctionState> dispatcher;
 	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
@@ -1756,6 +1779,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+	LaneShareReport(state);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

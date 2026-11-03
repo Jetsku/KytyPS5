@@ -641,10 +641,22 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	}
 }
 
+// KYTY_GDS_M0_BASE (adapted from Erlou93/KytyPS5-Yotei Translator::DsAddress): a DS instruction on GDS
+// addresses M0[31:16] (the base) + its address, as DS_APPEND/DS_CONSUME already do (GCN3 ISA 3.7 "M#
+// Memory Descriptor": for GDS M0 holds {base[15:0], size[15:0]}; RDNA2 DS_APPEND/DS_CONSUME: "M0.base
+// ... will have the physical GDS address"). Without the switch the base is ignored.
+IR::U32 Translator::DsAddress(const Decoder::Instruction& inst, IR::U32 address) {
+	if (!inst.gds || !GetCodegenOptions().gds_m0_base) {
+		return address;
+	}
+	const auto base = ir.ShiftRightLogical(ReadU32(MakeM0Operand()), IR::U32(IR::Value(16u)));
+	return ir.IAdd(address, base);
+}
+
 void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(inst.src0);
+	const auto address = DsAddress(inst, ReadU32(inst.src0));
 	const auto read = [&](const Decoder::Operand& operand) -> IR::Value {
 		return memory.data_dwords == 2u ? IR::Value(ReadU64(operand)) : IR::Value(ReadU32(operand));
 	};
@@ -961,7 +973,7 @@ void Translator::WriteSharedU32(uint32_t width, IR::U32 address,
 
 void Translator::DS_READ(const Decoder::Instruction& inst) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 0));
+	const auto address = DsAddress(inst, ReadU32(MemorySourceAt(inst, 0)));
 	if (memory.data_bits == 32u) {
 		const auto width  = memory.data_dwords;
 		const auto loaded = LoadSharedU32(width, address, memory, inst.pc);
@@ -979,7 +991,7 @@ void Translator::DS_READ(const Decoder::Instruction& inst) {
 void Translator::DS_READ2(const Decoder::Instruction& inst) {
 	const auto memory       = MemoryInfoFromDecoded(inst);
 	const auto width        = memory.data_dwords / 2u;
-	const auto address      = ReadU32(MemorySourceAt(inst, 0));
+	const auto address      = DsAddress(inst, ReadU32(MemorySourceAt(inst, 0)));
 	auto       first        = memory;
 	first.data_dwords       = width;
 	first.component_count   = width;
@@ -1005,7 +1017,7 @@ void Translator::DS_WRITE(const Decoder::Instruction& inst) {
 	for (uint32_t index = 0; index < width; index++) {
 		values[index] = ReadU32(OffsetOperand(data_operand, index));
 	}
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto address = DsAddress(inst, ReadU32(MemorySourceAt(inst, 1)));
 	if (memory.data_bits == 32u) {
 		WriteSharedU32(width, address, values, memory, inst.pc);
 		return;
@@ -1019,7 +1031,7 @@ void Translator::DS_WRITE(const Decoder::Instruction& inst) {
 void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 	const auto               memory      = MemoryInfoFromDecoded(inst);
 	const auto               width       = memory.data_dwords / 2u;
-	const auto               address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto               address     = DsAddress(inst, ReadU32(MemorySourceAt(inst, 1)));
 	const auto               first_data  = MemorySourceAt(inst, 0);
 	const auto               second_data = MemorySourceAt(inst, 2);
 	std::array<IR::Value, 4> first_values {};

@@ -364,6 +364,34 @@ struct CodegenOptions {
 	// all-ones compare never held and a loop exiting on such a branch spun forever (a GPU hang).
 	// Identical results when every host invocation is active; one extra ballot per such branch.
 	bool wave64_active_zero = false;
+	// KYTY_LANE2_SHARE=1 (default 0; on in the PPSA26344 title preset; adapted from Erlou93/KytyPS5-Yotei
+	// spirvEmitterLaneShare.cpp): a wave64 compute program that runs two lanes per host invocation
+	// (lane_count 2) emits an instruction whose value is provably the same in both halves (scalar
+	// state, loop counters, addresses from user data) once; the high half reuses the low half's id.
+	// Exact: the second copy would be the same SPIR-V on the same ids. KYTY_LANE2_SHARE_LOG=1 prints
+	// the counts per program.
+	bool lane2_share = false;
+	// KYTY_KNOWN_BITS_MASKS=1 (default 0; on in the PPSA26344 title preset; adapted from
+	// Erlou93/KytyPS5-Yotei ConstantPropagation.cpp PossibleBits): an AND with a constant mask that keeps
+	// every bit its other operand can have (KnownZeros), and a BitFieldUExtract from bit 0 of a value
+	// with no bit at or above the width, become that operand. Exact (needs KYTY_MOVREL_RANGE, the
+	// known-zero analysis).
+	bool known_bits_masks = false;
+	// KYTY_GDS_M0_BASE=1 (default 0; on in the PPSA26344 title preset; adapted from Erlou93/KytyPS5-Yotei
+	// Translator::DsAddress): DS reads, writes and atomics on GDS add M0[31:16] (the GDS base) to their
+	// address, as DS_APPEND/DS_CONSUME already do. Without it the base is ignored.
+	bool gds_m0_base = false;
+	// KYTY_LDS_ATOMIC_ORDER=1 (default 0; on in the PPSA26344 title preset; adapted from
+	// Erlou93/KytyPS5-Yotei M110): DS_ADD_RTN_U32/DS_SUB_RTN_U32 on workgroup LDS return their old values in
+	// lane order for lanes that address the same dword, as the hardware does (EmitLaneOrderedLdsAdd).
+	bool lds_atomic_order = false;
+	// KYTY_SPLIT_LDS_WRITE_SYNC=1 (default 0; on in the PPSA26344 title preset; adapted from
+	// Erlou93/KytyPS5-Yotei EmitPairLdsWriteSync): in a split wave (KYTY_WAVE64_WARPS) an LDS write is
+	// followed by a workgroup barrier and preceded by one only when this half read the LDS since the last
+	// barrier, instead of a barrier before every LDS access of a program that writes the LDS. The same
+	// orderings (a read sees the other half's earlier writes; a write does not overtake its earlier reads)
+	// with far fewer barriers in programs that read the LDS often.
+	bool split_lds_write_sync = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
