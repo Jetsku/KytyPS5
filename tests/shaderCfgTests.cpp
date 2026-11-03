@@ -6214,6 +6214,19 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
         "null image did not use the canonical 2D sampled descriptor binding");
   Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_1 "),
         "null image retained the decoded 1D descriptor binding");
+  // KYTY_NULL_IMAGE_KEEP_DIM (TheCruZ 4f1b2ebc): the null image keeps the decoded 1D view.
+  auto keep = ShaderRecompiler::GetCodegenOptions();
+  const auto saved = keep;
+  keep.null_image_keep_dim = true;
+  ShaderRecompiler::SetCodegenOptions(keep);
+  auto kept = RecompileForTest(shader, options);
+  ShaderRecompiler::SetCodegenOptions(saved);
+  CheckSpirvBinaryValidates(kept.spirv);
+  const auto kept_source = DisassembleSpirvBinary(kept.spirv);
+  Check(SpirvSourceHasInstructionUsing(kept_source, "OpAccessChain", "image_1 "),
+        "null image did not keep the decoded 1D descriptor binding");
+  Check(!SpirvSourceHasInstructionUsing(kept_source, "OpAccessChain", "image_3 "),
+        "null image with KYTY_NULL_IMAGE_KEEP_DIM used the canonical 2D binding");
 }
 
 void TestNewShaderRecompilerImageGatherVariants() {

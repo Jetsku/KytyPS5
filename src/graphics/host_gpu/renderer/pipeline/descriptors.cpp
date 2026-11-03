@@ -82,6 +82,64 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
+// Texture edge cases adapted from Erlou93/KytyPS5-Yotei (descriptors.cpp; the PPSA26344 preset turns
+// them on, default off). Each one binds a T# the strict checks below bound as null:
+//   KYTY_TEXTURE_MIN_LOD_CLAMP=1: a MIN_LOD past the last mip (streaming textures publish 4095 before
+//     their mips are resident) is clamped to the last level, as the sampler does.
+//   KYTY_TEXTURE_BASE_LAYER_CLAMP=1: a 1D/2D view of a one-layer image whose BASE_ARRAY names a layer
+//     the image does not have reads layer 0 (RDNA2 ISA table 45 lists BASE_ARRAY for array, 3D, cube
+//     and MSAA resources only).
+//   KYTY_TEXTURE_MISALIGNED_BASE=1: a base less aligned than its swizzle block but 256-byte aligned
+//     (the T# base is only required to be 256-byte aligned) is bound at its address.
+//   KYTY_DEPTH_ENCODING_FIELDS=1: a sampled depth T# that differs from the known encoding only in
+//     fields the texture unit does not use for a non-array 1D/2D resource is bound (=2 also binds
+//     any other encoding, Erlou's DEPTH_ENCODING_LENIENT approximation; logged).
+bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] == '1';
+}
+
+bool TextureMinLodClamp() {
+	static const bool on = EnvFlag("KYTY_TEXTURE_MIN_LOD_CLAMP");
+	return on;
+}
+
+bool TextureBaseLayerClamp() {
+	static const bool on = EnvFlag("KYTY_TEXTURE_BASE_LAYER_CLAMP");
+	return on;
+}
+
+bool TextureMisalignedBase() {
+	static const bool on = EnvFlag("KYTY_TEXTURE_MISALIGNED_BASE");
+	return on;
+}
+
+// KYTY_ARRAY_VIEW_SUBRANGE=1 (adapted from Erlou93/KytyPS5-Yotei ARRAY_VIEW_SUBRANGE /
+// ImageInfo::ViewLayersAlone): a sampled view of a single-level array that starts past layer 0 is
+// described as an image of its layers alone (Ghost of Yotei binds one-layer views of 2 GiB arrays),
+// not of the whole array. Not for storage or DCC textures (their metadata and validation describe
+// the whole array).
+bool ArrayViewSubrange() {
+	static const bool on = EnvFlag("KYTY_ARRAY_VIEW_SUBRANGE");
+	return on;
+}
+
+uint32_t DepthEncodingFieldsMode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_DEPTH_ENCODING_FIELDS");
+		return value == nullptr ? 0u : value[0] == '1' ? 1u : value[0] == '2' ? 2u : 0u;
+	}();
+	return mode;
+}
+
+// A view's BASE_ARRAY past the image's layers: true when KYTY_TEXTURE_BASE_LAYER_CLAMP reads layer 0
+// instead (a 1D/2D view of a one-layer image).
+bool ClampsBaseLayer(ShaderRecompiler::Decoder::ImageDimension dimension, uint32_t image_layers) {
+	using Dim = ShaderRecompiler::Decoder::ImageDimension;
+	return TextureBaseLayerClamp() && image_layers == 1u &&
+	       (dimension == Dim::Dim1D || dimension == Dim::Dim2D || dimension == Dim::Dim2DMsaa);
+}
+
 } // namespace
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
@@ -418,6 +476,34 @@ uint64_t SampledDepthBindingSignature(const ShaderRecompiler::IR::ImageResource&
 	return result;
 }
 
+// KYTY_DEPTH_ENCODING_FIELDS (adapted from Erlou93/KytyPS5-Yotei DepthEncodingFieldsVerdict):
+// IsSupportedDepthTextureEncoding compares words 4-7 whole. For a non-array 1D/2D T# the texture
+// unit does not use word 4 apart from BASE_ARRAY (checked as 0 here), word 5 apart from MAX_MIP and
+// PERF_MOD, nor words 6-7 when COMPRESSION_EN is 0 (no metadata is read) (RDNA2 ISA table 45). The
+// strict check on a copy with those fields cleared: 1 = only unused fields differ, 2 = they differ
+// and CORNER_SAMPLES is set (not emulated), 0 = something else.
+uint32_t DepthEncodingFieldsVerdict(const ShaderTextureResource& descriptor, bool r128) {
+	if (r128 ||
+	    (descriptor.Type() != Prospero::ImageType::kColor1D &&
+	     descriptor.Type() != Prospero::ImageType::kColor2D) ||
+	    descriptor.BaseArray5() != 0) {
+		return 0;
+	}
+	auto       used       = descriptor;
+	const bool compressed = descriptor.MetaCompress();
+	used.fields[4]        = 0;
+	used.fields[5]        = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                 (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
+	if (!compressed) {
+		used.fields[6] = 0;
+		used.fields[7] = 0;
+	}
+	if (!IsSupportedDepthTextureEncoding(used, false)) {
+		return 0;
+	}
+	return descriptor.CornerSample() ? 2u : 1u;
+}
+
 // A sampled binding the cache resolved to a depth image that the host cannot sample as the shader
 // asked. Never fatal: it is reported once per descriptor signature and the caller binds a null
 // texture instead.
@@ -430,6 +516,23 @@ static bool ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
 		return true;
+	}
+	if (const auto mode = DepthEncodingFieldsMode(); mode != 0 && resource_ok && view_ok) {
+		const auto verdict = DepthEncodingFieldsVerdict(descriptor, resource.r128);
+		if (verdict == 1u || mode == 2u) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::printf("Depth T# bound with %s (KYTY_DEPTH_ENCODING_FIELDS=%u): addr=0x%016" PRIx64
+				            " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				            verdict == 1u   ? "fields the texture unit does not use"
+				            : verdict == 2u ? "CORNER_SAMPLES set (approximation)"
+				                            : "an unknown encoding (approximation)",
+				            mode, descriptor.Base40(), descriptor.fields[0], descriptor.fields[1],
+				            descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+				            descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			}
+			return true;
+		}
 	}
 	static std::mutex                   reported_mutex;
 	static std::unordered_set<uint64_t> reported;
@@ -709,13 +812,15 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
+	if (descriptor.MinLod() > descriptor.LastLevel() * 256u && !TextureMinLodClamp()) {
 		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
 		     descriptor.MinLod(), descriptor.LastLevel());
 	}
+	// KYTY_TEXTURE_MIN_LOD_CLAMP: the sampler clamps a minimum LOD past the last level to that level.
+	const auto min_lod  = std::min<uint32_t>(descriptor.MinLod(), descriptor.LastLevel() * 256u);
 	const auto base_lod = view.base_level * 256u;
-	if (descriptor.MinLod() > base_lod) {
-		view.min_lod = descriptor.MinLod() - base_lod;
+	if (min_lod > base_lod) {
+		view.min_lod = min_lod - base_lod;
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
@@ -726,6 +831,9 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
 			view.base_layer = descriptor.BaseArray5();
+			if (view.base_layer >= image_layers && ClampsBaseLayer(resource.dimension, image_layers)) {
+				view.base_layer = 0;
+			}
 			if (view.base_layer >= image_layers) {
 				EXIT("texture base layer is out of bounds\n");
 			}
@@ -757,6 +865,9 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
+			if (view.base_layer >= image_layers && ClampsBaseLayer(resource.dimension, image_layers)) {
+				view.base_layer = 0;
+			}
 			if (view.base_layer >= image_layers) {
 				EXIT("texture base layer is out of bounds\n");
 			}
@@ -933,8 +1044,24 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
-	if (size.size == 0 || size.align == 0 ||
-	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+	// KYTY_TEXTURE_MISALIGNED_BASE: a 256-byte aligned base below its swizzle block's alignment is
+	// bound at its address (the swizzle offsets are base-relative). Erlou logged only SW_4KB_S
+	// textures at mip-tail positions (Ghost of Yotei's small RGBA16F mips written and read per level).
+	const bool misaligned_base = TextureMisalignedBase() && size.size != 0 && size.align != 0 &&
+	                             (address & (static_cast<uint64_t>(size.align) - 1u)) != 0 &&
+	                             (address & 0xffu) == 0;
+	if (misaligned_base) {
+		static std::atomic<uint32_t> logged {0};
+		const auto n = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (n <= 8u || std::has_single_bit(n)) {
+			std::printf("Texture misaligned base #%u (KYTY_TEXTURE_MISALIGNED_BASE): addr=0x%016" PRIx64
+			            " align=0x%x %ux%u format=%u tile=%u size=0x%x %s\n",
+			            n, address, size.align, width, height, static_cast<uint32_t>(format),
+			            static_cast<uint32_t>(tile), size.size, storage ? "storage" : "sampled");
+		}
+	}
+	if (!misaligned_base && (size.size == 0 || size.align == 0 ||
+	                         (address & (static_cast<uint64_t>(size.align) - 1u)) != 0)) {
 		if (storage && skip) {
 			static std::atomic_bool logged {false};
 			return SkipTextureDescriptor(resource, descriptor,
@@ -1023,13 +1150,14 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		// layer past the image's layers or a component selector no texture has (each an EXIT in
 		// TextureViewInfo): a bindless heap entry read while the guest rewrote it (GT7 races), or
 		// a T# read after its reuse. Bound as null (a bindless key stays on its placeholder).
-		if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
+		if (descriptor.MinLod() > descriptor.LastLevel() * 256u && !TextureMinLodClamp()) {
 			static std::atomic_bool logged {false};
 			return SkipTextureDescriptor(resource, descriptor, "texture minimum LOD past its last mip",
 			                             logged);
 		}
 		if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
-		    descriptor.BaseArray5() >= desc.info.resources.layers) {
+		    descriptor.BaseArray5() >= desc.info.resources.layers &&
+		    !ClampsBaseLayer(resource.dimension, desc.info.resources.layers)) {
 			static std::atomic_bool logged {false};
 			return SkipTextureDescriptor(resource, descriptor, "texture base layer past its layers",
 			                             logged);
@@ -1045,6 +1173,31 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	const auto first_layer = desc.view_info.base_layer;
+	if (ArrayViewSubrange() && layered && !storage && first_layer != 0 &&
+	    first_layer < desc.info.resources.layers && desc.info.resources.levels == 1 && samples == 1 &&
+	    desc.info.metadata.kind == ImageMetadataKind::None &&
+	    desc.info.data.size % desc.info.resources.layers == 0) {
+		const auto slice  = desc.info.data.size / desc.info.resources.layers;
+		const auto layers = desc.info.resources.layers - first_layer;
+		// The layers' bytes are one slice each (one level), so the sub-array is a contiguous range
+		// with the whole array's slice layout.
+		if (desc.info.mip_layout[0].offset == 0 && desc.info.mip_layout[0].size == desc.info.data.size &&
+		    (slice & (static_cast<uint64_t>(size.align) - 1u)) == 0) {
+			desc.info.data             = {address + slice * first_layer, slice * layers};
+			desc.info.resources.layers = layers;
+			desc.info.mip_layout[0].size = slice * layers;
+			desc.view_info.base_layer  = 0;
+			desc.view_info.layer_count = std::min(desc.view_info.layer_count, layers);
+			static std::atomic<uint32_t> logged {0};
+			const auto n = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+			if (n <= 4u || std::has_single_bit(n)) {
+				std::printf("Array view subrange #%u (KYTY_ARRAY_VIEW_SUBRANGE): addr=0x%016" PRIx64
+				            " %ux%u layers %u..%u slice=0x%" PRIx64 "\n",
+				            n, address, width, height, first_layer, first_layer + layers - 1u, slice);
+			}
+		}
+	}
 
 	return desc;
 }
@@ -1240,8 +1393,32 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	const bool ms_depth_sample0 = TextureCache::MsDepthSample0Enabled() && single_sample_read;
 	bool       copy_binding     = false;
 	if (stencil_association) {
+		const auto record_id = id;
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+		if (storage) {
+			// A storage view of a depth/stencil image's stencil aspect (Erlou: STENCIL_STORAGE_SHADOW).
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::printf("Stencil plane bound as a storage image: plane 0x%012" PRIx64
+				            " depth 0x%012" PRIx64 " %ux%u format %d\n",
+				            texture_cache.GetImage(record_id).info.data.address,
+				            image->info.data.address, image->backing.extent.width,
+				            image->backing.extent.height, static_cast<int>(image->backing.format));
+			}
+		} else if (TextureCache::PreserveStencilEnabled()) {
+			// KYTY_PRESERVE_STENCIL: a plane the depth image does not hold is read from its saved copy.
+			bool       plane_copy = false;
+			const auto reader     = texture_cache.StencilPlaneReader(record_id, plane_copy);
+			if (plane_copy) {
+				id           = reader;
+				image        = &texture_cache.GetImage(id);
+				copy_binding = true;
+				// As the stencil aspect view reads: the plane's bytes as integers.
+				desc.view_info.format = vk::Format::eR8Uint;
+				desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+			}
+		}
 		if (ms_depth_sample0 && !storage && image->backing.samples > 1) {
 			id           = texture_cache.SingleSampleStencil(id);
 			image        = &texture_cache.GetImage(id);
@@ -1264,6 +1441,12 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		// KYTY_STENCIL_ALIAS_COPY: a stencil plane read at another extent than its depth image.
+		if (TextureCache::StencilAliasCopyEnabled() && image->info.bytes_per_block == 1u &&
+		    texture_cache.CopyStencilPlaneToAlias(id)) {
+			image        = &texture_cache.GetImage(id);
+			copy_binding = true; // not memoized: each resolution copies the plane again
+		}
 		if (!IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
 		                                 descriptor.DstSelXYZW()) &&
 		    Common::SkipInvalidEnabled()) {

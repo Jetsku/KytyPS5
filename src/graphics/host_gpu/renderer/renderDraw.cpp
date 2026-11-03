@@ -90,6 +90,20 @@ static bool MeshRestartEnabled() {
 	return enabled;
 }
 
+// KYTY_HTILE_FULL_RANGE=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_HTILE_FULL_RANGE, a logged
+// approximation; PPSA26344 preset, default off): the host never writes HTILE contents (a consumed
+// clear leaves the guest bytes as they were), but shaders read the per-tile min/max depth (Ghost of
+// Yotei: to enqueue shadow-resolve tiles). Once per frame and HTILE address (and at each depth
+// clear) the guest HTILE of a bound depth target is filled with "expanded, full depth range"
+// (ZMask 0xF, MinZ 0, MaxZ 0x3FFF), so such tests are conservative instead of using stale tiles.
+static bool HtileFullRangeEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_HTILE_FULL_RANGE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 // KYTY_HTILE_STENCIL_CLEAR (default on): an HTile clear also clears a stencil plane it tracks.
 static bool HtileStencilClearEnabled() {
 	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
@@ -1004,6 +1018,27 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
+		}
+		if (HtileFullRangeEnabled() && metadata.kind == ImageMetadataKind::Htile &&
+		    metadata.range.size >= 4u && (metadata.range.address & 3u) == 0) {
+			static std::unordered_map<uint64_t, uint64_t> filled_frame;
+			const auto frame = static_cast<uint64_t>(buffer.GetContext().GetGpu().GetFrameNum());
+			const auto [entry, inserted] = filled_frame.try_emplace(metadata.range.address, frame);
+			if (inserted || entry->second != frame || depth.depth_clear_enable) {
+				entry->second   = frame;
+				const auto size = metadata.range.size & ~uint64_t {3};
+				auto [htile, htile_offset] =
+				    buffer.GetContext().GetBufferCache().ObtainBuffer(metadata.range.address, size, true);
+				if (htile != nullptr) {
+					htile->Fill(htile_offset, size, 0xFFFC000Fu);
+				}
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 4u) {
+					LOGF("HTILE full range (KYTY_HTILE_FULL_RANGE, approximation): 0x%012" PRIx64
+					     " size 0x%" PRIx64 "\n",
+					     metadata.range.address, size);
+				}
+			}
 		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&

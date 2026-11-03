@@ -2198,7 +2198,304 @@ void CheckRealtimeClock(VulkanHarness *vulkan) {
               host.shift, clock_words[2], clock_words[1]);
 }
 
+// KYTY_LANE2_SHARE: a wave64 program (two lanes per host invocation on a 32-wide host) with a
+// scalar inner loop whose counter and running sum are the same in both halves, feeding per-lane
+// VALU work and a uniform output. Results must match with and without the sharing and the CPU
+// reference, and the shared module must be smaller.
+void CheckLane2Share(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenLane2Share";
+  using O = ShaderOpcode;
+  constexpr u32 Count = 2048;
+  constexpr u32 Seed = 0x9e3779b9u;
+  std::vector<std::vector<u32>> inputs(2);
+  uint64_t state = 0x1a2e5aa5u;
+  for (u32 e = 0; e < Count; e++) {
+    inputs[0].push_back(NextRandom(state));
+    inputs[1].push_back(NextRandom(state));
+  }
+  const auto body = [&](std::vector<u32> *code) {
+    code->push_back(EncodeVop1(0x01, 10, Vgpr(2)));     // v_mov_b32 v10, v2
+    code->push_back(EncodeSMovB32(70, InlineU32(3)));   // s_mov_b32 s70, 3
+    code->push_back(EncodeSMovB32(71, 255));            // s_mov_b32 s71, lit
+    code->push_back(Seed);
+    const auto inner = static_cast<u32>(code->size());
+    code->push_back(EncodeSop2(0x00, 71, 71, 70));      // s_add_u32 s71, s71, s70
+    code->push_back(EncodeVop2(0x25, 10, 71, 10));      // v_add_nc_u32 v10, s71, v10
+    code->push_back(EncodeVop2(0x1d, 10, Vgpr(10), 3)); // v_xor_b32 v10, v10, v3
+    code->push_back(EncodeSop2(0x01, 70, 70, InlineU32(1))); // s_sub_u32 s70, s70, 1
+    code->push_back(EncodeSopc(0x07, 70, InlineU32(0)));      // s_cmp_lg_u32 s70, 0
+    const auto branch = static_cast<int32_t>(inner) - static_cast<int32_t>(code->size()) - 1;
+    code->push_back(EncodeSopp(0x05, static_cast<u32>(branch) & 0xffffu)); // s_cbranch_scc1
+    code->push_back(EncodeVop1(0x01, 11, 71));          // v_mov_b32 v11, s71
+  };
+  auto bulk = MakeBulkCase(name, 2, 2, inputs, body,
+                           {O::V_MOV_B32, O::S_SUB_U32, O::S_CMP_LG_U32, O::V_ADD_NC_U32,
+                            O::V_XOR_B32});
+  CodegenOptions shared = GetCodegenOptions();
+  shared.lane2_share = true;
+  shared.wave64_warps = false;
+  shared.lane_local = false;
+  CodegenOptions legacy = shared;
+  legacy.lane2_share = false;
+  const auto fast = RunBulk(vulkan, bulk, shared);
+  const auto slow = RunBulk(vulkan, bulk, legacy);
+  const auto reference = [&](u32 output, u32 e) -> u32 {
+    u32 sum = Seed;
+    u32 value = inputs[0][e];
+    for (u32 counter = 3; counter != 0; counter--) {
+      sum += counter;
+      value = (value + sum) ^ inputs[1][e];
+    }
+    return output == 0 ? value : sum;
+  };
+  static const char *const names[] = {"per-lane v10", "uniform v11"};
+  CompareBulk(name, bulk, fast, slow, reference, names);
+  const bool host32 = vulkan->SubgroupSize() == 32u;
+  if (host32) {
+    Require(name, "module size", fast.spirv.size() < slow.spirv.size(),
+            "SPIR-V " + std::to_string(slow.spirv.size()) + " -> " +
+                std::to_string(fast.spirv.size()) + " words");
+  }
+  std::printf("[codegen] %-32s ok (SPIR-V %zu -> %zu words, OpPhi %zu -> %zu)\n", name,
+              slow.spirv.size(), fast.spirv.size(), CountSpirv(slow.spirv, "OpPhi"),
+              CountSpirv(fast.spirv, "OpPhi"));
+}
+
+// KYTY_KNOWN_BITS_MASKS: v_and_b32 0xffff of a value shifted right by 16, and v_bfe_u32 0, 8 of a
+// value already masked to 0xff, are their sources. Same results, fewer masks.
+void CheckKnownBitsMasks(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenKnownBitsMasks";
+  using O = ShaderOpcode;
+  constexpr u32 Count = 1024;
+  std::vector<std::vector<u32>> inputs(2);
+  uint64_t state = 0x6b17b175u;
+  for (u32 e = 0; e < Count; e++) {
+    inputs[0].push_back(NextRandom(state));
+    inputs[1].push_back(NextRandom(state));
+  }
+  const auto body = [&](std::vector<u32> *code) {
+    code->push_back(EncodeVop2(0x16, 20, InlineU32(16), 2)); // v_lshrrev_b32 v20, 16, v2
+    code->push_back(EncodeVop2(0x1b, 10, 255, 20));          // v_and_b32 v10, lit, v20
+    code->push_back(0xffffu);
+    code->push_back(EncodeVop2(0x1b, 21, 255, 3));           // v_and_b32 v21, lit, v3
+    code->push_back(0xffu);
+    AppendVop3(code, 0x148, 11, Vgpr(21), InlineU32(0), InlineU32(8)); // v_bfe_u32 v11, v21, 0, 8
+  };
+  auto bulk = MakeBulkCase(name, 2, 2, inputs, body,
+                           {O::V_LSHRREV_B32, O::V_AND_B32, O::V_BFE_U32});
+  for (const u32 wave : {64u, 32u}) {
+    bulk.test.compute_info.wave_size = wave;
+    CodegenOptions merged = GetCodegenOptions();
+    merged.movrel_range = true;
+    merged.known_bits_masks = true;
+    CodegenOptions legacy = merged;
+    legacy.known_bits_masks = false;
+    const auto fast = RunBulk(vulkan, bulk, merged);
+    const auto slow = RunBulk(vulkan, bulk, legacy);
+    const auto reference = [&](u32 output, u32 e) -> u32 {
+      return output == 0 ? inputs[0][e] >> 16u : inputs[1][e] & 0xffu;
+    };
+    static const char *const names[] = {"and of shift v10", "bfe of and v11"};
+    CompareBulk(name, bulk, fast, slow, reference, names);
+    const auto masks_fast = CountSpirv(fast.spirv, "OpBitwiseAnd") +
+                            CountSpirv(fast.spirv, "OpBitFieldUExtract");
+    const auto masks_slow = CountSpirv(slow.spirv, "OpBitwiseAnd") +
+                            CountSpirv(slow.spirv, "OpBitFieldUExtract");
+    Require(name, "mask count", masks_fast + 2u <= masks_slow,
+            "wave" + std::to_string(wave) + ": masks " + std::to_string(masks_slow) + " -> " +
+                std::to_string(masks_fast));
+    std::printf("[codegen] %-32s ok (wave%u, AND+BFE %zu -> %zu)\n", name, wave, masks_slow,
+                masks_fast);
+  }
+}
+
+// KYTY_GDS_M0_BASE: ds_write_b32/ds_read_b32 on GDS with M0 = {base 16 bytes, size 0x1000} address
+// GDS word 4 + lane; without the switch the base is ignored (word lane).
+void CheckGdsM0Base(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  for (const bool enabled : {true, false}) {
+    for (const u32 wave_size : {32u, 64u}) {
+      TestCase test;
+      test.name = enabled ? "CodegenGdsM0Base" : "CodegenGdsM0BaseOff";
+      auto &code = test.code;
+      code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v_lshlrev_b32 v1, 2, v0
+      code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0)); // v_add_nc_u32 v2, 1, v0
+      AppendSMovLiteral(&code, 124, 0x00101000u);           // s_mov_b32 m0, base 16, size 4096
+      code.insert(code.end(), {EncodeDs0(0x0d, 0, true), EncodeDs1(0, 2, 1),   // ds_write_b32 gds
+                               EncodeDs0(0x36, 0, true), EncodeDs1(5, 0, 1)}); // ds_read_b32 gds
+      AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 0);
+      AppendEnd(&code);
+      test.initial.assign(wave_size, 0xdeadbeefu);
+      test.expected.resize(wave_size);
+      std::iota(test.expected.begin(), test.expected.end(), 1u);
+      test.compute_info.threads_num[0] = wave_size;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.wave_size = wave_size;
+      test.has_compute_info = true;
+      const u32 base_words = enabled ? 4u : 0u;
+      test.gds_initial.assign(wave_size + 4u, 0u);
+      test.expected_gds.assign(wave_size + 4u, 0u);
+      for (u32 lane = 0; lane < wave_size; lane++) {
+        test.expected_gds[base_words + lane] = lane + 1u;
+      }
+      test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::DS_WRITE_B32,
+                      O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+      CodegenOptions options = GetCodegenOptions();
+      options.gds_m0_base = enabled;
+      ScopedCodegenOptions scope(options);
+      RunCase(vulkan, test);
+    }
+  }
+}
+
+// KYTY_LDS_ATOMIC_ORDER: every lane of one wave does ds_add_rtn_u32 (lane + 1) and ds_sub_rtn_u32
+// (lane + 1) on one LDS dword; the returned old values follow lane order (lane L sees the sum of the
+// lanes below it), in wave32 and in wave64 (two lanes per host invocation).
+void CheckLdsAtomicOrder(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  for (const u32 wave_size : {64u, 32u}) {
+    TestCase test;
+    test.name = wave_size == 64u ? "CodegenLdsAtomicOrder64" : "CodegenLdsAtomicOrder32";
+    auto &code = test.code;
+    AppendVMovU32(&code, 1, 0);                           // v1 = 0 (LDS address)
+    AppendVMovU32(&code, 4, 0);                           // v4 = 0
+    code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0)); // v_add_nc_u32 v2, 1, v0
+    code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 4, 1)});     // ds_write_b32 v1, v4
+    code.insert(code.end(), {EncodeDs0(0x0d, 4), EncodeDs1(0, 4, 1)});  // ds_write_b32 v1, v4 offset:4
+    code.insert(code.end(), {EncodeDs0(0x20), EncodeDs1(3, 2, 1)});     // ds_add_rtn_u32 v3, v1, v2
+    code.insert(code.end(), {EncodeDs0(0x21, 4), EncodeDs1(5, 2, 1)});  // ds_sub_rtn_u32 v5, v1, v2 offset:4
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+    AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, wave_size);
+    AppendEnd(&code);
+    test.initial.assign(wave_size * 2u, 0xdeadbeefu);
+    test.expected.resize(wave_size * 2u);
+    for (u32 lane = 0; lane < wave_size; lane++) {
+      const u32 below = lane * (lane + 1u) / 2u;
+      test.expected[lane] = below;
+      test.expected[wave_size + lane] = 0u - below;
+    }
+    test.compute_info.threads_num[0] = wave_size;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = wave_size;
+    test.compute_info.lds_size_dwords = 2;
+    test.has_compute_info = true;
+    test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::DS_WRITE_B32, O::DS_ADD_RTN_U32,
+                    O::DS_SUB_RTN_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.required_spirv = {"OpGroupNonUniformIAdd"};
+    CodegenOptions options = GetCodegenOptions();
+    options.lds_atomic_order = true;
+    options.wave64_warps = false;
+    options.lds_slots = false;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+  }
+}
+
+// KYTY_SPLIT_LDS_WRITE_SYNC: a split wave64 (KYTY_WAVE64_WARPS, one 64-thread workgroup) writes its
+// lane id to LDS, reads the mirrored lane (the other host subgroup) twice, overwrites its dword after
+// those reads and reads the mirrored lane again: every read must see the other half's write in guest
+// order, with and without the switch.
+void CheckSplitLdsWriteSync(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  for (const bool enabled : {true, false}) {
+    TestCase test;
+    test.name = enabled ? "CodegenSplitLdsWriteSync" : "CodegenSplitLdsWriteSyncOff";
+    auto &code = test.code;
+    code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));       // v_lshlrev_b32 v1, 2, v0
+    code.push_back(EncodeVop2(0x26, 2, 255, 0));                // v_sub_nc_u32 v2, 63, v0
+    code.push_back(63u);
+    code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 2));       // v_lshlrev_b32 v2, 2, v2
+    code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 0, 1)});   // ds_write_b32 v1, v0
+    code.insert(code.end(), {EncodeDs0(0x36), EncodeDs1(3, 0, 2)});   // ds_read_b32 v3, v2
+    code.insert(code.end(), {EncodeDs0(0x36), EncodeDs1(4, 0, 2)});   // ds_read_b32 v4, v2
+    code.push_back(EncodeVop2(0x25, 5, 255, 0));                // v_add_nc_u32 v5, 100, v0
+    code.push_back(100u);
+    code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 5, 1)});   // ds_write_b32 v1, v5
+    code.insert(code.end(), {EncodeDs0(0x36), EncodeDs1(6, 0, 2)});   // ds_read_b32 v6, v2
+    code.push_back(EncodeVop2(0x25, 3, Vgpr(3), 4));            // v_add_nc_u32 v3, v3, v4
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+    AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 64);
+    AppendEnd(&code);
+    test.initial.assign(128, 0xdeadbeefu);
+    test.expected.resize(128);
+    for (u32 lane = 0; lane < 64; lane++) {
+      test.expected[lane] = 2u * (63u - lane);
+      test.expected[64 + lane] = 100u + 63u - lane;
+    }
+    test.compute_info.threads_num[0] = 64;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = 64;
+    test.compute_info.lds_size_dwords = 64;
+    test.has_compute_info = true;
+    test.opcodes = {O::V_LSHLREV_B32, O::V_SUB_NC_U32, O::V_ADD_NC_U32, O::DS_WRITE_B32,
+                    O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_warps = true;
+    options.split_lds_write_sync = enabled;
+    options.lds_slots = false;
+    options.lane_local = false;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+  }
+}
+
+// KYTY_SCALAR_LOAD_GROUPS: S_LOAD_DWORDX4 through a scalar address, once inside one BDA page
+// (one page lookup for the four dwords) and once straddling a page boundary (per-dword path); the
+// results match the memory with and without the switch.
+void CheckScalarLoadGroups(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Page = static_cast<u32>(BufferCache::CACHING_PAGESIZE);
+  constexpr u32 Inside = 256u;
+  constexpr u32 Straddle = Page - 8u;
+  for (const bool enabled : {true, false}) {
+    TestCase test;
+    test.name = enabled ? "CodegenScalarLoadGroups" : "CodegenScalarLoadGroupsOff";
+    test.initial.assign((2u * Page) / 4u, 0u);
+    for (u32 word = 0; word < 4; word++) {
+      test.initial[Inside / 4 + word] = 0x11110000u + word;
+      test.initial[Straddle / 4 + word] = 0x22220000u + word;
+    }
+    auto &code = test.code;
+    AppendSMovLiteral(&code, 2, static_cast<u32>(GuestBase));
+    AppendSMovLiteral(&code, 3, static_cast<u32>(GuestBase >> 32u));
+    code.push_back(EncodeSmem0(0x02, 8, 1));   // s_load_dwordx4 s[8:11], s[2:3], Inside
+    code.push_back(EncodeSmem1(Inside));
+    code.push_back(EncodeSmem0(0x02, 12, 1));  // s_load_dwordx4 s[12:15], s[2:3], Straddle
+    code.push_back(EncodeSmem1(Straddle));
+    code.push_back(EncodeSopp(0x0c, 0));       // s_waitcnt 0
+    for (u32 i = 0; i < 8; i++) {
+      code.push_back(EncodeVop1(0x01, 20 + i, 8 + i)); // v_mov_b32 v(20+i), s(8+i)
+      AppendStoreVgpr(&code, 20 + i, i);
+    }
+    AppendEnd(&code);
+    test.expected = {0x11110000u, 0x11110001u, 0x11110002u, 0x11110003u,
+                     0x22220000u, 0x22220001u, 0x22220002u, 0x22220003u};
+    test.bda_mappings = {{GuestBase, 0}};
+    test.opcodes = {O::S_MOV_B32, O::S_LOAD_DWORDX4, O::S_WAITCNT, O::V_MOV_B32,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+    CodegenOptions options = GetCodegenOptions();
+    options.scalar_load_groups = enabled;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+    // S_BUFFER_LOAD_DWORDXn through GPU-selected V#s (the indirect scalar group form) and the
+    // scalar load variants.
+    RunCase(vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(vulkan, ScalarMemoryLoadVariants());
+  }
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckScalarLoadGroups(vulkan);
+  CheckSplitLdsWriteSync(vulkan);
+  CheckLdsAtomicOrder(vulkan);
+  CheckGdsM0Base(vulkan);
+  CheckKnownBitsMasks(vulkan);
+  CheckLane2Share(vulkan);
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
   CheckExecSelects(vulkan);

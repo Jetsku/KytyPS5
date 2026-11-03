@@ -301,6 +301,24 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
+// KYTY_STORAGE_SWIZZLE_CANON (TheCruZ 72e95dcd): a storage image in its own format (no conversion)
+// applies the swizzle only to stores (StoreTexel), and a store keeps just the channels the format
+// has. A swizzle that stores each of them from its own component is the identity, so an RG target
+// written as (R, G, 0, 1) shares the program of an RGBA target written as (R, G, B, A).
+uint32_t CanonicalStorageSwizzle(uint32_t swizzle, Prospero::BufferFormat format) {
+	const auto info = Format::GetFormatInfo(format);
+	if (info.type == Format::ComponentType::Unknown || info.component_count == 0u ||
+	    info.component_count > 4u) {
+		return swizzle;
+	}
+	for (uint32_t channel = 0; channel < info.component_count; channel++) {
+		uint32_t source = 0;
+		while (source < 4u && ((swizzle >> (source * 3u)) & 7u) != 4u + channel) source++;
+		if (source != channel) return swizzle;
+	}
+	return ShaderImageIdentitySwizzle;
+}
+
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	return Prospero::RemapTextureFormat(format) != format ? format
 	                                                      : Prospero::BufferFormat::kInvalid;
@@ -998,6 +1016,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			if (GetCodegenOptions().null_image_keep_dim &&
+			    base.dimension != Decoder::ImageDimension::Unknown) {
+				// KYTY_NULL_IMAGE_KEEP_DIM (TheCruZ 4f1b2ebc): a null descriptor reads zero through a
+				// view of any type (NullTextureDesc makes one per dimension), so the image keeps the
+				// dimension the shader samples with and a game that binds it later (a texture still
+				// streaming in) reuses the same program instead of compiling another.
+				image.dimension = base.dimension;
+				image.cube      = base.cube;
+			}
 			if (image.bindless) {
 				// No one descriptor describes a bindless image: keep the dimension the
 				// instruction samples, which picks the set-1 array.
@@ -1045,6 +1072,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.conversion_format = ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
+		}
+		if (storage && GetCodegenOptions().storage_swizzle_canon &&
+		    image.conversion_format == Prospero::BufferFormat::kInvalid) {
+			image.shader_swizzle = CanonicalStorageSwizzle(image.shader_swizzle, format);
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && (base.atomic ? !base.atomic64 : !base.read);
@@ -1142,6 +1173,29 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
+			// KYTY_STORAGE_TABLE_LOOSE (adapted from Erlou93/KytyPS5-Yotei M120): a storage-table
+			// candidate that differs from the exemplar only in a plain dimension (not cube or MSAA:
+			// each write takes its coordinates as the candidate's own type needs them) or in the
+			// swizzle of a format without conversion (each write applies its own, StoreTexel) keeps
+			// its own type, as the GPU addresses it by its own T#, instead of failing the stage.
+			const auto plain_dimension = [](Decoder::ImageDimension dimension) {
+				return dimension == Decoder::ImageDimension::Dim1D ||
+				       dimension == Decoder::ImageDimension::Dim1DArray ||
+				       dimension == Decoder::ImageDimension::Dim2D ||
+				       dimension == Decoder::ImageDimension::Dim2DArray ||
+				       dimension == Decoder::ImageDimension::Dim3D;
+			};
+			if (GetCodegenOptions().storage_table_loose &&
+			    program.info.images[root_index].resource_class == ImageResourceClass::Storage &&
+			    !image.cube && !image_class.cube && plain_dimension(image.dimension) &&
+			    plain_dimension(image_class.dimension) &&
+			    image.numeric_class == image_class.numeric_class &&
+			    image.mip_count == image_class.mip_count &&
+			    image.conversion_format == image_class.conversion_format &&
+			    image.conversion_format == Prospero::BufferFormat::kInvalid &&
+			    (!same_coordinates || image.shader_swizzle != image_class.shader_swizzle)) {
+				continue;
+			}
 			if (image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||

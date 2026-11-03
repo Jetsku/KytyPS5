@@ -239,6 +239,14 @@ public:
 	// thread only (the depth-target resolution of draws).
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// KYTY_HTILE_SLICE_CLEAR=1 (adapted from Erlou93/KytyPS5-Yotei FIX_HTILE_SLICE_CLEAR, M122;
+	// PPSA26344 preset, default off; =0 is ClearMeta(address)): a clear of `size` bytes at a
+	// layered HTILE clears the layers it covers only. At the HTILE's base address the first
+	// size / slice-size layers (the other layers keep their state; ClearMeta takes every layer as
+	// cleared); inside it (a single layer's or a few layers' HTILE bytes) those layers, which
+	// ClearMeta did not see at all. True only for a clear at the base (the caller may consume it).
+	[[nodiscard]] bool ClearMetaRange(uint64_t address, uint64_t size);
+	[[nodiscard]] static bool HtileSliceClearEnabled();
 	// KYTY_META_CLEAR_COVER: marks cleared every surface metadata entry that starts inside
 	// (address, address + size) (the exact start is ClearMeta's); returns how many.
 	[[nodiscard]] uint32_t ClearMetaCovered(uint64_t address, uint64_t size);
@@ -264,6 +272,29 @@ public:
 	[[nodiscard]] static bool MsDepthSample0Enabled();
 	[[nodiscard]] ImageId SingleSampleDepth(ImageId id);
 	[[nodiscard]] ImageId SingleSampleStencil(ImageId depth_id);
+	// KYTY_PRESERVE_STENCIL=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_PRESERVE_STENCIL,
+	// STENCIL_PLANE_SYNC and FIX_STENCIL_PLANE_WRITES, M119; PPSA26344 preset, default off). The
+	// PS5 keeps each stencil plane in its own memory; the host keeps one stencil aspect per depth
+	// image. When a depth target is bound with another stencil plane than the one its stencil
+	// aspect holds, the held plane is saved (a GPU buffer per depth address, plane and extent) and
+	// the new plane's saved copy, if any, is restored (SwapStencilPlane). A shader read of a plane
+	// the depth image does not hold now reads that plane's saved copy (StencilPlaneReader) instead
+	// of the other plane, and a refresh of such a plane from guest memory waits until the plane is
+	// swapped back in, so a guest write to it no longer lands on the plane the depth image holds
+	// (Erlou: the game's fill of one plane overwrote the water bits of another: no water lighting).
+	// Single-sample, one-layer depth images only. GPU thread.
+	[[nodiscard]] static bool PreserveStencilEnabled();
+	// The image a sampled read of the stencil plane `record_id` (a stencil association record)
+	// binds: its depth image, or (copy = true) a copy of the plane's saved contents.
+	[[nodiscard]] ImageId StencilPlaneReader(ImageId record_id, bool& copy);
+	// KYTY_STENCIL_ALIAS_COPY=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_ALIAS_COPY,
+	// a logged approximation for dynamic resolution; PPSA26344 preset, default off): a 1-byte
+	// image at a stencil plane's address with another extent than its depth image (the plane read
+	// at another resolution) is a separate image nothing writes; before it is sampled the
+	// overlapping top-left region of the plane (the depth image's stencil aspect, or the plane's
+	// saved copy with KYTY_PRESERVE_STENCIL) is copied into it. True when it copied.
+	[[nodiscard]] static bool StencilAliasCopyEnabled();
+	bool CopyStencilPlaneToAlias(ImageId target_id);
 	// KYTY_SUB_EXTENT_COPY=1 (from usa-ratt/KytyPS5-GT7 429692dd3, Franseven's case): a texture
 	// narrower or shorter than the single-sample colour image at its address, with the same guest
 	// layout (same memory size and tiling: UI text drawn with a narrower viewport into a wider
@@ -330,6 +361,10 @@ private:
 		Type type;
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// KYTY_HTILE_SLICE_CLEAR: one layer's HTILE bytes and the layers, from a depth target bound
+		// with all of its image's layers (0 = not known).
+		uint64_t slice_size = 0;
+		uint32_t layers     = 0;
 	};
 
 	struct OverlapResult {
@@ -667,6 +702,22 @@ private:
 	// KYTY_CMASK_MSAA: the addresses colour targets' CMASK starts at (IsColorMeta), at most 4096.
 	std::unordered_set<uint64_t>                       m_color_metas;
 	std::unordered_map<ImageId, SingleSampleCopy>      m_single_sample_stencils;
+	// KYTY_PRESERVE_STENCIL: saved stencil planes by StencilPlaneKey (depth address, plane address,
+	// extent): the buffer, its extent, the save count it holds and the reader copy made of it.
+	struct SavedStencilPlane {
+		std::shared_ptr<Buffer> buffer;
+		uint32_t                width  = 0;
+		uint32_t                height = 0;
+		uint64_t                serial = 0;
+		ImageId                 reader {};
+		uint64_t                reader_serial = 0;
+	};
+	std::unordered_map<uint64_t, SavedStencilPlane> m_stencil_planes;
+	uint64_t                                        m_stencil_plane_serial = 0;
+	std::shared_ptr<Buffer>                         m_stencil_alias_staging;
+	// Whether the depth image of a stencil record holds the record's plane (KYTY_PRESERVE_STENCIL).
+	[[nodiscard]] bool StencilPlaneHeld(const Image& record) const;
+	void SwapStencilPlane(ImageId depth_id, uint64_t next_plane);
 	// SubExtentCopy's copies, by the image they copy (at most 4 extents each).
 	struct SubExtentCopyEntry {
 		ImageId  copy {};

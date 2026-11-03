@@ -2644,6 +2644,262 @@ ImageId TextureCache::SingleSampleStencil(ImageId depth_id) {
 	return SingleSampleCopyOf(depth_id, true);
 }
 
+bool TextureCache::PreserveStencilEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PRESERVE_STENCIL");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Stencil planes: one saved copy per guest plane, swapped at depth binds "
+			     "(KYTY_PRESERVE_STENCIL=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+namespace {
+
+uint64_t StencilPlaneKey(uint64_t depth_address, uint64_t plane, uint32_t width, uint32_t height) {
+	uint64_t key = depth_address * 0x9E3779B97F4A7C15ull;
+	key ^= plane + 0x632BE59BD9B4E019ull + (key << 6u) + (key >> 2u);
+	key ^= (uint64_t {width} << 32u | height) + 0x9E3779B97F4A7C15ull + (key << 6u) + (key >> 2u);
+	return key;
+}
+
+// The depth images whose stencil planes KYTY_PRESERVE_STENCIL swaps.
+bool SwapsStencilPlanes(const Image& depth) {
+	return depth.info.IsDepth() && depth.info.HasStencil() && depth.backing.image != nullptr &&
+	       depth.backing.samples == 1 && depth.info.samples == 1 &&
+	       depth.info.resources.layers == 1 && depth.backing.layers == 1 &&
+	       !depth.info.metadata.stencil_compressed && depth.info.type == Prospero::ImageType::kColor2D;
+}
+
+vk::BufferImageCopy StencilPlaneCopy(uint32_t width, uint32_t height, vk::ImageAspectFlagBits aspect) {
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource = {aspect, 0, 0, 1};
+	copy.imageExtent      = vk::Extent3D {width, height, 1};
+	return copy;
+}
+
+} // namespace
+
+bool TextureCache::StencilPlaneHeld(const Image& record) const {
+	const auto* depth = record.depth_id ? m_slot_images.try_get(record.depth_id) : nullptr;
+	return depth == nullptr || !SwapsStencilPlanes(*depth) ||
+	       depth->info.stencil.address == record.info.data.address;
+}
+
+void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
+	auto&      depth    = m_slot_images[depth_id];
+	const auto previous = depth.info.stencil.address;
+	if (!SwapsStencilPlanes(depth) || previous == next_plane || previous == 0 || next_plane == 0) {
+		return;
+	}
+	const auto width  = depth.backing.extent.width;
+	const auto height = depth.backing.extent.height;
+	const auto bytes  = uint64_t {width} * height;
+	const auto copy   = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+	// The stencil aspect is saved as it is: a pending refresh of the held plane's record from guest
+	// memory stays pending (its record is not held after the swap, so the refresh is applied when
+	// the plane is swapped back in, after the restore).
+	for (const auto record_id: depth.stencil_ids) {
+		if (const auto* record = m_slot_images.try_get(record_id);
+		    record != nullptr && record->info.data.address == previous) {
+			NoteStructureChange(*record);
+		}
+	}
+	auto& held = m_stencil_planes[StencilPlaneKey(depth.info.data.address, previous, width, height)];
+	if (!held.buffer || held.buffer->Size() < bytes) {
+		if (held.buffer) {
+			m_scheduler.DeferOperation([old = held.buffer] { (void)old; });
+		}
+		held.buffer = std::make_shared<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, bytes);
+	}
+	held.width  = width;
+	held.height = height;
+	held.serial = ++m_stencil_plane_serial;
+	m_slot_images[depth_id].Download({&copy, 1}, held.buffer->Handle(), 0, bytes);
+	const auto key   = StencilPlaneKey(depth.info.data.address, next_plane, width, height);
+	const auto found = m_stencil_planes.find(key);
+	const bool restored =
+	    found != m_stencil_planes.end() && found->second.buffer && found->second.width == width &&
+	    found->second.height == height;
+	if (restored) {
+		m_slot_images[depth_id].Upload({&copy, 1}, found->second.buffer->Handle(), 0, bytes);
+	}
+	for (const auto record_id: m_slot_images[depth_id].stencil_ids) {
+		if (const auto* record = m_slot_images.try_get(record_id);
+		    record != nullptr && record->info.data.address == next_plane) {
+			NoteStructureChange(*record);
+		}
+	}
+	NoteImageStateChange();
+	static std::atomic<uint32_t> swaps {0};
+	const auto n = swaps.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || std::has_single_bit(n)) {
+		LOGF("Stencil plane swap #%u (KYTY_PRESERVE_STENCIL): depth 0x%012" PRIx64
+		     " %ux%u plane 0x%012" PRIx64 " -> 0x%012" PRIx64 " %s\n",
+		     n, depth.info.data.address, width, height, previous, next_plane,
+		     restored ? "restored" : "first use (guest bytes)");
+	}
+}
+
+bool TextureCache::StencilAliasCopyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_ALIAS_COPY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool TextureCache::CopyStencilPlaneToAlias(ImageId target_id) {
+	std::scoped_lock lock {m_lock};
+	const auto*      target = m_slot_images.try_get(target_id);
+	if (target == nullptr || !target->registered || target->depth_id || target->info.IsDepth() ||
+	    target->info.bytes_per_block != 1u || target->backing.samples != 1u ||
+	    target->backing.image == nullptr || target->info.IsVolume()) {
+		return false;
+	}
+	const auto address = target->info.data.address;
+	ImageId    record_id {};
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && image->depth_id && image->info.data.address == address) {
+			record_id = id;
+		}
+	}
+	if (!record_id) {
+		return false;
+	}
+	const auto  depth_id = m_slot_images[record_id].depth_id;
+	const auto* depth    = m_slot_images.try_get(depth_id);
+	if (depth == nullptr || !SwapsStencilPlanes(*depth) ||
+	    (depth->backing.extent.width == target->backing.extent.width &&
+	     depth->backing.extent.height == target->backing.extent.height)) {
+		return false;
+	}
+	const auto depth_width  = depth->backing.extent.width;
+	const auto depth_height = depth->backing.extent.height;
+	const auto width        = std::min(depth_width, target->backing.extent.width);
+	const auto height       = std::min(depth_height, target->backing.extent.height);
+	if (width == 0 || height == 0) {
+		return false;
+	}
+	// What the CPU or a buffer write put in the alias's memory is taken first, so no later refresh
+	// replaces the copy with older guest bytes.
+	RefreshImage(target_id);
+	vk::Buffer source_buffer {};
+	uint32_t   source_row = 0;
+	bool       from_saved = false;
+	if (StencilPlaneHeld(m_slot_images[record_id])) {
+		const auto bytes = uint64_t {width} * height;
+		if (!m_stencil_alias_staging || m_stencil_alias_staging->Size() < bytes) {
+			if (m_stencil_alias_staging) {
+				m_scheduler.DeferOperation([old = m_stencil_alias_staging] { (void)old; });
+			}
+			m_stencil_alias_staging = std::make_shared<Buffer>(
+			    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+			    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+			    std::max<uint64_t>(bytes, uint64_t {1920} * 1080));
+		}
+		auto stencil_copy            = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+		stencil_copy.bufferRowLength = width;
+		m_slot_images[depth_id].Download({&stencil_copy, 1}, m_stencil_alias_staging->Handle(), 0, bytes);
+		source_buffer = m_stencil_alias_staging->Handle();
+		source_row    = width;
+	} else {
+		const auto found = m_stencil_planes.find(
+		    StencilPlaneKey(m_slot_images[depth_id].info.data.address, address, depth_width, depth_height));
+		if (found == m_stencil_planes.end() || !found->second.buffer) {
+			return false;
+		}
+		source_buffer = found->second.buffer->Handle();
+		source_row    = depth_width;
+		from_saved    = true;
+	}
+	auto color_copy            = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eColor);
+	color_copy.bufferRowLength = source_row;
+	auto& alias                = m_slot_images[target_id];
+	alias.Upload({&color_copy, 1}, source_buffer,
+	             0, uint64_t {source_row} * (height - 1u) + width);
+	MarkImageGpuModified(alias);
+	static std::atomic<uint32_t> logged {0};
+	const auto n = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || std::has_single_bit(n)) {
+		LOGF("Stencil alias copy #%u (KYTY_STENCIL_ALIAS_COPY, approximation): plane 0x%012" PRIx64
+		     " depth %ux%u -> alias %ux%u%s\n",
+		     n, address, depth_width, depth_height, alias.backing.extent.width, alias.backing.extent.height,
+		     from_saved ? " from the saved plane" : "");
+	}
+	return true;
+}
+
+ImageId TextureCache::StencilPlaneReader(ImageId record_id, bool& copy) {
+	copy = false;
+	std::scoped_lock lock {m_lock};
+	const auto* record = m_slot_images.try_get(record_id);
+	if (record == nullptr || !record->depth_id) {
+		return record_id;
+	}
+	const auto depth_id = record->depth_id;
+	if (StencilPlaneHeld(*record)) {
+		return depth_id;
+	}
+	const auto& depth  = m_slot_images[depth_id];
+	const auto  width  = depth.backing.extent.width;
+	const auto  height = depth.backing.extent.height;
+	const auto  found =
+	    m_stencil_planes.find(StencilPlaneKey(depth.info.data.address, record->info.data.address, width, height));
+	if (found == m_stencil_planes.end() || !found->second.buffer || found->second.width != width ||
+	    found->second.height != height) {
+		return depth_id; // never saved: the held plane, as without the switch
+	}
+	auto& saved  = found->second;
+	auto* reader = saved.reader ? m_slot_images.try_get(saved.reader) : nullptr;
+	if (reader == nullptr || reader->info.extent.width != width || reader->info.extent.height != height) {
+		if (reader != nullptr) {
+			ReleaseUnregisteredImage(saved.reader);
+		}
+		ImageInfo info {};
+		info.pixel_format    = vk::Format::eR8Uint;
+		info.guest_format    = Prospero::BufferFormat::k8UInt;
+		info.type            = Prospero::ImageType::kColor2D;
+		info.extent          = {width, height, 1};
+		info.resources       = {1, 1};
+		info.pitch           = width;
+		info.bytes_per_block = 1;
+		info.samples         = 1;
+		info.tile_mode       = Prospero::TileMode::kLinear;
+		info.mip_layout[0]   = {0, uint64_t {width} * height, width, height};
+		const auto reader_id = InsertImage(info);
+		// InsertImage may move the slots: the entry is looked up again.
+		auto& fresh         = m_stencil_planes[found->first];
+		fresh.reader        = reader_id;
+		fresh.reader_serial = 0;
+	}
+	auto& entry  = m_stencil_planes[found->first];
+	auto& target = m_slot_images[entry.reader];
+	target.tick_accessed_last  = m_scheduler.CurrentTick();
+	target.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
+	if (entry.reader_serial != entry.serial) {
+		const auto plane_copy = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eColor);
+		target.Upload({&plane_copy, 1}, entry.buffer->Handle(), 0, uint64_t {width} * height);
+		entry.reader_serial = entry.serial;
+		static std::atomic<uint32_t> reads {0};
+		const auto n = reads.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (n <= 8u || std::has_single_bit(n)) {
+			LOGF("Stencil plane read #%u (KYTY_PRESERVE_STENCIL): plane 0x%012" PRIx64
+			     " of depth 0x%012" PRIx64 " %ux%u from its saved copy\n",
+			     n, m_slot_images[record_id].info.data.address, m_slot_images[depth_id].info.data.address,
+			     width, height);
+		}
+	}
+	copy = true;
+	return entry.reader;
+}
+
 ImageId TextureCache::SingleSampleCopyOf(ImageId id, bool stencil) {
 	if (!MsDepthSample0Enabled()) {
 		return id;
@@ -5275,6 +5531,11 @@ void TextureCache::RefreshImage(ImageId id, RefreshIntent intent) {
 	     m_slot_images[image.depth_id].info.samples != 1)) {
 		return;
 	}
+	// KYTY_PRESERVE_STENCIL: a plane the depth image does not hold is refreshed when it is swapped
+	// back in (its guest bytes would land on the held plane).
+	if (image.depth_id && PreserveStencilEnabled() && !StencilPlaneHeld(image)) {
+		return;
+	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
@@ -6008,6 +6269,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		image.stencil_subresources = {0, desc.info.resources.levels,
 		                             static_cast<uint32_t>(offset / slice_size),
 		                             desc.info.resources.layers};
+		if (PreserveStencilEnabled() && image.info.HasStencil() &&
+		    image.info.stencil.address != desc.info.stencil.address) {
+			SwapStencilPlane(id, desc.info.stencil.address);
+		}
 	}
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
@@ -6025,6 +6290,16 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		// The only insertion into m_surface_metas (EraseSurfaceMeta). Every draw with this target
 		// asks again; only an added entry is a change (KYTY_META_CLEAR_MEMO's generation).
 		m_surface_meta_inserts += inserted ? 1u : 0u;
+		// KYTY_HTILE_SLICE_CLEAR: the per-layer HTILE size, from a binding of the whole image.
+		if (HtileSliceClearEnabled()) {
+			const auto layers = desc.info.resources.layers;
+			const auto size   = desc.info.metadata.range.size;
+			if (layers > 1 && layers == image.info.resources.layers &&
+			    desc.info.data.address == image.info.data.address && size % layers == 0) {
+				metadata->second.slice_size = size / layers;
+				metadata->second.layers     = layers;
+			}
+		}
 		if (inserted) {
 			NoteSurfaceMetaChange();
 		}
@@ -8159,6 +8434,70 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	found->second.clear_mask.set();
 	NoteSurfaceMetaChange();
 	return true;
+}
+
+bool TextureCache::HtileSliceClearEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_HTILE_SLICE_CLEAR");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool TextureCache::ClearMetaRange(uint64_t address, uint64_t size) {
+	if (!HtileSliceClearEnabled()) {
+		return ClearMeta(address);
+	}
+	std::scoped_lock lock {m_lock};
+	static std::atomic<uint32_t> logged {0};
+	const auto note = [&](const char* kind, uint64_t base, uint32_t first, uint32_t count, uint32_t layers) {
+		const auto n = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (n <= 16u || std::has_single_bit(n)) {
+			LOGF("HTILE slice clear #%u (KYTY_HTILE_SLICE_CLEAR): %s htile 0x%012" PRIx64 " at 0x%012" PRIx64
+			     " size 0x%" PRIx64 " layers %u..%u of %u\n",
+			     n, kind, base, address, size, first, first + count - 1u, layers);
+		}
+	};
+	if (const auto found = m_surface_metas.find(address); found != m_surface_metas.end()) {
+		auto&      meta = found->second;
+		const auto ss   = meta.slice_size;
+		if (meta.type == MetaDataInfo::Type::HTile && ss != 0 && meta.layers > 1 && size != 0 &&
+		    size % ss == 0 && size / ss < meta.layers) {
+			const auto count = static_cast<uint32_t>(size / ss);
+			for (uint32_t s = 0; s < count && s < meta.clear_mask.size(); s++) {
+				meta.clear_mask.set(s);
+			}
+			note("first layers of", found->first, 0, count, meta.layers);
+		} else {
+			meta.clear_mask.set();
+		}
+		NoteSurfaceMetaChange();
+		return true;
+	}
+	auto inside = m_surface_metas.upper_bound(address);
+	if (inside == m_surface_metas.begin()) {
+		return false;
+	}
+	--inside;
+	auto&      meta = inside->second;
+	const auto ss   = meta.slice_size;
+	if (meta.type != MetaDataInfo::Type::HTile || ss == 0 || meta.layers <= 1 || address <= inside->first) {
+		return false;
+	}
+	const auto offset = address - inside->first;
+	const auto total  = ss * meta.layers;
+	if (offset >= total || offset % ss != 0 || size == 0 || size % ss != 0 || size > total - offset) {
+		return false;
+	}
+	const auto first = static_cast<uint32_t>(offset / ss);
+	const auto count = static_cast<uint32_t>(size / ss);
+	for (uint32_t s = first; s < first + count && s < meta.clear_mask.size(); s++) {
+		meta.clear_mask.set(s);
+	}
+	NoteSurfaceMetaChange();
+	note("layers inside", inside->first, first, count, meta.layers);
+	// Not a clear at the base: the caller keeps the write itself (the guest bytes stay current).
+	return false;
 }
 
 // KYTY_META_CLEAR_COVER=1 (default off; GT7 course-map preview depth): a buffer clear (compute

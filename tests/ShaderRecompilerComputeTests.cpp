@@ -54837,6 +54837,25 @@ void CheckDepthTextureEncoding() {
           IsSupportedDepthTextureEncoding(first_use_depth),
           "captured comparison texture required tracked HTILE metadata");
 
+  // KYTY_DEPTH_ENCODING_FIELDS (Erlou93/KytyPS5-Yotei): DEPTH in word 4, ARRAY_PITCH,
+  // MIN_LOD_WARN and bits 31:24 in word 5 and words 6-7 without COMPRESSION_EN are unused by a
+  // non-array 2D depth T#; CORNER_SAMPLES is used; BASE_ARRAY keeps the strict answer.
+  auto unused_fields = disabled_metadata;
+  unused_fields.fields[4] = 0x00000318u;
+  unused_fields.fields[5] |= 0x5004ef05u;
+  unused_fields.fields[6] = 0x0000031bu;
+  auto corner_samples = unused_fields;
+  corner_samples.fields[5] |= 1u << 23u;
+  auto base_array = unused_fields;
+  base_array.fields[4] |= 1u << 16u;
+  Require("DepthTextureEncoding", "unused fields verdict",
+          !IsSupportedDepthTextureEncoding(unused_fields) &&
+              DepthEncodingFieldsVerdict(unused_fields, false) == 1u &&
+              DepthEncodingFieldsVerdict(corner_samples, false) == 2u &&
+              DepthEncodingFieldsVerdict(base_array, false) == 0u &&
+              DepthEncodingFieldsVerdict(unused_fields, true) == 0u,
+          "unused depth T# fields were not told apart from used ones");
+
   auto missing_metadata = compressed_descriptor;
   missing_metadata.fields[6] &= 0x00ffffffu;
   missing_metadata.fields[7] = 0;

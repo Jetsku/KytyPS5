@@ -205,6 +205,22 @@ void CheckFingerprint() {
                  [](CodegenOptions &o) { o.sample_lod_clamp = !o.sample_lod_clamp; });
   options_differ("host_ftz_inputs", [](CodegenOptions &o) { o.host_ftz_inputs = !o.host_ftz_inputs; });
   options_differ("exec_selects", [](CodegenOptions &o) { o.exec_selects = !o.exec_selects; });
+  options_differ("lane2_share", [](CodegenOptions &o) { o.lane2_share = !o.lane2_share; });
+  options_differ("known_bits_masks",
+                 [](CodegenOptions &o) { o.known_bits_masks = !o.known_bits_masks; });
+  options_differ("gds_m0_base", [](CodegenOptions &o) { o.gds_m0_base = !o.gds_m0_base; });
+  options_differ("lds_atomic_order",
+                 [](CodegenOptions &o) { o.lds_atomic_order = !o.lds_atomic_order; });
+  options_differ("split_lds_write_sync",
+                 [](CodegenOptions &o) { o.split_lds_write_sync = !o.split_lds_write_sync; });
+  options_differ("storage_table_loose",
+                 [](CodegenOptions &o) { o.storage_table_loose = !o.storage_table_loose; });
+  options_differ("scalar_load_groups",
+                 [](CodegenOptions &o) { o.scalar_load_groups = !o.scalar_load_groups; });
+  options_differ("null_image_keep_dim",
+                 [](CodegenOptions &o) { o.null_image_keep_dim = !o.null_image_keep_dim; });
+  options_differ("storage_swizzle_canon",
+                 [](CodegenOptions &o) { o.storage_swizzle_canon = !o.storage_swizzle_canon; });
   options_differ("ps_append_live_election",
                  [](CodegenOptions &o) { o.ps_append_live_election = !o.ps_append_live_election; });
   for (const auto mode : {ShaderRecompiler::PsLiveExec::Off,

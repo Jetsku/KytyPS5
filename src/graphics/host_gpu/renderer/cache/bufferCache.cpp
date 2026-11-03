@@ -5052,7 +5052,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	const bool exact_meta = m_texture_cache.ClearMeta(vaddr);
+	const bool exact_meta = m_texture_cache.ClearMetaRange(vaddr, size);
 	// KYTY_META_CLEAR_COVER: a fill that starts below a metadata surface and covers it clears it.
 	const uint32_t covered_meta = MetaClearCoverEnabled() ? m_texture_cache.ClearMetaCovered(vaddr, size) : 0u;
 	if (const auto traced = MetaTraceAddress();

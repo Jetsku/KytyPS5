@@ -99,6 +99,18 @@ SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 // (the large Miles RT kernels hit "Shader Instruction Error" device losses with it); unset = all.
 [[nodiscard]] bool BufferPairAtomicProgram(uint64_t shader_hash);
 
+// KYTY_LANE2_SHARE (spirvEmitterLaneShare.cpp): with lane_count 2 every IR instruction is emitted once
+// per wave half; a value proven the same in both halves is emitted by the low half only.
+struct LaneShareState {
+	bool active = false;
+	// Instructions the high half does not emit (uniform minus the whole-wave ones it already reuses).
+	std::unordered_set<const IR::Inst*> shared;
+	// Every instruction proven to have the same value in both halves.
+	std::unordered_set<const IR::Inst*> uniform;
+	size_t   instructions = 0;
+	uint64_t reused       = 0;
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -138,6 +150,7 @@ struct EmitterState {
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	LaneShareState                                   lane_share;
 	// KYTY_WAVE64_WARPS (split wave): a wave64 compute workgroup of one wave runs as two 32-wide
 	// host subgroups, one guest lane per invocation (lane_count 1). Cross-lane operations
 	// exchange the halves through workgroup memory (ExchangeWaveValue), and DS accesses
@@ -153,6 +166,8 @@ struct EmitterState {
 	std::unordered_set<const IR::Block*>*            wave_sync_blocks        = nullptr;
 	// DS instructions write the LDS, so DS reads must wait for the other half too.
 	bool                                             ds_writes_lds           = false;
+	// KYTY_SPLIT_LDS_WRITE_SYNC: no LDS read since the last split-wave barrier in this block.
+	bool                                             lds_split_synced        = false;
 	// KYTY_WAVE32_CLUSTERS (Spirv::WaveClustersActive): a wave32 program on a host subgroup that may
 	// hold two guest waves keeps each to its own 32 lanes (EmitSubgroupLocalInvocationId,
 	// EmitHostLane, EmitWaveBallot).
@@ -724,6 +739,11 @@ inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, ui
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
+
+void LaneShareClassify(EmitterState& state);
+// Defines `inst` in the high half with the low half's id when the classification shares it.
+bool LaneShareReuse(ValueEmitContext& low, ValueEmitContext& high, const IR::Inst& inst);
+void LaneShareReport(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 
