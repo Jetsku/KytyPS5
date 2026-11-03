@@ -1608,6 +1608,7 @@ static void LogStabilitySwitches(const GraphicContext& graphics) {
 	const auto  eop      = EopTimestamps::GetMode();
 	const char* eop_text = eop == EopTimestamps::Mode::Gpu         ? "gpu"
 	                       : eop == EopTimestamps::Mode::GpuVerify ? "gpu-verify"
+	                       : eop == EopTimestamps::Mode::Busy      ? "busy"
 	                                                               : "record";
 	const auto  targets      = DrawRun::Detail::g_targets.Get();
 	const char* targets_text = targets == 0 ? "0" : targets == 2 ? "verify" : targets == 3 ? "exit" : "1";

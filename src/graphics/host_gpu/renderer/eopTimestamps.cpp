@@ -94,7 +94,10 @@ Mode GetMode() {
 		if (std::strcmp(value, "gpu-verify") == 0) {
 			return Mode::GpuVerify;
 		}
-		std::printf("KYTY_EOP_TIMESTAMPS must be record, gpu or gpu-verify (got '%s'): record\n",
+		if (std::strcmp(value, "busy") == 0) {
+			return Mode::Busy;
+		}
+		std::printf("KYTY_EOP_TIMESTAMPS must be record, gpu, gpu-verify or busy (got '%s'): record\n",
 		            value);
 		return Mode::Record;
 	}();
@@ -110,6 +113,7 @@ uint64_t VerifyMismatches() {
 EopTimestampRing::EopTimestampRing(GraphicContext& graphics, uint32_t capacity)
     : m_graphics(graphics), m_ring(capacity) {
 	m_verify = EopTimestamps::GetMode() == EopTimestamps::Mode::GpuVerify;
+	m_busy   = EopTimestamps::GetMode() == EopTimestamps::Mode::Busy;
 	uint32_t family_count = 0;
 	graphics.physical_device.getQueueFamilyProperties(&family_count, nullptr);
 	std::vector<vk::QueueFamilyProperties> families(family_count);
@@ -205,12 +209,33 @@ void EopTimestampRing::Recalibrate(uint64_t now_ns, bool force) {
 	m_calibrated_ns = now_ns;
 }
 
-void EopTimestampRing::BeginCommand(const CommandSink& sink) {
+void EopTimestampRing::BeginCommand(const CommandSink& sink, uint64_t tick) {
 	if (!Valid()) {
 		return;
 	}
 	(void)m_ring.ResetConsumed(
 	    [&](uint32_t first, uint32_t count) { sink.resetQueryPool(m_pool, first, count); });
+	if (m_busy && tick != UINT64_MAX) {
+		QueueMarker(sink, tick, BeginMarker, true);
+	}
+}
+
+void EopTimestampRing::EndCommand(const CommandSink& sink, uint64_t tick) {
+	if (Valid() && m_busy) {
+		QueueMarker(sink, tick, EndMarker, false);
+	}
+}
+
+void EopTimestampRing::QueueMarker(const CommandSink& sink, uint64_t tick, uint64_t marker,
+                                   bool top_of_pipe) {
+	const auto slot = m_ring.Allocate();
+	if (slot == NoSlot) {
+		return; // a missing marker only makes that gap count as busy
+	}
+	sink.writeTimestamp2(top_of_pipe ? vk::PipelineStageFlagBits2::eTopOfPipe
+	                                 : vk::PipelineStageFlagBits2::eAllCommands,
+	                     m_pool, slot);
+	m_queue.push_back({tick, marker, 0, slot});
 }
 
 uint32_t EopTimestampRing::RecordQuery(const CommandSink& sink) {
@@ -238,6 +263,22 @@ void EopTimestampRing::Queue(uint32_t slot, uint64_t tick, uint64_t address,
 }
 
 void EopTimestampRing::PublishEntry(const Entry& entry, bool available, uint64_t device_raw) {
+	if (m_busy) {
+		if (entry.address == BeginMarker || entry.address == EndMarker) {
+			if (available) {
+				// A buffer that starts after everything before it ended: the gap was idle.
+				if (entry.address == BeginMarker && m_last_raw != 0 && device_raw > m_last_raw) {
+					m_idle_raw.fetch_add(device_raw - m_last_raw, std::memory_order_relaxed);
+				}
+				m_last_raw = std::max(m_last_raw, device_raw);
+			}
+			return;
+		}
+		if (available) {
+			m_last_raw = std::max(m_last_raw, device_raw);
+			device_raw -= std::min(device_raw, m_idle_raw.load(std::memory_order_relaxed));
+		}
+	}
 	uint64_t published = 0;
 	if (!available || !EopTimestamps::ToReference(m_map, device_raw, published)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::EopTimestampsUnavailable);
@@ -333,6 +374,10 @@ uint64_t EopTimestampRing::TakeDeferred(uint32_t slot, uint64_t record_value) {
 		map = m_map;
 	}
 	uint64_t published = 0;
+	if (m_busy) {
+		// busy: the idle time measured so far (markers not published yet are not in it).
+		result[0] -= std::min(result[0], m_idle_raw.load(std::memory_order_relaxed));
+	}
 	const bool ok = (status == vk::Result::eSuccess || status == vk::Result::eNotReady) &&
 	                result[1] != 0 && EopTimestamps::ToReference(map, result[0], published);
 	m_ring.Consume(slot);

@@ -631,7 +631,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 			// KYTY_EOP_TIMESTAMPS=gpu: reset the slots whose results were read, as recorder
 			// packets after the recorder's Begin (no drain). Without it no slot would ever become
 			// free.
-			m_eop_timestamps->BeginCommand(m_command.StateSink());
+			m_eop_timestamps->BeginCommand(m_command.StateSink(), m_master.CurrentTick());
 		}
 		return m_command;
 	}
@@ -643,7 +643,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	}
 	if (m_eop_timestamps) {
 		// Outside rendering: reset the guest timestamp slots whose results were read.
-		m_eop_timestamps->BeginCommand(m_command.StateSink());
+		m_eop_timestamps->BeginCommand(m_command.StateSink(), m_master.CurrentTick());
 	}
 	if (m_gpu_ops) {
 		GpuOpProfiler::OnBeginCommand(m_graphics, m_command.m_buffer, m_master.CurrentTick(),
@@ -724,6 +724,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		// allocated here, exactly as in queued mode.
 		m_command.EndRendering();
 		m_command.FlushBarriers();
+		if (m_eop_timestamps) {
+			m_eop_timestamps->EndCommand(m_command.StateSink(), m_master.CurrentTick()); // busy
+		}
 		m_command.CloseDirectWindow();
 		CommandStream::SubmitPacket packet;
 		packet.submit       = submit;
@@ -756,6 +759,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			// Pending batched barriers belong before the end stamp, as when recorded directly.
 			m_command.FlushBarriers();
 			m_gpu_timing->EndCommand(m_command.m_buffer);
+		}
+		if (m_eop_timestamps) {
+			m_eop_timestamps->EndCommand(m_command.StateSink(), m_master.CurrentTick()); // busy
 		}
 		m_command.End();
 	}
