@@ -17,6 +17,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/watchRange.h"
+
+#include <fmt/format.h>
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/texelImageLookup.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -4756,6 +4758,32 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	const auto range = desc.info.metadata.range;
+	// KYTY_WATCH_RANGE (diagnostic): every 32nd DCC decision of an image over the watched range
+	// reads the metadata (waits for the GPU) and logs how many key bytes hold each value.
+	if (WatchRange::Enabled() && range.Valid() && range.size != 0 && range.size <= (16u << 20u)) {
+		static std::atomic<uint32_t> calls {0};
+		if ((calls.fetch_add(1, std::memory_order_relaxed) & 31u) == 0) {
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+			std::vector<uint8_t> keys(range.size);
+			if (LibKernel::Memory::TryReadBacking(range.address, keys.data(), range.size)) {
+				std::array<uint32_t, 256> histogram {};
+				for (const auto key: keys) {
+					histogram[key]++;
+				}
+				std::string text;
+				for (uint32_t value = 0; value < 256; value++) {
+					if (histogram[value] != 0) {
+						text += fmt::format(" {:02x}:{}", value, histogram[value]);
+					}
+				}
+				WatchRange::Note(fmt::format("DCC keys meta 0x{:x}+0x{:x} {}x{} type {}:{}", range.address,
+				                             range.size, desc.info.extent.width, desc.info.extent.height,
+				                             static_cast<uint32_t>(desc.type), text)
+				                     .c_str(),
+				                 desc.info.data.address, desc.info.data.size);
+			}
+		}
+	}
 	ClearTrace("DCC", "enter", range.address, range.size, desc.info.data.address, desc.info.data.size,
 	           desc.info.extent.width, desc.info.extent.height,
 	           desc.info.resources.levels | (static_cast<uint32_t>(desc.type) << 8u) |
@@ -6266,6 +6294,12 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
 	    image.info.HasStencil() || image.backing.image == nullptr) {
 		return;
+	}
+	if (WatchRange::Enabled()) {
+		WatchRange::Note(fmt::format("image alias sync check {} {}x{}", vk::to_string(image.backing.format),
+		                             image.backing.extent.width, image.backing.extent.height)
+		                     .c_str(),
+		                 image.info.data.address, image.info.data.size);
 	}
 	// A kept alias (same memory, another format) is stale when another interpretation wrote the
 	// memory since. Reinterpret the owner's contents, as the recreate path used to, and take over.

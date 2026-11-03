@@ -980,6 +980,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                                               target.guest_mip_level == 0 ? written
 		                                                                           : nullptr);
 		auto&      image      = cache.GetImage(target.image_id);
+		if (WatchRange::Enabled()) {
+			WatchRange::Note(fmt::format("color target slot {} image {}:{} {} {}x{} written {} meta {} 0x{:x}+0x{:x}",
+			                             target.target_slot, target.image_id.index, target.image_id.generation,
+			                             vk::to_string(image.backing.format), image.backing.extent.width,
+			                             image.backing.extent.height, written != nullptr ? 1 : 0,
+			                             static_cast<uint32_t>(target.desc.info.metadata.kind),
+			                             target.desc.info.metadata.range.address,
+			                             target.desc.info.metadata.range.size)
+			                     .c_str(),
+			                 target.desc.info.data.address, target.desc.info.data.size);
+		}
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
