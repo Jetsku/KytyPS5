@@ -2209,6 +2209,15 @@ uint64_t RenderExecutor::BindlessFrame() const {
 	return static_cast<uint64_t>(m_context.GetGpu().GetFrameNum());
 }
 
+// KYTY_R128_TABLE_IMAGES: a heap of 128-bit T#s (R128=1) holds four words per key; the four read
+// past them belong to the next entry and are zeroed, so they neither change the view nor make an
+// unchanged key look rewritten.
+static void MaskR128HeapWords(const BindlessHeap& heap, uint32_t* words) {
+	if (heap.resource.r128 && ShaderRecompiler::GetCodegenOptions().r128_table_images) {
+		std::fill_n(words + 4, 4, 0u);
+	}
+}
+
 // Key `key`'s T#: in the heap itself, or behind the key's record pointer.
 static bool ReadBindlessEntry(const BindlessHeap& heap, uint32_t key, uint32_t* words) {
 	if (heap.runtime) {
@@ -2221,8 +2230,12 @@ static bool ReadBindlessEntry(const BindlessHeap& heap, uint32_t key, uint32_t* 
 		return true;
 	}
 	if (heap.record_pointer == UINT32_MAX) {
-		return LibKernel::Memory::TryReadBacking(
-		    heap.base + heap.table_offset + static_cast<uint64_t>(key) * heap.stride, words, 32u);
+		if (!LibKernel::Memory::TryReadBacking(
+		        heap.base + heap.table_offset + static_cast<uint64_t>(key) * heap.stride, words, 32u)) {
+			return false;
+		}
+		MaskR128HeapWords(heap, words);
+		return true;
 	}
 	const bool nested = heap.nested_vsharp != UINT32_MAX && heap.nested_keys != 0;
 	const auto record = nested ? key / heap.nested_keys : key;
@@ -2597,6 +2610,9 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 			                         m_bindless_window.data())) {
 				continue;
 			}
+			for (auto& words: m_bindless_window) {
+				MaskR128HeapWords(heap, words.data());
+			}
 			for (uint32_t key = first; key < last; key++) {
 				const auto& words = m_bindless_window[key - first];
 				if (heap.settled[key] == 0 || heap.descriptors[key] == words) {
@@ -2688,6 +2704,9 @@ uint32_t RenderExecutor::RevalidateBindlessHeap(BindlessHeap& heap, uint32_t bud
 		} else {
 			readable = ReadHeapDescriptors(heap.base + heap.table_offset, heap.stride, begin, count,
 			                               m_bindless_window.data());
+			for (auto& words: m_bindless_window) {
+				MaskR128HeapWords(heap, words.data());
+			}
 		}
 		uint32_t   next     = begin + count;
 		for (uint32_t i = 0; readable && i < count; i++) {

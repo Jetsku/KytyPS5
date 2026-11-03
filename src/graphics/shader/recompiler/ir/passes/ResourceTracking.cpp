@@ -255,7 +255,7 @@ public:
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
+				return inst != nullptr && std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
@@ -1171,6 +1171,30 @@ private:
 		return found;
 	}
 
+	// KYTY_INDIRECT_FORMAT_STORES: BUFFER_STORE_FORMAT_X..XYZW of 32-bit data.
+	static bool IndirectFormattedStore(const MemoryInfo& memory, ValueOpcode op) {
+		return memory.formatted && !memory.typed && memory.data_bits == 32u &&
+		       (op == ValueOpcode::StoreBufferU32 || op == ValueOpcode::StoreBufferU32x2 ||
+		        op == ValueOpcode::StoreBufferU32x3 || op == ValueOpcode::StoreBufferU32x4);
+	}
+
+	// Every image instruction on the handle takes a 128-bit T# (R128=1).
+	bool AllUsersR128(const Inst& handle) const {
+		bool any = false;
+		for (const auto& use: handle.Uses()) {
+			if (ImageOpcodeInfoOf(use.user->GetOpcode()).access == ImageAccess::None ||
+			    use.operand != 0u) {
+				return false;
+			}
+			const auto index = use.user->Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size() || !m_program.memory_info[index].image_r128) {
+				return false;
+			}
+			any = true;
+		}
+		return any;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return WhyNot(__LINE__);
@@ -1203,7 +1227,15 @@ private:
 				}
 			}
 		}
-		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+		// KYTY_R128_TABLE_IMAGES: image instructions that all take a 128-bit T# read four words
+		// from the table; the translator passes the upper four as constants.
+		const bool     r128 = GetCodegenOptions().r128_table_images && AllUsersR128(handle);
+		const uint32_t tsharp_dwords = r128 ? 4u : static_cast<uint32_t>(plan.reads.size());
+		for (uint32_t dword = tsharp_dwords; dword < plan.reads.size(); ++dword) {
+			plan.memory[dword] = UINT32_MAX;
+			plan.reads[dword]  = nullptr;
+		}
+		for (uint32_t dword = 0; dword < tsharp_dwords; ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			// KYTY_HEAP_KEY_MASK: a Phi web whose inputs agree resolves even when no word is plain
 			// (ResolveDescriptorPhi then needs no reference table).
@@ -1421,7 +1453,7 @@ private:
 			// The host reads key k's T# at table_offset + k * table_stride: any 4-byte-aligned
 			// stride that holds a T# (GT7's 188-byte material records).
 			if (!BindlessImagesEnabled() || !sampled_only || table_source.dword_count != 4u ||
-			    table_stride < 32u || (table_stride & 3u) != 0u) {
+			    table_stride < (r128 ? 16u : 32u) || (table_stride & 3u) != 0u) {
 				return WhyNot(__LINE__);
 			}
 			indirect              = {};
@@ -2193,11 +2225,27 @@ private:
 				     d16_formatted);
 				// KYTY_BDA_WRITES: a raw store or atomic through one writes through BDA (compute
 				// only: the renderer settles each dispatch of such a program synchronously).
+				// KYTY_INDIRECT_FORMAT_STORES: a formatted 32-bit store too, in the V#'s run-time format.
 				const bool indirect_write = m_bda_writes && memory.kind == ResourceKind::Buffer &&
 				                            m_program.stage == ShaderType::Compute &&
-				                            memory.SupportsIndirectRawWrite(op);
+				                            (memory.SupportsIndirectRawWrite(op) ||
+				                             (GetCodegenOptions().indirect_format_stores &&
+				                              IndirectFormattedStore(memory, op)));
 				if (!indirect_variant && !indirect_write && !d16_formatted &&
 				    (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op))) {
+					// KYTY_DROP_GRAPHICS_INDIRECT_STORES: a graphics-stage raw store through a
+					// computed V# is removed (an approximation) rather than skipping the program.
+					if (GetCodegenOptions().drop_graphics_indirect_stores &&
+					    m_program.stage != ShaderType::Compute && memory.kind == ResourceKind::Buffer &&
+					    BufferAccessOf(op) == BufferAccess::Write && memory.SupportsIndirectRawWrite(op)) {
+						Log::WriteToConsoleAndLog(fmt::format(
+						    "KYTY_DROP_GRAPHICS_INDIRECT_STORES: {} shader 0x{:016x} pc=0x{:08x} {} "
+						    "through a computed V# removed\n",
+						    StageName(m_program.stage), m_program.shader_hash, flags.pc,
+						    ValueOpcodeName(op)));
+						m_dead_stores.push_back(&inst);
+						return;
+					}
 					if (m_indirect_scalar_buffers) {
 						// KYTY_SRT_UNRESOLVED_ALL: which buffer access has no BDA path.
 						if (const char* value = std::getenv("KYTY_SRT_UNRESOLVED_ALL");

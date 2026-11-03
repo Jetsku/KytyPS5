@@ -2564,6 +2564,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-writes-only)
 	set_tests_properties(bda_writes PROPERTIES
 		ENVIRONMENT "KYTY_BDA_WRITES=1;KYTY_SRT_VARIANT_READS=1")
+	# KYTY_INDIRECT_FORMAT_STORES: formatted stores through runtime V#s via BDA.
+	add_test(NAME bda_format_stores
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-writes-only)
+	set_tests_properties(bda_format_stores PROPERTIES
+		ENVIRONMENT "KYTY_BDA_WRITES=1;KYTY_SRT_VARIANT_READS=1;KYTY_INDIRECT_FORMAT_STORES=1")
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)

@@ -3448,6 +3448,69 @@ void TestBoundedKeyAddressTable() {
              "a field key enumerated without KYTY_BOUNDED_KEY_IMAGES");
 }
 
+// KYTY_R128_TABLE_IMAGES: a 128-bit T# (R128=1) whose four words come from a keyed table plans
+// those four words; the upper four are constants. Without the switch the handle has no plan.
+void TestR128TableImage() {
+  namespace RC = Libs::Graphics::ShaderRecompiler;
+  const auto make = [](bool r128) {
+    auto options = RC::GetCodegenOptions();
+    const auto saved = options;
+    options.bounded_key_images = true;
+    options.r128_table_images = r128;
+    RC::SetCodegenOptions(options);
+    struct Restore {
+      RC::CodegenOptions saved;
+      ~Restore() { RC::SetCodegenOptions(saved); }
+    } restore{saved};
+    Fixture fixture(ShaderType::Pixel);
+    const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < pointer.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      pointer[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32, {srt, Value(0u), Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x20));
+    }
+    const auto record = fixture.Emit(ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
+    const auto key = fixture.Emit(ValueOpcode::BitFieldUExtract, {record, Value(16u), Value(5u)});
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    const auto table = fixture.Address(pointer[0], pointer[1]);
+    for (uint32_t word = 0; word < 4u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x100));
+    }
+    for (uint32_t word = 4u; word < 8u; ++word) {
+      words[word] = Value(0u);
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    memory.image_r128 = true;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x128));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(fixture.program.info.images[0].r128 && indirect && !indirect->selector.has_value() &&
+              indirect->table_offset == 0u && indirect->key_count.Resolve().IsImmediate() &&
+              indirect->key_count.Resolve().U32() == 32u,
+          "a keyed 128-bit T# did not enumerate its table records");
+  };
+  make(true);
+  CheckFatal([&] { make(false); }, "not a valid runtime value",
+             "a keyed 128-bit T# planned without KYTY_R128_TABLE_IMAGES");
+}
+
 } // namespace
 
 int main() {
@@ -3460,6 +3523,7 @@ int main() {
       }
     };
     Run("dense buffers", TestDenseBufferTracking);
+    Run("R128 table image", TestR128TableImage);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);

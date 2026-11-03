@@ -1010,7 +1010,7 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 			value = EncodeFormattedStoreComponent(ctx, info, component, value, mem.data_bits);
 			const auto bits = info.component_bits[component];
 			if (info.packed_bitfield) {
-				packed = EmitBitFieldInsert(
+				packed = EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
 				    ctx.state, packed, value,
 				    ConstantU32(ctx.state, info.component_bit_offset[component]),
 				    ConstantU32(ctx.state, bits));
@@ -1546,6 +1546,109 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 			    },
 			    GetCodegenOptions().bda_store_log ? &log : nullptr);
 		}
+	});
+}
+
+// KYTY_INDIRECT_FORMAT_STORES: one 8, 16 or 32-bit piece of a formatted store through BDA at the
+// byte address `guest`; 8 and 16-bit pieces replace their bits of the dword atomically.
+static void StoreIndirectFormattedPiece(ValueEmitContext& ctx, uint32_t guest, uint32_t in_bounds,
+                                        uint32_t bits, uint32_t value) {
+	auto&      state   = ctx.state;
+	const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), guest,
+	                            ConstantDeviceAddress(state, ~uint64_t {3}));
+	uint32_t   mask    = 0;
+	uint32_t   shifted = 0;
+	if (bits != 32u) {
+		const auto mask_bits = ConstantU32(state, bits == 8u ? 0xffu : 0xffffu);
+		const auto shift     = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                              Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		                                     Unary(state, spv::OpUConvert, TypeU32(state), guest),
+		                                     ConstantU32(state, bits == 8u ? 3u : 2u)),
+		                              ConstantU32(state, 3));
+		mask    = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), mask_bits, shift);
+		shifted = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                 Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, mask_bits), shift);
+	}
+	(void)WriteBdaIfMapped(ctx, aligned, in_bounds, TypeU32(state), ConstantU32(state, 0),
+	                       [&](uint32_t host) {
+		                       const auto pointer = state.builder.AllocateId();
+		                       state.builder.AddFunction(spv::OpConvertUToPtr,
+		                                                 TypePhysicalU32Pointer(state), pointer, host);
+		                       if (bits == 32u) {
+			                       state.builder.AddFunction(spv::OpStore, pointer, value,
+			                                                 spv::MemoryAccessAlignedMask, 4u);
+		                       } else {
+			                       (void)AtomicUpdate(
+			                           state, pointer, IR::ResourceKind::IndirectBuffer,
+			                           [&](uint32_t old) {
+				                           return Binary(
+				                               state, spv::OpBitwiseOr, TypeU32(state),
+				                               Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+				                                      Unary(state, spv::OpNot, TypeU32(state), mask)),
+				                               shifted);
+			                           });
+		                       }
+		                       return ConstantU32(state, 0);
+	                       });
+}
+
+// KYTY_INDIRECT_FORMAT_STORES (adapted from Erlou93/KytyPS5-Yotei's StoreIndirectFormatted, M48):
+// a formatted X..XYZW store of 32-bit data through a V# the shader computed. The V#'s run-time
+// format selects the encoding; the whole element is written (missing channels zero, as RDNA2
+// does) when it is in bounds. Packed formats are one 16/32-bit piece; other formats write each
+// 8/16/32-bit channel at its byte offset. Unknown formats, elements over 16 bytes and wider
+// channels are dropped.
+void StoreIndirectFormatted(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer = PrepareIndirectBuffer(ctx, inst);
+		const auto data   = ctx.Arg(inst, inst.NumArgs() - 2);
+		const auto value  = [&](uint32_t component) {
+			if (component >= components) return ConstantU32(state, 0);
+			if (components == 1u) return data;
+			const auto extracted = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extracted, data,
+			                          component);
+			return extracted;
+		};
+		(void)EmitIndexSwitch(
+		    state, buffer.format,
+		    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u, TypeU32(state),
+		    [&](uint32_t format) {
+			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+			    if (info.type == Format::ComponentType::Unknown || info.component_count == 0u ||
+			        info.byte_size == 0u || info.byte_size > 16u ||
+			        (info.packed_bitfield && info.byte_size != 2u && info.byte_size != 4u)) {
+				    return ConstantU32(state, 0);
+			    }
+			    const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
+			    if (info.packed_bitfield) {
+				    auto packed = ConstantU32(state, 0);
+				    for (uint32_t component = 0; component < info.component_count; ++component) {
+					    packed = EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
+					        state, packed,
+					        EncodeFormattedStoreComponent(ctx, info, component, value(component), 32u),
+					        ConstantU32(state, info.component_bit_offset[component]),
+					        ConstantU32(state, info.component_bits[component]));
+				    }
+				    StoreIndirectFormattedPiece(ctx, buffer.address, in_bounds, info.byte_size * 8u,
+				                                packed);
+				    return ConstantU32(state, 0);
+			    }
+			    for (uint32_t component = 0; component < info.component_count; ++component) {
+				    const auto bits = info.component_bits[component];
+				    if (bits != 8u && bits != 16u && bits != 32u) continue;
+				    const auto offset  = Format::GetFormatComponentByteOffset(info, component);
+				    const auto address = offset == 0u
+				                             ? buffer.address
+				                             : Binary(state, spv::OpIAdd, TypeU64(state),
+				                                      buffer.address, ConstantU64(state, offset));
+				    StoreIndirectFormattedPiece(
+				        ctx, address, in_bounds, bits,
+				        EncodeFormattedStoreComponent(ctx, info, component, value(component), 32u));
+			    }
+			    return ConstantU32(state, 0);
+		    });
 	});
 }
 
@@ -3404,6 +3507,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	if (buffer_components == 2u && BufferPairAtomic(ctx, inst))
 		StoreBufferPair(ctx, inst);
+	else if (buffer_components != 0u && mem.kind == IR::ResourceKind::IndirectBuffer && mem.formatted)
+		StoreIndirectFormatted(ctx, inst, buffer_components);
 	else if (buffer_components != 0u && mem.kind == IR::ResourceKind::IndirectBuffer)
 		StoreIndirectBuffer(ctx, inst, buffer_components,
 		                    type == IR::Type::U8 ? 8u : type == IR::Type::U16 ? 16u : 32u);

@@ -504,7 +504,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
 				    !memory.SupportsIndirectRawLoad(inst.GetOpcode()) &&
 				    !(program.info.bda_writes &&
-				      memory.SupportsIndirectRawWrite(inst.GetOpcode()))) {
+				      (memory.SupportsIndirectRawWrite(inst.GetOpcode()) ||
+				       (GetCodegenOptions().indirect_format_stores && memory.formatted &&
+				        !memory.typed && memory.data_bits == 32u &&
+				        BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write)))) {
 					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());

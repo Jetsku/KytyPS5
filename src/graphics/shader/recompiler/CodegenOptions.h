@@ -286,6 +286,24 @@ struct CodegenOptions {
 	// (adapted from Erlou93/KytyPS5-Yotei's MatchDescriptorTable bounds). Ghost of Yotei's compute
 	// shaders take a 5-bit slot field from a record. Off: such programs are skipped, as before.
 	bool bounded_key_images = false;
+	// KYTY_R128_TABLE_IMAGES=1 (default 0; PPSA26344 preset): a T# read from a table for image
+	// instructions that all use a 128-bit T# (R128=1) plans only its four words: the upper four are
+	// constants, not table reads. Bindless heaps of such images zero the words past the 16-byte T#.
+	// Off: such programs are skipped, as before (Ghost of Yotei's compute shaders).
+	bool r128_table_images = false;
+	// KYTY_INDIRECT_FORMAT_STORES=1 (default 0; NOT in the PPSA26344 preset: with it Ghost of
+	// Yotei's village lighting turned magenta on half the screen, so the port is still wrong): a formatted 32-bit
+	// BUFFER_STORE_FORMAT_X..XYZW through a V# a compute shader computed is written through BDA (with
+	// KYTY_BDA_WRITES) in the V#'s run-time format: the whole element (missing channels zero),
+	// packed formats as one 16/32-bit piece, others per 8/16/32-bit channel (adapted from
+	// Erlou93/KytyPS5-Yotei's StoreIndirectFormatted, M48). Off: such programs are skipped, as before.
+	bool indirect_format_stores = false;
+	// KYTY_DROP_GRAPHICS_INDIRECT_STORES=1 (default 0; PPSA26344 preset; an approximation): a raw
+	// store (not an atomic) through a V# a graphics-stage shader computed is removed instead of
+	// skipping every draw of the program (BDA writes are compute-only). Each dropped store is
+	// logged once per program. Ghost of Yotei's split merged hull program HS 0x93ec51ae70b429ce
+	// stores a byte that way; without the switch its tessellated draws are skipped.
+	bool drop_graphics_indirect_stores = false;
 	// KYTY_INDIRECT_FORMAT_D16=1 (default 0; PPSA26344 preset): BUFFER_LOAD_FORMAT_D16_XYZ/XYZW (two dwords) through a
 	// V# the shader computed read through the indirect format decoder, then pack component pairs into
 	// dwords as the D16 load does (16-bit float for float/norm formats, clamped 16-bit integers for

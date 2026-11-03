@@ -22129,6 +22129,20 @@ public:
     code.push_back(EncodeMubuf1(3, 2, 2));
     code.push_back(EncodeMubuf0(0x1c));             // buffer_store_dword v1, v2, s[12:15] offen
     code.push_back(EncodeMubuf1(1, 3, 2));
+    // KYTY_INDIRECT_FORMAT_STORES (ctest bda_format_stores): buffer_store_format_xy of (1.0, -2.0)
+    // through a third selected V# (16_16 float at header + 8) packs 0xc0003c00.
+    const bool format_stores = ShaderRecompiler::GetCodegenOptions().indirect_format_stores;
+    if (format_stores) {
+      AppendVMovU32(&code, 30, 40);
+      AppendBufferLoadDword(&code, 0, 30);            // v0 = table[10] (selector of the format V#)
+      code.push_back(EncodeVop1(0x02, 22, Vgpr(0)));  // v_readfirstlane_b32 s22, v0
+      code.push_back(EncodeSmem0(0x0a, 16, 0));       // s_buffer_load_dwordx4 s[16:19], s[0:3], s22
+      code.push_back(EncodeSmem1(0, 22));
+      AppendVMovU32(&code, 4, 0x3f800000u);
+      AppendVMovU32(&code, 5, 0xc0000000u);
+      code.push_back(EncodeMubuf0(0x05));             // buffer_store_format_xy v[4:5], v2, s[16:19] offen
+      code.push_back(EncodeMubuf1(4, 4, 2));
+    }
     AppendEnd(&code);
     ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
                       {.type = Prospero::ShaderBinaryType::kCs,
@@ -22159,6 +22173,12 @@ public:
     std::copy(unbacked_vsharp.begin(), unbacked_vsharp.end(), table_words + 4);
     table_words[8] = 0;  // selectors: byte offsets of the two V#s in the table
     table_words[9] = 16;
+    if (format_stores) {
+      auto format_vsharp = v_sharp(header + 8u, 4);
+      format_vsharp[3] = (3u << 28u) | (29u << 12u) | 0xfacu; // k16_16Float
+      std::copy(format_vsharp.begin(), format_vsharp.end(), table_words + 12);
+      table_words[10] = 48;
+    }
     reinterpret_cast<u32 *>(neighbour)[0] = 0x0badf00du;
 
     {
@@ -22198,6 +22218,12 @@ public:
       const auto header_sum = *reinterpret_cast<volatile u32 *>(header + 4);
       const auto neighbour_word = *reinterpret_cast<volatile u32 *>(neighbour);
       const auto unbacked_word = *reinterpret_cast<volatile u32 *>(unbacked);
+      if (format_stores) {
+        const auto formatted_word = *reinterpret_cast<volatile u32 *>(header + 8);
+        Require(name, "formatted store",
+                formatted_word == 0xc0003c00u,
+                "a 16_16 float store through a selected V# wrote " + Hex(formatted_word));
+      }
       Require(name, "CPU read after the dispatch",
               header_word == 0xc0ffee42u && header_sum == 5u,
               "a guest read after the dispatch did not see the BDA store and atomic: " +

@@ -173,6 +173,15 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.indirect_format_d16) {
 		b.Text("indirect_format_d16_1");
 	}
+	if (options.drop_graphics_indirect_stores) {
+		b.Text("drop_graphics_indirect_stores1");
+	}
+	if (options.indirect_format_stores) {
+		b.Text("indirect_format_stores1");
+	}
+	if (options.r128_table_images) {
+		b.Text("r128_table_images1");
+	}
 	if (options.bounded_key_images) {
 		b.Text("bounded_key_images1");
 	}

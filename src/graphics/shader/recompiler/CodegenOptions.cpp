@@ -78,6 +78,10 @@ CodegenOptions FromEnvironment() {
 	options.indirect_raw_outline = EnvFlag("KYTY_INDIRECT_RAW_OUTLINE", options.indirect_raw_outline);
 	options.null_buffer_share    = EnvFlag("KYTY_NULL_BUFFER_SHARE", options.null_buffer_share);
 	options.bounded_key_images   = EnvFlag("KYTY_BOUNDED_KEY_IMAGES", options.bounded_key_images);
+	options.drop_graphics_indirect_stores =
+	    EnvFlag("KYTY_DROP_GRAPHICS_INDIRECT_STORES", options.drop_graphics_indirect_stores);
+	options.indirect_format_stores = EnvFlag("KYTY_INDIRECT_FORMAT_STORES", options.indirect_format_stores);
+	options.r128_table_images    = EnvFlag("KYTY_R128_TABLE_IMAGES", options.r128_table_images);
 	options.indirect_format_d16  = EnvFlag("KYTY_INDIRECT_FORMAT_D16", options.indirect_format_d16);
 	options.heap_key_mask     = EnvFlag("KYTY_HEAP_KEY_MASK", options.heap_key_mask);
 	options.wave64_active_zero =

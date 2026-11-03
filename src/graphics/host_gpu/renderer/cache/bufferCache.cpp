@@ -4938,7 +4938,37 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
 	    !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size) &&
 	    !ReadPartlyUnmappedImageBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+		// KYTY_IMAGE_UNMAPPED_ZERO=1 (default 0; PPSA26344 preset): an image range that runs past the
+		// guest's reserved memory reads page by page: what the guest has (mapped or reserved) is
+		// copied, the rest reads as zero, instead of ending the emulator. A streamed texture's chain
+		// stores its largest levels last; when they are not loaded their pages are not even reserved,
+		// while the levels the T# views are (the case of Erlou93/KytyPS5-Yotei's streamed-view
+		// sub-chain: Ghost of Yotei's terrain snow mask).
+		static const bool zero = [] {
+			const char* value = std::getenv("KYTY_IMAGE_UNMAPPED_ZERO");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (!zero) {
+			EXIT("BufferCache: failed to read mapped guest image backing 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+			     vaddr, size);
+		}
+		constexpr uint64_t Page   = 0x4000;
+		uint64_t           copied = 0;
+		for (uint64_t offset = 0; offset < size;) {
+			const auto bytes = std::min(size - offset, Page - ((vaddr + offset) & (Page - 1u)));
+			if (Libs::LibKernel::Memory::CopySparseMemory(vaddr + offset, staging + offset, bytes)) {
+				copied += bytes;
+			} else {
+				std::memset(staging + offset, 0, bytes);
+			}
+			offset += bytes;
+		}
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("KYTY_IMAGE_UNMAPPED_ZERO: image backing 0x%016" PRIx64 "+0x%" PRIx64
+			     " runs past guest memory: 0x%" PRIx64 " bytes copied, the rest reads as zero\n",
+			     vaddr, size, copied);
+		}
 	}
 	if (source == &m_staging_buffer) m_staging_buffer.Commit();
 	else source->Flush(0, size);

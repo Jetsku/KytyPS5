@@ -690,6 +690,10 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
 			return false;
 		}
+		// KYTY_R128_TABLE_IMAGES: a 128-bit T# has no upper words (the next entry's bytes).
+		if (program.info.images[image_index].r128 && GetCodegenOptions().r128_table_images) {
+			std::fill(candidate.dwords.begin() + 4, candidate.dwords.begin() + 8, 0u);
+		}
 		if (NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
 			candidate.dwords.fill(0);
