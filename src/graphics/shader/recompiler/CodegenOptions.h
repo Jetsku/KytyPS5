@@ -392,6 +392,23 @@ struct CodegenOptions {
 	// orderings (a read sees the other half's earlier writes; a write does not overtake its earlier reads)
 	// with far fewer barriers in programs that read the LDS often.
 	bool split_lds_write_sync = false;
+	// KYTY_STORAGE_TABLE_LOOSE=1 (default 0; on in the PPSA26344 title preset; adapted from
+	// Erlou93/KytyPS5-Yotei M120): a storage image table the GPU indexes accepts candidates that differ
+	// from its exemplar only in a plain dimension or in the swizzle of a format without conversion; each
+	// write through the table takes the candidate's own coordinates. Before, such a table failed the
+	// stage ("indirect image table ... has incompatible candidates").
+	bool storage_table_loose = false;
+	// KYTY_SCALAR_LOAD_GROUPS=1 (default 0; on in the PPSA26344 title preset; adapted from
+	// Erlou93/KytyPS5-Yotei FindScalarLoadGroups): the dwords of one S_LOAD_DWORDXn through a scalar
+	// address share one BDA page lookup when they lie in one page (EmitScalarLoadGroup). Exact.
+	bool scalar_load_groups = false;
+	// KYTY_NULL_IMAGE_KEEP_DIM=1 (default 0; on in the PPSA26344 title preset; TheCruZ 4f1b2ebc): a
+	// null image keeps the shader's dimension instead of the canonical 2D view (fewer program variants).
+	bool null_image_keep_dim = false;
+	// KYTY_STORAGE_SWIZZLE_CANON=1 (default 0; on in the PPSA26344 title preset; TheCruZ 72e95dcd): a
+	// storage image swizzle that stores every channel of its format from its own component is
+	// specialized as the identity (fewer program variants; same stored bits).
+	bool storage_swizzle_canon = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has

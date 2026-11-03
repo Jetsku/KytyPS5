@@ -1356,21 +1356,25 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
+	const auto low_value   = other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate);
 	const auto low         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope, low_value);
 	if (other_half == nullptr) {
 		return EmitWaveBallot(state, low);
 	}
-	const auto high      = state.builder.AllocateId();
-	const auto low_word  = state.builder.AllocateId();
-	const auto high_word = state.builder.AllocateId();
-	const auto ballot    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	const auto high_value = half == 1 ? Def(predicate) : other_half->Def(predicate);
+	const auto low_word   = state.builder.AllocateId();
+	const auto ballot     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
+	// KYTY_LANE2_SHARE: both halves hold the same id (a constant, or a value proven equal in both
+	// halves), so the high half's ballot is the low half's.
+	uint32_t high_word = low_word;
+	if (high_value != low_value || !GetCodegenOptions().lane2_share) {
+		const auto high = state.builder.AllocateId();
+		high_word       = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope, high_value);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
+	}
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
 	                          ConstantU32(state, 0), ConstantU32(state, 0));
 	return ballot;

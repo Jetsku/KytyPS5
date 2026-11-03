@@ -1607,13 +1607,22 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                [&](uint32_t ordinal) {
 				                auto target     = mem;
 				                target.resource = resources[ordinal];
+				                const auto& candidate = ImageResourceAt(state, target.resource);
+				                // KYTY_STORAGE_TABLE_LOOSE: a candidate of another plain dimension
+				                // takes its coordinates (and mip) as its own type needs them.
+				                const bool own_dimension = GetCodegenOptions().storage_table_loose &&
+				                                           candidate.dimension != dimension;
 				                const auto mip_lod =
-				                    ImageResourceAt(state, target.resource).mip_mode ==
-				                            IR::ImageMipMode::Dynamic
-				                        ? lod
+				                    candidate.mip_mode == IR::ImageMipMode::Dynamic
+				                        ? (own_dimension ? LodU32(ctx, target, *address, candidate.dimension)
+				                                         : lod)
 				                        : 0u;
 				                const auto texel = StoreTexel(ctx, target, data, uint_image);
-				                EmitStorageImageWrite(state, target.resource, mip_lod, coord, texel);
+				                EmitStorageImageWrite(
+				                    state, target.resource, mip_lod,
+				                    own_dimension ? CoordU32(ctx, target, *address, candidate.dimension)
+				                                  : coord,
+				                    texel);
 			                });
 		});
 		return;

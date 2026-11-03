@@ -221,6 +221,18 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.split_lds_write_sync) {
 		b.Text("split_lds_write_sync");
 	}
+	if (options.storage_table_loose) {
+		b.Text("storage_table_loose");
+	}
+	if (options.scalar_load_groups) {
+		b.Text("scalar_load_groups");
+	}
+	if (options.null_image_keep_dim) {
+		b.Text("null_image_keep_dim");
+	}
+	if (options.storage_swizzle_canon) {
+		b.Text("storage_swizzle_canon");
+	}
 	if (options.bindless_3d_as_array) {
 		b.Text("bindless_3d_as_array");
 	}

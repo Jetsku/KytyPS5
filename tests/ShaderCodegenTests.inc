@@ -2442,7 +2442,55 @@ void CheckSplitLdsWriteSync(VulkanHarness *vulkan) {
   }
 }
 
+// KYTY_SCALAR_LOAD_GROUPS: S_LOAD_DWORDX4 through a scalar address, once inside one BDA page
+// (one page lookup for the four dwords) and once straddling a page boundary (per-dword path); the
+// results match the memory with and without the switch.
+void CheckScalarLoadGroups(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Page = static_cast<u32>(BufferCache::CACHING_PAGESIZE);
+  constexpr u32 Inside = 256u;
+  constexpr u32 Straddle = Page - 8u;
+  for (const bool enabled : {true, false}) {
+    TestCase test;
+    test.name = enabled ? "CodegenScalarLoadGroups" : "CodegenScalarLoadGroupsOff";
+    test.initial.assign((2u * Page) / 4u, 0u);
+    for (u32 word = 0; word < 4; word++) {
+      test.initial[Inside / 4 + word] = 0x11110000u + word;
+      test.initial[Straddle / 4 + word] = 0x22220000u + word;
+    }
+    auto &code = test.code;
+    AppendSMovLiteral(&code, 2, static_cast<u32>(GuestBase));
+    AppendSMovLiteral(&code, 3, static_cast<u32>(GuestBase >> 32u));
+    code.push_back(EncodeSmem0(0x02, 8, 1));   // s_load_dwordx4 s[8:11], s[2:3], Inside
+    code.push_back(EncodeSmem1(Inside));
+    code.push_back(EncodeSmem0(0x02, 12, 1));  // s_load_dwordx4 s[12:15], s[2:3], Straddle
+    code.push_back(EncodeSmem1(Straddle));
+    code.push_back(EncodeSopp(0x0c, 0));       // s_waitcnt 0
+    for (u32 i = 0; i < 8; i++) {
+      code.push_back(EncodeVop1(0x01, 20 + i, 8 + i)); // v_mov_b32 v(20+i), s(8+i)
+      AppendStoreVgpr(&code, 20 + i, i);
+    }
+    AppendEnd(&code);
+    test.expected = {0x11110000u, 0x11110001u, 0x11110002u, 0x11110003u,
+                     0x22220000u, 0x22220001u, 0x22220002u, 0x22220003u};
+    test.bda_mappings = {{GuestBase, 0}};
+    test.opcodes = {O::S_MOV_B32, O::S_LOAD_DWORDX4, O::S_WAITCNT, O::V_MOV_B32,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+    CodegenOptions options = GetCodegenOptions();
+    options.scalar_load_groups = enabled;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+    // S_BUFFER_LOAD_DWORDXn through GPU-selected V#s (the indirect scalar group form) and the
+    // scalar load variants.
+    RunCase(vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(vulkan, ScalarMemoryLoadVariants());
+  }
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckScalarLoadGroups(vulkan);
   CheckSplitLdsWriteSync(vulkan);
   CheckLdsAtomicOrder(vulkan);
   CheckGdsM0Base(vulkan);

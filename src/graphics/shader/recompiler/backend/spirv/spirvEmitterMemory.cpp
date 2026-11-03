@@ -3363,9 +3363,18 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
 	               GetCodegenOptions().indirect_coherent && mem.coherent);
 }
 
+static bool EmitScalarLoadGroup(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem);
+
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
+	if (mem.kind == IR::ResourceKind::IndirectBuffer && GetCodegenOptions().scalar_load_groups &&
+	    ctx.definitions.contains(&inst)) {
+		return; // KYTY_SCALAR_LOAD_GROUPS: a member its group's leader already loaded.
+	}
+	if (mem.kind == IR::ResourceKind::IndirectBuffer && EmitScalarLoadGroup(ctx, inst, mem)) {
+		return;
+	}
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 		ctx.Define(inst, LoadIndirectScalarBuffer(ctx, inst, mem));
 		return;
@@ -3546,7 +3555,191 @@ static void StoreLdsSlot(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                 ctx.Arg(inst, inst.NumArgs() - 2), before));
 }
 
+// KYTY_SCALAR_LOAD_GROUPS (adapted from Erlou93/KytyPS5-Yotei FindScalarLoadGroups /
+// EmitScalarLoadGroup): the dwords of one S_LOAD_DWORDXn through a scalar address are consecutive
+// LoadAddressU32 instructions on the same operands. Their leader loads every member: when the
+// highest member's dword lies in the page of the lowest one, one get_bda_pointer of the lowest
+// address gives every member's pointer as pointer + delta (a missing page gives 0 for every member
+// and records the same fault bit, as each member would); otherwise each member takes the per-dword
+// path. The members are defined here; their own emission finds them defined.
+static bool EmitScalarLoadGroup(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto& state = ctx.state;
+	const auto opcode   = inst.GetOpcode();
+	const bool indirect = opcode == IR::ValueOpcode::ReadConstBuffer && mem.kind == IR::ResourceKind::IndirectBuffer;
+	if (!GetCodegenOptions().scalar_load_groups || mem.planning_only || state.current_block == nullptr ||
+	    ctx.definitions.contains(&inst) ||
+	    !(indirect || (opcode == IR::ValueOpcode::LoadAddressU32 && mem.kind == IR::ResourceKind::ScalarAddress))) {
+		return false;
+	}
+	auto it = state.current_block->begin();
+	while (it != state.current_block->end() && &*it != &inst) ++it;
+	if (it == state.current_block->end()) {
+		return false;
+	}
+	const uint32_t base = indirect ? mem.offset : mem.offset & ~3u;
+	std::vector<std::pair<const IR::Inst*, uint32_t>> members; // instruction, byte delta
+	uint32_t last_component = mem.component_index;
+	for (++it; it != state.current_block->end() && members.size() < 15u; ++it) {
+		const auto& next = *it;
+		if (next.GetOpcode() != opcode || next.NumArgs() != inst.NumArgs()) break;
+		const auto index = next.Flags<IR::MemoryFlags>().index;
+		if (index >= state.program.memory_info.size()) break;
+		const auto& other = state.program.memory_info[index];
+		const uint32_t other_offset = indirect ? other.offset : other.offset & ~3u;
+		if (other.kind != mem.kind || other.planning_only ||
+		    other.address_is_full != mem.address_is_full || other.coherent != mem.coherent ||
+		    other.component_index <= last_component || other_offset <= base || other_offset - base >= 64u ||
+		    ((other_offset - base) & 3u) != 0u) {
+			break;
+		}
+		bool same = true;
+		for (size_t arg = 0; arg < inst.NumArgs() && same; arg++) {
+			same = next.Arg(arg) == inst.Arg(arg);
+		}
+		if (!same) break;
+		members.emplace_back(&next, other_offset - base);
+		last_component = other.component_index;
+	}
+	if (members.empty()) {
+		static const bool log = std::getenv("KYTY_SCALAR_LOAD_GROUPS_LOG") != nullptr;
+		if (log) {
+			auto next = state.current_block->begin();
+			while (next != state.current_block->end() && &*next != &inst) ++next;
+			if (next != state.current_block->end()) ++next;
+			std::printf("ScalarLoadGroup: no member after offset %u component %u (next %.*s)\n", mem.offset,
+			            mem.component_index,
+			            static_cast<int>(next == state.current_block->end() ? 3 : IR::ValueOpcodeName(next->GetOpcode()).size()),
+			            next == state.current_block->end() ? "end" : IR::ValueOpcodeName(next->GetOpcode()).data());
+		}
+		return false;
+	}
+	const bool coherent = GetCodegenOptions().indirect_coherent && mem.coherent;
+	const auto u64      = TypeU64(state);
+	const auto span     = members.back().second + static_cast<uint32_t>(sizeof(uint32_t));
+	uint32_t   first    = 0;
+	uint32_t   in_range = 0; // indirect: the highest member's dword is in the buffer's range
+	if (indirect) {
+		// LoadIndirectScalarBuffer's address and range for the leader and the highest member.
+		const auto& handle = *inst.Arg(0).ResolveInstruction();
+		const auto  word1  = ctx.Arg(handle, 1);
+		const auto  records = ctx.Arg(handle, 2);
+		const auto  stride =
+		    EmitBitFieldUExtract(state, word1, ConstantU32(state, 16), ConstantU32(state, 14));
+		const auto widen = [&](uint32_t value) { return Unary(state, spv::OpUConvert, u64, value); };
+		const auto buffer_base = DeviceAddressFromWords(
+		    state, ctx.Arg(handle, 0),
+		    EmitBitFieldUExtract(state, word1, ConstantU32(state, 0), ConstantU32(state, 16)));
+		const auto offset = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
+		const auto size   = Select(state, u64, Binary(state, spv::OpIEqual, TypeBool(state), stride, ConstantU32(state, 0)),
+		                           widen(records), Binary(state, spv::OpIMul, u64, widen(stride), widen(records)));
+		const auto last   = Binary(state, spv::OpIAdd, TypeU32(state), offset, ConstantU32(state, members.back().second));
+		const auto end    = Binary(state, spv::OpIAdd, u64,
+		                           widen(Binary(state, spv::OpBitwiseAnd, TypeU32(state), last, ConstantU32(state, ~3u))),
+		                           ConstantDeviceAddress(state, sizeof(uint32_t)));
+		// (No 32-bit wrap of the members' offsets: the fast path's addresses are first + delta.)
+		in_range = AndCondition(state, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size),
+		                        Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), last, offset));
+		first    = Binary(state, spv::OpBitwiseAnd, u64, Binary(state, spv::OpIAdd, u64, buffer_base, widen(offset)),
+		                  ConstantDeviceAddress(state, ~uint64_t {3}));
+	} else {
+		first = GuestAddress(ctx, inst, mem);
+	}
+	auto in_page  = Binary(
+	    state, spv::OpULessThanEqual, TypeBool(state),
+	    Binary(state, spv::OpIAdd, u64,
+	           Binary(state, spv::OpBitwiseAnd, u64, first, ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1)),
+	           ConstantU64(state, span)),
+	    ConstantU64(state, BufferCache::CACHING_PAGESIZE));
+	if (indirect) {
+		in_page = AndCondition(state, in_range, in_page);
+	}
+	const auto count = members.size() + 1u;
+	std::vector<uint32_t> fast(count);
+	std::vector<uint32_t> slow(count);
+	const auto fast_label  = state.builder.AllocateId();
+	const auto slow_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, in_page, fast_label, slow_label);
+	EmitLabel(state, fast_label);
+	{
+		const auto bda     = GetBdaPointer(ctx, first);
+		const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+		const auto header  = state.current_label;
+		const auto load_label   = state.builder.AllocateId();
+		const auto loaded_label = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, loaded_label, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, present, load_label, loaded_label);
+		EmitLabel(state, load_label);
+		const auto access = GetCodegenOptions().volatile_loads || coherent
+		                        ? spv::MemoryAccessAlignedMask | spv::MemoryAccessVolatileMask
+		                        : spv::MemoryAccessAlignedMask;
+		std::vector<uint32_t> loads(count);
+		for (size_t k = 0; k < count; k++) {
+			const auto address =
+			    k == 0 ? bda : Binary(state, spv::OpIAdd, u64, bda, ConstantU64(state, members[k - 1].second));
+			uint32_t pointer = state.builder.AllocateId();
+			if (coherent) {
+				const auto block = state.builder.DecoratedType(
+				    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+				                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+				                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
+				state.builder.AddFunction(spv::OpConvertUToPtr,
+				                          TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+				                          pointer, address);
+				const auto struct_pointer = pointer;
+				pointer                   = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
+				                          struct_pointer, ConstantU32(state, 0));
+			} else {
+				state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+				                          address);
+			}
+			loads[k] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), loads[k], pointer, access,
+			                          static_cast<uint32_t>(sizeof(uint32_t)));
+		}
+		state.builder.AddFunction(spv::OpBranch, loaded_label);
+		EmitLabel(state, loaded_label);
+		for (size_t k = 0; k < count; k++) {
+			fast[k] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpPhi, TypeU32(state), fast[k], loads[k], load_label,
+			                          ConstantU32(state, 0), header);
+		}
+	}
+	const auto fast_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, slow_label);
+	for (size_t k = 0; k < count; k++) {
+		if (indirect) {
+			const auto& member = k == 0 ? inst : *members[k - 1].first;
+			slow[k] = LoadIndirectScalarBuffer(ctx, member, ctx.Memory(member));
+		} else {
+			slow[k] = LoadBdaDword(
+			    ctx, k == 0 ? first : Binary(state, spv::OpIAdd, u64, first, ConstantU64(state, members[k - 1].second)),
+			    coherent);
+		}
+	}
+	const auto slow_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+	for (size_t k = 0; k < count; k++) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), value, fast[k], fast_exit, slow[k], slow_exit);
+		ctx.Define(k == 0 ? inst : *members[k - 1].first, value);
+	}
+	return true;
+}
+
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (GetCodegenOptions().scalar_load_groups && ctx.definitions.contains(&inst) &&
+	    inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32 &&
+	    ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress) {
+		return; // A member of a scalar load group its leader already loaded.
+	}
+	if (EmitScalarLoadGroup(ctx, inst, ctx.Memory(inst))) {
+		return;
+	}
 	if (ctx.state.lds_slot_plan && ctx.Memory(inst).kind == IR::ResourceKind::Lds) {
 		ctx.Define(inst, LoadLdsSlot(ctx, inst));
 		return;

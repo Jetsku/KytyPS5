@@ -94,6 +94,10 @@ CodegenOptions FromEnvironment() {
 	options.gds_m0_base      = EnvFlag("KYTY_GDS_M0_BASE", options.gds_m0_base);
 	options.lds_atomic_order = EnvFlag("KYTY_LDS_ATOMIC_ORDER", options.lds_atomic_order);
 	options.split_lds_write_sync = EnvFlag("KYTY_SPLIT_LDS_WRITE_SYNC", options.split_lds_write_sync);
+	options.storage_table_loose  = EnvFlag("KYTY_STORAGE_TABLE_LOOSE", options.storage_table_loose);
+	options.scalar_load_groups   = EnvFlag("KYTY_SCALAR_LOAD_GROUPS", options.scalar_load_groups);
+	options.null_image_keep_dim  = EnvFlag("KYTY_NULL_IMAGE_KEEP_DIM", options.null_image_keep_dim);
+	options.storage_swizzle_canon = EnvFlag("KYTY_STORAGE_SWIZZLE_CANON", options.storage_swizzle_canon);
 	options.bindless_3d_as_array =
 	    EnvFlag("KYTY_BINDLESS_3D_AS_ARRAY", options.bindless_3d_as_array);
 	options.runtime_images   = EnvFlag("KYTY_RUNTIME_IMAGES", options.runtime_images);
