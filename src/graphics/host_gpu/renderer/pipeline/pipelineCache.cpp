@@ -1393,6 +1393,38 @@ thread_local const ShaderRecompiler::CallSplit::Code*          t_split_code = nu
 thread_local std::shared_ptr<ShaderRecompiler::CallSplit::Run> t_split_run;
 thread_local std::shared_ptr<ShaderRecompiler::CallPartitionRun> t_partition_run;
 
+// Why a compute lookup returned no program (PipelineCache::TakeEmptyProgramReason): the reason of
+// the last empty result on this thread, and the translation's skip reason per shader hash (a skip
+// verdict reloaded from the program cache has none unless the pass census retranslates it).
+static thread_local uint64_t    t_empty_hash = 0;
+static thread_local std::string t_empty_why;
+static std::mutex                                g_skip_reason_mutex;
+static std::unordered_map<uint64_t, std::string> g_skip_reasons;
+
+static void NoteEmptyProgram(uint64_t hash, std::string why) {
+	t_empty_hash = hash;
+	t_empty_why  = std::move(why);
+}
+
+static void NoteSkipReason(uint64_t hash, const ShaderRecompiler::TranslateResult& translated) {
+	std::string text = translated.skip_reason.empty() ? std::string("translation skip verdict")
+	                                                  : translated.skip_reason;
+	if (translated.skip_pc != UINT32_MAX) text += fmt::format(" (pc=0x{:x})", translated.skip_pc);
+	std::scoped_lock lock(g_skip_reason_mutex);
+	g_skip_reasons[hash] = std::move(text);
+}
+
+static std::string SkipReasonText(uint64_t hash) {
+	std::scoped_lock lock(g_skip_reason_mutex);
+	const auto       it = g_skip_reasons.find(hash);
+	return it != g_skip_reasons.end() ? it->second : std::string("verdict reloaded from the program cache");
+}
+
+static std::string TakeEmptyProgramReasonImpl(uint64_t* hash) {
+	if (hash != nullptr) *hash = std::exchange(t_empty_hash, 0);
+	return std::exchange(t_empty_why, std::string());
+}
+
 // Programs with calls go through ExpandComputeCalls: KYTY_SHADER_CALLS (expansion, and splitting
 // with KYTY_SHADER_CALLS_SPLIT) or KYTY_SHADER_CALLS_SPLIT alone (splitting only).
 static bool CallProgramsHandled() {
@@ -3974,6 +4006,12 @@ struct PipelineCache::ProgramCache {
 				disk->Invalidate(disk_source->id);
 			} else if (disk_source->skip_dispatch) {
 				NoteDiskSkip(options);
+				// KYTY_TRACE_PASS_CENSUS: the reason the disk record does not keep (one translation).
+				if (PassCensus::Enabled() && !speculative) {
+					if (!translated_now) translate_now();
+					if (translated.skip_dispatch) NoteSkipReason(options.shader_hash, translated);
+				}
+				NoteEmptyProgram(options.shader_hash, "skip verdict: " + SkipReasonText(options.shader_hash));
 				lock.lock();
 				const auto entry =
 				    programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
@@ -4008,10 +4046,15 @@ struct PipelineCache::ProgramCache {
 		}
 		if (source == nullptr) {
 			if (!translated_now) {
-				if (defer_translation()) return nullptr; // KYTY_ASYNC_TRANSLATION: skipped meanwhile
+				if (defer_translation()) {
+					NoteEmptyProgram(options.shader_hash, "translation deferred (KYTY_ASYNC_TRANSLATION)");
+					return nullptr; // KYTY_ASYNC_TRANSLATION: skipped meanwhile
+				}
 				translate_now();
 			}
 			if (translated.skip_dispatch) {
+				NoteSkipReason(options.shader_hash, translated);
+				NoteEmptyProgram(options.shader_hash, "skip verdict: " + SkipReasonText(options.shader_hash));
 				// Skipped ray-tracing shaders are never compiled; dump their guest code here.
 				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
 				                   params.code, translated.decoded_dump);
@@ -4578,6 +4621,7 @@ struct PipelineCache::ProgramCache {
 		if (source != nullptr) DumpRequestedProgram(params, key.stage);
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
 			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
+			if (!speculative) NoteEmptyProgram(params.hash, "skip verdict: " + SkipReasonText(params.hash));
 			return {};
 		}
 		auto runtime = speculative ? MakeSpeculativeRuntime(params) : MakeRuntime(params, read_attempt);
@@ -4597,6 +4641,7 @@ struct PipelineCache::ProgramCache {
 			}
 			if (!materialized) {
 				ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedResources, params.hash);
+				if (!speculative) NoteEmptyProgram(params.hash, "resource materialization failed");
 				return {};
 			}
 			if (ResourceReuseEnabled() && ResourceDependencyCacheEnabled() &&
@@ -4630,6 +4675,10 @@ struct PipelineCache::ProgramCache {
 		if (compile_ns != nullptr) *compile_ns += CompileClockNs() - begin;
 		if (permutation == nullptr) {
 			ShaderRecompiler::IR::NullTraceNote(ShaderRecompiler::IR::NullTraceKind::SkippedProgram, params.hash);
+			if (!speculative && t_empty_hash != params.hash) {
+				// No more specific reason was noted by CompileAndPublish.
+				NoteEmptyProgram(params.hash, "no permutation (materialization or compile failed)");
+			}
 			return {};
 		}
 		return Bind(*permutation, input_info, prep, push_data_cursor);
@@ -8440,7 +8489,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	std::optional<CpGaps::Scope> prepare_gap;
 	prepare_gap.emplace(CpGaps::Cat::ProgPrepare);
 	auto              params      = PrepareProgram(regs, sh, input_info);
+	t_empty_hash = 0;
+	t_empty_why.clear();
 	if (!ExpandComputeCalls(params, input_info)) {
+		NoteEmptyProgram(params.hash, "call split plan being built");
 		return {};
 	}
 	prepare_gap.reset();
@@ -8484,8 +8536,13 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 			auto&      translations = CallTranslations::Instance();
 			const auto id = CallTranslations::Id(key.hash, key.user_data_count, key.static_state);
 			switch (translations.Query(id)) {
-				case CallTranslations::State::Missing: translations.Queue(id, params, input_info); return {};
-				case CallTranslations::State::Pending: return {};
+				case CallTranslations::State::Missing:
+					translations.Queue(id, params, input_info);
+					NoteEmptyProgram(params.hash, "expanded call program translating");
+					return {};
+				case CallTranslations::State::Pending:
+					NoteEmptyProgram(params.hash, "expanded call program translating");
+					return {};
 				case CallTranslations::State::Ready: break;
 			}
 		}
@@ -8501,6 +8558,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 				EXIT("compute resource readiness: a missing range cannot be synchronized\n");
 			}
 			(void)SkipUnmaterializable("a dispatch's resource tables read memory that cannot be synchronized");
+			NoteEmptyProgram(params.hash, "resource tables read memory that cannot be synchronized");
 			return {};
 		}
 	}
@@ -8508,6 +8566,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		EXIT("compute resource readiness did not converge after 64 attempts\n");
 	}
 	(void)SkipUnmaterializable("a dispatch's resource readiness did not converge after 64 attempts");
+	NoteEmptyProgram(params.hash, "resource readiness did not converge");
 	return {};
 }
 
@@ -9727,6 +9786,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComput
 	}
 	auto built = future.get();
 	return rt.Finish(id, job->second, *built);
+}
+
+std::string PipelineCache::TakeEmptyProgramReason(uint64_t* hash) {
+	return TakeEmptyProgramReasonImpl(hash);
 }
 
 } // namespace Libs::Graphics

@@ -231,6 +231,10 @@ public:
 	// KYTY_CALL_PARTITIONS: the dispatch's partitions (a ShaderRecompiler::CallPartitionRun), and
 	// the keys a partition program's report set held.
 	[[nodiscard]] static std::shared_ptr<const void> TakePartitionRun();
+	// Why the last GetComputeProgram of this thread returned no program ("" when it returned one or
+	// the reason is unknown) and the program's shader hash (0 when not known). Read by the dispatch
+	// that drops itself (pass census drop lines, one console line per shader and reason).
+	[[nodiscard]] static std::string TakeEmptyProgramReason(uint64_t* hash);
 	static void ReportPartitionKeys(uint64_t program, std::span<const uint32_t> keys);
 	// Draw-prep (KYTY_DRAW_PREP_DISPATCH): GetComputeProgram as a speculative preparation, as
 	// PrepareGraphicsProgramsSpeculative for a draw (every read through the active recorder,

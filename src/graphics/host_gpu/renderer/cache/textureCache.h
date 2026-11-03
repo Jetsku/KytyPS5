@@ -152,6 +152,15 @@ public:
 	bool DebugNanScan(uint64_t address, uint32_t width, uint32_t height, const std::string& label);
 	// One image of DebugDumpImage (m_lock held).
 	bool DebugDumpOne(ImageId id, uint64_t address, const std::string& prefix);
+	// KYTY_PASS_DUMP (renderCompute.cpp, diagnostic): samples every `step`-th row and column of the
+	// cached image at `address` (layer 0, mip 0; `aspect` 0 colour, 1 depth, 2 stencil of a depth
+	// image; an image of want_width x want_height preferred) after the current recording. When the
+	// submission completed, `emit` gets one text record: extent, format, per-channel mean/min/max,
+	// NaN/Inf and all-zero counts, a hash of the sampled bytes and a 16x9 grid of region means; with
+	// `thumb_path` the sampled texels are also written there as float RGBA. False when no such
+	// image is cached or the format is block-compressed / multisampled.
+	bool DebugPassSample(uint64_t address, uint32_t want_width, uint32_t want_height, int aspect, uint32_t step,
+	                     const std::string& thumb_path, std::function<void(std::string)> emit);
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      RepeatLookup* record = nullptr);
 	// The lookup `record` describes, repeated for the same `desc` and `exact_format` (the caller

@@ -52,14 +52,37 @@
 #include <filesystem>
 #include <fmt/format.h>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// A dispatch without a compute program: the pass census drop line names the shader and the reason
+// (PipelineCache::TakeEmptyProgramReason); the console gets one line per shader and reason.
+static void DropProgramless(PipelineCache& cache) {
+	(void)cache;
+	uint64_t   hash   = 0;
+	const auto reason = PipelineCache::TakeEmptyProgramReason(&hash);
+	const auto text   = reason.empty() ? std::string("dropped: no compute program")
+	                                   : "dropped: no compute program: " + reason;
+	PassCensus::Drop('c', hash, text.c_str());
+	static std::mutex                   mutex;
+	static std::unordered_set<std::string> logged;
+	const auto key = fmt::format("{:016x} {}", hash, reason);
+	{
+		std::scoped_lock lock(mutex);
+		if (logged.size() > 256 || !logged.insert(key).second) return;
+	}
+	std::printf("Dispatch dropped: CS 0x%016llx has no program: %s\n", static_cast<unsigned long long>(hash),
+	            reason.empty() ? "reason unknown" : reason.c_str());
+	std::fflush(stdout);
+}
 // KYTY_DISPATCH_OVERLAP accounting, printed every 10 s once a direct dispatch ran:
 //   DispatchOverlap 10s (on|off): <direct> direct dispatches, <pairs> unordered pairs (<pct>%),
 //   <overlapped> overlapped, <indirect> indirect (<empty> empty skipped, KYTY_SKIP_EMPTY_INDIRECT)
@@ -280,6 +303,223 @@ uint32_t NanScanTake() {
 	left--;
 	if (left == 0) std::printf("NanScan: end of scan %u (recorded; results follow as submissions complete)\n", scan);
 	return request.count - left;
+}
+
+
+// KYTY_PASS_DUMP=<folder>[:<step>] (diagnostic, default off; needs KYTY_TRACE_PASS_CENSUS=1 for the
+// game's marker names, exact with KYTY_CP_SEQ=0 KYTY_CP_SEQ_PREFETCH=0). While <folder>/pass.now
+// exists it is read ("<frames> [<thumb frames>]", default "30 1") and removed; from the next frame
+// boundary on, for <frames> consecutive frames, every pass segment (a run of draws and dispatches
+// under the same "outer>inner" marker) is followed by a readback of every image it wrote: colour
+// targets, depth and stencil of the depth target, storage images written by dispatches. Each
+// image gives one line in <folder>/passdump.txt (frame, segment, marker, the segment's draw and
+// dispatch counts by shader hash, then TextureCache::DebugPassSample's record: format, per-channel
+// mean/min/max, NaN/Inf, zero fraction, a hash and a 16x9 grid of region means). The first
+// <thumb frames> frames also write the sampled texels (every <step>-th row and column, default 4)
+// as float RGBA files <folder>/f<frame>_s<segment>_<address>_<aspect>_<w>x<h>.f32. Frames are slow
+// while dumping (each segment boundary ends the rendering). Local files only.
+namespace PassDump {
+namespace {
+struct Output {
+	uint64_t address = 0;
+	uint32_t width   = 0;
+	uint32_t height  = 0;
+	int      aspect  = 0;
+};
+struct State {
+	std::string                                   folder;
+	uint32_t                                      step        = 4;
+	uint32_t                                      polls       = 0;
+	uint32_t                                      want_frames = 0; // armed: frames to capture
+	uint32_t                                      want_thumbs = 1;
+	bool                                          capturing   = false;
+	uint64_t                                      start_frame = 0;
+	uint64_t                                      arm_frame   = 0;
+	uint64_t                                      seg_frame   = 0;
+	uint32_t                                      seg_index   = 0;
+	std::string                                   seg_key;
+	std::map<std::pair<char, uint64_t>, uint32_t> seg_ops;
+	std::vector<Output>                           seg_outputs;
+	std::FILE*                                    file = nullptr;
+	std::mutex                                    file_mutex;
+};
+State& Get() {
+	static State s;
+	static const bool parsed = [] {
+		State& st = s;
+		if (const char* value = std::getenv("KYTY_PASS_DUMP"); value != nullptr && value[0] != '\0') {
+			std::string text(value);
+			if (const auto colon = text.rfind(':'); colon != std::string::npos && colon > 1) {
+				st.step = std::max(1u, static_cast<uint32_t>(std::strtoul(text.c_str() + colon + 1, nullptr, 10)));
+				text.resize(colon);
+			}
+			st.folder = text;
+			std::printf("KYTY_PASS_DUMP enabled (diagnostic): trigger %s/pass.now, step %u\n", st.folder.c_str(),
+			            st.step);
+		}
+		return true;
+	}();
+	(void)parsed;
+	return s;
+}
+void Track(RenderContext& context);
+} // namespace
+
+// Before a draw or dispatch (GPU thread): true when the current segment ended and has outputs to
+// read back; the caller then ends the rendering and calls Flush.
+bool Before(RenderContext& context) {
+	auto& s = Get();
+	if (s.folder.empty()) return false;
+	const uint64_t frame = context.GetGpu().GetFrameNum();
+	if (!s.capturing && s.want_frames == 0) {
+		if ((s.polls++ & 63u) != 0u) return false;
+		std::error_code error;
+		const auto      trigger = std::filesystem::path(s.folder) / "pass.now";
+		if (!std::filesystem::exists(trigger, error)) return false;
+		unsigned frames = 30, thumbs = 1;
+		if (std::FILE* f = std::fopen(trigger.string().c_str(), "rb"); f != nullptr) {
+			if (std::fscanf(f, "%u %u", &frames, &thumbs) < 1) frames = 30;
+			std::fclose(f);
+		}
+		std::filesystem::remove(trigger, error);
+		s.want_frames = std::max(1u, frames);
+		s.want_thumbs = thumbs;
+		s.arm_frame   = frame;
+		std::printf("KYTY_PASS_DUMP: armed at frame %llu for %u frames (%u with texels)\n",
+		            static_cast<unsigned long long>(frame), s.want_frames, s.want_thumbs);
+		std::fflush(stdout);
+		return false;
+	}
+	if (!s.capturing) {
+		if (frame == s.arm_frame) return false;
+		s.capturing   = true;
+		s.start_frame = frame;
+		s.seg_frame   = frame;
+		s.seg_index   = 0;
+		s.seg_key     = PassCensus::CurrentKey();
+		s.seg_ops.clear();
+		s.seg_outputs.clear();
+		if (s.file == nullptr) {
+			s.file = std::fopen((std::filesystem::path(s.folder) / "passdump.txt").string().c_str(), "a");
+		}
+		std::printf("KYTY_PASS_DUMP: capture starts at frame %llu\n", static_cast<unsigned long long>(frame));
+		std::fflush(stdout);
+		return false;
+	}
+	const auto key = PassCensus::CurrentKey();
+	if (frame == s.seg_frame && key == s.seg_key) return false;
+	if (!s.seg_outputs.empty()) return true;
+	Track(context);
+	return false;
+}
+
+// Reads back the ended segment's outputs and starts the next segment (rendering ended).
+void Flush(RenderContext& context) {
+	auto& s = Get();
+	if (!s.capturing) return;
+	const uint64_t frame     = context.GetGpu().GetFrameNum();
+	const uint32_t rel_frame = static_cast<uint32_t>(s.seg_frame - s.start_frame);
+	std::string    ops;
+	for (const auto& [k, n]: s.seg_ops) {
+		ops += fmt::format("{}{}:{:016x}x{}", ops.empty() ? "" : ",", k.first, k.second, n);
+	}
+	const auto prefix = fmt::format("PASSDUMP f={} gpu_frame={} seg={} key=\"{}\" ops={}", rel_frame, s.seg_frame,
+	                                s.seg_index, s.seg_key, ops.empty() ? "-" : ops);
+	for (const auto& o: s.seg_outputs) {
+		const auto thumb = rel_frame < s.want_thumbs
+		                       ? fmt::format("{}/f{}_s{}_{:x}_{}", s.folder, rel_frame, s.seg_index, o.address,
+		                                     o.aspect == 0 ? "c" : o.aspect == 1 ? "d" : "s")
+		                       : std::string();
+		auto* file_state = &s;
+		const auto head  = fmt::format("{} addr={:x} want={}x{} ", prefix, o.address, o.width, o.height);
+		const bool ok    = context.GetTextureCache().DebugPassSample(
+            o.address, o.width, o.height, o.aspect, s.step, thumb, [file_state, head](std::string line) {
+                std::scoped_lock lock(file_state->file_mutex);
+                if (file_state->file != nullptr) {
+                    std::fprintf(file_state->file, "%s%s\n", head.c_str(), line.c_str());
+                    std::fflush(file_state->file);
+                }
+            });
+		if (!ok) {
+			std::scoped_lock lock(s.file_mutex);
+			if (s.file != nullptr) std::fprintf(s.file, "%snot cached (aspect %d)\n", head.c_str(), o.aspect);
+		}
+	}
+	s.seg_outputs.clear();
+	s.seg_ops.clear();
+	s.seg_key = PassCensus::CurrentKey();
+	if (frame != s.seg_frame) {
+		s.seg_frame = frame;
+		s.seg_index = 0;
+		if (frame - s.start_frame >= s.want_frames) {
+			s.capturing   = false;
+			s.want_frames = 0;
+			std::printf("KYTY_PASS_DUMP: capture ended at frame %llu\n", static_cast<unsigned long long>(frame));
+			std::fflush(stdout);
+		}
+	} else {
+		s.seg_index++;
+	}
+}
+
+namespace {
+// A segment without outputs ends: the next one starts.
+void Track(RenderContext& context) {
+	auto& s = Get();
+	if (!s.capturing) return;
+	const uint64_t frame = context.GetGpu().GetFrameNum();
+	const auto     key   = PassCensus::CurrentKey();
+	if (frame == s.seg_frame && key == s.seg_key) return;
+	s.seg_ops.clear();
+	s.seg_key = key;
+	if (frame != s.seg_frame) {
+		s.seg_frame = frame;
+		s.seg_index = 0;
+		if (frame - s.start_frame >= s.want_frames) {
+			s.capturing   = false;
+			s.want_frames = 0;
+			std::printf("KYTY_PASS_DUMP: capture ended at frame %llu\n", static_cast<unsigned long long>(frame));
+			std::fflush(stdout);
+		}
+	} else {
+		s.seg_index++;
+	}
+}
+
+} // namespace
+
+bool Capturing() {
+	return Get().capturing;
+}
+
+// After a draw ('d': hash = PS, or VS without PS) or dispatch ('c'): counts it and notes an image it wrote.
+void NoteOp(char kind, uint64_t hash) {
+	auto& s = Get();
+	if (!s.capturing) return;
+	s.seg_ops[{kind, hash}]++;
+}
+
+void NoteOutput(uint64_t address, uint32_t width, uint32_t height, int aspect) {
+	auto& s = Get();
+	if (!s.capturing || address == 0) return;
+	for (const auto& o: s.seg_outputs) {
+		if (o.address == address && o.aspect == aspect) return;
+	}
+	s.seg_outputs.push_back({address, width, height, aspect});
+}
+} // namespace PassDump
+
+// KYTY_PASS_DUMP: a dispatch and the images it wrote.
+static void PassDumpNoteDispatch(const ShaderComputeInputInfo& input_info) {
+	if (!PassDump::Capturing() || input_info.stage.program == nullptr || input_info.stage.resources == nullptr) return;
+	const auto& program = *input_info.stage.program;
+	PassDump::NoteOp('c', program.shader_hash);
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (!program.info.images[i].written) continue;
+		const auto r = DecodeNativeDescriptor<ShaderTextureResource>(input_info.stage.resources->images[i]);
+		PassDump::NoteOutput(r.Base40(), static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+		                     0);
+	}
 }
 
 // KYTY_FRAME_TRACE=<folder>[:<count>] (diagnostic): while <folder>/trace.now exists, the next <count>
@@ -1046,6 +1286,10 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	RenderLockGuard lock(m_context.GetMutex());
 	// KYTY_DRAW_RUN: a dispatch ends the run of the draws before it (drawPrep/drawRun.h).
 	BeginDrawRun();
+	if (PassDump::Before(m_context)) { // KYTY_PASS_DUMP: the previous pass segment's outputs
+		buffer.EndRendering();
+		PassDump::Flush(m_context);
+	}
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -1146,7 +1390,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
-		PassCensus::Drop('c', 0, "dropped: no compute program");
+		DropProgramless(m_context.GetPipelineCache());
 		return;
 	}
 	if (auto split = PipelineCache::TakeCallSplitRun(); split != nullptr) {
@@ -1164,6 +1408,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 			DispatchCallSplit(buffer, pristine_info, split, cs_regs, sh_regs, thread_group_x,
 			                  thread_group_y, thread_group_z);
 			RunCsImageDump(m_context, image_dump);
+			PassDumpNoteDispatch(input_info); // KYTY_PASS_DUMP
 		}
 		return;
 	}
@@ -1436,6 +1681,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 		RunCsImageDump(m_context, image_dump);
 	}
+	PassDumpNoteDispatch(input_info); // KYTY_PASS_DUMP
 	if (const auto op = NanScanTake(); op != 0) {
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1541,6 +1787,10 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	RenderLockGuard lock(m_context.GetMutex());
 	// KYTY_DRAW_RUN: a dispatch ends the run of the draws before it (drawPrep/drawRun.h).
 	BeginDrawRun();
+	if (PassDump::Before(m_context)) { // KYTY_PASS_DUMP: the previous pass segment's outputs
+		buffer.EndRendering();
+		PassDump::Flush(m_context);
+	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -1640,7 +1890,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
-		PassCensus::Drop('c', 0, "dropped: no compute program");
+		DropProgramless(m_context.GetPipelineCache());
 		return;
 	}
 	if (PipelineCache::TakeCallSplitRun() != nullptr) {
@@ -1790,6 +2040,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	if (!guest_barriers) {
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	PassDumpNoteDispatch(input_info); // KYTY_PASS_DUMP
 	if (const auto op = NanScanTake(); op != 0) {
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {

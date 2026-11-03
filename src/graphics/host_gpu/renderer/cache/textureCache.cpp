@@ -39,6 +39,8 @@
 #include "graphics/host_gpu/vramStats.h"
 
 #include <algorithm>
+#include <functional>
+#include <cmath>
 #include <array>
 #include <optional>
 #include <atomic>
@@ -2324,6 +2326,251 @@ bool TextureCache::DebugNanScan(uint64_t address, uint32_t want_width, uint32_t 
 			            static_cast<unsigned long long>(nan), static_cast<unsigned long long>(inf),
 			            static_cast<unsigned long long>(texels));
 		}
+	});
+	return true;
+}
+
+// KYTY_PASS_DUMP: one texel of a sampled row as float RGBA (raw integer values for integer
+// formats; colour channels as stored, no sRGB decoding or swizzle).
+static float PassSampleHalf(uint16_t h) {
+	const uint32_t sign = (h >> 15u) & 1u;
+	const uint32_t exp  = (h >> 10u) & 0x1fu;
+	const uint32_t man  = h & 0x3ffu;
+	if (exp == 0) {
+		const float v = std::ldexp(static_cast<float>(man), -24);
+		return sign != 0 ? -v : v;
+	}
+	uint32_t bits = exp == 31 ? ((sign << 31u) | 0x7f800000u | (man << 13u))
+	                          : ((sign << 31u) | ((exp + 112u) << 23u) | (man << 13u));
+	float f = 0;
+	std::memcpy(&f, &bits, 4);
+	return f;
+}
+
+static float PassSampleSmallFloat(uint32_t v, uint32_t man_bits) {
+	const uint32_t exp = v >> man_bits;
+	const uint32_t man = v & ((1u << man_bits) - 1u);
+	if (exp == 0) return std::ldexp(static_cast<float>(man), -14 - static_cast<int>(man_bits));
+	if (exp == 31) return man != 0 ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+	return std::ldexp(1.0f + static_cast<float>(man) / static_cast<float>(1u << man_bits), static_cast<int>(exp) - 15);
+}
+
+static void PassSampleDecode(vk::Format format, int aspect, const uint8_t* p, float out[4]) {
+	out[0] = out[1] = out[2] = out[3] = 0.0f;
+	uint32_t u32 = 0;
+	if (aspect == 2) {
+		out[0] = p[0];
+		return;
+	}
+	if (aspect == 1) {
+		switch (format) {
+			case vk::Format::eD16Unorm:
+			case vk::Format::eD16UnormS8Uint: {
+				uint16_t v = 0;
+				std::memcpy(&v, p, 2);
+				out[0] = static_cast<float>(v) / 65535.0f;
+				return;
+			}
+			case vk::Format::eX8D24UnormPack32:
+			case vk::Format::eD24UnormS8Uint:
+				std::memcpy(&u32, p, 4);
+				out[0] = static_cast<float>(u32 & 0xffffffu) / 16777215.0f;
+				return;
+			default: std::memcpy(&out[0], p, 4); return;
+		}
+	}
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32:
+			std::memcpy(&u32, p, 4);
+			out[0] = PassSampleSmallFloat(u32 & 0x7ffu, 6);
+			out[1] = PassSampleSmallFloat((u32 >> 11u) & 0x7ffu, 6);
+			out[2] = PassSampleSmallFloat((u32 >> 22u) & 0x3ffu, 5);
+			return;
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+			std::memcpy(&u32, p, 4);
+			out[0] = static_cast<float>(u32 & 0x3ffu) / 1023.0f;
+			out[1] = static_cast<float>((u32 >> 10u) & 0x3ffu) / 1023.0f;
+			out[2] = static_cast<float>((u32 >> 20u) & 0x3ffu) / 1023.0f;
+			out[3] = static_cast<float>(u32 >> 30u) / 3.0f;
+			return;
+		case vk::Format::eE5B9G9R9UfloatPack32: {
+			std::memcpy(&u32, p, 4);
+			const float scale = std::ldexp(1.0f, static_cast<int>(u32 >> 27u) - 15 - 9);
+			out[0]            = static_cast<float>(u32 & 0x1ffu) * scale;
+			out[1]            = static_cast<float>((u32 >> 9u) & 0x1ffu) * scale;
+			out[2]            = static_cast<float>((u32 >> 18u) & 0x1ffu) * scale;
+			return;
+		}
+		default: break;
+	}
+	const auto     name  = vk::to_string(format);
+	const uint32_t comps = std::min<uint32_t>(vk::componentCount(format), 4);
+	const uint32_t bytes = vk::blockSize(format);
+	if (comps == 0 || bytes % comps != 0) return;
+	const uint32_t width  = bytes / comps;
+	const bool     sfloat = name.find("Sfloat") != std::string::npos;
+	const bool     unorm  = name.find("Unorm") != std::string::npos || name.find("Srgb") != std::string::npos;
+	const bool     snorm  = name.find("Snorm") != std::string::npos;
+	const bool     sint   = name.find("Sint") != std::string::npos;
+	for (uint32_t c = 0; c < comps; c++) {
+		const uint8_t* q = p + c * width;
+		if (width == 1) {
+			const uint8_t v = q[0];
+			out[c] = unorm   ? static_cast<float>(v) / 255.0f
+			         : snorm ? std::max(-1.0f, static_cast<float>(static_cast<int8_t>(v)) / 127.0f)
+			         : sint  ? static_cast<float>(static_cast<int8_t>(v))
+			                 : static_cast<float>(v);
+		} else if (width == 2) {
+			uint16_t v = 0;
+			std::memcpy(&v, q, 2);
+			out[c] = sfloat  ? PassSampleHalf(v)
+			         : unorm ? static_cast<float>(v) / 65535.0f
+			         : snorm ? std::max(-1.0f, static_cast<float>(static_cast<int16_t>(v)) / 32767.0f)
+			         : sint  ? static_cast<float>(static_cast<int16_t>(v))
+			                 : static_cast<float>(v);
+		} else if (width == 4) {
+			std::memcpy(&u32, q, 4);
+			if (sfloat) {
+				std::memcpy(&out[c], &u32, 4);
+			} else {
+				out[c] = sint ? static_cast<float>(static_cast<int32_t>(u32)) : static_cast<float>(u32);
+			}
+		}
+	}
+}
+
+bool TextureCache::DebugPassSample(uint64_t address, uint32_t want_width, uint32_t want_height, int aspect,
+                                   uint32_t step, const std::string& thumb_path,
+                                   std::function<void(std::string)> emit) {
+	std::scoped_lock lock {m_lock};
+	ImageId          found {};
+	FindImagesInRegion(address, 1, false).ForEach([&](ImageId id) {
+		const auto& image = m_slot_images[id];
+		if (image.info.data.address != address || image.depth_id) return;
+		if ((aspect != 0) != image.info.IsDepth()) return;
+		if (!found || (image.info.extent.width == want_width && image.info.extent.height == want_height)) {
+			found = id;
+		}
+	});
+	if (!found) {
+		return false;
+	}
+	auto&      image  = m_slot_images[found];
+	const auto format = image.backing.format;
+	const auto block  = vk::blockExtent(format);
+	uint32_t   bytes  = vk::blockSize(format);
+	if (aspect == 1) {
+		bytes = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint ? 2u : 4u;
+	} else if (aspect == 2) {
+		if (vk::to_string(format).find("S8") == std::string::npos) return false;
+		bytes = 1;
+	}
+	if (image.info.samples != 1 || bytes == 0 || block[0] != 1 || block[1] != 1) {
+		return false;
+	}
+	step                     = std::max(step, 1u);
+	const uint32_t width     = image.info.extent.width;
+	const uint32_t height    = image.info.extent.height;
+	const uint32_t rows      = (height + step - 1) / step;
+	const uint64_t row_bytes = uint64_t {width} * bytes;
+	std::vector<vk::BufferImageCopy> copies(rows);
+	const auto aspect_bits = aspect == 0   ? vk::ImageAspectFlagBits::eColor
+	                         : aspect == 1 ? vk::ImageAspectFlagBits::eDepth
+	                                       : vk::ImageAspectFlagBits::eStencil;
+	for (uint32_t r = 0; r < rows; r++) {
+		auto& copy            = copies[r];
+		copy.bufferOffset     = row_bytes * r;
+		copy.imageSubresource = {aspect_bits, 0, 0, 1};
+		copy.imageOffset      = vk::Offset3D {0, static_cast<int32_t>(r * step), 0};
+		copy.imageExtent      = vk::Extent3D {width, 1, 1};
+	}
+	const uint64_t size   = row_bytes * rows;
+	auto           buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                       vk::BufferUsageFlagBits::eTransferDst,
+	                                       Common::AlignUp(size, uint64_t {4}));
+	image.Download(copies, buffer->Handle(), 0, size);
+	vk::MemoryBarrier2 to_host {};
+	to_host.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &to_host;
+	m_scheduler.Current().HelperSink().pipelineBarrier2(dependency);
+	const auto head = fmt::format("{}x{} vk{} {} img{}", width, height, static_cast<uint32_t>(format),
+	                              aspect == 0 ? "color" : aspect == 1 ? "depth" : "stencil", found.index);
+	m_scheduler.DeferOperation([buffer, size, head, format, aspect, bytes, width, rows, step, thumb_path,
+	                            emit = std::move(emit)] {
+		buffer->Invalidate(0, size);
+		const auto*    data = buffer->Mapped().data();
+		const uint32_t cols = (width + step - 1) / step;
+		double         sum[4] {};
+		float          lo[4];
+		float          hi[4];
+		for (int c = 0; c < 4; c++) {
+			lo[c] = std::numeric_limits<float>::max();
+			hi[c] = -std::numeric_limits<float>::max();
+		}
+		uint64_t           nan = 0, inf = 0, zero = 0, count = 0;
+		constexpr uint32_t GX = 16, GY = 9;
+		std::array<double, GX * GY>   grid {};
+		std::array<uint32_t, GX * GY> grid_n {};
+		std::vector<float>            thumb;
+		if (!thumb_path.empty()) thumb.resize(uint64_t {cols} * rows * 4);
+		const uint32_t comps = aspect != 0 ? 1u : std::max(1u, std::min<uint32_t>(vk::componentCount(format), 4));
+		for (uint32_t r = 0; r < rows; r++) {
+			for (uint32_t cx = 0; cx < cols; cx++) {
+				float v[4];
+				PassSampleDecode(format, aspect, data + uint64_t {r} * width * bytes + uint64_t {cx} * step * bytes, v);
+				bool   all_zero = true;
+				double lum      = 0;
+				for (uint32_t c = 0; c < comps; c++) {
+					const float x = v[c];
+					if (std::isnan(x)) {
+						nan++;
+						continue;
+					}
+					if (std::isinf(x)) {
+						inf++;
+						continue;
+					}
+					sum[c] += x;
+					lo[c] = std::min(lo[c], x);
+					hi[c] = std::max(hi[c], x);
+					if (x != 0.0f) all_zero = false;
+					if (c < 3) lum += x;
+				}
+				zero += all_zero ? 1u : 0u;
+				count++;
+				const uint32_t gx = std::min(GX - 1, cx * GX / cols);
+				const uint32_t gy = std::min(GY - 1, r * GY / rows);
+				grid[gy * GX + gx] += lum / std::min(comps, 3u);
+				grid_n[gy * GX + gx]++;
+				if (!thumb.empty()) std::memcpy(&thumb[(uint64_t {r} * cols + cx) * 4], v, sizeof(v));
+			}
+		}
+		std::string line = head;
+		line += fmt::format(" hash={:016x} n={} nan={} inf={} zero={:.4f}", XXH3_64bits(data, size), count, nan, inf,
+		                    count != 0 ? static_cast<double>(zero) / static_cast<double>(count) : 0.0);
+		for (uint32_t c = 0; c < comps; c++) {
+			line += fmt::format(" c{}={:.5g}/{:.5g}/{:.5g}", c,
+			                    count != 0 ? sum[c] / static_cast<double>(count) : 0.0, lo[c], hi[c]);
+		}
+		line += " grid=";
+		for (uint32_t i = 0; i < GX * GY; i++) {
+			line += fmt::format("{}{:.4g}", i == 0 ? "" : ",", grid_n[i] != 0 ? grid[i] / grid_n[i] : 0.0);
+		}
+		if (!thumb.empty()) {
+			const auto path = fmt::format("{}_{}x{}.f32", thumb_path, cols, rows);
+			if (std::FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+				std::fwrite(thumb.data(), sizeof(float), thumb.size(), file);
+				std::fclose(file);
+			}
+			line += " thumb=" + path;
+		}
+		emit(std::move(line));
 	});
 	return true;
 }

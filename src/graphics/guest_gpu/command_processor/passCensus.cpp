@@ -155,7 +155,15 @@ void Drop(char kind, uint64_t hash, const char* reason) {
 	if (!Enabled() || !OnGpuThread()) return;
 	auto&            c = Global();
 	std::scoped_lock lock(c.mutex);
-	c.passes[t_key].drops[{kind, hash != 0 ? hash : t_shader, std::string(reason)}]++;
+	// A drop whose shader is not known keeps hash 0; the thread's last materialized shader is only named in the
+	// reason (it is often a different, earlier shader: the census used to attribute such drops to it).
+	std::string text(reason);
+	if (hash == 0 && t_shader != 0) {
+		char buffer[64];
+		std::snprintf(buffer, sizeof(buffer), " [hash unknown; last materialized %016" PRIx64 "]", t_shader);
+		text += buffer;
+	}
+	c.passes[t_key].drops[{kind, hash, text}]++;
 }
 
 void Null(const char* reason) {
@@ -170,6 +178,10 @@ void Null(const char* reason) {
 void SetShader(uint64_t hash) {
 	if (!Enabled()) return;
 	t_shader = hash;
+}
+
+std::string CurrentKey() {
+	return t_key;
 }
 
 void Frame() {

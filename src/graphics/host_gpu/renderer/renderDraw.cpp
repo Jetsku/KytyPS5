@@ -81,6 +81,14 @@ namespace Libs::Graphics {
 bool FrameTraceTake();
 // KYTY_NAN_SCAN (renderCompute.cpp).
 uint32_t NanScanTake();
+// KYTY_PASS_DUMP (renderCompute.cpp).
+namespace PassDump {
+bool Before(RenderContext& context);
+void Flush(RenderContext& context);
+bool Capturing();
+void NoteOp(char kind, uint64_t hash);
+void NoteOutput(uint64_t address, uint32_t width, uint32_t height, int aspect);
+} // namespace PassDump
 
 static bool MeshRestartEnabled() {
 	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
@@ -2493,6 +2501,29 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 		if (!SameRenderDepthInfo(state.depth_info, reference)) {
 			ReportRenderStateMismatch("the depth target entry resolved over the last draw's");
 			state.depth_info = reference;
+		}
+	}
+	// KYTY_TRACE_DRS_EXTENT=<hex address> (diagnostic; =1: 0x5002870000, Ghost of Yotei's main depth target;
+	// idea from Erlou93/KytyPS5-Yotei's DRS_EXTENT): one stdout line "DRS_EXTENT frame=<n> depth=<w>x<h>"
+	// whenever the extent of the depth target at that address changes (the game's internal resolution).
+	{
+		static const uint64_t drs_address = [] {
+			const char* value = std::getenv("KYTY_TRACE_DRS_EXTENT");
+			if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) return uint64_t {0};
+			if (std::strcmp(value, "1") == 0) return uint64_t {0x5002870000ull};
+			return static_cast<uint64_t>(std::strtoull(value, nullptr, 16));
+		}();
+		if (drs_address != 0 && state.depth_info.image_id && state.depth_info.desc.info.data.address == drs_address) {
+			static uint32_t last = 0;
+			const auto&     e    = state.depth_info.desc.info.extent;
+			const uint32_t  key  = e.width * 65536u + e.height;
+			if (key != last) {
+				last = key;
+				std::printf("DRS_EXTENT frame=%llu depth=%ux%u\n",
+				            static_cast<unsigned long long>(buffer.GetContext().GetGpu().GetFrameNum()), e.width,
+				            e.height);
+				std::fflush(stdout);
+			}
 		}
 	}
 	// Upstream 7b7294aa0 (TODO PPSA09243): Vulkan passes take one sample count. Where PS5
@@ -5241,6 +5272,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	draw_cmd_scope.Stop();
+	// KYTY_PASS_DUMP (renderCompute.cpp): the draw and the targets it wrote.
+	if (PassDump::Capturing()) {
+		PassDump::NoteOp('d', state.ps_active && state.ps_input_info.stage.program
+		                          ? state.ps_input_info.stage.program->shader_hash
+		                      : state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash
+		                                                           : 0);
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& target = state.color_info[i];
+			PassDump::NoteOutput(target.desc.info.data.address, target.desc.info.extent.width,
+			                     target.desc.info.extent.height, 0);
+		}
+		const auto& depth = state.depth_info;
+		if (depth.image_id && depth.desc.info.data.address != 0) {
+			const auto aspects = depth.AttachmentWriteAspects();
+			if (aspects & vk::ImageAspectFlagBits::eDepth) {
+				PassDump::NoteOutput(depth.desc.info.data.address, depth.desc.info.extent.width,
+				                     depth.desc.info.extent.height, 1);
+			}
+			if (aspects & vk::ImageAspectFlagBits::eStencil) {
+				PassDump::NoteOutput(depth.desc.info.data.address, depth.desc.info.extent.width,
+				                     depth.desc.info.extent.height, 2);
+			}
+		}
+	}
 	// KYTY_NAN_SCAN (renderCompute.cpp): the draw's colour targets, after it (ends the rendering).
 	if (const auto op = NanScanTake(); op != 0) {
 		buffer.EndRendering();
@@ -5547,6 +5602,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	CommitStats::StepMark(CommitStats::Step::DebugInfo);
 	RenderLockGuard lock(m_context.GetMutex());
+	if (PassDump::Before(m_context)) { // KYTY_PASS_DUMP: the previous pass segment's outputs
+		buffer.EndRendering();
+		m_run.valid        = false;
+		m_run_active       = false;
+		m_run_targets_kept = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
+		PassDump::Flush(m_context);
+	}
 	CommitStats::StepMark(CommitStats::Step::Lock);
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
 	BeginDrawRun();
@@ -5703,6 +5768,16 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	CommitStats::StepMark(CommitStats::Step::DebugInfo);
 	RenderLockGuard lock(m_context.GetMutex());
+	if (PassDump::Before(m_context)) { // KYTY_PASS_DUMP: the previous pass segment's outputs
+		buffer.EndRendering();
+		m_run.valid        = false;
+		m_run_active       = false;
+		m_run_targets_kept = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
+		PassDump::Flush(m_context);
+	}
 	CommitStats::StepMark(CommitStats::Step::Lock);
 	// KYTY_DRAW_RUN: only a draw that records through the eligible path seeds the next continuation.
 	BeginDrawRun();
@@ -5941,6 +6016,16 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	RenderLockGuard lock(m_context.GetMutex());
+	if (PassDump::Before(m_context)) { // KYTY_PASS_DUMP: the previous pass segment's outputs
+		buffer.EndRendering();
+		m_run.valid        = false;
+		m_run_active       = false;
+		m_run_targets_kept = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
+		PassDump::Flush(m_context);
+	}
 	// KYTY_DRAW_RUN: an engine commit with KYTY_DRAW_RUN_INDIRECT and a prepared slot, otherwise
 	// other command-processor work for the run certificate.
 	BeginDrawRun();

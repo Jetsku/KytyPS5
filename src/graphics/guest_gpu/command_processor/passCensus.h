@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PASSCENSUS_H_
 
 #include <cstdint>
+#include <string>
 
 // KYTY_TRACE_PASS_CENSUS=1 (diagnostic, default off; idea from Erlou93/KytyPS5-Yotei passCensus.cpp): the game's
 // debug-marker passes ("outer>inner", two levels of the command processor's marker stack) with, per pass and frame,
@@ -19,8 +20,8 @@ void Marker(const void* cp, const char* push_name);
 void Packet(const void* cp, bool dispatch);
 // A draw ('d': a = VS hash, b = PS hash) or dispatch ('c': a = CS hash) prepared for recording.
 void Exec(char kind, uint64_t a, uint64_t b);
-// A draw ('d') or dispatch ('c') the renderer dropped or skipped; `hash` is 0 when unknown (then the last
-// materialized shader of the thread is named).
+// A draw ('d') or dispatch ('c') the renderer dropped or skipped; `hash` is 0 when unknown (the line then keeps
+// hash 0 and names the thread's last materialized shader only in the reason, as a hint).
 void Drop(char kind, uint64_t hash, const char* reason);
 // A resource of the shader being prepared bound as null, or a specialization failure (`reason` copied).
 void Null(const char* reason);
@@ -28,6 +29,8 @@ void Null(const char* reason);
 void SetShader(uint64_t hash);
 // One presented frame.
 void Frame();
+// The "outer>inner" marker pass of the GPU thread's current packet ("-" outside markers; KYTY_PASS_DUMP).
+[[nodiscard]] std::string CurrentKey();
 
 } // namespace Libs::Graphics::PassCensus
 
