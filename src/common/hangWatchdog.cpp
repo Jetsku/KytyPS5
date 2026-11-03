@@ -453,7 +453,7 @@ bool WriteSnapshot(const std::string& directory, bool stacks) {
 bool StallDetector::Poll(uint64_t now, uint64_t f, uint64_t s, uint64_t timeout) {
 	if (fired) return false;
 	if (!armed) {
-		armed         = f != 0 && s != 0;
+		armed         = (f != 0 && s != 0) || arm_at_start;
 		flips         = f;
 		submissions   = s;
 		idle_since_ms = now;
@@ -497,10 +497,15 @@ void StartMonitor(std::string_view trace_directory) {
 	const auto* value = std::getenv("KYTY_HANG_WATCHDOG_MS");
 	const auto  timeout =
 	    value ? std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 1000, 600000) : 5000;
-	g_watchdog = std::jthread([timeout](std::stop_token stop) {
+	// KYTY_HANG_WATCHDOG_STARTUP=1 also watches the time before the first flip and submission, for
+	// stalls while loading.
+	const auto* startup  = std::getenv("KYTY_HANG_WATCHDOG_STARTUP");
+	const bool  at_start = startup != nullptr && std::strcmp(startup, "1") == 0;
+	g_watchdog = std::jthread([timeout, at_start](std::stop_token stop) {
 		Common::PlaceCurrentThreadCold();
 		try {
 			StallDetector    detector;
+			detector.arm_at_start = at_start;
 			std::unique_lock lock(g_sleep_mutex);
 			for (;;) {
 				const bool terminal = g_terminal_requested.exchange(false);
@@ -508,7 +513,7 @@ void StartMonitor(std::string_view trace_directory) {
 				const auto now = NowMs();
 				g_time_ms.store(now, std::memory_order_relaxed);
 				if (!Enabled() && !terminal)
-					detector = {};
+					detector = {.arm_at_start = at_start};
 				else if (terminal ||
 				         detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
 					g_report_reason.store(terminal ? 2 : 1);
