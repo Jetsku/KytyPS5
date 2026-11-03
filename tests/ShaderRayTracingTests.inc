@@ -581,9 +581,16 @@ int ValidateBvhShaderFiles(int argc, char **argv) {
         ShaderComputeInputInfo info{};
         info.wave_size = wave;
         info.host_subgroup_size = 32;
-        info.threads_num[0] = 64;
+        // KYTY_HARNESS_THREADS=<n>: the workgroup size (default 64).
+        const char *threads_text = std::getenv("KYTY_HARNESS_THREADS");
+        info.threads_num[0] =
+            threads_text != nullptr ? static_cast<uint32_t>(std::strtoul(threads_text, nullptr, 10)) : 64u;
         info.threads_num[1] = 1;
         info.threads_num[2] = 1;
+        // KYTY_HARNESS_LDS_DWORDS=<n>: the workgroup's LDS size (default none).
+        if (const char *lds = std::getenv("KYTY_HARNESS_LDS_DWORDS"); lds != nullptr) {
+          info.lds_size_dwords = static_cast<uint32_t>(std::strtoul(lds, nullptr, 10));
+        }
         info.thread_ids_num = 3;
         info.group_id[0] = info.group_id[1] = info.group_id[2] = true;
         info.workgroup_register = 16;

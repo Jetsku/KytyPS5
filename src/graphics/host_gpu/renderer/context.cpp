@@ -39,6 +39,8 @@ namespace Libs::Graphics {
 static Live::Switch g_sink_routes("KYTY_CP_SINK_ROUTES", Live::ParseDefaultOn);
 // KYTY_DISPATCH_OVERLAP (render.h DispatchOverlapEnabled): live; default on.
 static Live::Switch g_dispatch_overlap("KYTY_DISPATCH_OVERLAP", Live::ParseDefaultOn);
+// KYTY_DISPATCH_OVERLAP_UPLOADS (render.h DispatchOverlapUploadsEnabled): live; default off.
+static Live::Switch g_dispatch_overlap_uploads("KYTY_DISPATCH_OVERLAP_UPLOADS", Live::ParseDefaultOff);
 // KYTY_PM4_BARRIERS=guest (render.h GuestSyncBarriersEnabled): live; default off.
 static Live::Switch g_pm4_guest_barriers("KYTY_PM4_BARRIERS", [](const char* value) -> int64_t {
 	return value != nullptr && std::strcmp(value, "guest") == 0 ? 1 : 0;
@@ -341,10 +343,17 @@ void CommandBuffer::ResetBarrierState() const {
 	m_internal_recording   = 0;
 	m_feedback_keep.reset();
 	m_overlap_open         = false;
+	m_overlap_upload_fenced = false;
+	m_upload_narrow         = false;
+	m_dispatch_prep         = false;
 }
 
 bool DispatchOverlapEnabled() {
 	return BarrierBatchEnabled() && g_dispatch_overlap.Get() != 0;
+}
+
+bool DispatchOverlapUploadsEnabled() {
+	return DispatchOverlapEnabled() && UploadBatchEnabled() && g_dispatch_overlap_uploads.Get() != 0;
 }
 
 bool GuestSyncBarriersEnabled() {
@@ -360,18 +369,44 @@ void CommandBuffer::NoteGuestDispatch(bool lds) const {
 	m_overlap_lds = lds;
 }
 
+bool CommandBuffer::KeepUploadsForDispatch() const {
+	return m_dispatch_prep && m_overlap_open && DispatchOverlapUploadsEnabled() &&
+	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty() &&
+	       (m_pending.origins & ~(OriginBit(BarrierOrigin::ShaderAccess) | OriginBit(BarrierOrigin::Upload))) == 0;
+}
+
 bool CommandBuffer::TakeDispatchOverlap(bool lds, bool take) const {
 	const bool open = m_overlap_open;
 	m_overlap_open  = false;
+	// KYTY_DISPATCH_OVERLAP_UPLOADS: upload copies queued for this dispatch (CPU-written pages its
+	// bindings need) do not end the chain.
+	const bool with_uploads = !m_pending.uploads.empty() && DispatchOverlapUploadsEnabled();
+	const uint32_t allowed  = OriginBit(BarrierOrigin::ShaderAccess) |
+	                         (with_uploads ? OriginBit(BarrierOrigin::Upload) : 0u);
 	if (!open || lds || m_overlap_lds || !m_pending.has_memory || !m_pending.images.empty() ||
-	    !m_pending.buffers.empty() || !m_pending.uploads.empty() ||
-	    m_pending.origins != OriginBit(BarrierOrigin::ShaderAccess)) {
+	    !m_pending.buffers.empty() || (!m_pending.uploads.empty() && !with_uploads) ||
+	    m_pending.origins != allowed) {
+		m_overlap_upload_fenced = false;
 		return false;
 	}
 	if (take) {
 		// The next dispatch's own ShaderAccess request covers the dropped one: its first scope is
 		// every earlier compute shader access, the dropped dispatch's included.
-		m_pending.Clear();
+		if (with_uploads) {
+			// The first upload of a chain keeps its full pre-copy barrier (everything earlier,
+			// the chain's first dispatch included, before the copies). Later ones only wait for
+			// earlier copies (RecordPendingUploads): the CPU wrote those pages while no guest
+			// synchronization separated the chain's dispatches, which on the console run
+			// concurrently with such writes too. The copies' post barrier still orders them
+			// before this dispatch.
+			m_pending.memory     = vk::MemoryBarrier2 {};
+			m_pending.has_memory = false;
+			m_pending.origins    = OriginBit(BarrierOrigin::Upload);
+			m_upload_narrow         = m_overlap_upload_fenced;
+			m_overlap_upload_fenced = true;
+		} else {
+			m_pending.Clear();
+		}
 	}
 	return true;
 }
@@ -536,6 +571,12 @@ void CommandBuffer::RecordPendingUploads() const {
 		                        vk::AccessFlagBits2::eMemoryWrite |
 		                        vk::AccessFlagBits2::eTransferRead |
 		                        vk::AccessFlagBits2::eTransferWrite;
+		if (m_upload_narrow) {
+			// KYTY_DISPATCH_OVERLAP_UPLOADS (TakeDispatchOverlap): a later upload of an open
+			// dispatch chain waits for the earlier copies only.
+			barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+		}
 		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
 		barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
 		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -666,6 +707,7 @@ void CommandBuffer::FlushBarriers() const {
 	m_epoch_clean    = m_pending.has_memory && IsFullBarrier(m_pending.memory);
 	m_epoch_instance = 0;
 	m_overlap_open   = false;
+	m_upload_narrow  = false;
 	m_pending.Clear();
 }
 

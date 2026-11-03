@@ -481,13 +481,13 @@ static void PrintDispatchOverlap(bool enabled) {
 	const auto taken    = g_overlap_taken.exchange(0, std::memory_order_relaxed);
 	const auto indirect = g_overlap_indirect.exchange(0, std::memory_order_relaxed);
 	const auto empty    = g_overlap_empty_indirect.exchange(0, std::memory_order_relaxed);
-	std::printf("DispatchOverlap 10s (%s): %llu direct dispatches, %llu unordered pairs (%.1f%%), "
-	            "%llu overlapped, %llu indirect (%llu empty skipped)\n",
-	            enabled ? "on" : "off", static_cast<unsigned long long>(direct),
-	            static_cast<unsigned long long>(pairs),
-	            direct != 0 ? 100.0 * static_cast<double>(pairs) / static_cast<double>(direct) : 0.0,
-	            static_cast<unsigned long long>(taken), static_cast<unsigned long long>(indirect),
-	            static_cast<unsigned long long>(empty));
+	// Console and log (the launcher does not keep stdout).
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "DispatchOverlap 10s ({}{}): {} direct dispatches, {} unordered pairs ({:.1f}%), {} overlapped, "
+	    "{} indirect ({} empty skipped)\n",
+	    enabled ? "on" : "off", DispatchOverlapUploadsEnabled() ? ", uploads" : "", direct, pairs,
+	    direct != 0 ? 100.0 * static_cast<double>(pairs) / static_cast<double>(direct) : 0.0, taken,
+	    indirect, empty));
 }
 
 static void CountDispatchOverlap(bool unordered, bool enabled) {
@@ -1206,6 +1206,14 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	if (program.info.uses_dma) {
 		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
 	}
+	// KYTY_DISPATCH_OVERLAP_UPLOADS: uploads of this preparation stay pending for the dispatch's
+	// flush while the overlap chain is open (CommandBuffer::KeepUploadsForDispatch).
+	struct DispatchPrepScope {
+		const CommandBuffer& buffer;
+		explicit DispatchPrepScope(const CommandBuffer& b): buffer(b) { buffer.SetDispatchPrep(true); }
+		~DispatchPrepScope() { buffer.SetDispatchPrep(false); }
+		void End() const { buffer.SetDispatchPrep(false); }
+	} dispatch_prep(buffer);
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	if (program.info.uses_dma) {
@@ -1260,6 +1268,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	const bool no_overlap      = bindings.shared_memory.buffer != nullptr || program.info.bda_writes;
 	const bool overlap_enabled = DispatchOverlapEnabled();
 	const bool overlap         = buffer.TakeDispatchOverlap(no_overlap, overlap_enabled);
+	dispatch_prep.End();
 	CountDispatchOverlap(overlap, overlap_enabled);
 	// KYTY_PM4_BARRIERS=guest (render.h): the guest's own sync points order dispatches instead.
 	const bool guest_barriers = GuestSyncBarriersEnabled() && !no_overlap;

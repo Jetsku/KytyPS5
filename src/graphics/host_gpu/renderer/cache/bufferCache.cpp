@@ -1752,6 +1752,9 @@ BufferCache::UploadBatch::~UploadBatch() {
 			}
 			return;
 		}
+		if (command.KeepUploadsForDispatch()) {
+			return; // KYTY_DISPATCH_OVERLAP_UPLOADS: recorded at the dispatch's own flush
+		}
 		command.FlushBarriers();
 	}
 }
@@ -3779,7 +3782,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			source = StageUploadDma(source, copies, &host_copies, force_dma);
 			command.RequestUploadCopy(source, buffer.Handle(), copies);
 			buffer.MarkContentWritten();
-			if (m_upload_batch_depth == 0) {
+			if (m_upload_batch_depth == 0 && !command.KeepUploadsForDispatch()) {
 				command.FlushBarriers();
 			}
 			if (is_texel_buffer && !is_written) {

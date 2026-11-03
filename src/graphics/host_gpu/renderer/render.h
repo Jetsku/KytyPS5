@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -222,6 +223,12 @@ struct DrawAutoArgs {
 // Indirect dispatches keep their barriers (their argument barrier serializes them anyway).
 // KYTY_DISPATCH_OVERLAP=0 restores the barrier pair between every two dispatches.
 [[nodiscard]] bool DispatchOverlapEnabled();
+// KYTY_DISPATCH_OVERLAP_UPLOADS (live, default off; needs KYTY_DISPATCH_OVERLAP and the upload
+// batcher): buffer uploads queued for a dispatch (pages the CPU wrote) do not end its overlap
+// chain. The first such upload in a chain keeps the full pre-copy barrier; later ones only wait
+// for earlier copies, so their dispatches overlap the chain's earlier ones (Ghost of Yotei's
+// one-workgroup skinning dispatches each come with a few uploads).
+[[nodiscard]] bool DispatchOverlapUploadsEnabled();
 // KYTY_PM4_BARRIERS=guest (live, default off; the GT7 fork's barriers:guest, usa-ratt
 // a67c978c5/31b711db6): the guest's own synchronization orders the GPU work. A full barrier at
 // its ACQUIRE_MEMs, passed WAIT_REG_MEMs and the start of each queue's slice (another queue's
@@ -336,6 +343,11 @@ public:
 	// Whether anything is pending, and whether queued upload copies are (RequestUploadCopy).
 	[[nodiscard]] bool HasPendingBarriers() const noexcept { return !m_pending.Empty(); }
 	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending.uploads.empty(); }
+	// KYTY_DISPATCH_OVERLAP_UPLOADS: set while a direct dispatch prepares its bindings
+	// (renderCompute.cpp); uploads queued then stay pending for the dispatch's own flush while its
+	// overlap chain is open (KeepUploadsForDispatch), instead of being recorded at once.
+	void SetDispatchPrep(bool on) const noexcept { m_dispatch_prep = on; }
+	[[nodiscard]] bool KeepUploadsForDispatch() const;
 	// KYTY_DEPTH_FEEDBACK_KEEP: the draw being recorded left out an access-only barrier of its
 	// depth attachment that no access inside the active rendering instance needs. Unless the
 	// next BeginRendering() continues that instance, it queues `ordering` with the batch it
@@ -538,6 +550,11 @@ private:
 	// KYTY_DISPATCH_OVERLAP: NoteGuestDispatch() since anything else happened (TakeDispatchOverlap).
 	mutable bool m_overlap_open = false;
 	mutable bool m_overlap_lds  = false;
+	// KYTY_DISPATCH_OVERLAP_UPLOADS: the open chain already recorded an upload with the full
+	// pre-copy barrier; the next flush's uploads take the narrow one (m_upload_narrow).
+	mutable bool m_overlap_upload_fenced = false;
+	mutable bool m_upload_narrow         = false;
+	mutable bool m_dispatch_prep         = false;
 
 	// KYTY_CP_RECORDER: the scheduler's recorder and its encoder (null when off), and whether a
 	// direct window is open (the CP records natively after a drain; see Sink()).
@@ -1168,6 +1185,13 @@ private:
 	std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>> m_runtime_image_requests;
 	std::vector<std::array<uint32_t, 8>>       m_bindless_window;
 	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
+	// KYTY_BINDLESS_SYNC_INDEX: heap serials by 1 MiB guest bucket of their key span, how many of
+	// BindlessTable::Heaps() (append-only) are indexed, and scratch for the resized heaps.
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_bindless_heap_buckets;
+	size_t                                              m_bindless_heap_indexed = 0;
+	std::vector<uint32_t>                               m_bindless_heap_resized;
+	std::vector<uint32_t>                               m_bindless_heap_candidates;
+	std::vector<uint64_t>                               m_bindless_heap_marks;
 	std::vector<ImageId>                       m_bindless_changed;
 	std::vector<uint32_t>                      m_bindless_srt;
 

@@ -2604,6 +2604,9 @@ void RenderExecutor::SyncBindlessHeaps() {
 	SyncWrittenBindlessEntries();
 }
 
+// KYTY_BINDLESS_SYNC_INDEX (live, default off): see SyncWrittenBindlessEntries.
+static Live::Switch g_bindless_sync_index("KYTY_BINDLESS_SYNC_INDEX", Live::ParseDefaultOff);
+
 void RenderExecutor::SyncWrittenBindlessEntries() {
 	auto& table = m_context.GetBindlessTable();
 	KYTY_PROFILER_FUNCTION();
@@ -2611,7 +2614,80 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 	// again. Every entry in them is compared with the T# its key was settled from.
 	table.TakeWrittenRanges(m_bindless_written);
 	uint32_t view_changes = 0, resource_changes = 0, resettled = 0;
-	for (auto& heap: table.Heaps()) {
+	// KYTY_BINDLESS_SYNC_INDEX=1 (live, default 0; PPSA26344 preset): only the heaps whose key tables can
+	// reach a written range are compared, found through 1 MiB address buckets of the heaps' key
+	// spans (filled incrementally: new heaps, and heaps whose region was reallocated). Ghost of
+	// Yotei creates ~100k small heaps in 10 minutes (KYTY_BINDLESS_SMALL_HEAPS, never freed) and
+	// every sync walked all of them for every written range (CPU profile: ~24% of the command
+	// processor thread at the village). Same comparisons, same order per heap.
+	const bool sync_index = g_bindless_sync_index.Get() != 0;
+	auto& heaps = table.Heaps();
+	auto& candidates = m_bindless_heap_candidates;
+	candidates.clear();
+	const bool use_index = sync_index;
+	if (use_index) {
+		constexpr uint32_t BucketShift = 20u;
+		const auto add = [&](uint32_t serial) {
+			const auto& heap  = heaps[serial];
+			if (heap.record_pointer != UINT32_MAX || heap.runtime) {
+				return; // not compared here (see below)
+			}
+			const auto  begin = heap.base + heap.table_offset;
+			const auto  end   = begin + uint64_t {heap.entries} * std::max(heap.stride, 32u) + 32u;
+			for (uint64_t bucket = begin >> BucketShift; bucket <= (end - 1u) >> BucketShift; bucket++) {
+				m_bindless_heap_buckets[bucket].push_back(serial);
+			}
+		};
+		if (m_bindless_heap_indexed > heaps.size()) {
+			m_bindless_heap_buckets.clear();
+			m_bindless_heap_indexed = 0;
+		}
+		// A region (re)allocation may have widened an indexed heap's span: index it again over
+		// its new span (duplicate serials are removed below).
+		table.TakeResizedHeaps(m_bindless_heap_resized);
+		for (const auto serial: m_bindless_heap_resized) {
+			if (serial < m_bindless_heap_indexed) {
+				add(serial);
+			}
+		}
+		for (; m_bindless_heap_indexed < heaps.size(); m_bindless_heap_indexed++) {
+			add(static_cast<uint32_t>(m_bindless_heap_indexed));
+		}
+		// Each heap once, in table order (as the full walk visits them): a bit per heap.
+		auto& marks = m_bindless_heap_marks;
+		marks.assign((heaps.size() + 63u) / 64u, 0u);
+		auto& buckets = m_bindless_heap_resized; // reused as scratch: the bucket ids, each once
+		buckets.clear();
+		for (const auto& [begin, end]: m_bindless_written) {
+			if (end <= begin) {
+				continue;
+			}
+			for (uint64_t bucket = begin >> BucketShift; bucket <= (end - 1u) >> BucketShift; bucket++) {
+				buckets.push_back(static_cast<uint32_t>(bucket));
+			}
+		}
+		std::sort(buckets.begin(), buckets.end());
+		buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
+		for (const auto bucket: buckets) {
+			if (const auto found = m_bindless_heap_buckets.find(bucket); found != m_bindless_heap_buckets.end()) {
+				for (const auto serial: found->second) {
+					marks[serial >> 6u] |= uint64_t {1} << (serial & 63u);
+				}
+			}
+		}
+		for (size_t word = 0; word < marks.size(); word++) {
+			for (auto bits = marks[word]; bits != 0; bits &= bits - 1u) {
+				candidates.push_back(static_cast<uint32_t>(word * 64u + static_cast<size_t>(std::countr_zero(bits))));
+			}
+		}
+	} else {
+		table.TakeResizedHeaps(m_bindless_heap_resized);
+		m_bindless_heap_buckets.clear();
+		m_bindless_heap_indexed = 0;
+	}
+	const auto heap_count = use_index ? candidates.size() : heaps.size();
+	for (size_t heap_index = 0; heap_index < heap_count; heap_index++) {
+		auto& heap = heaps[use_index ? candidates[heap_index] : heap_index];
 		if (heap.record_pointer != UINT32_MAX || heap.runtime) {
 			continue; // compared key by key in RevalidateBindlessKeys (runtime heaps: never)
 		}

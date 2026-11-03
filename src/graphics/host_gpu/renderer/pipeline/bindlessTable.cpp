@@ -564,6 +564,7 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 		// feedback flags; frames in flight read only those.
 		m_next_region = old_region + capacity;
 		heap.entries  = capacity;
+		m_resized_heaps.push_back(heap.serial);
 		heap.slots.resize(capacity, 0u);
 		heap.settled.resize(capacity, 0u);
 		heap.descriptors.resize(capacity);
@@ -594,6 +595,7 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	}
 	heap.region            = m_next_region;
 	heap.entries           = capacity;
+	m_resized_heaps.push_back(heap.serial);
 	m_next_region += capacity;
 	heap.slots.resize(capacity, 0u);
 	heap.settled.resize(capacity, 0u);
@@ -641,6 +643,7 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 		}
 	}
 	auto& heap         = m_heaps.emplace_back();
+	heap.serial        = static_cast<uint32_t>(m_heaps.size() - 1u);
 	heap.base          = base;
 	heap.table_offset   = table_offset;
 	heap.stride         = stride;
@@ -1114,6 +1117,7 @@ BindlessTable::Heap* BindlessTable::RuntimeHeap(uint32_t binding,
 		return m_runtime_heaps[binding];
 	}
 	auto& heap          = m_heaps.emplace_back();
+	heap.serial         = static_cast<uint32_t>(m_heaps.size() - 1u);
 	heap.base           = 0;
 	heap.table_offset   = 0xfffffff0u + binding; // no guest heap matches it
 	heap.binding        = binding;

@@ -52,6 +52,8 @@ struct BindlessHeap {
 	uint32_t nested_keys    = 0;
 	uint32_t binding      = 0;
 	uint32_t region       = 0;
+	// Position in BindlessTable::Heaps() (append-only), for KYTY_BINDLESS_SYNC_INDEX.
+	uint32_t serial       = 0;
 	// Keys the region holds. The guest appends textures to a heap as it streams them in and
 	// its descriptor grows; each draw patches its own descriptor's entry count.
 	uint32_t entries = 0;
@@ -154,6 +156,12 @@ public:
 	                                     uint32_t nested_vsharp = UINT32_MAX, uint32_t nested_heap = 0,
 	                                     uint32_t nested_keys = 0);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
+	// KYTY_BINDLESS_SYNC_INDEX: the serials of heaps whose region was (re)allocated since the last
+	// call (their key span may have grown), moved out.
+	void TakeResizedHeaps(std::vector<uint32_t>& out) {
+		out.clear();
+		out.swap(m_resized_heaps);
+	}
 	// 0 when the array is full. A released slot is reused once the GPU has finished the work
 	// recorded before its release.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
@@ -295,6 +303,7 @@ private:
 	std::atomic<uint64_t> m_watch_generation {1};
 	uint64_t              m_unregistered_keys = 0;
 	std::deque<Heap>      m_heaps;
+	std::vector<uint32_t> m_resized_heaps; // TakeResizedHeaps()
 	// FindOrCreateHeap's heaps by guest base (KYTY_BINDLESS_SMALL_HEAPS: Ghost of Yotei creates
 	// tens of thousands; a linear search per draw was the old lookup).
 	std::unordered_map<uint64_t, std::vector<Heap*>> m_heaps_by_base;
