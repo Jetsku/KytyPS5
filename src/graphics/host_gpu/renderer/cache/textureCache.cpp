@@ -7352,7 +7352,7 @@ void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_
 	}
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic_bool> done) {
 	KYTY_GPU_OP_SITE("texcache.download");
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -7413,18 +7413,24 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	const auto pending = m_writeback_guard ? BeginPendingWriteback(range) : nullptr;
 	if (oversized != nullptr) {
 		m_scheduler.DeferPriorityOperation(
-		    [this, owner = std::move(oversized), range, mapped, publication, pending]() mutable {
+		    [this, owner = std::move(oversized), range, mapped, publication, pending, done]() mutable {
 			    owner->Invalidate(0, range.size);
 			    WriteBackImageBytes(range, mapped, pending);
 			    m_buffer_cache.EndBackingPublication(publication);
 			    owner.reset();
+			    if (done != nullptr) {
+				    done->store(true, std::memory_order_release);
+			    }
 		    });
 		return true;
 	}
-	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication, pending] {
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication, pending, done] {
 		download.Invalidate(offset, range.size);
 		WriteBackImageBytes(range, mapped, pending);
 		m_buffer_cache.EndBackingPublication(publication);
+		if (done != nullptr) {
+			done->store(true, std::memory_order_release);
+		}
 	});
 	return true;
 }
@@ -8161,6 +8167,212 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+// KYTY_VRAM_GC_FIX=1 (live, default off; adapted from Erlou93/KytyPS5-Yotei's collector of the same
+// name): with KYTY_VRAM_GC_BUDGET, when freeing clean images (RetireUnusedImages) does not bring the
+// usage back to the trigger, GPU-written colour images unused for the same age are downloaded into
+// guest memory (the tiler writes tiled images back) and freed at a later collection, once the
+// write-back has published the bytes and only when the image was neither written (content serial)
+// nor used (frame) since: a later use re-creates it from those bytes, as for any image that left the
+// cache. Without it, GPU-written images stay however long they go unused (IdleRetirable). Never a
+// depth/stencil image (HTILE and stencil planes are not in the bytes a download writes back), a
+// stencil association, a multisampled, sparse, bound, target, presentation or bindless-pinned image,
+// or one whose download would not be exact (SafeToDownload: CPU-dirty, buffer-modified, partly
+// resident or with GPU-dirty buffer bytes in its range). At most 128 MiB of downloads are recorded
+// per frame (256 MiB above the critical mark).
+// KYTY_VRAM_GC_FIX_VERIFY=1 (live, diagnostic, stalls the GPU thread): before each free, an image is
+// rebuilt from the published guest bytes and its native texels are compared with the original's; a
+// mismatch keeps the image (logged, counted). KYTY_VRAM_GC_FIX_LOG=<frames> (default 600, 0 = off):
+// a stats line while the switch is on.
+static Live::Switch g_vram_gc_fix("KYTY_VRAM_GC_FIX", Live::ParseDefaultOff);
+static Live::Switch g_vram_gc_fix_verify("KYTY_VRAM_GC_FIX_VERIFY", Live::ParseDefaultOff);
+
+uint64_t TextureCache::LimitTickForAge(uint64_t frame, uint64_t min_age) const {
+	if (frame <= min_age) {
+		return 0;
+	}
+	const auto limit_frame = frame - min_age;
+	const auto newer       = std::upper_bound(m_frame_ticks.begin(), m_frame_ticks.end(), limit_frame,
+	                                          [](uint64_t value, const auto& entry) { return value < entry.first; });
+	return newer == m_frame_ticks.begin() ? 0 : std::prev(newer)->second;
+}
+
+bool TextureCache::GcFixEligible(const Image& image, uint64_t frame, uint64_t min_age) {
+	if (!image.registered || !image.IsGpuModified() || image.depth_id || image.info.IsDepth() ||
+	    image.info.HasStencil() || image.usage.video_out || image.usage.depth_target ||
+	    image.bindless_pinned || image.binding.is_bound || image.binding.is_target || image.info.samples != 1 ||
+	    image.backing.samples != 1 || image.backing.image == nullptr || image.backing.sparse ||
+	    frame - std::min(frame, image.frame_accessed_last) <= min_age) {
+		return false;
+	}
+	return SafeToDownload(image) && BuildDownload(image).valid;
+}
+
+uint64_t TextureCache::CollectGpuWrittenImages(uint64_t frame, uint64_t min_age, uint64_t enough, bool critical) {
+	const auto limit_tick = LimitTickForAge(frame, min_age);
+	if (limit_tick == 0 || enough == 0) {
+		return 0;
+	}
+	const uint64_t       max_download = critical ? (256ull << 20u) : (128ull << 20u);
+	uint64_t             planned      = 0;
+	size_t               scanned      = 0;
+	std::vector<ImageId> downloads;
+	m_lru_cache.ForEachItemBelow(limit_tick, [&](ImageId id) {
+		if (++scanned > 16384 || planned >= enough) {
+			return true;
+		}
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || m_gc_fix_pending_ids.contains(id.index) || !GcFixEligible(*image, frame, min_age)) {
+			return false;
+		}
+		const auto bytes = image->AccountedSize();
+		if (planned + bytes > max_download && !downloads.empty()) {
+			m_gc_fix_stats.skip_budget++;
+			return false;
+		}
+		planned += bytes;
+		downloads.push_back(id);
+		return false;
+	});
+	for (const auto id: downloads) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			continue;
+		}
+		auto done = std::make_shared<std::atomic_bool>(false);
+		if (!DownloadImageMemory(id, done)) {
+			m_gc_fix_stats.failed++;
+			continue;
+		}
+		image            = &m_slot_images[id];
+		const auto bytes = image->AccountedSize();
+		m_gc_fix_pending.push_back({id, image->ContentSerial(), frame, bytes, std::move(done)});
+		m_gc_fix_pending_ids.insert(id.index);
+		m_gc_fix_stats.downloads++;
+		m_gc_fix_stats.download_bytes += bytes;
+	}
+	return planned;
+}
+
+void TextureCache::FinishGcFixEvictions(uint64_t frame) {
+	size_t kept = 0;
+	for (size_t i = 0; i < m_gc_fix_pending.size(); i++) {
+		auto& pending = m_gc_fix_pending[i];
+		auto* image   = m_slot_images.try_get(pending.id);
+		if (image != nullptr && image->registered && !pending.done->load(std::memory_order_acquire)) {
+			if (kept != i) {
+				m_gc_fix_pending[kept] = std::move(pending);
+			}
+			kept++;
+			continue;
+		}
+		m_gc_fix_pending_ids.erase(pending.id.index);
+		if (image == nullptr || !image->registered) {
+			continue; // freed meanwhile (unmap, overlap)
+		}
+		// Written or used since the download was recorded: it stays (guest memory holds an older copy,
+		// as after any download). Also when the switch went off meanwhile.
+		if (!g_vram_gc_fix.On() || image->ContentSerial() != pending.serial || !image->IsGpuModified() ||
+		    image->frame_accessed_last > pending.frame || image->bindless_pinned || image->binding.is_bound ||
+		    image->binding.is_target || !SafeToDownload(*image)) {
+			m_gc_fix_stats.cancelled++;
+			continue;
+		}
+		if (g_vram_gc_fix_verify.On()) {
+			const int verdict = VerifyGcFixRoundTrip(pending.id);
+			if (verdict < 0) {
+				m_gc_fix_stats.verify_skipped++;
+			} else if (verdict == 0) {
+				m_gc_fix_stats.verify_mismatch++;
+				continue; // kept: its bytes do not come back exactly
+			} else {
+				m_gc_fix_stats.verify_exact++;
+			}
+			image = m_slot_images.try_get(pending.id);
+			if (image == nullptr || !image->registered) {
+				continue;
+			}
+		}
+		m_gc_fix_stats.freed++;
+		m_gc_fix_stats.freed_bytes += image->AccountedSize();
+		FreeImage(pending.id, HangTrace::ImageFreeReason::GarbageCollect);
+	}
+	m_gc_fix_pending.resize(kept);
+	static const uint64_t log_frames = [] {
+		const char* value = std::getenv("KYTY_VRAM_GC_FIX_LOG");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 600ull;
+	}();
+	if (log_frames != 0 && g_vram_gc_fix.On() && frame >= m_gc_fix_log_frame + log_frames) {
+		m_gc_fix_log_frame = frame;
+		const auto& s      = m_gc_fix_stats;
+		LOGF("VramGcFix: frame=%" PRIu64 " downloads=%" PRIu64 " (%" PRIu64 " MiB) freed=%" PRIu64 " (%" PRIu64
+		     " MiB) cancelled=%" PRIu64 " failed=%" PRIu64 " over_frame_budget=%" PRIu64
+		     " pending=%zu verify exact=%" PRIu64 " mismatch=%" PRIu64 " unchecked=%" PRIu64 " usage=%" PRIu64 " MiB\n",
+		     frame, s.downloads, s.download_bytes >> 20u, s.freed, s.freed_bytes >> 20u, s.cancelled, s.failed,
+		     s.skip_budget, m_gc_fix_pending.size(), s.verify_exact, s.verify_mismatch, s.verify_skipped,
+		     m_total_used_memory >> 20u);
+	}
+}
+
+int TextureCache::VerifyGcFixRoundTrip(ImageId id) {
+	const auto transfer = BuildDownload(m_slot_images[id]);
+	const auto info     = m_slot_images[id].info;
+	const auto usage    = m_slot_images[id].usage;
+	const auto range    = info.data;
+	if (!transfer.valid || transfer.depth_target || range.Empty()) {
+		return -1;
+	}
+	// Native texels of both images, in the transfer's linear layout (before tiling and colour
+	// transforms): the original, and an image rebuilt from the guest bytes the download published.
+	const uint64_t linear_size = transfer.texture.tiles.empty() ? range.size : transfer.texture.LinearSize();
+	if (linear_size == 0) {
+		return -1;
+	}
+	auto upload = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0, AllFlags, range.size);
+	if (!LibKernel::Memory::TryReadBacking(range.address, upload->Mapped().data(), range.size)) {
+		return -1;
+	}
+	upload->Flush(0, range.size);
+	const auto copy = m_slot_images.insert(m_graphics, m_scheduler, info, 0u);
+	m_slot_images[copy].usage = usage;
+	UploadImage(m_slot_images[copy], *upload, 0);
+	auto a = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, linear_size);
+	auto b = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, linear_size);
+	std::memset(a->Mapped().data(), 0, linear_size);
+	std::memset(b->Mapped().data(), 0, linear_size);
+	a->Flush(0, linear_size);
+	b->Flush(0, linear_size);
+	m_scheduler.EndRendering();
+	m_slot_images[id].Download(transfer.texture.regions, a->Handle(), 0, linear_size);
+	m_slot_images[copy].Download(transfer.texture.regions, b->Handle(), 0, linear_size);
+	m_scheduler.FlushAndWait();
+	a->Invalidate(0, linear_size);
+	b->Invalidate(0, linear_size);
+	const auto* pa     = a->Mapped().data();
+	const auto* pb     = b->Mapped().data();
+	uint64_t    first  = UINT64_MAX;
+	uint64_t    differ = 0;
+	for (uint64_t i = 0; i < linear_size; i++) {
+		if (pa[i] != pb[i]) {
+			first = std::min(first, i);
+			differ++;
+		}
+	}
+	ReleaseUnregisteredImage(copy);
+	// The GPU is done with the buffers (FlushAndWait), but they are released like the download path's.
+	m_scheduler.DeferOperation([up = std::shared_ptr<Buffer>(std::move(upload)), da = std::shared_ptr<Buffer>(std::move(a)),
+	                            db = std::shared_ptr<Buffer>(std::move(b))] {});
+	static std::atomic<uint32_t> reports {0};
+	if (differ != 0 && reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("VramGcFix verify: MISMATCH image 0x%" PRIx64 "+0x%" PRIx64 " %ux%ux%u levels=%u layers=%u vkfmt=%d "
+		     "guest_fmt=%u tile=%u tiled=%d: %" PRIu64 " of %" PRIu64 " linear bytes differ, first at %" PRIu64 "\n",
+		     range.address, range.size, info.extent.width, info.extent.height, info.extent.depth,
+		     info.resources.levels, info.resources.layers, static_cast<int>(info.pixel_format),
+		     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+		     transfer.texture.tiles.empty() ? 0 : 1, differ, linear_size, first);
+	}
+	return differ == 0 ? 1 : 0;
+}
+
 bool TextureCache::IdleRetirable(const Image& image, uint64_t frame, uint64_t min_age) const {
 	// What the submission-age collector frees without a download: clean of GPU writes (the guest
 	// bytes or the buffer cache hold the contents, a later use recreates and refreshes it), and
@@ -8193,8 +8405,14 @@ bool TextureCache::RunBudgetGarbageCollector(uint64_t frame) {
 		return true;
 	}
 	const auto before  = m_idle_freed;
-	m_budget_freed_bytes += RetireUnusedImages(frame, plan.age_frames, 256, plan.bytes);
+	const auto freed   = RetireUnusedImages(frame, plan.age_frames, 256, plan.bytes);
+	m_budget_freed_bytes += freed;
 	m_budget_freed += m_idle_freed - before;
+	// KYTY_VRAM_GC_FIX: the rest from GPU-written colour images (downloaded now, freed later).
+	if (freed < plan.bytes && g_vram_gc_fix.On()) {
+		(void)CollectGpuWrittenImages(frame, plan.age_frames, plan.bytes - freed,
+		                              m_total_used_memory >= VramBudget::Critical(budget));
+	}
 	return true;
 }
 
@@ -8346,6 +8564,9 @@ void TextureCache::RunGarbageCollector() {
 	}
 	const auto frame = m_frame.load(std::memory_order_relaxed);
 	FreeGuestDroppedImages(frame);
+	if (!m_gc_fix_pending.empty() || g_vram_gc_fix.On()) {
+		FinishGcFixEvictions(frame);
+	}
 	// Always (one entry per frame): KYTY_VRAM_GC_BUDGET is a live switch and needs recent frames.
 	NoteFrameTick(frame, tick);
 	if (m_idle_frames != 0 && frame >= m_idle_next_frame) {
