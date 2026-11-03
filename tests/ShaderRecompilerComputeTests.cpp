@@ -604,6 +604,12 @@ struct TextureCacheTestAccess {
     cache.TrackImageDownload(id, cache.m_slot_images[id]);
   }
 
+  static void SetDepthGrowRecreate(TextureCache &cache, bool enabled) {
+    cache.m_depth_grow_recreate = enabled;
+  }
+  static bool IsDepthGrowth(const ImageInfo &requested, const ImageInfo &cached) {
+    return TextureCache::IsDepthGrowth(requested, cached);
+  }
   static void AssociateStencil(TextureCache &cache, ImageId depth,
                                GuestRange stencil) {
     std::lock_guard lock(cache.m_lock);
@@ -16057,6 +16063,247 @@ public:
                 direct_offset, allocation_size) == 0,
             "cache direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_DEPTH_GROW_RECREATE (upstream PR #2082): GT7 binds one depth-target address with a fixed
+  // pitch and a growing extent (143x204 -> 173x220 -> 189x220). A wider request matched the
+  // cached image by pitch and height and kept the smaller attachment (draws past its edge lost the
+  // device); a taller one never reached the depth overlap rule. With the switch the target gets a
+  // larger image: the GPU-written depth and stencil of the old image over its extent, guest bytes
+  // in the texels it never had.
+  uint32_t ReadAspectTexel(const char *name, RenderContext &context, ImageId id,
+                           vk::ImageAspectFlagBits aspect, vk::Offset3D offset) {
+    auto &scheduler = context.GetCommandScheduler();
+    auto &image = context.GetTextureCache().GetImage(id);
+    auto probe = CreateHostBuffer(name, sizeof(u32),
+                                  vk::BufferUsageFlagBits::eTransferDst, {0});
+    scheduler.Current().EndRendering();
+    image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                  vk::AccessFlagBits2::eTransferRead, {},
+                  scheduler.Current().Handle());
+    vk::BufferImageCopy copy{};
+    copy.imageSubresource = {aspect, 0, 0, 1};
+    copy.imageOffset = offset;
+    copy.imageExtent = vk::Extent3D{1, 1, 1};
+    scheduler.Current().Handle().copyImageToBuffer(
+        image.backing.image, vk::ImageLayout::eTransferSrcOptimal, probe.buffer,
+        1, &copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = probe.buffer;
+    barrier.size = probe.size;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+        {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    const auto result = ReadBuffer(name, probe, 1);
+    DestroyBuffer(&probe);
+    return aspect == vk::ImageAspectFlagBits::eStencil ? result[0] & 0xffu
+                                                       : result[0];
+  }
+
+  void CheckDepthTargetGrowth() {
+    constexpr const char *name = "DepthTargetGrowth";
+    constexpr uintptr_t base = 0x0000000204000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t stencil_offset = 0x100000;
+    constexpr uint64_t off_offset = 0x40000; // second target, switch off
+    constexpr uint32_t pitch = 64;
+    constexpr uint32_t max_height = 24;
+    constexpr uint32_t cleared_depth = 0x3f400000u; // 0.75f
+    constexpr uint32_t cleared_stencil = 0x3cu;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "depth-growth direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "depth-growth fixed mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    // Guest depth: a distinct exact value in [0, 1) per texel; guest stencil: a distinct byte.
+    const auto guest_depth = [](uint32_t x, uint32_t y) {
+      const float value = static_cast<float>(y * pitch + x) / 4096.0f;
+      uint32_t bits = 0;
+      std::memcpy(&bits, &value, sizeof(bits));
+      return bits;
+    };
+    const auto guest_stencil = [](uint32_t x, uint32_t y) {
+      return (0x80u + x * 3u + y * 5u) & 0xffu;
+    };
+    for (const uint64_t offset : {uint64_t{0}, off_offset}) {
+      for (uint32_t y = 0; y < max_height; y++) {
+        for (uint32_t x = 0; x < pitch; x++) {
+          const uint32_t depth = guest_depth(x, y);
+          std::memcpy(memory + offset + (y * pitch + x) * 4u, &depth, 4);
+          memory[stencil_offset + offset + y * pitch + x] =
+              static_cast<uint8_t>(guest_stencil(x, y));
+        }
+      }
+    }
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    {
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      const auto make_desc = [&](uint64_t offset, uint32_t width, uint32_t height) {
+        const uint64_t size = uint64_t{pitch} * height * 4u;
+        auto desc = MakeLinearDesc(base + offset, size, vk::Format::eD32SfloatS8Uint,
+                                   Prospero::BufferFormat::k32Float,
+                                   Prospero::ImageType::kColor2D, {width, height, 1},
+                                   1, 4, 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.pitch = pitch;
+        desc.info.stencil = {base + stencil_offset + offset, uint64_t{pitch} * height};
+        desc.info.mip_layout[0] = {0, size, pitch, height};
+        desc.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      const auto bind = [&](TextureCache::ImageDesc &desc) {
+        const auto id = cache.FindImage(desc);
+        (void)cache.FindDepthTarget(id, desc);
+        return id;
+      };
+      const auto depth_at = [&](ImageId id, int32_t x, int32_t y) {
+        return ReadAspectTexel(name, context, id, vk::ImageAspectFlagBits::eDepth,
+                               {x, y, 0});
+      };
+      const auto stencil_at = [&](ImageId id, int32_t x, int32_t y) {
+        return ReadAspectTexel(name, context, id, vk::ImageAspectFlagBits::eStencil,
+                               {x, y, 0});
+      };
+
+      // Switch on: 40x16 -> 56x16 (wider, same pitch and height) -> 56x24 (taller).
+      TextureCacheTestAccess::SetDepthGrowRecreate(cache, true);
+      auto first = make_desc(0, 40, 16);
+      const auto first_id = bind(first);
+      Require(name, "guest upload",
+              depth_at(first_id, 39, 15) == guest_depth(39, 15) &&
+                  stencil_at(first_id, 39, 15) == guest_stencil(39, 15),
+              "the first depth target did not take its guest depth and stencil");
+      vk::ClearValue clear{};
+      clear.depthStencil = vk::ClearDepthStencilValue{0.75f, cleared_stencil};
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), first_id,
+          {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+          clear);
+      cache.MarkGpuWritten(first_id);
+
+      auto wide = make_desc(0, 56, 16);
+      const auto wide_id = bind(wide);
+      Require(name, "wider target recreated",
+              wide_id != first_id &&
+                  !TextureCacheTestAccess::Contains(cache, first_id) &&
+                  cache.GetImage(wide_id).info.extent == vk::Extent3D(56, 16, 1) &&
+                  cache.GetImage(wide_id).backing.extent.width == 56,
+              "a wider depth target at the same address kept the smaller image");
+      Require(name, "wider target keeps GPU depth and stencil",
+              depth_at(wide_id, 0, 0) == cleared_depth &&
+                  depth_at(wide_id, 39, 15) == cleared_depth &&
+                  stencil_at(wide_id, 0, 0) == cleared_stencil &&
+                  stencil_at(wide_id, 39, 15) == cleared_stencil,
+              fmt::format("old texels lost their GPU contents: depth 0x{:08x} stencil 0x{:02x}",
+                          depth_at(wide_id, 39, 15), stencil_at(wide_id, 39, 15))
+                  .c_str());
+      Require(name, "wider target exposes guest texels",
+              depth_at(wide_id, 40, 0) == guest_depth(40, 0) &&
+                  depth_at(wide_id, 55, 15) == guest_depth(55, 15) &&
+                  stencil_at(wide_id, 40, 0) == guest_stencil(40, 0) &&
+                  stencil_at(wide_id, 55, 15) == guest_stencil(55, 15),
+              fmt::format("new texels are not the guest bytes: depth 0x{:08x} (0x{:08x}) "
+                          "stencil 0x{:02x} (0x{:02x})",
+                          depth_at(wide_id, 55, 15), guest_depth(55, 15),
+                          stencil_at(wide_id, 55, 15), guest_stencil(55, 15))
+                  .c_str());
+      Require(name, "wider target GPU ownership",
+              cache.GetImage(wide_id).IsGpuModified(),
+              "the grown image does not own the copied GPU contents");
+
+      auto tall = make_desc(0, 56, 24);
+      const auto tall_id = bind(tall);
+      Require(name, "taller target recreated",
+              tall_id != wide_id && !TextureCacheTestAccess::Contains(cache, wide_id) &&
+                  cache.GetImage(tall_id).info.extent == vk::Extent3D(56, 24, 1),
+              "a taller depth target at the same address was not given a larger image");
+      Require(name, "taller target contents",
+              depth_at(tall_id, 39, 15) == cleared_depth &&
+                  stencil_at(tall_id, 39, 15) == cleared_stencil &&
+                  depth_at(tall_id, 55, 15) == guest_depth(55, 15) &&
+                  stencil_at(tall_id, 55, 15) == guest_stencil(55, 15) &&
+                  depth_at(tall_id, 0, 16) == guest_depth(0, 16) &&
+                  depth_at(tall_id, 55, 23) == guest_depth(55, 23) &&
+                  stencil_at(tall_id, 0, 16) == guest_stencil(0, 16) &&
+                  stencil_at(tall_id, 55, 23) == guest_stencil(55, 23),
+              "the taller image lost copied texels or did not take guest texels");
+      // Back to a narrower extent: the larger image serves it (no shrink).
+      auto narrow = make_desc(0, 48, 24);
+      const auto narrow_id = bind(narrow);
+      Require(name, "narrower target reuses the larger image", narrow_id == tall_id,
+              "a narrower request replaced the larger depth image");
+
+      // Switch off: the previous behaviour (the wider request keeps the smaller image).
+      TextureCacheTestAccess::SetDepthGrowRecreate(cache, false);
+      auto off_small = make_desc(off_offset, 40, 16);
+      const auto off_small_id = bind(off_small);
+      auto off_wide = make_desc(off_offset, 56, 16);
+      const auto off_wide_id = bind(off_wide);
+      Require(name, "switch off keeps the smaller image",
+              off_wide_id == off_small_id &&
+                  cache.GetImage(off_wide_id).info.extent.width == 40,
+              "with KYTY_DEPTH_GROW_RECREATE off the wider target changed images");
+
+      // The rule itself.
+      const auto rule = [&](const TextureCache::ImageDesc &requested,
+                            const TextureCache::ImageDesc &cached) {
+        return TextureCacheTestAccess::IsDepthGrowth(requested.info, cached.info);
+      };
+      auto other_pitch = make_desc(0, 56, 16);
+      other_pitch.info.pitch = 128;
+      auto layered = make_desc(0, 56, 16);
+      layered.info.resources.layers = 2;
+      auto layered_small = make_desc(0, 40, 16);
+      layered_small.info.resources.layers = 2;
+      auto no_stencil = make_desc(0, 56, 16);
+      no_stencil.info.stencil = {};
+      auto color = make_desc(0, 56, 16);
+      color.info.pixel_format = vk::Format::eR32Sfloat;
+      Require(name, "growth rule",
+              rule(wide, first) && rule(tall, wide) && rule(tall, first) &&
+                  !rule(first, wide) && !rule(wide, wide) && !rule(other_pitch, first) &&
+                  !rule(layered, layered_small) && !rule(no_stencil, first) &&
+                  !rule(color, first),
+              "the depth growth rule accepted a different layout or a non-growth");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "depth-growth fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "depth-growth direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBgra16Readback() {
@@ -61637,6 +61884,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-grow-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthTargetGrowth();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-exact-lookup-only") == 0) {

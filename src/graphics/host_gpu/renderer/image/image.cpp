@@ -606,7 +606,13 @@ void Image::CopyDepthColorImage(Image& source) {
 	CopyImageRegions(source);
 }
 
-void Image::CopyImageRegions(Image& source) {
+void Image::CopyDepthStencilImage(Image& source) {
+	KYTY_GPU_OP_SITE("image.copy_depth_stencil");
+	EXIT_IF(source.backing.format != backing.format);
+	CopyImageRegions(source, true);
+}
+
+void Image::CopyImageRegions(Image& source, bool stencil) {
 	NoteContentWrite();
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
@@ -617,9 +623,11 @@ void Image::CopyImageRegions(Image& source) {
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
 	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? FullAspectMask(source.backing.format)
+	            : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? FullAspectMask(backing.format)
+	            : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {

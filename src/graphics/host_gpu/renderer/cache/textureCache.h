@@ -485,6 +485,14 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	// KYTY_DEPTH_GROW_RECREATE: a depth target bound at the address of a cached one with the same
+	// layout but a larger width and/or height (a dynamic-resolution target that grows inside a fixed
+	// pitch). The pitch/height comparison of ResolveOverlap never recreates it, so draws covered the
+	// larger extent of a smaller attachment (GT7 License Center, upstream PR #2082).
+	[[nodiscard]] static bool   IsDepthGrowth(const ImageInfo& requested, const ImageInfo& cached);
+	// Caller holds m_lock. A new image of the requested size: guest bytes everywhere, then the
+	// cached image's native depth and stencil over its own extent; the cached image is freed.
+	[[nodiscard]] ImageId       GrowDepthTarget(const ImageInfo& requested, ImageId cached);
 	// KYTY_VIEW_PLACEMENT: where a binding the overlap loop found inside `result` lies in it
 	// (loop_own: the loop's last overlap placed the binding itself there, at view_mip/view_layer);
 	// clears `result` when it has no place there its view fits in (it gets an image of its own).
@@ -844,6 +852,8 @@ private:
 	bool m_partial_gpu_write_verify       = false;
 	bool m_partial_gpu_write_stencil_keep = false;
 	bool m_stencil_draw_suppressed        = false;
+	// KYTY_DEPTH_GROW_RECREATE=1 (GrowDepthTarget).
+	bool m_depth_grow_recreate = false;
 	bool m_bind_mark                      = false; // a binding's mark right before its refresh
 	struct PartialGpuWriteTotals {
 		uint64_t refreshes       = 0; // refreshes of buffer-modified images

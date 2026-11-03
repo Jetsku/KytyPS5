@@ -462,6 +462,12 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		            AliasBytesEnabled() ? "" : " (colour/depth images need KYTY_ALIAS_BYTES: stencil records only)");
 		std::fflush(stdout);
 	}
+	if (const auto* grow = std::getenv("KYTY_DEPTH_GROW_RECREATE"); grow != nullptr && grow[0] == '1') {
+		m_depth_grow_recreate = true;
+		std::printf("Depth grow recreate (KYTY_DEPTH_GROW_RECREATE=1): a depth target that grows inside "
+		            "its pitch gets a larger image (old depth/stencil copied, the rest from guest memory)\n");
+		std::fflush(stdout);
+	}
 	m_gpu_write_skip  = EnvNotZero("KYTY_GPU_WRITE_IMAGE_SKIP");
 	if (m_gpu_write_skip) {
 		const auto* verify = std::getenv("KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY");
@@ -3293,6 +3299,105 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	return replacement_id;
 }
 
+bool TextureCache::IsDepthGrowth(const ImageInfo& requested, const ImageInfo& cached) {
+	// Same guest layout apart from the extent: with an equal pitch every texel of the smaller
+	// image keeps its address in the larger one. One level and one layer only (a taller target
+	// moves the start of every further slice).
+	if (!requested.IsDepth() || !cached.IsDepth() ||
+	    requested.data.address != cached.data.address || requested.data.size < cached.data.size ||
+	    requested.pixel_format != cached.pixel_format ||
+	    requested.guest_format != cached.guest_format ||
+	    requested.bytes_per_block != cached.bytes_per_block || requested.samples != 1 ||
+	    cached.samples != 1 || requested.HasStencil() != cached.HasStencil() ||
+	    requested.tile_mode != cached.tile_mode || requested.type != cached.type ||
+	    requested.IsVolume() || requested.pitch != cached.pitch ||
+	    requested.resources != cached.resources || requested.resources.levels != 1 ||
+	    requested.resources.layers != 1 || requested.extent.depth != cached.extent.depth ||
+	    requested.GetColorTransform() != cached.GetColorTransform()) {
+		return false;
+	}
+	return requested.extent.width >= cached.extent.width &&
+	       requested.extent.height >= cached.extent.height &&
+	       (requested.extent.width > cached.extent.width ||
+	        requested.extent.height > cached.extent.height);
+}
+
+ImageId TextureCache::GrowDepthTarget(const ImageInfo& requested, ImageId cached_id) {
+	// The cached image's native depth and stencil must be current before they are copied: CPU
+	// writes to its depth or stencil bytes reach it first.
+	RefreshCopySource(cached_id);
+	bool stencil_gpu = false;
+	for (const auto record: std::vector<ImageId>(m_slot_images[cached_id].stencil_ids)) {
+		if (const auto* plane = m_slot_images.try_get(record); plane != nullptr && plane->registered) {
+			RefreshImage(record);
+			stencil_gpu |= m_slot_images[record].IsGpuModified();
+		}
+	}
+	auto info                = requested;
+	info.htile_initial_clear = false;
+	const auto grown_id      = InsertImage(info);
+	{
+		auto& cached = m_slot_images[cached_id];
+		auto& grown  = m_slot_images[grown_id];
+		grown.usage  = cached.usage;
+		if (cached.binding.is_bound || cached.binding.is_target) {
+			cached.binding.needs_rebind = true;
+			NoteImageStateChange();
+		}
+		// As FindImage does for a new image: bytes the GPU wrote to buffers or other images
+		// own come from there.
+		if (m_buffer_cache.HasGpuDirtyBytes(grown.live.address, grown.live.size) ||
+		    (AliasBytesEnabled() && OtherImagesOwnBytes(grown.live, grown_id))) {
+			grown.MarkBufferModified();
+		}
+	}
+	// Guest bytes over the whole image (the texels the cached image never had included).
+	InitializeImage(grown_id, RefreshIntent::Read);
+	ImageId record_id {};
+	if (requested.HasStencil() && requested.stencil.Valid()) {
+		// The stencil plane's guest bytes go into the new stencil aspect now, before the copy below
+		// (a record made later by FindDepthTarget would upload them over the copied stencil).
+		auto& grown                = m_slot_images[grown_id];
+		grown.stencil_subresources = {0, requested.resources.levels, 0, requested.resources.layers};
+		grown.info.stencil         = requested.stencil;
+		record_id                  = AssociateStencil(grown_id, requested.stencil);
+		RefreshImage(record_id, RefreshIntent::Read);
+	}
+	auto& cached = m_slot_images[cached_id];
+	auto& grown  = m_slot_images[grown_id];
+	TrackImage(grown_id);
+	PrepareImageCopy(grown);
+	if (cached.backing.format == grown.backing.format) {
+		// Depth and stencil the GPU wrote, over the cached extent.
+		grown.CopyDepthStencilImage(cached);
+	} else {
+		grown.CopyImage(cached);
+	}
+	HangTrace::RecordTransfer(HangTrace::TransferKind::ImageCopy, "depth-grow", "depth-grow",
+	                          grown.info.data.address, static_cast<uint32_t>(grown.backing.format),
+	                          grown.info.extent.width, grown.info.extent.height,
+	                          grown.info.data.size, 0);
+	if (cached.IsGpuModified()) {
+		MarkImageGpuModified(grown);
+		TakeOverOwnedBytes(grown, cached);
+	}
+	grown.ClearBufferModified();
+	if (record_id && stencil_gpu) {
+		// The copied stencil is newer than the stencil plane's guest bytes.
+		TrackImage(record_id);
+		CommitGpuWrite(m_slot_images[record_id]);
+	}
+	if (static std::atomic<uint32_t> logged {0}; logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("TextureCache: depth target 0x%016" PRIx64 " grew %ux%u -> %ux%u (pitch %u%s%s)\n",
+		     requested.data.address, cached.info.extent.width, cached.info.extent.height,
+		     requested.extent.width, requested.extent.height, requested.pitch,
+		     cached.IsGpuModified() ? ", GPU depth copied" : "",
+		     stencil_gpu ? ", GPU stencil copied" : "");
+	}
+	FreeImage(cached_id, HangTrace::ImageFreeReason::DepthRecreate);
+	return grown_id;
+}
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -3307,6 +3412,26 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
 	    (!AliasAgeByFrames() || current_frame - std::min(current_frame, cached.frame_accessed_last) >
 	                                AliasFramesBeforeRemoval);
+
+	// KYTY_DEPTH_GROW_RECREATE: before the pitch/height comparison below, which takes a wider
+	// cached depth image as it is and never sees a taller one.
+	if (binding == BindingType::DepthTarget && IsDepthGrowth(requested, cached.info) &&
+	    cached.registered && !cached.depth_id && cached.backing.samples == 1) {
+		if (m_depth_grow_recreate) {
+			if (merged_id) {
+				// A larger image was already chosen for this binding: an older, smaller one at the
+				// same address must not replace it.
+				return {merged_id};
+			}
+			return {GrowDepthTarget(requested, cached_id)};
+		}
+		if (static std::atomic<uint32_t> logged {0}; logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth target 0x%016" PRIx64 " grows %ux%u -> %ux%u (pitch %u); "
+			     "KYTY_DEPTH_GROW_RECREATE is off, the smaller image is kept\n",
+			     requested.data.address, cached.info.extent.width, cached.info.extent.height,
+			     requested.extent.width, requested.extent.height, requested.pitch);
+		}
+	}
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
