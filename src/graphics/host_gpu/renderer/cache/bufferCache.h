@@ -798,6 +798,21 @@ public:
 	// Byte-exact, unlike a buffer's content revision (any write anywhere in the buffer).
 	void               WatchMetadata(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool MetadataUnwritten(uint64_t vaddr, uint64_t size);
+	// KYTY_CP_DECISION_MEMORY (graphicsRun.cpp): the same byte-exact watch, in its own set, for the
+	// guest bytes a command-processor write put on the GPU timeline (TryWriteDataGpu) with a value the
+	// command processor knows. CpValueUnwritten: the exact range is watched, unwritten since and not
+	// CPU-modified now, so the known value is still the bytes' value.
+	void               WatchCpValue(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool CpValueUnwritten(uint64_t vaddr, uint64_t size);
+	// KYTY_CP_WRITE_THROUGH=1 (live, default off; based on Erlou93/KytyPS5-Yotei's
+	// BufferCache::TryCpWriteThrough), GPU thread: a command-processor write (record-time label,
+	// WRITE_DATA) of [vaddr, vaddr + size) into a page the GPU modified, none of whose written bytes
+	// the GPU owns (not GPU-dirty, no pending publication or side readback, no GPU-modified image):
+	// written to the backing (no fault, no drain) and to the cached GPU copy at this point of the
+	// command stream, so both copies hold it and the page stays GPU-owned. False: the caller writes
+	// it as before.
+	[[nodiscard]] static bool CpWriteThroughEnabled();
+	[[nodiscard]] bool        TryCpWriteThrough(uint64_t vaddr, const void* data, uint64_t size);
 
 private:
 	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
@@ -809,6 +824,9 @@ private:
 	std::map<uint64_t, MetadataWatch> m_metadata_watches; // by first byte
 	uint64_t                          m_metadata_watch_span = 0;
 	std::atomic<size_t>               m_metadata_watch_count {0};
+	std::map<uint64_t, MetadataWatch> m_cp_value_watches; // m_metadata_watch_mutex
+	uint64_t                          m_cp_value_watch_span = 0;
+	std::atomic<size_t>               m_cp_value_watch_count {0};
 	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
 	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
 	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,

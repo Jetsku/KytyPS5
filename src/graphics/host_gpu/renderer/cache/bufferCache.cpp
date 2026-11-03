@@ -3379,7 +3379,9 @@ bool BufferCache::MetadataUnwritten(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::NoteMetadataWrite(uint64_t vaddr, uint64_t size) {
-	if (m_metadata_watch_count.load(std::memory_order_relaxed) == 0 || size == 0) {
+	if ((m_metadata_watch_count.load(std::memory_order_relaxed) == 0 &&
+	     m_cp_value_watch_count.load(std::memory_order_relaxed) == 0) ||
+	    size == 0) {
 		return;
 	}
 	const auto       end = vaddr + size < vaddr ? UINT64_MAX : vaddr + size;
@@ -3390,6 +3392,47 @@ void BufferCache::NoteMetadataWrite(uint64_t vaddr, uint64_t size) {
 			it->second.written = true;
 		}
 	}
+	for (auto it = m_cp_value_watches.lower_bound(vaddr >= m_cp_value_watch_span ? vaddr - m_cp_value_watch_span : 0);
+	     it != m_cp_value_watches.end() && it->first < end; ++it) {
+		if (it->second.end > vaddr) {
+			it->second.written = true;
+		}
+	}
+}
+
+void BufferCache::WatchCpValue(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	constexpr size_t MaxWatches = 1024;
+	std::scoped_lock lock(m_metadata_watch_mutex);
+	if (m_cp_value_watches.size() >= MaxWatches) {
+		m_cp_value_watches.clear();
+		m_cp_value_watch_span = 0;
+	}
+	// Older watches over the range go: this write is the bytes' newest value now.
+	for (auto it = m_cp_value_watches.lower_bound(vaddr >= m_cp_value_watch_span ? vaddr - m_cp_value_watch_span : 0);
+	     it != m_cp_value_watches.end() && it->first < vaddr + size;) {
+		if (it->second.end > vaddr && it->first != vaddr) {
+			it = m_cp_value_watches.erase(it);
+		} else {
+			++it;
+		}
+	}
+	m_cp_value_watches[vaddr] = {vaddr + size, false};
+	m_cp_value_watch_span     = std::max(m_cp_value_watch_span, size);
+	m_cp_value_watch_count.store(m_cp_value_watches.size(), std::memory_order_relaxed);
+}
+
+bool BufferCache::CpValueUnwritten(uint64_t vaddr, uint64_t size) {
+	{
+		std::scoped_lock lock(m_metadata_watch_mutex);
+		const auto       found = m_cp_value_watches.find(vaddr);
+		if (found == m_cp_value_watches.end() || found->second.end != vaddr + size || found->second.written) {
+			return false;
+		}
+	}
+	return !m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
 void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
@@ -3750,7 +3793,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
 	// An upload of CPU-dirty bytes over watched metadata changes it (MetadataUnwritten).
-	if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0 &&
+	if ((m_metadata_watch_count.load(std::memory_order_relaxed) != 0 ||
+	     m_cp_value_watch_count.load(std::memory_order_relaxed) != 0) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		NoteMetadataWrite(vaddr, size);
 	}
@@ -5279,6 +5323,73 @@ void BufferCache::FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>>
 		dst->Fill(dst_offset, size, value);
 		RecordKnownFill(vaddr, size, value);
 	}
+}
+
+// KYTY_CP_WRITE_THROUGH (live, default 0): each command-processor write decides on its own.
+static Live::Switch g_cp_write_through("KYTY_CP_WRITE_THROUGH", Live::ParseDefaultOff);
+
+bool BufferCache::CpWriteThroughEnabled() {
+	return g_cp_write_through.Get() != 0;
+}
+
+bool BufferCache::TryCpWriteThrough(uint64_t vaddr, const void* data, uint64_t size) {
+	if (vaddr == 0 || data == nullptr || size == 0 || (vaddr & 3u) != 0 || (size & 3u) != 0 || size > 65536 ||
+	    !GuestRange {vaddr, size}.Valid() || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// Only a write that would fault on a GPU-modified page; any other write stays a plain store.
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (HasGpuDirtyBytes(vaddr, size) || HasPendingBackingPublication(vaddr, size) ||
+	    OverlapsPendingSideReadback(vaddr, vaddr + size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	// The GPU copy: the buffer that owns the page must hold the whole range (or no buffer at all).
+	Buffer*    buffer = nullptr;
+	const auto first  = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const auto last   = m_page_table.Find((vaddr + size - 1) >> PageTable::kPageBits);
+	const bool owned_first = first != nullptr && *first;
+	const bool owned_last  = last != nullptr && *last;
+	if (owned_first || owned_last) {
+		if (!owned_first || !owned_last || *first != *last) {
+			return false;
+		}
+		buffer = &m_slot_buffers[*first];
+		if (!buffer->IsInBounds(vaddr, size)) {
+			return false;
+		}
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	if (buffer != nullptr) {
+		KYTY_GPU_OP_SITE("buffercache.cp_write_through");
+		const auto offset  = buffer->Offset(vaddr);
+		auto&      command = m_scheduler.Current();
+		command.EndRendering();
+		const auto              native = command.Handle();
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer->Handle();
+		before.offset              = offset;
+		before.size                = size;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+		                       nullptr, 1, &before, 0, nullptr);
+		native.updateBuffer(buffer->Handle(), offset, size, data);
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 0,
+		                       nullptr, 1, &after, 0, nullptr);
+	}
+	// A CPU-side image of these bytes (none GPU-modified, checked above) is stale now, as after the fault.
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	NoteMetadataWrite(vaddr, size);
+	return true;
 }
 
 bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size) {
