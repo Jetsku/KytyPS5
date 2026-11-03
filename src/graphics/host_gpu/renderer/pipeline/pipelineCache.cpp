@@ -6170,8 +6170,8 @@ struct PipelineCache::ComputePrewarm {
 };
 
 // KYTY_PIPELINE_LIST (default off): a KYPLST1 pipeline list (pipelineList.h) made from recorded runs,
-// for players who never ran the game: =1 reads PipelineLists/<title>.kyplst (next to the emulator, the
-// working directory), any other value is the file's path. The list must name this game's title and
+// for players who never ran the game: =1 reads PipelineLists/<title>_<version>.kyplst, else
+// PipelineLists/<title>.kyplst (next to the emulator, the working directory), any other value is the file's path. The list must name this game's title and
 // version (else it is ignored); each shader's code is read from the player's own executable at the
 // recorded offset (or found elsewhere in it by its hashes) and used only when its hashes match. The
 // matching shaders' permutations join the shader precompile replay, and the pipelines whose stages all
@@ -6827,9 +6827,18 @@ void PipelineCache::InitializePipelineList() {
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) return;
 	const auto begin = CompileClockNs();
-	const auto path  = unset || off || std::strcmp(setting, "1") == 0
-	                       ? std::filesystem::path("PipelineLists") / (title_id + ".kyplst")
-	                       : std::filesystem::path(setting);
+	std::string game_version;
+	(void)Loader::SystemContentParamSfoGetString("APP_VER", &game_version);
+	// The default file: PipelineLists/<title>_<version>.kyplst (one list per game version; adapted from
+	// Erlou93/KytyPS5-Yotei 9daeb9e), else PipelineLists/<title>.kyplst.
+	auto default_path = std::filesystem::path("PipelineLists") / (title_id + "_" + game_version + ".kyplst");
+	{
+		std::error_code versioned_error;
+		if (game_version.empty() || !std::filesystem::exists(default_path, versioned_error)) {
+			default_path = std::filesystem::path("PipelineLists") / (title_id + ".kyplst");
+		}
+	}
+	const auto path = unset || off || std::strcmp(setting, "1") == 0 ? default_path : std::filesystem::path(setting);
 	std::vector<uint8_t> bytes;
 	{
 		std::error_code exists_error;
@@ -6876,7 +6885,8 @@ void PipelineCache::InitializePipelineList() {
 		if (index != 0) {
 			auto& opened = data_files[index];
 			if (opened == nullptr && index <= file.files.size()) {
-				opened = std::make_unique<std::ifstream>(executable.parent_path() / file.files[index - 1], std::ios::binary);
+				opened = std::make_unique<std::ifstream>(executable.parent_path() / Common::PathFromUtf8(file.files[index - 1]),
+				                                          std::ios::binary);
 			}
 			if (opened == nullptr || !*opened) return false;
 			in = opened.get();
