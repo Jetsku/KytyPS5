@@ -170,36 +170,6 @@ static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS
     {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
 };
 
-// KYTY_ENTITLEMENT_GRANT: "all", or labels separated by ',' or ';'. Additional-content labels
-// the title asks for through GetAddcontEntitlementInfo that are not installed are reported as
-// installed unlock keys. Default off (not entitled, as before). Ghost of Yotei 02.002 checks one
-// of them as its base entitlement and otherwise stops at the loading screen.
-static bool EntitlementGranted(const std::string& label) {
-	static const std::string grant = [] {
-		const char* value = std::getenv("KYTY_ENTITLEMENT_GRANT");
-		return std::string(value != nullptr ? value : "");
-	}();
-	if (grant.empty() || grant == "0") {
-		return false;
-	}
-	if (grant == "all" || grant == "1") {
-		return true;
-	}
-	size_t start = 0;
-	while (start <= grant.size()) {
-		const auto end = grant.find_first_of(",;", start);
-		const auto len = (end == std::string::npos ? grant.size() : end) - start;
-		if (len == label.size() && grant.compare(start, len, label) == 0) {
-			return true;
-		}
-		if (end == std::string::npos) {
-			break;
-		}
-		start = end + 1;
-	}
-	return false;
-}
-
 static NpEntitlementAccessAddcontEntitlementInfo
 MakeAddcontInfo(const Loader::AddContentEntry& entry) {
 	NpEntitlementAccessAddcontEntitlementInfo info {};
@@ -489,7 +459,6 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 
 	const std::string label(entitlement_label->data,
 	                        strnlen(entitlement_label->data, sizeof(entitlement_label->data)));
-	const bool        granted = EntitlementGranted(label);
 	{
 		// Each label once: shows which entitlement a title checks before a "missing
 		// entitlement" message.
@@ -498,7 +467,10 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 		std::scoped_lock             lock(printed_mutex);
 		if (printed.size() < 256 && printed.insert(label).second) {
 			LOGF("NpEntitlementAccessGetAddcontEntitlementInfo: service_label=%u label='%s'%s\n",
-			     service_label, label.c_str(), granted ? " (granted by KYTY_ENTITLEMENT_GRANT)" : "");
+			     service_label, label.c_str(),
+			     Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data)) != nullptr
+			         ? " (installed)"
+			         : " (not installed)");
 		}
 	}
 
@@ -516,14 +488,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 		return 0;
 	}
 
-	if (granted) {
-		// An installed unlock key (no extra data, so the title has nothing to mount).
-		std::memcpy(info->entitlement_label.data, label.data(), label.size());
-		info->package_type    = 3; // PSAL
-		info->download_status = 4; // Installed.
-		return 0;
-	}
-
+	// Only add-on content installed in the title's add-on folder is entitled (AddContentFind above).
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
