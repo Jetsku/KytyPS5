@@ -3,7 +3,9 @@
 // Conditional DCC clear of one image layer (dispatched indirectly: zero groups when the metadata
 // slice was rejected). Writes the raw texel bits of the accepted clear value through an unsigned
 // integer view of the same texel size, then consumes the clear key (every metadata byte 0xFF),
-// matching TextureCache's CPU fallback ClearImage + FillBuffer(UINT32_MAX).
+// matching TextureCache's CPU fallback ClearImage + FillBuffer(UINT32_MAX). Bit 8 of texel_bytes
+// (KYTY_DCC_GPU_VIDEOOUT) keeps the keys: the video-out path clears the image and leaves the guest's
+// metadata as it is, as the CPU fallback does for a video-out binding.
 
 layout(local_size_x = 128) in;
 
@@ -26,13 +28,15 @@ layout(push_constant, std430) uniform Push {
 
 void main() {
 	uvec4 raw = decision.raw;
-	if (params.texel_bytes == 1u) {
+	uint texel_bytes = params.texel_bytes & 0xffu;
+	bool consume = (params.texel_bytes & 0x100u) == 0u;
+	if (texel_bytes == 1u) {
 		raw = uvec4(raw.x & 0xffu, 0u, 0u, 0u);
-	} else if (params.texel_bytes == 2u) {
+	} else if (texel_bytes == 2u) {
 		raw = uvec4(raw.x & 0xffffu, 0u, 0u, 0u);
-	} else if (params.texel_bytes == 4u) {
+	} else if (texel_bytes == 4u) {
 		raw = uvec4(raw.x, 0u, 0u, 0u);
-	} else if (params.texel_bytes == 8u) {
+	} else if (texel_bytes == 8u) {
 		raw = uvec4(raw.x, raw.y, 0u, 0u);
 	}
 	uint index = gl_GlobalInvocationID.x;
@@ -43,7 +47,7 @@ void main() {
 		if (index < pixels) {
 			imageStore(destination_image, ivec2(index % params.width, index / params.width), raw);
 		}
-		if (index < params.metadata_words) {
+		if (consume && index < params.metadata_words) {
 			metadata.words[params.metadata_base_words + index] = 0xffffffffu;
 		}
 		// Avoid wrap even for large images when the device limits require strided coverage.

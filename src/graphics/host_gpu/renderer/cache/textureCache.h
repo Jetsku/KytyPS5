@@ -492,11 +492,12 @@ private:
 	// The native inspection behind TryMaterializeGpuDccClear for any metadata whose uniform
 	// bytes select a clear value (values/decodable in DccClearHelper::ClearCodes order): clears
 	// the bound slices whose bytes all equal an accepted code and leaves those bytes 0xFF. cmask:
-	// CMASK bytes (only code 0x00), not counted as DCC work.
+	// CMASK bytes (only code 0x00), not counted as DCC work. consume=false (video-out bindings,
+	// KYTY_DCC_GPU_VIDEOOUT): the keys stay as they are, and no inspection is retained for reuse.
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuMetadataClear(
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-	    bool cmask);
+	    bool cmask, bool consume = true);
 	// KYTY_LIGHT_GRID_CAP: a light grid's staged upload bytes, repaired before the copy is recorded.
 	void RepairLightGridUpload(const Image& image, Buffer& source, uint64_t source_offset);
 	void                        InitializeImage(ImageId id,

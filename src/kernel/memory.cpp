@@ -4,6 +4,7 @@
 
 #include "common/assert.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/platform/uffdWriteWatch.h"
 #include "common/profiler.h"
@@ -28,6 +29,7 @@
 #include <atomic>
 #include <bit>
 #include <bitset>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -1567,11 +1569,120 @@ static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Re
 	return ReadFailure::None;
 }
 
+// KYTY_DRAW_PREP_BACKING_LOG=1 (default 0, diagnostics): the worker reads that failed because the
+// backing store holds no translation for the bytes, aggregated by owning guest range, read purpose
+// and calling host code, printed every 10 s by the thread that crosses the period.
+namespace {
+struct BackingFailEntry {
+	uint64_t    count      = 0;
+	uint64_t    min_size   = UINT64_MAX;
+	uint64_t    max_size   = 0;
+	uint64_t    sample     = 0;
+	uint64_t    range_start = 0;
+	uint64_t    range_size = 0;
+	uint64_t    dmem       = 0;
+	int         prot       = 0;
+	const char* type       = "none";
+	const char* purpose    = "";
+	uint64_t    caller     = 0;
+	bool        backing_head = false; // the first byte has a backing translation
+	char        name[40] {};
+};
+std::mutex                                     g_backing_fail_mutex;
+std::unordered_map<uint64_t, BackingFailEntry> g_backing_fails;
+uint64_t                                       g_backing_fail_period_ns = 0;
+uint64_t                                       g_backing_fail_total     = 0;
+} // namespace
+
+static bool BackingFailLogEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_BACKING_LOG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static void NoteBackingFailure(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	VirtualRanges::Range range {};
+	const bool known = g_virtual_ranges != nullptr && g_virtual_ranges->Query(vaddr, 0, &range);
+	const char* purpose = Graphics::DrawPrep::ReadPurpose();
+	const uint64_t key = (known ? range.start : (vaddr >> 20u)) ^ (caller * 0x9e3779b97f4a7c15ull) ^
+	                     reinterpret_cast<uint64_t>(purpose);
+	const bool backing_head =
+	    g_guest_address_space != nullptr && g_guest_address_space->BackingContains(vaddr, 1);
+	const auto now = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	        .count());
+	std::vector<BackingFailEntry> report;
+	uint64_t                      total = 0;
+	{
+		std::lock_guard lock(g_backing_fail_mutex);
+		auto& entry = g_backing_fails[key];
+		if (entry.count == 0) {
+			entry.sample       = vaddr;
+			entry.caller       = caller;
+			entry.purpose      = purpose != nullptr ? purpose : "";
+			entry.backing_head = backing_head;
+			if (known) {
+				entry.range_start = range.start;
+				entry.range_size  = range.size;
+				entry.dmem        = range.offset;
+				entry.prot        = range.protection;
+				entry.type        = magic_enum::enum_name(range.type).data();
+				std::snprintf(entry.name, sizeof(entry.name), "%s", range.name);
+			}
+		}
+		entry.count++;
+		entry.min_size = std::min(entry.min_size, size);
+		entry.max_size = std::max(entry.max_size, size);
+		g_backing_fail_total++;
+		if (g_backing_fail_period_ns == 0) {
+			g_backing_fail_period_ns = now;
+		} else if (now - g_backing_fail_period_ns >= 10'000'000'000ull) {
+			for (auto& [k, value]: g_backing_fails) {
+				report.push_back(value);
+			}
+			total = g_backing_fail_total;
+			g_backing_fails.clear();
+			g_backing_fail_total     = 0;
+			g_backing_fail_period_ns = now;
+		}
+	}
+	if (report.empty()) {
+		return;
+	}
+	std::sort(report.begin(), report.end(),
+	          [](const auto& a, const auto& b) { return a.count > b.count; });
+	static const uint64_t module_base = [] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+#else
+		return uint64_t {0};
+#endif
+	}();
+	std::printf("DrawPrepBacking 10s: %" PRIu64 " worker reads without a backing translation, %zu groups\n",
+	            total, report.size());
+	for (size_t i = 0; i < report.size() && i < 24; i++) {
+		const auto& e = report[i];
+		std::printf("  DrawPrepBacking: %" PRIu64 " reads size %" PRIu64 "-%" PRIu64
+		            " sample 0x%016" PRIx64 " range 0x%016" PRIx64 "+0x%" PRIx64
+		            " type=%s prot=0x%x dmem=0x%" PRIx64 " name='%s' head-backed=%s purpose=%s "
+		            "caller=exe+0x%" PRIx64 "\n",
+		            e.count, e.min_size, e.max_size, e.sample, e.range_start, e.range_size, e.type,
+		            static_cast<unsigned>(e.prot), e.dmem, e.name, e.backing_head ? "yes" : "no",
+		            e.purpose, e.caller - module_base);
+	}
+	std::fflush(stdout);
+}
+
 // A backing read that failed after the gate (exact reads fail as Unclean, as before).
 static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
     const Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, uint64_t size, uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
 	if (!recorder.exact) {
+		if (BackingFailLogEnabled()) [[unlikely]] {
+			NoteBackingFailure(vaddr, size, caller);
+		}
 		return ReadFailure::Backing;
 	}
 	NoteDrawPrepUnclean(Profiler::FrameEvent::DrawPrepUncleanBacking, "backing", vaddr, size,
@@ -1653,9 +1764,31 @@ static void VerifyDirectRead(uint64_t vaddr, const void* data, uint64_t size) {
 	}
 }
 
+// KYTY_DRAW_PREP_NULL_READS=1 (default off; Ghost of Yotei preset): a preparation's read that lies
+// wholly in the first 64 KiB, which no guest or host mapping ever contains
+// (ShaderRecompiler::IR::NeverMappedAddress), reads zeros, exactly as the serial path's readers do
+// for such reads (ReadsUnmappedGuestMemory, SrtWalker::InPlaceReadable / ReadRawWord: a null
+// table or descriptor pointer on a path the shader does not take). The bytes can never change, so
+// the read needs no certificate entry. Without the switch such a read fails the preparation
+// ("backing"), and the whole draw is prepared again serially on the command processor: ~1,600
+// draws per frame at Ghost of Yotei's torii, through null-based V# reads at 0xa0 and 0. Live.
+static Live::Switch g_draw_prep_null_reads("KYTY_DRAW_PREP_NULL_READS", Live::ParseDefaultOff);
+
+static bool DrawPrepNullReadsEnabled() {
+	return g_draw_prep_null_reads.On();
+}
+
 static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
                                uint64_t size, uint64_t caller) {
-	constexpr uint64_t PageMask = 4095u;
+	constexpr uint64_t PageMask      = 4095u;
+	constexpr uint64_t NullRegionEnd = 0x10000;
+	if (vaddr < NullRegionEnd && size <= NullRegionEnd - vaddr && DrawPrepNullReadsEnabled()) {
+		if (recorder.reads->Failed()) {
+			return false;
+		}
+		std::memset(data, 0, static_cast<size_t>(size));
+		return true;
+	}
 	const bool direct = !recorder.exact && g_guest_address_space != nullptr && Graphics::DrawPrep::DirectReadsMode() != 0;
 	if (direct && (vaddr >> 12u) == recorder.direct_page && size <= 64u &&
 	    (vaddr & PageMask) + size <= 4096u && !recorder.reads->Failed()) {

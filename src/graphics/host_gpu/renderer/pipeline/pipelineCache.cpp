@@ -3085,7 +3085,10 @@ struct PipelineCache::ProgramCache {
 			const auto count = unmaterializable.fetch_add(1, std::memory_order_relaxed) + 1u;
 			if (count <= 4u || (count & 2047u) == 0u) {
 				std::printf("Warning: stage materialization failed without a retryable read "
-				            "(#%" PRIu64 "); its draws/dispatches are dropped\n", count);
+				            "(#%" PRIu64 ", %s shader 0x%016" PRIx64 "); its draws/dispatches are "
+				            "dropped\n",
+				            count, ProgramStageName(source.resource_plan.stage),
+				            source.resource_plan.shader_hash);
 			}
 			return false;
 		}

@@ -4180,17 +4180,29 @@ bool TextureCache::VerifyCleanChunks(Image& image) {
 	return true;
 }
 
+// KYTY_DCC_GPU_VIDEOOUT (default off; live): TryMaterializeGpuDccClear.
+static Live::Switch g_dcc_gpu_video_out("KYTY_DCC_GPU_VIDEOOUT", Live::ParseDefaultOff);
+
 Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
                                                               uint32_t metadata_base_layer) {
 	using Event = Profiler::FrameEvent;
 	if (!m_dcc_clear || !m_dcc_clear->Available()) {
 		return Event::DccFallbackDisabled;
 	}
-	// The video-out path does not consume its clear key; keep it on the CPU inspection.
-	if (desc.type == BindingType::VideoOut) {
+	// The video-out path does not consume its clear key; it stays on the CPU inspection unless
+	// KYTY_DCC_GPU_VIDEOOUT=1 (default off; Ghost of Yotei preset): the native inspection then
+	// checks the keys in the command stream and clears the image as the CPU fallback would, but
+	// leaves the keys as the guest wrote them (no consumption, no retained inspection). Ghost of
+	// Yotei's compute pass 0x1ed5a1e735be2f6a rewrites its flip target's keys every frame, so the
+	// CPU inspection read them back from the GPU at every flip (~10.8 ms of waiting per frame at
+	// the torii). Adapted from Erlou93/KytyPS5-Yotei KYTY_PERF_DCC_GPU_ALL
+	// (TextureCache::MaterializeDccClearOnGpu: video-out keys checked every time, never consumed). Live.
+	const bool video_out = desc.type == BindingType::VideoOut;
+	if (video_out && !g_dcc_gpu_video_out.On()) {
 		return Event::DccFallbackBinding;
 	}
-	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+	// The CPU fallback treats a compressed video-out description like any other (its keys decide).
+	if (!video_out && desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		return Event::DccFallbackShape;
 	}
 	// The CPU decoder's result for every clear code under this binding (ClearCodes order).
@@ -4204,13 +4216,14 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 		}
 	}
 	return TryMaterializeGpuMetadataClear(*m_dcc_clear, id, desc, desc.info.metadata.range,
-	                                      metadata_base_layer, values, decodable, false);
+	                                      metadata_base_layer, values, decodable, false,
+	                                      !video_out);
 }
 
 Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
     DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
     uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-    bool cmask) {
+    bool cmask, bool consume) {
 	using Event = Profiler::FrameEvent;
 	using Support = DccClearHelper::Support;
 	const auto& view = desc.view_info;
@@ -4246,7 +4259,8 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
 		// than that one reads the same bytes to the same no-op, for any image or layer; only the
 		// metadata processing is skipped, the caller still refreshes this image normally.
-		bool reusable = true;
+		// Kept keys (consume=false) prove nothing about a later use: never reused.
+		bool reusable = consume;
 		for (uint32_t slice = 0; reusable && slice < count; ++slice) {
 			const auto metadata = slice_range(slice);
 			const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
@@ -4270,6 +4284,10 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	// is fully resident is accepted while waiting for a refresh or not GPU-owned; it is refreshed
 	// right before the inspection, as the CPU fallback's ClearImage refreshes it.
 	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
+	if (!consume && m_dcc_gpu_refresh_verify != 0) {
+		// The refresh verification expects consumed keys; the video-out path keeps them.
+		return Event::DccFallbackBinding;
+	}
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
 		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
@@ -4368,7 +4386,8 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
 		for (uint32_t slice = 0; slice < count; ++slice) {
 			helper.RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
-			                         offset + slice_size * (first + slice), slice_size, values);
+			                         offset + slice_size * (first + slice), slice_size, values,
+			                         consume);
 		}
 	}
 	CommitGpuWrite(image);
@@ -4384,7 +4403,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		m_gpu_dcc_records += count;
 		Profiler::CountFrameEvent(Event::DccGpuRecords, count);
 	}
-	for (uint32_t slice = 0; slice < count; ++slice) {
+	for (uint32_t slice = 0; consume && slice < count; ++slice) {
 		const auto metadata = slice_range(slice);
 		if (const auto revision =
 		        m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {

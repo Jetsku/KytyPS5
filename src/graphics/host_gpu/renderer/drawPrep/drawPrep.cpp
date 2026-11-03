@@ -1300,6 +1300,10 @@ bool SamePixelInfo(const ShaderPixelInputInfo& a, const ShaderPixelInputInfo& b)
 
 } // namespace
 
+// KYTY_DRAW_PREP_VERIFY: draws compared with the serial path, and differences (DrawPrep 10 s line).
+std::atomic<uint64_t> g_draw_verify_checks {0};
+std::atomic<uint64_t> g_draw_verify_mismatches {0};
+
 bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& programs,
                      const ShaderVertexInputInfo& vertex_info, const ShaderPixelInputInfo& pixel_info,
                      const PipelineCache::GraphicsStagePreps& preps,
@@ -1308,6 +1312,7 @@ bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& p
                      const ShaderPixelInputInfo&             serial_pixel_info,
                      const PipelineCache::GraphicsStagePreps& serial_preps) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepVerifyChecks);
+	g_draw_verify_checks.fetch_add(1, std::memory_order_relaxed);
 	const bool programs_equal = programs.pixel.id == serial_programs.pixel.id &&
 	                            programs.vertex[0].id == serial_programs.vertex[0].id &&
 	                            programs.vertex[1].id == serial_programs.vertex[1].id;
@@ -1321,6 +1326,7 @@ bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& p
 		return true;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepVerifyMismatches);
+	g_draw_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("DrawPrepVerify: committed preparation differs from the serial one: programs=%d "
@@ -2170,6 +2176,13 @@ void PrintDrawPrepSummary() {
 		             std::to_string(values[3] - last_dispatch[3]) + " checks, " +
 		             std::to_string(values[4] - last_dispatch[4]) + " mismatches";
 		std::copy(std::begin(values), std::end(values), std::begin(last_dispatch));
+	}
+	if (VerifyMode() != 0) {
+		dispatches += " | draw verify: " +
+		              std::to_string(g_draw_verify_checks.load(std::memory_order_relaxed)) +
+		              " checks, " +
+		              std::to_string(g_draw_verify_mismatches.load(std::memory_order_relaxed)) +
+		              " mismatches (total)";
 	}
 	if (g_clean_since.Get() >= 2) {
 		dispatches += " | clean-since verify: " +

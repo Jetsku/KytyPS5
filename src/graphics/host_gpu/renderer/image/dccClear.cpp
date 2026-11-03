@@ -278,7 +278,7 @@ void DccClearHelper::RecordPalette(vk::CommandBuffer command, vk::Format view_fo
 
 void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t layer,
                                  vk::Buffer metadata, uint64_t metadata_offset,
-                                 uint64_t metadata_size, const ClearValues& values) {
+                                 uint64_t metadata_size, const ClearValues& values, bool consume) {
 	KYTY_GPU_OP_SITE("dcc.clear");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(SupportsImage(image, view_format, metadata_size) != Support::Ok ||
@@ -304,7 +304,7 @@ void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t 
 	                 image.backing.extent.height,
 	                 static_cast<uint32_t>(groups),
 	                 decodable,
-	                 texel_bytes};
+	                 texel_bytes | (consume ? 0u : 0x100u)};
 	ImageViewInfo view_info {};
 	view_info.format      = alias;
 	view_info.type        = vk::ImageViewType::e2D;

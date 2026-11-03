@@ -51,9 +51,11 @@ public:
 	                                    uint64_t metadata_size) const;
 	// Inspects one metadata slice and conditionally clears one layer of `image` (single mip) as
 	// the CPU fallback would. The image and canonical metadata buffer must remain alive through
-	// this scheduler tick. metadata_offset must be 4-byte aligned.
+	// this scheduler tick. metadata_offset must be 4-byte aligned. consume=false (video-out
+	// bindings, KYTY_DCC_GPU_VIDEOOUT) leaves the keys as they are after a clear.
 	void RecordSlice(Image& image, vk::Format view_format, uint32_t layer, vk::Buffer metadata,
-	                 uint64_t metadata_offset, uint64_t metadata_size, const ClearValues& values);
+	                 uint64_t metadata_offset, uint64_t metadata_size, const ClearValues& values,
+	                 bool consume = true);
 
 private:
 	struct Push {

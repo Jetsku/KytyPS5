@@ -905,6 +905,19 @@ static bool TryDccKey10Fill(RenderContext& context, const ShaderComputeInputInfo
 	}
 	ShaderBufferResource v {};
 	std::copy_n(resources.user_data.begin(), 4, v.fields);
+	// KYTY_DCC_FILL_CS_LOG (diagnostics): the first dispatches of this shader with another record
+	// stride (Erlou93/KytyPS5-Yotei registers stride-16 ones as DCC key fills).
+	if (v.Stride() != 256u && std::getenv("KYTY_DCC_FILL_CS_LOG") != nullptr) {
+		static std::atomic<uint32_t> fill_logged {0};
+		if (fill_logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("DccFillCs: addr=0x%016" PRIx64 " stride=%u format=%u records=%u groups=%ux%ux%u "
+			            "value=%08x,%08x,%08x,%08x swizzle=%d addtid=%d\n",
+			            v.Base48(), v.Stride(), v.RawFormat(), v.NumRecords(), group_x, group_y,
+			            group_z, resources.user_data[4], resources.user_data[5],
+			            resources.user_data[6], resources.user_data[7], v.SwizzleEnabled() ? 1 : 0,
+			            v.AddTid() ? 1 : 0);
+		}
+	}
 	if (v.Base48() == 0 || v.Stride() != 256u || v.SwizzleEnabled() || v.AddTid()) {
 		return false;
 	}
