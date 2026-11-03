@@ -325,6 +325,10 @@ public:
 	// processor continues) and takes every page it wrote into GPU ownership exactly as a writable
 	// binding over the page would, so no later reader sees the page as clean. GPU thread.
 	void SettleBdaWrites(uint64_t shader_hash);
+	// KYTY_CP_FAULT_WRITERS=1 (diagnostics): a read fault the command processor took on GPU-written
+	// bytes, with its handler time: aggregated by the newest recorded GPU writer of the address
+	// (shader, ticks between that write and the fault) and the op being prepared, every 10 s.
+	void NoteCpFault(uint64_t vaddr, uint64_t handler_ns);
 	// KYTY_BDA_ASYNC_SETTLE (bufferCache.cpp): finishes the settles whose dispatch completed (with
 	// wait_oldest, waits for the oldest first). GPU thread.
 	void ProcessPendingBdaSettles(bool wait_oldest);
@@ -350,6 +354,20 @@ private:
 	};
 	std::deque<PendingBdaSettle>                 m_bda_pending;
 	std::unordered_map<uint64_t, BdaPrediction>  m_bda_predict;
+	// KYTY_CP_FAULT_WRITERS
+	struct CpFaultWriter {
+		uint64_t    vaddr = 0, size = 0, tick = 0, hash = 0;
+		const char* kind  = "";
+	};
+	struct CpFaultStats {
+		uint64_t    faults = 0, ns = 0, sample = 0, tick_delta = 0, reader = 0;
+		const char* kind   = "";
+		const char* reader_kind = "";
+	};
+	std::vector<CpFaultWriter>                    m_cp_fault_writers;
+	size_t                                        m_cp_fault_writer_next = 0;
+	std::unordered_map<uint64_t, CpFaultStats>    m_cp_fault_stats;
+	std::chrono::steady_clock::time_point         m_cp_fault_print {};
 	BdaAsyncTotals                               m_bda_async_totals;
 	std::chrono::steady_clock::time_point        m_bda_async_print {};
 

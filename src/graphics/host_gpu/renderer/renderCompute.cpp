@@ -241,6 +241,46 @@ static void RunCsImageDump(RenderContext& context, const CsImageDump& dump) {
 	}
 }
 
+// KYTY_NAN_SCAN=<folder>[:<count>] (diagnostic): while <folder>/scan.now exists, the next <count>
+// (default 8000) compute dispatches and draws have the images they read and write (dispatches) or
+// their colour targets (draws) checked for NaN/Inf after they ran (TextureCache::DebugNanScan: a
+// band of rows, float formats only); "NanScan:" lines in submission order name the op, the shader
+// and the image. Then the file is removed. Returns the op's ordinal (0: not scanning).
+uint32_t NanScanTake() {
+	struct Request {
+		std::filesystem::path trigger;
+		uint32_t              count = 8000;
+	};
+	static const Request request = [] {
+		Request parsed;
+		if (const char* value = std::getenv("KYTY_NAN_SCAN"); value != nullptr && value[0] != '\0') {
+			std::string text(value);
+			if (const auto colon = text.rfind(':'); colon != std::string::npos && colon > 1) {
+				parsed.count = static_cast<uint32_t>(std::strtoul(text.c_str() + colon + 1, nullptr, 10));
+				text.resize(colon);
+			}
+			parsed.trigger = std::filesystem::path(text) / "scan.now";
+		}
+		return parsed;
+	}();
+	if (request.trigger.empty()) return 0;
+	static uint32_t left  = 0; // GPU thread only
+	static uint32_t polls = 0;
+	static uint32_t scan  = 0;
+	if (left == 0) {
+		if ((polls++ & 255u) != 0u) return 0;
+		std::error_code error;
+		if (!std::filesystem::exists(request.trigger, error)) return 0;
+		std::filesystem::remove(request.trigger, error);
+		scan++;
+		std::printf("NanScan: start of scan %u, %u operations\n", scan, request.count);
+		left = request.count;
+	}
+	left--;
+	if (left == 0) std::printf("NanScan: end of scan %u (recorded; results follow as submissions complete)\n", scan);
+	return request.count - left;
+}
+
 // KYTY_FRAME_TRACE=<folder>[:<count>] (diagnostic): while <folder>/trace.now exists, the next <count>
 // (default 4000) compute dispatches and draws are logged as "FrameTrace" lines (programs, bound
 // images and buffers, render targets; frameTrace.h), then the file is removed. One frame's producers
@@ -1388,6 +1428,17 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 		RunCsImageDump(m_context, image_dump);
 	}
+	if (const auto op = NanScanTake(); op != 0) {
+		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(input_info.stage.resources->images[i]);
+			(void)m_context.GetTextureCache().DebugNanScan(
+			    r.Base40(), static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+			    fmt::format("op {} CS 0x{:016x} groups {}x{}x{} image {} {}", op, program.shader_hash,
+			                thread_group_x, thread_group_y, thread_group_z, i,
+			                program.info.images[i].written ? "written" : "read"));
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (!guest_barriers) {
@@ -1725,6 +1776,16 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (!guest_barriers) {
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (const auto op = NanScanTake(); op != 0) {
+		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(input_info.stage.resources->images[i]);
+			(void)m_context.GetTextureCache().DebugNanScan(
+			    r.Base40(), static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+			    fmt::format("op {} CS 0x{:016x} indirect image {} {}", op, program.shader_hash, i,
+			                program.info.images[i].written ? "written" : "read"));
+		}
 	}
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);

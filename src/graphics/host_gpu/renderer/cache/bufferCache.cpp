@@ -3160,7 +3160,67 @@ void BufferCache::CompleteAllSideReadbacks() {
 	}
 }
 
+void BufferCache::NoteCpFault(uint64_t vaddr, uint64_t handler_ns) {
+	if (!WatchRange::CpFaultWritersEnabled()) {
+		return;
+	}
+	// The newest recorded writer of the address.
+	const CpFaultWriter* writer = nullptr;
+	const size_t         count  = m_cp_fault_writers.size();
+	for (size_t i = 0; i < count && writer == nullptr; i++) {
+		const auto& w = m_cp_fault_writers[(m_cp_fault_writer_next + count - 1 - i) % count];
+		if (vaddr >= w.vaddr && vaddr < w.vaddr + w.size) {
+			writer = &w;
+		}
+	}
+	const uint64_t key = (writer != nullptr ? writer->hash : 0) ^ ((vaddr >> 16u) * 0x9e3779b97f4a7c15ull);
+	auto& stats = m_cp_fault_stats[key];
+	if (stats.faults == 0) {
+		stats.sample      = vaddr;
+		stats.kind        = writer != nullptr ? writer->kind : "none";
+		stats.tick_delta  = writer != nullptr ? m_scheduler.CurrentTick() - writer->tick : UINT64_MAX;
+		stats.reader      = WatchRange::CurrentOpHash();
+		stats.reader_kind = WatchRange::CurrentOpKind();
+	}
+	stats.faults++;
+	stats.ns += handler_ns;
+	(void)stats;
+	const auto now = std::chrono::steady_clock::now();
+	if (m_cp_fault_print.time_since_epoch().count() == 0) {
+		m_cp_fault_print = now;
+		return;
+	}
+	if (now - m_cp_fault_print < std::chrono::seconds(10)) {
+		return;
+	}
+	m_cp_fault_print = now;
+	std::vector<std::pair<uint64_t, CpFaultStats>> rows(m_cp_fault_stats.begin(), m_cp_fault_stats.end());
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	std::printf("CpFaultWriters 10s: %zu groups\n", rows.size());
+	for (size_t i = 0; i < rows.size() && i < 16; i++) {
+		const auto& s = rows[i].second;
+		std::printf("  CpFaultWriters: %llu faults %.1f ms sample 0x%016llx written by %s 0x%016llx "
+		            "(%lld ticks before the first fault), last op %s 0x%016llx\n",
+		            static_cast<unsigned long long>(s.faults), static_cast<double>(s.ns) * 1e-6,
+		            static_cast<unsigned long long>(s.sample), s.kind,
+		            static_cast<unsigned long long>(rows[i].first ^ ((s.sample >> 16u) * 0x9e3779b97f4a7c15ull)),
+		            static_cast<long long>(s.tick_delta), s.reader_kind,
+		            static_cast<unsigned long long>(s.reader));
+	}
+	std::fflush(stdout);
+	m_cp_fault_stats.clear();
+}
+
 void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
+	if (WatchRange::CpFaultWritersEnabled()) [[unlikely]] {
+		if (m_cp_fault_writers.size() < 8192) {
+			m_cp_fault_writers.resize(8192);
+		}
+		m_cp_fault_writers[m_cp_fault_writer_next] = {vaddr, size, m_scheduler.CurrentTick(),
+		                                              WatchRange::CurrentOpHash(),
+		                                              WatchRange::CurrentOpKind()};
+		m_cp_fault_writer_next = (m_cp_fault_writer_next + 1) % m_cp_fault_writers.size();
+	}
 	if (m_side == nullptr) {
 		return;
 	}

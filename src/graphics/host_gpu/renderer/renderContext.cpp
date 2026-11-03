@@ -254,6 +254,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	const auto handler_ns  = FaultCost::NowNs() - start;
+	if (access != PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
+		m_buffer_cache.NoteCpFault(fault_vaddr, handler_ns); // KYTY_CP_FAULT_WRITERS
+	}
 	const bool found_dirty = access == PageFaultAccess::Write && MemoryTracker::TakeFaultFoundDirty();
 	FaultCost::NoteFault(handler_ns);
 	if (map) {

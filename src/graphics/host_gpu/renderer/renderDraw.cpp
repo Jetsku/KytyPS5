@@ -78,6 +78,8 @@
 namespace Libs::Graphics {
 // KYTY_FRAME_TRACE (renderCompute.cpp).
 bool FrameTraceTake();
+// KYTY_NAN_SCAN (renderCompute.cpp).
+uint32_t NanScanTake();
 
 static bool MeshRestartEnabled() {
 	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
@@ -2513,6 +2515,15 @@ static bool DrawRunProgramEligible(const ShaderRecompiler::IR::CompiledShaderInf
 	return true;
 }
 
+// KYTY_DRAW_RUN_FAULT_BUFFER (live, default 0; Ghost of Yotei preset candidate): programs whose
+// only "write" is the fault buffer (every program reading memory through BDA has the binding) may
+// form runs. The binding is the same buffer for every draw, its bits are OR-ed without order and
+// read after the submission (RenderContext::RunGarbageCollector), and a continuation still prepares
+// its buffers (PrepareGraphicsBindings: PrefaultDmaPointers, PrepareBda), so a continued draw reads
+// and reports what the full path's draw would. At Ghost of Yotei's torii ~1,250 draws per frame
+// left no run record for this reason, ~740 of them followed by a draw with the same key.
+static Live::Switch g_draw_run_fault_buffer("KYTY_DRAW_RUN_FAULT_BUFFER", Live::ParseDefaultOff);
+
 // KYTY_PIPELINE_SKIP_FAULT_BUFFER=1 (default off; on in the GT7 preset): a program whose only
 // "write" is the fault buffer may have its draws skipped while their pipeline builds. Every program
 // that reads memory through BDA gets that binding (BindingLayout, info.uses_dma): it reports pages
@@ -3174,8 +3185,9 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 			return false;
 		}
 		// The new vertex program: run-eligible, and its buffer writes (if allowed) off the run's images.
-		if (!DrawRunProgramEligible(program)) {
-			if (!m_run.record_writes_ok || !DrawRunProgramEligible(program, true)) {
+		if (!DrawRunProgramEligible(program, false, g_draw_run_fault_buffer.On())) {
+			if (!m_run.record_writes_ok ||
+			    !DrawRunProgramEligible(program, true, g_draw_run_fault_buffer.On())) {
 				DrawRun::CountMiss(Miss::Writes);
 				return false;
 			}
@@ -4400,7 +4412,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			LOGF("%s\n", text.c_str());
 		}
 	}
-	if (WatchRange::Enabled()) {
+	if (WatchRange::Enabled() || WatchRange::CpFaultWritersEnabled()) {
 		WatchRange::SetCurrentOp("draw", state.ps_active && state.ps_input_info.stage.program != nullptr
 		                                     ? state.ps_input_info.stage.program->shader_hash
 		                                     : 0);
@@ -5173,6 +5185,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	draw_cmd_scope.Stop();
+	// KYTY_NAN_SCAN (renderCompute.cpp): the draw's colour targets, after it (ends the rendering).
+	if (const auto op = NanScanTake(); op != 0) {
+		buffer.EndRendering();
+		m_run_active = false;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& target = state.color_info[i];
+			(void)m_context.GetTextureCache().DebugNanScan(
+			    target.desc.info.data.address, target.desc.info.extent.width, target.desc.info.extent.height,
+			    fmt::format("op {} DRAW vs 0x{:016x} ps 0x{:016x} target {}", op,
+			                state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+			                state.ps_active && state.ps_input_info.stage.program
+			                    ? state.ps_input_info.stage.program->shader_hash
+			                    : 0,
+			                i));
+		}
+	}
 	// KYTY_GRAPHICS_BDA_WRITES: the pages a stage wrote through BDA, settled as after a dispatch
 	// (the settle ends rendering, records the written-page pass, submits and waits).
 	for (auto* stage: stages) {
@@ -5311,7 +5339,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			bool ok = true;
 			for (const auto* stage: stages) {
 				ok = ok && stage->gds.buffer == nullptr &&
-				     DrawRunProgramEligible(*stage->runtime->program, writes_ok);
+				     DrawRunProgramEligible(*stage->runtime->program, writes_ok,
+				                            g_draw_run_fault_buffer.On());
 				for (const auto& binding: stage->images) {
 					// Storage bindings are transitioned with write access (a barrier every draw).
 					ok = ok && !is_attachment(binding.image_id) &&
@@ -5322,7 +5351,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		};
 		const auto stages_write = [&] {
 			return writes_ok && std::any_of(stages.begin(), stages.end(), [](const auto* stage) {
-				       return !DrawRunProgramEligible(*stage->runtime->program);
+				       return !DrawRunProgramEligible(*stage->runtime->program, false,
+				                                      g_draw_run_fault_buffer.On());
 			       });
 		};
 		if (cont_known && cont_mode == 1) {
@@ -5369,7 +5399,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						}
 						if (stage->gds.buffer != nullptr) {
 							reason = Inelig::Gds;
-						} else if (!DrawRunProgramEligible(*stage->runtime->program, writes_ok)) {
+						} else if (!DrawRunProgramEligible(*stage->runtime->program, writes_ok,
+						                                   g_draw_run_fault_buffer.On())) {
 							reason = Inelig::Program;
 						} else {
 							for (const auto& binding: stage->images) {

@@ -145,6 +145,11 @@ public:
 	// an emission safe point.
 	// width/height 0: any extent; otherwise an image of that extent is preferred.
 	bool DebugDumpImage(uint64_t address, uint32_t width, uint32_t height, const std::string& prefix);
+	// KYTY_NAN_SCAN (renderCompute.cpp, diagnostics): downloads a band of rows of the cached image at
+	// `address` (layer 0, mip 0) after the current recording and counts NaN/Inf texels of float
+	// formats when the submission completed; the line names `label` (op order, shader, image).
+	// False when the image is not cached or its format cannot hold NaN.
+	bool DebugNanScan(uint64_t address, uint32_t width, uint32_t height, const std::string& label);
 	// One image of DebugDumpImage (m_lock held).
 	bool DebugDumpOne(ImageId id, uint64_t address, const std::string& prefix);
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,

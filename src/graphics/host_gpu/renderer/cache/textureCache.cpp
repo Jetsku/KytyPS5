@@ -2220,6 +2220,112 @@ bool TextureCache::DebugDumpImage(uint64_t address, uint32_t want_width, uint32_
 	return dumped;
 }
 
+bool TextureCache::DebugNanScan(uint64_t address, uint32_t want_width, uint32_t want_height,
+                                const std::string& label) {
+	std::scoped_lock lock {m_lock};
+	ImageId          found {};
+	FindImagesInRegion(address, 1, false).ForEach([&](ImageId id) {
+		const auto& image = m_slot_images[id];
+		if (image.info.data.address != address || image.depth_id) return;
+		if (!found || (image.info.extent.width == want_width && image.info.extent.height == want_height)) {
+			found = id;
+		}
+	});
+	if (!found) {
+		return false;
+	}
+	auto&          image  = m_slot_images[found];
+	const auto     format = image.backing.format;
+	const auto     name   = vk::to_string(format);
+	const uint32_t bytes  = vk::blockSize(format);
+	const uint32_t comps  = vk::componentCount(format);
+	const bool     packed = format == vk::Format::eB10G11R11UfloatPack32;
+	const bool     sfloat = name.find("Sfloat") != std::string::npos && comps != 0 &&
+	                    (bytes / comps == 2 || bytes / comps == 4);
+	if (image.info.samples != 1 || (!packed && !sfloat) || image.info.IsDepth()) {
+		return false;
+	}
+	const uint32_t width  = image.info.extent.width;
+	const uint32_t height = image.info.extent.height;
+	// Rows 30 %..60 % of the height in 8 bands of 2 rows: the torii, the hat and the village.
+	constexpr uint32_t Bands = 8;
+	constexpr uint32_t Rows  = 2;
+	const uint64_t band_bytes = uint64_t {width} * Rows * bytes;
+	std::array<vk::BufferImageCopy, Bands> copies {};
+	uint32_t count = 0;
+	for (uint32_t b = 0; b < Bands; b++) {
+		const uint32_t y = static_cast<uint32_t>(uint64_t {height} * (30u + b * 4u) / 100u);
+		if (y + Rows > height) continue;
+		auto& copy            = copies[count];
+		copy.bufferOffset     = band_bytes * count;
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageOffset      = vk::Offset3D {0, static_cast<int32_t>(y), 0};
+		copy.imageExtent      = vk::Extent3D {width, Rows, 1};
+		count++;
+	}
+	if (count == 0) {
+		return false;
+	}
+	const uint64_t size   = band_bytes * count;
+	auto           buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                       vk::BufferUsageFlagBits::eTransferDst,
+	                                       Common::AlignUp(size, uint64_t {4}));
+	image.Download({copies.data(), count}, buffer->Handle(), 0, size);
+	vk::MemoryBarrier2 to_host {};
+	to_host.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &to_host;
+	m_scheduler.Current().HelperSink().pipelineBarrier2(dependency);
+	const auto line = fmt::format("{} base 0x{:x} {}x{} {}", label, address, width, height, name);
+	m_scheduler.DeferOperation([buffer, size, line, packed, bytes, comps] {
+		buffer->Invalidate(0, size);
+		const auto* data  = buffer->Mapped().data();
+		uint64_t    nan   = 0;
+		uint64_t    inf   = 0;
+		uint64_t    texels = size / bytes;
+		const auto  half = [&](uint16_t v) {
+			if ((v & 0x7c00u) == 0x7c00u) ((v & 0x3ffu) != 0 ? nan : inf)++;
+		};
+		const auto single = [&](uint32_t v) {
+			if ((v & 0x7f800000u) == 0x7f800000u) ((v & 0x7fffffu) != 0 ? nan : inf)++;
+		};
+		if (packed) {
+			for (uint64_t at = 0; at + 4 <= size; at += 4) {
+				uint32_t v = 0;
+				std::memcpy(&v, data + at, 4);
+				const uint32_t channels[3] = {v & 0x7ffu, (v >> 11u) & 0x7ffu, (v >> 22u) & 0x3ffu};
+				const uint32_t mant[3]     = {0x3fu, 0x3fu, 0x1fu};
+				const uint32_t shift[3]    = {6u, 6u, 5u};
+				for (int c = 0; c < 3; c++) {
+					if ((channels[c] >> shift[c]) == 0x1fu) ((channels[c] & mant[c]) != 0 ? nan : inf)++;
+				}
+			}
+		} else if (bytes / comps == 2) {
+			for (uint64_t at = 0; at + 2 <= size; at += 2) {
+				uint16_t v = 0;
+				std::memcpy(&v, data + at, 2);
+				half(v);
+			}
+		} else {
+			for (uint64_t at = 0; at + 4 <= size; at += 4) {
+				uint32_t v = 0;
+				std::memcpy(&v, data + at, 4);
+				single(v);
+			}
+		}
+		if (nan != 0 || inf != 0) {
+			std::printf("NanScan: %s: nan %llu inf %llu of %llu texels sampled\n", line.c_str(),
+			            static_cast<unsigned long long>(nan), static_cast<unsigned long long>(inf),
+			            static_cast<unsigned long long>(texels));
+		}
+	});
+	return true;
+}
+
 bool TextureCache::DebugDumpOne(ImageId found, uint64_t address, const std::string& prefix) {
 	auto&          image  = m_slot_images[found];
 	const auto     format = image.backing.format;

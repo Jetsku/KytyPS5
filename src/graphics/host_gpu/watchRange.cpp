@@ -53,8 +53,24 @@ bool Enabled() noexcept {
 	return !Get().ranges.empty();
 }
 
+bool CpFaultWritersEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_FAULT_WRITERS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+uint64_t CurrentOpHash() noexcept {
+	return g_hash.load(std::memory_order_relaxed);
+}
+
+const char* CurrentOpKind() noexcept {
+	return g_kind.load(std::memory_order_relaxed);
+}
+
 void SetCurrentOp(const char* kind, uint64_t shader_hash) noexcept {
-	if (!Enabled()) return;
+	if (!Enabled() && !CpFaultWritersEnabled()) return;
 	g_kind.store(kind, std::memory_order_relaxed);
 	g_hash.store(shader_hash, std::memory_order_relaxed);
 	g_ops.fetch_add(1, std::memory_order_relaxed);
