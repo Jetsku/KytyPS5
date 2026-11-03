@@ -7095,6 +7095,16 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 		return false;
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
+#if !defined(__APPLE__)
+	if (with_depth && targets.depth_bounds_test_enable && !m_graphics.depth_bounds_enabled) {
+		if (fatal) {
+			EXIT("This draw uses the depth bounds test, which needs the Vulkan feature depthBounds. "
+			     "The GPU \"%s\" does not support it, and the emulator has no fallback.\n",
+			     m_graphics.GetPhysicalDeviceProperties().deviceName.data());
+		}
+		return false;
+	}
+#endif
 	static_params.depth_bounds_test_enable = targets.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = targets.depth_min_bounds;
 	static_params.depth_max_bounds         = targets.depth_max_bounds;

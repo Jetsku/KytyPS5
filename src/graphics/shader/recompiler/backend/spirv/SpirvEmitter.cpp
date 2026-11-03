@@ -318,6 +318,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			requirements.coherent_buffers |= inst.GetOpcode() == IR::ValueOpcode::DataCacheInvalidate;
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
+				if (!GetHostBufferInt64Atomics()) {
+					Fail(program, "64-bit buffer atomics need the Vulkan feature "
+					              "shaderBufferInt64Atomics, which this GPU does not support");
+				}
 				requirements.buffer_int64_atomics = true;
 			}
 			// KYTY_PS_HELPER_ATOMICS_SKIP: emulated read-modify-writes (AtomicUpdate) of pixel shaders
