@@ -4,8 +4,10 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -301,6 +303,26 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
+// One output picture as the decoder writes it: NV12, rows padded to a 256-byte pitch
+// (videoDec2Decoder.cpp), rounded up to 64 KiB. Games size their frame pools from this value:
+// Ghost of Yotei skipped every movie with the old fixed 16 MiB (based on Erlou93/KytyPS5-Yotei).
+// KYTY_VIDEODEC2_FRAME_SIZE=1 (default off, PPSA26344 preset): report this size instead of the
+// fixed 16 MiB.
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo* config) {
+	static const bool exact = [] {
+		const char* value = std::getenv("KYTY_VIDEODEC2_FRAME_SIZE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!exact) {
+		return VIDEODEC2_MIN_MEMORY_SIZE;
+	}
+	const auto width  = static_cast<uint64_t>(std::max(config->max_frame_width, 1));
+	const auto height = static_cast<uint64_t>(std::max(config->max_frame_height, 1));
+	const auto pitch  = (width + 255u) & ~uint64_t {255};
+	const auto bytes  = pitch * height + pitch * ((height + 1u) / 2u);
+	return static_cast<size_t>((bytes + 0xffffu) & ~uint64_t {0xffff});
+}
+
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
                                                     Videodec2DecoderMemoryInfo*       memory_info) {
 	PRINT_NAME();
@@ -325,7 +347,7 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
@@ -354,7 +376,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	    memory_info->max_frame_buffer_size < MaxFrameBufferSize(config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 

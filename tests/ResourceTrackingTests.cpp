@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -3383,6 +3384,70 @@ void TestBufferWriteRanges() {
         "ADD_TID lanes were not added to the store index");
 }
 
+
+// KYTY_BOUNDED_KEY_IMAGES: a T# at key << 5 in a scalar-address table whose key is a 5-bit field
+// enumerates 32 keys; without the switch such a key is not a valid runtime value.
+void TestBoundedKeyAddressTable() {
+  namespace RC = Libs::Graphics::ShaderRecompiler;
+  const auto make = [](bool bounded) {
+    auto options = RC::GetCodegenOptions();
+    const auto saved = options;
+    options.bounded_key_images = bounded;
+    RC::SetCodegenOptions(options);
+    struct Restore {
+      RC::CodegenOptions saved;
+      ~Restore() { RC::SetCodegenOptions(saved); }
+    } restore{saved};
+    Fixture fixture(ShaderType::Pixel);
+    const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < pointer.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      pointer[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32, {srt, Value(0u), Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x20));
+    }
+    const auto record = fixture.Emit(ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
+    const auto key = fixture.Emit(ValueOpcode::BitFieldUExtract, {record, Value(16u), Value(5u)});
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(16u)});
+    std::array<Value, 8> words;
+    for (uint32_t group = 0; group < 2u; ++group) {
+      const auto table = fixture.Address(pointer[0], pointer[1]);
+      const auto group_offset = group == 0u ? offset : fixture.Emit(
+          ValueOpcode::IAdd32, {offset, Value(16u)});
+      for (uint32_t word = 0; word < 4u; ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = word * 4u;
+        words[group * 4u + word] = fixture.Emit(
+            ValueOpcode::LoadAddressU32, {table, group_offset, Value(0u), Value(true)},
+            fixture.AddMemory(memory, 0x100 + group * 8u));
+      }
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x128));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 16u &&
+              indirect->key_count.Resolve().IsImmediate() &&
+              indirect->key_count.Resolve().U32() == 32u,
+          "a 5-bit field key did not enumerate 32 table records");
+  };
+  make(true);
+  CheckFatal([&] { make(false); }, "not a valid runtime value",
+             "a field key enumerated without KYTY_BOUNDED_KEY_IMAGES");
+}
+
 } // namespace
 
 int main() {
@@ -3406,6 +3471,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("bounded key address table", TestBoundedKeyAddressTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

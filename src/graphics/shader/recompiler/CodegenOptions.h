@@ -280,6 +280,18 @@ struct CodegenOptions {
 	// (NullBufferMarkerOffset), so every access is out of range: loads read 0, stores drop, and a
 	// formatted read's DST_SEL constants are replaced by 0 as a null V# gives.
 	bool null_buffer_share = false;
+	// KYTY_BOUNDED_KEY_IMAGES=1 (default 0; PPSA26344 preset): a T# read from a scalar-address table
+	// at key << 5 whose key is an unsigned bit-field extract of constant width (at most 6 bits) or a
+	// low-bit mask (at most 63) enumerates every key below that bound, as a loop-bounded key does
+	// (adapted from Erlou93/KytyPS5-Yotei's MatchDescriptorTable bounds). Ghost of Yotei's compute
+	// shaders take a 5-bit slot field from a record. Off: such programs are skipped, as before.
+	bool bounded_key_images = false;
+	// KYTY_INDIRECT_FORMAT_D16=1 (default 0; PPSA26344 preset): BUFFER_LOAD_FORMAT_D16_XYZ/XYZW (two dwords) through a
+	// V# the shader computed read through the indirect format decoder, then pack component pairs into
+	// dwords as the D16 load does (16-bit float for float/norm formats, clamped 16-bit integers for
+	// UINT/SINT, chosen from the V#'s format at run time). Off: such programs are skipped, as before.
+	// Ghost of Yotei's merged hull programs and several compute shaders use them.
+	bool indirect_format_d16 = false;
 	// KYTY_INDIRECT_FORMAT_INLINE_HASHES=<hex>[,<hex>...] (default unset): with
 	// KYTY_INDIRECT_FORMAT_FAST, these programs inline the full decoder (as
 	// KYTY_INDIRECT_FORMAT_INLINE does for all), the others keep the fast + DontInline pair.

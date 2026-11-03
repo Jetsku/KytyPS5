@@ -2397,9 +2397,73 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// KYTY_INDIRECT_FORMAT_D16: the decoded channels of a D16 load packed into `components` dwords, two
+// per dword: 16-bit floats (float and normalized formats) or 16-bit integers clamped like
+// LoadFormattedPrepared's D16 path (UINT/SINT), chosen by the V#'s format (word 3 bits 12-18).
+static uint32_t PackIndirectFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t channels,
+                                         uint32_t components) {
+	auto&       state  = ctx.state;
+	const auto& handle = *inst.Arg(0).ResolveInstruction();
+	const auto  count  = std::min<uint32_t>(ctx.Memory(inst).component_count, 4u);
+	std::array<uint32_t, 4> uint_mask {};
+	std::array<uint32_t, 4> sint_mask {};
+	for (uint32_t format = 0; format < 128u; ++format) {
+		const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+		if (info.type == Format::ComponentType::Uint) uint_mask[format / 32u] |= 1u << (format % 32u);
+		if (info.type == Format::ComponentType::Sint) sint_mask[format / 32u] |= 1u << (format % 32u);
+	}
+	const auto format = EmitBitFieldUExtract(state, ctx.Arg(handle, 3), ConstantU32(state, 12), ConstantU32(state, 7));
+	const auto word   = Binary(state, spv::OpShiftRightLogical, TypeU32(state), format, ConstantU32(state, 5));
+	const auto bit    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), format, ConstantU32(state, 31));
+	const auto test   = [&](const std::array<uint32_t, 4>& mask) {
+		auto selected = ConstantU32(state, mask[3]);
+		for (uint32_t i = 3; i-- > 0;) {
+			selected = Select(state, TypeU32(state),
+			                  Binary(state, spv::OpIEqual, TypeBool(state), word, ConstantU32(state, i)),
+			                  ConstantU32(state, mask[i]), selected);
+		}
+		const auto shifted = Binary(state, spv::OpShiftRightLogical, TypeU32(state), selected, bit);
+		return Binary(state, spv::OpINotEqual, TypeBool(state),
+		              Binary(state, spv::OpBitwiseAnd, TypeU32(state), shifted, ConstantU32(state, 1)),
+		              ConstantU32(state, 0));
+	};
+	const auto is_uint = test(uint_mask);
+	const auto is_sint = test(sint_mask);
+	const auto channel = [&](uint32_t index) {
+		if (index >= count) return ConstantU32(state, 0u);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, channels, index);
+		return value;
+	};
+	std::array<uint32_t, 4> packed {};
+	for (uint32_t out = 0; out < components; ++out) {
+		const auto low  = channel(out * 2u);
+		const auto high = channel(out * 2u + 1u);
+		const auto as_uint = [&](uint32_t value) { return EmitUMin32(state, value, ConstantU32(state, 0xffffu)); };
+		const auto as_sint = [&](uint32_t value) {
+			return EmitSMin32(state, EmitSMax32(state, value, ConstantU32(state, 0xffff8000u)), ConstantU32(state, 0x7fffu));
+		};
+		const auto pack_int = [&](uint32_t lo, uint32_t hi) {
+			return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+			              Binary(state, spv::OpBitwiseAnd, TypeU32(state), lo, ConstantU32(state, 0xffffu)),
+			              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), hi, ConstantU32(state, 16u)));
+		};
+		const auto pair = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+		                          EmitBitCastF32U32(state, low), EmitBitCastF32U32(state, high));
+		const auto as_half = EmitPackHalf2x16(state, pair);
+		packed[out] = Select(state, TypeU32(state), is_uint, pack_int(as_uint(low), as_uint(high)),
+		                     Select(state, TypeU32(state), is_sint, pack_int(as_sint(low), as_sint(high)), as_half));
+	}
+	return ConstructU32Composite(state, components, packed);
+}
+
 // BUFFER_LOAD_FORMAT_XY/XYZ/XYZW through a V# the shader computed.
 uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	const auto channels = CallIndirectFormatFunction(ctx, inst);
+	if (ctx.Memory(inst).data_bits == 16u) {
+		return PackIndirectFormattedD16(ctx, inst, channels, components);
+	}
 	if (components == 4u) {
 		return channels;
 	}

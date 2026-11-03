@@ -1646,6 +1646,92 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
+// KYTY_TESS_MERGED_HULL=1 (default off, PPSA26344 preset; based on Erlou93/KytyPS5-Yotei): Ghost of
+// Yotei 2.x binds one merged LS+HS program (Agc binary type kHs) at the LS address and leaves the HS
+// address 0, where 1.x bound the two halves sceAgcFuseShaderHalves joined. The merged program is the
+// two halves one after the other: a prologue (EXEC = all, v0 = lane index by V_MBCNT, V_CMPX lane <
+// LS vertex count, S_CBRANCH_EXECZ to the HS part), the LS part, then the HS part from the branch
+// target on (beginning with EXEC = all). It is split there into what the halves path takes: the front
+// is the prologue and the LS part ending in the merged-stage handoff (S_SETPC_B64 s[6:7], where the
+// Local stage ends for AnalyzeTessellationPrograms); the back is the prologue's two V_MBCNT (the lane
+// index a separately compiled HS back half computes itself) and the HS part. A program of another
+// shape is not split (its patch draws are skipped).
+static bool TessMergedHullEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TESS_MERGED_HULL");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+struct MergedHullHalves {
+	bool                  valid = false;
+	std::vector<uint32_t> front;
+	std::vector<uint32_t> back;
+	uint64_t              front_hash = 0;
+	uint64_t              back_hash  = 0;
+};
+
+static const MergedHullHalves& SplitMergedHullProgram(uint64_t addr, uint32_t code_size_bytes, uint64_t hash) {
+	namespace Decoder = ShaderRecompiler::Decoder;
+	using Decoder::Opcode;
+	static std::mutex                                     mutex;
+	static std::unordered_map<uint64_t, MergedHullHalves> splits; // node-based: the halves stay valid
+	std::scoped_lock lock(mutex);
+	const uint64_t   key = hash ^ (addr * 0x9e3779b97f4a7c15ull);
+	if (const auto found = splits.find(key); found != splits.end()) return found->second;
+	auto&      halves = splits[key];
+	const auto code   = std::span {reinterpret_cast<const uint32_t*>(addr), code_size_bytes / sizeof(uint32_t)};
+	Decoder::Program program;
+	Decoder::DecodeProgram(code, program);
+	const auto& insts = program.instructions;
+	const auto  fail  = [&](const char* reason) -> const MergedHullHalves& {
+		LOGF("Tessellation: merged HS program 0x%016" PRIx64 " cannot be split: %s\n", addr, reason);
+		return halves;
+	};
+	size_t i = 0;
+	if (i < insts.size() && insts[i].opcode == Opcode::S_INST_PREFETCH) i++;
+	const auto is_exec_all = [](const Decoder::Instruction& inst) {
+		return inst.opcode == Opcode::S_MOV_B64 && inst.raw[0] == 0xbefe04c1u; // s_mov_b64 exec, -1
+	};
+	const auto is_lane_index = [](const Decoder::Instruction& inst, Opcode opcode) {
+		return inst.opcode == opcode && inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 0u;
+	};
+	if (i + 5u > insts.size() || !is_exec_all(insts[i]) || !is_lane_index(insts[i + 1u], Opcode::V_MBCNT_LO_U32_B32) ||
+	    !is_lane_index(insts[i + 2u], Opcode::V_MBCNT_HI_U32_B32) || insts[i + 3u].opcode != Opcode::V_CMPX_LT_U32 ||
+	    insts[i + 4u].opcode != Opcode::S_CBRANCH_EXECZ) {
+		return fail("no LS prologue (EXEC = all, V_MBCNT lane index, V_CMPX, S_CBRANCH_EXECZ)");
+	}
+	const auto& mbcnt_lo = insts[i + 1u];
+	const auto& mbcnt_hi = insts[i + 2u];
+	const auto  split_pc = insts[i + 4u].branch_target;
+	const auto  at_split = std::find_if(insts.begin(), insts.end(), [&](const auto& inst) { return inst.pc == split_pc; });
+	if (at_split == insts.end() || !is_exec_all(*at_split)) return fail("the HS part does not begin with EXEC = all");
+	for (const auto& inst: insts) {
+		if (inst.opcode == Opcode::S_GETPC_B64 || inst.opcode == Opcode::S_SETPC_B64 ||
+		    inst.opcode == Opcode::UNKNOWN || (inst.opcode == Opcode::S_ENDPGM && inst.pc < split_pc)) {
+			return fail("PC-relative code, an unknown instruction or an LS-part exit");
+		}
+		if (Decoder::IsDirectBranch(inst.opcode) && (inst.pc < split_pc) != (inst.branch_target <= split_pc)) {
+			return fail("a branch crosses between the LS and HS parts");
+		}
+	}
+	const auto split_word = split_pc / sizeof(uint32_t);
+	halves.front.assign(code.begin(), code.begin() + split_word);
+	halves.front.push_back(0xbe802006u); // s_setpc_b64 s[6:7]: the merged-stage handoff of a front half
+	for (const auto* inst: {&mbcnt_lo, &mbcnt_hi}) {
+		const auto first = code.begin() + inst->pc / sizeof(uint32_t);
+		halves.back.insert(halves.back.end(), first, first + inst->word_count);
+	}
+	halves.back.insert(halves.back.end(), code.begin() + split_word, code.end());
+	halves.front_hash = XXH3_64bits(halves.front.data(), halves.front.size() * sizeof(uint32_t));
+	halves.back_hash  = XXH3_64bits(halves.back.data(), halves.back.size() * sizeof(uint32_t));
+	halves.valid      = true;
+	LOGF("Tessellation: merged HS program 0x%016" PRIx64 " split at 0x%x: LS 0x%016" PRIx64 " HS 0x%016" PRIx64 "\n",
+	     addr, split_pc, halves.front_hash, halves.back_hash);
+	return halves;
+}
+
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info, bool* unsupported) {
@@ -1653,12 +1739,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	// Ghost of Yotei 02.002 issues patch draws whose hull program address is 0. A set with a stage
 	// the shader map does not hold has its patch draws skipped (KYTY_SKIP_INVALID, as below)
 	// instead of ending the emulator in the lookup.
+	// KYTY_TESS_MERGED_HULL: no HS address, one merged program at the LS address (checked below).
+	const bool maybe_merged = TessMergedHullEnabled() && regs.hs_regs.data_addr == 0;
 	if (unsupported != nullptr && Common::SkipInvalidEnabled() && !DrawPrep::Speculative()) {
 		bool missing = false;
 		{
 			std::scoped_lock lock(g_shader_map_mutex);
 			for (const auto addr: {regs.ls_regs.data_addr, regs.hs_regs.data_addr,
 			                       regs.es_regs.data_addr}) {
+				if (maybe_merged && addr == 0) continue;
 				missing = missing || g_shader_map == nullptr || !g_shader_map->contains(addr);
 			}
 		}
@@ -1679,10 +1768,31 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		}
 	}
 	const auto local      = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	const MergedHullHalves* merged = nullptr;
+	if (maybe_merged && local.type == Prospero::ShaderBinaryType::kHs) {
+		if (DrawPrep::Speculative()) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return {};
+		}
+		const auto& halves = SplitMergedHullProgram(regs.ls_regs.data_addr, local.code_size_bytes,
+		                                            RegisteredOrDeclaredShaderHash(regs.ls_regs.data_addr, local));
+		if (!halves.valid) {
+			EXIT_IF(unsupported == nullptr);
+			*unsupported = true;
+			return {};
+		}
+		merged = &halves;
+	}
+	ShaderMapEntry control;
+	if (merged != nullptr) {
+		control      = local;
+		control.type = Prospero::ShaderBinaryType::kHsBack;
+	} else {
+		control = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	}
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	if (unsupported != nullptr) *unsupported = false;
-	const bool unsupported_types = local.type != Prospero::ShaderBinaryType::kHsFront ||
+	const bool unsupported_types = (merged == nullptr && local.type != Prospero::ShaderBinaryType::kHsFront) ||
 	                               control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                               evaluation.type != Prospero::ShaderBinaryType::kGs;
 	const uint32_t stages             = context.GetShaderStages();
@@ -1714,23 +1824,32 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	EXIT_NOT_IMPLEMENTED(unsupported_types);
 	EXIT_NOT_IMPLEMENTED(unsupported_stages);
-	EXIT_IF(regs.hs_regs.user_data_addr == 0);
+	EXIT_IF(merged == nullptr && regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
+	const auto control_addr = merged != nullptr ? regs.ls_regs.data_addr : regs.hs_regs.data_addr;
 	std::array<ShaderParams, 3> params {
 	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS",
 	                    RegisteredOrDeclaredShaderHash(regs.ls_regs.data_addr, local), local_users, local),
-	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS",
-	                    RegisteredOrDeclaredShaderHash(regs.hs_regs.data_addr, control), local_users, control, 8u),
+	    GetShaderParams(control_addr, "ShaderRecompiler HS",
+	                    RegisteredOrDeclaredShaderHash(control_addr, control), local_users, control, 8u),
 	    GetShaderParams(regs.es_regs.data_addr, "ShaderRecompiler TES",
 	                    RegisteredOrDeclaredShaderHash(regs.es_regs.data_addr, evaluation), evaluation_users,
 	                    evaluation),
 	};
-	// The fused HS back half receives its separate user-data address in s0:s1.
-	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
-	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
-	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
+	if (merged != nullptr) {
+		// The halves of the merged program; the HS part keeps the merged program's user SGPRs at s8+.
+		params[0].code = merged->front;
+		params[0].hash = merged->front_hash;
+		params[1].code = merged->back;
+		params[1].hash = merged->back_hash;
+	} else {
+		// The fused HS back half receives its separate user-data address in s0:s1.
+		// RDNA2 reserves s0:s7 before the native HS user SGPRs.
+		params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
+		params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
+	}
 
 	input_info = {};
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,

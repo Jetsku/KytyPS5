@@ -21,12 +21,12 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 44 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
+// Members: 45 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
 // loop_guard_budget, loop_guard_shaders, bda_force_shaders, dispatcher_cap, rt_node_budget,
 // rt_function, lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 152,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 160,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -169,6 +169,12 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
+	}
+	if (options.indirect_format_d16) {
+		b.Text("indirect_format_d16_1");
+	}
+	if (options.bounded_key_images) {
+		b.Text("bounded_key_images1");
 	}
 	if (options.null_buffer_share) {
 		b.Text("null_buffer_share1");

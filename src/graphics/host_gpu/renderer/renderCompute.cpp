@@ -525,6 +525,48 @@ static bool ComputeMetaClearDispatchEnabled() {
 	return enabled;
 }
 
+// KYTY_HTILE_RMW_CLEAR=1 (default off, PPSA26344 preset; based on Erlou93/KytyPS5-Yotei, a port of
+// peepostare dbeff606): a dispatch that reads and rewrites one depth surface's HTile in place still
+// runs, and the clear is recorded for the next draw. Ghost of Yotei clears each shadow map's HTile
+// this way (CS b25b01ff1361e795); UpdateComputeMetaClears never takes a read metadata buffer, so the
+// shadow maps were never cleared and every caster failed the depth test (no moonlight).
+static void RecordHtileRewriteClear(TextureCache& cache, const ShaderComputeInputInfo& input) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HTILE_RMW_CLEAR");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	if (program.info.has_bitwise_xor) {
+		return;
+	}
+	const auto count = std::min(program.info.buffers.size(), resources.buffers.size());
+	uint64_t   meta  = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (!program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (!cache.IsMeta(descriptor.Base48())) {
+			continue;
+		}
+		// Several metadata surfaces, or a write-only clear (UpdateComputeMetaClears handles that one).
+		if (meta != 0 || !program.info.buffers[i].read) {
+			return;
+		}
+		meta = descriptor.Base48();
+	}
+	if (meta != 0 && cache.ClearMeta(meta)) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			LOGF("HTILE_RMW_CLEAR: CS 0x%016" PRIx64 " meta 0x%" PRIx64 "\n", program.shader_hash, meta);
+		}
+	}
+}
+
 // Whether a metadata clear was recorded.
 bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
                                             const CommandBuffer&          buffer,
@@ -1012,6 +1054,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	// A recorded metadata clear consumes the dispatch unless KYTY_COMPUTE_META_CLEAR_DISPATCH keeps
 	// its guest writes (upstream 01ce97388).
 	bool keep_meta_dispatch = false;
+	RecordHtileRewriteClear(buffer.GetContext().GetTextureCache(), input_info);
 	if (UpdateComputeMetaClears(input_info, buffer, &keep_meta_dispatch) &&
 	    !ComputeMetaClearDispatchEnabled() && !keep_meta_dispatch) {
 		ResetBindings();
