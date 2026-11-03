@@ -45,6 +45,11 @@ CodegenOptions FromEnvironment() {
 	options.flat_aperture_bvh   = EnvFlag("KYTY_FLAT_APERTURE_BVH", options.flat_aperture_bvh);
 	options.lane_local          = EnvFlag("KYTY_LANE_LOCAL", options.lane_local);
 	options.readonly_buffers    = EnvFlag("KYTY_READONLY_BUFFERS", options.readonly_buffers);
+	options.native_f16     = EnvFlag("KYTY_NATIVE_F16", options.native_f16);
+	options.f32_flush_host = EnvFlag("KYTY_F32_FLUSH_HOST", options.f32_flush_host);
+	if (const auto* glc = std::getenv("KYTY_COHERENT_GLC_ONLY"); glc != nullptr && glc[0] != '\0') {
+		options.coherent_glc_only = std::strcmp(glc, "2") == 0 ? 2u : std::strcmp(glc, "0") == 0 ? 0u : 1u;
+	}
 	options.interp_modes = EnvFlag("KYTY_INTERP_MODES", options.interp_modes);
 	options.sample_offsets = EnvFlag("KYTY_SAMPLE_OFFSETS", options.sample_offsets);
 	options.sample_lod_clamp = EnvFlag("KYTY_SAMPLE_LOD_CLAMP", options.sample_lod_clamp);
@@ -236,6 +241,22 @@ void SetHostUniformBufferRobust(bool robust) {
 
 bool GetHostUniformBufferRobust() {
 	return g_host_uniform_buffer_robust.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::atomic<bool> g_host_native_half {false};
+} // namespace
+
+void SetHostNativeHalf(bool supported) {
+	g_host_native_half.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostNativeHalf() {
+	return g_host_native_half.load(std::memory_order_relaxed);
+}
+
+bool NativeHalfActive() {
+	return Storage().native_f16 && GetHostNativeHalf();
 }
 
 const CodegenOptions& GetCodegenOptions() {

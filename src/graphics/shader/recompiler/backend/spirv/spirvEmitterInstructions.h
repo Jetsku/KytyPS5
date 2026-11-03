@@ -47,6 +47,18 @@ inline constexpr auto EmitPackSnorm2x16 =
 inline constexpr auto EmitPackUnorm2x16 =
     EmitGlsl<GLSLstd450PackUnorm2x16, IR::Type::U32, uint32_t>;
 uint32_t              EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1);
+inline uint32_t EmitHalfPkAdd(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitHalfPk(state, HalfPkOp::Add, arg0, arg1);
+}
+inline uint32_t EmitHalfPkMul(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitHalfPk(state, HalfPkOp::Mul, arg0, arg1);
+}
+inline uint32_t EmitHalfPkMin(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitHalfPk(state, HalfPkOp::Min, arg0, arg1);
+}
+inline uint32_t EmitHalfPkMax(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	return EmitHalfPk(state, HalfPkOp::Max, arg0, arg1);
+}
 inline constexpr auto EmitFPAbs32 = EmitFAbsValue;
 inline constexpr auto EmitFPNeg32 = EmitFNegateValue;
 uint32_t              EmitFPSaturate32(EmitterState& state, uint32_t arg0);
@@ -132,6 +144,11 @@ EMIT_NATIVE(LogicalNot, OpLogicalNot, U1, uint32_t)
 template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
+	// KYTY_F32_FLUSH_HOST: two register operands are flushed by the host's compare (CodegenOptions,
+	// checked with dynamic operands only); a compare with an immediate keeps the explicit flush, as
+	// the driver may lower it to an integer test.
+	const bool host_flush = F32FlushHost(ctx.state) && !inst.Arg(0).IsImmediate() &&
+	                        !inst.Arg(1).IsImmediate();
 	const bool flush =
 	    inst.Flags<IR::FPCompareFlags>().flush_input_denorms && !DenormFlushSkipped(ctx.state);
 	const auto operand = [&](size_t index) {
@@ -142,7 +159,7 @@ uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                  ? bits & 0x80000000u : bits);
 		}
 		const auto id = ctx.Arg(inst, index);
-		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
+		return flush && !host_flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
 	};
 	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
 }

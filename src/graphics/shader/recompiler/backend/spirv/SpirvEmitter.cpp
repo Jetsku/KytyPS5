@@ -333,6 +333,19 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
 			// KYTY_DCACHE_INV: an invalidation makes every buffer the program reads coherent.
 			requirements.coherent_buffers |= inst.GetOpcode() == IR::ValueOpcode::DataCacheInvalidate;
+			requirements.coherent_dcache |= inst.GetOpcode() == IR::ValueOpcode::DataCacheInvalidate;
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::HalfPkAdd:
+				case IR::ValueOpcode::HalfPkMul:
+				case IR::ValueOpcode::HalfPkMin:
+				case IR::ValueOpcode::HalfPkMax: requirements.native_half = true; break;
+				default: break;
+			}
+			{
+				const auto image_access = IR::ImageOpcodeInfoOf(inst.GetOpcode()).access;
+				requirements.image_writes |=
+				    image_access == IR::ImageAccess::Write || image_access == IR::ImageAccess::Atomic;
+			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
@@ -392,6 +405,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					const auto bits = StorageBufferElementBits(program, memory);
 					requirements.buffer_u8 |= bits == 8u;
 					requirements.buffer_u16 |= bits == 16u;
+					requirements.coherent_narrow |= memory.coherent && bits != 32u;
 					// ADD_TID adds the lane's id within its wave to the index. BufferLane takes it from
 					// EmitSubgroupLocalInvocationId, the lane id every cross-lane op of the stage uses
 					// (wave64 halves, wave32 clusters). A wave64 vertex or pixel shader on a 32-wide

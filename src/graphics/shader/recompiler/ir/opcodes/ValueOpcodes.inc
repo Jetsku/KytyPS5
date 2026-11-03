@@ -85,6 +85,11 @@ VALUE_OPCODE(PackHalf2x16, U32, F32x2)
 VALUE_OPCODE(PackSnorm2x16, U32, F32x2)
 VALUE_OPCODE(PackUnorm2x16, U32, F32x2)
 VALUE_OPCODE(PackFloat2x16Rtz, U32, F32, F32)
+// KYTY_NATIVE_F16: two f16 lanes packed in each u32, one f16vec2 operation.
+VALUE_OPCODE(HalfPkAdd, U32, U32, U32)
+VALUE_OPCODE(HalfPkMul, U32, U32, U32)
+VALUE_OPCODE(HalfPkMin, U32, U32, U32)
+VALUE_OPCODE(HalfPkMax, U32, U32, U32)
 
 // Source/destination modifiers made explicit by translation.
 VALUE_OPCODE(FPAbs32, F32, F32)

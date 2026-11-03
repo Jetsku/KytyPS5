@@ -4,10 +4,15 @@
 
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 
@@ -31,7 +36,40 @@ void NoteMissingComputeDerivatives(uint64_t shader_hash) {
 	             shader_hash);
 }
 
+// KYTY_COHERENT_GLC_LOG=1: one line per emitted program with coherent buffers (why it keeps
+// whole-program coherence, or that only its GLC accesses are Coherent), with running totals; also
+// one line per program with KYTY_NATIVE_F16 operations.
+std::atomic<uint64_t> g_coherent_programs {0};
+std::atomic<uint64_t> g_coherent_per_access {0};
+
 } // namespace
+
+void CountCoherentProgram(const EmitterState& state, bool per_access) {
+	if (!state.requirements.coherent_buffers) {
+		return;
+	}
+	const auto total = g_coherent_programs.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto glc   = g_coherent_per_access.fetch_add(per_access ? 1 : 0, std::memory_order_relaxed) +
+	                 (per_access ? 1 : 0);
+	static const bool log = [] {
+		const auto* value = std::getenv("KYTY_COHERENT_GLC_LOG");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (!log) {
+		return;
+	}
+	const auto& r = state.requirements;
+	char        text[320];
+	std::snprintf(text, sizeof(text),
+	              "Kyty coherent program 0x%016" PRIx64 " stage %u: %s (buffer writes %d, narrow %d, "
+	              "image writes %d, u64 %d, dcache inv %d); totals %" PRIu64 " coherent, %" PRIu64
+	              " GLC-only\n",
+	              state.program.shader_hash, static_cast<unsigned>(state.program.stage),
+	              per_access ? "GLC accesses only" : "whole program", r.buffer_writes ? 1 : 0,
+	              r.coherent_narrow ? 1 : 0, r.image_writes ? 1 : 0, r.buffer_int64_atomics ? 1 : 0,
+	              r.coherent_dcache ? 1 : 0, total, glc);
+	Log::WriteToConsoleAndLog(text);
+}
 
 bool DispatchDimensionsIndirect(const EmitterState& state) {
 	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
@@ -430,14 +468,35 @@ void DefineDescriptors(EmitterState& state) {
 				// scalar registers, as the guest's S_BUFFER_LOAD does, instead of once per lane
 				// with the address in a vector register. Coherent (polling) loads keep the
 				// buffers writable-declared so no load can be assumed loop-invariant.
+				// KYTY_COHERENT_GLC_ONLY (Erlou93/KytyPS5-Yotei: a grass vertex shader with one GLC read
+				// among 107 per vertex 7.2 -> <0.15 ms per frame on their GPU): in a program that writes
+				// no buffer or image memory, only the GLC/DLC accesses use a Coherent alias. Nothing the
+				// command itself does can change what a plain read sees (no invocation of it writes
+				// buffer memory); writes of earlier commands are made visible by the emulator's barriers;
+				// and the guest's own non-GLC loads go through its non-coherent GL0/GL1 caches too.
+				const auto glc_only_mode = GetCodegenOptions().coherent_glc_only;
+				const bool per_access_coherence =
+				    glc_only_mode != 0u && state.requirements.coherent_buffers &&
+				    !state.requirements.buffer_writes && !state.requirements.coherent_narrow &&
+				    !state.requirements.image_writes && !state.requirements.buffer_int64_atomics &&
+				    (glc_only_mode == 2u || !state.requirements.coherent_dcache);
+				CountCoherentProgram(state, per_access_coherence);
+				if (per_access_coherence) {
+					state.storage_buffer_coherent_variable =
+					    Define(ArrayType(StorageBufferType(state)), "buffers_coherent");
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_coherent_variable,
+					                            spv::DecorationAliased);
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_coherent_variable,
+					                            spv::DecorationCoherent);
+				}
 				const bool read_only = GetCodegenOptions().readonly_buffers &&
 				                       !state.requirements.buffer_writes &&
-				                       !state.requirements.coherent_buffers;
+				                       (!state.requirements.coherent_buffers || per_access_coherence);
 				for (const auto variable: {state.storage_buffer_variable, state.storage_buffer_u8_variable,
 				                           state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
 					if (variable == 0) continue;
 					if (state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
-					    state.storage_buffer_u64_variable != 0) {
+					    state.storage_buffer_u64_variable != 0 || per_access_coherence) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
 					}
 					if (read_only) {
@@ -445,7 +504,7 @@ void DefineDescriptors(EmitterState& state) {
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (state.requirements.coherent_buffers) {
+					if (state.requirements.coherent_buffers && !per_access_coherence) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
 					}
 				}
@@ -1091,6 +1150,29 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	// KYTY_NATIVE_F16: f16vec2 arithmetic rounds to nearest even and keeps signed zeros, infinities
+	// and NaNs, as the guest's packed f16 ops do (f16 denormals: DenormPreserve 16 below, when the
+	// device takes it, as before).
+	if (state.requirements.native_half) {
+		static std::atomic<uint64_t> native_half_programs {0};
+		const auto count = native_half_programs.fetch_add(1, std::memory_order_relaxed) + 1;
+		static const bool log = [] {
+			const auto* value = std::getenv("KYTY_COHERENT_GLC_LOG");
+			return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		}();
+		if (log) {
+			char text[160];
+			std::snprintf(text, sizeof(text),
+			              "Kyty native f16 program 0x%016" PRIx64 " stage %u; total %" PRIu64 "\n",
+			              state.program.shader_hash, static_cast<unsigned>(state.program.stage), count);
+			Log::WriteToConsoleAndLog(text);
+		}
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 16u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               16u);
+	}
 	// FLOAT_MODE 0xC0 flushes f32 denormals (inputs and outputs) and keeps f16/f64 ones.
 	// Declare only what the device supports; otherwise host defaults stay in effect.
 	const auto float_controls = GetHostFloatControls();

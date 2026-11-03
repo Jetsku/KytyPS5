@@ -906,6 +906,27 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering == VK_TRUE;
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	// KYTY_NATIVE_F16 (CodegenOptions::native_f16): shaderFloat16 with RoundingModeRTE and
+	// SignedZeroInfNanPreserve for 16-bit floats settable apart from the 32/64-bit modes.
+	if (const auto* native_f16 = std::getenv("KYTY_NATIVE_F16");
+	    native_f16 != nullptr && native_f16[0] != '\0' && std::strcmp(native_f16, "0") != 0) {
+		vk::PhysicalDeviceVulkan12Properties float_properties {};
+		vk::PhysicalDeviceProperties2        properties {};
+		properties.pNext = &float_properties;
+		physical_device.getProperties2(&properties);
+		using Independence = vk::ShaderFloatControlsIndependence;
+		const bool native_half =
+		    supported_features12.shaderFloat16 == VK_TRUE &&
+		    float_properties.shaderRoundingModeRTEFloat16 == VK_TRUE &&
+		    float_properties.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE &&
+		    float_properties.roundingModeIndependence == Independence::eAll &&
+		    float_properties.denormBehaviorIndependence != Independence::eNone;
+		if (native_half) {
+			features12.shaderFloat16 = VK_TRUE;
+		}
+		ShaderRecompiler::SetHostNativeHalf(native_half);
+		LOGF("Vulkan native f16 (KYTY_NATIVE_F16): %s\n", native_half ? "true" : "false (device lacks it)");
+	}
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;

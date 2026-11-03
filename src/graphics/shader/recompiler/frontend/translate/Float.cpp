@@ -25,7 +25,25 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 	auto raw    = DestinationOperand(inst);
 	raw.omod    = 0u;
 	raw.clamp   = false;
-	auto result = PackHalf2x16(translate_lane(false), translate_lane(true));
+	// KYTY_NATIVE_F16: add/mul/min/max of two sources without result modifiers as one f16vec2
+	// operation on the packed source halves (selection, abs and neg already applied per lane).
+	IR::ValueOpcode native = IR::ValueOpcode::Void;
+	if (!accumulator && inst.src_count == 2u && !inst.dst.clamp && inst.dst.omod == 0u &&
+	    NativeHalfActive()) {
+		switch (opcode) {
+			case IR::ValueOpcode::FPAdd32: native = IR::ValueOpcode::HalfPkAdd; break;
+			case IR::ValueOpcode::FPMul32: native = IR::ValueOpcode::HalfPkMul; break;
+			case IR::ValueOpcode::FPMin32: native = IR::ValueOpcode::HalfPkMin; break;
+			case IR::ValueOpcode::FPMax32: native = IR::ValueOpcode::HalfPkMax; break;
+			default: break;
+		}
+	}
+	const auto packed = [&](const Decoder::Operand& operand) {
+		return PackU16Lanes(Read16LaneBits(operand, false), Read16LaneBits(operand, true));
+	};
+	auto result = native != IR::ValueOpcode::Void
+	                  ? IR::U32(ir.Emit(native, {packed(inst.src0), packed(inst.src1)}))
+	                  : PackHalf2x16(translate_lane(false), translate_lane(true));
 	if (quiet_snan) {
 		const auto quiet_snan_lane = [&](const Decoder::Operand& operand, bool high) {
 			const auto bits     = ReadU16LaneAsU32(operand, high, false);

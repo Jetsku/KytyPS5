@@ -243,9 +243,12 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			const auto bits = mem.kind == IR::ResourceKind::Buffer
 			                      ? StorageBufferElementBits(state.program, mem) : 32u;
+			// KYTY_COHERENT_GLC_ONLY: only GLC/DLC accesses use the Coherent alias.
 			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
 			                      : bits == 16u ? state.storage_buffer_u16_variable
-			                                    : state.storage_buffer_variable;
+			                      : mem.coherent && state.storage_buffer_coherent_variable != 0
+			                          ? state.storage_buffer_coherent_variable
+			                          : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
 			    state, mem, variable, TypeStorageBufferPointer(state, bits));
 			access.element_bits = bits;
