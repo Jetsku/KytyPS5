@@ -78,6 +78,10 @@ struct BindlessHeap {
 	std::vector<ImageId>                 images;
 	uint32_t                             revalidate_cursor = 0; // next key to compare
 	uint64_t                             processed_frame    = UINT64_MAX; // record heaps: last ProcessRecordHeap
+	// KYTY_BINDLESS_SYNC_RETIRE: the last frame a draw prepared this heap, and whether a sync
+	// skipped a write into its keys since (the next draw that uses it compares every key first).
+	uint64_t                             sync_used_frame    = 0;
+	bool                                 sync_stale         = false;
 	uint64_t                             processed_snapshot = 0; // record heaps: snapshot serial taken
 	// What RenderExecutor::CommitBindings last checked: g_bindless_state_generation then, and
 	// how many resolved images. Unchanged since, only the images resolved after need a look.

@@ -1141,6 +1141,10 @@ private:
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void ResolveBindlessRequests();
 	void SyncWrittenBindlessEntries();
+	// Compares keys [first, last) of a heap with the T#s now in guest memory and settles the
+	// changed ones again (SyncWrittenBindlessEntries; KYTY_BINDLESS_SYNC_RETIRE's recheck).
+	void RecheckBindlessKeys(BindlessHeap& heap, uint32_t first, uint32_t last, uint32_t& view_changes,
+	                         uint32_t& resource_changes, uint32_t& resettled);
 	bool ResolveBindlessKey(BindlessHeap& heap, uint32_t key);
 	// A settled key whose T# changed: released (its image unpinned when no key refers to it any
 	// more) and resolved again; it keeps its old slot while the new texture cannot be resolved

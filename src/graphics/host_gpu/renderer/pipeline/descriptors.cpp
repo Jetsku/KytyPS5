@@ -2606,6 +2606,38 @@ void RenderExecutor::SyncBindlessHeaps() {
 
 // KYTY_BINDLESS_SYNC_INDEX (live, default off): see SyncWrittenBindlessEntries.
 static Live::Switch g_bindless_sync_index("KYTY_BINDLESS_SYNC_INDEX", Live::ParseDefaultOff);
+// KYTY_BINDLESS_SYNC_RETIRE=<frames> (live, default 0): see SyncWrittenBindlessEntries.
+static Live::Switch g_bindless_sync_retire("KYTY_BINDLESS_SYNC_RETIRE", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::min(std::strtoull(value, nullptr, 10), 1000000ull)) : 0;
+});
+static std::atomic<uint64_t> g_bindless_retired_skips {0};
+static std::atomic<uint64_t> g_bindless_retired_rechecks {0};
+
+void RenderExecutor::RecheckBindlessKeys(BindlessHeap& heap, uint32_t first, uint32_t last,
+                                         uint32_t& view_changes, uint32_t& resource_changes,
+                                         uint32_t& resettled) {
+	const auto heap_begin = heap.base + heap.table_offset;
+	const auto stride     = heap.stride;
+	m_bindless_window.resize(last - first);
+	if (!ReadHeapDescriptors(heap_begin, stride, first, last - first, m_bindless_window.data())) {
+		return;
+	}
+	for (auto& words: m_bindless_window) {
+		MaskR128HeapWords(heap, words.data());
+	}
+	for (uint32_t key = first; key < last; key++) {
+		const auto& words = m_bindless_window[key - first];
+		if (heap.settled[key] == 0 || heap.descriptors[key] == words) {
+			continue;
+		}
+		bool resource = false;
+		for (uint32_t i = 0; i < 8; i++) {
+			resource |= ((heap.descriptors[key][i] ^ words[i]) & ~BindlessViewMask[i]) != 0;
+		}
+		(resource ? resource_changes : view_changes)++;
+		resettled += ResettleBindlessKey(heap, key) ? 1u : 0u;
+	}
+}
 
 void RenderExecutor::SyncWrittenBindlessEntries() {
 	auto& table = m_context.GetBindlessTable();
@@ -2685,6 +2717,15 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 		m_bindless_heap_buckets.clear();
 		m_bindless_heap_indexed = 0;
 	}
+	// KYTY_BINDLESS_SYNC_RETIRE=<frames> (live, default 0 = off; PPSA26344 preset): a heap no draw
+	// prepared in that many frames is not compared here; it is marked stale and its next user
+	// compares all its keys before the draw (the same comparison, later). Ghost of Yotei leaves
+	// tens of thousands of dead heaps over memory it keeps rewriting (material records at moving
+	// addresses), and comparing them made each sync slower with play time (uProf: the sync and
+	// its guest reads grew from 330 s to 670 s of one boot).
+	const auto retire  = static_cast<uint64_t>(g_bindless_sync_retire.Get());
+	const auto frame   = BindlessFrame();
+	uint64_t   retired = 0;
 	const auto heap_count = use_index ? candidates.size() : heaps.size();
 	for (size_t heap_index = 0; heap_index < heap_count; heap_index++) {
 		auto& heap = heaps[use_index ? candidates[heap_index] : heap_index];
@@ -2708,26 +2749,30 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 			if (last <= first) {
 				continue;
 			}
-			m_bindless_window.resize(last - first);
-			if (!ReadHeapDescriptors(heap_begin, stride, first, last - first,
-			                         m_bindless_window.data())) {
-				continue;
+			if (retire != 0 && frame > heap.sync_used_frame + retire) {
+				// KYTY_BINDLESS_SYNC_RETIRE: no draw used the heap for a while; its next user
+				// compares every key first (PrepareBindlessHeaps).
+				heap.sync_stale = true;
+				retired++;
+				break;
 			}
-			for (auto& words: m_bindless_window) {
-				MaskR128HeapWords(heap, words.data());
-			}
-			for (uint32_t key = first; key < last; key++) {
-				const auto& words = m_bindless_window[key - first];
-				if (heap.settled[key] == 0 || heap.descriptors[key] == words) {
-					continue;
-				}
-				bool resource = false;
-				for (uint32_t i = 0; i < 8; i++) {
-					resource |= ((heap.descriptors[key][i] ^ words[i]) & ~BindlessViewMask[i]) != 0;
-				}
-				(resource ? resource_changes : view_changes)++;
-				resettled += ResettleBindlessKey(heap, key) ? 1u : 0u;
-			}
+			RecheckBindlessKeys(heap, first, last, view_changes, resource_changes, resettled);
+		}
+	}
+	g_bindless_retired_skips.fetch_add(retired, std::memory_order_relaxed);
+	if (retire != 0 || sync_index) {
+		// Every 10 s while either switch is on: what the sync did (log only).
+		static auto last_line = std::chrono::steady_clock::now();
+		static uint64_t syncs = 0, candidate_sum = 0;
+		syncs++;
+		candidate_sum += use_index ? candidates.size() : heaps.size();
+		if (const auto now = std::chrono::steady_clock::now(); now - last_line >= std::chrono::seconds(10)) {
+			last_line = now;
+			LOGF("BindlessSync 10s: syncs=%" PRIu64 " heaps=%zu compared_per_sync=%.0f retired_skips=%" PRIu64
+			     " stale_rechecks=%" PRIu64 "\n",
+			     syncs, heaps.size(), syncs != 0 ? static_cast<double>(candidate_sum) / static_cast<double>(syncs) : 0.0,
+			     g_bindless_retired_skips.exchange(0), g_bindless_retired_rechecks.exchange(0));
+			syncs = candidate_sum = 0;
 		}
 	}
 	uint64_t bytes = 0;
@@ -3150,6 +3195,18 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		}
 		if (heap == nullptr) {
 			continue; // region 0, count 0: every key samples the placeholder
+		}
+		// KYTY_BINDLESS_SYNC_RETIRE (SyncWrittenBindlessEntries): in use again; a skipped write is
+		// caught up by comparing every key now, before this draw.
+		heap->sync_used_frame = BindlessFrame();
+		if (heap->sync_stale) {
+			heap->sync_stale = false;
+			const auto keys  = std::min(heap->guest_entries, static_cast<uint32_t>(heap->settled.size()));
+			uint32_t   view = 0, resource_changes = 0, resettled = 0;
+			if (keys != 0 && heap->record_pointer == UINT32_MAX && !heap->runtime) {
+				RecheckBindlessKeys(*heap, 0, keys, view, resource_changes, resettled);
+			}
+			g_bindless_retired_rechecks.fetch_add(1, std::memory_order_relaxed);
 		}
 		if (BindlessEngineEnabled() && table.NeedsWatch(*heap)) {
 			table.WatchHeap(*heap);
