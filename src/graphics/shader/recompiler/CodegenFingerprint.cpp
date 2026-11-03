@@ -170,6 +170,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
 	}
+	if (options.null_buffer_share) {
+		b.Text("null_buffer_share1");
+	}
 	if (options.indirect_raw_outline) {
 		b.Text("indirect_raw_outline1");
 	}

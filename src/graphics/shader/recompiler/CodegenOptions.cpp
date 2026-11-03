@@ -76,6 +76,7 @@ CodegenOptions FromEnvironment() {
 	options.cfg_clone_exits   = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
 	options.cfg_clone_regions = EnvFlag("KYTY_CFG_CLONE_REGIONS", options.cfg_clone_regions);
 	options.indirect_raw_outline = EnvFlag("KYTY_INDIRECT_RAW_OUTLINE", options.indirect_raw_outline);
+	options.null_buffer_share    = EnvFlag("KYTY_NULL_BUFFER_SHARE", options.null_buffer_share);
 	options.heap_key_mask     = EnvFlag("KYTY_HEAP_KEY_MASK", options.heap_key_mask);
 	options.wave64_active_zero =
 	    EnvFlag("KYTY_WAVE64_ACTIVE_ZERO", options.wave64_active_zero);

@@ -272,6 +272,14 @@ struct CodegenOptions {
 	// dword at every load (adapted from Erlou93/KytyPS5-Yotei F1, indirect_raw_dword / _x<N>). Same
 	// results. Ghost of Yotei's 0x4ca0cf7e5a0c4757 has ~500 such loads; its driver compile took 65 s.
 	bool indirect_raw_outline = false;
+	// KYTY_NULL_BUFFER_SHARE=1 (default 0): a null buffer V# (all zeros) specializes like the last live
+	// V# of its slot (ResourceMaterialization.cpp SpecializeBuffer), so a shader whose slots are null in
+	// some dispatches and live in others has one permutation instead of one per null/live combination
+	// (Ghost of Yotei: 0x79b0066f0cd1f3cd had 15, each a 50-100 s driver compile; Erlou93/KytyPS5-Yotei
+	// M115). The renderer binds such a slot as the null buffer at the null marker offset
+	// (NullBufferMarkerOffset), so every access is out of range: loads read 0, stores drop, and a
+	// formatted read's DST_SEL constants are replaced by 0 as a null V# gives.
+	bool null_buffer_share = false;
 	// KYTY_INDIRECT_FORMAT_INLINE_HASHES=<hex>[,<hex>...] (default unset): with
 	// KYTY_INDIRECT_FORMAT_FAST, these programs inline the full decoder (as
 	// KYTY_INDIRECT_FORMAT_INLINE does for all), the others keep the fast + DontInline pair.
@@ -600,6 +608,9 @@ struct ComputeLdsPlan {
 
 // GDS dwords, counted from the end of GDS, that KYTY_RT_NODE_BUDGET and KYTY_RT_NODE_STATS report
 // through (the last one is KYTY_LOOP_GUARD's).
+// KYTY_NULL_BUFFER_SHARE: the shader-data byte offset of a buffer slot bound as the null buffer (an
+// 8-bit field; real offsets stay below the storage/uniform offset alignment).
+inline constexpr uint32_t NullBufferMarkerOffset = 255;
 inline constexpr uint32_t RtNodeBudgetGdsFromEnd = 2;
 inline constexpr uint32_t RtNodeStatsGdsFromEnd  = 3;
 inline constexpr uint32_t RtNodeStatsBins        = 24;

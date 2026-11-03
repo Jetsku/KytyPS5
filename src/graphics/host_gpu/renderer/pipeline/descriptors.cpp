@@ -239,6 +239,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	using LookupOutcome = BufferLookupStats::Outcome;
 	if (address == 0 || size == 0) {
 		BufferLookupStats::AddBinding(LookupOutcome::Null, 0);
+		// KYTY_NULL_BUFFER_SHARE: the slot may run a live V#'s specialization; the marker offset
+		// puts every access past the null buffer's 16 bytes (and tells formatted reads it is null).
+		if (ShaderRecompiler::GetCodegenOptions().null_buffer_share) {
+			buffer_offset = ShaderRecompiler::NullBufferMarkerOffset;
+		}
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();

@@ -840,9 +840,22 @@ uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
 uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                    const PreparedFormattedMemory& plan, uint32_t components) {
 	std::array<uint32_t, 4> values {};
+	// KYTY_NULL_BUFFER_SHARE: a slot bound as the null buffer (marker offset) reads zero in every
+	// channel, as a null V# (DST_SEL 0) does, whatever DST_SELs its shared specialization has.
+	uint32_t is_null = 0;
+	if (GetCodegenOptions().null_buffer_share && mem.kind == IR::ResourceKind::Buffer &&
+	    mem.resource < ctx.state.memory_byte_offsets.size()) {
+		is_null = Binary(ctx.state, spv::OpIEqual, TypeBool(ctx.state),
+		                 ctx.state.memory_byte_offsets[mem.resource],
+		                 ConstantU32(ctx.state, NullBufferMarkerOffset));
+	}
 	for (uint32_t component = 0; component < components; component++) {
 		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
 		values[component] = FormattedConstant(ctx, plan.info, source.kind);
+		if (is_null != 0 && source.kind == FormattedSourceKind::One) {
+			values[component] = Select(ctx.state, TypeU32(ctx.state), is_null,
+			                           ConstantU32(ctx.state, 0), values[component]);
+		}
 	}
 	return ConstructU32Composite(ctx.state, components, values);
 }

@@ -3,7 +3,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/liveSwitch.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -502,6 +504,55 @@ void TestRecordedPreparationCertifies() {
   g_probe_memory = {};
 }
 
+// KYTY_NULL_BUFFER_SHARE: a formatted buffer slot read from user data specializes a null V# (all
+// zeros) like the slot's last live V#; without the switch the null V# is its own specialization.
+void TestNullBufferShare() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto saved = GetCodegenOptions();
+  for (const bool share : {false, true}) {
+    auto options = saved;
+    options.null_buffer_share = share;
+    SetCodegenOptions(options);
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &value_block = AddValueBlock(program);
+    DescriptorSource source;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto &user_data = value_block.AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+      source.dwords[i] = Value(&user_data);
+    }
+    source.dword_count = 4;
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0, .read = true, .formatted = true});
+    const auto plan = ExtractResourcePlan(program);
+    // A live V#: base 0x10000, stride 16, 64 records, DST_SEL X,Y,Z,1, format 77, OOB_SELECT 3.
+    const std::array<uint32_t, 4> live{0x10000u, 16u << 16u, 64u,
+                                       (3u << 28u) | (77u << 12u) | 4u | (5u << 3u) | (6u << 6u) | (1u << 9u)};
+    const std::array<uint32_t, 4> null{};
+    ResourceSnapshot live_snapshot, null_snapshot;
+    ResourceSpecialization live_spec, null_spec;
+    Check(MaterializeResources(plan, SrtRuntime{.user_data = live}, live_snapshot, live_spec),
+          "null share: live materialization failed");
+    Check(MaterializeResources(plan, SrtRuntime{.user_data = null}, null_snapshot, null_spec),
+          "null share: null materialization failed");
+    Check(live_spec.buffers.size() == 1 && null_spec.buffers.size() == 1,
+          "null share: one buffer expected");
+    if (share) {
+      Check(null_spec == live_spec, "null share: the null V# did not take the live specialization");
+      Check(std::ranges::all_of(null_snapshot.buffers[0].dwords, [](uint32_t w) { return w == 0u; }),
+            "null share: the null V#'s snapshot must stay null (the renderer binds the null buffer)");
+    } else {
+      Check(!(null_spec == live_spec) && null_spec.buffers[0].zero_stride_oob,
+            "null share off: the null V# must keep its own specialization");
+    }
+  }
+  SetCodegenOptions(saved);
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -936,6 +987,7 @@ int main() {
   TestGpuFillSlotsLeaveShaderOnlyReads();
   }
   TestMultisampleDepthReadAsSingleSample();
+  TestNullBufferShare();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

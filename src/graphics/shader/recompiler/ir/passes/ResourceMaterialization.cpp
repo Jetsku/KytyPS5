@@ -811,7 +811,67 @@ uint64_t UnmappedBufferNulls() {
 	return g_unmapped_buffer_nulls.load(std::memory_order_relaxed);
 }
 
-static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& descriptor_value,
+// KYTY_NULL_BUFFER_SHARE (CodegenOptions::null_buffer_share): a buffer slot of the plan that
+// specializes the same in every permutation but for null vs live. Bindings selected at run time
+// (indirect roots, image aliases) and scalar buffers keep their own null specialization.
+static bool NullShareSlot(const BufferResource& buffer) {
+	return buffer.indirect_root == BufferResource::NoIndirectBuffer &&
+	       buffer.image_alias == BufferResource::NoImageAlias && !buffer.scalar &&
+	       buffer.indirect_resources.empty();
+}
+
+static uint64_t PackNullShare(const ResourceSpecialization::Buffer& b) {
+	return 1u | (uint64_t {b.packed_stride & 0xfffffu} << 1u) |
+	       (uint64_t {static_cast<uint32_t>(b.descriptor_format) & 0xffu} << 21u) |
+	       (uint64_t {b.descriptor_swizzle & 0xfffu} << 29u) | (uint64_t {b.zero_stride_oob ? 1u : 0u} << 41u);
+}
+
+// The last live specialization per (shader, stage, user data, slot): an open-addressed table of
+// atomics (the materialization hot path takes no lock). A full table shares nothing more.
+struct NullShareEntry {
+	std::atomic<uint64_t> key {0};
+	std::atomic<uint64_t> value {0};
+};
+constexpr size_t                         NullShareTableSize = size_t {1} << 15u;
+static std::array<NullShareEntry, NullShareTableSize> g_null_share_table;
+
+static uint64_t NullShareKey(const ResourcePlan& program, uint32_t i) {
+	uint64_t key = program.shader_hash ^ (uint64_t {static_cast<uint32_t>(program.stage)} << 56u) ^
+	               (uint64_t {program.user_data_base} << 40u) ^ (uint64_t {program.user_data_count} << 48u) ^
+	               ((uint64_t {i} + 1u) * 0x9e3779b97f4a7c15ull);
+	key ^= key >> 29u;
+	key *= 0xbf58476d1ce4e5b9ull;
+	key ^= key >> 32u;
+	return key == 0u ? 1u : key;
+}
+
+static std::atomic<uint64_t>* NullShareValue(uint64_t key, bool insert) {
+	for (size_t probe = 0; probe < 16u; ++probe) {
+		auto&    entry    = g_null_share_table[(key + probe) & (NullShareTableSize - 1u)];
+		uint64_t existing = entry.key.load(std::memory_order_acquire);
+		if (existing == key) return &entry.value;
+		if (existing == 0u) {
+			if (!insert) return nullptr;
+			if (entry.key.compare_exchange_strong(existing, key, std::memory_order_acq_rel) ||
+			    existing == key) {
+				return &entry.value;
+			}
+		}
+	}
+	return nullptr;
+}
+
+static ResourceSpecialization::Buffer UnpackNullShare(uint64_t v) {
+	return {
+	    .packed_stride      = static_cast<uint32_t>((v >> 1u) & 0xfffffu),
+	    .descriptor_format  = static_cast<Prospero::BufferFormat>((v >> 21u) & 0xffu),
+	    .descriptor_swizzle = static_cast<uint32_t>((v >> 29u) & 0xfffu),
+	    .zero_stride_oob    = ((v >> 41u) & 1u) != 0u,
+	};
+}
+
+static bool SpecializeBuffer(const ResourcePlan& program, const BufferResource& buffer,
+                             DescriptorValue& descriptor_value,
                              ResourceSpecialization& specialization, uint32_t i) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
@@ -820,6 +880,43 @@ static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& desc
 	if (NullBufferDescriptor(descriptor)) {
 		descriptor_value.dwords.fill(0);
 		descriptor = {};
+	}
+	// KYTY_NULL_BUFFER_SHARE: a null V# (all zeros: the renderer binds the null buffer with the
+	// null marker offset, so every access is out of range and a formatted read gives zeros) takes
+	// the last live specialization of its slot, so null and live share one permutation.
+	if (GetCodegenOptions().null_buffer_share && NullShareSlot(buffer)) {
+		const auto key  = NullShareKey(program, i);
+		const bool null = std::ranges::all_of(descriptor_value.dwords, [](uint32_t w) { return w == 0u; });
+		if (null) {
+			if (const auto* slot = NullShareValue(key, false); slot != nullptr) {
+				if (const auto live = slot->load(std::memory_order_relaxed); live != 0u) {
+					specialization.buffers.push_back(UnpackNullShare(live));
+					return true;
+				}
+			}
+		} else if (auto* slot = NullShareValue(key, true);
+		           slot != nullptr &&
+		           !(descriptor.OutOfBounds() == 0u && (descriptor.PackedStride() & 0x3fffu) == 0u)) {
+			// (A live V# whose reads fold to constants, zero_stride_oob, is not shared: its
+			// constants are its DST_SELs, not the null V#'s zeros.)
+			auto       packed = descriptor.PackedStride();
+			const auto st     = packed & 0x3fffu;
+			const bool sw     = st != 0u && ((packed >> 14u) & 1u) != 0u;
+			if (st == 0u) {
+				packed &= ~((1u << 14u) | (3u << 16u));
+			} else if (!sw) {
+				packed &= ~(3u << 16u);
+			}
+			slot->store(PackNullShare({
+			               .packed_stride      = packed,
+			               .descriptor_format  = buffer.formatted ? descriptor.Format()
+			                                                      : Prospero::BufferFormat::kInvalid,
+			               .descriptor_swizzle = buffer.formatted ? descriptor.DstSelXYZW()
+			                                                      : DstSel(4, 5, 6, 7),
+			               .zero_stride_oob    = descriptor.OutOfBounds() == 0u && st == 0u,
+			           }),
+			           std::memory_order_relaxed);
+		}
 	}
 	auto       packed_stride = descriptor.PackedStride();
 	const auto stride        = packed_stride & 0x3fffu;
@@ -847,7 +944,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		specialization.buffers.clear();
 		specialization.buffers.reserve(program.info.buffers.size());
 		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-			if (!SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
+			if (!SpecializeBuffer(program, program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
 		}
 	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1745,7 +1842,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
 				return false;
 			}
-			if (fuse_buffers && !SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
+			if (fuse_buffers && !SpecializeBuffer(program, program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
 		}
 		if (capture_reads) {
 			for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {

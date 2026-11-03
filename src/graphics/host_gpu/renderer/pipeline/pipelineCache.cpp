@@ -4208,6 +4208,46 @@ struct PipelineCache::ProgramCache {
 		const char* reason = source->permutations.Size() == 0 ? "first"
 		                     : same_specialization            ? "push"
 		                                                      : "spec";
+		// KYTY_SPEC_DIFF_LOG=1 (diagnostics, default off): a new specialization of a compiled
+		// source logs the buffers and images in which it differs from the source's first one.
+		static const bool spec_diff_log = [] {
+			const auto* env = std::getenv("KYTY_SPEC_DIFF_LOG");
+			return env != nullptr && env[0] == '1';
+		}();
+		if (spec_diff_log && !same_specialization && source->permutations.Size() != 0) {
+			const Permutation* first = nullptr;
+			source->permutations.ForEach([&](const Permutation& existing) {
+				if (first == nullptr) first = &existing;
+			});
+			const auto& a = first->specialization;
+			const auto& b = prep.specialization;
+			std::string diff;
+			for (size_t i = 0; i < std::max(a.buffers.size(), b.buffers.size()); ++i) {
+				if (i < a.buffers.size() && i < b.buffers.size() && a.buffers[i] == b.buffers[i]) continue;
+				const auto f = [](const ShaderRecompiler::IR::ResourceSpecialization& s, size_t n) {
+					if (n >= s.buffers.size()) return std::string("-");
+					const auto& x = s.buffers[n];
+					return fmt::format("stride {:#x} fmt {} sel {:#x} zoob {}", x.packed_stride,
+					                   static_cast<uint32_t>(x.descriptor_format), x.descriptor_swizzle,
+					                   x.zero_stride_oob ? 1 : 0);
+				};
+				diff += fmt::format(" b{}[{} -> {}]", i, f(a, i), f(b, i));
+			}
+			for (size_t i = 0; i < std::max(a.images.size(), b.images.size()); ++i) {
+				if (i < a.images.size() && i < b.images.size() && a.images[i] == b.images[i]) continue;
+				const auto g = [](const ShaderRecompiler::IR::ResourceSpecialization& s, size_t n) {
+					if (n >= s.images.size()) return std::string("-");
+					const auto& x = s.images[n];
+					return fmt::format("cls {} dim {} mips {} conv {} sw {:#x} cube {} bindless {} rt {}",
+					                   static_cast<uint32_t>(x.numeric_class), static_cast<uint32_t>(x.dimension),
+					                   x.mip_count, static_cast<uint32_t>(x.conversion_format), x.shader_swizzle,
+					                   x.cube ? 1 : 0, x.bindless ? 1 : 0, x.runtime ? 1 : 0);
+				};
+				diff += fmt::format(" i{}[{} -> {}]", i, g(a, i), g(b, i));
+			}
+			PipelineCacheLog("Spec diff: shader {:016x} permutation {}:{}", params.hash,
+			                 source->permutations.Size(), diff);
+		}
 		const auto& permutation = source->permutations.Append(std::move(*compiled));
 		FinishInFlight(record);
 		lock.unlock();
