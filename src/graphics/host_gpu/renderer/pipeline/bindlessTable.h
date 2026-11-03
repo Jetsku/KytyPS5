@@ -295,6 +295,9 @@ private:
 	std::atomic<uint64_t> m_watch_generation {1};
 	uint64_t              m_unregistered_keys = 0;
 	std::deque<Heap>      m_heaps;
+	// FindOrCreateHeap's heaps by guest base (KYTY_BINDLESS_SMALL_HEAPS: Ghost of Yotei creates
+	// tens of thousands; a linear search per draw was the old lookup).
+	std::unordered_map<uint64_t, std::vector<Heap*>> m_heaps_by_base;
 	// Released slots per array, with the tick after which no command buffer reads them, and per
 	// slot whether it waits there (FreeSlot keeps each slot on the list once).
 	std::array<std::deque<std::pair<uint32_t, uint64_t>>, ImageArrays> m_free_slots;

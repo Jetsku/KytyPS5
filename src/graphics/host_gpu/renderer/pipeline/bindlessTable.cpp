@@ -624,7 +624,10 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	if (entries == 0 || m_set == nullptr) {
 		return nullptr;
 	}
-	for (auto& heap: m_heaps) {
+	static const auto no_heaps = std::vector<Heap*> {};
+	const auto        indexed  = m_heaps_by_base.find(base);
+	for (auto* candidate: indexed == m_heaps_by_base.end() ? no_heaps : indexed->second) {
+		auto& heap = *candidate;
 		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding &&
 		    heap.stride == stride && heap.record_pointer == record_pointer &&
 		    heap.nested_vsharp == nested_vsharp && heap.nested_heap == nested_heap &&
@@ -649,7 +652,7 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	heap.resource      = resource;
 	heap.guest_entries = entries;
 	// KYTY_BINDLESS_SMALL_HEAPS=1 (default 0; PPSA26344 preset): a new heap reserves its guest
-	// entries (at least 256) instead of at least 16 Ki. Ghost of Yotei samples T#s from hundreds
+	// entries (at least 16) instead of at least 16 Ki. Ghost of Yotei samples T#s from hundreds
 	// of small material record tables (KYTY_BINDLESS_STRIDE, 440-byte records) at changing
 	// addresses; at 16 Ki keys (32 Ki with headroom) each, they filled the 24 Mi-entry translation
 	// buffer before gameplay and every later heap sampled the placeholder. A heap that grows past
@@ -658,10 +661,11 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 		const char* value = std::getenv("KYTY_BINDLESS_SMALL_HEAPS");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (!AllocateRegion(heap, std::max(entries, small_heaps ? 256u : 1u << 14u))) {
+	if (!AllocateRegion(heap, std::max(entries, small_heaps ? 16u : 1u << 14u))) {
 		m_heaps.pop_back();
 		return nullptr;
 	}
+	m_heaps_by_base[base].push_back(&heap);
 	return &heap;
 }
 
