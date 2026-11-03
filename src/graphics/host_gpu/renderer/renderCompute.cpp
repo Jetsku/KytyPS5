@@ -876,6 +876,75 @@ bool OrderedAppendSplitEnabled() {
 	return enabled;
 }
 
+// KYTY_DCC_KEY10_FILL=1 (default off; Ghost of Yotei preset): the AGC Toolkit's clear to pixel. CS
+// 0x2bd3cd129405f9a9 (V# in s[0:3], element in s[4:7], one formatted store per thread) with a
+// 256-byte record stride stores the packed element (1-4 dwords of a 32-bit buffer format) once at
+// the start of every 256-byte block after the Toolkit filled the target's DCC keys with 0x10; the
+// hardware then reads every texel of such a block as that element. The texture cache keeps 0x10
+// keys as uncompressed data, so the dispatch is replaced by a fill of the whole store range with
+// the element (one dword pattern: every channel equal). Elements with unequal words keep the store
+// as written (logged). Adapted from Erlou93/KytyPS5-Yotei KYTY_FIX_DCC_KEY_0X10 (renderCompute.cpp,
+// TextureCache::RegisterDccPixelFill), which clears the texture at its next use instead.
+static bool DccKey10FillEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DCC_KEY10_FILL");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static bool TryDccKey10Fill(RenderContext& context, const ShaderComputeInputInfo& input,
+                            uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                            bool use_thread_dimensions) {
+	constexpr uint64_t ClearToPixelHash = 0x2bd3cd129405f9a9ull;
+	const auto&        program          = *input.stage.program;
+	const auto&        resources        = *input.stage.resources;
+	if (program.shader_hash != ClearToPixelHash || use_thread_dimensions ||
+	    resources.user_data.size() < 8u) {
+		return false;
+	}
+	ShaderBufferResource v {};
+	std::copy_n(resources.user_data.begin(), 4, v.fields);
+	if (v.Base48() == 0 || v.Stride() != 256u || v.SwizzleEnabled() || v.AddTid()) {
+		return false;
+	}
+	// GFX10 buffer formats of 1-4 32-bit channels (UINT, SINT, FLOAT each): 20-22 (32), 62-64
+	// (32_32), 72-74 (32_32_32), 75-77 (32_32_32_32).
+	const uint32_t format   = v.RawFormat();
+	const uint32_t channels = format >= 20u && format <= 22u   ? 1u
+	                          : format >= 62u && format <= 64u ? 2u
+	                          : format >= 72u && format <= 74u ? 3u
+	                          : format >= 75u && format <= 77u ? 4u
+	                                                           : 0u;
+	const uint64_t threads = uint64_t {group_x} * group_y * group_z *
+	                         std::max(input.threads_num[0], 1u) *
+	                         std::max(input.threads_num[1], 1u) *
+	                         std::max(input.threads_num[2], 1u);
+	const uint64_t bytes = std::min<uint64_t>(v.NumRecords(), threads) * 256u;
+	if (channels == 0 || bytes == 0) {
+		return false;
+	}
+	const uint32_t value = resources.user_data[4];
+	bool           equal = true;
+	for (uint32_t i = 1; i < channels; i++) {
+		equal = equal && resources.user_data[4u + i] == value;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("KYTY_DCC_KEY10_FILL: clear to pixel addr=0x%016" PRIx64 " bytes=0x%" PRIx64
+		     " channels=%u element=%08x,%08x,%08x,%08x: %s\n",
+		     v.Base48(), bytes, channels, resources.user_data[4],
+		     channels > 1 ? resources.user_data[5] : 0u, channels > 2 ? resources.user_data[6] : 0u,
+		     channels > 3 ? resources.user_data[7] : 0u,
+		     equal ? "filled" : "unequal words, store kept as written");
+	}
+	if (!equal) {
+		return false;
+	}
+	context.GetBufferCache().FillBuffer(v.Base48(), bytes, value, false);
+	return true;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -1062,6 +1131,12 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	}
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
+	if (DccKey10FillEnabled() &&
+	    TryDccKey10Fill(m_context, input_info, thread_group_x, thread_group_y, thread_group_z,
+	                    use_thread_dimensions)) {
 		ResetBindings();
 		return;
 	}

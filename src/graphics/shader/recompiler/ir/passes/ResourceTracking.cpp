@@ -2226,8 +2226,13 @@ private:
 				// KYTY_BDA_WRITES: a raw store or atomic through one writes through BDA (compute
 				// only: the renderer settles each dispatch of such a program synchronously).
 				// KYTY_INDIRECT_FORMAT_STORES: a formatted 32-bit store too, in the V#'s run-time format.
+				// KYTY_GRAPHICS_BDA_WRITES: raw stores and atomics in graphics stages too (the
+				// renderer settles such a draw right after it).
+				const bool graphics_raw = GetCodegenOptions().graphics_bda_writes &&
+				                          m_program.stage != ShaderType::Compute &&
+				                          memory.SupportsIndirectRawWrite(op);
 				const bool indirect_write = m_bda_writes && memory.kind == ResourceKind::Buffer &&
-				                            m_program.stage == ShaderType::Compute &&
+				                            (m_program.stage == ShaderType::Compute || graphics_raw) &&
 				                            (memory.SupportsIndirectRawWrite(op) ||
 				                             (GetCodegenOptions().indirect_format_stores &&
 				                              IndirectFormattedStore(memory, op)));

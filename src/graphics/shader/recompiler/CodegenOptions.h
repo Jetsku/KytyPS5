@@ -304,6 +304,16 @@ struct CodegenOptions {
 	// logged once per program. Ghost of Yotei's split merged hull program HS 0x93ec51ae70b429ce
 	// stores a byte that way; without the switch its tessellated draws are skipped.
 	bool drop_graphics_indirect_stores = false;
+	// KYTY_GRAPHICS_BDA_WRITES=1 (default 0; PPSA26344 preset): a raw store or atomic through a V#
+	// a graphics-stage shader computed writes through BDA as in compute (KYTY_BDA_WRITES); the
+	// renderer prepares the write log before such a draw and settles it right after the draw
+	// (RenderExecutor::ExecutePreparedDraw). For Ghost of Yotei's split merged hull program
+	// HS 0x93ec51ae70b429ce, whose byte stores feed later GPU work (dropping them lost the device).
+	bool graphics_bda_writes = false;
+	// KYTY_INDIRECT_FORMAT_STORES_LOG=1 (default 0; with KYTY_INDIRECT_FORMAT_STORES): a formatted
+	// store piece for a page without a cache buffer is appended to the BDA store log (written into
+	// guest memory by the settle) instead of being dropped, as raw stores are (KYTY_BDA_STORE_LOG).
+	bool indirect_format_stores_log = false;
 	// KYTY_INDIRECT_FORMAT_D16=1 (default 0; PPSA26344 preset): BUFFER_LOAD_FORMAT_D16_XYZ/XYZW (two dwords) through a
 	// V# the shader computed read through the indirect format decoder, then pack component pairs into
 	// dwords as the D16 load does (16-bit float for float/norm formats, clamped 16-bit integers for

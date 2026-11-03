@@ -40,6 +40,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -2424,6 +2425,32 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 			return false;
 		}
 	}
+	// KYTY_BINDLESS_CLASS_LOG=<n> (diagnostic, default 0): the first n keys whose T# holds an
+	// integer format while the heap's image resource samples float (the bindless arrays have one
+	// numeric class per resource; Erlou93/KytyPS5-Yotei KYTY_PERF_BINDLESS_CLASSES: Ghost of Yotei's
+	// terrain tile records hold 8_UINT material maps among float textures).
+	{
+		static const uint32_t class_log_limit = [] {
+			const char* env = std::getenv("KYTY_BINDLESS_CLASS_LOG");
+			return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 0u;
+		}();
+		if (class_log_limit != 0u) {
+			const auto type = ShaderRecompiler::Format::GetFormatInfo(descriptor.Format()).type;
+			const bool integer = type == ShaderRecompiler::Format::ComponentType::Uint ||
+			                     type == ShaderRecompiler::Format::ComponentType::Sint;
+			static std::atomic<uint32_t> class_logged = 0;
+			if (integer && resource.numeric_class != Prospero::TextureNumericClass::Uint &&
+			    resource.numeric_class != Prospero::TextureNumericClass::Sint &&
+			    class_logged.fetch_add(1, std::memory_order_relaxed) < class_log_limit) {
+				LOGF("Bindless class: key %u of heap 0x%016" PRIx64 " (binding %u, record pointer %u, table offset %u) "
+				     "holds integer T# format %u %ux%u; the resource samples numeric class %u\n",
+				     key, heap.base, heap.binding, heap.record_pointer, heap.table_offset,
+				     static_cast<uint32_t>(descriptor.Format()), static_cast<uint32_t>(descriptor.Width5()) + 1u,
+				     static_cast<uint32_t>(descriptor.Height5()) + 1u,
+				     static_cast<uint32_t>(resource.numeric_class));
+			}
+		}
+	}
 	TextureBinding binding;
 	ResolveTexture(resource, value, binding);
 	auto* image         = texture_cache.m_slot_images.try_get(binding.image_id);
@@ -4081,6 +4108,15 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::PrepareBda);
 		m_context.PrepareBda();
+	}
+	// KYTY_GRAPHICS_BDA_WRITES: a stage that writes through BDA; settled right after the draw
+	// (ExecutePreparedDraw). As for a dispatch, PrepareBda above uploaded every CPU-dirty page.
+	for (auto* stage: stages) {
+		if (stage->runtime->program->info.bda_writes) {
+			EXIT_IF(!uses_dma);
+			m_context.GetBufferCache().PrepareBdaWrites();
+			break;
+		}
 	}
 	CommitStats::StepMark(CommitStats::Step::Bda);
 	CommitStats::Mark(CommitStats::Phase::FindBuffers);

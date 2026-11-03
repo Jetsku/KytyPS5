@@ -5173,6 +5173,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	draw_cmd_scope.Stop();
+	// KYTY_GRAPHICS_BDA_WRITES: the pages a stage wrote through BDA, settled as after a dispatch
+	// (the settle ends rendering, records the written-page pass, submits and waits).
+	for (auto* stage: stages) {
+		if (stage->runtime->program->info.bda_writes) {
+			m_context.GetBufferCache().SettleBdaWrites(stage->runtime->program->shader_hash);
+			break;
+		}
+	}
 	CommitStats::StepMark(CommitStats::Step::DrawCmd);
 	static const bool occlusion_draw_rows = [] {
 		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");

@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
@@ -169,8 +171,8 @@ void Print(ThreadState& state, Report& report, uint64_t now_ns, uint64_t now_tsc
 		state.cpu_cycles = {};
 		state.cpu_wall   = {};
 	}
-	std::printf("%s\n", line.c_str());
-	std::fflush(stdout);
+	// The console and the emulator log (the launcher's console is not kept).
+	Log::WriteToConsoleAndLog(line + "\n");
 	ledger.ResetTotals();
 	report.start_ns  = now_ns;
 	report.start_tsc = now_tsc;

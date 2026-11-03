@@ -81,6 +81,9 @@ CodegenOptions FromEnvironment() {
 	options.drop_graphics_indirect_stores =
 	    EnvFlag("KYTY_DROP_GRAPHICS_INDIRECT_STORES", options.drop_graphics_indirect_stores);
 	options.indirect_format_stores = EnvFlag("KYTY_INDIRECT_FORMAT_STORES", options.indirect_format_stores);
+	options.graphics_bda_writes    = EnvFlag("KYTY_GRAPHICS_BDA_WRITES", options.graphics_bda_writes);
+	options.indirect_format_stores_log =
+	    EnvFlag("KYTY_INDIRECT_FORMAT_STORES_LOG", options.indirect_format_stores_log);
 	options.r128_table_images    = EnvFlag("KYTY_R128_TABLE_IMAGES", options.r128_table_images);
 	options.indirect_format_d16  = EnvFlag("KYTY_INDIRECT_FORMAT_D16", options.indirect_format_d16);
 	options.heap_key_mask     = EnvFlag("KYTY_HEAP_KEY_MASK", options.heap_key_mask);

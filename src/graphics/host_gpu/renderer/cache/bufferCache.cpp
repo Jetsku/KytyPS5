@@ -6520,10 +6520,9 @@ static void NoteBdaSettleStats(size_t logged, uint32_t dropped) {
 	if (ms < 10000) {
 		return;
 	}
-	std::printf("BdaSettle 10s: %" PRIu64 " settles, %" PRIu64 " logged stores, %" PRIu64
-	            " dropped writes in %.1f s; total %" PRIu64 " settles\n",
-	            settles, stores, drops, static_cast<double>(ms) / 1000.0, total);
-	std::fflush(stdout);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "BdaSettle 10s: {} settles, {} logged stores, {} dropped writes in {:.1f} s; total {} settles\n",
+	    settles, stores, drops, static_cast<double>(ms) / 1000.0, total));
 	settles = stores = drops = 0;
 	start = now;
 }

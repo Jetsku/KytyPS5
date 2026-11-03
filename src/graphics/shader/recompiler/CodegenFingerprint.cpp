@@ -179,6 +179,12 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.indirect_format_stores) {
 		b.Text("indirect_format_stores1");
 	}
+	if (options.graphics_bda_writes) {
+		b.Text("graphics_bda_writes1");
+	}
+	if (options.indirect_format_stores_log) {
+		b.Text("indirect_format_stores_log1");
+	}
 	if (options.r128_table_images) {
 		b.Text("r128_table_images1");
 	}

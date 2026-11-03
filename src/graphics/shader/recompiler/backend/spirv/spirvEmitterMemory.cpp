@@ -1569,6 +1569,11 @@ static void StoreIndirectFormattedPiece(ValueEmitContext& ctx, uint32_t guest, u
 		shifted = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		                 Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, mask_bits), shift);
 	}
+	// KYTY_INDIRECT_FORMAT_STORES_LOG=1 (codegen option): a piece for a page without a cache buffer
+	// goes to the store log (KYTY_BDA_STORE_LOG) as raw stores do, instead of being dropped.
+	const BdaStoreLogValue log {bits == 32u ? value : shifted,
+	                            bits == 32u ? ConstantU32(state, ~0u) : mask};
+	const bool use_log = GetCodegenOptions().bda_store_log && GetCodegenOptions().indirect_format_stores_log;
 	(void)WriteBdaIfMapped(ctx, aligned, in_bounds, TypeU32(state), ConstantU32(state, 0),
 	                       [&](uint32_t host) {
 		                       const auto pointer = state.builder.AllocateId();
@@ -1589,7 +1594,8 @@ static void StoreIndirectFormattedPiece(ValueEmitContext& ctx, uint32_t guest, u
 			                           });
 		                       }
 		                       return ConstantU32(state, 0);
-	                       });
+	                       },
+	                       use_log ? &log : nullptr);
 }
 
 // KYTY_INDIRECT_FORMAT_STORES (adapted from Erlou93/KytyPS5-Yotei's StoreIndirectFormatted, M48):

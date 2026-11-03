@@ -2389,6 +2389,19 @@ static uint64_t SmallLinearReadbackBytes() {
 	return bytes;
 }
 
+// KYTY_READBACK_LINEAR_COPIES=1 (default off; Ghost of Yotei preset): with --readback-linear-images,
+// GPU-written linear depth targets and image copy destinations are read back after each
+// submission too, not only storage images and color targets. Erlou93/KytyPS5-Yotei M118: the
+// game's CPU occlusion test reads its hi-Z pyramid from memory, and that pyramid ends each frame
+// as the D32 copy of an R32 one; a stale pyramid made distant objects vanish.
+static bool ReadbackLinearCopiesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_LINEAR_COPIES");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	// Small tiled targets are written back too: games read GPU results such as reductions and
 	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
@@ -3107,6 +3120,9 @@ bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const ch
 	if (source.IsGpuModified()) {
 		MarkImageGpuModified(destination);
 		TakeOverOwnedBytes(destination, source);
+		if (ReadbackLinearCopiesEnabled()) {
+			TrackImageDownload(destination_id, destination);
+		}
 	}
 	destination.ClearBufferModified();
 	// Copies never include a stencil aspect, so combined depth/stencil images never compare equal.
@@ -3141,6 +3157,9 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsGpuModified()) {
 		MarkImageGpuModified(destination);
 		TakeOverOwnedBytes(destination, source);
+		if (ReadbackLinearCopiesEnabled()) {
+			TrackImageDownload(destination_id, destination);
+		}
 	}
 }
 
@@ -5889,6 +5908,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	m_stencil_draw_suppressed = true;
 	CommitGpuWrite(image);
 	m_stencil_draw_suppressed = false;
+	if (ReadbackLinearCopiesEnabled() && !image.info.IsTiled()) {
+		TrackImageDownload(id, image);
+	}
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil), RefreshIntent::Write);
 	}

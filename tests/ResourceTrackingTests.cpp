@@ -3511,6 +3511,53 @@ void TestR128TableImage() {
              "a keyed 128-bit T# planned without KYTY_R128_TABLE_IMAGES");
 }
 
+// KYTY_GRAPHICS_BDA_WRITES: a hull-stage byte store through a V# the shader loaded from memory
+// writes through BDA (an indirect buffer, program.info.bda_writes); without the switch the
+// program has an unresolved access (its draws are skipped).
+void TestGraphicsBdaWrite() {
+  namespace RC = Libs::Graphics::ShaderRecompiler;
+  const auto make = [](bool graphics) {
+    auto options = RC::GetCodegenOptions();
+    const auto saved = options;
+    options.graphics_bda_writes = graphics;
+    options.bda_writes = true;
+    RC::SetCodegenOptions(options);
+    struct Restore {
+      RC::CodegenOptions saved;
+      ~Restore() { RC::SetCodegenOptions(saved); }
+    } restore{saved};
+    auto fixture = std::make_unique<Fixture>(ShaderType::TessellationControl);
+    auto &f = *fixture;
+    const auto bound = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    const auto loaded = f.Emit(ValueOpcode::LoadBufferU32,
+                               {bound, Value(0u), Value(0u), Value(0u), Value(true)},
+                               f.AddMemory(load, 4));
+    const auto computed = f.Buffer({loaded, f.UserData(5), f.UserData(6), f.UserData(7)}, 8);
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.data_bits = 8;
+    f.Emit(ValueOpcode::StoreBufferU8,
+           {computed, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+           f.AddMemory(store, 12));
+    BuildSrtPlan(f.program);
+    const auto unresolved = TrackResources(f.program, true, true);
+    return std::make_pair(std::move(fixture), unresolved);
+  };
+  {
+    auto [fixture, unresolved] = make(true);
+    Check(unresolved == UINT32_MAX && fixture->program.info.bda_writes &&
+              fixture->program.memory_info[1].kind == ResourceKind::IndirectBuffer,
+          "a hull-stage store through a computed V# did not take the BDA path");
+  }
+  {
+    auto [fixture, unresolved] = make(false);
+    Check(unresolved != UINT32_MAX && !fixture->program.info.bda_writes,
+          "a hull-stage store through a computed V# was accepted without KYTY_GRAPHICS_BDA_WRITES");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -3524,6 +3571,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("R128 table image", TestR128TableImage);
+    Run("graphics BDA write", TestGraphicsBdaWrite);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
