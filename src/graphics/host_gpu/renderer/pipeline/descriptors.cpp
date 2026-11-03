@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -662,6 +663,7 @@ bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return true;
 	}
+	PassCensus::Null("unsupported storage texture bound as null");
 	static std::atomic_bool logged {false};
 	if (!fatal && !Common::LogOnce(logged)) {
 		return false;
@@ -1074,6 +1076,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		}
 		// A sampled texture whose descriptor has no valid footprint (zero size, or a base address
 		// the tile layout cannot align to): bind a null texture like a null descriptor.
+		PassCensus::Null("sampled texture with invalid footprint");
 		static std::atomic_uint32_t reported {0};
 		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
 			std::printf("Warning: texture with invalid footprint bound as null: addr=0x%016" PRIx64
@@ -1205,6 +1208,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 static TextureCache::ImageDesc SkipTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
                                                      const ShaderTextureResource& descriptor,
                                                      const char* why, std::atomic_bool& logged) {
+	PassCensus::Null(why);
 	if (Common::LogOnce(logged)) {
 		std::printf("Warning: %s: %s view bound as null (KYTY_SKIP_INVALID; logged once): "
 		            "addr=0x%016" PRIx64 " format=%u type=%u tile=%u "
@@ -1452,6 +1456,7 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		    Common::SkipInvalidEnabled()) {
 			// usa-ratt/KytyPS5-GT7 5ef1f4c3c: an image the T# cannot view (a stale bindless heap
 			// entry, a reused T#): bound as null instead of ending the emulator.
+			PassCensus::Null("sampled texture over an image it cannot view");
 			static std::atomic_bool logged {false};
 			if (Common::LogOnce(logged)) {
 				std::printf("Warning: sampled texture over an image it cannot view (image format %d, "

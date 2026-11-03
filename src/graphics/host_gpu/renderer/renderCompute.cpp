@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/rtBvhDump.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1145,11 +1146,13 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		PassCensus::Drop('c', 0, "dropped: no compute program");
 		return;
 	}
 	if (auto split = PipelineCache::TakeCallSplitRun(); split != nullptr) {
 		// A kernel with call loops runs as its chain of dispatches (callSplitDispatch.cpp).
 		ResetBindings();
+		PassCensus::Exec('c', input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0, 2);
 		if (input_info.stage.program != nullptr && input_info.stage.resources != nullptr) {
 			// KYTY_DISPATCH_TRACE / _IMAGE: split kernels too (their chain never reaches the trace below).
 			const uint32_t traced_groups[3] {thread_group_x, thread_group_y, thread_group_z};
@@ -1171,6 +1174,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	}
 
 	const auto& program   = *input_info.stage.program;
+	PassCensus::Exec('c', program.shader_hash, 0);
 	WatchRange::SetCurrentOp("CS", program.shader_hash);
 	WatchRange::NoteDispatch(program.shader_hash, async_compute, thread_group_x, thread_group_y, thread_group_z, false);
 	const auto& resources = *input_info.stage.resources;
@@ -1633,6 +1637,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		PassCensus::Drop('c', 0, "dropped: no compute program");
 		return;
 	}
 	if (PipelineCache::TakeCallSplitRun() != nullptr) {
@@ -1683,6 +1688,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;
+	PassCensus::Exec('c', program.shader_hash, 1);
 	WatchRange::SetCurrentOp("CS", program.shader_hash);
 	WatchRange::NoteDispatch(program.shader_hash, async_compute, 0, 0, 0, true);
 	if (program.info.uses_dma) {

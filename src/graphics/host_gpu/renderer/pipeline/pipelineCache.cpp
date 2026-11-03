@@ -41,6 +41,7 @@
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderCodeSnapshot.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
@@ -3063,6 +3064,7 @@ struct PipelineCache::ProgramCache {
 	                 StagePrep& prep, ShaderReadAttempt& read_attempt) {
 		read_attempt.count = 0;
 		read_attempt.materialization_failed = false;
+		PassCensus::SetShader(source.resource_plan.shader_hash); // KYTY_TRACE_PASS_CENSUS
 		read_attempt.overflow = false;
 		if (ResourceReuseEnabled() && !source.workgroup_counts
 		        ? MaterializeReusing(source, runtime, evaluation, scratch, prep)
@@ -3081,6 +3083,7 @@ struct PipelineCache::ProgramCache {
 			// A failure no read can fix (an unsupported descriptor format, a specialization the
 			// recompiler rejects): the stage gets no program and its draws/dispatches are dropped
 			// instead of ending the emulator. The reason was already logged by the materializer.
+			PassCensus::Null("stage materialization failed without a retryable read (stage dropped)");
 			static std::atomic_uint64_t unmaterializable {0};
 			const auto count = unmaterializable.fetch_add(1, std::memory_order_relaxed) + 1u;
 			if (count <= 4u || (count & 2047u) == 0u) {
@@ -9214,6 +9217,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 		};
 		if (poll == PrefetchState::Poll::Pending) {
 			g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
+			PassCensus::Drop('d', vs_input_info.stage.program != nullptr ? vs_input_info.stage.program->shader_hash : 0,
+			                 "skipped: pipeline building (KYTY_PIPELINE_SKIP)");
 			if (m_skip_draws.fetch_add(1, std::memory_order_relaxed) == 0) {
 				PipelineCacheLog("Pipeline skip: first draw skipped while its pipeline builds "
 				                 "(VS 0x{:016x})", vs_input_info.stage.program != nullptr

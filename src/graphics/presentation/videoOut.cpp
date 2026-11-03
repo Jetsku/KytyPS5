@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
@@ -1392,6 +1393,7 @@ static bool TakeFrameHold() {
 	static uint32_t shown      = 8;
 	static uint64_t held       = 0;
 	static std::chrono::steady_clock::time_point held_since;
+	Graphics::PassCensus::Frame(); // KYTY_TRACE_PASS_CENSUS
 	const uint32_t skips = Graphics::g_frame_pipeline_skips.exchange(0, std::memory_order_relaxed);
 	const auto     threshold = static_cast<uint64_t>(g_hold_skipped_draws.Get());
 	const auto     now       = std::chrono::steady_clock::now();

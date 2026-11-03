@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/watchRange.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -2237,6 +2238,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		// pipeline builds (counted for KYTY_HOLD_SKIPPED_DRAWS); no draw-run record may be continued
 		// or recalled across it.
 		g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
+		PassCensus::Drop('d', 0, "skipped: stage translation pending (KYTY_ASYNC_TRANSLATION)");
 		m_run.valid        = false;
 		m_run_active       = false;
 		m_run_targets_kept = false;
@@ -2264,7 +2266,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			                                     : "pixel",
 			            draw.Name());
 		}
+		PassCensus::Drop('d', 0,
+		                 !state.programs.vertex[0] ? "dropped: vertex program missing"
+		                 : tess_missing           ? "dropped: tessellation program missing"
+		                                          : "dropped: pixel program missing");
 		return false;
+	}
+	if (PassCensus::Enabled()) {
+		PassCensus::Exec('d', state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+		                 state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0);
 	}
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): a continuation keeps the previous draw's targets (the
 	// entries are still in `state`: the fast reset leaves them, DrawRunCandidate requires it).
