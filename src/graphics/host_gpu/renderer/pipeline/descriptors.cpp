@@ -40,6 +40,7 @@
 #include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/host_gpu/watchRange.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
@@ -1384,6 +1385,21 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	                      CpCommit::Enabled(CpCommit::Part::TexDcc);
 	TextureCache::RepeatLookup dcc_record;
 	auto id = texture_cache.FindImage(desc, shader_conversion, dcc_memo ? &dcc_record : nullptr);
+	// KYTY_WATCH_RANGE: a texture binding over the watched range, with the T#'s format and the
+	// cached image it resolved to (several images can share one address).
+	if (WatchRange::Enabled()) {
+		const auto& found_image = texture_cache.GetImage(id);
+		WatchRange::Note(fmt::format("bind {} T# fmt {} {}x{} view {} -> image {}:{} {} {}x{} depth_id {} meta {} 0x{:x}+0x{:x}",
+		                             storage ? "storage" : "texture",
+		                             static_cast<uint32_t>(descriptor.Format()), desc.info.extent.width,
+		                             desc.info.extent.height, vk::to_string(desc.view_info.format), id.index,
+		                             id.generation, vk::to_string(found_image.backing.format),
+		                             found_image.backing.extent.width, found_image.backing.extent.height,
+		                             found_image.depth_id ? 1 : 0, static_cast<uint32_t>(desc.info.metadata.kind),
+		                             desc.info.metadata.range.address, desc.info.metadata.range.size)
+		                     .c_str(),
+		                 desc.info.data.address, desc.info.data.size);
+	}
 	const auto found               = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -1400,7 +1416,18 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		const auto record_id = id;
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
-		if (storage) {
+		if (storage && TextureCache::StencilStorageShadowEnabled()) {
+			bool       shadowed = false;
+			const auto shadow   = texture_cache.StencilStorageShadow(record_id, shadowed);
+			if (shadowed) {
+				id                    = shadow;
+				image                 = &texture_cache.GetImage(id);
+				copy_binding          = true;
+				desc.view_info.format = vk::Format::eR8Uint;
+				desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+			}
+		}
+		if (storage && !copy_binding) {
 			// A storage view of a depth/stencil image's stencil aspect (Erlou: STENCIL_STORAGE_SHADOW).
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {

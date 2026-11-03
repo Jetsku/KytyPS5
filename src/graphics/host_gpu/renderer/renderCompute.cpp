@@ -1429,6 +1429,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (auto& cache = m_context.GetTextureCache(); cache.HasStencilStorageShadows()) {
+		cache.FlushStencilStorageShadows(); // KYTY_STENCIL_STORAGE_SHADOW
+	}
 	if (!image_dump.items.empty()) {
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 		RunCsImageDump(m_context, image_dump);
@@ -1781,6 +1784,9 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (auto& cache = m_context.GetTextureCache(); cache.HasStencilStorageShadows()) {
+		cache.FlushStencilStorageShadows(); // KYTY_STENCIL_STORAGE_SHADOW
+	}
 	if (!guest_barriers) {
 		ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
