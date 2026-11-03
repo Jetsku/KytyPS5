@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
 
 namespace Libs::Graphics {
 namespace {
@@ -37,7 +40,50 @@ uint32_t DescriptorPoolScale() {
 	return scale;
 }
 
+// KYTY_DESCRIPTOR_FIT=1 (default off; TheCruZ/KytyPS5-GTA 7da23f0a): a batch asks the pool only for
+// the sets its remaining room holds (from the layout's descriptor counts), a refused allocation
+// retires the pool, and a set larger than an empty default pool gets a pool sized for a few of
+// them. AMD's driver keeps the room of the sets a failed batch allocation did create, so halving
+// a 32-set request on failure could leave an empty pool unable to hold even one large set (GTA V
+// ray tracing tables on an RX 9070: exit in Commit).
+bool DescriptorFitEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DESCRIPTOR_FIT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Sets of a layout that does not fit a default pool that its own pool holds.
+constexpr uint32_t LargeSetsPerPool = 4;
+
+vk::DescriptorPoolSize* FindSize(std::vector<vk::DescriptorPoolSize>& sizes, vk::DescriptorType type) {
+	const auto size =
+	    std::find_if(sizes.begin(), sizes.end(), [&](const auto& entry) { return entry.type == type; });
+	return size == sizes.end() ? nullptr : &*size;
+}
+
 } // namespace
+
+const std::vector<vk::DescriptorPoolSize>& DescriptorHeap::LayoutSizes(vk::DescriptorSetLayout layout) {
+	auto found = m_layout_sizes.find(layout);
+	if (found == m_layout_sizes.end()) {
+		std::vector<vk::DescriptorPoolSize> sizes;
+		{
+			std::lock_guard lock(s_layout_mutex);
+			if (const auto registered = s_layout_sizes.find(layout); registered != s_layout_sizes.end()) {
+				sizes = registered->second;
+			}
+		}
+		found = m_layout_sizes.emplace(layout, std::move(sizes)).first;
+	}
+	return found->second;
+}
+
+void DescriptorHeap::ResetRoom(std::span<const vk::DescriptorPoolSize> sizes, uint32_t sets) {
+	m_free.assign(sizes.begin(), sizes.end());
+	m_free_sets = sets;
+}
 
 DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master_semaphore)
     : m_graphics(graphics), m_master_semaphore(master_semaphore) {
@@ -69,14 +115,54 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();
 		EXIT_IF(m_graphics.device.resetDescriptorPool(m_current_pool, {}) != vk::Result::eSuccess);
+		if (DescriptorFitEnabled()) {
+			// At least the default sizes (a large pool, below, holds more).
+			const auto scale = DescriptorPoolScale();
+			auto       sizes = DescriptorPoolSizes;
+			for (auto& size: sizes) {
+				size.descriptorCount *= scale;
+			}
+			ResetRoom(sizes, DescriptorHeapCount * scale);
+		}
 	} else {
 		CreateDescriptorPool();
 	}
 
 	m_sets.clear();
 	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
-	return fresh_batch.sets[--fresh_batch.size];
+	if (Allocate(layout, fresh_batch)) {
+		return fresh_batch.sets[--fresh_batch.size];
+	}
+	EXIT_IF(!DescriptorFitEnabled());
+
+	// KYTY_DESCRIPTOR_FIT: the set has more descriptors of a type than an empty default pool holds:
+	// a pool with the default sizes raised to hold LargeSetsPerPool of its sets. Once retired it is
+	// reused like a default pool (its room is then counted as the default sizes, which it holds).
+	const auto scale = DescriptorPoolScale();
+	std::vector<vk::DescriptorPoolSize> sizes(DescriptorPoolSizes.begin(), DescriptorPoolSizes.end());
+	for (auto& size: sizes) {
+		size.descriptorCount *= scale;
+	}
+	for (const auto& needed: LayoutSizes(layout)) {
+		const auto count = needed.descriptorCount * LargeSetsPerPool;
+		if (auto* size = FindSize(sizes, needed.type); size != nullptr) {
+			size->descriptorCount = std::max(size->descriptorCount, count);
+		} else {
+			sizes.push_back({needed.type, count});
+		}
+	}
+	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+	CreateDescriptorPool(sizes);
+	m_sets.clear();
+	auto& large_batch = m_sets[layout];
+	if (!Allocate(layout, large_batch)) {
+		std::string counts;
+		for (const auto& size: sizes) {
+			counts += " " + vk::to_string(size.type) + "=" + std::to_string(size.descriptorCount);
+		}
+		EXIT("descriptor set does not fit a pool sized for it:%s\n", counts.c_str());
+	}
+	return large_batch.sets[--large_batch.size];
 }
 
 bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
@@ -86,6 +172,35 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorPool = m_current_pool;
 	allocate.pSetLayouts    = layouts.data();
+
+	if (DescriptorFitEnabled()) {
+		// Only the sets the pool has room for; a refusal anyway retires the pool (no retry).
+		const auto& needs = LayoutSizes(layout);
+		uint32_t    count = std::min(DescriptorSetBatch, m_free_sets);
+		for (const auto& needed: needs) {
+			const auto* free = FindSize(m_free, needed.type);
+			count = std::min(count, free == nullptr ? 0u : free->descriptorCount / needed.descriptorCount);
+		}
+		if (count == 0) {
+			return false;
+		}
+		allocate.descriptorSetCount = count;
+		const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
+		if (result != vk::Result::eSuccess) {
+			EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
+			        result != vk::Result::eErrorFragmentedPool);
+			m_free_sets = 0;
+			return false;
+		}
+		m_free_sets -= count;
+		for (const auto& needed: needs) {
+			if (auto* free = FindSize(m_free, needed.type); free != nullptr) {
+				free->descriptorCount -= needed.descriptorCount * count;
+			}
+		}
+		batch.size = count;
+		return true;
+	}
 
 	for (;;) {
 		allocate.descriptorSetCount = batch.allocation;
@@ -103,18 +218,21 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	}
 }
 
-void DescriptorHeap::CreateDescriptorPool() {
+void DescriptorHeap::CreateDescriptorPool(std::span<const vk::DescriptorPoolSize> custom) {
 	const auto scale = DescriptorPoolScale();
 	auto       sizes = DescriptorPoolSizes;
 	for (auto& size: sizes) {
 		size.descriptorCount *= scale;
 	}
+	const std::span<const vk::DescriptorPoolSize> used =
+	    custom.empty() ? std::span<const vk::DescriptorPoolSize>(sizes) : custom;
 	vk::DescriptorPoolCreateInfo create {};
 	create.maxSets       = DescriptorHeapCount * scale;
-	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
-	create.pPoolSizes    = sizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(used.size());
+	create.pPoolSizes    = used.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
+	ResetRoom(used, create.maxSets);
 }
 
 } // namespace Libs::Graphics

@@ -724,6 +724,18 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::atomic<uint64_t>                             m_frame {0};
+	// KYTY_DISCARDED_TARGET_SKIP (textureCache.cpp): ranges of GPU-written render/depth targets freed
+	// without their pixels reaching guest memory, with the frame of the free.
+	struct DiscardedTarget {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t frame = 0;
+	};
+	static constexpr size_t DiscardedTargetCount = 32;
+	std::array<DiscardedTarget, DiscardedTargetCount> m_discarded_targets {};
+	size_t                                            m_discarded_next = 0;
+	void               NoteDiscardedTarget(ImageId id, const Image& image);
+	[[nodiscard]] bool WasDiscardedTarget(const Image& image) const;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// KYTY_CP_COMMIT=metaerase (EraseSurfaceMeta): insertions into m_surface_metas so far, and per
 	// recently erased address the insertion count at its erase. While the count is unchanged the

@@ -12,9 +12,9 @@ layout(set = 0, binding = 1, std430) writeonly buffer Decision {
 	uvec4 dispatch_args;
 	uvec4 raw;
 } decision;
-// Raw texel bits of the clear value of codes 0x00, 0x20, 0x40, 0x80, 0xC0 (16 bytes each), as
-// vkCmdClearColorImage encodes them in the view format.
-layout(set = 0, binding = 2, std430) readonly buffer Palette { uvec4 raw[5]; } palette;
+// Raw texel bits of the clear value of codes 0x00, 0x20, 0x40, 0x80, 0xC0, 0x10 (16 bytes each), as
+// vkCmdClearColorImage encodes them in the view format (DccClearHelper::ClearCodes order).
+layout(set = 0, binding = 2, std430) readonly buffer Palette { uvec4 raw[6]; } palette;
 
 layout(push_constant, std430) uniform Push {
 	uint metadata_base_words;
@@ -35,7 +35,8 @@ uint CodeIndex(uint code) {
 		case 0x40u: return 2u;
 		case 0x80u: return 3u;
 		case 0xc0u: return 4u;
-		default: return 5u;
+		case 0x10u: return 5u;
+		default: return 6u;
 	}
 }
 
@@ -48,7 +49,7 @@ void main() {
 
 	uint code = metadata.words[params.metadata_base_words] & 0xffu;
 	uint index = CodeIndex(code);
-	bool valid = index < 5u && ((params.decodable_mask >> index) & 1u) != 0u;
+	bool valid = index < 6u && ((params.decodable_mask >> index) & 1u) != 0u;
 	uint packed = code * 0x01010101u;
 	for (uint word = lane; valid && word < params.metadata_words; word += 128u) {
 		valid = metadata.words[params.metadata_base_words + word] == packed;

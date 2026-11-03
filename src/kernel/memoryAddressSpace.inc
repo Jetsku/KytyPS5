@@ -41,6 +41,96 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 // through that lock (chenxiao07 3f3825158 / e6dfd8e6b).
 thread_local std::vector<std::pair<uint64_t, uint64_t>> g_remapped_views;
 
+// KYTY_TRANSIENT_UNMAP_RETRY=1 (default off; TheCruZ/KytyPS5-GTA 355f5de3): ranges whose guest
+// mapping is briefly absent while the emulator replaces it: a guest mmap with MAP_FIXED over an
+// existing mapping (unmapped, then mapped again), and, on Windows, the parts of a file view that
+// stay mapped when part of it is unmapped (a view is split only by unmapping all of it). On the
+// console these replacements are atomic and guest threads keep using the memory (GTA V's streamer
+// decompresses into 64 KiB pages that are mapped again, ~1 crash in 100 sessions). A fault inside
+// such a range waits until the mapping is back and is retried instead of being reported.
+static std::atomic<int> g_transient_unmap_retry {-1};
+
+static bool TransientUnmapRetryEnabled() {
+	auto value = g_transient_unmap_retry.load(std::memory_order_relaxed);
+	if (value < 0) {
+		const auto* env = std::getenv("KYTY_TRANSIENT_UNMAP_RETRY");
+		value           = env != nullptr && std::strcmp(env, "1") == 0 ? 1 : 0;
+		g_transient_unmap_retry.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
+
+struct TransientUnmapWindow {
+	std::atomic<uint64_t> id {0};
+	std::atomic<uint64_t> start {0};
+	std::atomic<uint64_t> end {0};
+	std::atomic<int64_t>  closed_ns {0}; // 0 while the range is being remapped
+};
+
+class TransientUnmapWindows {
+public:
+	using Window = TransientUnmapWindow;
+
+	class Scope {
+	public:
+		Scope(uint64_t start, uint64_t end) noexcept: m_window(Open(start, end)) {}
+		~Scope() { m_window->closed_ns.store(Now(), std::memory_order_release); }
+		KYTY_CLASS_NO_COPY(Scope);
+
+	private:
+		Window* m_window;
+	};
+
+	// The newest range being remapped recently that holds vaddr (0: none). Waits while it still
+	// is being remapped.
+	static uint64_t Wait(uint64_t vaddr) noexcept {
+		constexpr int64_t Second  = 1000000000;
+		uint64_t          matched = 0;
+		for (auto& window: s_windows) {
+			if (vaddr < window.start.load(std::memory_order_acquire) ||
+			    vaddr >= window.end.load(std::memory_order_acquire)) {
+				continue;
+			}
+			const auto begin = Now();
+			for (uint32_t spins = 0; window.closed_ns.load(std::memory_order_acquire) == 0; spins++) {
+				if (Now() - begin > Second * 10) {
+					return 0; // never closed: report the fault
+				}
+				if (spins < 4096) {
+					std::this_thread::yield();
+				} else {
+					std::this_thread::sleep_for(std::chrono::microseconds(50));
+				}
+			}
+			// The fault may be handled after the mapping is already back.
+			if (Now() - window.closed_ns.load(std::memory_order_acquire) < Second) {
+				matched = std::max(matched, window.id.load(std::memory_order_acquire));
+			}
+		}
+		return matched;
+	}
+
+private:
+	static Window* Open(uint64_t start, uint64_t end) noexcept {
+		auto& window = s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
+		window.closed_ns.store(0, std::memory_order_relaxed);
+		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		window.start.store(start, std::memory_order_relaxed);
+		window.end.store(end, std::memory_order_seq_cst);
+		return &window;
+	}
+
+	static int64_t Now() noexcept {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		           std::chrono::steady_clock::now().time_since_epoch())
+		    .count();
+	}
+
+	inline static std::array<Window, 16> s_windows {};
+	inline static std::atomic<uint32_t>  s_next {0};
+	inline static std::atomic<uint64_t>  s_opened {0};
+};
+
 static void ResyncRemappedViews() {
 	for (const auto& [vaddr, size]: std::exchange(g_remapped_views, {})) {
 		ResyncGpuRangeProtection(vaddr, size);
@@ -731,6 +821,11 @@ public:
 			return true;
 		}
 
+		// KYTY_TRANSIENT_UNMAP_RETRY: the parts that stay mapped vanish until they are mapped again.
+		std::optional<TransientUnmapWindows::Scope> transient;
+		if (TransientUnmapRetryEnabled()) {
+			transient.emplace(old.vaddr, old.vaddr + old.size);
+		}
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -1815,15 +1910,47 @@ private:
 		return true;
 	}
 
+	// KYTY_LAST_SHARED_MAPPING=1 (default off; TheCruZ/KytyPS5-GTA 37e935cd): backing-store writes
+	// and reads ask this for a few bytes at a time, mostly within the mapping they asked for last
+	// (labels, query results, WRITE_DATA): each thread remembers the last shared mapping that held
+	// the whole range until the mappings change (ASTRO BOT Wormy Passage, theirs: 2.9% of the
+	// execution thread, 41% of the completions thread).
+	static bool LastSharedMappingEnabled() {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_LAST_SHARED_MAPPING");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+
 	[[nodiscard]] bool OverlapsPrivateUnlocked(uint64_t vaddr, uint64_t size) const {
+		struct LastShared {
+			const void* space      = nullptr;
+			uint64_t    generation = 0;
+			uint64_t    begin      = 0;
+			uint64_t    end        = 0;
+		};
+		thread_local LastShared last;
+		const bool remember   = LastSharedMappingEnabled();
+		const auto generation = m_mapped_generation.load(std::memory_order_relaxed);
+		if (remember && last.space == this && last.generation == generation && vaddr >= last.begin &&
+		    size <= last.end - vaddr) {
+			return false;
+		}
 		auto mapping = m_mapped.upper_bound(vaddr);
 		if (mapping != m_mapped.begin()) {
 			--mapping;
 		}
 		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
 			const auto& region = mapping->second;
-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+			if (region.vaddr + region.size <= vaddr) {
+				continue;
+			}
+			if (region.type == MappingType::Private) {
 				return true;
+			}
+			if (remember && region.vaddr <= vaddr && vaddr + size <= region.vaddr + region.size) {
+				last = {this, generation, region.vaddr, region.vaddr + region.size};
 			}
 		}
 		return false;
@@ -1845,6 +1972,7 @@ private:
 				return false;
 			}
 		}
+		m_mapped_generation.fetch_add(1, std::memory_order_relaxed); // KYTY_LAST_SHARED_MAPPING
 		return m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type, uffd}).second;
 	}
 
@@ -1859,6 +1987,7 @@ private:
 			const auto original = it->second;
 			const auto part_end = std::min(end, original.vaddr + original.size);
 			m_mapped.erase(it);
+			m_mapped_generation.fetch_add(1, std::memory_order_relaxed); // KYTY_LAST_SHARED_MAPPING
 			// The remaining parts keep their VMAs, so their userfaultfd state too.
 			if (original.vaddr < current) {
 				const auto left_size = current - original.vaddr;
@@ -2323,6 +2452,9 @@ private:
 	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Advances on every change of m_mapped (under the exclusive lock; read under either):
+	// KYTY_LAST_SHARED_MAPPING.
+	std::atomic<uint64_t>                       m_mapped_generation {1};
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	// AddLiveStack's ranges (KYTY_TRACKER_SPARE), host-page aligned: start to end.
 	std::multimap<uint64_t, uint64_t>          m_live_stacks;

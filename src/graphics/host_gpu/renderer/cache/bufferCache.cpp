@@ -4,6 +4,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/cruzStats.h"
 #include "common/guestLoad.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
@@ -5239,6 +5240,17 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	if (!IsRegionGpuModified(vaddr, size)) {
 		ForgetFillsUnder(vaddr, size); // KYTY_PENDING_FILLS
+		// KYTY_FILL_INVALIDATE_FIRST=1 (default off; TheCruZ/KytyPS5-GTA d1046f83): invalidate the
+		// cached buffers and images of the whole range at once (what each page's write fault does)
+		// when any page of it is watched, then write without faulting. GTA V clears DCC metadata
+		// with uniform fills every frame: one fault per tracked page before.
+		static const bool invalidate_first = [] {
+			const auto* value = std::getenv("KYTY_FILL_INVALIDATE_FIRST");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (invalidate_first) {
+			(void)Libs::LibKernel::Memory::PrepareHostOverwrite(vaddr, size);
+		}
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -5334,6 +5346,33 @@ bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &after, 0,
 	                       nullptr);
+	// KYTY_WRITE_DATA_GPU_RELEASE=1 (default off; adapted from TheCruZ/KytyPS5-GTA f4d1d0c7): from
+	// this point of the stream the bytes are the ones just written. They also go to the backing
+	// store and leave the GPU-written ranges, so reads around the GPU's writes take them from
+	// there instead of reading the buffer back (GTA V Fidelity: WRITE_DATA records next to a
+	// dispatch's writes, ~5 ms of GPU waits per frame). A later GPU write marks them again. Not
+	// while a download, side readback or image over them is pending (as StoreInPlace): publishing
+	// it would put older bytes over the new ones.
+	static const bool release = [] {
+		const auto* value = std::getenv("KYTY_WRITE_DATA_GPU_RELEASE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (release) {
+		const auto page_first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_last  = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		if (!HasPendingBackingPublication(vaddr, size) && !OverlapsPendingSideReadback(page_first, page_last) &&
+		    (m_early_released.empty() || !OverlapsUnpublished(vaddr, size)) &&
+		    !m_texture_cache.IsRegionGpuModified(vaddr, size) && m_gpu_modified_ranges.Intersects(vaddr, size)) {
+			StreamCopyDefer::NoteGuestWrite(vaddr, size);
+			if (Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+				CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtySubtract);
+				m_gpu_modified_ranges.Subtract(vaddr, size);
+				Coherence::NoteContentWrite(vaddr, size, Coherence::Source::CpWrite);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataGpuReleased);
+				Common::CruzStats::Add(Common::CruzStats::Counter::WriteDataReleased);
+			}
+		}
+	}
 	return true;
 }
 

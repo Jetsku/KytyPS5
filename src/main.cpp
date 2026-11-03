@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -877,7 +878,29 @@ static void InitCudaEarly() {
 }
 #endif
 
+// An exception no one catches (a worker thread of the program cache, for one) ends the process
+// with 0xC0000409 and no message: name the exception first, then abort as std::terminate does.
+static void ReportUncaughtException() {
+#if defined(__cpp_exceptions)
+	try {
+		if (const auto exception = std::current_exception(); exception != nullptr) {
+			std::rethrow_exception(exception);
+		}
+		std::fprintf(stderr, "terminate called without an active exception\n");
+	} catch (const std::exception& error) {
+		std::fprintf(stderr, "terminate: uncaught exception: %s\n", error.what());
+	} catch (...) {
+		std::fprintf(stderr, "terminate: uncaught exception of an unknown type\n");
+	}
+#else
+	std::fprintf(stderr, "terminate called\n");
+#endif
+	std::fflush(stderr);
+	std::abort();
+}
+
 static int Main(int argc, char* argv[]) {
+	std::set_terminate(ReportUncaughtException);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	InitCudaEarly();
 #endif

@@ -32,8 +32,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -141,7 +144,106 @@ bool CanRecycleImage(const vk::ImageCreateInfo& info) {
 	       info.initialLayout == vk::ImageLayout::eUndefined && !(info.flags & ~allowed_flags);
 }
 
+// KYTY_IMAGE_DESTROY_WORKER=1 (default off; TheCruZ/KytyPS5-GTA 6061bf2f): native images the pool
+// does not keep are destroyed by a worker thread in batches. Releasing a large render target's
+// memory takes 0.2 to 0.4 ms in the driver, on the thread that records the draws (RDR scales its
+// resolution every frame: ~6 such destroys per frame). An allocation that fails and the
+// allocator's destruction wait for the worker first, so no memory is held back.
+bool ImageDestroyWorkerEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_DESTROY_WORKER");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+class ImageGraveyard {
+public:
+	ImageGraveyard() = default;
+	~ImageGraveyard() {
+		Flush();
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	ImageGraveyard(const ImageGraveyard&)            = delete;
+	ImageGraveyard& operator=(const ImageGraveyard&) = delete;
+
+	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+			m_items.push_back({allocator, image, allocation});
+		}
+		m_wake.notify_one();
+	}
+
+	// Returns once every image pushed so far is destroyed.
+	void Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_items.empty() && !m_busy; });
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkImage       image;
+		VmaAllocation allocation;
+	};
+
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_items.empty(); });
+			if (m_items.empty()) {
+				return;
+			}
+			batch.swap(m_items);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) {
+				vmaDestroyImage(item.allocator, item.image, item.allocation);
+			}
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	std::vector<Item>       m_items;
+	bool                    m_busy = false;
+	bool                    m_stop = false;
+	std::thread             m_thread;
+};
+
+ImageGraveyard& Graveyard() {
+	static ImageGraveyard graveyard;
+	return graveyard;
+}
+
+void FlushImageGraveyard() {
+	if (ImageDestroyWorkerEnabled()) {
+		Graveyard().Flush();
+	}
+}
+
 void DestroyNativeImage(VmaAllocator allocator, vk::Image image, VmaAllocation allocation) {
+	if (ImageDestroyWorkerEnabled()) {
+		Graveyard().Push(allocator, image, allocation);
+		return;
+	}
 	Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageDestroy);
 	vmaDestroyImage(allocator, image, allocation);
 }
@@ -318,6 +420,7 @@ void GraphicContext::DestroyAllocator() {
 		return;
 	}
 	ClearRetiredImages();
+	FlushImageGraveyard(); // KYTY_IMAGE_DESTROY_WORKER
 	if (m_sparse_fence != nullptr) {
 		device.destroyFence(m_sparse_fence, nullptr);
 		m_sparse_fence = nullptr;
@@ -838,6 +941,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		if (result == vk::Result::eErrorOutOfDeviceMemory && NativeImagePoolEnabled()) {
 			// Retained objects are optional. Release them before one allocation retry.
 			ClearRetiredImages();
+			FlushImageGraveyard(); // KYTY_IMAGE_DESTROY_WORKER
+			result = allocate();
+		} else if (result == vk::Result::eErrorOutOfDeviceMemory && ImageDestroyWorkerEnabled()) {
+			FlushImageGraveyard();
 			result = allocate();
 		}
 		if (result == vk::Result::eErrorOutOfDeviceMemory && ImageSystemMemoryFallbackEnabled()) {

@@ -220,6 +220,16 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 	}
 }
 
+// KYTY_DCC_CLEAR_KEY_10=1 (default off; TheCruZ/KytyPS5-GTA eca56bfd): DCC key 0x10 is a clear to
+// the CB_COLOR_CLEAR_WORD register value, like 0x20, both on the CPU path and the GPU inspection.
+static bool DccClearKey10Enabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DCC_CLEAR_KEY_10");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	switch (code) {
@@ -228,11 +238,18 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 		case 0x40:
 		case 0x80:
 		case 0xc0: break;
+		case 0x10:
+			if (DccClearKey10Enabled()) {
+				break;
+			}
+			return false;
 		default: return false;
 	}
 	const auto& metadata = desc.info.metadata;
 	const auto  format   = desc.view_info.format;
-	if (code == 0x20) {
+	// KYTY_DCC_CLEAR_KEY_10=1: PS5 DCC fast clears to the CB_COLOR_CLEAR_WORD value can fill the
+	// keys with 0x10, not the GFX10 0x20 (GTA V's R16_FLOAT particle depth cleared to 65504).
+	if (code == 0x20 || code == 0x10) {
 		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
 		// KYTY_CLEAR_REGISTER_WIDE (imageInfo.h): both CLEAR_WORDs, so 64-bit targets decode.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
@@ -754,6 +771,19 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	}
 	const auto range = image.info.data;
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
+}
+
+// KYTY_GC_KEEP_SMALL_RT=1 (default off; TheCruZ/KytyPS5-GTA 23585d0c): the LRU and pressure collectors
+// never evict a render target of at most 1024x1024. Those are the layers a game draws once and
+// samples from then on (glyph atlases, cached UI); evicting one that cannot be downloaded loses its
+// contents (Wolverine's missing letters). Freeing their memory (unmap) still drops them.
+static bool KeepSmallRenderTarget(const Image& image) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GC_KEEP_SMALL_RT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled && image.usage.render_target && image.info.extent.width <= 1024 &&
+	       image.info.extent.height <= 1024;
 }
 
 // KYTY_IMAGE_SUPERSEDES_GPU_DIRTY=0 keeps refusing texel-read syncs of a GPU-modified image whose
@@ -1300,6 +1330,8 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 		// The bytes this image still owns exist nowhere else (an overlap-stale free at a layout
 		// switch, a garbage collection): move them into the buffer first. An unmap discards them.
 		(void)MaterializeOwnedBytes(image.info.data, id, {}, "free");
+	} else if (image.IsGpuModified() && !collected && reason != HangTrace::ImageFreeReason::Unmap) {
+		NoteDiscardedTarget(id, image); // KYTY_DISCARDED_TARGET_SKIP
 	}
 	if (image.IsGpuModified()) {
 		CleanVerdict::Invalidate(image.live.address, image.live.size,
@@ -1307,6 +1339,45 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
+}
+
+// KYTY_DISCARDED_TARGET_SKIP=1 (default off; TheCruZ/KytyPS5-GTA 1b9454f7): a new render or depth
+// target over memory where a GPU-written target was freed without its pixels reaching guest memory
+// within the last four frames, not written by any GPU buffer and never uploaded, is not initialized
+// from guest memory: those bytes are stale, and the target's first write replaces them. Games
+// that scale their resolution every frame (RDR: ~10 targets recreated per frame, 70 MB of uploads)
+// otherwise copy and detile every replacement.
+static bool DiscardedTargetSkipEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DISCARDED_TARGET_SKIP");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static bool IsTargetImage(const Image& image) noexcept {
+	return image.usage.render_target || image.usage.depth_target;
+}
+
+void TextureCache::NoteDiscardedTarget(ImageId id, const Image& image) {
+	// Images read back after every submission hold their pixels in guest memory.
+	if (!DiscardedTargetSkipEnabled() || !IsTargetImage(image) || image.info.data.Empty() ||
+	    m_download_images.contains(id)) {
+		return;
+	}
+	m_discarded_targets[m_discarded_next] = {image.info.data.address,
+	                                         image.info.data.address + image.info.data.size, Frame()};
+	m_discarded_next                      = (m_discarded_next + 1) % DiscardedTargetCount;
+}
+
+bool TextureCache::WasDiscardedTarget(const Image& image) const {
+	constexpr uint64_t MaxAgeFrames = 4;
+	const auto         begin        = image.info.data.address;
+	const auto         end          = begin + image.info.data.size;
+	const auto         frame        = Frame();
+	return std::any_of(m_discarded_targets.begin(), m_discarded_targets.end(), [&](const DiscardedTarget& target) {
+		return target.end != 0 && target.begin <= begin && end <= target.end && target.frame + MaxAgeFrames >= frame;
+	});
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -3710,6 +3781,15 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	// KYTY_DISCARDED_TARGET_SKIP: a new target over a just-discarded GPU-written target holds
+	// nothing the game wrote.
+	if (upload && DiscardedTargetSkipEnabled() && !image.IsBufferModified() && !image.WasEverUploaded() &&
+	    IsTargetImage(image) && !m_buffer_cache.IsRegionGpuModified(image.info.data.address, image.info.data.size) &&
+	    WasDiscardedTarget(image)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureDiscardedTargetSkips);
+		image.RefreshComplete();
+		return;
+	}
 	// KYTY_PENDING_FILLS: a fresh target inside a GPU fill starts as the fill.
 	if (upload && !image.WasEverUploaded() && BufferCache::PendingFillsEnabled() &&
 	    ClearFromKnownFill(id)) {
@@ -9223,6 +9303,9 @@ void TextureCache::RunGarbageCollector() {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				return true; // a stencil association goes with its depth image
 			}
+			if (KeepSmallRenderTarget(*owner)) {
+				return true;
+			}
 			if (!owner->IsGpuModified()) {
 				return false;
 			}
@@ -9245,7 +9328,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered || owner->depth_id || KeepSmallRenderTarget(*owner)) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
@@ -9304,7 +9387,7 @@ void TextureCache::RunPressureGarbageCollector(uint64_t tick) {
 			break;
 		}
 		auto* owner = m_slot_images.try_get(id);
-		if (owner == nullptr || !owner->registered || owner->depth_id) {
+		if (owner == nullptr || !owner->registered || owner->depth_id || KeepSmallRenderTarget(*owner)) {
 			continue;
 		}
 		// Retain resources still in use whenever pressure leaves room to do so.

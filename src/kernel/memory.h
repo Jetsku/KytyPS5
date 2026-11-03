@@ -232,6 +232,14 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 bool                   PrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// KYTY_TRANSIENT_UNMAP_RETRY (default off): for a fault in a guest range briefly unmapped while the
+// emulator replaced its mapping (MAP_FIXED over a mapping, or a Windows file view split by a
+// partial unmap), waits until it is mapped again and returns the range's id. 0 for any other fault
+// and while the switch is off.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
+void               SetTransientUnmapRetryForTest(bool enabled) noexcept;
 // Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN; RenderContext::TryStoreInPlace): whether a
 // game thread's write fault at fault_vaddr may be completed by writing the store's bytes to both
 // copies, and that write (false to decline: the fault then takes the normal path).
@@ -326,6 +334,8 @@ struct TestClampTotals {
 	uint64_t verify_races      = 0;
 };
 TestClampTotals TestClampRangeMemoTotals();
+// KYTY_CLAMP_RANGE_BITMAP for the following map changes and lookups.
+void TestSetClampRangeBitmap(bool enabled);
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);

@@ -753,6 +753,10 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 		case CoreAccess::Execute: access = GpuAccess::Execute; break;
 		default: return false;
 	}
+	// KYTY_TRANSIENT_UNMAP_RETRY: a guest range briefly unmapped while the emulator replaced its
+	// mapping: wait until it is mapped again, then retry the access unless the GPU tracking
+	// resolves the fault (0 at once while the switch is off).
+	const auto transient = Libs::LibKernel::Memory::WaitForTransientUnmap(info->access_violation_vaddr);
 	if (HangTrace::Enabled()) {
 		char fault_thread[32] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -829,6 +833,10 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 		}
 	}
 	bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	if (!handled && transient != 0 &&
+	    Libs::LibKernel::Memory::RetryTransientUnmapFault(info->access_violation_vaddr, transient)) {
+		handled = true;
+	}
 	// KYTY_FAULT_AMM_WAIT_MS=N (default 5000; 0 off; after IDXTRI's Wolverine fix): an access to
 	// memory that a queued AMM map command will map waits for that map, up to N ms, and then runs
 	// again. On the hardware the map runs within microseconds; here its queue can sit behind a wait

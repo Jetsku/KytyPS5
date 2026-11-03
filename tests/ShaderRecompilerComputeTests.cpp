@@ -33328,12 +33328,18 @@ private:
       ShaderRecompiler::Spirv::SetHostImageFeatures(
           {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
       namespace Spirv = ShaderRecompiler::Spirv;
+      // KYTY_MEMREALTIME_EXACT=1 runs the S_MEMREALTIME cases with the exact divisor.
+      const char *exact_clock = std::getenv("KYTY_MEMREALTIME_EXACT");
+      const auto clock_scale = Spirv::RealtimeClockScale(
+          properties.properties.limits.timestampPeriod,
+          exact_clock != nullptr && std::strcmp(exact_clock, "1") == 0);
       Spirv::SetHostShaderClock(
           {.scope = !shader_clock ? Spirv::HostClockScope::None
                     : available_clock.shaderDeviceClock == VK_TRUE
                         ? Spirv::HostClockScope::Device
                         : Spirv::HostClockScope::Subgroup,
-           .shift = Spirv::RealtimeClockShift(properties.properties.limits.timestampPeriod)});
+           .shift = clock_scale.shift,
+           .divisor = clock_scale.divisor});
     }
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -42804,6 +42810,39 @@ TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
   return test;
 }
 
+// Wave32 lane mask from a float inline constant keeps the f32 bits (1/(2*pi) = 0x3e22f983: lanes 0 and 1),
+// not the low word of its f64 encoding (0x6dc9c882: lane 1 only).
+TestCase Vop3CndmaskWave32FloatInlineMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, 0),
+      EncodeVop2(0x1a, 1, InlineU32(2), 1),
+      EncodeVop2(0x25, 1, Vgpr(0), 1),
+  };
+  AppendVop3(&code, 0x101, 2, InlineU32(10), InlineU32(20), 248);
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 1));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3CndmaskWave32FloatInlineMask";
+  test.code = code;
+  test.expected = {20, 20, 10, 10, 20, 20, 10, 10};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  return test;
+}
+
 TestCase Vop3CndmaskAllowsDataSourceModifier() {
   using O = ShaderOpcode;
 
@@ -43779,6 +43818,14 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads) {
 
 // The values are the host clock's (KYTY_REALTIME_CLOCK), so this case only compiles; the clock
 // read and its GPU behaviour are CodegenTests::CheckRealtimeClock (--s-memrealtime-only).
+// KYTY_MEMREALTIME_EXACT: the whole divisor nearest to rate / 100 MHz.
+static_assert(ShaderRecompiler::Spirv::RealtimeClockDivisor(1000) == 10);  // NVIDIA, 1 GHz
+static_assert(ShaderRecompiler::Spirv::RealtimeClockDivisor(10000) == 1);  // AMD, 100 MHz
+static_assert(ShaderRecompiler::Spirv::RealtimeClockDivisor(1250) == 8);   // 800 MHz
+static_assert(ShaderRecompiler::Spirv::RealtimeClockDivisor(52083) == 1);  // 19.2 MHz
+static_assert(ShaderRecompiler::Spirv::RealtimeClockDivisor(1) == 1024);
+static_assert(ShaderRecompiler::Spirv::RealtimeClockDivisor(0) == 1);
+
 TestCase ScalarMemRealtimeCaptured() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
@@ -53546,6 +53593,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaCndmaskSourceModifier);
   AddCase(Vop2SdwaCndmaskCapturedByte3Source);
   AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
+  AddCase(Vop3CndmaskWave32FloatInlineMask);
   AddCase(Vop3CndmaskAllowsDataSourceModifier);
   AddCase(VectorCompareExecOps);
   AddCase(VectorVopcCmpxOrderedCapturedExecMask);

@@ -1167,16 +1167,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			                                                    : Spirv::HostClockScope::None;
 		}
 		const double period = properties2.properties.limits.timestampPeriod;
-		clock.shift         = Spirv::RealtimeClockShift(period);
+		// KYTY_MEMREALTIME_EXACT=1 (default off): divide a fast clock to 100 MHz (SpirvEmitter.h).
+		const char* exact_env = std::getenv("KYTY_MEMREALTIME_EXACT");
+		const bool  exact     = exact_env != nullptr && std::strcmp(exact_env, "1") == 0;
+		const auto  scale     = Spirv::RealtimeClockScale(period, exact);
+		clock.shift           = scale.shift;
+		clock.divisor         = scale.divisor;
 		Spirv::SetHostShaderClock(clock);
 		const bool requested = ShaderRecompiler::GetCodegenOptions().realtime_clock;
 		std::printf("Kyty shader clock (S_MEMREALTIME, KYTY_REALTIME_CLOCK): %s; timestamp period "
-		            "%.3f ns, shift %d\n",
+		            "%.3f ns, shift %d, divisor %u\n",
 		            !requested                                      ? "off (placeholder)"
 		            : clock.scope == Spirv::HostClockScope::Device   ? "device clock"
 		            : clock.scope == Spirv::HostClockScope::Subgroup ? "subgroup clock"
 		                                                             : "none (placeholder)",
-		            period, clock.shift);
+		            period, clock.shift, clock.divisor);
 		if (requested && clock.scope == Spirv::HostClockScope::Subgroup) {
 			Log::WriteToConsoleAndLog("Warning: the Vulkan device has no shaderDeviceClock; "
 			                          "S_MEMREALTIME reads the subgroup clock\n");

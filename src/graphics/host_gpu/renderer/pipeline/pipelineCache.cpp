@@ -8018,9 +8018,20 @@ struct PipelineCache::DriverCacheSaver {
 		}
 	}
 
-	void NoteCreated() {
+	void NoteCreated(uint64_t create_ns) {
 		last_created_ns.store(CompileClockNs(), std::memory_order_relaxed);
 		created.fetch_add(1, std::memory_order_release);
+		// KYTY_PCACHE_SAVE_SLOW_MS=N (default 0: off; TheCruZ/KytyPS5-GTA 988e46cd): a pipeline whose
+		// creation took N ms or more has the cache saved at the saver's next wake-up (within a
+		// second), not at the next period: closing the emulator soon after a minutes-long ray
+		// tracing pipeline (Wolverine) threw the work away.
+		static const uint64_t slow_ns = [] {
+			const auto* value = std::getenv("KYTY_PCACHE_SAVE_SLOW_MS");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) * 1'000'000ull : 0ull;
+		}();
+		if (slow_ns != 0 && create_ns >= slow_ns) {
+			urgent.store(true, std::memory_order_release);
+		}
 	}
 
 	[[nodiscard]] bool Due(uint64_t now) const {
@@ -8028,6 +8039,9 @@ struct PipelineCache::DriverCacheSaver {
 		const auto  pending  = created.load(std::memory_order_acquire) - saved_created;
 		if (pending == 0 || oversized || now < retry_after_ns) {
 			return false;
+		}
+		if (urgent.load(std::memory_order_acquire)) {
+			return true; // KYTY_PCACHE_SAVE_SLOW_MS
 		}
 		const auto since_save   = now - last_save_ns;
 		const auto last_created = last_created_ns.load(std::memory_order_relaxed);
@@ -8052,6 +8066,7 @@ struct PipelineCache::DriverCacheSaver {
 				continue;
 			}
 			// Count only what the serialized data can contain: pipelines created before it.
+			urgent.store(false, std::memory_order_release);
 			const auto covered = created.load(std::memory_order_acquire);
 			const auto written = cache.WriteDriverCache(true);
 			const auto now     = CompileClockNs();
@@ -8073,6 +8088,7 @@ struct PipelineCache::DriverCacheSaver {
 	PipelineCache&        cache;
 	std::atomic<uint64_t> created {0};
 	std::atomic<uint64_t> last_created_ns {0};
+	std::atomic<bool>     urgent {false}; // KYTY_PCACHE_SAVE_SLOW_MS
 	// Saver thread only, then Save() after Stop().
 	uint64_t saved_created  = 0;
 	uint64_t last_save_ns   = 0;
@@ -8087,7 +8103,7 @@ void PipelineCache::NotePipelineCreated(uint64_t create_ns) {
 	if (m_saver == nullptr) {
 		return;
 	}
-	m_saver->NoteCreated();
+	m_saver->NoteCreated(create_ns);
 	if (m_saver->serializing.load(std::memory_order_relaxed)) {
 		HangTrace::RecordPipelineCacheSaveOverlap(create_ns);
 	}
