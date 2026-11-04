@@ -16,6 +16,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <fmt/format.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -422,6 +423,14 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	return m_mapped_ranges.Contains(vaddr, size);
+}
+
+std::string RenderContext::DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
+	const auto images = m_texture_cache.DescribeGpuModifiedImages(vaddr, size);
+	return fmt::format("mapped {} gpu_dirty {} pending_pub {} gpu_images [{}] writer {}", IsMapped(vaddr, size) ? 1 : 0,
+	                   m_buffer_cache.HasGpuDirtyBytes(vaddr, size) ? 1 : 0,
+	                   m_buffer_cache.HasPendingBackingPublication(vaddr, size) ? 1 : 0, images,
+	                   m_buffer_cache.DescribeNewestWriter(vaddr));
 }
 
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {

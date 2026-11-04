@@ -15,6 +15,7 @@
 
 #include <array>
 #include <atomic>
+#include <string>
 #include <chrono>
 #include <deque>
 #include <unordered_map>
@@ -329,6 +330,9 @@ public:
 	// bytes, with its handler time: aggregated by the newest recorded GPU writer of the address
 	// (shader, ticks between that write and the fault) and the op being prepared, every 10 s.
 	void NoteCpFault(uint64_t vaddr, uint64_t handler_ns);
+	// Diagnostics (KYTY_INDIRECT_ARGS_DIAG / KYTY_READINESS_DIAG, needs KYTY_CP_FAULT_WRITERS=1): the
+	// newest recorded GPU buffer write over `vaddr` ("<kind> 0x<hash> <ticks> ticks ago"), or "none".
+	[[nodiscard]] std::string DescribeNewestWriter(uint64_t vaddr);
 	// KYTY_BDA_ASYNC_SETTLE (bufferCache.cpp): finishes the settles whose dispatch completed (with
 	// wait_oldest, waits for the oldest first). GPU thread.
 	void ProcessPendingBdaSettles(bool wait_oldest);

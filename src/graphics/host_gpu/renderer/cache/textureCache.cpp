@@ -8360,6 +8360,12 @@ bool TextureCache::SkipGpuWriteImageWalk(uint64_t address, uint64_t size) {
 	return false;
 }
 
+void TextureCache::InvalidateMemoryFromGPUImageStarts(uint64_t address, uint64_t size) {
+	m_invalidate_image_starts_only = true;
+	InvalidateMemoryFromGPU(address, size);
+	m_invalidate_image_starts_only = false;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
@@ -8403,6 +8409,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	for (const auto id: images) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (m_invalidate_image_starts_only &&
+		    (image.info.data.address < address || image.info.data.address >= address + size)) {
 			continue;
 		}
 		// KYTY_IMAGE_PARTIAL_GPU_WRITE: decided before the write takes the bytes.
@@ -8625,6 +8635,33 @@ void TextureCache::RestoreContentIfUnwritten(ImageId id, const ContentMark& mark
 	if (image != nullptr && image->DefiniteWrites() == mark.definite_writes) {
 		image->AdoptContentSerial(mark.serial);
 	}
+}
+
+std::string TextureCache::DescribeGpuModifiedImages(uint64_t address, uint64_t size) {
+	std::string text;
+	if (!GuestRange {address, size}.Valid()) {
+		return text;
+	}
+	std::scoped_lock lock {m_lock};
+	uint32_t         listed = 0;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (image.depth_id || !image.IsGpuModified()) {
+			continue;
+		}
+		if (listed++ == 4) {
+			text += "; ...";
+			break;
+		}
+		if (!text.empty()) {
+			text += "; ";
+		}
+		text += fmt::format("image 0x{:x}+0x{:x} {} {}x{} type {} alias_owner {}", image.info.data.address,
+		                    image.info.data.size, vk::to_string(image.backing.format), image.backing.extent.width,
+		                    image.backing.extent.height, static_cast<uint32_t>(image.info.type),
+		                    image.alias_owner ? 1 : 0);
+	}
+	return text;
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

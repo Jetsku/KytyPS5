@@ -2013,6 +2013,13 @@ bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().SynchronizeGpuBackingForRead(vaddr, size);
 }
 
+std::string DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return "no GPU range";
+	}
+	return GetGpuResources().DescribeGpuBackingForRead(vaddr, size);
+}
+
 uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
 }

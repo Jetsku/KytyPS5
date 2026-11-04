@@ -20,6 +20,7 @@
 
 #include <array>
 #include <atomic>
+#include <string>
 #include <deque>
 #include <functional>
 #include <bitset>
@@ -236,6 +237,13 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Diagnostics (KYTY_INDIRECT_ARGS_DIAG / KYTY_READINESS_DIAG): the GPU-modified images over the
+	// range, "image 0x<addr>+0x<size> <format> <w>x<h> ..." joined by "; " (empty when none).
+	[[nodiscard]] std::string DescribeGpuModifiedImages(uint64_t address, uint64_t size);
+	// KYTY_BDA_SETTLE_IMAGE_STARTS (BufferCache::SettleBdaWrittenRange): InvalidateMemoryFromGPU
+	// restricted to the images whose first byte lies in [address, address + size) (Erlou93/
+	// KytyPS5-Yotei's rule, which acts on images starting at the written address only). GPU thread.
+	void InvalidateMemoryFromGPUImageStarts(uint64_t address, uint64_t size);
 	// Whether any cached image overlaps the range (RenderContext::UnmapMemory: CPU-only unmaps skip
 	// the GPU drain).
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
@@ -860,6 +868,7 @@ private:
 	void NoteExactRangeRewrite(Image& image);
 	void PrintExactRangeSummary();
 	int  m_exact_range_mode = 0;
+	bool m_invalidate_image_starts_only = false; // InvalidateMemoryFromGPUImageStarts
 	struct ExactRangeTotals {
 		uint64_t exact_writes = 0; // buffer writes whose range equals an image's range
 		uint64_t kept         = 0; // partly overlapped images left unrebuilt (count: would be)
