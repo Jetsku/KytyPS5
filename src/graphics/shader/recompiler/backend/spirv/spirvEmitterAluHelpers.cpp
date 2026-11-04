@@ -254,6 +254,54 @@ bool DenormFlushSkipped(const EmitterState& state) {
 	return (skip & (1u << DenormFlushStage(state))) != 0u;
 }
 
+bool F32FlushHost(const EmitterState& state) {
+	return GetCodegenOptions().f32_flush_host && !state.requirements.float64;
+}
+
+// KYTY_NATIVE_F16 (Erlou93/KytyPS5-Yotei): V_PK_ADD/MUL/MIN/MAX_F16 as one f16vec2 instruction.
+// The module declares Float16, RoundingModeRTE 16 and SignedZeroInfNanPreserve 16
+// (SpirvRequirements::native_half). Adds and multiplies are NoContraction (the guest rounds each
+// to f16). Checked on an RTX 3090 over all 2^32 lane pairs against the f32 path they replace:
+// add and mul identical, f16 subnormals kept; NMin/NMax identical except the NaN payload when
+// both lanes are NaN (one signaling NaN is quieted by the translator's override as before).
+uint32_t EmitHalfPk(EmitterState& state, HalfPkOp op, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.f16_type == 0) {
+		state.f16_type = state.builder.Type(spv::OpTypeFloat, 16);
+	}
+	if (state.f16_pair_type == 0) {
+		state.f16_pair_type = state.builder.Type(spv::OpTypeVector, state.f16_type, 2);
+	}
+	const auto pair = state.f16_pair_type;
+	const auto ha   = Unary(state, spv::OpBitcast, pair, a);
+	const auto hb   = Unary(state, spv::OpBitcast, pair, b);
+	uint32_t   result = 0;
+	switch (op) {
+		case HalfPkOp::Add:
+		case HalfPkOp::Mul:
+			result = Binary(state, op == HalfPkOp::Add ? spv::OpFAdd : spv::OpFMul, pair, ha, hb);
+			state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+			break;
+		case HalfPkOp::Min:
+		case HalfPkOp::Max:
+			result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, pair, result, GlslStd450(state),
+			                          op == HalfPkOp::Max ? GLSLstd450NMax : GLSLstd450NMin, ha, hb);
+			break;
+		case HalfPkOp::Fma: {
+			// V_PK_FMA_F16 / V_PK_FMAC_F16: one fused f16 rounding per lane, as the guest does. The
+			// f32 path rounds once to f16 too, but the driver folds UnpackHalf2x16(PackHalf2x16(x))
+			// back to x, so a chain of emulated packed ops kept f32 precision and range (no f16
+			// overflow to infinity) where the guest rounds every step.
+			const auto hc = Unary(state, spv::OpBitcast, pair, c);
+			result        = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, pair, result, GlslStd450(state), GLSLstd450Fma,
+			                          ha, hb, hc);
+			break;
+		}
+	}
+	return Unary(state, spv::OpBitcast, TypeU32(state), result);
+}
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (CodegenOptions::denorm_flush_skip).
 	if (DenormFlushSkipped(state)) {

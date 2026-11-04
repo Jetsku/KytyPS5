@@ -8767,12 +8767,47 @@ std::string TextureCache::DescribeGpuModifiedImages(uint64_t address, uint64_t s
 		if (!text.empty()) {
 			text += "; ";
 		}
-		text += fmt::format("image 0x{:x}+0x{:x} {} {}x{} type {} alias_owner {}", image.info.data.address,
-		                    image.info.data.size, vk::to_string(image.backing.format), image.backing.extent.width,
-		                    image.backing.extent.height, static_cast<uint32_t>(image.info.type),
-		                    image.alias_owner ? 1 : 0);
+		text += fmt::format("image 0x{:x}+0x{:x} {} {}x{} type {} alias_owner {} owns {} all {} cpu_dirty {}/{} "
+		                    "span 0x{:x}+0x{:x} buffer_mod {} registered {} resident {} live 0x{:x}+0x{:x}",
+		                    image.info.data.address, image.info.data.size, vk::to_string(image.backing.format),
+		                    image.backing.extent.width, image.backing.extent.height,
+		                    static_cast<uint32_t>(image.info.type), image.alias_owner ? 1 : 0,
+		                    image.OwnsBytesIn(address, size) ? 1 : 0, image.OwnsAllBytes() ? 1 : 0,
+		                    image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+		                    image.DirtySpanBegin(), image.DirtySpanBytes(), image.IsBufferModified() ? 1 : 0,
+		                    image.registered ? 1 : 0, image.FullyResident() ? 1 : 0, image.live.address,
+		                    image.live.size);
 	}
 	return text;
+}
+
+uint64_t TextureCache::MaterializeForRead(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return 0;
+	}
+	std::scoped_lock lock {m_lock};
+	return MaterializeOwnedBytes({address, size}, {}, {}, "srt-read");
+}
+
+bool TextureCache::IsRegionGpuOwnedForRead(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || image->depth_id || !image->IsGpuModified() ||
+		    !image->Overlaps(address, size, false)) {
+			continue;
+		}
+		if (image->IsDefinitelyCpuDirty() && !image->HasKeptDirty()) {
+			continue; // superseded: refreshed whole from guest memory, its bytes are no source
+		}
+		if (image->OwnsBytesIn(address, size)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

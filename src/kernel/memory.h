@@ -198,6 +198,12 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 [[nodiscard]] bool     GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
+// KYTY_SRT_STALE_IMAGE_READS=1 (default off): a resource-table read on the GPU thread that the clean
+// gate refused only because GPU-modified images overlap the range, none of which is still a source
+// of these guest bytes (TextureCache::IsRegionGpuOwnedForRead: a CPU write superseded it), reads the
+// backing. False otherwise (the caller keeps its normal synchronization path).
+[[nodiscard]] bool     SrtStaleImageReadsEnabled();
+bool                   TryReadGpuBackingOverStaleImages(uint64_t vaddr, void* data, uint64_t size);
 // Diagnostics: RenderContext::DescribeGpuBackingForRead (GPU thread; "no GPU" without a renderer).
 std::string            DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);

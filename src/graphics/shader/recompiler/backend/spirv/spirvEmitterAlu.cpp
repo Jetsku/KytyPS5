@@ -568,6 +568,10 @@ static uint32_t FlushTranscendentalInput(EmitterState& state, uint32_t value) {
 	if (GetCodegenOptions().host_ftz_inputs && GetHostFloatControls().denorm_flush_f32) {
 		return value;
 	}
+	// KYTY_F32_FLUSH_HOST: the host's default f32 mode flushes these inputs (CodegenOptions).
+	if (F32FlushHost(state)) {
+		return value;
+	}
 	return EmitFlushF32DenormToSignedZero(state, value);
 }
 

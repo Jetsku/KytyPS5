@@ -2008,6 +2008,40 @@ bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 	return QueryGpuCleanVerdict(vaddr, size);
 }
 
+bool SrtStaleImageReadsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SRT_STALE_IMAGE_READS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool TryReadGpuBackingOverStaleImages(uint64_t vaddr, void* data, uint64_t size) {
+	if (!SrtStaleImageReadsEnabled() || g_gpu_resources == nullptr || size == 0 ||
+	    !IsGpuAddressRange(vaddr, size) || !Graphics::GuestGpu::IsGpuThread() ||
+	    Graphics::DrawPrep::ActiveRecorder() != nullptr) {
+		return false;
+	}
+	auto& resources = GetGpuResources();
+	auto& buffers   = resources.GetBufferCache();
+	auto& textures  = resources.GetTextureCache();
+	if (buffers.HasGpuDirtyBytes(vaddr, size) || buffers.HasPendingBackingPublication(vaddr, size) ||
+	    !textures.IsRegionGpuModified(vaddr, size) || textures.IsRegionGpuOwnedForRead(vaddr, size)) {
+		return false;
+	}
+	if (!TryReadBacking(vaddr, data, size)) {
+		return false;
+	}
+	static std::atomic<uint64_t> reads {0};
+	const auto n = reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n & (n - 1)) == 0) {
+		std::printf("SrtStaleImageReads: %" PRIu64 " resource-table reads under superseded GPU-modified "
+		            "images read the guest bytes (last 0x%" PRIx64 "+0x%" PRIx64 ")\n",
+		            n, vaddr, size);
+	}
+	return true;
+}
+
 bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       GetGpuResources().SynchronizeGpuBackingForRead(vaddr, size);

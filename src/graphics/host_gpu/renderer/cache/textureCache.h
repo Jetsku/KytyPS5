@@ -237,6 +237,16 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// KYTY_SRT_STALE_IMAGE_READS (kernel/memory.cpp): whether a GPU-modified image is still the
+	// source of some guest byte of the range: it owns bytes there and no CPU write superseded it
+	// (a definitely CPU-dirty image without kept ranges is refreshed whole from guest memory and is
+	// no source of guest bytes, as MaterializeOwnedBytes treats it). IsRegionGpuModified asks only
+	// whether a GPU-modified image overlaps the range.
+	[[nodiscard]] bool IsRegionGpuOwnedForRead(uint64_t address, uint64_t size);
+	// KYTY_SRT_STALE_IMAGE_READS: moves the bytes of the range that GPU-modified images own into the
+	// buffer cache (MaterializeOwnedBytes, KYTY_ALIAS_BYTES), so a GPU-thread read can download them
+	// like any GPU-written buffer bytes. GPU thread; records GPU work. Returns the bytes moved.
+	uint64_t MaterializeForRead(uint64_t address, uint64_t size);
 	// Diagnostics (KYTY_INDIRECT_ARGS_DIAG / KYTY_READINESS_DIAG): the GPU-modified images over the
 	// range, "image 0x<addr>+0x<size> <format> <w>x<h> ..." joined by "; " (empty when none).
 	[[nodiscard]] std::string DescribeGpuModifiedImages(uint64_t address, uint64_t size);

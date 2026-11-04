@@ -930,6 +930,11 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	if (!read && !values.empty() && ReadsUnmappedGuestMemory(address, values)) {
 		return true;
 	}
+	// KYTY_SRT_STALE_IMAGE_READS: refused only for GPU-modified images a CPU write superseded.
+	if (!read && !values.empty() &&
+	    LibKernel::Memory::TryReadGpuBackingOverStaleImages(address, values.data(), values.size_bytes())) {
+		return true;
+	}
 	if (!read && userdata != nullptr) {
 		static_cast<ShaderReadAttempt*>(userdata)->Missing(address, values.size_bytes());
 	}
@@ -1996,6 +2001,74 @@ void DumpLargeSpirv(const char* stage_name, uint64_t hash, const std::vector<uin
 	}
 }
 
+// KYTY_SHADER_DUMP=<folder>;<hash>[,<hash>...] or <folder>;all, ';' or '@' (diagnostics, local files
+// only): the selected guest shaders bypass the persistent program cache (dump_ir) and every emitted
+// permutation is written as <folder>/<stage>_<hash>_<spirv hash>.rdna2 (decoded guest code), .ir.txt
+// and .spv. A 32-bit hash matches either half of the 64-bit one. Default off.
+struct ShaderDumpRequest {
+	std::string           folder;
+	std::vector<uint64_t> hashes;
+	bool                  all = false;
+};
+
+const ShaderDumpRequest& ShaderDumpSettings() {
+	static const ShaderDumpRequest request = [] {
+		ShaderDumpRequest parsed;
+		const char*       value = std::getenv("KYTY_SHADER_DUMP");
+		if (value == nullptr) return parsed;
+		const std::string text(value);
+		const auto        split = text.find_first_of(";@");
+		if (split == std::string::npos) return parsed;
+		parsed.folder    = text.substr(0, split);
+		std::string list = text.substr(split + 1);
+		if (list == "all") {
+			parsed.all = true;
+			return parsed;
+		}
+		size_t at = 0;
+		while (at < list.size()) {
+			const auto next = list.find(',', at);
+			const auto item = list.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			if (!item.empty()) parsed.hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		return parsed;
+	}();
+	return request;
+}
+
+bool ShaderDumpSelected(uint64_t hash) {
+	const auto& request = ShaderDumpSettings();
+	if (request.folder.empty()) return false;
+	return request.all || std::ranges::find(request.hashes, hash) != request.hashes.end() ||
+	       std::ranges::find(request.hashes, hash & 0xffffffffull) != request.hashes.end() ||
+	       std::ranges::find(request.hashes, hash >> 32u) != request.hashes.end();
+}
+
+void DumpSelectedShader(const char* stage_name, uint64_t hash, const std::string& decoded,
+                        const std::string& ir, const std::vector<uint32_t>& spirv) {
+	if (!ShaderDumpSelected(hash)) return;
+	const auto&     request = ShaderDumpSettings();
+	std::error_code error;
+	std::filesystem::create_directories(request.folder, error);
+	const auto spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+	const auto base       = std::filesystem::path(request.folder) /
+	                  fmt::format("{}_{:016x}_{:016x}", stage_name, hash, spirv_hash);
+	const auto write = [&](const char* suffix, const void* data, size_t size) {
+		if (size == 0) return;
+		auto path = base;
+		path += suffix;
+		if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+			std::fwrite(data, 1, size, file);
+			std::fclose(file);
+		}
+	};
+	write(".rdna2", decoded.data(), decoded.size());
+	write(".ir.txt", ir.data(), ir.size());
+	write(".spv", spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -2790,6 +2863,8 @@ struct PipelineCache::ProgramCache {
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		DumpSelectedShader(stage_name, options.shader_hash, result.decoded_dump, result.ir_dump,
+		                   result.spirv);
 		return {.spirv       = std::move(result.spirv),
 		        .spirv_plain = std::move(result.spirv_plain),
 		        .info        = std::move(result.program).TakeCompiledInfo()};
@@ -3902,6 +3977,7 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		if (ShaderDumpSelected(params.hash)) options.dump_ir = true; // KYTY_SHADER_DUMP
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.plain_mip_stats_variant =
@@ -4019,7 +4095,7 @@ struct PipelineCache::ProgramCache {
 					job->options            = options;
 					job->options.user_data  = job->user_data;
 					job->options.back_code  = job->back_code;
-					job->options.dump_ir    = false;
+					job->options.dump_ir    = ShaderDumpSelected(params.hash);
 					job->options.early_dump = false;
 					ShaderStageInputInfo job_input {};
 					if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {

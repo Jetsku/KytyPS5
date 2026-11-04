@@ -86,10 +86,17 @@ struct SpirvRequirements {
 	bool buffer_u16                   = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	// KYTY_COHERENT_GLC_ONLY: a coherent buffer access narrower than 32 bits (u8/u16 alias), a
+	// BUFFER_GL0/GL1_INV, and an image store or atomic; each keeps whole-program coherence.
+	bool coherent_narrow              = false;
+	bool coherent_dcache              = false;
+	bool image_writes                 = false;
 	// A buffer store or atomic anywhere in the program; without one (and without coherent loads)
 	// the storage buffers are declared NonWritable (CodegenOptions::readonly_buffers).
 	bool buffer_writes                = false;
 	bool float64                      = false;
+	// KYTY_NATIVE_F16: HalfPk* operations (Float16 and the 16-bit float controls).
+	bool native_half                  = false;
 	// S_MEMREALTIME reads the host shader clock (OpReadClockKHR, VK_KHR_shader_clock).
 	bool shader_clock                 = false;
 };
@@ -110,6 +117,10 @@ struct LaneShareState {
 	size_t   instructions = 0;
 	uint64_t reused       = 0;
 };
+
+struct EmitterState;
+// KYTY_COHERENT_GLC_ONLY bookkeeping (KYTY_COHERENT_GLC_LOG=1 logs each coherent program).
+void CountCoherentProgram(const EmitterState& state, bool per_access);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
@@ -136,6 +147,9 @@ struct EmitterState {
 	uint32_t                                        i32_type = 0;
 	uint32_t                                        f32_type = 0;
 	uint32_t                                        f64_type = 0;
+	// KYTY_NATIVE_F16: float16 and f16vec2 (EmitHalfPk).
+	uint32_t                                        f16_type = 0;
+	uint32_t                                        f16_pair_type = 0;
 	uint32_t                                        u32_pair_type = 0;
 	uint32_t                                        i32_pair_type = 0;
 	uint32_t                                        function_type = 0;
@@ -178,6 +192,9 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
+	// KYTY_COHERENT_GLC_ONLY: the Coherent alias the GLC/DLC 32-bit buffer accesses use (0 = none:
+	// every alias carries the program's coherence).
+	uint32_t                                         storage_buffer_coherent_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -725,6 +742,12 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
 // KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off: this program's stage skips the flushes
 // (EmitFlushF32DenormToSignedZero then returns its operand).
 bool     DenormFlushSkipped(const EmitterState& state);
+// KYTY_F32_FLUSH_HOST in a program without f64: the host's default f32 mode flushes denormal
+// inputs of compares and transcendentals.
+bool     F32FlushHost(const EmitterState& state);
+// KYTY_NATIVE_F16: two f16 lanes packed in a u32, one f16vec2 operation.
+enum class HalfPkOp : uint32_t { Add, Mul, Min, Max, Fma };
+uint32_t EmitHalfPk(EmitterState& state, HalfPkOp op, uint32_t a, uint32_t b, uint32_t c = 0);
 // KYTY_LDS_SLOTS: the element offset k of a dword LDS access whose dword index is LaneId + k
 // (address (LaneId << 2) + c, or LaneId * 4 + c, plus the DS offset; k = c >> 2), or none.
 std::optional<uint32_t> StaticLdsSlot(const IR::Program& program, const IR::Inst& inst);
