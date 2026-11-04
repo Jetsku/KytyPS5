@@ -5617,21 +5617,25 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	BeginDrawRun();
 	CommitStats::StepMark(CommitStats::Step::BeginRun);
 	if (args.index_count == 0 || args.instance_count == 0) {
+		PassCensus::Drop('d', 0, "skipped: zero indices or instances");
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+		PassCensus::Drop('d', 0, "consumed: metadata colour op / depth-stencil copy / colour resolve");
 		ResetBindings();
 		return;
 	}
 	CommitStats::StepMark(CommitStats::Step::TargetOps);
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		PassCensus::Drop('d', 0, "skipped: no valid vertex shader");
 		return;
 	}
 	if (SkipCubeDraw(buffer)) {
+		PassCensus::Drop('d', 0, "skipped: SkipCubeDraw");
 		return;
 	}
 
@@ -5783,21 +5787,25 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	BeginDrawRun();
 	CommitStats::StepMark(CommitStats::Step::BeginRun);
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		PassCensus::Drop('d', 0, "skipped: zero vertices or instances");
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+		PassCensus::Drop('d', 0, "consumed: metadata colour op / depth-stencil copy / colour resolve");
 		ResetBindings();
 		return;
 	}
 	CommitStats::StepMark(CommitStats::Step::TargetOps);
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		PassCensus::Drop('d', 0, "skipped: no valid vertex shader");
 		return;
 	}
 	if (SkipCubeDraw(buffer)) {
+		PassCensus::Drop('d', 0, "skipped: SkipCubeDraw");
 		return;
 	}
 

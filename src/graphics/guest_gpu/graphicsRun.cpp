@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
@@ -2935,6 +2936,7 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	                           .index_buffer_size   = op.index_buffer_size,
 	                           .index_type_and_size = op.index_type_and_size})) {
 		g_cp_op_outcome = "DrawIndirect native";
+		Libs::Graphics::PassCensus::Drop('i', 0, "info: indirect draw, native GPU path");
 		return;
 	}
 	g_cp_op_outcome = indexed ? "DrawIndirect cpu indexed" : "DrawIndirect cpu auto";
@@ -2947,6 +2949,10 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	if (!indexed) {
 		const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
 		m_num_instances = args.instance_count;
+		// KYTY_TRACE_PASS_CENSUS: which indirect draws took the CPU path (args not tracked as GPU-written).
+		Libs::Graphics::PassCensus::Drop('i', 0, args.vertex_count_per_instance == 0 || args.instance_count == 0
+		                                             ? "info: indirect draw, CPU path, args read zero"
+		                                             : "info: indirect draw, CPU path, args nonzero");
 		ExecDrawAuto(CpuIndirectAutoDraw(args.vertex_count_per_instance, args.instance_count,
 		                                 args.start_vertex_location,
 		                                 args.start_instance_location));
@@ -2972,6 +2978,10 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	}
 
 	m_num_instances = args.instance_count;
+	// KYTY_TRACE_PASS_CENSUS: which indirect draws took the CPU path (args not tracked as GPU-written).
+	Libs::Graphics::PassCensus::Drop('i', 0, index_count == 0 || args.instance_count == 0
+	                                             ? "info: indexed indirect draw, CPU path, args read zero"
+	                                             : "info: indexed indirect draw, CPU path, args nonzero");
 	ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
 	                                   static_cast<int32_t>(args.base_vertex_location),
 	                                   args.start_instance_location, op.index_type_and_size));
@@ -3047,6 +3057,7 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 	                           .index_base_addr     = op.index_base_addr,
 	                           .index_buffer_size   = op.index_buffer_size,
 	                           .index_type_and_size = op.index_type_and_size})) {
+		Libs::Graphics::PassCensus::Drop('i', 0, "info: multi-indirect draw, native GPU path");
 		return;
 	}
 
@@ -3058,6 +3069,10 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		}
 	}
 
+	// KYTY_TRACE_PASS_CENSUS: multi-draws taking the CPU path and their GPU-written count.
+	Libs::Graphics::PassCensus::Drop('i', 0, count_addr != 0 && draw_count == 0
+	                                             ? "info: multi-indirect draw, CPU path, count read zero"
+	                                             : "info: multi-indirect draw, CPU path, records drawn");
 	if (draw_count == 0) {
 		return;
 	}
