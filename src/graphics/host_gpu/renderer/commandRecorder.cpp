@@ -599,6 +599,13 @@ struct CommandRecorder::NativeExecutor {
 	                          uint32_t marker) {
 		command.writeBufferMarkerAMD(stage, buffer, offset, marker);
 	}
+	void insertDebugLabel(const char* name) {
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdInsertDebugUtilsLabelEXT != nullptr) {
+			vk::DebugUtilsLabelEXT label {};
+			label.pLabelName = name;
+			command.insertDebugUtilsLabelEXT(label);
+		}
+	}
 	// KYTY_STREAM_COPY_DEFER (BufferCache::ObtainBufferNow): the stream copy the CP reserved.
 	void hostCopy(void* destination, uint64_t source, uint64_t size) {
 		if (!Libs::LibKernel::Memory::TryReadBackingDirect(source, destination, size)) {

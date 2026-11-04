@@ -3211,6 +3211,18 @@ void BufferCache::NoteCpFault(uint64_t vaddr, uint64_t handler_ns) {
 	m_cp_fault_stats.clear();
 }
 
+std::string BufferCache::DescribeNewestWriter(uint64_t vaddr) {
+	const size_t count = m_cp_fault_writers.size();
+	for (size_t i = 0; i < count; i++) {
+		const auto& w = m_cp_fault_writers[(m_cp_fault_writer_next + count - 1 - i) % count];
+		if (w.size != 0 && vaddr >= w.vaddr && vaddr < w.vaddr + w.size) {
+			return fmt::format("{} 0x{:016x} ({} ticks ago, 0x{:x}+0x{:x})", w.kind != nullptr ? w.kind : "?", w.hash,
+			                   m_scheduler.CurrentTick() - w.tick, w.vaddr, w.size);
+		}
+	}
+	return "none";
+}
+
 void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 	if (WatchRange::CpFaultWritersEnabled()) [[unlikely]] {
 		if (m_cp_fault_writers.size() < 8192) {
@@ -6603,6 +6615,15 @@ Live::Switch g_bda_async_settle("KYTY_BDA_ASYNC_SETTLE", [](const char* value) -
 	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
 });
 
+// KYTY_BDA_SETTLE_IMAGE_STARTS (live, default 0; adapted from Erlou93/KytyPS5-Yotei's
+// InvalidateMemoryFromGPU, which acts only on images starting at the written address): a settled
+// BDA write takes GPU ownership only from the images whose first byte lies in its written pages.
+// Off: from every image overlapping the pages (16 KiB granules), which drops the GPU-only bytes of
+// render targets that merely share a page with the written records.
+static Live::Switch g_bda_settle_image_starts("KYTY_BDA_SETTLE_IMAGE_STARTS", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+});
+
 void BufferCache::ProcessPendingBdaSettles(bool wait_oldest) {
 	if (wait_oldest && !m_bda_pending.empty()) {
 		Profiler::ScopedFrameWait wait(Profiler::FrameWait::BdaSettle);
@@ -6768,6 +6789,24 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 			written.Add(page, CACHING_PAGESIZE);
 		}
 	}
+	{
+		// KYTY_BDA_ALIAS_DIAG=1 (diagnostic): the written pages of a shader's first 4 settles.
+		static const bool written_diag = [] {
+			const auto* value = std::getenv("KYTY_BDA_ALIAS_DIAG");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		static std::unordered_map<uint64_t, uint32_t> settles;
+		if (written_diag && settles[shader_hash]++ < 4u) {
+			std::string ranges;
+			uint32_t    listed = 0;
+			written.ForEach([&](uint64_t start, uint64_t end) {
+				if (listed++ < 48u) ranges += fmt::format(" 0x{:x}+0x{:x}", start, end - start);
+			});
+			Log::WriteToConsoleAndLog(fmt::format("BdaWrittenDiag: CS 0x{:016x} settle {}: {} range(s), {} logged, {} dropped:{}\n",
+			                                      shader_hash, settles[shader_hash], listed, writes.stores.size(),
+			                                      writes.dropped, ranges));
+		}
+	}
 	uint64_t settled_pages = 0;
 	written.ForEach([&](uint64_t start, uint64_t end) {
 		SettleBdaWrittenRange(start, end - start, shader_hash, settled_pages);
@@ -6806,6 +6845,18 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 		// (writebacks off, or a GPU-modified image this dispatch made): its bytes are lost now.
 		if (m_texture_cache.IsRegionGpuModified(start, bytes)) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaAliasHits);
+			// KYTY_BDA_ALIAS_DIAG=1 (diagnostic): every such hit with the images, at most 300 lines.
+			static const bool alias_diag = [] {
+				const auto* value = std::getenv("KYTY_BDA_ALIAS_DIAG");
+				return value != nullptr && std::strcmp(value, "1") == 0;
+			}();
+			static uint32_t alias_lines = 0;
+			if (alias_diag && alias_lines < 300u) {
+				alias_lines++;
+				Log::WriteToConsoleAndLog(fmt::format("BdaAliasDiag: CS 0x{:016x} wrote 0x{:x}+0x{:x} under [{}]\n",
+				                                      shader_hash, start, bytes,
+				                                      m_texture_cache.DescribeGpuModifiedImages(start, bytes)));
+			}
 			if (FirstBdaWriteNote(shader_hash, 2)) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "KYTY_BDA_WRITES: CS shader 0x{:016x} wrote 0x{:x}+0x{:x}, under a GPU-modified "
@@ -6860,7 +6911,12 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 		ForgetKnownFills(start, bytes);
 		HangTrace::NoteGpuWrite(start, bytes);
 		// Overlapping images are rebuilt from the buffer (the Water agent's rule for BDA writes).
-		m_texture_cache.InvalidateMemoryFromGPU(start, bytes);
+		// KYTY_BDA_SETTLE_IMAGE_STARTS=1: only the images that start in the written pages.
+		if (g_bda_settle_image_starts.Get() != 0) {
+			m_texture_cache.InvalidateMemoryFromGPUImageStarts(start, bytes);
+		} else {
+			m_texture_cache.InvalidateMemoryFromGPU(start, bytes);
+		}
 	}
 }
 

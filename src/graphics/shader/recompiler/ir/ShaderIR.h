@@ -209,6 +209,15 @@ struct BufferResource {
 
 enum class ImageMipMode { None, Dynamic };
 
+// ImageResource::table_access bits (recorded with KYTY_SAMPLED_TABLE_READS only).
+enum ImageTableAccess : uint32_t {
+	ImageTableAccessRead        = 1u << 0u, // ImageRead (IMAGE_LOAD*)
+	ImageTableAccessSample      = 1u << 1u, // ImageSampleRaw without LOD, clamp, gradients or offset
+	ImageTableAccessSampleExtra = 1u << 2u, // ImageSampleRaw with an LOD or clamp after its coordinates
+	ImageTableAccessWrite       = 1u << 3u, // ImageWrite
+	ImageTableAccessOther       = 1u << 4u, // gathers, queries, atomics, samples with gradients/offsets
+};
+
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
@@ -240,6 +249,10 @@ struct ImageResource {
 	// KYTY_FLOAT_STORE_CLAMP: a storage image of a 16-bit float format whose float stores clamp
 	// finite values beyond the half range to the largest half, as the guest GPU's conversion.
 	bool                          clamp_half_float  = false;
+	// KYTY_SAMPLED_TABLE_READS: the kinds of instruction that access the image (ImageTableAccess
+	// bits, ResourceTracking). A GPU-selected table lets its candidates differ in dimension only
+	// when every access takes its own candidate's coordinates. 0 without the switch.
+	uint32_t                      table_access      = 0;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;

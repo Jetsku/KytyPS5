@@ -215,6 +215,8 @@ void CheckFingerprint() {
                  [](CodegenOptions &o) { o.split_lds_write_sync = !o.split_lds_write_sync; });
   options_differ("storage_table_loose",
                  [](CodegenOptions &o) { o.storage_table_loose = !o.storage_table_loose; });
+  options_differ("sampled_table_reads",
+                 [](CodegenOptions &o) { o.sampled_table_reads = !o.sampled_table_reads; });
   options_differ("scalar_load_groups",
                  [](CodegenOptions &o) { o.scalar_load_groups = !o.scalar_load_groups; });
   options_differ("null_image_keep_dim",
@@ -231,6 +233,9 @@ void CheckFingerprint() {
     }
   }
   options_differ("loop_guard_budget", [](CodegenOptions &o) { o.loop_guard_budget++; });
+  options_differ("indirect_format_stores_shaders", [](CodegenOptions &o) {
+    o.indirect_format_stores_shaders.push_back(0x0b0ec2bac5920bd3u);
+  });
   options_differ("loop_guard_shaders",
                  [](CodegenOptions &o) { o.loop_guard_shaders.push_back(0x1234u); });
   options_differ("srt_variant_reads",

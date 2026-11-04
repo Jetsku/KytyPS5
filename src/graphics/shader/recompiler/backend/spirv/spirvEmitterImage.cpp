@@ -1539,6 +1539,83 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, result);
 		return;
 	}
+	if (op == IR::ValueOpcode::ImageRead && image.indirect_root == mem.resource &&
+	    !image.bindless && image.indirect_resources.size() >= 2u) {
+		// KYTY_SAMPLED_TABLE_READS (adapted from Erlou93/KytyPS5-Yotei EmitImageAccess): a load
+		// through a table the GPU indexes reads the candidate its key selects, with the candidate's
+		// own coordinates. The instruction's address holds as many coordinates as its own
+		// dimension; a candidate that has more reads zero for the rest (the mip follows them).
+		EXIT_IF(!GetCodegenOptions().sampled_table_reads);
+		const auto* handle = image_arg.ResolveInstruction();
+		if (handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0) {
+			ctx.Fail(inst, "has invalid indirect image key provenance");
+		}
+		const auto numeric_class = image.numeric_class;
+		const auto instruction_dimension =
+		    mem.image_dimension != ImageDimension::Unknown ? mem.image_dimension : image.dimension;
+		const auto instruction_components =
+		    ImageDimensionInfoFor(instruction_dimension).coordinate_components;
+		const auto condition = ctx.Arg(inst, 2);
+		ctx.Define(
+		    inst,
+		    EmitValueOrDefaultIfCondition(
+		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
+		        [&]() {
+			        // Everything the cases share is defined before the switch, so it dominates them.
+			        const auto key = ctx.Def(handle->Arg(0));
+			        std::array<uint32_t, 3> address_words {};
+			        for (uint32_t component = 0; component < address_words.size(); component++) {
+				        address_words[component] =
+				            component < instruction_components &&
+				                    mem.image_address_components > component
+				                ? AddressU32(ctx, mem, *address, component)
+				                : ConstantU32(state, 0);
+			        }
+			        const auto lod = LodU32(ctx, mem, *address, instruction_dimension);
+			        const auto selected = EmitIndirectResourceIndex(
+			            state, key, image.indirect_mapping_offset, image.indirect_search_iterations,
+			            0u);
+			        const auto resources = image.indirect_resources;
+			        const auto color = EmitIndexSwitch(
+			            state, selected, static_cast<uint32_t>(resources.size()),
+			            ImageVectorType(state, numeric_class, 4), [&](uint32_t ordinal) {
+			            	const auto  resource       = resources[ordinal];
+			            	const auto& candidate      = ImageResourceAt(state, resource);
+			            	const auto& candidate_info = ImageDimensionInfoFor(candidate.dimension);
+			            	EXIT_IF(candidate.numeric_class != numeric_class);
+			            	const auto components = candidate_info.coordinate_components;
+			            	uint32_t   coord      = address_words[0];
+			            	if (components > 1u) {
+			            		coord = state.builder.AllocateId();
+			            		if (components == 3u) {
+			            			state.builder.AddFunction(
+			            				spv::OpCompositeConstruct, TypeU32Vector(state, 3), coord,
+			            				address_words[0], address_words[1], address_words[2]);
+			            		} else {
+			            			state.builder.AddFunction(
+			            			spv::OpCompositeConstruct, TypeU32Vector(state, 2), coord,
+			            			address_words[0], address_words[1]);
+			            		}
+			            	}
+			            	const auto descriptor = LoadImageDescriptor(state, resource);
+			            	const auto fetched    = state.builder.AllocateId();
+			            	if (candidate_info.multisampled != 0u) {
+			            		state.builder.AddFunction(
+			            			spv::OpImageFetch, ImageVectorType(state, numeric_class, 4),
+			            			fetched, descriptor, coord, spv::ImageOperandsSampleMask,
+			            			AddressU32(ctx, mem, *address, instruction_components));
+			            	} else {
+			            		state.builder.AddFunction(
+			            			spv::OpImageFetch, ImageVectorType(state, numeric_class, 4),
+			            			fetched, descriptor, coord, spv::ImageOperandsLodMask, lod);
+			            	}
+			            	return fetched;
+			            });
+			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
+			                            false, mem);
+		        }));
+		return;
+	}
 	if (op == IR::ValueOpcode::ImageRead) {
 		const auto  dimension      = image.dimension;
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);

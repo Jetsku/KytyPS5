@@ -80,6 +80,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <shared_mutex>
@@ -218,6 +219,38 @@ std::string PipelineCacheTitleId() {
 		return {};
 	}
 	return title_id;
+}
+
+// The stem of the cache files written under _PipelineCache. Under --rd, RenderDoc reports another
+// Vulkan version (1.4.0) and wraps the device, so the program and driver caches are rejected and
+// would be overwritten: a RenderDoc session keeps its own set ("<title>.renderdoc.*") and the
+// normal play cache stays untouched.
+static std::string PipelineCacheFileStem() {
+	auto stem = PipelineCacheTitleId();
+	if (!stem.empty() && Config::RenderDocEnabled()) {
+		stem += ".renderdoc";
+	}
+	return stem;
+}
+
+// Under --rd: a cache file of the RenderDoc set that does not exist yet starts as a copy of the normal one (the
+// journals and the driver cache hold nothing RenderDoc changes; a rejected copy is simply rebuilt), so a first
+// RenderDoc session precompiles what the normal sessions found. The normal file is only read.
+static void SeedRenderDocCacheFile(const std::filesystem::path& path, const char* suffix) {
+	if (!Config::RenderDocEnabled()) {
+		return;
+	}
+	std::error_code error;
+	if (std::filesystem::exists(path, error)) {
+		return;
+	}
+	const auto normal = path.parent_path() / (PipelineCacheTitleId() + suffix);
+	if (!std::filesystem::exists(normal, error)) {
+		return;
+	}
+	std::filesystem::copy_file(normal, path, error);
+	std::printf("RenderDoc cache: %s %s from %s\n", error ? "could not seed" : "seeded",
+	            Common::PathToString(path).c_str(), Common::PathToString(normal).c_str());
 }
 
 // A hint, not a decoder: whether a code word is shaped like IMAGE_BVH_INTERSECT_RAY or
@@ -812,6 +845,52 @@ struct ShaderReadAttempt {
 		return ready;
 	}
 };
+
+// KYTY_DROP_CS_HASHES=<hash>,... (live diagnostic, default unset): the dispatches of these compute
+// shaders are dropped like programs without a translation (same-boot A/B of a shader's effect).
+static std::array<std::atomic<uint64_t>, 8> g_drop_cs_list {};
+static Live::Switch g_drop_cs_hashes("KYTY_DROP_CS_HASHES", [](const char* value) -> int64_t {
+	size_t count = 0;
+	for (const char* text = value; text != nullptr && *text != ' ' && count < g_drop_cs_list.size();) {
+		char*      end  = nullptr;
+		const auto hash = std::strtoull(text, &end, 16);
+		if (end == text) break;
+		g_drop_cs_list[count++].store(hash, std::memory_order_relaxed);
+		text = *end == ',' ? end + 1 : end;
+		if (*end != ',') break;
+	}
+	for (size_t i = count; i < g_drop_cs_list.size(); ++i) g_drop_cs_list[i].store(0, std::memory_order_relaxed);
+	return static_cast<int64_t>(count);
+});
+static bool DropCsHashListed(uint64_t hash) {
+	for (const auto& entry: g_drop_cs_list) {
+		if (entry.load(std::memory_order_relaxed) == hash && hash != 0) return true;
+	}
+	return false;
+}
+
+// KYTY_READINESS_DIAG=1 (diagnostic, default off): a program whose resource tables read memory
+// that cannot be synchronized is logged with every missing range and why it is not clean
+// (LibKernel::Memory::DescribeGpuBackingForRead), at most 4 times per shader and 400 lines.
+static void NoteReadinessFailure(const char* stage, uint64_t hash, const ShaderReadAttempt& attempt) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_READINESS_DIAG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) return;
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint32_t> per_hash;
+	static uint32_t                               lines = 0;
+	std::scoped_lock                              lock {mutex};
+	if (lines >= 400u || per_hash[hash]++ >= 4u) return;
+	for (size_t i = 0; i < attempt.count && lines < 400u; ++i, ++lines) {
+		const auto& range = attempt.missing[i];
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "ReadinessDiag: {} 0x{:016x} pass {} missing 0x{:x}+0x{:x} ({}/{}): {}\n", stage, hash,
+		    PassCensus::CurrentKey(), range.address, range.size, i + 1, attempt.count,
+		    LibKernel::Memory::DescribeGpuBackingForRead(range.address, range.size)));
+	}
+}
 
 bool NativeDccEnabled() {
 	static const bool enabled = [] {
@@ -6790,8 +6869,9 @@ void PipelineCache::InitializePipelineJournal() {
 		std::filesystem::path path;
 		if (const auto* custom = std::getenv("KYTY_PIPELINE_JOURNAL_PATH"); custom != nullptr && *custom != '\0') {
 			path = custom;
-		} else if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+		} else if (const auto title_id = PipelineCacheFileStem(); !title_id.empty()) {
 			path = std::filesystem::path("_PipelineCache") / (title_id + ".pipelines.journal");
+			SeedRenderDocCacheFile(path, ".pipelines.journal");
 		}
 		if (!path.empty()) {
 			// The records hold module content hashes and Vulkan state: tied to the device, not the driver
@@ -7295,7 +7375,7 @@ PipelineCache::~PipelineCache() {
 }
 
 void PipelineCache::InitializeDriverCache() {
-	const auto title_id = PipelineCacheTitleId();
+	const auto title_id = PipelineCacheFileStem();
 	if (title_id.empty()) {
 		return;
 	}
@@ -7309,6 +7389,9 @@ void PipelineCache::InitializeDriverCache() {
 		m_driver_cache_path = std::filesystem::path(custom);
 	} else {
 		m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+		SeedRenderDocCacheFile(m_driver_cache_path, ".bin");
+		SeedRenderDocCacheFile(std::filesystem::path(m_driver_cache_path).replace_extension(".pipelines.known"),
+		                       ".pipelines.known");
 	}
 	auto path               = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -7380,7 +7463,7 @@ void PipelineCache::InitializeProgramDiskCache() {
 	    custom != nullptr && *custom != '\0') {
 		path = std::filesystem::path(custom);
 	} else {
-		const auto title_id = PipelineCacheTitleId();
+		const auto title_id = PipelineCacheFileStem();
 		if (title_id.empty()) {
 			return;
 		}
@@ -7389,6 +7472,7 @@ void PipelineCache::InitializeProgramDiskCache() {
 			return;
 		}
 		path = std::filesystem::path("_PipelineCache") / (title_id + ".programs.bin");
+		SeedRenderDocCacheFile(path, ".programs.bin");
 	}
 	// The file's identity: the codegen version and runtime codegen state, and the device (its
 	// state that the emitter reads is part of the fingerprint already; the device and driver are
@@ -7679,11 +7763,12 @@ void PipelineCache::InitializeShaderPrecompile() {
 		    custom != nullptr && *custom != '\0') {
 			path = std::filesystem::path(custom);
 		} else {
-			const auto title_id = PipelineCacheTitleId();
+			const auto title_id = PipelineCacheFileStem();
 			if (title_id.empty()) {
 				return;
 			}
 			path = std::filesystem::path("_PipelineCache") / (title_id + ".shaders.journal");
+			SeedRenderDocCacheFile(path, ".shaders.journal");
 		}
 		// The identity holds what the stored inputs depend on besides the game: the device (subgroup
 		// and mesh limits are part of the stage input infos) and the sizes of the input structs. The
@@ -8378,6 +8463,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
 			// Restart all stages before final bindings/uploads, including their SRT refresh.
 			if (!read_attempt.Synchronize()) {
+				NoteReadinessFailure("draw", pixel_params.hash, read_attempt);
 				if (!Common::SkipInvalidEnabled()) {
 					EXIT("graphics resource readiness: a missing range cannot be synchronized\n");
 				}
@@ -8491,6 +8577,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	auto              params      = PrepareProgram(regs, sh, input_info);
 	t_empty_hash = 0;
 	t_empty_why.clear();
+	if (g_drop_cs_hashes.Get() != 0 && DropCsHashListed(params.hash)) {
+		NoteEmptyProgram(params.hash, "listed in KYTY_DROP_CS_HASHES");
+		return {};
+	}
 	if (!ExpandComputeCalls(params, input_info)) {
 		NoteEmptyProgram(params.hash, "call split plan being built");
 		return {};
@@ -8554,6 +8644,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		                                         read_attempt, scratch, evaluation);
 		if (!read_attempt.materialization_failed) return result;
 		if (!read_attempt.Synchronize()) {
+			NoteReadinessFailure("dispatch", params.hash, read_attempt);
 			if (!Common::SkipInvalidEnabled()) {
 				EXIT("compute resource readiness: a missing range cannot be synchronized\n");
 			}

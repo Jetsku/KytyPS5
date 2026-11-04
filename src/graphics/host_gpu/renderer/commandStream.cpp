@@ -236,6 +236,7 @@ const char* OpName(Op op) noexcept {
 	    "ClearColorImage",
 	    "ClearDepthStencilImage",
 	    "HostCopy",
+	    "InsertDebugLabel",
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -311,6 +312,13 @@ uint64_t BeginRendering(const vk::RenderingInfo& info) {
 		AddAttachment(h, *info.pStencilAttachment);
 	}
 	h.Add(info.pNext == nullptr ? 0 : 1);
+	return h.Value();
+}
+
+uint64_t DebugLabel(const char* name, uint32_t size) {
+	Hasher h(Op::InsertDebugLabel);
+	h.Add(size);
+	h.AddBytes(name, size);
 	return h.Value();
 }
 
@@ -1395,6 +1403,14 @@ void Encoder::hostCopy(void* destination, uint64_t source, uint64_t size) {
 	auto       w                = Open(Op::HostCopy, Sz<HostCopyPacket>(), false);
 	w.Put(HostCopyPacket {destination_bits, source, size});
 	Close(w, m_options.verify ? VerifyHash::Value(Op::HostCopy, destination_bits, source, size) : 0);
+}
+
+void Encoder::insertDebugLabel(const char* name) {
+	const auto size = static_cast<uint32_t>(std::strlen(name) + 1u); // with the terminator
+	auto       w    = Open(Op::InsertDebugLabel, Sz<uint32_t>() + Arr<char>(size), false);
+	w.Put(size);
+	w.PutArray(name, size);
+	Close(w, m_options.verify ? VerifyHash::DebugLabel(name, size) : 0);
 }
 
 void Encoder::writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer,

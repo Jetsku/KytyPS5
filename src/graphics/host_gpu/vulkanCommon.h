@@ -39,7 +39,8 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	// Names are set for the debug dump and under --rd (RenderDoc shows them: images by guest address).
+	if ((!Config::GraphicsDebugDumpEnabled() && !Config::RenderDocEnabled()) || device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

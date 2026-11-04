@@ -77,6 +77,11 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+// KYTY_DEPTH_EQUAL_RELAX: see SetGraphicsDynamicParams.
+static Live::Switch g_depth_equal_relax("KYTY_DEPTH_EQUAL_RELAX", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+});
 // KYTY_FRAME_TRACE (renderCompute.cpp).
 bool FrameTraceTake();
 // KYTY_NAN_SCAN (renderCompute.cpp).
@@ -739,8 +744,15 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 	if (recorder.Update(shadow.depth_write_enable, depth_write_enable)) {
 		vk_buffer.setDepthWriteEnable(depth_write_enable);
 	}
-	if (recorder.Update(shadow.depth_compare_op, depth.depth_compare_op)) {
-		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	// KYTY_DEPTH_EQUAL_RELAX (live diagnostic, default 0): an EQUAL depth test as LESS_OR_EQUAL (1)
+	// or GREATER_OR_EQUAL (2), to test whether a pass's EQUAL test fails against a depth pre-pass.
+	auto depth_compare_op = depth.depth_compare_op;
+	if (depth_compare_op == vk::CompareOp::eEqual && g_depth_equal_relax.Get() != 0) {
+		depth_compare_op = g_depth_equal_relax.Get() == 1 ? vk::CompareOp::eLessOrEqual
+		                                                   : vk::CompareOp::eGreaterOrEqual;
+	}
+	if (recorder.Update(shadow.depth_compare_op, depth_compare_op)) {
+		vk_buffer.setDepthCompareOp(depth_compare_op);
 	}
 
 	const auto& mode              = ctx.GetModeControl();
@@ -5215,6 +5227,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		        (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex),
 		    ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
 		    count * 4u * sizeof(uint32_t), buffer.GetRegisters().GetUserClipPlanes().data());
+	}
+	// Vulkan debug labels (--rd / KYTY_TRACE_VK_LABELS): the draw's shaders and game pass.
+	const bool draw_label = PassCensus::LabelsEnabled();
+	if (draw_label) {
+		char text[256];
+		PassCensus::LabelText(text, sizeof(text), 'd',
+		                      state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+		                      state.ps_active && state.ps_input_info.stage.program
+		                          ? state.ps_input_info.stage.program->shader_hash
+		                          : 0);
+		vk_buffer.insertDebugLabel(text);
 	}
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own

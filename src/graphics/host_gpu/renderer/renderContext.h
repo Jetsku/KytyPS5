@@ -19,6 +19,7 @@
 #include "kernel/eventQueue.h"
 
 #include <atomic>
+#include <string>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -157,6 +158,9 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// GPU preparation only, outside texture-cache/tracker locks. Does not download dirty images.
 	[[nodiscard]] bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
+	// Diagnostics: why a read of [vaddr, vaddr + size) is not clean (mapping, GPU-dirty bytes, a
+	// pending publication, GPU-modified images over it, the newest recorded buffer writer).
+	[[nodiscard]] std::string DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	// The host protection of the range was replaced behind the page tracker (PageManager::

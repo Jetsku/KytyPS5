@@ -104,6 +104,26 @@ static bool AliasAgeByFrames() {
 	return enabled;
 }
 
+// KYTY_STENCIL_DEPTH_ALIAS=1 (default off; Erlou93/KytyPS5-Yotei keeps both): a depth/stencil image
+// whose memory a colour interpretation writes (Ghost of Yotei's "Composite depth bias" writes its
+// D32S8 target 0x5002870000 as R32 storage) stays alive as a non-owner alias, as colour/colour and
+// depth/colour pairs without stencil already do. Freed, its stencil planes had no image until the
+// next depth bind recreated it: Deferred wetness read plane A as a null texture, and the recreated
+// image's stencil was undefined. The alias syncs the depth aspect from the owner (copies never
+// include stencil), so its stencil survives.
+static bool StencilDepthAliasEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STENCIL_DEPTH_ALIAS");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			std::printf("Depth/stencil images kept as aliases of their colour interpretations "
+			            "(KYTY_STENCIL_DEPTH_ALIAS=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
 [[nodiscard]] bool EnvNotZero(const char* name) {
 	const auto* value = std::getenv(name);
 	return value == nullptr || std::strcmp(value, "0") != 0;
@@ -2995,6 +3015,82 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 	}
 }
 
+bool TextureCache::PreserveStencilRecreateEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PRESERVE_STENCIL_RECREATE");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Stencil of depth images replaced by colour images: saved and restored "
+			     "(KYTY_PRESERVE_STENCIL_RECREATE=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+void TextureCache::SaveRecreatedStencil(Image& depth) {
+	const auto width  = depth.backing.extent.width;
+	const auto height = depth.backing.extent.height;
+	const auto bytes  = uint64_t {width} * height;
+	if (!m_recreate_stencil || m_recreate_stencil->Size() < bytes) {
+		if (m_recreate_stencil) {
+			m_scheduler.DeferOperation([old = m_recreate_stencil] { (void)old; });
+		}
+		m_recreate_stencil = std::make_shared<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, bytes);
+	}
+	const auto copy = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+	// (Download transitions the image itself; the copy is recorded before the image is freed.)
+	depth.Download({&copy, 1}, m_recreate_stencil->Handle(), 0, bytes);
+	m_recreate_stencil_address = depth.info.data.address;
+	m_recreate_stencil_plane   = depth.info.stencil.address;
+	m_recreate_stencil_width   = width;
+	m_recreate_stencil_height  = height;
+	m_recreate_stencil_valid   = true;
+	static std::atomic<uint32_t> saves {0};
+	const auto n = saves.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 4u || std::has_single_bit(n)) {
+		LOGF("Stencil save #%u (KYTY_PRESERVE_STENCIL_RECREATE): depth 0x%012" PRIx64 " %ux%u plane 0x%012" PRIx64
+		     " replaced by a colour image\n",
+		     n, depth.info.data.address, width, height, depth.info.stencil.address);
+	}
+}
+
+bool TextureCache::RestoreRecreatedStencil(Image& depth) {
+	const auto width  = depth.backing.extent.width;
+	const auto height = depth.backing.extent.height;
+	if (!m_recreate_stencil_valid || m_recreate_stencil_address != depth.info.data.address ||
+	    m_recreate_stencil_width != width || m_recreate_stencil_height != height) {
+		static std::atomic<uint32_t> misses {0};
+		const auto n = misses.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (n <= 4u || std::has_single_bit(n)) {
+			LOGF("Stencil restore miss #%u (KYTY_PRESERVE_STENCIL_RECREATE): depth 0x%012" PRIx64
+			     " %ux%u, saved %s 0x%012" PRIx64 " %ux%u\n",
+			     n, depth.info.data.address, width, height, m_recreate_stencil_valid ? "valid" : "none",
+			     m_recreate_stencil_address, m_recreate_stencil_width, m_recreate_stencil_height);
+		}
+		return false;
+	}
+	const auto bytes = uint64_t {width} * height;
+	const auto copy  = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+	depth.Upload({&copy, 1}, m_recreate_stencil->Handle(), 0, bytes);
+	m_recreate_stencil_valid = false;
+	// The stencil aspect holds the plane the replaced image held: with KYTY_PRESERVE_STENCIL the
+	// next depth bind swaps planes from that one.
+	if (PreserveStencilEnabled() && m_recreate_stencil_plane != 0) {
+		depth.info.stencil.address = m_recreate_stencil_plane;
+	}
+	static std::atomic<uint32_t> restores {0};
+	const auto n = restores.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 4u || std::has_single_bit(n)) {
+		LOGF("Stencil restore #%u (KYTY_PRESERVE_STENCIL_RECREATE): depth 0x%012" PRIx64 " %ux%u plane 0x%012" PRIx64
+		     "\n",
+		     n, depth.info.data.address, width, height, m_recreate_stencil_plane);
+	}
+	return true;
+}
+
 bool TextureCache::StencilAliasCopyEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_STENCIL_ALIAS_COPY");
@@ -3985,7 +4081,19 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
+			// KYTY_PRESERVE_STENCIL_RECREATE: a copy never includes the stencil aspect.
+			const bool recreate_stencil = PreserveStencilRecreateEnabled() && cached.backing.samples == 1;
+			if (recreate_stencil && cached.info.IsDepth() && cached.info.HasStencil() &&
+			    !replacement.info.IsDepth() && SwapsStencilPlanes(cached)) {
+				SaveRecreatedStencil(cached);
+			}
 			(void)CopyImage(replacement_id, cached_id, "depth-overlap");
+			if (recreate_stencil && !cached.info.IsDepth()) {
+				auto& made = m_slot_images[replacement_id];
+				if (made.info.IsDepth() && made.info.HasStencil() && SwapsStencilPlanes(made)) {
+					(void)RestoreRecreatedStencil(made);
+				}
+			}
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
 			           "TextureCache: unsupported cross-format multisample depth copy\n");
@@ -4014,8 +4122,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
+	// KYTY_STENCIL_DEPTH_ALIAS: single-sample depth/stencil pairs too.
+	const bool stencil_alias = StencilDepthAliasEnabled() && cached.backing.samples == 1 &&
+	                           (cached.info.HasStencil() != replacement.info.HasStencil());
 	if (keep_aliases && cached.backing.samples == replacement.backing.samples &&
-	    !cached.info.HasStencil() && !replacement.info.HasStencil()) {
+	    ((!cached.info.HasStencil() && !replacement.info.HasStencil()) || stencil_alias)) {
 		// The replacement now holds the newest contents; the cached interpretation stays alive
 		// as a non-owner alias for the next switch back.
 		if (replacement.IsGpuModified()) {
@@ -6721,7 +6832,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 
 bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
 	return !AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	       image.info.HasStencil() || image.backing.image == nullptr;
+	       (image.info.HasStencil() && !StencilDepthAliasEnabled()) || image.backing.image == nullptr;
 }
 
 // Whether two images at the same guest range are interpretations of the same texel grid. Same
@@ -6766,7 +6877,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	ImageWatch("image alias sync", image);
 	// TextureCache::SyncAliasReturnsAtOnce mirrors this condition.
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
-	    image.info.HasStencil() || image.backing.image == nullptr) {
+	    (image.info.HasStencil() && !StencilDepthAliasEnabled()) || image.backing.image == nullptr) {
 		return;
 	}
 	if (WatchRange::Enabled()) {
@@ -6781,7 +6892,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		const auto* other = m_slot_images.try_get(other_id);
 		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
 		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
-		    other->info.HasStencil() || other->info.data != image.info.data ||
+		    (other->info.HasStencil() && !StencilDepthAliasEnabled()) || other->info.data != image.info.data ||
 		    !SameAliasGrid(other->info, image.info) ||
 		    other->backing.samples != image.backing.samples) {
 			continue;
@@ -8360,6 +8471,12 @@ bool TextureCache::SkipGpuWriteImageWalk(uint64_t address, uint64_t size) {
 	return false;
 }
 
+void TextureCache::InvalidateMemoryFromGPUImageStarts(uint64_t address, uint64_t size) {
+	m_invalidate_image_starts_only = true;
+	InvalidateMemoryFromGPU(address, size);
+	m_invalidate_image_starts_only = false;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
@@ -8403,6 +8520,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	for (const auto id: images) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (m_invalidate_image_starts_only &&
+		    (image.info.data.address < address || image.info.data.address >= address + size)) {
 			continue;
 		}
 		// KYTY_IMAGE_PARTIAL_GPU_WRITE: decided before the write takes the bytes.
@@ -8625,6 +8746,33 @@ void TextureCache::RestoreContentIfUnwritten(ImageId id, const ContentMark& mark
 	if (image != nullptr && image->DefiniteWrites() == mark.definite_writes) {
 		image->AdoptContentSerial(mark.serial);
 	}
+}
+
+std::string TextureCache::DescribeGpuModifiedImages(uint64_t address, uint64_t size) {
+	std::string text;
+	if (!GuestRange {address, size}.Valid()) {
+		return text;
+	}
+	std::scoped_lock lock {m_lock};
+	uint32_t         listed = 0;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (image.depth_id || !image.IsGpuModified()) {
+			continue;
+		}
+		if (listed++ == 4) {
+			text += "; ...";
+			break;
+		}
+		if (!text.empty()) {
+			text += "; ";
+		}
+		text += fmt::format("image 0x{:x}+0x{:x} {} {}x{} type {} alias_owner {}", image.info.data.address,
+		                    image.info.data.size, vk::to_string(image.backing.format), image.backing.extent.width,
+		                    image.backing.extent.height, static_cast<uint32_t>(image.info.type),
+		                    image.alias_owner ? 1 : 0);
+	}
+	return text;
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
@@ -9609,11 +9757,35 @@ void TextureCache::ProcessDownloadImages() {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	// KYTY_READBACK_LOG=<n> (diagnostic, default off): the first n images enrolled for a readback here, with the
+	// result (downloaded, refused, not GPU-owned), and one count line every 1024 calls.
+	static const uint32_t log_limit = [] {
+		const char* value = std::getenv("KYTY_READBACK_LOG");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	static uint32_t logged = 0, calls = 0;
+	static uint64_t done = 0, refused = 0, skipped = 0;
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+		const bool owned = owner != nullptr && owner->registered && owner->IsGpuModified();
+		const bool ok    = owned && DownloadImageMemory(id);
+		if (log_limit == 0) {
+			continue;
 		}
+		(ok ? done : owned ? refused : skipped)++;
+		if (logged < log_limit && owner != nullptr) {
+			logged++;
+			std::printf("KYTY_READBACK_LOG: frame %" PRIu64 " image 0x%012" PRIx64 " size 0x%" PRIx64
+			            " %ux%ux%u fmt %u tile %u depth %d %s\n",
+			            m_frame.load(std::memory_order_relaxed), owner->info.data.address, owner->info.data.size,
+			            owner->info.extent.width, owner->info.extent.height, owner->info.extent.depth,
+			            static_cast<uint32_t>(owner->info.pixel_format), static_cast<uint32_t>(owner->info.tile_mode),
+			            owner->info.IsDepth() ? 1 : 0, ok ? "downloaded" : owned ? "refused" : "not GPU-owned");
+		}
+	}
+	if (log_limit != 0 && (++calls & 1023u) == 0) {
+		std::printf("KYTY_READBACK_LOG: frame %" PRIu64 " downloads %" PRIu64 " refused %" PRIu64 " skipped %" PRIu64 "\n",
+		            m_frame.load(std::memory_order_relaxed), done, refused, skipped);
 	}
 	m_download_images.clear();
 }

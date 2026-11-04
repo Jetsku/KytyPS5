@@ -102,6 +102,9 @@ enum class Op : uint16_t {
 	// A host memcpy of guest bytes into mapped memory (KYTY_STREAM_COPY_DEFER, BufferCache): not a
 	// command; replayed in stream order, so before the Submit of the commands that read it.
 	HostCopy,
+	// vkCmdInsertDebugUtilsLabelEXT (under --rd / KYTY_TRACE_VK_LABELS: pass and shader names for
+	// RenderDoc); the packet carries the label text.
+	InsertDebugLabel,
 	Count,
 };
 
@@ -482,6 +485,7 @@ uint64_t Scissors(uint32_t count, const vk::Rect2D* scissors);
 uint64_t Value(Op op, uint64_t a, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0, uint64_t e = 0,
                uint64_t f = 0);
 uint64_t Floats(Op op, const float* values, uint32_t count);
+uint64_t DebugLabel(const char* name, uint32_t size);
 uint64_t ColorWriteEnable(uint32_t count, const vk::Bool32* enables);
 uint64_t ClearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue& color,
                          uint32_t count, const vk::ImageSubresourceRange* ranges);
@@ -748,6 +752,7 @@ public:
 	                          vk::QueryResultFlags flags);
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query);
 	void hostCopy(void* destination, uint64_t source, uint64_t size);
+	void insertDebugLabel(const char* name);
 	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
 	                          uint32_t marker);
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,

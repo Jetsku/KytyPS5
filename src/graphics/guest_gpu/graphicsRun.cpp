@@ -116,6 +116,13 @@ static_assert(sizeof(DrawIndexedIndirectArgs) == sizeof(vk::DrawIndexedIndirectC
 constexpr uint64_t IndirectInstanceCountOffset = offsetof(DrawIndirectArgs, instance_count);
 static_assert(offsetof(DrawIndexedIndirectArgs, instance_count) == IndirectInstanceCountOffset);
 
+// KYTY_INDIRECT_NATIVE_ALWAYS (live, default 0): an indirect draw takes the host indirect path
+// even when its argument bytes are not GPU-owned now. Off: such arguments are read on the CPU from
+// guest memory.
+static Live::Switch g_indirect_native_always("KYTY_INDIRECT_NATIVE_ALWAYS", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+});
+
 // KYTY_NATIVE_INDIRECT=0 keeps every indirect draw on CPU-read arguments.
 static bool NativeIndirectEnabled() {
 	static const bool enabled = [] {
@@ -2758,6 +2765,38 @@ void CommandProcessor::ValidateIndirectSource(const DrawIndirectSource& source) 
 	}
 }
 
+// KYTY_INDIRECT_ARGS_DIAG=1 (diagnostic, default off): indirect draws that read zero arguments on
+// the CPU path, per argument address: the pass, the values, whether a clean read was possible and
+// why not (LibKernel::Memory::DescribeGpuBackingForRead; the newest buffer writer needs
+// KYTY_CP_FAULT_WRITERS=1). Each address is logged at its first CPU read and then every 512th,
+// at most 4000 lines. GPU thread.
+static void NoteCpuIndirectArgs(const char* what, uint64_t address, uint64_t size, uint32_t a, uint32_t b) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_INDIRECT_ARGS_DIAG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	// Only reads that drew nothing (a zero count): those are the ones a missed GPU write would explain.
+	if (a != 0u && b != 0u) {
+		return;
+	}
+	static std::unordered_map<uint64_t, uint32_t> seen;
+	static uint32_t                               lines = 0;
+	auto&                                         n     = seen[address];
+	if (lines >= 4000u || (n++ % 512u) != 0u) {
+		return;
+	}
+	lines++;
+	uint32_t   probe = 0;
+	const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(address, &probe, sizeof(probe));
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "IndirectArgsDiag: {} pass {} args 0x{:x}+0x{:x} values {} {} (seen {}) clean_read {}: {}\n", what,
+	    Libs::Graphics::PassCensus::CurrentKey(), address, size, a, b, n, clean ? 1 : 0,
+	    LibKernel::Memory::DescribeGpuBackingForRead(address, size)));
+}
+
 // Takes the host indirect path when the argument (or count) bytes are GPU-owned, i.e. when a CPU
 // read would page-fault and drain the GPU. CPU-clean arguments stay on the CPU path, which then
 // reads them without synchronization.
@@ -2771,7 +2810,8 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		return cache.HasGpuDirtyBytes(address, size) ||
 		       cache.HasPendingBackingPublication(address, size);
 	};
-	if (!gpu_owned(source.args_addr, source.ArgsSize()) &&
+	// KYTY_INDIRECT_NATIVE_ALWAYS: every indirect draw reads its arguments on the GPU.
+	if (g_indirect_native_always.Get() == 0 && !gpu_owned(source.args_addr, source.ArgsSize()) &&
 	    (source.count_addr == 0 || !gpu_owned(source.count_addr, sizeof(uint32_t)))) {
 		return false;
 	}
@@ -2949,6 +2989,8 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	if (!indexed) {
 		const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
 		m_num_instances = args.instance_count;
+		NoteCpuIndirectArgs("auto", args_addr, sizeof(DrawIndirectArgs), args.vertex_count_per_instance,
+		                    args.instance_count);
 		// KYTY_TRACE_PASS_CENSUS: which indirect draws took the CPU path (args not tracked as GPU-written).
 		Libs::Graphics::PassCensus::Drop('i', 0, args.vertex_count_per_instance == 0 || args.instance_count == 0
 		                                             ? "info: indirect draw, CPU path, args read zero"
@@ -2978,6 +3020,8 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	}
 
 	m_num_instances = args.instance_count;
+	NoteCpuIndirectArgs("indexed", args_addr, sizeof(DrawIndexedIndirectArgs), args.index_count_per_instance,
+	                    args.instance_count);
 	// KYTY_TRACE_PASS_CENSUS: which indirect draws took the CPU path (args not tracked as GPU-written).
 	Libs::Graphics::PassCensus::Drop('i', 0, index_count == 0 || args.instance_count == 0
 	                                             ? "info: indexed indirect draw, CPU path, args read zero"
@@ -3069,6 +3113,9 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		}
 	}
 
+	if (count_addr != 0) {
+		NoteCpuIndirectArgs("multi-count", count_addr, sizeof(uint32_t), draw_count, max_count_or_count);
+	}
 	// KYTY_TRACE_PASS_CENSUS: multi-draws taking the CPU path and their GPU-written count.
 	Libs::Graphics::PassCensus::Drop('i', 0, count_addr != 0 && draw_count == 0
 	                                             ? "info: multi-indirect draw, CPU path, count read zero"

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PASSCENSUS_H_
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PASSCENSUS_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -14,6 +15,17 @@
 namespace Libs::Graphics::PassCensus {
 
 [[nodiscard]] bool Enabled();
+// Vulkan debug labels (default on under --rd, KYTY_TRACE_VK_LABELS=1 elsewhere, =0 off): every draw and dispatch is
+// preceded by an inserted VK_EXT_debug_utils label "draw <vs> <ps> | <pass>" / "dispatch <cs> | <pass>" (Erlou93/KytyPS5-Yotei's
+// format, so its RenderDoc tools read ours too), <pass> = the "outer>inner" game markers as for the census (exact
+// with KYTY_CP_SEQ=0 KYTY_CP_SEQ_PREFETCH=0).
+[[nodiscard]] bool LabelsEnabled();
+// The marker stack is tracked (census or labels): the CP calls Marker/Packet only then.
+[[nodiscard]] inline bool Tracking() {
+	return Enabled() || LabelsEnabled();
+}
+// Writes the label text of a draw ('d', a = VS, b = PS) or dispatch ('c', a = CS) into `out`.
+void LabelText(char* out, size_t size, char kind, uint64_t a, uint64_t b);
 // A marker push (`push_name`) or pop (null) of command processor `cp`.
 void Marker(const void* cp, const char* push_name);
 // A draw (or dispatch) packet of `cp`.
