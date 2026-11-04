@@ -136,6 +136,13 @@ struct GraphicContext {
 	uint32_t                           side_queue_index = 0;
 	vk::Queue                          side_queue       = nullptr;
 	Common::Mutex                      side_queue_mutex;
+	// Another queue of queue_family for vkQueuePresentKHR alone; null when the family has no spare
+	// queue, then presents use `queue`. A present may block until the GPU finished the image and
+	// the window system took it (software WSI: about a frame), and queue_mutex held that long
+	// stopped every game submission. Presents hold present_queue_mutex instead.
+	uint32_t                           present_queue_index = 0;
+	vk::Queue                          present_queue       = nullptr;
+	Common::Mutex                      present_queue_mutex;
 	// Queue of a transfer-only family (the copy engines) for asynchronous uploads (KYTY_UPLOAD_DMA,
 	// renderer/cache/uploadDma.h); null when the device has none or the path is off. Only the
 	// UploadDma worker submits to it. Buffers it touches are created shared by both families.

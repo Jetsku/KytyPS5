@@ -668,10 +668,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	// Queue 0 carries every scheduler submission and presentation. A second queue of the same
-	// family (KYTY_SIDE_QUEUE, default on when the family has one) runs side-copy readbacks, so a
-	// copy waits only for its producer instead of for everything queued ahead of it on queue 0.
-	// Buffers stay EXCLUSIVE: ownership is per family, and both queues share it.
+	// Queue 0 carries every scheduler submission. A second queue of the same family
+	// (KYTY_SIDE_QUEUE, default on when the family has one) runs side-copy readbacks, so a copy
+	// waits only for its producer instead of for everything queued ahead of it on queue 0; the
+	// next spare one presents (GraphicContext::present_queue). Buffers stay EXCLUSIVE: ownership
+	// is per family, and all these queues share it.
 	uint32_t family_queue_count = 0;
 	{
 		uint32_t count = 0;
@@ -690,12 +691,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	std::printf("Kyty side-copy queue: %s (family %u has %u queues, KYTY_SIDE_QUEUE)\n",
 	       graphics.side_queue_index != 0 ? "queue 1" : "shared with queue 0", queue_family,
 	       family_queue_count);
+	// Presentation gets the next spare queue of the family (GraphicContext::present_queue).
+	const uint32_t family_queues_used = graphics.side_queue_index + 1;
+	graphics.present_queue_index = family_queue_count > family_queues_used ? family_queues_used : 0u;
+	std::printf("Kyty present queue: %s\n",
+	            graphics.present_queue_index != 0
+	                ? fmt::format("queue {}", graphics.present_queue_index).c_str()
+	                : "shared with queue 0");
 
-	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
+	const std::array<float, 3> queue_priorities {1.0f, 1.0f, 1.0f};
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
 	auto&                      queue_create_info = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
+	queue_create_info.queueCount =
+	    std::max(graphics.side_queue_index, graphics.present_queue_index) + 1;
 	queue_create_info.pQueuePriorities = queue_priorities.data();
 	// KYTY_UPLOAD_DMA: one queue of a transfer-only family (the copy engines), for UploadDma.
 	// Not under RenderDoc, whose captures of the extra queue are not needed for analysis.
@@ -2158,6 +2167,11 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.side_queue_index,
 		                            &graphic_ctx.side_queue);
 		EXIT_IF(graphic_ctx.side_queue == nullptr);
+	}
+	if (graphic_ctx.present_queue_index != 0) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.present_queue_index,
+		                            &graphic_ctx.present_queue);
+		EXIT_IF(graphic_ctx.present_queue == nullptr);
 	}
 	if (graphic_ctx.transfer_queue_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.transfer_queue_family, 0,
