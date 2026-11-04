@@ -230,10 +230,16 @@ public:
 	struct SharedSlot {
 		uint32_t entry = 0; // a Heap::slots entry (slot, or BindlessSlotArrayFlag | slot)
 		ImageId  image;
+		uint32_t slot_binding = 0;
+		uint32_t slot_index   = 0;
 	};
-	[[nodiscard]] const SharedSlot* FindSharedSlot(uint32_t binding, const std::array<uint32_t, 8>& words) const;
+	// Null when unknown, or when the slot no longer shows an image (a placeholder was written to
+	// it, e.g. ReleaseViews when the image's views were dropped): the words are forgotten then.
+	[[nodiscard]] const SharedSlot* FindSharedSlot(uint32_t binding, const std::array<uint32_t, 8>& words);
 	void NoteSharedSlot(const Heap& heap, const std::array<uint32_t, 8>& words, uint32_t entry, ImageId image);
 	void AddSharedSlotRef(uint32_t binding, uint32_t slot);
+	// Shared slots found holding a placeholder and forgotten (diagnostics).
+	[[nodiscard]] uint64_t SharedSlotsForgotten() const noexcept { return m_shared_forgotten; }
 
 	// Engine method, E1. The guest pages holding a heap's entries are write-watched; a CPU write
 	// to one (a page fault on a game thread, or an explicit invalidation such as a file read into
@@ -347,6 +353,10 @@ private:
 	std::unordered_map<SharedSlotKey, SharedSlot, SharedSlotKeyHash> m_shared_slots;
 	std::unordered_map<uint64_t, SharedSlotKey>                      m_shared_slot_words;
 	std::unordered_map<uint64_t, uint32_t>                           m_shared_slot_refs;
+	uint64_t                                                         m_shared_forgotten = 0;
+	// The slot's words are forgotten (no new key shares it); drop_refs: its keys were released
+	// together, so the next FreeSlot frees it.
+	void ForgetSharedSlot(uint32_t binding, uint32_t slot, bool drop_refs);
 	uint32_t m_next_region = 1; // translation[0] is the out-of-range entry
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors, PlaceholderColors};

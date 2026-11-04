@@ -2854,16 +2854,32 @@ void RenderExecutor::PrefillBindlessHeap(BindlessHeap& heap, uint32_t entries) {
 			made++;
 		} else {
 			failed++;
+			if (BindlessPrefillMode() >= 2u) {
+				static std::atomic<uint32_t> failures_logged {0};
+				if (failures_logged.fetch_add(1, std::memory_order_relaxed) < 400u) {
+					ShaderRecompiler::IR::DescriptorValue value {};
+					value.dword_count = 8u;
+					std::copy_n(words.begin(), 8, value.dwords.begin());
+					const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+					LOGF("Bindless prefill failed: frame=%" PRIu64 " heap 0x%" PRIx64 "+%u key %u: T# base 0x%" PRIx64
+					     " type %u format %u %ux%u transient %d slot 0x%x\n",
+					     BindlessFrame(), heap.base, heap.table_offset, key, descriptor.Base40(),
+					     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(descriptor.Format()),
+					     static_cast<uint32_t>(descriptor.Width5()) + 1u, static_cast<uint32_t>(descriptor.Height5()) + 1u,
+					     m_bindless_transient_failure ? 1 : 0, heap.slots[key]);
+				}
+			}
 		}
 	}
 	if (BindlessPrefillMode() >= 2u) {
 		static std::atomic<uint32_t> logged {0};
 		const auto                   n = logged.fetch_add(1, std::memory_order_relaxed);
-		if (n < 64u || (n & 1023u) == 0u) {
+		// Mode 3: every heap.
+		if (n < 64u || (n & 1023u) == 0u || BindlessPrefillMode() >= 3u) {
 			LOGF("Bindless prefill: frame=%" PRIu64 " heap 0x%" PRIx64 "+%u stride %u binding %u keys %u: shared %u "
-			     "resolved %u failed %u skipped %u (#%u)\n",
+			     "resolved %u failed %u skipped %u forgotten %" PRIu64 " (#%u)\n",
 			     BindlessFrame(), heap.base, heap.table_offset, heap.stride, heap.binding, keys, shared, made,
-			     failed, skipped, n);
+			     failed, skipped, table.SharedSlotsForgotten(), n);
 		}
 	}
 }

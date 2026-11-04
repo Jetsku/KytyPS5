@@ -697,7 +697,7 @@ void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
 		return value == nullptr || value[0] != '0';
 	}();
 	// KYTY_BINDLESS_PREFILL: a shared slot stays while another key holds it; its last key frees it.
-	if (!m_shared_slot_words.empty()) {
+	if (!m_shared_slot_words.empty() || !m_shared_slot_refs.empty()) {
 		const uint64_t shared_key = (uint64_t {binding} << 32u) | slot;
 		if (const auto refs = m_shared_slot_refs.find(shared_key); refs != m_shared_slot_refs.end()) {
 			if (--refs->second == 0u) {
@@ -818,6 +818,8 @@ bool BindlessTable::ReleaseViews(std::span<const CachedImageView> views) {
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
 			// Only a slot this took from keys goes to the free list: one no key uses is on it
 			// already (ReleaseKey / OnImageUnregistered keep its view until it is reused).
+			// KYTY_BINDLESS_PREFILL: every key of a shared slot was released here at once.
+			ForgetSharedSlot(binding, slot, keys != 0);
 			if (keys != 0) {
 				FreeSlot(binding, slot);
 			}
@@ -1063,9 +1065,32 @@ void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 }
 
 const BindlessTable::SharedSlot* BindlessTable::FindSharedSlot(uint32_t binding,
-                                                               const std::array<uint32_t, 8>& words) const {
+                                                               const std::array<uint32_t, 8>& words) {
 	const auto found = m_shared_slots.find(SharedSlotKey {binding, words});
-	return found != m_shared_slots.end() ? &found->second : nullptr;
+	if (found == m_shared_slots.end()) {
+		return nullptr;
+	}
+	// The slot must still show an image: a placeholder there (its views were dropped) would be
+	// shared by every later heap that holds this T#.
+	const auto& shared = found->second;
+	const auto& views  = m_slot_views[shared.slot_binding];
+	if (shared.slot_index >= views.size() || views[shared.slot_index] == nullptr) {
+		m_shared_forgotten++;
+		ForgetSharedSlot(shared.slot_binding, shared.slot_index, false);
+		return nullptr;
+	}
+	return &shared;
+}
+
+void BindlessTable::ForgetSharedSlot(uint32_t binding, uint32_t slot, bool drop_refs) {
+	const uint64_t slot_key = (uint64_t {binding} << 32u) | slot;
+	if (const auto words = m_shared_slot_words.find(slot_key); words != m_shared_slot_words.end()) {
+		m_shared_slots.erase(words->second);
+		m_shared_slot_words.erase(words);
+	}
+	if (drop_refs) {
+		m_shared_slot_refs.erase(slot_key);
+	}
 }
 
 void BindlessTable::NoteSharedSlot(const Heap& heap, const std::array<uint32_t, 8>& words, uint32_t entry,
@@ -1083,7 +1108,7 @@ void BindlessTable::NoteSharedSlot(const Heap& heap, const std::array<uint32_t, 
 		m_shared_slot_words.erase((uint64_t {SlotBinding(heap, old->second.entry)} << 32u) |
 		                          SlotIndex(old->second.entry));
 	}
-	m_shared_slots[key]           = SharedSlot {entry, image};
+	m_shared_slots[key]           = SharedSlot {entry, image, SlotBinding(heap, entry), SlotIndex(entry)};
 	m_shared_slot_words[slot_key] = key;
 }
 
