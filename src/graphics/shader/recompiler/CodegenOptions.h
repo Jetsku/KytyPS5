@@ -420,6 +420,11 @@ struct CodegenOptions {
 	// storage image swizzle that stores every channel of its format from its own component is
 	// specialized as the identity (fewer program variants; same stored bits).
 	bool storage_swizzle_canon = false;
+	// KYTY_RAW_SMALL_SINT_STORAGE=1 (default 0; adapted from Erlou93/KytyPS5-Yotei): a write-only,
+	// non-atomic storage image of 16- or 8-bit SINT format stores the same low bits through an
+	// unsigned view (R16_UINT / R8_UINT), as 32-bit SINT already does, instead of failing the
+	// program. Ghost of Yotei's cloud shadow precompute (CS 753c552f, R16 SINT) was dropped without it.
+	bool raw_small_sint_storage = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has

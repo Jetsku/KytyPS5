@@ -1077,8 +1077,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    image.conversion_format == Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = CanonicalStorageSwizzle(image.shader_swizzle, format);
 		}
-		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && (base.atomic ? !base.atomic64 : !base.read);
+		// KYTY_RAW_SMALL_SINT_STORAGE: write-only 16/8-bit SINT storage, the same low bits through an
+		// unsigned view (Erlou93/KytyPS5-Yotei).
+		const bool raw_small_sint_storage =
+		    storage && GetCodegenOptions().raw_small_sint_storage &&
+		    (format == Prospero::BufferFormat::k16SInt || format == Prospero::BufferFormat::k8SInt) &&
+		    base.written && !base.read && !base.atomic;
+		const bool raw_sint_storage = raw_small_sint_storage ||
+		                              (storage && format == Prospero::BufferFormat::k32SInt &&
+		                               base.written && (base.atomic ? !base.atomic64 : !base.read));
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||

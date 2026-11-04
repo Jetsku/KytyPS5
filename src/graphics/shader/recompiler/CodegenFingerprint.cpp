@@ -243,6 +243,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.storage_swizzle_canon) {
 		b.Text("storage_swizzle_canon");
 	}
+	if (options.raw_small_sint_storage) {
+		b.Text("raw_small_sint_storage");
+	}
 	if (options.bindless_3d_as_array) {
 		b.Text("bindless_3d_as_array");
 	}

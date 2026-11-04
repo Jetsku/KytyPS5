@@ -99,6 +99,8 @@ CodegenOptions FromEnvironment() {
 	options.scalar_load_groups   = EnvFlag("KYTY_SCALAR_LOAD_GROUPS", options.scalar_load_groups);
 	options.null_image_keep_dim  = EnvFlag("KYTY_NULL_IMAGE_KEEP_DIM", options.null_image_keep_dim);
 	options.storage_swizzle_canon = EnvFlag("KYTY_STORAGE_SWIZZLE_CANON", options.storage_swizzle_canon);
+	options.raw_small_sint_storage =
+	    EnvFlag("KYTY_RAW_SMALL_SINT_STORAGE", options.raw_small_sint_storage);
 	options.bindless_3d_as_array =
 	    EnvFlag("KYTY_BINDLESS_3D_AS_ARRAY", options.bindless_3d_as_array);
 	options.runtime_images   = EnvFlag("KYTY_RUNTIME_IMAGES", options.runtime_images);

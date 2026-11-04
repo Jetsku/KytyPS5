@@ -648,9 +648,15 @@ bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool encoding_ok   = IsCanonicalTextureEncoding(descriptor, resource.r128);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	// Signed 32-bit atomics through a uint view (upstream aec8c8875).
-	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written &&
-	                              (resource.atomic ? !resource.atomic64 : !resource.read);
+	// KYTY_RAW_SMALL_SINT_STORAGE: write-only 16/8-bit SINT storage through a uint view.
+	const bool raw_small_sint_storage =
+	    ShaderRecompiler::GetCodegenOptions().raw_small_sint_storage &&
+	    (format == Prospero::BufferFormat::k16SInt || format == Prospero::BufferFormat::k8SInt) &&
+	    uint_resource && resource.written && !resource.read && !resource.atomic;
+	const bool raw_sint_storage = raw_small_sint_storage ||
+	                              (format == Prospero::BufferFormat::k32SInt && uint_resource &&
+	                               resource.written &&
+	                               (resource.atomic ? !resource.atomic64 : !resource.read));
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
@@ -1106,10 +1112,17 @@ static TextureCache::ImageDesc BuildTextureDescription(
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
+	// KYTY_RAW_SMALL_SINT_STORAGE: the uint view of a 16/8-bit SINT storage image (Erlou93/KytyPS5-Yotei).
+	const bool small_sint_view = storage && ShaderRecompiler::GetCodegenOptions().raw_small_sint_storage &&
+	                             resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
 	                                 : storage && (resource.atomic ||
 	                                               format == Prospero::BufferFormat::k32SInt)
 	                                     ? vk::Format::eR32Uint
+	                                 : small_sint_view && format == Prospero::BufferFormat::k16SInt
+	                                     ? vk::Format::eR16Uint
+	                                 : small_sint_view && format == Prospero::BufferFormat::k8SInt
+	                                     ? vk::Format::eR8Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
