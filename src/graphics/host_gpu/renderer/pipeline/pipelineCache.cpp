@@ -8358,6 +8358,66 @@ void PipelineCache::NoteAsyncTranslationRefused(uint64_t shader_hash) {
 	GraphicsTranslations::Instance().Refuse(shader_hash);
 }
 
+// KYTY_OBJPRIM_ID=1 (ShaderObjprimIdEnabled; based on Erlou93/KytyPS5-Yotei): the hardware ObjPrimID
+// write. A draw with VGT_DRAW_PAYLOAD_CNTL.OBJPRIM_ID_EN writes VGT_OBJECT_ID (plus the primitive
+// index when PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID is set) into an enabled 32-bit colour slot its
+// pixel shader does not export. Ghost of Yotei's depth pre-pass writes its visibility image
+// (R32_UINT, slot 7) so; the Vcull tile scan (CS 17444e6a) reads it to build the deferred pass's
+// indirect draws, which all draw nothing without it (depth but no G-buffer).
+// The slot of the ObjPrimID write: slot 7 when it qualifies (Yotei binds its ID image to slot 7),
+// else the first that does. A slot qualifies when CB_TARGET_MASK enables it, a colour target is set
+// (base != 0, COLOR_32) and the pixel shader does not export to it. 0xff: none.
+static uint8_t ObjprimIdSlot(const HW::Context& context, const ShaderPixelInputInfo& pixel_info) {
+	if (!ShaderObjprimIdEnabled() || (context.GetDrawPayloadControl() & 0x1u) == 0) {
+		return 0xffu;
+	}
+	uint32_t exported = 0;
+	for (uint32_t index = 0; index < std::size(pixel_info.target_output_mode); index++) {
+		if (pixel_info.target_output_mode[index] == 0) {
+			continue;
+		}
+		const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, index);
+		if (slot < 8u) {
+			exported |= 1u << slot;
+		}
+	}
+	const auto usable = [&](uint32_t slot) {
+		const auto& rt = context.GetRenderTarget(slot);
+		return render_target_mask_slot(context.GetRenderTargetMask(), slot) != 0 &&
+		       (exported & (1u << slot)) == 0 && rt.base.addr != 0 &&
+		       rt.info.format == Prospero::ChannelLayout::k32;
+	};
+	uint8_t chosen = 0xffu;
+	if (usable(7)) {
+		chosen = 7;
+	} else {
+		for (uint32_t slot = 0; slot < 8u && chosen == 0xffu; slot++) {
+			if (usable(slot)) {
+				chosen = static_cast<uint8_t>(slot);
+			}
+		}
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+		std::string layout;
+		for (uint32_t slot = 0; slot < 8u; slot++) {
+			const auto& rt = context.GetRenderTarget(slot);
+			if (rt.base.addr == 0) {
+				continue;
+			}
+			layout += fmt::format(" [{} base=0x{:x} fmt={} mask={:x}{}]", slot, rt.base.addr,
+			                      static_cast<uint32_t>(rt.info.format),
+			                      render_target_mask_slot(context.GetRenderTargetMask(), slot),
+			                      (exported & (1u << slot)) != 0 ? " export" : "");
+		}
+		std::printf("ObjPrimID: payload=0x%x objprim_cntl=0x%x slot=%d%s\n", context.GetDrawPayloadControl(),
+		            context.GetObjprimIdControl(), chosen == 0xffu ? -1 : static_cast<int>(chosen),
+		            layout.c_str());
+		std::fflush(stdout);
+	}
+	return chosen;
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -8408,11 +8468,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	// The program cache locks internally, so no pipeline lock is held across materialization.
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
-	const uint32_t push_data_start = ShaderRecompiler::IR::PushData::GraphicsPushStart(
+	uint32_t push_data_start = ShaderRecompiler::IR::PushData::GraphicsPushStart(
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
 	                      vertex_info[0].mesh.split_groups != 0)
 	                : 0,
 	    vertex_info[tess_active ? 2u : 0u].user_clip_planes);
+	// KYTY_OBJPRIM_ID: the per-draw VGT_OBJECT_ID takes the first push dword after the draw's own
+	// dwords (mesh parameters, clip planes); the stages' data follows it.
+	pixel_info.objprim_slot        = 0xffu;
+	pixel_info.objprim_push_dword  = 0xffu;
+	pixel_info.objprim_add_prim_id = false;
+	if (pixel_active) {
+		pixel_info.objprim_slot = ObjprimIdSlot(context, pixel_info);
+		if (pixel_info.HasObjprimOutput()) {
+			if (push_data_start < ShaderRecompiler::IR::PushData::DwordCount) {
+				pixel_info.objprim_add_prim_id = (context.GetObjprimIdControl() & 0x2u) != 0;
+				pixel_info.objprim_push_dword  = static_cast<uint8_t>(push_data_start);
+				push_data_start++;
+			} else {
+				pixel_info.objprim_slot = 0xffu;
+			}
+		}
+	}
 	// KYTY_ASYNC_TRANSLATION: no mesh draws, and tessellated ones only with KYTY_PIPELINE_SKIP_TESS
 	// (the pipeline-skip stage refusal).
 	if (mesh_active || (tess_active && !SkipTessellatedEnabled())) defer_translation = false;
@@ -8529,6 +8606,13 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	               Prospero::IsRectList(user_config.GetPrimType()));
 	if (vertex_info.user_clip_planes != 0) {
 		return SpeculativeResult::Ineligible; // the serial path places the plane dwords
+	}
+	// KYTY_OBJPRIM_ID: the serial path places the ObjPrimID push dword.
+	pixel_info.objprim_slot        = 0xffu;
+	pixel_info.objprim_push_dword  = 0xffu;
+	pixel_info.objprim_add_prim_id = false;
+	if (pixel_active && ObjprimIdSlot(context, pixel_info) != 0xffu) {
+		return SpeculativeResult::Ineligible;
 	}
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;

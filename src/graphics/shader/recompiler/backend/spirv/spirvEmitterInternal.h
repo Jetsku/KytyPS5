@@ -264,6 +264,8 @@ struct EmitterState {
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
+	// KYTY_OBJPRIM_ID: the pixel shader's ObjPrimID output (StageOutputKind::ObjPrimId).
+	uint32_t                   objprim_output_variable               = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;

@@ -255,6 +255,10 @@ bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
 	if (SkipInactivePixelShadersEnabled()) {
 		mrt_mask &= DrawColorOutputFilter(ctx); // as PrepareDrawRenderState
 	}
+	// KYTY_OBJPRIM_ID: the slot of the hardware ObjPrimID write (not a pixel-shader export).
+	if (prepared.pixel_active && prepared.pixel_info.HasObjprimOutput()) {
+		mrt_mask |= 1u << prepared.pixel_info.objprim_slot;
+	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) == 0) {
 			continue;

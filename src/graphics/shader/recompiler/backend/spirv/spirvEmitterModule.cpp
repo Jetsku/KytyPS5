@@ -348,8 +348,12 @@ void DefineDescriptors(EmitterState& state) {
 	                              state.program.stage != ShaderType::Compute &&
 	                              state.input_info.vertex != nullptr &&
 	                              state.input_info.vertex->user_clip_planes != 0;
+	// KYTY_OBJPRIM_ID: the per-draw VGT_OBJECT_ID is a push-constant dword even without push data.
+	const bool objprim_push = state.program.stage == ShaderType::Pixel &&
+	                          state.input_info.pixel != nullptr &&
+	                          state.input_info.pixel->HasObjprimOutput();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
-	    user_clip_planes) {
+	    user_clip_planes || objprim_push) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -742,6 +746,13 @@ void DefineInputs(EmitterState& state) {
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
+		// KYTY_OBJPRIM_ID: the fragment primitive index. SPIR-V enables PrimitiveId in a fragment
+		// shader through the Tessellation capability as well as Geometry (based on
+		// Erlou93/KytyPS5-Yotei).
+		if (input.kind == IR::StageInputKind::PrimitiveId && state.program.stage == ShaderType::Pixel) {
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+			state.builder.RequireCapability(spv::CapabilityTessellation);
+		}
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (input.per_vertex) {
@@ -891,6 +902,15 @@ void DefineOutputs(EmitterState& state) {
 				binding.variable_id =
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
 				            spv::BuiltInSampleMask);
+				break;
+			case IR::StageOutputKind::ObjPrimId:
+				// KYTY_OBJPRIM_ID: one 32-bit unsigned value at the colour slot (location) the
+				// hardware writes.
+				binding.variable_id = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassOutput,
+				                                              binding.debug_name.c_str());
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+				                            spv::DecorationLocation, binding.location);
+				state.objprim_output_variable = binding.variable_id;
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
