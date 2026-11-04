@@ -16,6 +16,7 @@ std::array<Sint16, 2> physical_stick {};
 std::array<int, 2>    guest_stick {128, 128};
 uint32_t             guest_buttons = 0;
 bool                 guest_touch   = false;
+bool                 host_shake    = false;
 } // namespace
 
 namespace Fake {
@@ -73,6 +74,11 @@ void SetTouchPad(int id, int finger, bool down, float, float) {
 }
 void SetRightStick(int, int, int) {}
 void ToggleGyroEmulation(int) {}
+void Shake(int id, bool down) {
+	if (id == HOST_INPUT_CONTROLLER_ID) {
+		host_shake = down;
+	}
+}
 void CycleSetting(Setting) {}
 } // namespace Libs::Controller
 
@@ -86,6 +92,7 @@ struct Inputs {
 		guest_stick    = {128, 128};
 		guest_buttons  = 0;
 		guest_touch    = false;
+		host_shake     = false;
 		HostInputInit(nullptr);
 	}
 	~Inputs() { HostInputShutdown(); }
@@ -190,6 +197,15 @@ void TestDisabledMappingTabs() {
 }
 } // namespace
 
+// Astro Bot's first scene asks for a shake; the keyboard's X holds one.
+void TestKeyboardShake() {
+	Inputs inputs;
+	HostInputKey(SDLK_X, true);
+	Check(host_shake, "holding X did not shake the keyboard pad");
+	HostInputKey(SDLK_X, false);
+	Check(!host_shake, "releasing X did not stop the shake");
+}
+
 int main() {
 	Config::Initialize();
 	Config::ConfigOptions options;
@@ -200,6 +216,7 @@ int main() {
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
 	TestDisabledMappingTabs();
+	TestKeyboardShake();
 	Config::Shutdown();
 	return 0;
 }

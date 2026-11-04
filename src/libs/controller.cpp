@@ -130,6 +130,7 @@ public:
 	void SetMotionSensorState(bool enable);
 	void ResetOrientation();
 	void ToggleGyroEmulation(int id);
+	void Shake(int id, bool down);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
@@ -154,6 +155,8 @@ private:
 	void AddState();
 	// Emulated tilt: the right stick drives pitch and roll instead of the stick axes.
 	void UpdateEmulatedTilt();
+	// A new shake sample for the current time; caller holds m_mutex.
+	void UpdateShake();
 	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
 	void ApplyVibration();
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
@@ -168,6 +171,8 @@ private:
 	bool             m_gyro_emulation  = false;
 	uint64_t         m_emulated_time   = 0;
 	std::array<int, 2> m_emulated_stick {128, 128};
+	bool             m_shaking         = false;
+	uint64_t         m_shake_start     = 0;
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
@@ -873,6 +878,49 @@ void GameController::ToggleGyroEmulation(int id) {
 	LOGF("Emulated gyro tilt: %s\n", m_gyro_emulation ? "enabled" : "disabled");
 }
 
+void GameController::Shake(int id, bool down) {
+	Common::LockGuard lock(m_mutex);
+	if (id != HOST_INPUT_CONTROLLER_ID && id != m_active_id) {
+		return;
+	}
+	// Pads with a real accelerometer report the shake themselves.
+	if (m_active_id != HOST_INPUT_CONTROLLER_ID) {
+		auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+		if (pad != nullptr && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
+			return;
+		}
+	}
+	if (down == m_shaking) {
+		return;
+	}
+	m_shaking     = down;
+	m_shake_start = LibKernel::KernelGetProcessTime();
+	if (down) {
+		UpdateShake();
+		return;
+	}
+	m_state.time  = m_shake_start;
+	m_state.accel = QuatRotate(QuatConjugate(m_state.orientation), {0.0f, 1.0f, 0.0f});
+	m_state.gyro  = {};
+	AddState();
+}
+
+void GameController::UpdateShake() {
+	// A vigorous hand shake: 6 Hz, +-2.5 g along the pad's X axis on top of gravity, with the roll
+	// rate that goes with it. Each pad read while the control is held gets a fresh sample.
+	constexpr float frequency = 6.0f;
+	constexpr float amplitude = 2.5f; // g
+	constexpr float roll_rate = 8.0f; // rad/s
+	const uint64_t  now       = LibKernel::KernelGetProcessTime();
+	const float     phase =
+	    6.2831853f * frequency * static_cast<float>(now - m_shake_start) * 0.000001f;
+	const Vec3 rest = QuatRotate(QuatConjugate(m_state.orientation), {0.0f, 1.0f, 0.0f});
+	m_state.time    = now;
+	m_state.accel   = {rest[0] + amplitude * std::sin(phase), rest[1], rest[2]};
+	m_state.gyro    = {0.0f, 0.0f, roll_rate * std::cos(phase)};
+	AddState();
+}
+
 void GameController::ResetOrientation() {
 	Common::LockGuard lock(m_mutex);
 	m_state.orientation  = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -894,6 +942,11 @@ void GameController::ResetInputState() {
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
+	if (m_shaking) {
+		m_shaking     = false;
+		m_state.accel = QuatRotate(QuatConjugate(m_state.orientation), {0.0f, 1.0f, 0.0f});
+		m_state.gyro  = {};
+	}
 	AddState();
 }
 
@@ -1068,6 +1121,9 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 
 	Common::LockGuard lock(m_mutex);
 
+	if (m_shaking) {
+		UpdateShake();
+	}
 	*flag  = m_connected;
 	*count = m_connected_count;
 	*state = m_state;
@@ -1081,6 +1137,9 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 
 	Common::LockGuard lock(m_mutex);
 
+	if (m_shaking) {
+		UpdateShake();
+	}
 	*flag  = m_connected;
 	*count = m_connected_count;
 
@@ -1227,6 +1286,13 @@ void ToggleGyroEmulation(int id) {
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
 		player->ToggleGyroEmulation(id);
+	}
+}
+
+void Shake(int id, bool down) {
+	Common::LockGuard lock(g_router_mutex);
+	if (auto* player = PlayerForDevice(id)) {
+		player->Shake(id, down);
 	}
 }
 

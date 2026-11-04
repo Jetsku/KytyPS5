@@ -37,6 +37,7 @@ struct ControlInfo {
 	Controller::Setting setting {};
 	bool                gyro          = false;
 	bool                touchpad_mode = false;
+	bool                shake         = false;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -72,6 +73,7 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {.name    = "TriggerEffectIntensity",
                  .setting = Controller::Setting::TriggerEffectIntensity},
     ControlInfo {.name = "GyroToggle", .gyro = true},
+    ControlInfo {.name = "Shake", .shake = true},
     ControlInfo {.name = "TouchPadMode", .touchpad_mode = true},
 };
 
@@ -478,6 +480,10 @@ void SetControl(std::size_t control, bool down) {
 		}
 		return;
 	}
+	if (info.shake) {
+		Controller::Shake(Controller::HOST_INPUT_CONTROLLER_ID, down);
+		return;
+	}
 	if (info.touchpad_mode) {
 		if (down) {
 			HostInputToggleTouchPadMode();
@@ -520,6 +526,7 @@ void DefaultKeyboardInput(int key_code, bool down) {
 		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
+		case SDLK_X: Controller::Shake(Controller::HOST_INPUT_CONTROLLER_ID, down); return;
 		case SDLK_A:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
@@ -649,6 +656,8 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 		if (down) {
 			Controller::ToggleGyroEmulation(id);
 		}
+	} else if (info.shake) {
+		Controller::Shake(id, down);
 	} else if (info.touchpad_mode) {
 		if (down) {
 			HostInputToggleGamepadTouchPad(id);
