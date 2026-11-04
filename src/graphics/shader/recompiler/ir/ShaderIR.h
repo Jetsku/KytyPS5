@@ -348,7 +348,10 @@ enum class StageOutputKind {
 	ClipDistance,
 	CullDistance,
 	Layer,
-	ViewportIndex
+	ViewportIndex,
+	// KYTY_OBJPRIM_ID: the 32-bit ObjPrimID the hardware writes to a colour slot the pixel shader
+	// does not export (location = that slot).
+	ObjPrimId
 };
 
 struct PositionExportComponent {

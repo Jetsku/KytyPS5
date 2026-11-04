@@ -930,6 +930,11 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	if (!read && !values.empty() && ReadsUnmappedGuestMemory(address, values)) {
 		return true;
 	}
+	// KYTY_SRT_STALE_IMAGE_READS: refused only for GPU-modified images a CPU write superseded.
+	if (!read && !values.empty() &&
+	    LibKernel::Memory::TryReadGpuBackingOverStaleImages(address, values.data(), values.size_bytes())) {
+		return true;
+	}
 	if (!read && userdata != nullptr) {
 		static_cast<ShaderReadAttempt*>(userdata)->Missing(address, values.size_bytes());
 	}
@@ -1996,6 +2001,74 @@ void DumpLargeSpirv(const char* stage_name, uint64_t hash, const std::vector<uin
 	}
 }
 
+// KYTY_SHADER_DUMP=<folder>;<hash>[,<hash>...] or <folder>;all, ';' or '@' (diagnostics, local files
+// only): the selected guest shaders bypass the persistent program cache (dump_ir) and every emitted
+// permutation is written as <folder>/<stage>_<hash>_<spirv hash>.rdna2 (decoded guest code), .ir.txt
+// and .spv. A 32-bit hash matches either half of the 64-bit one. Default off.
+struct ShaderDumpRequest {
+	std::string           folder;
+	std::vector<uint64_t> hashes;
+	bool                  all = false;
+};
+
+const ShaderDumpRequest& ShaderDumpSettings() {
+	static const ShaderDumpRequest request = [] {
+		ShaderDumpRequest parsed;
+		const char*       value = std::getenv("KYTY_SHADER_DUMP");
+		if (value == nullptr) return parsed;
+		const std::string text(value);
+		const auto        split = text.find_first_of(";@");
+		if (split == std::string::npos) return parsed;
+		parsed.folder    = text.substr(0, split);
+		std::string list = text.substr(split + 1);
+		if (list == "all") {
+			parsed.all = true;
+			return parsed;
+		}
+		size_t at = 0;
+		while (at < list.size()) {
+			const auto next = list.find(',', at);
+			const auto item = list.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			if (!item.empty()) parsed.hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		return parsed;
+	}();
+	return request;
+}
+
+bool ShaderDumpSelected(uint64_t hash) {
+	const auto& request = ShaderDumpSettings();
+	if (request.folder.empty()) return false;
+	return request.all || std::ranges::find(request.hashes, hash) != request.hashes.end() ||
+	       std::ranges::find(request.hashes, hash & 0xffffffffull) != request.hashes.end() ||
+	       std::ranges::find(request.hashes, hash >> 32u) != request.hashes.end();
+}
+
+void DumpSelectedShader(const char* stage_name, uint64_t hash, const std::string& decoded,
+                        const std::string& ir, const std::vector<uint32_t>& spirv) {
+	if (!ShaderDumpSelected(hash)) return;
+	const auto&     request = ShaderDumpSettings();
+	std::error_code error;
+	std::filesystem::create_directories(request.folder, error);
+	const auto spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+	const auto base       = std::filesystem::path(request.folder) /
+	                  fmt::format("{}_{:016x}_{:016x}", stage_name, hash, spirv_hash);
+	const auto write = [&](const char* suffix, const void* data, size_t size) {
+		if (size == 0) return;
+		auto path = base;
+		path += suffix;
+		if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+			std::fwrite(data, 1, size, file);
+			std::fclose(file);
+		}
+	};
+	write(".rdna2", decoded.data(), decoded.size());
+	write(".ir.txt", ir.data(), ir.size());
+	write(".spv", spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -2790,6 +2863,8 @@ struct PipelineCache::ProgramCache {
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		DumpSelectedShader(stage_name, options.shader_hash, result.decoded_dump, result.ir_dump,
+		                   result.spirv);
 		return {.spirv       = std::move(result.spirv),
 		        .spirv_plain = std::move(result.spirv_plain),
 		        .info        = std::move(result.program).TakeCompiledInfo()};
@@ -3902,6 +3977,7 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		if (ShaderDumpSelected(params.hash)) options.dump_ir = true; // KYTY_SHADER_DUMP
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.plain_mip_stats_variant =
@@ -4019,7 +4095,7 @@ struct PipelineCache::ProgramCache {
 					job->options            = options;
 					job->options.user_data  = job->user_data;
 					job->options.back_code  = job->back_code;
-					job->options.dump_ir    = false;
+					job->options.dump_ir    = ShaderDumpSelected(params.hash);
 					job->options.early_dump = false;
 					ShaderStageInputInfo job_input {};
 					if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -8358,6 +8434,66 @@ void PipelineCache::NoteAsyncTranslationRefused(uint64_t shader_hash) {
 	GraphicsTranslations::Instance().Refuse(shader_hash);
 }
 
+// KYTY_OBJPRIM_ID=1 (ShaderObjprimIdEnabled; based on Erlou93/KytyPS5-Yotei): the hardware ObjPrimID
+// write. A draw with VGT_DRAW_PAYLOAD_CNTL.OBJPRIM_ID_EN writes VGT_OBJECT_ID (plus the primitive
+// index when PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID is set) into an enabled 32-bit colour slot its
+// pixel shader does not export. Ghost of Yotei's depth pre-pass writes its visibility image
+// (R32_UINT, slot 7) so; the Vcull tile scan (CS 17444e6a) reads it to build the deferred pass's
+// indirect draws, which all draw nothing without it (depth but no G-buffer).
+// The slot of the ObjPrimID write: slot 7 when it qualifies (Yotei binds its ID image to slot 7),
+// else the first that does. A slot qualifies when CB_TARGET_MASK enables it, a colour target is set
+// (base != 0, COLOR_32) and the pixel shader does not export to it. 0xff: none.
+static uint8_t ObjprimIdSlot(const HW::Context& context, const ShaderPixelInputInfo& pixel_info) {
+	if (!ShaderObjprimIdEnabled() || (context.GetDrawPayloadControl() & 0x1u) == 0) {
+		return 0xffu;
+	}
+	uint32_t exported = 0;
+	for (uint32_t index = 0; index < std::size(pixel_info.target_output_mode); index++) {
+		if (pixel_info.target_output_mode[index] == 0) {
+			continue;
+		}
+		const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, index);
+		if (slot < 8u) {
+			exported |= 1u << slot;
+		}
+	}
+	const auto usable = [&](uint32_t slot) {
+		const auto& rt = context.GetRenderTarget(slot);
+		return render_target_mask_slot(context.GetRenderTargetMask(), slot) != 0 &&
+		       (exported & (1u << slot)) == 0 && rt.base.addr != 0 &&
+		       rt.info.format == Prospero::ChannelLayout::k32;
+	};
+	uint8_t chosen = 0xffu;
+	if (usable(7)) {
+		chosen = 7;
+	} else {
+		for (uint32_t slot = 0; slot < 8u && chosen == 0xffu; slot++) {
+			if (usable(slot)) {
+				chosen = static_cast<uint8_t>(slot);
+			}
+		}
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+		std::string layout;
+		for (uint32_t slot = 0; slot < 8u; slot++) {
+			const auto& rt = context.GetRenderTarget(slot);
+			if (rt.base.addr == 0) {
+				continue;
+			}
+			layout += fmt::format(" [{} base=0x{:x} fmt={} mask={:x}{}]", slot, rt.base.addr,
+			                      static_cast<uint32_t>(rt.info.format),
+			                      render_target_mask_slot(context.GetRenderTargetMask(), slot),
+			                      (exported & (1u << slot)) != 0 ? " export" : "");
+		}
+		std::printf("ObjPrimID: payload=0x%x objprim_cntl=0x%x slot=%d%s\n", context.GetDrawPayloadControl(),
+		            context.GetObjprimIdControl(), chosen == 0xffu ? -1 : static_cast<int>(chosen),
+		            layout.c_str());
+		std::fflush(stdout);
+	}
+	return chosen;
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -8408,11 +8544,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	// The program cache locks internally, so no pipeline lock is held across materialization.
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
-	const uint32_t push_data_start = ShaderRecompiler::IR::PushData::GraphicsPushStart(
+	uint32_t push_data_start = ShaderRecompiler::IR::PushData::GraphicsPushStart(
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
 	                      vertex_info[0].mesh.split_groups != 0)
 	                : 0,
 	    vertex_info[tess_active ? 2u : 0u].user_clip_planes);
+	// KYTY_OBJPRIM_ID: the per-draw VGT_OBJECT_ID takes the first push dword after the draw's own
+	// dwords (mesh parameters, clip planes); the stages' data follows it.
+	pixel_info.objprim_slot        = 0xffu;
+	pixel_info.objprim_push_dword  = 0xffu;
+	pixel_info.objprim_add_prim_id = false;
+	if (pixel_active) {
+		pixel_info.objprim_slot = ObjprimIdSlot(context, pixel_info);
+		if (pixel_info.HasObjprimOutput()) {
+			if (push_data_start < ShaderRecompiler::IR::PushData::DwordCount) {
+				pixel_info.objprim_add_prim_id = (context.GetObjprimIdControl() & 0x2u) != 0;
+				pixel_info.objprim_push_dword  = static_cast<uint8_t>(push_data_start);
+				push_data_start++;
+			} else {
+				pixel_info.objprim_slot = 0xffu;
+			}
+		}
+	}
 	// KYTY_ASYNC_TRANSLATION: no mesh draws, and tessellated ones only with KYTY_PIPELINE_SKIP_TESS
 	// (the pipeline-skip stage refusal).
 	if (mesh_active || (tess_active && !SkipTessellatedEnabled())) defer_translation = false;
@@ -8529,6 +8682,13 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	               Prospero::IsRectList(user_config.GetPrimType()));
 	if (vertex_info.user_clip_planes != 0) {
 		return SpeculativeResult::Ineligible; // the serial path places the plane dwords
+	}
+	// KYTY_OBJPRIM_ID: the serial path places the ObjPrimID push dword.
+	pixel_info.objprim_slot        = 0xffu;
+	pixel_info.objprim_push_dword  = 0xffu;
+	pixel_info.objprim_add_prim_id = false;
+	if (pixel_active && ObjprimIdSlot(context, pixel_info) != 0xffu) {
+		return SpeculativeResult::Ineligible;
 	}
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;

@@ -139,6 +139,12 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 		// KYTY_CB_SHADER_MASK_EXPORTS: which targets are written decides export locations.
 		key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
 	}
+	if (info.HasObjprimOutput()) {
+		// KYTY_OBJPRIM_ID: only with an ObjPrimID output, so every other key stays as it was.
+		key.push_back(0x0b1d0000u | info.objprim_slot |
+		              (static_cast<uint32_t>(info.objprim_push_dword) << 4u) |
+		              (static_cast<uint32_t>(info.objprim_add_prim_id) << 12u));
+	}
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {

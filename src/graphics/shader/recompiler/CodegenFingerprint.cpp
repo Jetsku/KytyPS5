@@ -243,6 +243,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.storage_swizzle_canon) {
 		b.Text("storage_swizzle_canon");
 	}
+	if (options.raw_small_sint_storage) {
+		b.Text("raw_small_sint_storage");
+	}
 	if (options.bindless_3d_as_array) {
 		b.Text("bindless_3d_as_array");
 	}
@@ -263,6 +266,16 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.dcache_invalidate) {
 		b.Text("dcache_invalidate");
+	}
+	if (options.native_f16 && GetHostNativeHalf()) {
+		b.Text("native_f16");
+	}
+	if (options.f32_flush_host) {
+		b.Text("f32_flush_host");
+	}
+	if (options.coherent_glc_only != 0u) {
+		b.Text("coherent_glc_only");
+		b.U8(options.coherent_glc_only);
 	}
 	if (options.readfirstlane_exec_zero) {
 		b.Text("readfirstlane_exec_zero");

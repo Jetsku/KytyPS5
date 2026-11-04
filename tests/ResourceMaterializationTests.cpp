@@ -990,6 +990,77 @@ void TestMultisampleDepthReadAsSingleSample() {
   SetMsDepthSample0ForTesting(false);
 }
 
+// KYTY_RAW_SMALL_SINT_STORAGE: a write-only 16/8-bit SINT storage image is specialized as a uint
+// storage image (the same low bits through an unsigned view); without the switch, or when the
+// shader also reads it, the program fails as before (Ghost of Yotei's cloud shadow precompute).
+void TestRawSmallSintStorage() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  using Libs::Graphics::Prospero::TileMode;
+  const auto saved = GetCodegenOptions();
+  struct Case {
+    bool enabled;
+    BufferFormat format;
+    bool read;
+    bool expected;
+    const char *text;
+  };
+  const Case cases[] = {
+      {false, BufferFormat::k16SInt, false, false, "16-bit SINT storage fails with the switch off"},
+      {true, BufferFormat::k16SInt, false, true, "write-only 16-bit SINT storage is raw uint storage"},
+      {true, BufferFormat::k8SInt, false, true, "write-only 8-bit SINT storage is raw uint storage"},
+      {true, BufferFormat::k16SInt, true, false, "read-write 16-bit SINT storage still fails"},
+  };
+  for (const auto &test : cases) {
+    auto options = saved;
+    options.raw_small_sint_storage = test.enabled;
+    SetCodegenOptions(options);
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    const uint32_t words[8] = {
+        0x0120fc00u, // base address 0x120fc0000 >> 8
+        static_cast<uint32_t>(test.format) << 20u | 0xc0000000u, // width - 1 low bits
+        0x007fc07fu, // width 512, height 512
+        static_cast<uint32_t>(ImageType::kColor2D) << 28u |
+            static_cast<uint32_t>(TileMode::kRenderTarget) << 20u | 0xfacu,
+        0u,
+        0u,
+        0u,
+        0u};
+    for (uint32_t i = 0; i < 8; i++) {
+      source.dwords[i] = Value(words[i]);
+    }
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back({.source = 0,
+                                   .resource_class = ImageResourceClass::Storage,
+                                   .numeric_class = TextureNumericClass::Uint,
+                                   .dimension = ImageDimension::Dim2D,
+                                   .read = test.read,
+                                   .written = true});
+    auto plan = ExtractResourcePlan(program);
+    const SrtRuntime runtime{};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    Check(materialized == test.expected, test.text);
+    if (materialized) {
+      Check(specialization.images.size() == 1 &&
+                specialization.images[0].numeric_class == TextureNumericClass::Uint,
+            test.text);
+    }
+  }
+  SetCodegenOptions(saved);
+}
+
 } // namespace
 
 namespace Common {
@@ -1023,6 +1094,7 @@ int main() {
   }
   TestMultisampleDepthReadAsSingleSample();
   TestNullBufferShare();
+  TestRawSmallSintStorage();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

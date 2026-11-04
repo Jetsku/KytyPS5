@@ -237,6 +237,16 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// KYTY_SRT_STALE_IMAGE_READS (kernel/memory.cpp): whether a GPU-modified image is still the
+	// source of some guest byte of the range: it owns bytes there and no CPU write superseded it
+	// (a definitely CPU-dirty image without kept ranges is refreshed whole from guest memory and is
+	// no source of guest bytes, as MaterializeOwnedBytes treats it). IsRegionGpuModified asks only
+	// whether a GPU-modified image overlaps the range.
+	[[nodiscard]] bool IsRegionGpuOwnedForRead(uint64_t address, uint64_t size);
+	// KYTY_SRT_STALE_IMAGE_READS: moves the bytes of the range that GPU-modified images own into the
+	// buffer cache (MaterializeOwnedBytes, KYTY_ALIAS_BYTES), so a GPU-thread read can download them
+	// like any GPU-written buffer bytes. GPU thread; records GPU work. Returns the bytes moved.
+	uint64_t MaterializeForRead(uint64_t address, uint64_t size);
 	// Diagnostics (KYTY_INDIRECT_ARGS_DIAG / KYTY_READINESS_DIAG): the GPU-modified images over the
 	// range, "image 0x<addr>+0x<size> <format> <w>x<h> ..." joined by "; " (empty when none).
 	[[nodiscard]] std::string DescribeGpuModifiedImages(uint64_t address, uint64_t size);
@@ -304,6 +314,11 @@ public:
 	// The image a sampled read of the stencil plane `record_id` (a stencil association record)
 	// binds: its depth image, or (copy = true) a copy of the plane's saved contents.
 	[[nodiscard]] ImageId StencilPlaneReader(ImageId record_id, bool& copy);
+	// KYTY_STENCIL_READ_DEPTH=1 (default off): sampled stencil-plane reads bind the depth image (see
+	// the .cpp). StencilPlaneDepth: the single-sample depth image that swaps to the plane at this
+	// address (SwapStencilPlane saw it), or none.
+	[[nodiscard]] static bool StencilReadDepthEnabled();
+	[[nodiscard]] ImageId     StencilPlaneDepth(uint64_t plane_address);
 	// KYTY_STENCIL_ALIAS_COPY=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_ALIAS_COPY,
 	// a logged approximation for dynamic resolution; PPSA26344 preset, default off): a 1-byte
 	// image at a stencil plane's address with another extent than its depth image (the plane read
@@ -750,6 +765,8 @@ private:
 	};
 	std::unordered_map<uint64_t, SavedStencilPlane> m_stencil_planes;
 	uint64_t                                        m_stencil_plane_serial = 0;
+	// KYTY_STENCIL_READ_DEPTH: plane address -> the depth image that swapped to or from it.
+	std::unordered_map<uint64_t, ImageId>           m_stencil_plane_depth;
 	std::shared_ptr<Buffer>                         m_stencil_alias_staging;
 	// KYTY_PRESERVE_STENCIL_RECREATE: the stencil of the last depth image replaced by a colour image.
 	void SaveRecreatedStencil(Image& depth);

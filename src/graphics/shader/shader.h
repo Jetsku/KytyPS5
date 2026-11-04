@@ -294,9 +294,19 @@ struct ShaderPixelInputInfo {
 	// exports clamp to the half range. In padding before `stage`: the struct keeps its size, and
 	// stored journals and pipeline lists read it as zero (ShaderSanitizeStoredInputInfo).
 	uint8_t                                        target_half_float_mask = 0;
+	// KYTY_OBJPRIM_ID (based on Erlou93/KytyPS5-Yotei): the colour slot that receives the draw's
+	// hardware ObjPrimID write (VGT_OBJECT_ID, plus the primitive index with
+	// PA_CL_OBJPRIM_ID_CNTL.ADD_PIPED_PRIM_ID), 0xff for none. VGT_OBJECT_ID changes every draw, so
+	// the program reads it from push-constant dword objprim_push_dword. In the padding before
+	// `stage` (offsets 213..215): the struct keeps its size; stored journals read them as "none"
+	// (ShaderSanitizeStoredInputInfo).
+	uint8_t                                        objprim_slot           = 0xffu;
+	uint8_t                                        objprim_push_dword     = 0xffu;
+	bool                                           objprim_add_prim_id    = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
+	bool HasObjprimOutput() const { return objprim_slot < 8u; }
 };
 
 // Journals and pipeline lists written before async_compute / parameter_mode existed hold padding
@@ -310,6 +320,9 @@ inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
 		info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	}
 	info.target_half_float_mask = 0;
+	info.objprim_slot           = 0xffu;
+	info.objprim_push_dword     = 0xffu;
+	info.objprim_add_prim_id    = false;
 }
 inline void ShaderSanitizeStoredInputInfo(ShaderVertexInputInfo& info) {
 	info.clip_space.vte_format = 0;
@@ -351,6 +364,9 @@ uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, ui
 // compact, as on AMD hardware: MRT export i is written to the i-th colour target whose
 // CB_SHADER_MASK nibble is non-zero. Off: export i is written to target i.
 bool     ShaderCbShaderMaskExports();
+// KYTY_OBJPRIM_ID=1 (startup, default off): the hardware ObjPrimID write (PipelineCache
+// ObjprimIdSlot, ShaderPixelInputInfo::objprim_slot).
+bool     ShaderObjprimIdEnabled();
 // The colour target of MRT export `export_index` under `shader_mask`; UINT32_MAX for none.
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,

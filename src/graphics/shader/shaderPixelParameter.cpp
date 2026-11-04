@@ -23,6 +23,14 @@ bool ShaderCbShaderMaskExports() {
 	return enabled;
 }
 
+bool ShaderObjprimIdEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OBJPRIM_ID");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
 	for (uint32_t target = 0; target < 8u; target++) {
 		if (((shader_mask >> (target * 4u)) & 0xfu) == 0u) {

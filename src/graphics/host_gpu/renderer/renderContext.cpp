@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -436,8 +437,24 @@ std::string RenderContext::DescribeGpuBackingForRead(uint64_t vaddr, uint64_t si
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
 	    !m_command_scheduler.Active() || m_command_scheduler.Current().IsInvalid() ||
-	    !IsMapped(vaddr, size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+	    !IsMapped(vaddr, size)) {
 		return false;
+	}
+	// KYTY_SRT_STALE_IMAGE_READS: GPU-modified images over the range either are no source of its
+	// bytes any more (a CPU write superseded them: the backing read past them is exact, see
+	// LibKernel::Memory::TryReadGpuBackingOverStaleImages) or have their owned bytes moved into the
+	// buffer cache, whose GPU-dirty bytes the download below brings to the backing.
+	const bool stale_image_reads = LibKernel::Memory::SrtStaleImageReadsEnabled();
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		if (!stale_image_reads) {
+			return false;
+		}
+		if (m_texture_cache.IsRegionGpuOwnedForRead(vaddr, size)) {
+			(void)m_texture_cache.MaterializeForRead(vaddr, size);
+			if (m_texture_cache.IsRegionGpuOwnedForRead(vaddr, size)) {
+				return false; // no download layout for an owner: its bytes stay with the image
+			}
+		}
 	}
 
 	// Exact dirty ranges are removed when a download is queued, before its backing publication.
@@ -460,7 +477,8 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	// A publication may already have finished since the failed strict read. Such a range is
 	// ready too; callers still retry the actual read and bound their preparation retries.
 	return IsMapped(vaddr, size) && !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
-	       !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+	       !(stale_image_reads ? m_texture_cache.IsRegionGpuOwnedForRead(vaddr, size)
+	                           : m_texture_cache.IsRegionGpuModified(vaddr, size)) &&
 	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
 }
 

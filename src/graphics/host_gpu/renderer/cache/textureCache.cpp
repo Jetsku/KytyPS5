@@ -2952,6 +2952,37 @@ vk::BufferImageCopy StencilPlaneCopy(uint32_t width, uint32_t height, vk::ImageA
 
 } // namespace
 
+// KYTY_STENCIL_READ_DEPTH=1 (default off; Erlou93/KytyPS5-Yotei behaviour): a sampled read of a
+// stencil plane binds the depth image's stencil aspect, whichever plane it holds, instead of the
+// plane's saved copy, and so does a 1-byte colour image at the address of a plane a depth image
+// swaps to (Ghost of Yotei's Deferred wetness 84f5a0d3: plane B resolved to a separate R8 image
+// nothing writes, plane A to the saved copy; Erlou binds the D32S8 for both).
+bool TextureCache::StencilReadDepthEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_READ_DEPTH");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Stencil planes: sampled reads bind the depth image's stencil (KYTY_STENCIL_READ_DEPTH=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+ImageId TextureCache::StencilPlaneDepth(uint64_t plane_address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_stencil_plane_depth.find(plane_address);
+	if (found == m_stencil_plane_depth.end()) {
+		return {};
+	}
+	const auto* depth = m_slot_images.try_get(found->second);
+	if (depth == nullptr || !depth->registered || !depth->info.IsDepth() || !depth->info.HasStencil() ||
+	    !SwapsStencilPlanes(*depth) || depth->backing.samples != 1u) {
+		return {};
+	}
+	return found->second;
+}
+
 bool TextureCache::StencilPlaneHeld(const Image& record) const {
 	const auto* depth = record.depth_id ? m_slot_images.try_get(record.depth_id) : nullptr;
 	return depth == nullptr || !SwapsStencilPlanes(*depth) ||
@@ -2968,6 +2999,9 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 	const auto height = depth.backing.extent.height;
 	const auto bytes  = uint64_t {width} * height;
 	const auto copy   = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eStencil);
+	// KYTY_STENCIL_READ_DEPTH: both planes are known to belong to this depth image.
+	m_stencil_plane_depth[previous]   = depth_id;
+	m_stencil_plane_depth[next_plane] = depth_id;
 	// The stencil aspect is saved as it is: a pending refresh of the held plane's record from guest
 	// memory stays pending (its record is not held after the swap, so the refresh is applied when
 	// the plane is swapped back in, after the restore).
@@ -8767,12 +8801,47 @@ std::string TextureCache::DescribeGpuModifiedImages(uint64_t address, uint64_t s
 		if (!text.empty()) {
 			text += "; ";
 		}
-		text += fmt::format("image 0x{:x}+0x{:x} {} {}x{} type {} alias_owner {}", image.info.data.address,
-		                    image.info.data.size, vk::to_string(image.backing.format), image.backing.extent.width,
-		                    image.backing.extent.height, static_cast<uint32_t>(image.info.type),
-		                    image.alias_owner ? 1 : 0);
+		text += fmt::format("image 0x{:x}+0x{:x} {} {}x{} type {} alias_owner {} owns {} all {} cpu_dirty {}/{} "
+		                    "span 0x{:x}+0x{:x} buffer_mod {} registered {} resident {} live 0x{:x}+0x{:x}",
+		                    image.info.data.address, image.info.data.size, vk::to_string(image.backing.format),
+		                    image.backing.extent.width, image.backing.extent.height,
+		                    static_cast<uint32_t>(image.info.type), image.alias_owner ? 1 : 0,
+		                    image.OwnsBytesIn(address, size) ? 1 : 0, image.OwnsAllBytes() ? 1 : 0,
+		                    image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+		                    image.DirtySpanBegin(), image.DirtySpanBytes(), image.IsBufferModified() ? 1 : 0,
+		                    image.registered ? 1 : 0, image.FullyResident() ? 1 : 0, image.live.address,
+		                    image.live.size);
 	}
 	return text;
+}
+
+uint64_t TextureCache::MaterializeForRead(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return 0;
+	}
+	std::scoped_lock lock {m_lock};
+	return MaterializeOwnedBytes({address, size}, {}, {}, "srt-read");
+}
+
+bool TextureCache::IsRegionGpuOwnedForRead(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || image->depth_id || !image->IsGpuModified() ||
+		    !image->Overlaps(address, size, false)) {
+			continue;
+		}
+		if (image->IsDefinitelyCpuDirty() && !image->HasKeptDirty()) {
+			continue; // superseded: refreshed whole from guest memory, its bytes are no source
+		}
+		if (image->OwnsBytesIn(address, size)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

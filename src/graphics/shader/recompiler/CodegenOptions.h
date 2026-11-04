@@ -180,6 +180,26 @@ struct CodegenOptions {
 	// (serbru20066666/brunoKytyPs5 def478029: a lighting shader of ASTRO's PLAYROOM 3.45 -> 2.76 ms
 	// on an RX 6800 XT); other drivers may use their read-only caches.
 	bool readonly_buffers = true;
+	// KYTY_COHERENT_GLC_ONLY=1 (default off; Erlou93/KytyPS5-Yotei): in a program that writes no
+	// buffer memory (no buffer store or atomic, no 8/16-bit coherent access, no u64 buffer view)
+	// only the cache-bypassing (GLC/DLC) buffer accesses go through a Coherent alias of the storage
+	// buffers ("buffers_coherent"); every other access uses the plain aliases, which may then be
+	// NonWritable (KYTY_READONLY_BUFFERS). Without it one GLC access makes every buffer access of
+	// the program Coherent. A program with BUFFER_GL0/GL1_INV (KYTY_DCACHE_INV) keeps whole-program
+	// coherence unless the value is 2.
+	uint8_t coherent_glc_only = 0;
+	// KYTY_NATIVE_F16=1 (default off; Erlou93/KytyPS5-Yotei): V_PK_ADD/MUL/MIN/MAX_F16 without
+	// clamp/omod become one f16vec2 instruction (Float16, RoundingModeRTE 16,
+	// SignedZeroInfNanPreserve 16) instead of two f32 operations on converted lanes. Needs a device
+	// with shaderFloat16 and those 16-bit float controls (SetHostNativeHalf). Checked on an RTX 3090
+	// over all 2^32 lane pairs against the f32 path: add and mul identical; min and max identical
+	// except NaN payloads when both lanes are NaN (signaling NaNs keep the existing quieting).
+	bool native_f16 = false;
+	// KYTY_F32_FLUSH_HOST=1 (default off; Erlou93/KytyPS5-Yotei): no shader-side flush of f32
+	// denormal inputs of compares and of rcp/rsq/sqrt/exp/log in programs without f64: the host's
+	// default f32 mode already flushes them. Checked on an RTX 3090 over all 2^24-2 denormals: those
+	// five ops and the six compares against 16 values give the flushed operand's result.
+	bool f32_flush_host = false;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
 	// KYTY_INTERP_MODES=0: interpolate every pixel input at the pixel center with the shader-wide
@@ -420,6 +440,11 @@ struct CodegenOptions {
 	// storage image swizzle that stores every channel of its format from its own component is
 	// specialized as the identity (fewer program variants; same stored bits).
 	bool storage_swizzle_canon = false;
+	// KYTY_RAW_SMALL_SINT_STORAGE=1 (default 0; adapted from Erlou93/KytyPS5-Yotei): a write-only,
+	// non-atomic storage image of 16- or 8-bit SINT format stores the same low bits through an
+	// unsigned view (R16_UINT / R8_UINT), as 32-bit SINT already does, instead of failing the
+	// program. Ghost of Yotei's cloud shadow precompute (CS 753c552f, R16 SINT) was dropped without it.
+	bool raw_small_sint_storage = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -737,6 +762,12 @@ void               SetHostComputeSubgroups32(bool fixed_32);
 // Spirv::SetHostBufferRobustness for IR::UniformBufferResources).
 void               SetHostUniformBufferRobust(bool robust);
 [[nodiscard]] bool GetHostUniformBufferRobust();
+// KYTY_NATIVE_F16 needs shaderFloat16 (enabled by the device layer) plus RoundingModeRTE and
+// SignedZeroInfNanPreserve for 16-bit floats, independent of the 32/64-bit modes.
+void               SetHostNativeHalf(bool supported);
+[[nodiscard]] bool GetHostNativeHalf();
+// Whether KYTY_NATIVE_F16 applies (option and device).
+[[nodiscard]] bool NativeHalfActive();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
 // while no shader is being compiled.
 void SetCodegenOptions(const CodegenOptions& options);

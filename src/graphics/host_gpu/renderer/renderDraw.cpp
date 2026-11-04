@@ -2444,6 +2444,63 @@ static void NoteMrtSplit(uint32_t slots) {
 		            static_cast<unsigned long long>(n), slots);
 	}
 }
+// KYTY_MRT_DIAG=<ps hash>[,<ps hash>...] (diagnostic, default off): for draws with those pixel
+// shaders, one stdout line per distinct register state (at most 64): CB_SHADER_MASK,
+// CB_TARGET_MASK, the export formats, the program's colour outputs and the bound targets.
+static void NoteMrtDiag(const CommandBuffer& buffer, const DrawRenderState& state, uint32_t mrt_mask) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           value = std::getenv("KYTY_MRT_DIAG");
+		for (const char* p = value; p != nullptr && *p != '\0';) {
+			char* end = nullptr;
+			list.push_back(std::strtoull(p, &end, 16));
+			if (end == p) break;
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}();
+	if (hashes.empty() || !state.ps_active || state.ps_input_info.stage.program == nullptr) {
+		return;
+	}
+	const auto hash = state.ps_input_info.stage.program->shader_hash;
+	if (std::find(hashes.begin(), hashes.end(), hash) == hashes.end()) {
+		return;
+	}
+	const auto& ctx     = buffer.GetRegisters();
+	const auto& sh_regs = ctx.GetShaderRegisters();
+	std::string modes;
+	for (uint32_t i = 0; i < 8; i++) {
+		modes += fmt::format("{}{}", i == 0 ? "" : ",", static_cast<uint32_t>(sh_regs.target_output_mode[i]));
+	}
+	std::string outputs;
+	for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
+		if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
+			outputs += fmt::format(" mrt@{}", output.location);
+		} else if (output.kind == ShaderRecompiler::IR::StageOutputKind::ObjPrimId) {
+			outputs += fmt::format(" objprim@{}", output.location);
+		}
+	}
+	std::string targets;
+	for (uint32_t i = 0; i < 8; i++) {
+		const auto& rt = ctx.GetRenderTarget(i);
+		if (rt.base.addr != 0) {
+			targets += fmt::format(" rt{}=0x{:x}/fmt{}/mask{:x}", i, rt.base.addr, static_cast<uint32_t>(rt.info.format),
+			                       render_target_mask_slot(ctx.GetRenderTargetMask(), i));
+		}
+	}
+	const auto line = fmt::format("MrtDiag: ps {:016x} cb_shader_mask 0x{:08x} target_mask 0x{:08x} col_format {} "
+	                              "key_mask 0x{:08x} outputs{} mrt_mask 0x{:x} targets{}\n",
+	                              hash, sh_regs.m_cbShaderMask, ctx.GetRenderTargetMask(), modes,
+	                              state.ps_input_info.target_shader_mask, outputs, mrt_mask, targets);
+	static std::mutex            mutex;
+	static std::set<std::string> seen;
+	std::lock_guard              lock(mutex);
+	if (seen.size() < 64 && seen.insert(line).second) {
+		std::printf("%s", line.c_str());
+		std::fflush(stdout);
+	}
+}
+
 // The draw's colour and depth target resolution (PrepareDrawRenderState; a KYTY_DRAW_RUN
 // continuation whose images changed resolves them late, from the same registers).
 void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -2461,6 +2518,10 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 	if (SkipInactivePixelShadersEnabled()) {
 		mrt_mask &= DrawColorOutputFilter(buffer.GetRegisters());
 	}
+	// KYTY_OBJPRIM_ID: the slot of the hardware ObjPrimID write (not a pixel-shader export).
+	if (state.ps_active && state.ps_input_info.HasObjprimOutput()) {
+		mrt_mask |= 1u << state.ps_input_info.objprim_slot;
+	}
 	// KYTY_MRT_SPLIT: the first pass of a draw that binds one surface to several slots leaves the
 	// later ones for a second pass (m_mrt_split_slots); the second pass binds only those.
 	mrt_mask &= m_mrt_filter;
@@ -2469,6 +2530,7 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 		m_mrt_split_slots = AliasedColorSlots(buffer.GetRegisters(), mrt_mask);
 		mrt_mask &= ~m_mrt_split_slots;
 	}
+	NoteMrtDiag(buffer, state, mrt_mask);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -5227,6 +5289,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		        (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex),
 		    ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
 		    count * 4u * sizeof(uint32_t), buffer.GetRegisters().GetUserClipPlanes().data());
+	}
+	// KYTY_OBJPRIM_ID (based on Erlou93/KytyPS5-Yotei): this draw's VGT_OBJECT_ID, after
+	// CommitBindings (which pushes the whole block). The stage flags are the layout's push range
+	// (fragment plus every vertex stage of the pipeline). The raw push bypasses the shadow, which
+	// is then invalidated: the next whole-block push must not be skipped as unchanged.
+	if (state.ps_active && state.ps_input_info.HasObjprimOutput()) {
+		vk::ShaderStageFlags objprim_stages = vk::ShaderStageFlagBits::eFragment;
+		for (const auto& stage: vertex_stages) {
+			objprim_stages |= NativeShaderStage(stage.logical_stage);
+		}
+		const uint32_t object_id = buffer.GetUserConfig().GetObjectId();
+		vk_buffer.pushConstants(pipeline.pipeline_layout, objprim_stages,
+		                        uint32_t {state.ps_input_info.objprim_push_dword} * 4u,
+		                        sizeof(object_id), &object_id);
+		buffer.InvalidatePushConstants();
 	}
 	// Vulkan debug labels (--rd / KYTY_TRACE_VK_LABELS): the draw's shaders and game pass.
 	const bool draw_label = PassCensus::LabelsEnabled();

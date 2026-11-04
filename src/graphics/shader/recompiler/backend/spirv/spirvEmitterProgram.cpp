@@ -19,6 +19,29 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+// KYTY_OBJPRIM_ID (based on Erlou93/KytyPS5-Yotei): what the hardware writes to the ObjPrimID colour
+// slot, VGT_OBJECT_ID (push-constant dword) plus the primitive index of the draw when
+// ADD_PIPED_PRIM_ID is set. Stored in the entry block: a fragment the guest code discards writes
+// nothing, like any colour output.
+void EmitObjprimIdOutput(EmitterState& state) {
+	const auto& pixel   = *state.input_info.pixel;
+	const auto  pointer = state.builder.AllocateId();
+	auto        value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+	                          state.push_constant_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, pixel.objprim_push_dword));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	if (pixel.objprim_add_prim_id) {
+		const auto variable = InputVariableForKind(state, IR::StageInputKind::PrimitiveId);
+		EXIT_IF(variable == 0);
+		const auto primitive = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeI32(state), primitive, variable);
+		const auto primitive_u32 = Unary(state, spv::OpBitcast, TypeU32(state), primitive);
+		value = Binary(state, spv::OpIAdd, TypeU32(state), value, primitive_u32);
+	}
+	state.builder.AddFunction(spv::OpStore, state.objprim_output_variable, value);
+}
+
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
@@ -1772,6 +1795,9 @@ void EmitProgram(EmitterState& state) {
 		                                      ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
+	if (state.objprim_output_variable != 0) {
+		EmitObjprimIdOutput(state);
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

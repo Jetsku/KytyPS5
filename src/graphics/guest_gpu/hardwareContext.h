@@ -884,6 +884,14 @@ public:
 	[[nodiscard]] uint32_t GetPrimitiveResetIndex() const { return m_primitive_reset_index; }
 	void SetPrimitiveResetIndex(uint32_t index) { m_primitive_reset_index = index; }
 
+	// VGT_DRAW_PAYLOAD_CNTL (bit 0 OBJPRIM_ID_EN) and PA_CL_OBJPRIM_ID_CNTL (bit 0 OBJ_ID_SEL, bit 1
+	// ADD_PIPED_PRIM_ID, bit 2 EN_32BIT_OBJPRIMID): the hardware ObjPrimID write (KYTY_OBJPRIM_ID,
+	// PipelineCache ObjprimIdSlot).
+	[[nodiscard]] uint32_t GetDrawPayloadControl() const { return m_draw_payload_cntl; }
+	void                   SetDrawPayloadControl(uint32_t value) { m_draw_payload_cntl = value; }
+	[[nodiscard]] uint32_t GetObjprimIdControl() const { return m_objprim_id_cntl; }
+	void                   SetObjprimIdControl(uint32_t value) { m_objprim_id_cntl = value; }
+
 	[[nodiscard]] const ShaderRegisters& GetShaderRegisters() const { return m_sh_regs; }
 
 	void SetVsOutConfig(uint32_t value) { m_sh_regs.m_spiVsOutConfig = value; }
@@ -965,6 +973,8 @@ public:
 		f(Viewport, &m_clip_control, sizeof(m_clip_control));
 		f(Raster, &m_line_width, sizeof(m_line_width));
 		f(Raster, &m_primitive_reset_index, sizeof(m_primitive_reset_index));
+		f(Raster, &m_draw_payload_cntl, sizeof(m_draw_payload_cntl));
+		f(Raster, &m_objprim_id_cntl, sizeof(m_objprim_id_cntl));
 		f(Raster, &m_scan_mode_control, sizeof(m_scan_mode_control));
 		f(Raster, &m_aa_sample_control, sizeof(m_aa_sample_control));
 		f(Raster, &m_aa_config, sizeof(m_aa_config));
@@ -979,6 +989,8 @@ public:
 private:
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
+	uint32_t m_draw_payload_cntl     = 0;
+	uint32_t m_objprim_id_cntl       = 0;
 
 	BlendControl    m_blend_control[8];
 	BlendColor      m_blend_color;
