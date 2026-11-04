@@ -5216,6 +5216,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
 		    count * 4u * sizeof(uint32_t), buffer.GetRegisters().GetUserClipPlanes().data());
 	}
+	// Vulkan debug labels (--rd / KYTY_TRACE_VK_LABELS): the draw's shaders and game pass.
+	const bool draw_label = PassCensus::LabelsEnabled();
+	if (draw_label) {
+		char text[256];
+		PassCensus::LabelText(text, sizeof(text), 'd',
+		                      state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
+		                      state.ps_active && state.ps_input_info.stage.program
+		                          ? state.ps_input_info.stage.program->shader_hash
+		                          : 0);
+		vk_buffer.insertDebugLabel(text);
+	}
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
 		// parameter block (a record the draw does not need has no workgroups). Indirect draws are

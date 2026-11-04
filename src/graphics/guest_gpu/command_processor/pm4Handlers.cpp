@@ -1375,7 +1375,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, true); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, true); // KYTY_TRACE_PASS_CENSUS
 	CountFrameWork(cp, Profiler::FrameWork::DispatchDirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
@@ -1393,7 +1393,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, true); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, true); // KYTY_TRACE_PASS_CENSUS
 	CountFrameWork(cp, Profiler::FrameWork::DispatchIndirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
@@ -1698,7 +1698,7 @@ static int32_t GsUserSgprAt(uint32_t location) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
 	// Ported from chenxiao07/KytyPS5 3b351932d: only an indirect draw has the CP write a start
 	// instance (START_INST_LOC); the vertex shader is translated for it.
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
@@ -1743,7 +1743,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
 	CountFrameWork(cp, Profiler::FrameWork::DrawIndirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0032400 && cmd_id != 0xc0032500);
@@ -1765,7 +1765,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
 	CountFrameWork(cp, Profiler::FrameWork::DrawIndirectMultiCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
@@ -1801,7 +1801,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0033500);
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
@@ -1821,7 +1821,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	if (PassCensus::Enabled()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012d00);
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
@@ -2482,7 +2482,7 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
 	static std::atomic<uint32_t> pop_marker_log_count {0};
-	if (PassCensus::Enabled()) PassCensus::Marker(&cp, nullptr); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Marker(&cp, nullptr); // KYTY_TRACE_PASS_CENSUS
 	if (pop_marker_log_count.fetch_add(1) < 64) {
 		LOGF("Pop marker\n");
 	}
@@ -2498,7 +2498,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	const char* str = reinterpret_cast<const char*>(buffer);
 
 	static std::atomic<uint32_t> push_marker_log_count {0};
-	if (PassCensus::Enabled()) PassCensus::Marker(&cp, str); // KYTY_TRACE_PASS_CENSUS
+	if (PassCensus::Tracking()) PassCensus::Marker(&cp, str); // KYTY_TRACE_PASS_CENSUS
 	if (push_marker_log_count.fetch_add(1) < 128) {
 		LOGF("Push marker: %s\n", str);
 	}

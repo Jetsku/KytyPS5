@@ -1647,6 +1647,13 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	// KYTY_DUMP_CS_IMAGES: ordinary dispatches too (the bound images after the dispatch).
 	const auto image_dump = PlanCsImageDump(input_info);
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	// Vulkan debug labels (--rd / KYTY_TRACE_VK_LABELS): the dispatch's shader and game pass.
+	const bool dispatch_label = PassCensus::LabelsEnabled();
+	if (dispatch_label) {
+		char text[256];
+		PassCensus::LabelText(text, sizeof(text), 'c', program.shader_hash, 0);
+		buffer.Sink().insertDebugLabel(text);
+	}
 	constexpr uint32_t DispatchInitiatorOrderedAppendEnable = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                               std::max(input_info.threads_num[1], 1u) *
@@ -2032,6 +2039,12 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	}
 	TraceDispatch(m_context, input_info, nullptr, args_addr);
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const bool dispatch_label = PassCensus::LabelsEnabled(); // --rd / KYTY_TRACE_VK_LABELS
+	if (dispatch_label) {
+		char text[256];
+		PassCensus::LabelText(text, sizeof(text), 'c', program.shader_hash, 0);
+		buffer.Sink().insertDebugLabel(text);
+	}
 	buffer.Sink().dispatchIndirect(dispatch_buffer, dispatch_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (auto& cache = m_context.GetTextureCache(); cache.HasStencilStorageShadows()) {

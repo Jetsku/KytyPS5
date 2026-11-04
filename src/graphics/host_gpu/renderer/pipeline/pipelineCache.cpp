@@ -220,6 +220,38 @@ std::string PipelineCacheTitleId() {
 	return title_id;
 }
 
+// The stem of the cache files written under _PipelineCache. Under --rd, RenderDoc reports another
+// Vulkan version (1.4.0) and wraps the device, so the program and driver caches are rejected and
+// would be overwritten: a RenderDoc session keeps its own set ("<title>.renderdoc.*") and the
+// normal play cache stays untouched.
+static std::string PipelineCacheFileStem() {
+	auto stem = PipelineCacheTitleId();
+	if (!stem.empty() && Config::RenderDocEnabled()) {
+		stem += ".renderdoc";
+	}
+	return stem;
+}
+
+// Under --rd: a cache file of the RenderDoc set that does not exist yet starts as a copy of the normal one (the
+// journals and the driver cache hold nothing RenderDoc changes; a rejected copy is simply rebuilt), so a first
+// RenderDoc session precompiles what the normal sessions found. The normal file is only read.
+static void SeedRenderDocCacheFile(const std::filesystem::path& path, const char* suffix) {
+	if (!Config::RenderDocEnabled()) {
+		return;
+	}
+	std::error_code error;
+	if (std::filesystem::exists(path, error)) {
+		return;
+	}
+	const auto normal = path.parent_path() / (PipelineCacheTitleId() + suffix);
+	if (!std::filesystem::exists(normal, error)) {
+		return;
+	}
+	std::filesystem::copy_file(normal, path, error);
+	std::printf("RenderDoc cache: %s %s from %s\n", error ? "could not seed" : "seeded",
+	            Common::PathToString(path).c_str(), Common::PathToString(normal).c_str());
+}
+
 // A hint, not a decoder: whether a code word is shaped like IMAGE_BVH_INTERSECT_RAY or
 // IMAGE_BVH64_INTERSECT_RAY (MIMG family, opcode 0xe6/0xe7 with the opcode's top bit in bit 0). A
 // literal can look like one; the only use is ordering the shader precompile replay.
@@ -6790,8 +6822,9 @@ void PipelineCache::InitializePipelineJournal() {
 		std::filesystem::path path;
 		if (const auto* custom = std::getenv("KYTY_PIPELINE_JOURNAL_PATH"); custom != nullptr && *custom != '\0') {
 			path = custom;
-		} else if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+		} else if (const auto title_id = PipelineCacheFileStem(); !title_id.empty()) {
 			path = std::filesystem::path("_PipelineCache") / (title_id + ".pipelines.journal");
+			SeedRenderDocCacheFile(path, ".pipelines.journal");
 		}
 		if (!path.empty()) {
 			// The records hold module content hashes and Vulkan state: tied to the device, not the driver
@@ -7295,7 +7328,7 @@ PipelineCache::~PipelineCache() {
 }
 
 void PipelineCache::InitializeDriverCache() {
-	const auto title_id = PipelineCacheTitleId();
+	const auto title_id = PipelineCacheFileStem();
 	if (title_id.empty()) {
 		return;
 	}
@@ -7309,6 +7342,9 @@ void PipelineCache::InitializeDriverCache() {
 		m_driver_cache_path = std::filesystem::path(custom);
 	} else {
 		m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+		SeedRenderDocCacheFile(m_driver_cache_path, ".bin");
+		SeedRenderDocCacheFile(std::filesystem::path(m_driver_cache_path).replace_extension(".pipelines.known"),
+		                       ".pipelines.known");
 	}
 	auto path               = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -7380,7 +7416,7 @@ void PipelineCache::InitializeProgramDiskCache() {
 	    custom != nullptr && *custom != '\0') {
 		path = std::filesystem::path(custom);
 	} else {
-		const auto title_id = PipelineCacheTitleId();
+		const auto title_id = PipelineCacheFileStem();
 		if (title_id.empty()) {
 			return;
 		}
@@ -7389,6 +7425,7 @@ void PipelineCache::InitializeProgramDiskCache() {
 			return;
 		}
 		path = std::filesystem::path("_PipelineCache") / (title_id + ".programs.bin");
+		SeedRenderDocCacheFile(path, ".programs.bin");
 	}
 	// The file's identity: the codegen version and runtime codegen state, and the device (its
 	// state that the emitter reads is part of the fingerprint already; the device and driver are
@@ -7679,11 +7716,12 @@ void PipelineCache::InitializeShaderPrecompile() {
 		    custom != nullptr && *custom != '\0') {
 			path = std::filesystem::path(custom);
 		} else {
-			const auto title_id = PipelineCacheTitleId();
+			const auto title_id = PipelineCacheFileStem();
 			if (title_id.empty()) {
 				return;
 			}
 			path = std::filesystem::path("_PipelineCache") / (title_id + ".shaders.journal");
+			SeedRenderDocCacheFile(path, ".shaders.journal");
 		}
 		// The identity holds what the stored inputs depend on besides the game: the device (subgroup
 		// and mesh limits are part of the stage input infos) and the sizes of the input structs. The

@@ -683,9 +683,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			family_queue_count = families[queue_family].queueCount;
 		}
 	}
+	// Under --rd the side queue defaults off: with it, a RenderDoc session lost the device in the
+	// Yotei menu after 65 s; with KYTY_SIDE_QUEUE=0 it ran clean (Phase A rd1/rd2).
+	// KYTY_SIDE_QUEUE=1 still turns it on.
 	const bool side_queue_requested = [] {
 		const auto* value = std::getenv("KYTY_SIDE_QUEUE");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		if (value == nullptr) {
+			return !Config::RenderDocEnabled();
+		}
+		return std::strcmp(value, "0") != 0;
 	}();
 	graphics.side_queue_index = side_queue_requested && family_queue_count >= 2 ? 1u : 0u;
 	std::printf("Kyty side-copy queue: %s (family %u has %u queues, KYTY_SIDE_QUEUE)\n",

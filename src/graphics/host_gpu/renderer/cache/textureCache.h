@@ -310,6 +310,15 @@ public:
 	// back into the stencil aspect (FlushStencilStorageShadows). Single-sample one-layer depth
 	// images whose stencil holds the bound plane only; anything else returns the depth image.
 	[[nodiscard]] static bool StencilStorageShadowEnabled();
+	// KYTY_PRESERVE_STENCIL_RECREATE=1 (Erlou93/KytyPS5-Yotei WORKAROUND_PRESERVE_STENCIL's
+	// SaveStencil/RestoreStencil; default off): a depth/stencil image replaced by a colour image
+	// at its memory (a compute shader writes the depth as R32 storage) is freed, and the depth
+	// image made again when the game binds the depth target copies only the depth aspect back: the
+	// stencil aspect of the new image was undefined (RenderDoc: "UNDEFINED IMG" at the torii's
+	// Water Lighting, whose classifier then lit tiles in the sky). The replaced image's stencil is
+	// saved and written into the next depth image made at the same address and extent.
+	// Single-sample, one-layer depth images only (as KYTY_PRESERVE_STENCIL).
+	[[nodiscard]] static bool PreserveStencilRecreateEnabled();
 	[[nodiscard]] ImageId StencilStorageShadow(ImageId record_id, bool& shadow);
 	[[nodiscard]] bool HasStencilStorageShadows() const noexcept { return !m_pending_stencil_shadows.empty(); }
 	void FlushStencilStorageShadows();
@@ -734,6 +743,15 @@ private:
 	std::unordered_map<uint64_t, SavedStencilPlane> m_stencil_planes;
 	uint64_t                                        m_stencil_plane_serial = 0;
 	std::shared_ptr<Buffer>                         m_stencil_alias_staging;
+	// KYTY_PRESERVE_STENCIL_RECREATE: the stencil of the last depth image replaced by a colour image.
+	void SaveRecreatedStencil(Image& depth);
+	bool RestoreRecreatedStencil(Image& depth);
+	std::shared_ptr<Buffer>                         m_recreate_stencil;
+	uint64_t                                        m_recreate_stencil_address = 0;
+	uint64_t                                        m_recreate_stencil_plane   = 0;
+	uint32_t                                        m_recreate_stencil_width   = 0;
+	uint32_t                                        m_recreate_stencil_height  = 0;
+	bool                                            m_recreate_stencil_valid   = false;
 	// KYTY_STENCIL_STORAGE_SHADOW: shadow image per depth image, and the pairs to copy back.
 	std::unordered_map<ImageId, ImageId>            m_stencil_shadows;
 	std::vector<std::pair<ImageId, ImageId>>        m_pending_stencil_shadows; // shadow, depth

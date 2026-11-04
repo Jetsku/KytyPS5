@@ -530,6 +530,13 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			              p.size);
 			break;
 		}
+		case Op::InsertDebugLabel: {
+			const auto  size = reader.Get<uint32_t>();
+			const auto* name = reader.GetArray<char>(size);
+			check(VerifyHash::DebugLabel(name, size));
+			exec.insertDebugLabel(name);
+			break;
+		}
 		case Op::WriteBufferMarker: {
 			const auto& p           = reader.Get<WriteBufferMarkerPacket>();
 			uint64_t    buffer_bits = 0;

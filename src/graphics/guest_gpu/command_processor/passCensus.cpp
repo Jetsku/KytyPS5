@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/command_processor/passCensus.h"
 
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include <algorithm>
@@ -121,8 +122,27 @@ bool Enabled() {
 	return on;
 }
 
+bool LabelsEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_VK_LABELS");
+		const bool  o     = value != nullptr && value[0] != '\0' ? value[0] != '0' : Config::RenderDocEnabled();
+		if (o) std::printf("Vulkan debug labels: on (game markers and shader hashes; KYTY_TRACE_VK_LABELS)\n");
+		return o;
+	}();
+	return on;
+}
+
+void LabelText(char* out, size_t size, char kind, uint64_t a, uint64_t b) {
+	const char* key = t_key.c_str();
+	if (kind == 'c') {
+		std::snprintf(out, size, "dispatch %016" PRIx64 " | %s", a, key);
+	} else {
+		std::snprintf(out, size, "draw %016" PRIx64 " %016" PRIx64 " | %s", a, b, key);
+	}
+}
+
 void Marker(const void* cp, const char* push_name) {
-	if (!Enabled() || !OnGpuThread()) return;
+	if (!Tracking() || !OnGpuThread()) return;
 	auto& stack = t_stacks[cp];
 	if (push_name != nullptr) {
 		stack.emplace_back(push_name);
@@ -133,8 +153,9 @@ void Marker(const void* cp, const char* push_name) {
 }
 
 void Packet(const void* cp, bool dispatch) {
-	if (!Enabled() || !OnGpuThread()) return;
+	if (!Tracking() || !OnGpuThread()) return;
 	t_key   = KeyOf(t_stacks[cp]);
+	if (!Enabled()) return; // labels only
 	auto& c = Global();
 	std::scoped_lock lock(c.mutex);
 	auto& p = c.passes[t_key];

@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -283,6 +284,10 @@ struct LogExecutor {
 	}
 	void hostCopy(void* d, uint64_t src, uint64_t n) {
 		Push(Op::HostCopy, VerifyHash::Value(Op::HostCopy, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(d)), src, n));
+	}
+	void insertDebugLabel(const char* name) {
+		const auto size = static_cast<uint32_t>(std::strlen(name) + 1u);
+		Push(Op::InsertDebugLabel, VerifyHash::DebugLabel(name, size));
 	}
 	void writeBufferMarkerAMD(vk::PipelineStageFlagBits st, vk::Buffer b, vk::DeviceSize o, uint32_t m) {
 		Push(Op::WriteBufferMarker,
@@ -829,6 +834,12 @@ public:
 				expected.push_back({op, VerifyHash::Value(op, LogExecutor::Bits(b), o,
 				                                          static_cast<uint32_t>(static_cast<VkPipelineStageFlagBits>(stage)),
 				                                          m)});
+				break;
+			}
+			case Op::InsertDebugLabel: {
+				const auto text = "label " + std::to_string(U32());
+				e.insertDebugLabel(text.c_str());
+				expected.push_back({op, VerifyHash::DebugLabel(text.c_str(), static_cast<uint32_t>(text.size() + 1u))});
 				break;
 			}
 			case Op::HostCopy: {

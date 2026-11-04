@@ -1017,6 +1017,19 @@ public:
 			m_owner->m_buffer.writeTimestamp2(stage, pool, query);
 		}
 	}
+	// A VK_EXT_debug_utils label before the next command (PassCensus::LabelsEnabled(): --rd or
+	// KYTY_TRACE_VK_LABELS=1). An inserted label, not a region: a RenderDoc torii capture with
+	// begin/end regions around every draw and dispatch lost the device (rd3b), one without labels
+	// did not (rd4).
+	void insertDebugLabel(const char* name) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->insertDebugLabel(name);
+		} else if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdInsertDebugUtilsLabelEXT != nullptr) {
+			vk::DebugUtilsLabelEXT label {};
+			label.pLabelName = name;
+			m_owner->m_buffer.insertDebugUtilsLabelEXT(label);
+		}
+	}
 	void writeBufferMarkerAMD(vk::PipelineStageFlagBits stage, vk::Buffer buffer, vk::DeviceSize offset,
 	                          uint32_t marker) const {
 		if (m_owner->Encoding()) {
