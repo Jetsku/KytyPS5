@@ -93,6 +93,75 @@ static std::atomic<uint64_t> g_overlap_direct {0}, g_overlap_pairs {0}, g_overla
 static Live::Switch g_skip_empty_indirect("KYTY_SKIP_EMPTY_INDIRECT", Live::ParseDefaultOn);
 static std::atomic<int64_t> g_overlap_last_print_ns {0};
 
+// KYTY_SKIP_EMPTY_LOG=1 (diagnostic, default off): which programs KYTY_SKIP_EMPTY_INDIRECT drops. Per program code
+// address: the first 4 skips, then every 256th, with the time since start and how many dispatches of that code ran
+// before; and once, the shader hash of that code when one of its dispatches runs.
+namespace SkipEmptyLog {
+static bool Enabled() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_SKIP_EMPTY_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+struct Entry {
+	uint64_t skips  = 0;
+	uint64_t runs   = 0;
+	bool     mapped = false;
+};
+static std::mutex                             g_mutex;
+static std::unordered_map<uint64_t, Entry>    g_entries;
+static double Seconds() {
+	static const auto start = std::chrono::steady_clock::now();
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+static void NoteSkip(uint64_t code, uint64_t args) {
+	if (!Enabled()) return;
+	std::scoped_lock lock(g_mutex);
+	auto& e = g_entries[code];
+	const auto n = e.skips++;
+	if (n < 4 || n % 256 == 0) {
+		std::printf("SkipEmpty: t=%.1f code 0x%llx args 0x%llx skip #%llu (runs before %llu)\n", Seconds(),
+		            static_cast<unsigned long long>(code), static_cast<unsigned long long>(args),
+		            static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(e.runs));
+		std::fflush(stdout);
+	}
+}
+static void NoteRun(uint64_t code, uint64_t hash, uint64_t args) {
+	if (!Enabled()) return;
+	std::scoped_lock lock(g_mutex);
+	auto& e = g_entries[code];
+	e.runs++;
+	if (!e.mapped) {
+		e.mapped = true;
+		std::printf("SkipEmpty: t=%.1f code 0x%llx = CS 0x%016llx (args 0x%llx; %llu skips, run #%llu)\n", Seconds(),
+		            static_cast<unsigned long long>(code), static_cast<unsigned long long>(hash),
+		            static_cast<unsigned long long>(args), static_cast<unsigned long long>(e.skips),
+		            static_cast<unsigned long long>(e.runs));
+		std::fflush(stdout);
+	}
+}
+} // namespace SkipEmptyLog
+
+// KYTY_SKIP_EMPTY_STRICT (live, default on): the guest copy of an indirect dispatch's arguments is
+// read (KYTY_SKIP_EMPTY_INDIRECT, KYTY_WORKGROUP_IMAGES) only when it is current. HasGpuDirtyBytes
+// alone misses two GPU-owned states: a queued download or side readback removes the exact dirty
+// range when it is queued, before its backing publication lands, and a GPU-modified image over the
+// range. In both the backing can still hold older bytes (the indirect draw path, TryDrawIndirectNative,
+// already treats a pending publication as GPU-owned). Off: the HasGpuDirtyBytes test only, as before.
+static Live::Switch g_skip_empty_strict("KYTY_SKIP_EMPTY_STRICT", Live::ParseDefaultOn);
+static bool IndirectArgsCleanForBackingRead(RenderContext& context, uint64_t address, uint64_t size) {
+	auto& buffers = context.GetBufferCache();
+	if (buffers.HasGpuDirtyBytes(address, size)) {
+		return false;
+	}
+	if (g_skip_empty_strict.Get() == 0) {
+		return true;
+	}
+	return !buffers.HasPendingBackingPublication(address, size) &&
+	       !context.GetTextureCache().IsRegionGpuModified(address, size);
+}
+
 // KYTY_DISPATCH_TRACE=<hash>[,<hash>...] or all (hexadecimal guest shader hashes, diagnostic): logs the
 // first KYTY_DISPATCH_TRACE_LIMIT (default 64) dispatches of each listed program: tick, groups or
 // indirect argument address (with the argument bytes guest memory holds and whether a GPU write of
@@ -1812,10 +1881,11 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	// pending for, read from guest memory, with a zero group count: the dispatch does nothing.
 	if (g_skip_empty_indirect.Get() != 0) {
 		vk::DispatchIndirectCommand args {};
-		if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+		if (IndirectArgsCleanForBackingRead(m_context, args_addr, sizeof(args)) &&
 		    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 		    (args.x == 0 || args.y == 0 || args.z == 0)) {
 			g_overlap_empty_indirect.fetch_add(1, std::memory_order_relaxed);
+			SkipEmptyLog::NoteSkip(cs_regs.cs_regs.data_addr, args_addr);
 			return;
 		}
 	}
@@ -1842,7 +1912,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 		const bool workgroup_images = ShaderRecompiler::GetCodegenOptions().workgroup_images;
 		const auto read_counts = [&] {
 			vk::DispatchIndirectCommand args {};
-			if (m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) ||
+			if (!IndirectArgsCleanForBackingRead(m_context, args_addr, sizeof(args)) ||
 			    !LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
 				return false;
 			}
@@ -1879,6 +1949,9 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (step != nullptr) {
 		PipelineCache::SelectCallSplitCode(nullptr);
+	}
+	if (input_info.stage.program != nullptr) {
+		SkipEmptyLog::NoteRun(cs_regs.cs_regs.data_addr, input_info.stage.program->shader_hash, args_addr);
 	}
 	if (partition_run != nullptr) {
 		if (auto run = PipelineCache::TakePartitionRun(); run != nullptr) {
