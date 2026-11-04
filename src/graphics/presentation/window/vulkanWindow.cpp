@@ -2084,6 +2084,8 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		graphic_ctx.depth_range_unrestricted_enabled =
+		    HasExtension(available_extensions, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 #if !defined(__APPLE__)
 		// Dynamic colour-write enables and the depth-clip switch: without them (older drivers) the
 		// renderer uses its MoltenVK path (GraphicContext::color_write_enable_enabled and

@@ -314,9 +314,11 @@ bool PredictRenderDepthTarget(const GraphicContext& graphics, const HW::Context&
 	prediction.with_depth         = true;
 	prediction.format             = format;
 	prediction.samples            = samples;
-	prediction.bounds_test_enable = dc.depth_bounds_enable;
 	prediction.min_bounds         = hw.GetDepthBoundsMin();
 	prediction.max_bounds         = hw.GetDepthBoundsMax();
+	prediction.bounds_test_enable = depth_bounds_test_effective(
+	    dc.depth_bounds_enable, prediction.min_bounds, prediction.max_bounds, format,
+	    graphics.depth_range_unrestricted_enabled);
 	return true;
 }
 
@@ -391,9 +393,11 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	                            !z.depth_view.depth_write_disable && !r.depth_clear_enable;
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
-	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();
 	r.depth_max_bounds         = hw.GetDepthBoundsMax();
+	r.depth_bounds_test_enable = depth_bounds_test_effective(
+	    dc.depth_bounds_enable, r.depth_min_bounds, r.depth_max_bounds, r.desc.view_info.format,
+	    m_context.GetGraphics().depth_range_unrestricted_enabled);
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;

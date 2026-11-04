@@ -55292,6 +55292,34 @@ void CheckDepthHtileStencilCompatibility() {
   std::printf("[host]    %-32s ok\n", "DepthHtileStencilCompatibility");
 }
 
+void CheckDepthBoundsTestEffective() {
+  constexpr auto d32 = vk::Format::eD32Sfloat;
+  constexpr auto d16 = vk::Format::eD16Unorm;
+  Require("DepthBoundsTestEffective", "[0, 1] on float depth",
+          !depth_bounds_test_effective(true, 0.0f, 1.0f, d32, false),
+          "a test that rejects nothing was kept (Astro Bot's 3D draws)");
+  Require("DepthBoundsTestEffective", "wider than [0, 1]",
+          !depth_bounds_test_effective(true, -1.0f, 2.0f, vk::Format::eD32SfloatS8Uint, false),
+          "a test that rejects nothing was kept");
+  Require("DepthBoundsTestEffective", "narrower bounds",
+          depth_bounds_test_effective(true, 0.0f, 0.5f, d32, false) &&
+              depth_bounds_test_effective(true, 0.25f, 1.0f, d16, false),
+          "a test that can reject samples was dropped");
+  Require("DepthBoundsTestEffective", "unrestricted float depth",
+          depth_bounds_test_effective(true, 0.0f, 1.0f, d32, true),
+          "float depth outside [0, 1] would pass a dropped test");
+  Require("DepthBoundsTestEffective", "UNORM with unrestricted range",
+          !depth_bounds_test_effective(true, 0.0f, 1.0f, d16, true),
+          "UNORM depth is always in [0, 1]");
+  Require("DepthBoundsTestEffective", "NaN bounds",
+          depth_bounds_test_effective(true, std::numeric_limits<float>::quiet_NaN(), 1.0f, d32, false),
+          "NaN bounds reject every sample");
+  Require("DepthBoundsTestEffective", "disabled",
+          !depth_bounds_test_effective(false, 0.0f, 0.5f, d32, false),
+          "a disabled test was enabled");
+  std::printf("[host]    %-32s ok\n", "DepthBoundsTestEffective");
+}
+
 void CheckPs5DepthRegisterDecoding() {
   constexpr uint32_t captured_z = 0x22900803u;
   constexpr uint32_t captured_stencil = 0x00100801u;
@@ -59372,6 +59400,7 @@ int main(int argc, char **argv) {
   CheckNativeMsaaState();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
+  CheckDepthBoundsTestEffective();
   CheckDepthAttachmentWrites();
   CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();
@@ -59385,6 +59414,7 @@ int main(int argc, char **argv) {
   }
   CheckShaderRecompilerFatalContracts();
   CheckDepthFeedbackAspects();
+  CheckDepthBoundsTestEffective();
   VulkanHarness vulkan;
 #endif
   CheckImageSamplerSpecialization();
