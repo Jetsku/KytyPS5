@@ -95,6 +95,7 @@ CodegenOptions FromEnvironment() {
 	options.lds_atomic_order = EnvFlag("KYTY_LDS_ATOMIC_ORDER", options.lds_atomic_order);
 	options.split_lds_write_sync = EnvFlag("KYTY_SPLIT_LDS_WRITE_SYNC", options.split_lds_write_sync);
 	options.storage_table_loose  = EnvFlag("KYTY_STORAGE_TABLE_LOOSE", options.storage_table_loose);
+	options.sampled_table_reads  = EnvFlag("KYTY_SAMPLED_TABLE_READS", options.sampled_table_reads);
 	options.scalar_load_groups   = EnvFlag("KYTY_SCALAR_LOAD_GROUPS", options.scalar_load_groups);
 	options.null_image_keep_dim  = EnvFlag("KYTY_NULL_IMAGE_KEEP_DIM", options.null_image_keep_dim);
 	options.storage_swizzle_canon = EnvFlag("KYTY_STORAGE_SWIZZLE_CANON", options.storage_swizzle_canon);
@@ -113,6 +114,21 @@ CodegenOptions FromEnvironment() {
 			const auto token = std::string(text.substr(0, comma));
 			if (!token.empty()) {
 				options.bda_force_shaders.push_back(std::strtoull(token.c_str(), nullptr, 16));
+			}
+			if (comma == std::string_view::npos) {
+				break;
+			}
+			text.remove_prefix(comma + 1);
+		}
+	}
+	if (const auto* list = std::getenv("KYTY_INDIRECT_FORMAT_STORES_SHADERS"); list != nullptr) {
+		std::string_view text(list);
+		while (!text.empty()) {
+			const auto comma = text.find(',');
+			const auto token = std::string(text.substr(0, comma));
+			if (!token.empty()) {
+				options.indirect_format_stores_shaders.push_back(
+				    std::strtoull(token.c_str(), nullptr, 16));
 			}
 			if (comma == std::string_view::npos) {
 				break;

@@ -1196,14 +1196,60 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    (!same_coordinates || image.shader_swizzle != image_class.shader_swizzle)) {
 				continue;
 			}
+			// KYTY_SAMPLED_TABLE_READS (adapted from Erlou93/KytyPS5-Yotei EmitImageAccess): a
+			// sampled-table candidate of another plain dimension keeps its own type when every access
+			// to the table takes the candidate's own coordinates: loads (one case per candidate) and
+			// samples without gradients or offsets; a sample with an LOD or clamp after its
+			// coordinates only when the candidate has no more coordinates than the instruction.
+			const auto coordinates = [](Decoder::ImageDimension dimension) {
+				return dimension == Decoder::ImageDimension::Dim1D ? 1u
+				       : dimension == Decoder::ImageDimension::Dim1DArray ||
+				               dimension == Decoder::ImageDimension::Dim2D
+				           ? 2u
+				           : 3u;
+			};
+			const auto& root_base = program.info.images[root_index];
+			if (GetCodegenOptions().sampled_table_reads && !same_coordinates &&
+			    root_base.resource_class == ImageResourceClass::Sampled &&
+			    (root_base.table_access & (ImageTableAccessWrite | ImageTableAccessOther)) == 0u &&
+			    (root_base.table_access & (ImageTableAccessRead | ImageTableAccessSample |
+			                               ImageTableAccessSampleExtra)) != 0u &&
+			    !image.cube && !image_class.cube && plain_dimension(image.dimension) &&
+			    plain_dimension(image_class.dimension) &&
+			    plain_dimension(root_base.dimension) &&
+			    ((root_base.table_access & ImageTableAccessSampleExtra) == 0u ||
+			     (coordinates(image.dimension) <= coordinates(root_base.dimension) &&
+			      coordinates(image_class.dimension) <= coordinates(root_base.dimension))) &&
+			    image.numeric_class == image_class.numeric_class &&
+			    image.mip_count == image_class.mip_count &&
+			    image.conversion_format == image_class.conversion_format &&
+			    image.shader_swizzle == image_class.shader_swizzle) {
+				continue;
+			}
 			if (image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				// The fields that differ (exemplar/candidate): class, dimension, cube, mips,
+				// conversion format, swizzle, T# format; and the table's access kinds.
+				const auto format_of = [&](uint32_t index) {
+					return (snapshot.images[index].dwords[1] >> 20u) & 0x1ffu;
+				};
+				return SpecializationFail(fmt::format(
+				    "indirect image table at pc 0x{:08x} has incompatible candidates (class {}/{} "
+				    "dim {}/{} cube {}/{} mips {}/{} conv {}/{} swizzle {:03x}/{:03x} format {}/{}; "
+				    "{} dim {} access 0x{:x})",
+				    root_base.first_use_pc, static_cast<uint32_t>(image_class.numeric_class),
+				    static_cast<uint32_t>(image.numeric_class),
+				    static_cast<uint32_t>(image_class.dimension),
+				    static_cast<uint32_t>(image.dimension), image_class.cube, image.cube,
+				    image_class.mip_count, image.mip_count,
+				    static_cast<uint32_t>(image_class.conversion_format),
+				    static_cast<uint32_t>(image.conversion_format), image_class.shader_swizzle,
+				    image.shader_swizzle, format_of(exemplar), format_of(candidate),
+				    root_base.resource_class == ImageResourceClass::Storage ? "storage" : "sampled",
+				    static_cast<uint32_t>(root_base.dimension), root_base.table_access));
 			}
 		}
 	}
@@ -2271,9 +2317,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			// Enumerated candidates only sample, or are stored to (KYTY_WORKGROUP_IMAGES); a
 			// bindless image is loaded per instruction and may take any sampled operation.
+			// KYTY_SAMPLED_TABLE_READS: loads read the candidate the key selects too.
 			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageWrite);
+			        inst.GetOpcode() != ValueOpcode::ImageWrite &&
+			        !(inst.GetOpcode() == ValueOpcode::ImageRead &&
+			          GetCodegenOptions().sampled_table_reads));
 		}
 	}
 	// Dead-code elimination can remove an image operation (an unused IMAGE_GET_LOD result) before

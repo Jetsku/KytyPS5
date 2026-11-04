@@ -2084,6 +2084,7 @@ private:
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
+				image.table_access |= TableAccess(memory, op);
 				return i;
 			}
 		}
@@ -2106,8 +2107,35 @@ private:
 			image.runtime  = true;
 		}
 		Merge(image, op, pc);
+		image.table_access |= TableAccess(memory, op);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
+	}
+
+	// KYTY_SAMPLED_TABLE_READS: the access kind ImageResource::table_access records (0 without the
+	// switch, so programs and their cache entries stay as they were).
+	static uint32_t TableAccess(const MemoryInfo& memory, ValueOpcode op) {
+		if (!GetCodegenOptions().sampled_table_reads) {
+			return 0u;
+		}
+		switch (op) {
+			case ValueOpcode::ImageRead: return ImageTableAccessRead;
+			case ValueOpcode::ImageWrite: return ImageTableAccessWrite;
+			case ValueOpcode::ImageSampleRaw: {
+				// Gradients and offsets take the instruction's dimension (not a candidate's); an
+				// explicit LOD or clamp follows the coordinates (a candidate with more coordinates
+				// than the instruction would read it as one).
+				if ((memory.image_sample_flags &
+				     (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset)) != 0u) {
+					return ImageTableAccessOther;
+				}
+				return (memory.image_sample_flags &
+				        (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagLodClamp)) != 0u
+				           ? ImageTableAccessSampleExtra
+				           : ImageTableAccessSample;
+			}
+			default: return ImageTableAccessOther;
+		}
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
@@ -2234,7 +2262,7 @@ private:
 				const bool indirect_write = m_bda_writes && memory.kind == ResourceKind::Buffer &&
 				                            (m_program.stage == ShaderType::Compute || graphics_raw) &&
 				                            (memory.SupportsIndirectRawWrite(op) ||
-				                             (GetCodegenOptions().indirect_format_stores &&
+				                             (GetCodegenOptions().IndirectFormatStoresFor(m_program.shader_hash) &&
 				                              IndirectFormattedStore(memory, op)));
 				if (!indirect_variant && !indirect_write && !d16_formatted &&
 				    (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op))) {

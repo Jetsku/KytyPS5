@@ -189,7 +189,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
-                         bool memory_backed_material = false) {
+                         bool memory_backed_material = false,
+                         bool load = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -262,6 +263,18 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   MemoryInfo sample;
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  if (load) {
+    // IMAGE_LOAD through the GPU-selected table (KYTY_SAMPLED_TABLE_READS).
+    sample.image_address_components = 2;
+    sample.dmask = 0xf;
+    const auto loaded = fixture->Emit(
+        ValueOpcode::ImageRead, {image, fixture->ImageAddress(), Value(true)},
+        fixture->AddMemory(sample, 0x10f0));
+    const auto loaded_x =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {loaded_x});
+    return fixture;
+  }
   const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
                                      {image, sampler, fixture->ImageAddress()},
                                      fixture->AddMemory(sample, 0x10f0));
@@ -271,6 +284,101 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
+// KYTY_SAMPLED_TABLE_READS (Ghost of Yotei "Update Oct Maps", CS e8e383355f93ab53): an IMAGE_LOAD
+// through a sampled T# table the GPU indexes, whose candidates are a 2D and a 3D texture. Without
+// the switch the table fails ("incompatible candidates"); with it each candidate keeps its own
+// dimension and the load stays a per-candidate access of the table root.
+void TestSampledTableReads() {
+  namespace RC = Libs::Graphics::ShaderRecompiler;
+  const auto saved = RC::GetCodegenOptions();
+  struct Restore {
+    RC::CodegenOptions saved;
+    ~Restore() { RC::SetCodegenOptions(saved); }
+  } restore{saved};
+  const auto run = [&](bool enabled, bool volume, bool sample) {
+    auto options = saved;
+    options.sampled_table_reads = enabled;
+    RC::SetCodegenOptions(options);
+    auto fixture = MakeIndirectImageFixture(false, 0u, false, !sample);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    EliminateDeadCode(fixture->program.blocks);
+    ValidateProgram(fixture->program, true);
+    std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
+                                      16u << 16u, 4u,          0u, 7u};
+    LinearTestMemory memory;
+    std::array<uint32_t, 8> descriptor{};
+    descriptor[0] = 0x20u;
+    descriptor[1] = static_cast<uint32_t>(
+                        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                    << 20u;
+    descriptor[2] = 3u | (3u << 14u);
+    descriptor[3] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[(0x2000u - memory.base) / 4u + dword] = descriptor[dword];
+      memory.words[(0x2020u - memory.base) / 4u + dword] = descriptor[dword];
+    }
+    memory.words[(0x2020u - memory.base) / 4u] ^= 1u;
+    if (volume) {
+      memory.words[(0x2020u - memory.base) / 4u + 3u] =
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor3D) << 28u);
+      memory.words[(0x2020u - memory.base) / 4u + 4u] = 3u;
+    }
+    memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool ok = MaterializeResources(plan, runtime, snapshot, specialization);
+    struct Result {
+      bool ok;
+      uint32_t access;
+      ResourceSpecialization specialization;
+      std::unique_ptr<Fixture> fixture;
+    };
+    return Result{ok, fixture->program.info.images.empty()
+                          ? 0u
+                          : fixture->program.info.images[0].table_access,
+                  specialization, std::move(fixture)};
+  };
+
+  auto off = run(false, true, false);
+  Check(!off.ok && off.access == 0u,
+        "a load table with 2D and 3D candidates materialized without KYTY_SAMPLED_TABLE_READS");
+
+  auto on = run(true, true, false);
+  Check(on.access == RC::IR::ImageTableAccessRead,
+        "the table's load was not recorded as its only access");
+  Check(on.ok && on.specialization.images.size() == 2 &&
+            on.specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
+            on.specialization.images[1].dimension == Decoder::ImageDimension::Dim3D,
+        "a load table with 2D and 3D candidates did not keep each candidate's dimension");
+  ApplyResourceSpecialization(on.fixture->program, on.specialization);
+  const auto &images = on.fixture->program.info.images;
+  Check(images.size() == 2 && images[0].indirect_root == 0 &&
+            images[0].indirect_resources.size() == 2 &&
+            images[1].dimension == Decoder::ImageDimension::Dim3D,
+        "the specialized load table lost its 3D candidate");
+  const auto load = std::ranges::find_if(*on.fixture->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::ImageRead;
+  });
+  Check(load != on.fixture->block->end() &&
+            on.fixture->program.memory_info[load->Flags<MemoryFlags>().index].resource == 0u,
+        "the table load does not address the table root");
+
+  auto same = run(true, false, false);
+  Check(same.ok && same.specialization.images.size() == 2,
+        "a load table with matching candidates did not materialize");
+
+  // A sample without LOD or gradients takes each candidate's coordinates too.
+  auto sampled = run(true, true, true);
+  Check(sampled.access == RC::IR::ImageTableAccessSample && sampled.ok,
+        "a coordinates-only sample table with 2D and 3D candidates was rejected");
+}
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
@@ -3582,6 +3690,7 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+  Run("sampled table reads", TestSampledTableReads);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded key address table", TestBoundedKeyAddressTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

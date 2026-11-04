@@ -401,6 +401,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.Bool(v.bindless);
 	w.Bool(v.runtime);
 	w.Bool(v.clamp_half_float);
+	w.U32(v.table_access);
 	w.Words(v.indirect_resources);
 }
 
@@ -427,6 +428,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.bindless                   = r.Bool();
 	v.runtime                    = r.Bool();
 	v.clamp_half_float           = r.Bool();
+	v.table_access               = r.U32();
 	v.indirect_resources         = r.Words();
 }
 

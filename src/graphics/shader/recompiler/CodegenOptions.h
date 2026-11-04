@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_SHADER_RECOMPILER_CODEGENOPTIONS_H_
 #define EMULATOR_SRC_GRAPHICS_SHADER_RECOMPILER_CODEGENOPTIONS_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -398,6 +399,16 @@ struct CodegenOptions {
 	// write through the table takes the candidate's own coordinates. Before, such a table failed the
 	// stage ("indirect image table ... has incompatible candidates").
 	bool storage_table_loose = false;
+	// KYTY_SAMPLED_TABLE_READS=1 (default 0; not in the PPSA26344 preset yet; adapted from
+	// Erlou93/KytyPS5-Yotei EmitImageAccess): an IMAGE_LOAD through a sampled image table the GPU
+	// indexes reads the candidate its key selects (one switch case per candidate, each with its own
+	// coordinates), and the table accepts candidates that differ from its exemplar only in a plain
+	// dimension when every access to it is a load or a coordinates-only sample. Before, such a table
+	// failed the stage ("indirect image table ... has incompatible candidates"; Ghost of Yotei's
+	// "Update Oct Maps" CS e8e383355f93ab53). Its partner CS 0x0b0ec2bac5920bd3 needs
+	// KYTY_INDIRECT_FORMAT_STORES (or KYTY_INDIRECT_FORMAT_STORES_SHADERS): in one boot with both
+	// switches the village lighting had no magenta, while the stores alone (0b0e without e8e3) gave it.
+	bool sampled_table_reads = false;
 	// KYTY_SCALAR_LOAD_GROUPS=1 (default 0; on in the PPSA26344 title preset; adapted from
 	// Erlou93/KytyPS5-Yotei FindScalarLoadGroups): the dwords of one S_LOAD_DWORDXn through a scalar
 	// address share one BDA page lookup when they lie in one page (EmitScalarLoadGroup). Exact.
@@ -425,6 +436,16 @@ struct CodegenOptions {
 	// reading them on the command processor waits for the GPU every frame. Writes are
 	// KYTY_BDA_WRITES writes (settled per dispatch).
 	std::vector<uint64_t> bda_force_shaders;
+	// KYTY_INDIRECT_FORMAT_STORES_SHADERS=<hash>[,<hash>...] (default none): KYTY_INDIRECT_FORMAT_STORES
+	// for these programs only (Ghost of Yotei's "Update Oct Maps" CS 0x0b0ec2bac5920bd3 writes its GI
+	// volume records with BUFFER_STORE_FORMAT_XYZW through a computed V#), so one program's stores can
+	// be enabled while the global switch stays off. Use IndirectFormatStoresFor(hash).
+	std::vector<uint64_t> indirect_format_stores_shaders;
+	[[nodiscard]] bool IndirectFormatStoresFor(uint64_t hash) const {
+		return indirect_format_stores ||
+		       std::find(indirect_format_stores_shaders.begin(), indirect_format_stores_shaders.end(),
+		                 hash) != indirect_format_stores_shaders.end();
+	}
 	// KYTY_LOOP_GUARD_SHADERS=all: every shader is guarded (with KYTY_LOOP_GUARD). An exhausted
 	// invocation also records its shader hash (GDS dwords end - LoopGuardHashGdsFromEnd and the one
 	// after), which the "Loop guard" report names: one run finds a shader that never leaves a loop.
