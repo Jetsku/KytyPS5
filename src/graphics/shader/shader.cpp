@@ -1664,6 +1664,18 @@ static bool TessMergedHullEnabled() {
 	return enabled;
 }
 
+// KYTY_TESS_MERGED_CARRY=1 (default off; only with KYTY_TESS_MERGED_HULL; based on
+// Erlou93/KytyPS5-Yotei): the split merged program's HS part starts with the VGPRs it reads before
+// writing them, as its LS part left them in the lane (ShaderTessellationInputInfo::carried_vgprs).
+// Without it they start empty: Ghost of Yotei 2.x's particle HS then culls every particle.
+static bool TessMergedCarryEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TESS_MERGED_CARRY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 struct MergedHullHalves {
 	bool                  valid = false;
 	std::vector<uint32_t> front;
@@ -1885,7 +1897,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	// (the tess line's cache; int21's per-pair layout cache of upstream c71589124 is not used with it).
 	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess,
 	                                                   params[0].hash, params[1].hash,
-	                                                   params[2].code)) {
+	                                                   params[2].code, nullptr,
+	                                                   merged != nullptr && TessMergedCarryEnabled())) {
 		// The analysis logged the set once; without a caller that can skip, end as before.
 		EXIT_IF(unsupported == nullptr);
 		*unsupported = true;

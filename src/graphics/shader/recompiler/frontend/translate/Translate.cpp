@@ -1448,6 +1448,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    static_cast<IR::VectorReg>(1),
 			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
 			                              IR::U32(IR::Value(8u))));
+			// KYTY_TESS_MERGED_CARRY: a split merged program's HS part starts with the VGPRs its LS
+			// part left in the lane (carried_vgprs).
+			uint32_t rank = 0;
+			for (uint32_t reg = 0; reg < IR::NumVectorRegs; reg++) {
+				if (((tess.carried_vgprs[reg / 32u] >> (reg % 32u)) & 1u) == 0u) continue;
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(reg),
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::GetTessellationAttribute,
+				                          {IR::Value(static_cast<uint32_t>(IR::TessellationAttribute::CarriedInput)),
+				                           IR::Value(4u * rank++), IR::U1(IR::Value(true))})));
+			}
 		} else if (options.stage == ShaderType::TessellationEvaluation) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
 			entry_ir.SetScalarReg(
@@ -1575,6 +1586,21 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			translator.TranslateInstruction(instruction);
+		}
+		if (options.stage == ShaderType::Local && options.input_info.vertex != nullptr &&
+		    cfg_block.terminator.kind == CFG::TerminatorKind::Return) {
+			// KYTY_TESS_MERGED_CARRY: a split merged program's LS part hands the VGPRs its HS part
+			// reads to the HS stage (carried_vgprs).
+			const auto&   carried = options.input_info.vertex->tess.carried_vgprs;
+			IR::IREmitter exit_ir(result.blocks[typed_index]);
+			uint32_t      rank = 0;
+			for (uint32_t reg = 0; reg < IR::NumVectorRegs; reg++) {
+				if (((carried[reg / 32u] >> (reg % 32u)) & 1u) == 0u) continue;
+				exit_ir.Emit(IR::ValueOpcode::SetTessellationAttribute,
+				             {IR::Value(static_cast<uint32_t>(IR::TessellationAttribute::CarriedOutput)),
+				              IR::Value(4u * rank++), exit_ir.GetVectorReg(static_cast<IR::VectorReg>(reg)),
+				              IR::U1(IR::Value(true))});
+			}
 		}
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 		lds_write_pending = translator.LdsWritePending();
