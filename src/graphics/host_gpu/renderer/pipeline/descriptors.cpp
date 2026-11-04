@@ -2778,6 +2778,96 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	return true;
 }
 
+// KYTY_BINDLESS_PREFILL=1 (default 0; =2 also logs the first heaps and every 1024th): a heap of at
+// most KYTY_BINDLESS_PREFILL_MAX keys (default 256) has every key settled at its first use, before
+// the draw or dispatch that reads it, instead of sampling the placeholder until the feedback of a
+// later frame asks for it. A T# that a prefilled key of any heap already resolved shares that slot
+// (BindlessTable::FindSharedSlot), so a new heap of known textures takes no new slots or uploads.
+// Ghost of Yotei writes its terrain tile records (56 records of 440 bytes, the height map T# at
+// offset 0) to a new address every frame: each frame's heap was new, its keys never resolved, and
+// "Generate Terrain Index Buffers" (0041b6a0) read the placeholder's heights, culled every tile
+// and left the terrain without instances (measured, RenderDoc 2026-11-04; Erlou93/KytyPS5-Yotei
+// resolves new heaps the same way, PrefillBindlessHeap and descriptor_slots).
+static uint32_t BindlessPrefillMode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_PREFILL");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return mode;
+}
+
+static uint32_t BindlessPrefillMax() {
+	static const uint32_t max = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_PREFILL_MAX");
+		return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+		                                            : 256u;
+	}();
+	return max;
+}
+
+void RenderExecutor::PrefillBindlessHeap(BindlessHeap& heap, uint32_t entries) {
+	auto&          table   = m_context.GetBindlessTable();
+	auto&          cache   = m_context.GetTextureCache();
+	const uint32_t keys    = std::min({entries, heap.entries, static_cast<uint32_t>(heap.settled.size())});
+	uint32_t       shared  = 0;
+	uint32_t       made    = 0;
+	uint32_t       failed  = 0;
+	uint32_t       skipped = 0;
+	// New textures per heap (each may upload and detile); the rest wait for feedback as before.
+	constexpr uint32_t Budget = 64;
+	for (uint32_t key = 0; key < keys; key++) {
+		if (heap.settled[key] != 0) {
+			continue;
+		}
+		std::array<uint32_t, 8> words {};
+		if (!ReadBindlessEntry(heap, key, words.data()) ||
+		    std::ranges::all_of(words, [](uint32_t w) { return w == 0u; })) {
+			skipped++;
+			continue;
+		}
+		if (const auto* found = table.FindSharedSlot(heap.binding, words); found != nullptr) {
+			const auto id    = found->image;
+			const auto entry = found->entry;
+			auto*      image = cache.m_slot_images.try_get(id);
+			if (image != nullptr && image->registered && image->bindless_pinned) {
+				heap.slots[key]       = entry;
+				heap.images[key]      = id;
+				heap.settled[key]     = 1;
+				heap.descriptors[key] = words;
+				if (std::find(heap.resolved.begin(), heap.resolved.end(), id) == heap.resolved.end()) {
+					heap.resolved.push_back(id);
+				}
+				heap.unchecked.push_back(id);
+				table.AddImageReference(id, heap, key);
+				table.AddSharedSlotRef(BindlessTable::SlotBinding(heap, entry), BindlessTable::SlotIndex(entry));
+				table.SetTranslation(heap, key, entry);
+				shared++;
+				continue;
+			}
+		}
+		if (made + failed >= Budget) {
+			skipped++;
+			continue;
+		}
+		if (ResolveBindlessKey(heap, key)) {
+			table.NoteSharedSlot(heap, heap.descriptors[key], heap.slots[key], heap.images[key]);
+			made++;
+		} else {
+			failed++;
+		}
+	}
+	if (BindlessPrefillMode() >= 2u) {
+		static std::atomic<uint32_t> logged {0};
+		const auto                   n = logged.fetch_add(1, std::memory_order_relaxed);
+		if (n < 64u || (n & 1023u) == 0u) {
+			LOGF("Bindless prefill: frame=%" PRIu64 " heap 0x%" PRIx64 "+%u stride %u binding %u keys %u: shared %u "
+			     "resolved %u failed %u skipped %u (#%u)\n",
+			     BindlessFrame(), heap.base, heap.table_offset, heap.stride, heap.binding, keys, shared, made,
+			     failed, skipped, n);
+		}
+	}
+}
+
 static uint64_t BindlessRecordRetryId(const BindlessHeap& heap, uint32_t key) {
 	return (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&heap)) << 20u) ^ key;
 }
@@ -3465,6 +3555,12 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		}
 		if (pointers && BindlessRecordLazy()) {
 			ProcessRecordHeap(*heap);
+		}
+		// KYTY_BINDLESS_PREFILL: a new small heap's keys, before this draw or dispatch reads them.
+		if (BindlessPrefillMode() != 0u && !heap->prefilled && !pointers && !heap->runtime &&
+		    heap->nested_vsharp == UINT32_MAX && entries <= BindlessPrefillMax()) {
+			heap->prefilled = true;
+			PrefillBindlessHeap(*heap, std::min(entries, heap->entries));
 		}
 		prepared.bindless_patches.push_back(
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});

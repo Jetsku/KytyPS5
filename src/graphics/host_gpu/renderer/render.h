@@ -1159,6 +1159,9 @@ private:
 	void RecheckBindlessKeys(BindlessHeap& heap, uint32_t first, uint32_t last, uint32_t& view_changes,
 	                         uint32_t& resource_changes, uint32_t& resettled);
 	bool ResolveBindlessKey(BindlessHeap& heap, uint32_t key);
+	// KYTY_BINDLESS_PREFILL: a small heap's keys settled at its first use, before the draw or
+	// dispatch reads them (a T# another heap already resolved shares that key's slot).
+	void PrefillBindlessHeap(BindlessHeap& heap, uint32_t entries);
 	// A settled key whose T# changed: released (its image unpinned when no key refers to it any
 	// more) and resolved again; it keeps its old slot while the new texture cannot be resolved
 	// yet (IDXTRI, KYTY_BINDLESS_KEEP_OLD).
