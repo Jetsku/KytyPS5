@@ -11,9 +11,15 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs, bool graphics_compute)
+	           bool flush_f32_inputs, bool graphics_compute,
+	           const std::array<IR::U32, 2>* present_lanes = nullptr)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
+	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {
+		if (present_lanes != nullptr) {
+			present_mask      = *present_lanes;
+			mask_exec_present = true;
+		}
+	}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -35,6 +41,8 @@ private:
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
 	IR::Value              ReadOperand(const Decoder::Operand& operand, IR::Type type);
 	IR::U1                 ThreadBit(const std::array<IR::U32, 2>& mask);
+	// KYTY_WAVE64_PRESENT_EXEC: an EXEC write limited to the lanes of the host subgroup.
+	std::array<IR::U32, 2> PresentExec(const std::array<IR::U32, 2>& mask);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
@@ -294,6 +302,8 @@ private:
 	bool            lds_write_pending    = false;
 	bool            flush_f32_inputs;
 	bool            graphics_compute;
+	std::array<IR::U32, 2> present_mask {};
+	bool                   mask_exec_present = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

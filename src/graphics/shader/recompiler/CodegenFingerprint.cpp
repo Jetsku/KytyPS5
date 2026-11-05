@@ -26,7 +26,7 @@ constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 // rt_function, lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 200,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 208,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -245,6 +245,21 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.raw_small_sint_storage) {
 		b.Text("raw_small_sint_storage");
+	}
+	if (options.point_integer_images) {
+		b.Text("point_integer_images");
+	}
+	if (options.compare_sampler_split) {
+		b.Text("compare_sampler_split");
+	}
+	if (options.waterfall_active_leader) {
+		b.Text("waterfall_active_leader");
+	}
+	if (options.wave64_present_exec) {
+		b.Text("wave64_present_exec");
+	}
+	if (options.embedded_fetch_no_sgpr_offset) {
+		b.Text("embedded_fetch_no_sgpr_offset");
 	}
 	if (options.mov_no_float_mods) {
 		b.Text("mov_no_float_mods");

@@ -401,7 +401,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 								dst.attrib_id =
 								    BufferTableAttribFromOffset(raw_offset, static_cast<int>(i));
 							}
-						} else if (IsDecodedSgpr(inst.src1) &&
+						} else if (!GetCodegenOptions().embedded_fetch_no_sgpr_offset &&
+						           IsDecodedSgpr(inst.src1) &&
 						           DecodedSgprReg(inst.src1) < sgprs.size() &&
 						           sgprs[DecodedSgprReg(inst.src1)].type ==
 						               EmbeddedFetchValueType::Attrib &&

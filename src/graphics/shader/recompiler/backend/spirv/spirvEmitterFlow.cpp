@@ -1211,7 +1211,84 @@ static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction
 	return result;
 }
 
+// KYTY_WATERFALL_ACTIVE_LEADER (Erlou93/KytyPS5-Yotei WaterfallPendingLow): the waterfall form of
+// V_READLANE, whose lane is S_FF1_I32_B64(pending) & 63:
+// BitwiseAnd32(SelectU32(INotEqual32(low, 0), FindILsb32(low), ...), 63). Returns the pending mask's
+// low word (a graphics wave64 runs in one 32-wide host subgroup, its high word is 0), or empty.
+static IR::Value WaterfallPendingLow(const IR::Inst& inst) {
+	const auto* masked = inst.Arg(1).Resolve().TryInstruction();
+	if (masked == nullptr || masked->GetOpcode() != IR::ValueOpcode::BitwiseAnd32) return {};
+	const auto is_63 = [](IR::Value v) {
+		v = v.Resolve();
+		return v.IsImmediate() && v.GetType() == IR::Type::U32 && v.U32() == 63u;
+	};
+	const IR::Inst* select = nullptr;
+	if (is_63(masked->Arg(1))) select = masked->Arg(0).Resolve().TryInstruction();
+	else if (is_63(masked->Arg(0))) select = masked->Arg(1).Resolve().TryInstruction();
+	if (select == nullptr || select->GetOpcode() != IR::ValueOpcode::SelectU32) return {};
+	const auto* nonzero = select->Arg(0).Resolve().TryInstruction();
+	const auto* first   = select->Arg(1).Resolve().TryInstruction();
+	if (nonzero == nullptr || first == nullptr || nonzero->GetOpcode() != IR::ValueOpcode::INotEqual32 ||
+	    first->GetOpcode() != IR::ValueOpcode::FindILsb32) {
+		return {};
+	}
+	const auto low  = first->Arg(0).Resolve();
+	const auto zero = nonzero->Arg(1).Resolve();
+	if (!(nonzero->Arg(0).Resolve() == low) || !zero.IsImmediate() || zero.U32() != 0u) return {};
+	return low;
+}
+
+// KYTY_WATERFALL_ACTIVE_LEADER: a waterfall loop (S_FF1 pending -> V_READLANE -> V_CMP_EQ ->
+// S_AND_SAVEEXEC -> S_ANDN2 pending) of a graphics shader needs its leader to be a lane that runs the
+// compare in this iteration, but the lowest pending bit can name a host invocation that is not active
+// at the read. The leader is the lowest lane that is pending AND active; with only inactive lanes
+// pending the read returns a key that no active invocation holds (max + 1, else min - 1).
+static uint32_t EmitWaterfallLeaderRead(ValueEmitContext& ctx, const IR::Inst& inst,
+                                        const IR::Value& pending_low) {
+	auto&      state    = ctx.state;
+	const auto u32      = TypeU32(state);
+	const auto boolean  = TypeBool(state);
+	const auto zero     = ConstantU32(state, 0);
+	const auto subgroup = ConstantU32(state, spv::ScopeSubgroup);
+	const auto lane     = ctx.Arg(inst, 1);
+	const auto native   = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
+	const auto ballot   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot, subgroup,
+	                          ConstantBool(state, true));
+	const auto active = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, active, ballot, 0);
+	const auto pending = ctx.Def(pending_low);
+	const auto live    = EmitBinaryU32(state, spv::OpBitwiseAnd, pending, active);
+	const auto first   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, u32, first, GlslStd450(state), GLSLstd450FindILsb, live);
+	const auto has_live = Binary(state, spv::OpINotEqual, boolean, live, zero);
+	const auto leader   = Select(state, u32, has_live, first, native);
+	const auto value    = ctx.Shuffle(inst, 0, leader);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	const auto source = ctx.Arg(inst, 0);
+	const auto high   = state.builder.AllocateId();
+	const auto low    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMax, u32, high, subgroup, spv::GroupOperationReduce, source);
+	state.builder.AddFunction(spv::OpGroupNonUniformUMin, u32, low, subgroup, spv::GroupOperationReduce, source);
+	const auto below = Select(state, u32, Binary(state, spv::OpINotEqual, boolean, low, zero),
+	                          EmitBinaryU32(state, spv::OpISub, low, ConstantU32(state, 1)), value);
+	const auto distinct =
+	    Select(state, u32, Binary(state, spv::OpINotEqual, boolean, high, ConstantU32(state, 0xffffffffu)),
+	           EmitBinaryU32(state, spv::OpIAdd, high, ConstantU32(state, 1)), below);
+	const auto pending_any = Binary(state, spv::OpINotEqual, boolean, pending, zero);
+	const auto exhausted   = Binary(state, spv::OpLogicalAnd, boolean,
+	                                Unary(state, spv::OpLogicalNot, boolean, has_live), pending_any);
+	return Select(state, u32, exhausted, distinct, value);
+}
+
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (GetCodegenOptions().waterfall_active_leader && ctx.other_half == nullptr &&
+	    ctx.state.lane_count == 1u && !ctx.state.split_wave && !ctx.state.wave_clusters &&
+	    ctx.state.program.stage != ShaderType::Compute && inst.Arg(0).GetType() == IR::Type::U32) {
+		if (const auto pending_low = WaterfallPendingLow(inst); !pending_low.IsEmpty()) {
+			return EmitWaterfallLeaderRead(ctx, inst, pending_low);
+		}
+	}
 	// KYTY_WAVE32_CLUSTERS: a subgroup reduction would cover both guest waves; the scan stays.
 	if (GetCodegenOptions().lane_reductions && !ctx.state.wave_clusters) {
 		if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {

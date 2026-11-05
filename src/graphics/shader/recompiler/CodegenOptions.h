@@ -445,6 +445,28 @@ struct CodegenOptions {
 	// unsigned view (R16_UINT / R8_UINT), as 32-bit SINT already does, instead of failing the
 	// program. Ghost of Yotei's cloud shadow precompute (CS 753c552f, R16 SINT) was dropped without it.
 	bool raw_small_sint_storage = false;
+	// KYTY_POINT_INTEGER_IMAGES=1 (default 0; Erlou93/KytyPS5-Yotei): every UINT image samples with point
+	// filtering, as SINT and converted UINT already do (no linear filter for integer formats in
+	// Vulkan, VUID-04553; Yotei's CS 839cc50b samples an 8_UINT id map with a bilinear S#).
+	bool point_integer_images = false;
+	// KYTY_COMPARE_SAMPLER_SPLIT=1 (default 0; Erlou93/KytyPS5-Yotei FloatCompare, from peepostare
+	// f0bed387): one S# serving a plain sample and a depth-compare sample gets a host sampler for each
+	// (before, the plain sample also got the compare sampler: undefined on a colour view).
+	bool compare_sampler_split = false;
+	// KYTY_WATERFALL_ACTIVE_LEADER=1 (default 0; Erlou93/KytyPS5-Yotei EmitReadLane M124): the
+	// waterfall V_READLANE (lane = S_FF1(pending) & 63) of a graphics shader on one host lane per
+	// invocation reads the lowest lane that is pending AND active; with only inactive lanes pending it
+	// returns a key no active invocation holds.
+	bool waterfall_active_leader = false;
+	// KYTY_WAVE64_PRESENT_EXEC=1 (default 0; Erlou93/KytyPS5-Yotei PresentExec): a wave64 graphics
+	// shader runs in 32-wide host subgroups; scalar EXEC writes (S_LSHR_B64 exec, -1, 64-n) are
+	// masked to the lanes the host subgroup has, so waterfall loops cannot spin on absent lanes.
+	bool wave64_present_exec = false;
+	// KYTY_EMBEDDED_FETCH_NO_SGPR_OFFSET=1 (default 0; Erlou93/KytyPS5-Yotei DetectEmbeddedVertexFetch): a
+	// vertex buffer descriptor loaded from the attribute table at a runtime SGPR offset is not an
+	// embedded fetch; the load runs as an ordinary buffer load with the descriptor the shader computes
+	// (terrain grid shaders patch format/offset at runtime).
+	bool embedded_fetch_no_sgpr_offset = false;
 	// KYTY_MOV_NO_FLOAT_MODS=1 (default 0; Erlou93/KytyPS5-Yotei DIAG_MOV_NO_FLOAT_MODS): v_mov_b32 is a
 	// bit move (B32 operand in AMD's ISA tables), so the neg/abs input modifiers of its VOP3/SDWA/DPP
 	// forms leave the source unchanged. Ghost of Yotei's cloud shadow CS a2dfc83fbe2e55b8 (pc 0x2e4

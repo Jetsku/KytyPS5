@@ -324,17 +324,34 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
+// FloatCompare: KYTY_COMPARE_SAMPLER_SPLIT (Erlou93/KytyPS5-Yotei, ported there from peepostare
+// f0bed387): the depth-compare samples of an S# that also serves plain samples get their own host
+// sampler. KYTY_POINT_INTEGER_IMAGES: every UINT image is point sampled, as SINT ones are.
+enum class SamplerClass : uint8_t { Float, Integer, PointInteger, FloatCompare };
+constexpr uint32_t SamplerClassCount = 4;
+
+template <typename Image>
+SamplerClass ClassifySampler(const Image& image, bool depth_compare) {
+	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
+	     (image.conversion_format != Prospero::BufferFormat::kInvalid ||
+	      GetCodegenOptions().point_integer_images))) {
+		return SamplerClass::PointInteger;
+	}
+	if (image.numeric_class == Prospero::TextureNumericClass::Uint) {
+		return SamplerClass::Integer;
+	}
+	return depth_compare && GetCodegenOptions().compare_sampler_split ? SamplerClass::FloatCompare
+	                                                                   : SamplerClass::Float;
+}
 
 template <typename Image>
 SamplerClass ClassifySampler(const Image& image) {
-	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
-	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
-	     image.conversion_format != Prospero::BufferFormat::kInvalid)) {
-		return SamplerClass::PointInteger;
+	if constexpr (requires { image.depth_compare; }) {
+		return ClassifySampler(image, image.depth_compare);
+	} else {
+		return ClassifySampler(image, false);
 	}
-	return image.numeric_class == Prospero::TextureNumericClass::Uint ? SamplerClass::Integer
-	                                                               : SamplerClass::Float;
 }
 
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
@@ -763,7 +780,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::array<std::array<uint32_t, 3>, ShaderInfo::MaxSamplers> mapping;
+	std::array<std::array<uint32_t, SamplerClassCount>, ShaderInfo::MaxSamplers> mapping;
 	std::array<Binding, ShaderInfo::MaxSamplers>                bindings;
 	uint32_t                                                  sampler_count = 0;
 };
@@ -1294,7 +1311,10 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 		if (pair.image >= images.size() || pair.sampler >= base.samplers.size()) {
 			return false;
 		}
-		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(images[pair.image]));
+		// (A specialization's images carry no depth_compare: the program's image has it.)
+		const bool depth_compare = pair.image < base.images.size() && base.images[pair.image].depth_compare;
+		usage[pair.sampler] |=
+		    1u << static_cast<uint32_t>(ClassifySampler(images[pair.image], depth_compare));
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -2232,7 +2252,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type != SamplerClass::Float &&
+		                                        binding.type != SamplerClass::FloatCompare;
 	}
 	for (auto& pair: sampled_pairs) {
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));

@@ -106,6 +106,11 @@ CodegenOptions FromEnvironment() {
 	options.storage_swizzle_canon = EnvFlag("KYTY_STORAGE_SWIZZLE_CANON", options.storage_swizzle_canon);
 	options.raw_small_sint_storage =
 	    EnvFlag("KYTY_RAW_SMALL_SINT_STORAGE", options.raw_small_sint_storage);
+	options.point_integer_images = EnvFlag("KYTY_POINT_INTEGER_IMAGES", options.point_integer_images);
+	options.compare_sampler_split = EnvFlag("KYTY_COMPARE_SAMPLER_SPLIT", options.compare_sampler_split);
+	options.waterfall_active_leader = EnvFlag("KYTY_WATERFALL_ACTIVE_LEADER", options.waterfall_active_leader);
+	options.wave64_present_exec = EnvFlag("KYTY_WAVE64_PRESENT_EXEC", options.wave64_present_exec);
+	options.embedded_fetch_no_sgpr_offset = EnvFlag("KYTY_EMBEDDED_FETCH_NO_SGPR_OFFSET", options.embedded_fetch_no_sgpr_offset);
 	options.mov_no_float_mods = EnvFlag("KYTY_MOV_NO_FLOAT_MODS", options.mov_no_float_mods);
 	options.srgb8_decode = EnvFlag("KYTY_SRGB8_DECODE", options.srgb8_decode);
 	options.depth_bits_read = EnvFlag("KYTY_DEPTH_BITS_READ", options.depth_bits_read);

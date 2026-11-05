@@ -347,14 +347,18 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetVcc(ThreadBit({ir.GetVccLo(), value}));
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExecLo(IR::U32(value));
-			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
+		case Decoder::OperandKind::ExecLo: {
+			const auto masked = PresentExec({IR::U32(value), ir.GetExecHi()});
+			ir.SetExecLo(masked[0]);
+			ir.SetExec(ThreadBit(masked));
 			break;
-		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
+		}
+		case Decoder::OperandKind::ExecHi: {
+			const auto masked = PresentExec({ir.GetExecLo(), IR::U32(value)});
+			ir.SetExecHi(masked[1]);
+			ir.SetExec(ThreadBit(masked));
 			break;
+		}
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
 			break;
@@ -600,11 +604,13 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 		return;
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
+		case Decoder::OperandKind::ExecLo: {
+			const auto masked = PresentExec(value);
+			ir.SetExec(ThreadBit(masked));
+			ir.SetExecLo(masked[0]);
+			ir.SetExecHi(masked[1]);
 			return;
+		}
 		case Decoder::OperandKind::VccLo:
 			ir.SetVcc(ThreadBit(value));
 			ir.SetVccLo(value[0]);
@@ -615,6 +621,17 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	}
 	WriteRawU32(operand, value[0]);
 	WriteRawU32(OffsetOperand(operand, 1), value[1]);
+}
+
+// KYTY_WAVE64_PRESENT_EXEC (Erlou93/KytyPS5-Yotei): a wave64 graphics shader runs in 32-wide host
+// subgroups: a scalar EXEC write (for example S_LSHR_B64 exec, -1, 64-count) may name lanes that do
+// not exist on the host. Waterfall loops (S_FF1 + V_READLANE + V_CMP + S_ANDN2) then never clear
+// those bits and spin forever.
+std::array<IR::U32, 2> Translator::PresentExec(const std::array<IR::U32, 2>& mask) {
+	if (!mask_exec_present) {
+		return mask;
+	}
+	return {ir.BitwiseAnd(mask[0], present_mask[0]), ir.BitwiseAnd(mask[1], present_mask[1])};
 }
 
 IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
@@ -1217,6 +1234,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			result.blocks[source_index]->AddBranch(result.blocks[target->second]);
 		}
 	}
+	std::array<IR::U32, 2> present_lanes {};
+	bool                   use_present_lanes = false;
 	{
 		result.blocks.front()->AddBranch(result.blocks.at(block_indices.at(cfg.blocks.front().id)));
 		IR::IREmitter entry_ir(result.blocks.front());
@@ -1268,6 +1287,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		                                               : IR::U32(IR::Value(0u));
 		entry_ir.SetExecLo(initial_lo);
 		entry_ir.SetExecHi(initial_hi);
+		if (GetCodegenOptions().wave64_present_exec && options.stage != ShaderType::Compute &&
+		    options.wave_size == 64u) {
+			// The lanes the host subgroup has (helpers included), for PresentExec.
+			const auto present = entry_ir.Emit(IR::ValueOpcode::Ballot, {IR::U1(IR::Value(true))});
+			present_lanes      = {entry_ir.CompositeExtract(present, 0),
+			                      entry_ir.CompositeExtract(present, 1)};
+			use_present_lanes  = true;
+		}
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1560,7 +1587,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs,
-		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
+		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute,
+		    use_present_lanes ? &present_lanes : nullptr);
 		// Blocks are visited in address order; keep unordered LDS writes pending across
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);
