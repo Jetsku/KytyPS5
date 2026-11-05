@@ -1226,6 +1226,10 @@ private:
 	bool RefreshBindlessSlot(BindlessHeap& heap, uint32_t key, BindlessRefreshState& state);
 	std::array<std::vector<BindlessRefreshState>, 4> m_bindless_refresh;
 	uint64_t                                         m_bindless_refresh_draw = 0;
+	// KYTY_BINDLESS_IDLE_RELEASE (Erlou93/KytyPS5-Yotei ReleaseUnusedBindlessSlots): heaps no draw used
+	// for that many frames give their slots and image references back (round robin, a budget per frame).
+	void   ReleaseIdleBindlessHeaps(uint64_t frame);
+	size_t m_bindless_idle_cursor = 0;
 
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);

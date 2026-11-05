@@ -3392,6 +3392,69 @@ void RenderExecutor::ProcessRecordHeap(BindlessHeap& heap) {
 		m_bindless_budget_left -= std::min(m_bindless_budget_left, spent);
 	}
 }
+// KYTY_BINDLESS_IDLE_RELEASE=<frames> (startup, default 0 = off; PPSA26344 preset 300; ported from
+// Erlou93/KytyPS5-Yotei v0.1.4 ReleaseUnusedBindlessSlots): a guest heap no draw or dispatch used for
+// that many frames releases its resolved keys: their slots go back to the free lists and their images
+// lose the heap's references; an image no key refers to any more is unpinned, so the texture cache may
+// collect it (KYTY_BINDLESS_GUEST_DROP_FRAMES frees it). Without it every resolved key of every heap
+// stays: Ghost of Yotei creates ~100k small heaps per 10 minutes (per-frame terrain and material
+// tables), each holding its images pinned for the rest of the session (VRAM growth over a long
+// session). A released heap used again resolves its keys again (prefill, or feedback). Runtime and
+// record pointer heaps are left alone. 512 heaps are looked at per frame, round robin.
+void RenderExecutor::ReleaseIdleBindlessHeaps(uint64_t frame) {
+	static const uint64_t idle = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_IDLE_RELEASE");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0};
+	}();
+	if (idle == 0) {
+		return;
+	}
+	auto&        table = m_context.GetBindlessTable();
+	auto&        cache = m_context.GetTextureCache();
+	auto&        heaps = table.Heaps();
+	const size_t count = heaps.size();
+	if (count == 0 || frame < idle) {
+		return;
+	}
+	static uint64_t released_heaps = 0, released_keys = 0, unpinned = 0, logged_frame = 0;
+	constexpr uint32_t HeapBudget = 512;
+	for (uint32_t n = 0; n < HeapBudget && n < count; n++) {
+		if (m_bindless_idle_cursor >= count) {
+			m_bindless_idle_cursor = 0;
+		}
+		auto& heap = heaps[m_bindless_idle_cursor++];
+		if (heap.runtime || heap.record_pointer != UINT32_MAX || heap.resolved.empty() ||
+		    heap.sync_used_frame + idle > frame) {
+			continue;
+		}
+		for (uint32_t key = 0; key < heap.slots.size(); key++) {
+			const auto id = heap.images[key];
+			if (heap.slots[key] == 0 && !id) {
+				continue;
+			}
+			released_keys++;
+			if (table.ReleaseKey(heap, key, true) && id) {
+				if (auto* image = cache.m_slot_images.try_get(id); image != nullptr && image->bindless_pinned) {
+					NoteBindlessStateChange(*image);
+					image->bindless_pinned = false;
+					cache.ReleaseDroppedByGuest(id);
+					unpinned++;
+				}
+			}
+		}
+		heap.prefilled = false; // KYTY_BINDLESS_PREFILL settles it again at its next use
+		heap.refresh_gpu_keys.clear();
+		heap.refresh_frame = UINT64_MAX;
+		released_heaps++;
+	}
+	if (released_heaps != 0 && frame >= logged_frame + 600u) {
+		logged_frame = frame;
+		LOGF("Bindless idle release: frame=%" PRIu64 " heaps %" PRIu64 " keys %" PRIu64 " images unpinned %" PRIu64
+		     " (KYTY_BINDLESS_IDLE_RELEASE=%" PRIu64 ", %zu heaps)\n",
+		     frame, released_heaps, released_keys, unpinned, idle, count);
+	}
+}
+
 void RenderExecutor::ResolveBindlessRequests() {
 	KYTY_PROFILER_FUNCTION();
 	const BindlessHostTimer timer;
@@ -3414,6 +3477,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 	table.ConsumeSnapshot();
 	m_bindless_snapshot_serial++;
 	table.DebugWatchReport(frame);
+	ReleaseIdleBindlessHeaps(frame);
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget    = 128;
 	uint32_t           resolved  = RevalidateBindlessKeys(Budget);
