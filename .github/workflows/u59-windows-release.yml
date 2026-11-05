@@ -160,6 +160,8 @@ jobs:
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
           # Per-title overrides (u59-preset.<TITLE_ID>.json, common/u59Preset.h) ship next to it.
           Get-ChildItem -Path 'tools' -Filter 'u59-preset.*.json' | Copy-Item -Destination $release
+          # Default game patch plans (_Patches\<TITLE_ID>.json next to the launcher), e.g. Ghost of Yotei's 1080p patch.
+          Copy-Item -LiteralPath 'tools/_Patches' -Destination (Join-Path $release '_Patches') -Recurse
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
             throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
           }

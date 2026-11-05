@@ -1,0 +1,19 @@
+{
+    "id": "PPSA26344",
+    "mods": [
+        {
+            "enabled": true,
+            "memory": [
+                {
+                    "off": "8b8b10ee3200",
+                    "offset": "0x00ee01ec",
+                    "on": "b90f00000090"
+                }
+            ],
+            "name": "Render at 1080p (dynamic-resolution index locked at 15 = 1920x1080, also in cutscenes; Erlou93/KytyPS5-Yotei 7d8fd8d)"
+        }
+    ],
+    "name": "Ghost of Yotei patches",
+    "process": "eboot.bin",
+    "version": "02.002.000"
+}
