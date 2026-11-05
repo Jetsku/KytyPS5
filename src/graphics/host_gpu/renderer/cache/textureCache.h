@@ -318,6 +318,14 @@ public:
 	// the .cpp). StencilPlaneDepth: the single-sample depth image that swaps to the plane at this
 	// address (SwapStencilPlane saw it), or none.
 	[[nodiscard]] static bool StencilReadDepthEnabled();
+	// KYTY_STENCIL_READ_HELD (default on, see the .cpp): with KYTY_STENCIL_READ_DEPTH a plane record
+	// the depth image does not hold is still read from its saved copy.
+	[[nodiscard]] static bool StencilReadHeldEnabled();
+	// KYTY_STENCIL_PLANE_FILL_SAVED (default on): a fill of a plane the depth image does not hold
+	// fills the plane's saved copy (ClearImageFromBuffer).
+	[[nodiscard]] static bool StencilPlaneFillSavedEnabled();
+	bool FillStencilPlaneSaved(CommandBuffer& command, ImageId depth_id, ImageId record_id, uint8_t value,
+	                           const char* what);
 	[[nodiscard]] ImageId     StencilPlaneDepth(uint64_t plane_address);
 	// KYTY_STENCIL_ALIAS_COPY=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_ALIAS_COPY,
 	// a logged approximation for dynamic resolution; PPSA26344 preset, default off): a 1-byte

@@ -1473,9 +1473,10 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 				            image->info.data.address, image->backing.extent.width,
 				            image->backing.extent.height, static_cast<int>(image->backing.format));
 			}
-		} else if (TextureCache::PreserveStencilEnabled() && !TextureCache::StencilReadDepthEnabled()) {
+		} else if (TextureCache::PreserveStencilEnabled() &&
+		           (!TextureCache::StencilReadDepthEnabled() || TextureCache::StencilReadHeldEnabled())) {
 			// KYTY_PRESERVE_STENCIL: a plane the depth image does not hold is read from its saved copy
-			// (KYTY_STENCIL_READ_DEPTH: the depth image's stencil instead, as Erlou93/KytyPS5-Yotei).
+			// (KYTY_STENCIL_READ_DEPTH with KYTY_STENCIL_READ_HELD=0: the depth image's stencil instead).
 			bool       plane_copy = false;
 			const auto reader     = texture_cache.StencilPlaneReader(record_id, plane_copy);
 			if (plane_copy) {

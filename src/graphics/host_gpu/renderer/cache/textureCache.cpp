@@ -2984,6 +2984,27 @@ bool TextureCache::StencilReadDepthEnabled() {
 	return enabled;
 }
 
+// KYTY_STENCIL_READ_HELD=1 (default on; acts only with KYTY_STENCIL_READ_DEPTH=1 and
+// KYTY_PRESERVE_STENCIL=1): a sampled read of a stencil plane record whose depth image holds
+// another plane reads the plane's saved copy, as without KYTY_STENCIL_READ_DEPTH, instead of the
+// depth image's stencil (the other plane). Ghost of Yotei's Deferred wetness 84f5a0d3 reads plane A
+// (0x5004850000, the G-buffer classes) right after the volume draws swapped plane B (0x50615a0000)
+// in: it read plane B there, wrote a garbage wetness mask and G-buffer (CS Lights checkerboard and
+// stripes, cutscene wall blocks). Erlou93/KytyPS5-Yotei swaps plane A back in for that read.
+// =0 restores the depth image's stencil for every plane.
+bool TextureCache::StencilReadHeldEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_READ_HELD");
+		const bool  on    = value == nullptr || value[0] != '0';
+		if (on && StencilReadDepthEnabled() && PreserveStencilEnabled()) {
+			LOGF("Stencil planes: a plane the depth image does not hold is read from its saved copy "
+			     "(KYTY_STENCIL_READ_HELD=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
 ImageId TextureCache::StencilPlaneDepth(uint64_t plane_address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_stencil_plane_depth.find(plane_address);
@@ -3062,6 +3083,74 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 		     n, depth.info.data.address, width, height, previous, next_plane,
 		     restored ? "restored" : "first use (guest bytes)");
 	}
+}
+
+// KYTY_STENCIL_PLANE_FILL_SAVED (default on; based on Erlou93/KytyPS5-Yotei KYTY_FIX_STENCIL_PLANE_WRITES,
+// its fill part). =0: a fill of a stencil plane record clears the depth image's stencil aspect whatever
+// plane it holds, as before. Not seen to fire in Ghost of Yotei gameplay (2 boots).
+bool TextureCache::StencilPlaneFillSavedEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_PLANE_FILL_SAVED");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_STENCIL_PLANE_FILL_SAVED: a fill of the stencil plane `record_id` of `depth_id` while the depth
+// image holds another plane goes into the plane's saved copy (the next swap-in restores it). False
+// (nothing done) when the depth image holds this plane or the shapes differ. Caller holds m_lock.
+bool TextureCache::FillStencilPlaneSaved(CommandBuffer& command, ImageId depth_id, ImageId record_id, uint8_t value,
+                                         const char* what) {
+	auto* depth  = m_slot_images.try_get(depth_id);
+	auto* record = m_slot_images.try_get(record_id);
+	if (depth == nullptr || record == nullptr || record->depth_id != depth_id || !SwapsStencilPlanes(*depth)) {
+		return false;
+	}
+	const auto width  = depth->backing.extent.width;
+	const auto height = depth->backing.extent.height;
+	const auto bytes  = uint64_t {width} * height;
+	if (depth->info.stencil.address == 0 || depth->info.stencil.address == record->info.data.address ||
+	    record->info.extent.width != width || record->info.extent.height != height ||
+	    record->stencil_subresources.base_layer != 0 || bytes % 4u != 0u) {
+		return false;
+	}
+	const auto depth_address = depth->info.data.address;
+	const auto held_address  = depth->info.stencil.address;
+	const auto plane_address = record->info.data.address;
+	auto&      held          = m_stencil_planes[StencilPlaneKey(depth_address, plane_address, width, height)];
+	if (!held.buffer || held.buffer->Size() < bytes) {
+		if (held.buffer) {
+			m_scheduler.DeferOperation([old = held.buffer] { (void)old; });
+		}
+		held.buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		                                       vk::BufferUsageFlagBits::eTransferSrc |
+		                                           vk::BufferUsageFlagBits::eTransferDst,
+		                                       bytes);
+	}
+	held.width  = width;
+	held.height = height;
+	held.serial = ++m_stencil_plane_serial;
+	command.EndRendering();
+	const auto         native = command.Handle();
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	native.pipelineBarrier2(dependency);
+	native.fillBuffer(held.buffer->Handle(), 0, bytes, uint32_t {value} * 0x01010101u);
+	native.pipelineBarrier2(dependency);
+	static std::atomic<uint32_t> fills {0};
+	const auto n = fills.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || std::has_single_bit(n)) {
+		LOGF("Stencil plane fill #%u (KYTY_STENCIL_PLANE_FILL_SAVED, %s): plane 0x%012" PRIx64 " of depth 0x%012" PRIx64
+		     " (holding 0x%012" PRIx64 ") %ux%u value %u into its saved copy\n",
+		     n, what, plane_address, depth_address, held_address, width, height, static_cast<unsigned>(value));
+	}
+	return true;
 }
 
 bool TextureCache::PreserveStencilRecreateEnabled() {
@@ -7222,6 +7311,17 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			return false;
 		}
 		clear.depthStencil.stencil = stencil_clear;
+	}
+	// KYTY_STENCIL_PLANE_FILL_SAVED (default on, acts with KYTY_PRESERVE_STENCIL; based on
+	// Erlou93/KytyPS5-Yotei KYTY_FIX_STENCIL_PLANE_WRITES): a fill of a stencil plane record whose
+	// depth image holds another plane fills that plane's saved copy, which the next swap-in restores,
+	// instead of clearing the depth image's stencil aspect (the plane it holds).
+	if (stencil_id && aspect == vk::ImageAspectFlagBits::eStencil && PreserveStencilEnabled() &&
+	    StencilPlaneFillSavedEnabled() &&
+	    FillStencilPlaneSaved(command, selected, stencil_id, clear.depthStencil.stencil, "fill")) {
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+		return true;
 	}
 	// A rejected clear (reported) returns false: the guest's own fill shader then runs.
 	if (!ClearImage(command, selected, image.backing.format,
