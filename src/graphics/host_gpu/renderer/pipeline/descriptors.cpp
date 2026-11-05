@@ -129,6 +129,20 @@ uint32_t ImageCompareFuncs(const ShaderRecompiler::IR::CompiledShaderInfo& progr
 	}
 	return funcs;
 }
+
+// KYTY_TEXTURE_CLAMP_LAST_LEVEL=1 (Erlou93/KytyPS5-Yotei, default on there): a LAST_LEVEL past the
+// allocated MAX_MIP whose mip view cannot be remapped is cut to the allocated mips (else null).
+bool TextureClampLastLevel() {
+	static const bool on = EnvFlag("KYTY_TEXTURE_CLAMP_LAST_LEVEL");
+	return on;
+}
+
+// KYTY_DCC_NO_META_RAW=1 (Erlou93/KytyPS5-Yotei DIAG_TEXTURE_DCC_WITHOUT_METADATA): a DCC-compressed T#
+// with META_ADDR 0 is sampled from its raw data, without metadata (else null, "invalid DCC metadata").
+bool DccNoMetaRaw() {
+	static const bool on = EnvFlag("KYTY_DCC_NO_META_RAW");
+	return on;
+}
 }
 
 bool TextureMinLodClamp() {
@@ -1005,7 +1019,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
-	const auto view_levels = multisampled || single_storage_mip
+	auto       view_levels = multisampled || single_storage_mip
 	                             ? 1u
 	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
 	auto levels =
@@ -1037,7 +1051,11 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
-	const auto format         = descriptor.Format();
+	// KYTY_DEPTH_BITS_READ (upstream aafe014d0): a raw load of a kDepth k16UInt T# binds the D16
+	// surface as UNorm (ShaderRecompiler::IR::ReadsDepthBits; the shader converts back).
+	const auto format         = ShaderRecompiler::IR::ReadsDepthBits(resource)
+	                                ? Prospero::BufferFormat::k16UNorm
+	                                : descriptor.Format();
 	if (skip) {
 		// (TextureGetSurfaceFormatInfo exits over it; a format without a texel layout leaves
 		// TileGetTextureSize's size 0, the invalid-footprint path below.)
@@ -1066,8 +1084,24 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		const TileSurfaceDescription physical {
 		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
-		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
-		                           view_levels, levels, view_base)) {
+		const bool resolved = ResolveTextureMipView(
+		    physical, !resource.r128 && descriptor.MetaCompress(), view_levels, levels, view_base);
+		if (!resolved && TextureClampLastLevel()) {
+			// KYTY_TEXTURE_CLAMP_LAST_LEVEL (Erlou93/KytyPS5-Yotei FIX_TEXTURE_CLAMP_LAST_LEVEL, logged
+			// APPROXIMATION there): a view whose LAST_LEVEL exceeds the allocated MAX_MIP (partially
+			// resident streaming textures) keeps only the allocated mips; a BASE_LEVEL beyond MAX_MIP
+			// views the last allocated mip. Before: bound as null.
+			static std::atomic_uint32_t clamp_logged {0};
+			if (clamp_logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				std::printf("KYTY_TEXTURE_CLAMP_LAST_LEVEL: base=%u last=%u max=%u extent=%ux%u\n",
+				            static_cast<uint32_t>(base_level), static_cast<uint32_t>(last_level),
+				            static_cast<uint32_t>(max_mip), width, height);
+			}
+			const auto first = std::min<uint32_t>(base_level, max_mip);
+			view_levels      = static_cast<uint32_t>(max_mip) - first + 1u;
+			levels           = physical_levels;
+			view_base        = first;
+		} else if (!resolved) {
 			if (skip) {
 				static std::atomic_bool logged {false};
 				return SkipTextureDescriptor(resource, descriptor,
@@ -1188,8 +1222,18 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
+	const bool dcc_without_metadata =
+	    !resource.r128 && descriptor.MetaCompress() && descriptor.MetaAddr() == 0 && DccNoMetaRaw();
+	if (dcc_without_metadata) {
+		static std::atomic_uint32_t warned {0};
+		if (warned.fetch_add(1, std::memory_order_relaxed) < 8u) {
+			std::printf("KYTY_DCC_NO_META_RAW: DCC texture without metadata sampled raw: "
+			            "addr=0x%016" PRIx64 " format=%u extent=%ux%u\n",
+			            address, static_cast<uint32_t>(format), width, height);
+		}
+	}
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
-	    !desc.info.IsDepth()) {
+	    !desc.info.IsDepth() && !dcc_without_metadata) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,

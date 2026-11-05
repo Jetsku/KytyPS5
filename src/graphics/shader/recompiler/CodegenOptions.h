@@ -445,6 +445,10 @@ struct CodegenOptions {
 	// unsigned view (R16_UINT / R8_UINT), as 32-bit SINT already does, instead of failing the
 	// program. Ghost of Yotei's cloud shadow precompute (CS 753c552f, R16 SINT) was dropped without it.
 	bool raw_small_sint_storage = false;
+	// KYTY_DEPTH_BITS_READ=1 (default 0; re-applies upstream aafe014d0, which a merge dropped): a raw
+	// load of a kDepth k16UInt T# reads the D16 surface's codes: the host binds it as UNorm and the
+	// shader converts back (ReadsDepthBits). Before, such loads failed the depth view check (null).
+	bool depth_bits_read = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has

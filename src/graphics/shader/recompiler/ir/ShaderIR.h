@@ -261,6 +261,13 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+// KYTY_DEPTH_BITS_READ (upstream aafe014d0): a raw load of a kDepth k16UInt T# reads a D16
+// surface's codes. Vulkan cannot view D16 as R16Uint, so the host binds it as UNorm and the shader
+// converts back. Only ResourceMaterialization sets this conversion format (with the switch on).
+[[nodiscard]] constexpr bool ReadsDepthBits(const ImageResource& image) {
+	return image.conversion_format == Prospero::BufferFormat::k16UInt;
+}
+
 struct SamplerResource {
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;

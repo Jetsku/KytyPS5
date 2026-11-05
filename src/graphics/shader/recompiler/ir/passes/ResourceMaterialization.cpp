@@ -1069,7 +1069,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				return SpecializationFail("FMASK requires a direct image load");
 			}
 		}
-		image.conversion_format = ImageConversionFormat(format);
+		// KYTY_DEPTH_BITS_READ (upstream aafe014d0, see ReadsDepthBits): raw loads only, since
+		// filtering would blend the codes (ours: no sampled pair and no compare uses the image).
+		const bool depth_bits =
+		    GetCodegenOptions().depth_bits_read && !storage && !base.depth_compare &&
+		    format == Prospero::BufferFormat::k16UInt &&
+		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
+		        Prospero::TileMode::kDepth &&
+		    std::ranges::none_of(program.info.sampled_pairs,
+		                         [&](const auto& pair) { return pair.image == i; });
+		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
@@ -1086,7 +1095,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = raw_small_sint_storage ||
 		                              (storage && format == Prospero::BufferFormat::k32SInt &&
 		                               base.written && (base.atomic ? !base.atomic64 : !base.read));
-		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		image.numeric_class         = Prospero::SampledTextureNumericClass(
+		            depth_bits ? Prospero::BufferFormat::k16UNorm : format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {

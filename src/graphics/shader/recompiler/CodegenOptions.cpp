@@ -106,6 +106,7 @@ CodegenOptions FromEnvironment() {
 	options.storage_swizzle_canon = EnvFlag("KYTY_STORAGE_SWIZZLE_CANON", options.storage_swizzle_canon);
 	options.raw_small_sint_storage =
 	    EnvFlag("KYTY_RAW_SMALL_SINT_STORAGE", options.raw_small_sint_storage);
+	options.depth_bits_read = EnvFlag("KYTY_DEPTH_BITS_READ", options.depth_bits_read);
 	options.bindless_3d_as_array =
 	    EnvFlag("KYTY_BINDLESS_3D_AS_ARRAY", options.bindless_3d_as_array);
 	options.runtime_images   = EnvFlag("KYTY_RUNTIME_IMAGES", options.runtime_images);

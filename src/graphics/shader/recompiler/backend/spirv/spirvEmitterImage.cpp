@@ -594,6 +594,7 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto format = ImageResourceAt(state, mem.resource).conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
 	const auto info = Format::GetFormatInfo(format);
+	if (IR::ReadsDepthBits(ImageResourceAt(state, mem.resource))) return info;
 	EXIT_IF(Prospero::RemapTextureFormat(format) == format || info.component_count == 0u ||
 	        info.component_count > 4u);
 	// Non-packed: scaled formats on a normalized backing. Packed: the raw word in a k32UInt
@@ -687,6 +688,8 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 
 	const auto numeric_class = ImageResourceAt(ctx.state, mem.resource).numeric_class;
 	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
+	// KYTY_DEPTH_BITS_READ (upstream aafe014d0): the UNorm D16 value back to its stored code.
+	const bool depth_bits    = IR::ReadsDepthBits(ImageResourceAt(ctx.state, mem.resource));
 	uint32_t   packed        = 0;
 	if (info.packed_bitfield) {
 		packed = ctx.state.builder.AllocateId();
@@ -712,6 +715,14 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 			components[component] =
 			    Binary(ctx.state, spv::OpFMul, scalar_type, components[component],
 			           ConstantF32Value(ctx.state, ScaledFactor(info)));
+			if (depth_bits) {
+				// Round back to the stored UNorm code; its bits travel in the float vector.
+				components[component] = Unary(
+				    ctx.state, spv::OpBitcast, TypeF32(ctx.state),
+				    Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state),
+				          Binary(ctx.state, spv::OpFAdd, scalar_type, components[component],
+				                 ConstantF32Value(ctx.state, 0.5f))));
+			}
 		}
 	}
 	for (uint32_t component = info.component_count; component < 4u; component++) {
@@ -724,7 +735,9 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 		const auto selector = (swizzle >> (component * 3u)) & 7u;
 		if (selector == 1u) {
 			selected[component] = info.packed_bitfield ? PackedOneBits(ctx, mem, info)
-			                                           : ConstantF32Value(ctx.state, 1.0f);
+			                      : depth_bits ? Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state),
+			                                           ConstantU32(ctx.state, 1u))
+			                                   : ConstantF32Value(ctx.state, 1.0f);
 		} else if (selector >= 4u) {
 			selected[component] = components[selector - 4u];
 		} else {
