@@ -246,6 +246,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.raw_small_sint_storage) {
 		b.Text("raw_small_sint_storage");
 	}
+	if (options.mov_no_float_mods) {
+		b.Text("mov_no_float_mods");
+	}
 	if (options.srgb8_decode) {
 		b.Text("srgb8_decode");
 	}

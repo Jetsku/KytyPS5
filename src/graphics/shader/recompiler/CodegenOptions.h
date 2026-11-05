@@ -445,6 +445,11 @@ struct CodegenOptions {
 	// unsigned view (R16_UINT / R8_UINT), as 32-bit SINT already does, instead of failing the
 	// program. Ghost of Yotei's cloud shadow precompute (CS 753c552f, R16 SINT) was dropped without it.
 	bool raw_small_sint_storage = false;
+	// KYTY_MOV_NO_FLOAT_MODS=1 (default 0; Erlou93/KytyPS5-Yotei DIAG_MOV_NO_FLOAT_MODS): v_mov_b32 is a
+	// bit move (B32 operand in AMD's ISA tables), so the neg/abs input modifiers of its VOP3/SDWA/DPP
+	// forms leave the source unchanged. Ghost of Yotei's cloud shadow CS a2dfc83fbe2e55b8 (pc 0x2e4
+	// v_mov_b32_sdwa v12, -s106): with the modifier every cloud shadow texel got the same sign.
+	bool mov_no_float_mods = false;
 	// KYTY_SRGB8_DECODE=1 (default 0; Erlou93/KytyPS5-Yotei IsSrgbFormat / SrgbToLinear): a sampled
 	// 8 or 8_8 sRGB texture (UNorm backing, vulkanCommon.cpp) is decoded from sRGB in the shader on
 	// every fetch, gather and sample (after filtering; Erlou samples 8 sRGB through an R8_SRGB view).

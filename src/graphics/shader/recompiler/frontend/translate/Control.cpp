@@ -342,6 +342,15 @@ void Translator::ScalarSelect64(const Decoder::Instruction& inst,
 }
 
 void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers) {
+	if (apply_float_modifiers && GetCodegenOptions().mov_no_float_mods &&
+	    (inst.src0.negate || inst.src0.absolute)) {
+		// KYTY_MOV_NO_FLOAT_MODS (Erlou93/KytyPS5-Yotei): the bits move unchanged.
+		auto source     = inst.src0;
+		source.negate   = false;
+		source.absolute = false;
+		WriteOperand(DestinationOperand(inst), ReadOperand(source, IR::Type::U32));
+		return;
+	}
 	if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute)) {
 		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));
 	} else {
