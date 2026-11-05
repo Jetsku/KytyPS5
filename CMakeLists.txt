@@ -753,6 +753,14 @@ if(LINUX)
 	target_link_libraries(compile_watch_tests Threads::Threads)
 endif()
 
+# Guest console lines and KYTY_EVENT lines (common/kytyEvents.h).
+add_executable(kyty_events_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/KytyEventsTests.cpp")
+target_link_libraries(kyty_events_tests common)
+target_include_directories(kyty_events_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(kyty_events_tests Threads::Threads)
+endif()
+
 # Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
 add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
@@ -1361,6 +1369,7 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
 	add_test(NAME compile_watch COMMAND $<TARGET_FILE:compile_watch_tests>)
+	add_test(NAME kyty_events COMMAND $<TARGET_FILE:kyty_events_tests>)
 	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
 	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
 	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)

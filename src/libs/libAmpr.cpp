@@ -4,6 +4,7 @@
 #include "common/file.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
+#include "common/kytyEvents.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -2701,6 +2702,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprRead);
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRequestedBytes, size);
+	KytyEvents::NoteFileRead(size);
 	if (bytes_read == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
