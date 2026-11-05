@@ -425,7 +425,31 @@ bool ColourMetadataTargetsDepth(const char* site, ImageId id, const Image& image
 	return true;
 }
 
+// The compare functions of the binding being resolved (KYTY_NULL_COMPARE_DEPTH; set by the
+// descriptor resolution right before it looks the image up on this thread).
+thread_local uint32_t t_null_compare_funcs = 0;
+
 } // namespace
+
+bool NullTextureZeroEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_NULL_TEXTURE_ZERO");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+bool NullCompareDepthEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_NULL_COMPARE_DEPTH");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+void SetNullCompareFuncs(uint32_t funcs) {
+	t_null_compare_funcs = funcs;
+}
 
 struct TextureCache::TextureTransfer {
 	TextureUploadLayout              layout;
@@ -3949,8 +3973,32 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	                          desc.info.type == Prospero::ImageType::kColor3D
 	                      ? desc.info.type
 	                      : Prospero::ImageType::kColor2D;
+	// KYTY_NULL_COMPARE_DEPTH: the D16 null image of a depth-compare binding holds 0.0 or 1.0.
+	const bool compare_depth = NullCompareDepthEnabled() && desc.info.pixel_format == vk::Format::eD16Unorm &&
+	                           desc.view_info.aspect == vk::ImageAspectFlagBits::eDepth;
+	bool       compare_one   = false;
+	if (compare_depth) {
+		// Erlou NullCompareBinding: the depth that fails the S#'s comparison (reference OP texel; D16
+		// clamps the reference to [0, 1]). 0.0 for NEVER/LESS/EQUAL/LEQUAL, 1.0 for GREATER/GEQUAL.
+		// NOTEQUAL/ALWAYS (or both families) pass for some reference whatever the depth: Erlou exits,
+		// ours logs once and keeps 0.0.
+		constexpr uint32_t FailAtZero = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u);
+		constexpr uint32_t FailAtOne  = (1u << 0u) | (1u << 4u) | (1u << 6u);
+		const uint32_t     funcs      = t_null_compare_funcs;
+		compare_one                   = funcs != 0u && (funcs & ~FailAtOne) == 0u;
+		if (!compare_one && (funcs & ~FailAtZero) != 0u) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true)) {
+				std::printf("Warning: KYTY_NULL_COMPARE_DEPTH: null image on a depth-compare binding with "
+				            "compare functions 0x%02x (NOTEQUAL/ALWAYS or both families): bound as 0.0 "
+				            "(logged once)\n",
+				            funcs);
+			}
+		}
+	}
 	const auto format = (static_cast<uint64_t>(type) << 32u) |
-	                    static_cast<uint64_t>(desc.info.pixel_format);
+	                    static_cast<uint64_t>(desc.info.pixel_format) |
+	                    (static_cast<uint64_t>(compare_one ? 1u : 0u) << 40u);
 	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
 		return found->second;
 	}
@@ -3967,6 +4015,35 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
 	m_null_images.emplace(format, id);
+	const bool depth_format = info.pixel_format == vk::Format::eD16Unorm ||
+	                          info.pixel_format == vk::Format::eD32Sfloat;
+	if ((compare_depth || (NullTextureZeroEnabled() && !depth_format)) &&
+	    info.pixel_format != vk::Format::eUndefined) {
+		// Before, the texel was never written: an R32F null read (x, 0, 0, 1) with x undefined.
+		auto& image   = m_slot_images[id];
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto sink = command.HelperSink();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+		              sink.Identity());
+		if (compare_depth) {
+			const vk::ClearDepthStencilValue value {compare_one ? 1.0f : 0.0f, 0u};
+			const vk::ImageSubresourceRange  range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+			sink.clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+			                            &value, 1, &range);
+		} else {
+			const vk::ClearColorValue       zero {std::array<float, 4> {}};
+			const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			sink.clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1,
+			                     &range);
+		}
+		image.NoteContentWrite();
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			std::printf("KYTY_NULL_TEXTURE_ZERO / KYTY_NULL_COMPARE_DEPTH: null images cleared "
+			            "(colour 0,0,0,0; compare depth by function)\n");
+		}
+	}
 	return id;
 }
 

@@ -101,6 +101,36 @@ bool EnvFlag(const char* name) {
 	return value != nullptr && value[0] == '1';
 }
 
+// KYTY_NULL_COMPARE_DEPTH (Erlou93/KytyPS5-Yotei ImageCompareFuncs): DEPTH_COMPARE_FUNC values, as
+// 1 << func, of the S#s that compare-sample image `index` (a GPU-selected candidate is sampled with
+// the S#s of its table root); 0 when the image has no compare sample or the switch is off.
+uint32_t ImageCompareFuncs(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                           const ShaderRecompiler::IR::ResourceSnapshot& snapshot, uint32_t index) {
+	if (!NullCompareDepthEnabled()) {
+		return 0u;
+	}
+	const auto& images = program.info.images;
+	if (index >= images.size() || !images[index].depth_compare) {
+		return 0u;
+	}
+	const auto root = images[index].indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage
+	                      ? images[index].indirect_root
+	                      : index;
+	const auto& samplers = program.info.samplers;
+	uint32_t    funcs    = 0;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if ((pair.image != index && pair.image != root) || pair.sampler >= samplers.size()) {
+			continue;
+		}
+		const auto slot = samplers[pair.sampler].snapshot_index;
+		if (slot < snapshot.samplers.size()) {
+			funcs |= 1u << ((snapshot.samplers[slot].dwords[0] >> 12u) & 7u);
+		}
+	}
+	return funcs;
+}
+}
+
 bool TextureMinLodClamp() {
 	static const bool on = EnvFlag("KYTY_TEXTURE_MIN_LOD_CLAMP");
 	return on;
@@ -715,7 +745,13 @@ TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResourc
 	TextureCache::ImageDesc desc {};
 	switch (resource.numeric_class) {
 		case Prospero::TextureNumericClass::Float:
-			desc.info.guest_format = Prospero::BufferFormat::k32Float;
+			// KYTY_NULL_TEXTURE_ZERO (Erlou93/KytyPS5-Yotei): a sampled null float texture is the
+			// RGBA32F null image, cleared to (0, 0, 0, 0) (textureCache.cpp GetNullImage). Storage: R32F.
+			desc.info.guest_format = NullTextureZeroEnabled() &&
+			                                 binding == TextureCache::BindingType::Texture &&
+			                                 !resource.depth_compare
+			                             ? Prospero::BufferFormat::k32_32_32_32Float
+			                             : Prospero::BufferFormat::k32Float;
 			break;
 		case Prospero::TextureNumericClass::Uint:
 			desc.info.guest_format = resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
@@ -726,8 +762,16 @@ TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResourc
 			break;
 		default: EXIT("null image has unsupported numeric class\n");
 	}
-	desc.info.pixel_format    = resource.depth_compare ? vk::Format::eD32Sfloat
-	                                                   : VulkanFormat(desc.info.guest_format);
+	// KYTY_NULL_COMPARE_DEPTH (Erlou NullCompareBinding): a 1x1 D16 holding the depth that fails the
+	// S#'s comparison; before, a D32 that was never written (undefined compare result).
+	const bool compare_d16    = resource.depth_compare && NullCompareDepthEnabled() &&
+	                         binding == TextureCache::BindingType::Texture;
+	if (compare_d16) {
+		desc.info.guest_format = Prospero::BufferFormat::k16UNorm;
+	}
+	desc.info.pixel_format    = compare_d16              ? vk::Format::eD16Unorm
+	                            : resource.depth_compare ? vk::Format::eD32Sfloat
+	                                                     : VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
@@ -1252,6 +1296,10 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
                                     const ShaderRecompiler::IR::DescriptorValue& value,
                                     TextureBinding& binding, const uint64_t* hash_hint,
                                     uint64_t tag_hint) {
+	// The compare functions a caller set apply to this resolution only (KYTY_NULL_COMPARE_DEPTH).
+	struct ResetCompareFuncs {
+		~ResetCompareFuncs() { SetNullCompareFuncs(0u); }
+	} reset_compare_funcs;
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
 	// is kept), undefined layout.
@@ -1260,7 +1308,10 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 	binding.mip_views.clear();
 
 	auto&      texture_cache     = m_context.GetTextureCache();
-	const bool memo              = TextureBindingMemo::Enabled();
+	// KYTY_NULL_COMPARE_DEPTH: a null depth-compare binding depends on the S#s, which the memo key
+	// does not hold, so depth-compare bindings are not memoized.
+	const bool memo              = TextureBindingMemo::Enabled() &&
+	                  !(resource.depth_compare && NullCompareDepthEnabled());
 	const bool description_cache =
 	    Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u;
 	TextureBindingMemo::Key memo_key;
@@ -2134,6 +2185,7 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 			auto&      binding       = prepared.images[i];
 			const auto claimed_image = binding.image_id;
 			const auto claimed_tag   = binding.memo_tag;
+			SetNullCompareFuncs(ImageCompareFuncs(program, snapshot, i));
 			ResolveTexture(program.info.images[i], snapshot.images[i], binding);
 			if (xframe_verify) {
 				XFrameReuse::GetTotals().verify_checks.fetch_add(1, std::memory_order_relaxed);
@@ -3830,6 +3882,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				}
 			}
 			auto& binding = prepared.images[i];
+			SetNullCompareFuncs(ImageCompareFuncs(program, snapshot, i));
 			ResolveTexture(program.info.images[i], snapshot.images[i], binding,
 			               hashes ? &plan->texture_hashes[i] : nullptr,
 			               tags ? plan->texture_tags[i] : 0);
@@ -4561,6 +4614,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			old_image->binding = {};
 		}
+		SetNullCompareFuncs(ImageCompareFuncs(program, snapshot, i));
 		ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
 		BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
 	};

@@ -47,6 +47,14 @@ class BufferCache;
 void                   SetMetaTraceAddressAuto(uint64_t address);
 void                   SetMetaTraceAddressStencil(uint64_t address);
 [[nodiscard]] bool     MetaTraceLine();
+// Null images (adapted from Erlou93/KytyPS5-Yotei NullTextureDesc / GetNullImage / NullCompareBinding;
+// textureCache.cpp). KYTY_NULL_TEXTURE_ZERO=1: a sampled null float texture is an RGBA32F image and
+// every null colour image is cleared to (0, 0, 0, 0), what the hardware returns for a null T#.
+// KYTY_NULL_COMPARE_DEPTH=1: a null image on a depth-compare binding is a 1x1 D16 cleared to the
+// depth that fails the S#'s comparison (SetNullCompareFuncs: DEPTH_COMPARE_FUNC bits of the binding).
+[[nodiscard]] bool     NullTextureZeroEnabled();
+[[nodiscard]] bool     NullCompareDepthEnabled();
+void                   SetNullCompareFuncs(uint32_t funcs);
 class CommandBuffer;
 class CommandScheduler;
 class DccClearHelper;
