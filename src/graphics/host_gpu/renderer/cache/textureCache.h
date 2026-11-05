@@ -494,6 +494,9 @@ private:
 	                                                    HangTrace::ImageFreeReason::Other);
 	void                      TouchImage(Image& image);
 	void                      SyncAliasFromOwner(ImageId id);
+	// KYTY_BLOCK_SUBRESOURCE_WRITES (caller holds m_lock).
+	void                      NoteBlockSubwrite(ImageId id);
+	void                      ApplyBlockSubwrites(ImageId id);
 	void                      TrackImage(ImageId id);
 	// Chunk-granular tracking (Image::ChunkState). Caller holds m_lock.
 	[[nodiscard]] bool        ChunkTrackingEligible(const Image& image) const;

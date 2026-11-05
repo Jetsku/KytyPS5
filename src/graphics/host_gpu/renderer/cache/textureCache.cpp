@@ -4401,6 +4401,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	return replacement_id;
 }
 
+static bool BlockSubresourceWritesEnabled(); // KYTY_BLOCK_SUBRESOURCE_WRITES, defined below
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -6491,6 +6493,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 		EnsureResidency(result, RequestedFirstLevel(desc, image.info.resources.levels),
 		                desc.type == BindingType::Texture);
 		SyncAliasFromOwner(result);
+		if (BlockSubresourceWritesEnabled()) {
+			ApplyBlockSubwrites(result);
+		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 		// RepeatLookup: the state a repeat is checked against, taken after the residency extension
@@ -6635,7 +6640,7 @@ bool TextureCache::TryRepeatLookup(const ImageDesc& desc, bool exact_format,
 	if (m_image_lookup_mode != ImageLookupMode::FirstPage || image == nullptr ||
 	    !image->registered || PageVersion(record.page) != record.page_version ||
 	    record.requested_first < image->resident_first ||
-	    (record.has_partner && !SyncAliasReturnsAtOnce(*image)) ||
+	    (record.has_partner && !SyncAliasReturnsAtOnce(*image)) || !image->block_subwrites.empty() ||
 	    !MetadataPagesHold(record.dcc) || !MetadataPagesHold(record.cmask)) {
 		return false;
 	}
@@ -6931,6 +6936,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Storage:
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
+				if (BlockSubresourceWritesEnabled()) {
+					NoteBlockSubwrite(id);
+				}
 			}
 			TrackImageDownload(id, image);
 			break;
@@ -7085,6 +7093,149 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+}
+
+// KYTY_BLOCK_SUBRESOURCE_WRITES=1 (default off; PPSA26344 candidate). Ghost of Yotei builds its
+// BC6 reflection/ambient probe array (256x256, 6 levels, 102 layers) on the GPU: a compute
+// shader encodes each level of each updated layer through its own R32G32B32A32_UINT image
+// (64x64 .. 2x2, one texel per BC6 block) at that level's address inside the array. Those
+// images are not subresources of the array for the cache (other format, extent in blocks), so
+// the array kept its load-time contents: the composite's environment term stayed stale, the snow
+// water lost its cyan sky reflection and the ground was darker. With the switch a GPU write to
+// such an image is queued on the block image and copied into its (level, layer) at its next
+// lookup.
+static bool BlockSubresourceWritesEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BLOCK_SUBRESOURCE_WRITES");
+		const bool  on    = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		if (on) {
+			std::printf("KYTY_BLOCK_SUBRESOURCE_WRITES: uncompressed block views written by the GPU "
+			            "are copied into their block-compressed image\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+// The (level, layer) of `container` (block-compressed) whose blocks are the texels of `child`
+// (uncompressed, one level, one layer, same bytes per block and tiling), or {-1, -1}.
+static std::pair<int32_t, int32_t> BlockSubresourceOf(const ImageInfo& child,
+                                                      const ImageInfo& container) {
+	constexpr std::pair<int32_t, int32_t> none {-1, -1};
+	if (!container.IsBlock() || child.IsBlock() || child.IsVolume() || container.IsVolume() ||
+	    child.bytes_per_block != container.bytes_per_block || child.tile_mode != container.tile_mode ||
+	    child.samples != 1 || container.samples != 1 || child.resources.levels != 1 ||
+	    child.resources.layers != 1 || container.resources.layers == 0 ||
+	    container.resources.levels > container.mip_layout.size() || !child.data.Valid() ||
+	    !container.data.Valid() || child.data.address < container.data.address ||
+	    child.data.address >= container.data.End() || child.HasStencil() ||
+	    container.data.size % container.resources.layers != 0) {
+		return none;
+	}
+	const auto slice_stride  = container.data.size / container.resources.layers;
+	const auto address_delta = child.data.address - container.data.address;
+	const auto layer         = address_delta / slice_stride;
+	const auto in_slice      = address_delta % slice_stride;
+	// The level is the one whose block extent the child has (unique per level). A level outside
+	// the mip tail starts exactly at the child; the tail levels (here 8x8 .. 2x2 texels) are packed
+	// below the smallest full level at offsets of their own, so a tail child only has to lie
+	// between its level's offset and the next larger level.
+	for (uint32_t level = 0; level < container.resources.levels; level++) {
+		const auto width  = std::max(container.extent.width >> level, 1u);
+		const auto height = std::max(container.extent.height >> level, 1u);
+		if (child.extent.width != (width + 3) / 4 || child.extent.height != (height + 3) / 4) {
+			continue;
+		}
+		const auto& layout = container.mip_layout[level];
+		// The tail levels share one offset; the smallest full level starts above them.
+		uint64_t next_larger = slice_stride;
+		for (uint32_t larger = 0; larger < level; larger++) {
+			if (container.mip_layout[larger].offset > layout.offset) {
+				next_larger = std::min<uint64_t>(next_larger, container.mip_layout[larger].offset);
+			}
+		}
+		bool shared = false;
+		for (uint32_t other = 0; other < container.resources.levels; other++) {
+			shared = shared || (other != level && container.mip_layout[other].offset == layout.offset);
+		}
+		const bool tail = level > 0 && shared && layout.offset <= in_slice && in_slice < next_larger;
+		if (layout.offset != in_slice && !tail) {
+			return none;
+		}
+		return {static_cast<int32_t>(level), static_cast<int32_t>(layer)};
+	}
+	return none;
+}
+
+// Caller holds m_lock. `self` is bound as a storage image (its GPU write follows).
+void TextureCache::NoteBlockSubwrite(ImageId self) {
+	auto& image = m_slot_images[self];
+	if (image.info.IsBlock() || image.info.resources.levels != 1 ||
+	    image.info.resources.layers != 1 || image.info.data.Empty() || image.depth_id ||
+	    image.backing.image == nullptr || image.info.bytes_per_block != 16) {
+		return;
+	}
+	const auto ids = FindImagesInRegion(image.info.data.address, image.info.data.size, false);
+	for (const auto id: ids) {
+		auto* other = m_slot_images.try_get(id);
+		if (other == nullptr || other == &image || !other->registered || other->depth_id ||
+		    other->backing.image == nullptr || !other->info.IsBlock()) {
+			continue;
+		}
+		const auto [mip, layer] = BlockSubresourceOf(image.info, other->info);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+			std::printf("KYTY_BLOCK_SUBRESOURCE_WRITES: 0x%" PRIx64 " %ux%u tile %u in block image "
+			            "0x%" PRIx64 " %ux%u levels %u layers %u tile %u (offsets of levels 2-5: 0x%" PRIx64
+			            " 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 ") -> mip %d layer %d\n",
+			            image.info.data.address, image.info.extent.width, image.info.extent.height,
+			            static_cast<uint32_t>(image.info.tile_mode), other->info.data.address,
+			            other->info.extent.width, other->info.extent.height,
+			            other->info.resources.levels, other->info.resources.layers,
+			            static_cast<uint32_t>(other->info.tile_mode),
+			            static_cast<uint64_t>(other->info.mip_layout[2].offset),
+			            static_cast<uint64_t>(other->info.mip_layout[3].offset),
+			            static_cast<uint64_t>(other->info.mip_layout[4].offset),
+			            static_cast<uint64_t>(other->info.mip_layout[5].offset), mip, layer);
+		}
+		if (mip < 0 || static_cast<uint32_t>(mip) >= other->backing.mip_levels ||
+		    static_cast<uint32_t>(layer) >= other->backing.layers) {
+			continue;
+		}
+		auto& pending = other->block_subwrites;
+		if (std::none_of(pending.begin(), pending.end(), [&](const Image::BlockSubwrite& w) {
+			    return w.source == self && w.mip == static_cast<uint32_t>(mip) &&
+			           w.layer == static_cast<uint32_t>(layer);
+		    })) {
+			pending.push_back({self, static_cast<uint32_t>(mip), static_cast<uint32_t>(layer)});
+		}
+	}
+}
+
+// Caller holds m_lock: copies the queued block views into `id` (recorded after their writes).
+void TextureCache::ApplyBlockSubwrites(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (image.block_subwrites.empty()) {
+		return;
+	}
+	auto pending = std::move(image.block_subwrites);
+	image.block_subwrites.clear();
+	if (image.backing.image == nullptr) {
+		return;
+	}
+	for (const auto& write: pending) {
+		auto* source = m_slot_images.try_get(write.source);
+		if (source == nullptr || !source->registered || source->backing.image == nullptr ||
+		    source->IsBufferModified() || write.mip >= m_slot_images[id].backing.mip_levels ||
+		    write.layer >= m_slot_images[id].backing.layers) {
+			continue;
+		}
+		RefreshCopySource(write.source);
+		RequireFullResidency(id);
+		TrackImage(id);
+		m_slot_images[id].CopyBlockMip(m_slot_images[write.source], write.mip, write.layer);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyDirect);
 	}
 }
 

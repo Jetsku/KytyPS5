@@ -927,6 +927,33 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command.Identity());
 }
 
+void Image::CopyBlockMip(Image& source, uint32_t mip, uint32_t layer) {
+	KYTY_GPU_OP_SITE("image.copy_block_mip");
+	NoteContentWrite();
+	EXIT_IF(source.backing.samples != 1 || backing.samples != 1 || mip >= backing.mip_levels ||
+	        layer >= backing.layers || source.backing.image_type != vk::ImageType::e2D ||
+	        backing.image_type != vk::ImageType::e2D);
+	m_scheduler.EndRendering();
+	// Between an uncompressed and a compressed image the extent is in source texels, one per
+	// destination block; the blocks must lie inside the destination level.
+	const auto width  = std::max(backing.extent.width >> mip, 1u);
+	const auto height = std::max(backing.extent.height >> mip, 1u);
+	EXIT_IF(source.backing.extent.width != (width + 3) / 4 ||
+	        source.backing.extent.height != (height + 3) / 4);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, mip, layer, 1};
+	copy.extent         = {source.backing.extent.width, source.backing.extent.height, 1};
+	const auto command  = m_scheduler.Current().HelperSink();
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command.Identity());
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command.Identity());
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command.Identity());
+}
+
 namespace ImageOps {
 
 void Validate(const ImageInfo& info) {

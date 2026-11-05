@@ -122,6 +122,9 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// KYTY_BLOCK_SUBRESOURCE_WRITES: copies an uncompressed single-level image whose texels are
+	// this block-compressed image's blocks at (mip, layer) into that subresource.
+	void CopyBlockMip(Image& source, uint32_t mip, uint32_t layer);
 
 	// Native contents identity. Every recorded write to this image gives it a fresh serial
 	// (Image copy/upload/resolve methods here, TextureCache::MarkImageGpuModified for draws,
@@ -508,6 +511,15 @@ public:
 	// image's GPU write takes some of its bytes (TextureCache::CommitGpuWrite). Partial rebuilds
 	// need it false.
 	bool foreign_since_sync = true;
+	// KYTY_BLOCK_SUBRESOURCE_WRITES: GPU-written uncompressed views (e.g. 64x64 R32G32B32A32_UINT
+	// written as BC6 blocks) of one level and layer of this block-compressed image, copied into
+	// it at its next lookup (TextureCache::ApplyBlockSubwrites).
+	struct BlockSubwrite {
+		ImageId  source;
+		uint32_t mip;
+		uint32_t layer;
+	};
+	std::vector<BlockSubwrite> block_subwrites;
 
 	// Against the registered (resident) guest range; see `live`.
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
