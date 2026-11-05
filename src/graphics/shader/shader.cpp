@@ -1664,6 +1664,42 @@ static bool TessMergedHullEnabled() {
 	return enabled;
 }
 
+// KYTY_TESS_MERGED_CARRY (default off; only with KYTY_TESS_MERGED_HULL; based on
+// Erlou93/KytyPS5-Yotei): the split merged program's HS part starts with the VGPRs it reads before
+// writing them, as its LS part left them in the lane (ShaderTessellationInputInfo::carried_vgprs).
+// Without it they start empty: Ghost of Yotei 2.x's particle HS then culls every particle.
+// KYTY_TESS_MERGED_CARRY=1: every split merged pair; =<hash>[,<hash>...]: only the listed HS halves
+// (diagnosis; a 32-bit hash matches either half of the 64-bit one).
+static bool TessMergedCarryEnabled(uint64_t control_hash) {
+	struct Setting {
+		bool                  all = false;
+		std::vector<uint64_t> hashes;
+	};
+	static const Setting setting = [] {
+		Setting     parsed;
+		const char* value = std::getenv("KYTY_TESS_MERGED_CARRY");
+		if (value == nullptr) return parsed;
+		const std::string text(value);
+		if (text == "1") {
+			parsed.all = true;
+			return parsed;
+		}
+		size_t at = 0;
+		while (at < text.size()) {
+			const auto next = text.find(',', at);
+			const auto item = text.substr(at, next == std::string::npos ? std::string::npos : next - at);
+			if (!item.empty() && item != "0") parsed.hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+			if (next == std::string::npos) break;
+			at = next + 1;
+		}
+		return parsed;
+	}();
+	if (setting.all) return true;
+	return std::ranges::any_of(setting.hashes, [&](uint64_t hash) {
+		return hash == control_hash || hash == (control_hash & 0xffffffffull) || hash == (control_hash >> 32u);
+	});
+}
+
 struct MergedHullHalves {
 	bool                  valid = false;
 	std::vector<uint32_t> front;
@@ -1885,7 +1921,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	// (the tess line's cache; int21's per-pair layout cache of upstream c71589124 is not used with it).
 	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess,
 	                                                   params[0].hash, params[1].hash,
-	                                                   params[2].code)) {
+	                                                   params[2].code, nullptr,
+	                                                   merged != nullptr && TessMergedCarryEnabled(params[1].hash))) {
 		// The analysis logged the set once; without a caller that can skip, end as before.
 		EXIT_IF(unsupported == nullptr);
 		*unsupported = true;

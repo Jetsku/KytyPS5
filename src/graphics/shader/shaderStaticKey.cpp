@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <iterator>
@@ -84,6 +85,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       tess.max_tess_level});
 		// KYTY_TESS_INDEXED: the patch-constant range both stages declare (0 without the switch).
 		if (tess.patch_size != 0u) key.insert(key.end(), {tess.patch_base, tess.patch_size});
+		// KYTY_TESS_MERGED_CARRY: the carried VGPR set (empty for every pair without it).
+		if (std::ranges::any_of(tess.carried_vgprs, [](uint32_t word) { return word != 0u; }))
+			key.insert(key.end(), tess.carried_vgprs.begin(), tess.carried_vgprs.end());
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {

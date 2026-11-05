@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -418,6 +419,138 @@ const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
 	                                                                                 : nullptr;
 }
 
+// KYTY_TESS_MERGED_CARRY (based on Erlou93/KytyPS5-Yotei): the VGPRs the HS part of a split merged
+// LS+HS program reads before writing them (ShaderTessellationInputInfo::carried_vgprs). On the
+// hardware one wave runs the LS part and then the HS part, so such a register still holds what the
+// LS part left in the lane: Ghost of Yotei 2.x's particle HS takes the particle's index, flags and
+// position that way instead of reading them back from LDS as the 1.x HS halves do.
+// The set may only err on the large side: a read counts every register its operand could cover; a
+// write counts only when it certainly replaces the whole register in every lane that later reads
+// it, i.e. a full-width write in the straight-line code after the entry sequence (EXEC = all,
+// V_CMPX lane < HS threads, S_CBRANCH_EXECZ) and before the first branch or other EXEC change (a
+// write under a narrower EXEC keeps the LS value in the other lanes). An extra register only costs
+// one carried u32.
+std::array<uint32_t, 8> MergedHullCarriedVgprs(const Decoder::Program& control) {
+	using namespace Decoder;
+	std::bitset<IR::NumVectorRegs> defined, live;
+	defined.set(0); // the back half's own V_MBCNT lane index (SplitMergedHullProgram)
+	defined.set(1); // the packed HS IDs the frontend sets
+	bool entry    = true;
+	bool definite = true;
+	for (const auto& inst: control.instructions) {
+		const auto text   = InstructionToString(inst);
+		const auto colon  = text.find(": ");
+		const auto start  = colon == std::string::npos ? 0u : colon + 2u;
+		const auto name   = text.substr(start, text.find(' ', start) - start);
+		const auto has    = [&](const char* part) { return name.find(part) != std::string::npos; };
+		const bool memory = inst.family == Family::MUBUF || inst.family == Family::MTBUF ||
+		                    inst.family == Family::FLAT || inst.family == Family::DS ||
+		                    inst.family == Family::MIMG;
+		const bool load = memory && !has("D16") &&
+		                  (has("LOAD") || name.starts_with("DS_READ") || has("SAMPLE") || has("GATHER"));
+		const bool valu = inst.family == Family::VOP1 || inst.family == Family::VOP2 ||
+		                  inst.family == Family::VOP3 || inst.family == Family::VOP3P;
+		// Destinations that keep part of the old value (or read it): accumulators, lane writes,
+		// sub-dword writes.
+		const bool partial = has("MAC") || has("DOT2C") || has("DOT4C") || has("DOT8C") ||
+		                     has("WRITELANE") || has("MOVREL") || has("D16") || inst.dst.sdwa_sel != 6u ||
+		                     inst.dst.op_sel || inst.dst.dpp;
+		const auto read = [&](const Operand& operand, uint32_t width) {
+			if (operand.kind != OperandKind::Vgpr) return;
+			for (uint32_t index = 0; index < width && operand.reg + index < IR::NumVectorRegs; index++) {
+				if (!defined[operand.reg + index]) live.set(operand.reg + index);
+			}
+		};
+		const uint32_t source_width = memory ? std::max(inst.data_dwords, 4u) : has("64") ? 2u : 1u;
+		for (const auto* operand: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) read(*operand, source_width);
+		if (inst.family == Family::MIMG) {
+			read(inst.src0, std::max(inst.image_address_components, 4u));
+			for (uint32_t index = 0; index < inst.image_nsa_dwords && index < MaxImageNsaAddressComponents;
+			     index++) {
+				const Operand address {.kind = OperandKind::Vgpr, .reg = inst.image_nsa_addr[index]};
+				read(address, 1u);
+			}
+		}
+		if ((memory && !load) || ((valu || memory) && partial)) {
+			read(inst.dst, std::max(inst.data_dwords, 2u)); // store data, atomics, partial writes
+		}
+		if (entry) {
+			const bool entry_inst =
+			    inst.opcode == Opcode::V_MBCNT_LO_U32_B32 || inst.opcode == Opcode::V_MBCNT_HI_U32_B32 ||
+			    inst.opcode == Opcode::S_MOV_B64 || inst.opcode == Opcode::V_CMPX_LT_U32 ||
+			    inst.opcode == Opcode::S_BARRIER || inst.opcode == Opcode::S_INST_PREFETCH ||
+			    inst.opcode == Opcode::S_WAITCNT || inst.opcode == Opcode::S_NOP;
+			if (inst.opcode == Opcode::S_CBRANCH_EXECZ || !entry_inst) entry = false;
+			if (entry || inst.opcode == Opcode::S_CBRANCH_EXECZ) continue;
+		}
+		if (IsDirectBranch(inst.opcode) || inst.opcode == Opcode::S_SETPC_B64 ||
+		    inst.opcode == Opcode::S_ENDPGM || name.starts_with("S_SWAPPC") ||
+		    text.find("exec") != std::string::npos || text.find("EXEC") != std::string::npos) {
+			definite = false;
+		}
+		if (!definite || inst.dst.kind != OperandKind::Vgpr || partial) continue;
+		if (valu) {
+			defined.set(inst.dst.reg);
+		} else if (load &&
+		           (inst.family == Family::DS || inst.family == Family::MUBUF || inst.family == Family::MTBUF)) {
+			for (uint32_t index = 0;
+			     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < IR::NumVectorRegs; index++) {
+				defined.set(inst.dst.reg + index);
+			}
+		} else if (load) {
+			defined.set(inst.dst.reg);
+		}
+	}
+	live.reset(0);
+	live.reset(1);
+	std::array<uint32_t, 8> mask {};
+	for (uint32_t reg = 0; reg < IR::NumVectorRegs; reg++) {
+		if (live[reg]) mask[reg / 32u] |= 1u << (reg % 32u);
+	}
+	return mask;
+}
+
+// KYTY_TESS_MERGED_CARRY: the carried set of a split merged pair; empty when the HS part reads no
+// LS-part VGPR or the set cannot be carried (logged).
+std::array<uint32_t, 8> CarriedVgprs(const Decoder::Program& control_program,
+                                     const ShaderTessellationInputInfo& info, uint64_t control_hash) {
+	const auto  mask = MergedHullCarriedVgprs(control_program);
+	std::string list;
+	uint32_t    count = 0;
+	for (uint32_t reg = 0; reg < IR::NumVectorRegs; reg++) {
+		if (((mask[reg / 32u] >> (reg % 32u)) & 1u) == 0u) continue;
+		list += fmt::format(" v{}", reg);
+		count++;
+	}
+	if (count == 0u) return {};
+	// HS thread i of a patch ran the LS part for the patch's vertex i: the same lane only when
+	// the counts agree.
+	if (info.input_control_points != info.output_control_points) {
+		LOGF("Tessellation: merged HS 0x%016" PRIx64 " reads %u LS-part VGPRs but input_cp=%u != "
+		     "output_cp=%u, not carried:%s\n",
+		     control_hash, count, info.input_control_points, info.output_control_points, list.c_str());
+		std::printf("KYTY_TESS_MERGED_CARRY: HS 0x%016" PRIx64 " NOT carried (control points %u/%u):%s\n",
+		            control_hash, info.input_control_points, info.output_control_points, list.c_str());
+		return {};
+	}
+	// The carried registers follow the LS outputs in the LS -> HS interface (Vulkan guarantees 64
+	// components per vertex there; the GPUs this runs on offer 128).
+	const auto components = (info.ls_stride + 15u) / 16u * 4u + (count + 3u) / 4u * 4u;
+	if (components > 128u) {
+		LOGF("Tessellation: merged HS 0x%016" PRIx64 " carries %u VGPRs: %u interface components "
+		     "(max 128), not carried:%s\n",
+		     control_hash, count, components, list.c_str());
+		std::printf("KYTY_TESS_MERGED_CARRY: HS 0x%016" PRIx64 " NOT carried (%u components):%s\n",
+		            control_hash, components, list.c_str());
+		return {};
+	}
+	LOGF("Tessellation interface: the merged HS 0x%016" PRIx64 " carries %u VGPRs from its LS part:%s\n",
+	     control_hash, count, list.c_str());
+	std::printf("KYTY_TESS_MERGED_CARRY: HS 0x%016" PRIx64 " carries %u VGPRs:%s\n", control_hash, count,
+	            list.c_str());
+	return mask;
+}
+
 // Whether predicate p implies q: equal, or a conjunction one of whose terms does.
 bool ImpliesPredicate(IR::Value p, IR::Value q, uint32_t depth = 0) {
 	p = p.Resolve();
@@ -524,7 +657,7 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info, uint64_t local_hash,
                                  uint64_t control_hash, std::span<const uint32_t> evaluation,
-                                 std::string* rejection) {
+                                 std::string* rejection, bool merged) {
 	// Every tessellated draw prepares its programs; the interface depends only on
 	// the two programs and the control point counts.
 	struct Key {
@@ -540,8 +673,8 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		}
 	};
 	static std::mutex                                                      mutex;
-	// ls_stride, hs_stride, patch_base, patch_size.
-	static std::unordered_map<Key, std::array<uint32_t, 4>, KeyHash> strides;
+	// ls_stride, hs_stride, patch_base, patch_size, then carried_vgprs.
+	static std::unordered_map<Key, std::array<uint32_t, 12>, KeyHash> strides;
 	const bool cacheable = local_hash != 0u && control_hash != 0u;
 	const Key  key {local_hash, control_hash, (uint64_t {local.size()} << 32u) | control.size(),
 	                (info.input_control_points << 8u) | info.output_control_points};
@@ -552,6 +685,7 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 			info.hs_stride  = found->second[1];
 			info.patch_base = found->second[2];
 			info.patch_size = found->second[3];
+			std::copy_n(found->second.begin() + 4, 8, info.carried_vgprs.begin());
 			// A rejected set is cached as zero strides (its reason was logged once).
 			if (info.ls_stride == 0u || info.hs_stride == 0u) {
 				if (rejection != nullptr) *rejection = "rejected before";
@@ -575,8 +709,9 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	                                                 info.output_control_points, info.ls_stride,
 	                                                 control_hash, nullptr, &why,
 	                                                 indexed ? &constant_ranges : nullptr);
-	info.patch_base = 0;
-	info.patch_size = 0;
+	info.patch_base    = 0;
+	info.patch_size    = 0;
+	info.carried_vgprs = {};
 	if (indexed && info.hs_stride != 0u) {
 		// The patch constants: what the HS stores at constant addresses past its control points.
 		// HS and TES declare this range, so their patch interfaces agree whatever each touches.
@@ -602,7 +737,7 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		            local_hash, control_hash, why.c_str());
 		if (cacheable) {
 			std::lock_guard lock(mutex);
-			strides.emplace(key, std::array<uint32_t, 4> {});
+			strides.emplace(key, std::array<uint32_t, 12> {});
 		}
 		if (rejection != nullptr) *rejection = why;
 		return false;
@@ -624,10 +759,12 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		     ProgramToString(local_program).c_str(), ProgramToString(control_program).c_str(),
 		     evaluation.empty() ? "" : ProgramToString(evaluation_program).c_str());
 	}
+	if (merged) info.carried_vgprs = CarriedVgprs(control_program, info, control_hash);
 	if (cacheable) {
+		std::array<uint32_t, 12> entry {info.ls_stride, info.hs_stride, info.patch_base, info.patch_size};
+		std::copy_n(info.carried_vgprs.begin(), 8, entry.begin() + 4);
 		std::lock_guard lock(mutex);
-		strides.emplace(key, std::array<uint32_t, 4> {info.ls_stride, info.hs_stride, info.patch_base,
-		                                              info.patch_size});
+		strides.emplace(key, entry);
 	}
 	return true;
 }

@@ -171,6 +171,12 @@ struct ShaderTessellationInputInfo {
 	// VGT_HOS_MIN/MAX_TESS_LEVEL as f32 bits: the hardware clamps every factor to them.
 	uint32_t min_tess_level        = 0;
 	uint32_t max_tess_level        = 0;
+	// KYTY_TESS_MERGED_CARRY (with KYTY_TESS_MERGED_HULL; based on Erlou93/KytyPS5-Yotei): the VGPRs
+	// the HS part of a split merged LS+HS program reads before writing them. On the hardware one
+	// wave runs both parts, so they still hold what the LS part left in the lane. The LS stage
+	// exports them after its outputs and the HS stage starts with them; bit k = v<k>. Empty for
+	// every other pair.
+	std::array<uint32_t, 8> carried_vgprs {};
 };
 
 struct ShaderVertexInputInfo {
