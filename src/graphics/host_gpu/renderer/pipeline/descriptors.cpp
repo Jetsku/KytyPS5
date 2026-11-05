@@ -143,6 +143,12 @@ bool DccNoMetaRaw() {
 	static const bool on = EnvFlag("KYTY_DCC_NO_META_RAW");
 	return on;
 }
+
+// KYTY_STENCIL_STORAGE_NULL=1: a storage write to a stencil plane without the stencil storage
+// shadow binds a null storage image (Erlou93/KytyPS5-Yotei), not the depth/stencil image.
+bool StencilStorageNull() {
+	static const bool on = EnvFlag("KYTY_STENCIL_STORAGE_NULL");
+	return on;
 }
 
 bool TextureMinLodClamp() {
@@ -1592,6 +1598,14 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 				            texture_cache.GetImage(record_id).info.data.address,
 				            image->info.data.address, image->backing.extent.width,
 				            image->backing.extent.height, static_cast<int>(image->backing.format));
+			}
+			// KYTY_STENCIL_STORAGE_NULL=1 (Erlou93/KytyPS5-Yotei DIAG_DEPTH_STORAGE_NULL): a storage
+			// view of the depth/stencil image is invalid Vulkan (D32S8 has no storage usage), so a
+			// null storage image takes the write (not memoized: the next resolution logs again).
+			if (StencilStorageNull()) {
+				desc             = NullTextureDesc(resource, TextureCache::BindingType::Storage);
+				binding.image_id = texture_cache.FindImage(desc);
+				return;
 			}
 		} else if (TextureCache::PreserveStencilEnabled() &&
 		           (!TextureCache::StencilReadDepthEnabled() || TextureCache::StencilReadHeldEnabled())) {

@@ -431,6 +431,14 @@ thread_local uint32_t t_null_compare_funcs = 0;
 
 } // namespace
 
+bool StencilRestoreGuardEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STENCIL_RESTORE_GUARD");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 bool NullTextureZeroEnabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_NULL_TEXTURE_ZERO");
@@ -3090,11 +3098,11 @@ bool TextureCache::StencilPlaneHeld(const Image& record) const {
 	       depth->info.stencil.address == record.info.data.address;
 }
 
-void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
+bool TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 	auto&      depth    = m_slot_images[depth_id];
 	const auto previous = depth.info.stencil.address;
 	if (!SwapsStencilPlanes(depth) || previous == next_plane || previous == 0 || next_plane == 0) {
-		return;
+		return false;
 	}
 	const auto width  = depth.backing.extent.width;
 	const auto height = depth.backing.extent.height;
@@ -3206,6 +3214,7 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 			     l, next_plane, depth.info.data.address, width, height, loaded);
 		}
 	}
+	return restored || loaded != nullptr;
 }
 
 // KYTY_STENCIL_PLANE_SYNC (default 2; based on Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_PLANE_SYNC):
@@ -7089,6 +7098,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	m_bind_mark               = false;
 	m_stencil_draw_suppressed = false;
 	image.usage.depth_target = true;
+	bool stencil_swapped_in  = false; // KYTY_STENCIL_RESTORE_GUARD
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
 		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
@@ -7102,7 +7112,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             desc.info.resources.layers};
 		if (PreserveStencilEnabled() && image.info.HasStencil() &&
 		    image.info.stencil.address != desc.info.stencil.address) {
-			SwapStencilPlane(id, desc.info.stencil.address);
+			stencil_swapped_in = SwapStencilPlane(id, desc.info.stencil.address);
 		}
 	}
 	image.info.stencil = desc.info.stencil;
@@ -7143,7 +7153,21 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		TrackImageDownload(id, image);
 	}
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil), RefreshIntent::Write);
+		const auto association = AssociateStencil(id, desc.info.stencil);
+		if (stencil_swapped_in && StencilRestoreGuardEnabled()) {
+			// KYTY_STENCIL_RESTORE_GUARD=1 (Erlou93/KytyPS5-Yotei FindDepthTarget swap-in rule): the
+			// restored plane is newer than guest memory, so only a GPU buffer write to the plane's
+			// memory made while it was not held (the game's fill before drawing into it) is uploaded
+			// over it; a CPU-dirty mark alone is not (a new plane record starts CPU-dirty).
+			if (m_slot_images[association].IsBufferModified()) {
+				RefreshImage(association, RefreshIntent::Write);
+			}
+			if (m_slot_images[association].IsCpuDirty()) {
+				m_slot_images[association].RefreshComplete();
+			}
+		} else {
+			RefreshImage(association, RefreshIntent::Write);
+		}
 	}
 	if (m_partial_gpu_write != 0 && !m_partial_gpu_write_stencil_keep) {
 		// The draws of this binding come after the stencil record's refresh above.

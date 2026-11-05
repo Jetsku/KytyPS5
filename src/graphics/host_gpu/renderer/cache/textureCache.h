@@ -53,6 +53,9 @@ void                   SetMetaTraceAddressStencil(uint64_t address);
 // KYTY_NULL_COMPARE_DEPTH=1: a null image on a depth-compare binding is a 1x1 D16 cleared to the
 // depth that fails the S#'s comparison (SetNullCompareFuncs: DEPTH_COMPARE_FUNC bits of the binding).
 [[nodiscard]] bool     NullTextureZeroEnabled();
+// KYTY_STENCIL_RESTORE_GUARD=1 (Erlou93/KytyPS5-Yotei): after a stencil plane swap restored the
+// plane, its record is uploaded only for a GPU buffer write, not a CPU-dirty mark (FindDepthTarget).
+[[nodiscard]] bool     StencilRestoreGuardEnabled();
 [[nodiscard]] bool     NullCompareDepthEnabled();
 void                   SetNullCompareFuncs(uint32_t funcs);
 class CommandBuffer;
@@ -815,7 +818,8 @@ private:
 	std::vector<std::pair<ImageId, ImageId>>        m_pending_stencil_shadows; // shadow, depth
 	// Whether the depth image of a stencil record holds the record's plane (KYTY_PRESERVE_STENCIL).
 	[[nodiscard]] bool StencilPlaneHeld(const Image& record) const;
-	void SwapStencilPlane(ImageId depth_id, uint64_t next_plane);
+	// True when the incoming plane was restored from its saved copy (or loaded, STENCIL_PLANE_SYNC=2).
+	bool SwapStencilPlane(ImageId depth_id, uint64_t next_plane);
 	// SubExtentCopy's copies, by the image they copy (at most 4 extents each).
 	struct SubExtentCopyEntry {
 		ImageId  copy {};
