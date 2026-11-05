@@ -8,6 +8,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hash.h"
+#include "common/kytyEvents.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -678,6 +679,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	KytyEvents::NoteFileRead(bytes_read);
 
 	file->mutex.Unlock();
 
@@ -747,6 +749,10 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	}
 
 	if (d == 1 || d == 2) {
+		if (KytyEvents::GuestConsoleEnabled()) {
+			KytyEvents::GuestWrite(d, buf, nbytes);
+			return static_cast<int64_t>(nbytes);
+		}
 		auto*      out      = (d == 1 ? stdout : stderr);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
 		const auto flush_ok = std::fflush(out) == 0;
@@ -870,6 +876,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	}
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadReadBytes, bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
+	KytyEvents::NoteFileRead(bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -973,6 +980,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		uint32_t bytes = 0;
 		file->f.Read(buffer.iov_base, count, &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
+		KytyEvents::NoteFileRead(bytes);
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {
