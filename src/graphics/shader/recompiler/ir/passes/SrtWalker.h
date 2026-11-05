@@ -296,6 +296,7 @@ private:
 	bool ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe = true);
 	[[nodiscard]] bool InPlaceReadable(uint64_t address);
 	void NoteUnmappedRead(uint64_t address) const;
+	void DiagWatchSlots(const std::vector<uint32_t>& flat);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateFlatRun(uint32_t first, uint32_t end, std::vector<uint32_t>& flat,
 	                     uint32_t& consumed);
