@@ -147,6 +147,7 @@ public:
 	// (KYTY_IDLE_FLUSH_DRAWS) or every KYTY_DRAW_FLUSH_INTERVAL draws / KYTY_DISPATCH_FLUSH_INTERVAL
 	// dispatches of one recording.
 	void            MaybeFlushIdleGpu(bool dispatch = false);
+	void            MaybeFlushBatched(uint32_t every); // KYTY_SUBMIT_EVERY
 	// The periodic part (KYTY_DRAW_FLUSH_INTERVAL / KYTY_DISPATCH_FLUSH_INTERVAL): true when it
 	// submitted.
 	bool            MaybeFlushPeriodic(bool dispatch);
@@ -506,6 +507,10 @@ private:
 	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
 	uint64_t  m_idle_flush_tick             = 0;
 	uint32_t  m_idle_flush_draws            = 0;
+	// KYTY_SUBMIT_EVERY: the recording's idle-early submit is armed (its first command after a
+	// non-batch submit found the GPU idle), and the tick our last batch submit opened.
+	bool      m_idle_flush_armed            = false;
+	uint64_t  m_batch_flush_tick            = 0;
 	// MaybeFlushIdleGpu's periodic submits: recording tick being counted, its draws and dispatches.
 	uint64_t  m_periodic_flush_tick         = 0;
 	uint32_t  m_periodic_flush_draws        = 0;

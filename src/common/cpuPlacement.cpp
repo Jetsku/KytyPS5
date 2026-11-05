@@ -142,14 +142,17 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		                 candidates.end());
 		candidates.insert(candidates.begin(), forced);
 	}
-	const size_t needed = mode == CpuReserveMode::CpRecorder ? 2u : 1u;
+	const size_t needed = mode == CpuReserveMode::Stages       ? 3u
+	                      : mode == CpuReserveMode::CpRecorder ? 2u
+	                                                           : 1u;
 	if (candidates.size() < needed) {
 		layout.description =
 		    "fewer than " + std::to_string(needed) + " whole allowed cores in the largest cache";
 		return layout;
 	}
 	const Core* cp       = candidates[0];
-	const Core* recorder = needed == 2 ? candidates[1] : nullptr;
+	const Core* recorder  = needed >= 2 ? candidates[1] : nullptr;
+	const Core* sequencer = needed >= 3 ? candidates[2] : nullptr;
 	uint32_t    general  = 0;
 	for (const auto& set: sets) {
 		if (set.group != 0 || set.logical >= 64 || !set.allowed) {
@@ -162,6 +165,9 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		} else if (recorder != nullptr && set.core == recorder->index) {
 			layout.recorder_ids.push_back(set.id);
 			layout.recorder_mask |= bit;
+		} else if (sequencer != nullptr && set.core == sequencer->index) {
+			layout.sequencer_ids.push_back(set.id);
+			layout.sequencer_mask |= bit;
 		} else {
 			layout.general_ids.push_back(set.id);
 			layout.general_mask |= bit;
@@ -177,12 +183,17 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 	layout.reserved      = true;
 	layout.cp_core       = cp->index;
 	layout.recorder_core = recorder != nullptr ? recorder->index : -1;
+	layout.sequencer_core = sequencer != nullptr ? sequencer->index : -1;
 	layout.description   = "CP on logical " + MaskText(layout.cp_mask) + " (core " +
 	                       std::to_string(cp->index) + ", preference " +
 	                       std::to_string(cp->preference) + ")";
 	if (recorder != nullptr) {
 		layout.description += ", recorder on logical " + MaskText(layout.recorder_mask) +
 		                      " (core " + std::to_string(recorder->index) + ")";
+	}
+	if (sequencer != nullptr) {
+		layout.description += ", sequencer on logical " + MaskText(layout.sequencer_mask) +
+		                      " (core " + std::to_string(sequencer->index) + ")";
 	}
 	layout.description += ", other threads on " + MaskText(layout.general_mask);
 	return layout;
@@ -383,6 +394,9 @@ CpuReserveMode ParseCpuReserveMode(const char* text, bool* valid) {
 	if (std::strcmp(text, "cp+recorder") == 0 || std::strcmp(text, "2") == 0) {
 		return CpuReserveMode::CpRecorder;
 	}
+	if (std::strcmp(text, "stages") == 0 || std::strcmp(text, "3") == 0) {
+		return CpuReserveMode::Stages;
+	}
 	if (valid != nullptr) {
 		*valid = false;
 	}
@@ -395,7 +409,7 @@ CpuReserveMode GetCpuReserveMode() {
 		bool        valid = true;
 		const auto  mode  = ParseCpuReserveMode(value, &valid);
 		if (!valid) {
-			std::printf("KYTY_CPU_RESERVE must be off, cp or cp+recorder (got '%s'): off\n", value);
+			std::printf("KYTY_CPU_RESERVE must be off, cp, cp+recorder or stages (got '%s'): off\n", value);
 		}
 		return mode;
 	}();
@@ -612,6 +626,7 @@ struct State {
 #if defined(_WIN32)
 	// The threads placed on reserved cores (their sets are re-applied when the layout changes).
 	std::array<HANDLE, static_cast<size_t>(ThreadRole::Count)> threads {};
+	HANDLE sequencer = nullptr; // PlaceCurrentThreadSequencer (KYTY_CPU_RESERVE=stages)
 	bool applied_default = false; // our process default CPU sets are in effect
 	// The constraint without KYTY_CPU_SETS: the default CPU sets found at startup, replaced by
 	// another process's when it replaces ours (KYTY_CPU_RESERVE_REASSERT). Restored when nothing
@@ -887,6 +902,7 @@ void ApplyLayoutLocked(State& state, const char* why, bool log = true, bool keep
 	                reserved ? state.layout.cp_ids : std::vector<uint32_t> {});
 	ApplyThreadSets(state.threads[static_cast<size_t>(ThreadRole::Recorder)],
 	                reserved ? state.layout.recorder_ids : std::vector<uint32_t> {});
+	ApplyThreadSets(state.sequencer, reserved ? state.layout.sequencer_ids : std::vector<uint32_t> {});
 	for (size_t role = 0; role < state.threads.size(); role++) {
 		if (role != static_cast<size_t>(ThreadRole::Cp) &&
 		    role != static_cast<size_t>(ThreadRole::Recorder)) {
@@ -1084,6 +1100,26 @@ void PlaceCurrentThread(ThreadRole role) {
 	}
 #else
 	(void)role;
+#endif
+}
+
+void PlaceCurrentThreadSequencer() {
+	InitCpuPlacement();
+#if defined(_WIN32)
+	auto&           state = GetState();
+	std::lock_guard lock(state.mutex);
+	if (state.sequencer != nullptr) {
+		CloseHandle(state.sequencer);
+		state.sequencer = nullptr;
+	}
+	HANDLE handle = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle, 0,
+	                    FALSE, DUPLICATE_SAME_ACCESS) != 0) {
+		state.sequencer = handle;
+	}
+	if (state.layout.reserved && !state.layout.sequencer_ids.empty()) {
+		ApplyThreadSets(GetCurrentThread(), state.layout.sequencer_ids);
+	}
 #endif
 }
 
