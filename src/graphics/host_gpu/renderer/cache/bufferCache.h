@@ -198,6 +198,16 @@ public:
 	// GPU thread, outside every tracker and texture-cache lock.
 	[[nodiscard]] bool SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] static bool RawReadImageSyncEnabled();
+	// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS=1 (default off; PPSA26344 preset; completes the port of
+	// Erlou93/KytyPS5-Yotei SyncBufferFromWrittenImage, which runs inside every read-only ObtainBuffer):
+	// the read-only obtains that are not shader bindings - index buffers, vertex buffer ranges, draw and
+	// dispatch indirect arguments and counts - take a GPU-written image's contents as raw shader reads
+	// do (SyncRawReadFromWrittenImage). Needs KYTY_RAW_READ_IMAGE_SYNC=1.
+	// KYTY_RAW_READ_IMAGE_SYNC_ONCE=1 (default off; PPSA26344 preset; Erlou's buffer_sync_serial gate):
+	// an image's contents are copied into a buffer once per image content serial (and buffer, start and
+	// size) instead of on every read while the image stays GPU-modified.
+	// Called before the obtain itself: the synchronization can join cache buffers, as ObtainBuffer can.
+	void PrepareReadRange(uint64_t vaddr, uint64_t size);
 	// KYTY_CP_BINDING_BATCH_PREFETCH (default on, live): a CPU cache hint for the binding memo
 	// slot a later ObtainBuffer(vaddr, size, false, false) on the GPU thread looks up. A stage's
 	// bindings issue all hints first (RenderExecutor::RebindBuffers), so the slots' cache misses

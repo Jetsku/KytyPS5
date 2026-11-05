@@ -2047,6 +2047,8 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	BindComputeLds(input_info, bindings, nullptr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before the epoch is taken.
+	m_context.GetBufferCache().PrepareReadRange(args_addr, sizeof(vk::DispatchIndirectCommand));
 	m_rebind_epoch = m_context.GetBufferCache().UnregisterEpoch();
 	auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);

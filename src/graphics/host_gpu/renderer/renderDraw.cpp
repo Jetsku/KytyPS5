@@ -1467,6 +1467,11 @@ static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            b
                                                      const DrawIndirectSource& source) {
 	auto&                   cache = buffer.GetContext().GetBufferCache();
 	PreparedIndirectBuffers prepared;
+	// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before either obtain.
+	cache.PrepareReadRange(source.args_addr, source.ArgsSize());
+	if (source.count_addr != 0) {
+		cache.PrepareReadRange(source.count_addr, sizeof(uint32_t));
+	}
 	const auto [args, args_offset] = cache.ObtainBuffer(source.args_addr, source.ArgsSize(), false);
 	EXIT_IF(args == nullptr || (args_offset & 3u) != 0);
 	prepared.args        = args->Handle();
@@ -1679,6 +1684,11 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&                
 	auto& cache = buffer.GetContext().GetBufferCache();
 	std::array<std::pair<Buffer*, uint64_t>, ShaderVertexInputInfo::RES_MAX> acquired {};
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
+		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before every obtain.
+		cache.PrepareReadRange(ranges->merged[i].base_address,
+		                       ranges->merged[i].acquired_end - ranges->merged[i].base_address);
+	}
+	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range = ranges->merged[i];
 		const auto  size  = range.acquired_end - range.base_address;
 		acquired[i]       = cache.ObtainBuffer(range.base_address, size, false);
@@ -1768,6 +1778,11 @@ static void AcquireVertexBuffersInto(CommandBuffer&                   buffer,
 		uint64_t offset;
 	};
 	std::array<Acquired, ShaderVertexInputInfo::RES_MAX> acquired; // [0, merged_count) written
+	for (uint32_t i = 0; i < ranges->merged_count; i++) {
+		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before every obtain.
+		cache.PrepareReadRange(ranges->merged[i].base_address,
+		                       ranges->merged[i].acquired_end - ranges->merged[i].base_address);
+	}
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range           = ranges->merged[i];
 		const auto  size            = range.acquired_end - range.base_address;
@@ -3911,6 +3926,8 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		                     "Kyty.IndexBuffer[guest=transient size=0x{:x} type={}]", source.size,
 		                     static_cast<uint32_t>(source.type));
 	} else {
+		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange).
+		buffer.GetContext().GetBufferCache().PrepareReadRange(source.address, source.size);
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
