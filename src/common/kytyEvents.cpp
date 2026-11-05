@@ -1,5 +1,6 @@
 #include "common/kytyEvents.h"
 
+#include "common/guestProbe.h"
 #include "common/logging/log.h"
 
 #include <array>
@@ -85,6 +86,16 @@ std::string EventLine(const char* name, uint64_t frame, uint64_t now_ms, const s
 
 void Print(const std::string& line) {
 	Log::WriteToConsoleAndLog(line + "\n");
+	// KYTY_GUEST_PROBE_ARM_LOAD_END=<n> (diagnostic): arm the deferred ('^') guest probes at the n-th
+	// loading-end event (Ghost of Yotei: 1 = title menu, 2 = gameplay), so per-frame probes do not slow the load.
+	static const unsigned long arm_at = [] {
+		const char* v = std::getenv("KYTY_GUEST_PROBE_ARM_LOAD_END");
+		return v != nullptr ? std::strtoul(v, nullptr, 10) : 0ul;
+	}();
+	static unsigned long load_ends = 0;
+	if (arm_at != 0 && line.find("KYTY_EVENT: loading-end") != std::string::npos && ++load_ends == arm_at) {
+		Common::GuestProbe::ArmDeferred("loading-end");
+	}
 }
 
 void MonitorThread() {
