@@ -56,6 +56,7 @@ void                   SetMetaTraceAddressStencil(uint64_t address);
 // KYTY_STENCIL_RESTORE_GUARD=1 (Erlou93/KytyPS5-Yotei): after a stencil plane swap restored the
 // plane, its record is uploaded only for a GPU buffer write, not a CPU-dirty mark (FindDepthTarget).
 [[nodiscard]] bool     StencilRestoreGuardEnabled();
+[[nodiscard]] bool     ImageContainsEnabled();
 [[nodiscard]] bool     NullCompareDepthEnabled();
 void                   SetNullCompareFuncs(uint32_t funcs);
 class CommandBuffer;

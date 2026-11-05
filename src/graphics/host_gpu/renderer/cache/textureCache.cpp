@@ -431,6 +431,15 @@ thread_local uint32_t t_null_compare_funcs = 0;
 
 } // namespace
 
+// KYTY_IMAGE_CONTAINS (see ImageSubresources::Contains).
+bool ImageContainsEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_IMAGE_CONTAINS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 bool StencilRestoreGuardEnabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_STENCIL_RESTORE_GUARD");
@@ -4357,8 +4366,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	bool recreate = cached.info.resources < requested.resources ||
-	                requested.IsVolume() != cached.info.IsVolume();
+	// KYTY_IMAGE_CONTAINS=1 (Erlou93/KytyPS5-Yotei): capacity = levels AND layers, not the
+	// lexicographic compare (which reused 7 levels x 9 layers for a 1 level x 12 layers request).
+	const bool too_small = ImageContainsEnabled() ? !cached.info.resources.Contains(requested.resources)
+	                                              : cached.info.resources < requested.resources;
+	bool recreate = too_small || requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
@@ -6549,7 +6561,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (ImageContainsEnabled() ? !resolved.info.resources.Contains(desc.info.resources)
+			                                  : resolved.info.resources < desc.info.resources) {
 				FreeImage(result, HangTrace::ImageFreeReason::SmallerResources);
 				result = {};
 			}

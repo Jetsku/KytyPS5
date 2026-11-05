@@ -94,6 +94,11 @@ struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+	// Erlou93/KytyPS5-Yotei: lexicographic above is the overlap rules' order. As a capacity, levels
+	// and layers are independent: 7 levels of 9 layers hold no 12 layers (KYTY_IMAGE_CONTAINS).
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 struct ImageSubresourceRange {
