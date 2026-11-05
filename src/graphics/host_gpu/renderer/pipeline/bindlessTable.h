@@ -91,6 +91,11 @@ struct BindlessHeap {
 	// loaded at run time and asked for, kept here, not entries of a guest table; nothing of it is
 	// read from guest memory.
 	bool                                 runtime          = false;
+	// KYTY_BINDLESS_PREFILL: the heap's keys were settled at its first use (RenderExecutor::
+	// PrefillBindlessHeap).
+	bool                                 prefilled        = false;
+	// KYTY_BINDLESS_TOUCH: the last frame its resolved images were touched (TextureCache::TouchImage).
+	uint64_t                             touched_frame    = UINT64_MAX;
 	uint32_t                             runtime_next_key = 0;
 	std::vector<std::array<uint32_t, 8>> runtime_dwords;
 };
@@ -221,6 +226,23 @@ public:
 	// back to it, or free it itself; IDXTRI).
 	[[nodiscard]] bool ReleaseKey(Heap& heap, uint32_t key, bool free_slot = true);
 
+	// KYTY_BINDLESS_PREFILL: one slot per (heap binding, T# words) for prefilled keys, shared by
+	// every key of any heap that holds the same T#. A shared slot counts its extra keys; FreeSlot
+	// frees it with the last one (and forgets its words).
+	struct SharedSlot {
+		uint32_t entry = 0; // a Heap::slots entry (slot, or BindlessSlotArrayFlag | slot)
+		ImageId  image;
+		uint32_t slot_binding = 0;
+		uint32_t slot_index   = 0;
+	};
+	// Null when unknown, or when the slot no longer shows an image (a placeholder was written to
+	// it, e.g. ReleaseViews when the image's views were dropped): the words are forgotten then.
+	[[nodiscard]] const SharedSlot* FindSharedSlot(uint32_t binding, const std::array<uint32_t, 8>& words);
+	void NoteSharedSlot(const Heap& heap, const std::array<uint32_t, 8>& words, uint32_t entry, ImageId image);
+	void AddSharedSlotRef(uint32_t binding, uint32_t slot);
+	// Shared slots found holding a placeholder and forgotten (diagnostics).
+	[[nodiscard]] uint64_t SharedSlotsForgotten() const noexcept { return m_shared_forgotten; }
+
 	// Engine method, E1. The guest pages holding a heap's entries are write-watched; a CPU write
 	// to one (a page fault on a game thread, or an explicit invalidation such as a file read into
 	// the heap) stops watching that page and records it as written. TakeWrittenRanges, on the GPU
@@ -316,6 +338,27 @@ private:
 	std::array<std::deque<std::pair<uint32_t, uint64_t>>, ImageArrays> m_free_slots;
 	std::array<std::vector<uint8_t>, ImageArrays>                      m_slot_free;
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
+	// KYTY_BINDLESS_PREFILL: shared slots by (binding, T# words), the words of each shared slot
+	// ((binding << 32) | slot), and each shared slot's keys beyond the first.
+	struct SharedSlotKey {
+		uint32_t                binding = 0;
+		std::array<uint32_t, 8> words {};
+		bool operator==(const SharedSlotKey&) const = default;
+	};
+	struct SharedSlotKeyHash {
+		size_t operator()(const SharedSlotKey& key) const noexcept {
+			uint64_t hash = 0xcbf29ce484222325ull ^ key.binding;
+			for (const auto word: key.words) hash = (hash ^ word) * 0x100000001b3ull;
+			return static_cast<size_t>(hash);
+		}
+	};
+	std::unordered_map<SharedSlotKey, SharedSlot, SharedSlotKeyHash> m_shared_slots;
+	std::unordered_map<uint64_t, SharedSlotKey>                      m_shared_slot_words;
+	std::unordered_map<uint64_t, uint32_t>                           m_shared_slot_refs;
+	uint64_t                                                         m_shared_forgotten = 0;
+	// The slot's words are forgotten (no new key shares it); drop_refs: its keys were released
+	// together, so the next FreeSlot frees it.
+	void ForgetSharedSlot(uint32_t binding, uint32_t slot, bool drop_refs);
 	uint32_t m_next_region = 1; // translation[0] is the out-of-range entry
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors, PlaceholderColors};

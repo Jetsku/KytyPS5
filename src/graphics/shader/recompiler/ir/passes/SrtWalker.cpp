@@ -160,6 +160,25 @@ bool ComputeRawAddress(bool buffer, int64_t immediate, uint64_t low, uint64_t hi
 		const auto size = stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                              : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+			// KYTY_SRT_OOR_LOG=1 (diagnostic, default off): the first 64 distinct (base, stride,
+			// records) of SRT constant-buffer reads past the V#'s size, which read as 0.
+			static const bool oor_log = [] {
+				const char* value = std::getenv("KYTY_SRT_OOR_LOG");
+				return value != nullptr && value[0] == '1';
+			}();
+			if (oor_log) {
+				static std::mutex                   mutex;
+				static std::unordered_set<uint64_t> seen;
+				const uint64_t key = base ^ (uint64_t {stride} << 48u) ^ (static_cast<uint64_t>(records) << 20u);
+				std::scoped_lock lock(mutex);
+				if (seen.size() < 64 && seen.insert(key).second) {
+					std::printf("SrtOOR: base 0x%llx stride %u records %u size %llu read at %llu (V# hi 0x%08x)\n",
+					            static_cast<unsigned long long>(base), stride, static_cast<uint32_t>(records),
+					            static_cast<unsigned long long>(size), static_cast<unsigned long long>(aligned),
+					            static_cast<uint32_t>(high));
+					std::fflush(stdout);
+				}
+			}
 			address   = OutOfRangeReadAddress;
 			available = 0;
 			return true;

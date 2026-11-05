@@ -991,6 +991,14 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 	                                   : Profiler::FrameEvent::TextureResidencyFullFallbacks);
 }
 
+static bool ResidentIdleKeepBindless() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_RESIDENT_IDLE_KEEP_BINDLESS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 void TextureCache::RetireIdlePartialImages() {
 	// A partially resident image overlaps no neighbouring streamed texture, so the overlap
 	// rule that used to retire unused ones never fires: its full native mip chain would stay
@@ -1008,6 +1016,13 @@ void TextureCache::RetireIdlePartialImages() {
 		const auto id    = m_partial_images[index];
 		auto*      image = m_slot_images.try_get(id);
 		if (image == nullptr || !image->registered || image->FullyResident()) {
+			continue;
+		}
+		// KYTY_RESIDENT_IDLE_KEEP_BINDLESS (default on): an image a bindless heap key holds is in use
+		// although no binding touches it (bindless sampling never calls TouchImage); freeing it
+		// repoints its slots to the placeholder and re-resolves every key each time.
+		if (ResidentIdleKeepBindless() && image->bindless_pinned) {
+			m_partial_images[kept++] = id;
 			continue;
 		}
 		const bool idle =
