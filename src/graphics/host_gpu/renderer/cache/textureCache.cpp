@@ -7990,6 +7990,53 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return SynchronizeBufferFromImageCounted(buffer, vaddr, size, nullptr);
 }
 
+bool BufferCache::RawReadImageSyncEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RAW_READ_IMAGE_SYNC");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool BufferCache::SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// A stream-buffer read holds CPU-dirty guest bytes of a range without GPU-written buffer bytes
+	// (as for texel reads, no image download into it). Lock-free: no image registered on the
+	// range's 1 MiB pages (most raw reads).
+	if (&buffer == &m_stream_buffer || !m_texture_cache.MayOverlapImages(vaddr, size)) {
+		return false;
+	}
+	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size, true, true);
+	if (!selected) {
+		return false;
+	}
+	uint32_t width = 0, height = 0, format = 0;
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		const auto*      image = m_texture_cache.m_slot_images.try_get(selected);
+		// Only GPU-written contents differ from the buffer's bytes (a CPU-written image was
+		// uploaded from them).
+		if (image == nullptr || !image->IsGpuModified()) {
+			return false;
+		}
+		width  = image->info.extent.width;
+		height = image->info.extent.height;
+		format = static_cast<uint32_t>(image->backing.format);
+	}
+	const bool synced = SynchronizeBufferFromImage(buffer, vaddr, size);
+	static std::atomic<uint64_t> syncs {0};
+	if (synced) {
+		const auto n = syncs.fetch_add(1, std::memory_order_relaxed) + 1;
+		// The first 16, then at powers of two: how often raw reads take image contents.
+		if (n <= 16 || (n & (n - 1)) == 0) {
+			std::printf("KYTY_RAW_READ_IMAGE_SYNC: #%" PRIu64 " raw read 0x%016" PRIx64 "+0x%" PRIx64
+			            " took a GPU-written image's contents (%ux%u, vk format %u)\n",
+			            n, vaddr, size, width, height, format);
+			std::fflush(stdout);
+		}
+	}
+	return synced;
+}
+
 bool BufferCache::SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                                     bool* nothing) {
 	if (TexelImageSyncStatsEnabled()) [[unlikely]] {

@@ -728,6 +728,11 @@ void Arm(uint64_t base, uint64_t size) {
 }
 
 void ArmDeferred(const char* reason) {
+	// KYTY_GUEST_WRITE_WATCH=<hex address> (diagnostic): a hardware write watch on those 8 bytes,
+	// armed with the deferred probes (KYTY_GUEST_PROBE_ARM_LOAD_END).
+	if (const char* watch = std::getenv("KYTY_GUEST_WRITE_WATCH"); watch != nullptr && *watch != '\0') {
+		ArmWriteWatch(std::strtoull(watch, nullptr, 16) & ~uint64_t {7});
+	}
 	std::scoped_lock lock(g_mutex);
 	for (auto& p: g_probes) {
 		if (p.ring && p.armed) {
