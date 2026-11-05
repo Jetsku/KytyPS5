@@ -7128,6 +7128,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 				metadata->second.clear_mask.set();
 			}
 		}
+		metadata->second.size = std::max(metadata->second.size, desc.info.metadata.range.size);
 		// The only insertion into m_surface_metas (EraseSurfaceMeta). Every draw with this target
 		// asks again; only an added entry is a change (KYTY_META_CLEAR_MEMO's generation).
 		m_surface_meta_inserts += inserted ? 1u : 0u;
@@ -9628,6 +9629,34 @@ bool TextureCache::HtileSliceClearEnabled() {
 		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
+}
+
+bool TextureCache::HtileSizeRuleEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_HTILE_SIZE_RULE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+bool TextureCache::OversizedMetaWrite(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::HTile ||
+	    found->second.size == 0 || size <= found->second.size) {
+		return false;
+	}
+	// Ghost of Yotei: the UI depth target's HTILE (0xa0000 bytes) lies at the start of the contact
+	// shadow mask (0x870000 bytes R8); its per-frame fill was taken as an HTILE clear and dropped.
+	static std::atomic<uint32_t> logged {0};
+	const auto n = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || std::has_single_bit(n)) {
+		LOGF("KYTY_HTILE_SIZE_RULE #%u: write 0x%012" PRIx64 " size 0x%" PRIx64
+		     " larger than its HTILE (0x%" PRIx64 "): ordinary write, entry erased\n",
+		     n, address, size, found->second.size);
+	}
+	EraseSurfaceMeta(address);
+	return true;
 }
 
 bool TextureCache::ClearMetaRange(uint64_t address, uint64_t size) {

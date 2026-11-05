@@ -959,8 +959,12 @@ bool RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				const bool meta_cleared = resource.read ? cache.ClearMeta(descriptor.Base48())
-				                                         : cache.ClearMetaRange(descriptor.Base48(), descriptor.GetSize());
+				// KYTY_HTILE_SIZE_RULE: a write-only fill larger than the HTILE at its base is no clear.
+				const bool oversized = !resource.read && TextureCache::HtileSizeRuleEnabled() &&
+				                       cache.OversizedMetaWrite(descriptor.Base48(), descriptor.GetSize());
+				const bool meta_cleared = oversized       ? false
+				                          : resource.read ? cache.ClearMeta(descriptor.Base48())
+				                                          : cache.ClearMetaRange(descriptor.Base48(), descriptor.GetSize());
 				// KYTY_META_CLEAR_COVER: a write-only fill that starts below a metadata surface
 				// and covers it clears it too; the dispatch still runs (only an exact clear is
 				// consumed), so the bytes before the surface are written as before.

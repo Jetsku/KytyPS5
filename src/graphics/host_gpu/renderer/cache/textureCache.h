@@ -284,6 +284,10 @@ public:
 	// cleared); inside it (a single layer's or a few layers' HTILE bytes) those layers, which
 	// ClearMeta did not see at all. True only for a clear at the base (the caller may consume it).
 	[[nodiscard]] bool ClearMetaRange(uint64_t address, uint64_t size);
+	// KYTY_HTILE_SIZE_RULE=1 (Erlou93/KytyPS5-Yotei ClearMetaWrite): a compute write at an HTILE base
+	// larger than that HTILE is an ordinary write, not a clear: the entry is erased and true returned.
+	[[nodiscard]] bool OversizedMetaWrite(uint64_t address, uint64_t size);
+	[[nodiscard]] static bool HtileSizeRuleEnabled();
 	[[nodiscard]] static bool HtileSliceClearEnabled();
 	// KYTY_META_CLEAR_COVER: marks cleared every surface metadata entry that starts inside
 	// (address, address + size) (the exact start is ClearMeta's); returns how many.
@@ -445,6 +449,8 @@ private:
 		// with all of its image's layers (0 = not known).
 		uint64_t slice_size = 0;
 		uint32_t layers     = 0;
+		// KYTY_HTILE_SIZE_RULE: the largest HTILE size a depth target bound with it (0 = not known).
+		uint64_t size       = 0;
 	};
 
 	struct OverlapResult {
