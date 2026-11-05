@@ -353,10 +353,17 @@ bool BindlessTable::CreatePlaceholders() {
 	                     {}, 0, nullptr, 0, nullptr, Placeholders, to_transfer.data());
 	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 grey (not resident), slot
 	// 1 red (key outside its heap), slot 2 blue (pending), to see which case a surface is in.
-	const bool debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
-	const auto color        = [debug_colors](float r, float g, float b) {
+	// KYTY_BINDLESS_OPAQUE_PLACEHOLDER=1 (startup, default off; Erlou93/KytyPS5-Yotei v0.1.4
+	// KYTY_PERF_BINDLESS_CLASSES): opaque black (0,0,0,1) instead. Ghost of Yotei never samples a
+	// transparent black texture: a texture that is not ready is replaced by an opaque 1x1 default
+	// before the record is written, so a pending key reading alpha 0 hid alpha-tested or blended
+	// surfaces (foliage, decals) while it waited.
+	const bool  debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
+	const char* opaque_env   = std::getenv("KYTY_BINDLESS_OPAQUE_PLACEHOLDER");
+	const float opaque       = opaque_env != nullptr && opaque_env[0] == '1' ? 1.0f : 0.0f;
+	const auto  color        = [debug_colors, opaque](float r, float g, float b) {
         return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
-		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, opaque}};
 	};
 	const std::array<vk::ClearColorValue, PlaceholderColors> colors {
 	    color(0.5f, 0.5f, 0.5f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f)};
