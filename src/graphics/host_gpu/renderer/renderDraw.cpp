@@ -4491,6 +4491,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const auto& meta = d.desc.info.metadata;
 			LOGF("DrawTraceTarget: depth metadata kind %u at 0x%" PRIx64 " size 0x%" PRIx64 "\n",
 			     static_cast<unsigned>(meta.kind), meta.range.address, meta.range.size);
+			{
+				const auto& ctx = buffer.GetRegisters();
+				const auto& bc  = ctx.GetBlendControl(state.color_info[0].target_slot);
+				const auto& vp0 = ctx.GetScreenViewport().viewports[0];
+				const auto  sc  = calc_final_scissor(ctx.GetScreenViewport(), ctx.GetScanModeControl(),
+				                                     state.color_info[0].Extent(), 0);
+				LOGF("DrawTraceTarget: slot %u blend %d src %u dst %u comb %u a %u/%u/%u sep %d rt_mask 0x%08x "
+				     "cb_shader_mask 0x%08x viewport (%g,%g %gx%g z %g/%g) scissor (%d,%d)-(%d,%d) extent %ux%u fmt %u\n",
+				     state.color_info[0].target_slot, bc.enable ? 1 : 0, bc.color_srcblend, bc.color_destblend,
+				     bc.color_comb_fcn, bc.alpha_srcblend, bc.alpha_destblend, bc.alpha_comb_fcn,
+				     bc.separate_alpha_blend ? 1 : 0, ctx.GetRenderTargetMask(),
+				     ctx.GetShaderRegisters().m_cbShaderMask, static_cast<double>(vp0.xoffset - vp0.xscale),
+				     static_cast<double>(vp0.yoffset - vp0.yscale), static_cast<double>(vp0.xscale * 2.0f),
+				     static_cast<double>(vp0.yscale * 2.0f), static_cast<double>(vp0.zoffset),
+				     static_cast<double>(vp0.zscale), sc.left, sc.top, sc.right, sc.bottom,
+				     state.color_info[0].Extent().width, state.color_info[0].Extent().height,
+				     static_cast<unsigned>(state.color_info[0].desc.info.pixel_format));
+			}
 			if (meta.kind == ImageMetadataKind::Htile) SetMetaTraceAddressAuto(meta.range.address);
 		}
 	}
@@ -4563,6 +4581,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				text += fmt::format(" | V#@0x{:x}{}: {:08x} {:08x} {:08x} {:08x} base=0x{:x} stride={} records={}",
 				                    pointer + trace_ps[2], read ? "" : "?", vsharp[0], vsharp[1], vsharp[2],
 				                    vsharp[3], base, (vsharp[1] >> 16u) & 0x3fffu, vsharp[2]);
+				// The same pointer read as an image + sampler table (T# 8 dwords, S# 4 dwords), and the first
+				// bytes of the T#'s 256-byte-aligned base (and of its 0x100-spaced neighbours).
+				uint32_t table[12] {};
+				if (LibKernel::Memory::TryReadBacking(pointer + trace_ps[2], table, sizeof(table))) {
+					text += " | T#S#:";
+					for (const auto word: table) text += fmt::format(" {:08x}", word);
+					const uint64_t tbase = (table[0] | (static_cast<uint64_t>(table[1] & 0xffu) << 32u)) << 8u;
+					text += fmt::format(" tbase=0x{:x} gpu_dirty={}", tbase,
+					                    m_context.GetBufferCache().HasGpuDirtyBytes(tbase, 256) ? 1 : 0);
+					for (uint64_t k = 0; k < 16 && tbase >= 0x400; k++) {
+						uint32_t probe[4] {};
+						if (LibKernel::Memory::TryReadBacking(tbase - 0x400 + k * 0x100, probe, sizeof(probe))) {
+							text += fmt::format(" [{:x}: {:08x} {:08x}]", tbase - 0x400 + k * 0x100, probe[0], probe[1]);
+						}
+					}
+				}
 				uint32_t words[64] {};
 				if (base != 0 && LibKernel::Memory::TryReadBacking(base, words, sizeof(words))) {
 					text += fmt::format(" gpu_dirty={} data:",
