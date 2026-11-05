@@ -2253,6 +2253,15 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 }
 
+// KYTY_OCCLUSION_NO_OUTPUT_DRAWS=1 (live, default off; PPSA26344 preset with KYTY_GPU_OCCLUSION=1; ported from
+// Erlou93/KytyPS5-Yotei v0.1.4 ClassifyNoOutputDraw): a draw that writes no colour target, has no depth/stencil
+// target and no active pixel shader still runs while a guest occlusion query counts it (KYTY_GPU_OCCLUSION): with
+// nothing to test, every covered sample passes and the open query counts it. Ghost of Yotei's bloom draws each
+// sun/moon flare twice, depth-tested and then with the depth test off, and a CS divides the two query results into
+// the flare's visibility; the second draw was dropped here, so the ratio was wrong (flares through walls). Without
+// an open query such a draw is still dropped.
+static Live::Switch g_occlusion_no_output_draws("KYTY_OCCLUSION_NO_OUTPUT_DRAWS", Live::ParseDefaultOff);
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -2388,9 +2397,21 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
-		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
-		                   draw.index_count, 0);
-		return false;
+		auto& occlusion = m_context.GetOcclusionCounter();
+		if (g_occlusion_no_output_draws.On() && OcclusionCounter::Enabled() &&
+		    (occlusion.Active() || occlusion.WouldCount(buffer.GetRegisters().GetDepthCountControl()))) {
+			static std::atomic<uint64_t> counted {0};
+			const auto                   n = counted.fetch_add(1, std::memory_order_relaxed);
+			if (n < 4 || (n & 4095u) == 0) {
+				LOGF("Occlusion: no-output draw %s run for an open query (KYTY_OCCLUSION_NO_OUTPUT_DRAWS, %" PRIu64
+				     " so far)\n",
+				     draw.Name(), n + 1u);
+			}
+		} else {
+			LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
+			                   draw.index_count, 0);
+			return false;
+		}
 	}
 
 	CommitStats::StepMark(CommitStats::Step::MarkBindings);
