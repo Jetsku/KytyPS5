@@ -594,7 +594,9 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto format = ImageResourceAt(state, mem.resource).conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
 	const auto info = Format::GetFormatInfo(format);
-	if (IR::ReadsDepthBits(ImageResourceAt(state, mem.resource))) return info;
+	if (IR::ReadsDepthBits(ImageResourceAt(state, mem.resource)) || Format::IsSrgbFormat(format)) {
+		return info;
+	}
 	EXIT_IF(Prospero::RemapTextureFormat(format) == format || info.component_count == 0u ||
 	        info.component_count > 4u);
 	// Non-packed: scaled formats on a normalized backing. Packed: the raw word in a k32UInt
@@ -682,9 +684,50 @@ uint32_t ImageGatherSource(const EmitterState& state, const IR::MemoryInfo& mem)
 	return selector >= 4u ? (selector - 4u) % info.component_count : 0u;
 }
 
+// The sRGB EOTF of the PS5 sampler for one UNorm-read value (Erlou93/KytyPS5-Yotei SrgbToLinear;
+// 8 / 8_8 sRGB textures, Format::IsSrgbFormat, KYTY_SRGB8_DECODE).
+uint32_t SrgbToLinear(EmitterState& state, uint32_t value) {
+	const auto type   = TypeF32(state);
+	const auto linear = Binary(state, spv::OpFMul, type, value, ConstantF32Value(state, 1.0f / 12.92f));
+	const auto base   = Binary(state, spv::OpFMul, type,
+	                           Binary(state, spv::OpFAdd, type, value, ConstantF32Value(state, 0.055f)),
+	                           ConstantF32Value(state, 1.0f / 1.055f));
+	const auto curve  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, type, curve, GlslStd450(state), GLSLstd450Pow, base,
+	                          ConstantF32Value(state, 2.4f));
+	const auto low    = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), value,
+	                           ConstantF32Value(state, 0.04045f));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, type, result, low, linear, curve);
+	return result;
+}
+
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+	if (Format::IsSrgbFormat(info.format)) {
+		// UNorm backing read as float: decode the colour channels, then the guest swizzle.
+		uint32_t components[4] {};
+		for (uint32_t component = 0; component < info.component_count; component++) {
+			const auto value = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(ctx.state), value, texel,
+			                              component);
+			components[component] = SrgbToLinear(ctx.state, value);
+		}
+		const auto swizzle = ImageResourceAt(ctx.state, mem.resource).shader_swizzle;
+		uint32_t   selected[4] {};
+		for (uint32_t component = 0; component < 4u; component++) {
+			const auto selector = (swizzle >> (component * 3u)) & 7u;
+			selected[component] = selector == 1u ? ConstantF32Value(ctx.state, 1.0f)
+			                      : selector >= 4u && selector - 4u < info.component_count
+			                          ? components[selector - 4u]
+			                          : ZeroF32(ctx.state);
+		}
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 4), result,
+		                              selected[0], selected[1], selected[2], selected[3]);
+		return result;
+	}
 
 	const auto numeric_class = ImageResourceAt(ctx.state, mem.resource).numeric_class;
 	const auto scalar_type   = ImageScalarType(ctx.state, numeric_class);
@@ -770,6 +813,20 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		}
 		return ctx.state.builder.Constant(spv::OpConstantComposite, vector_type, value, value,
 		                                  value, value);
+	}
+	if (Format::IsSrgbFormat(info.format)) {
+		// One stored channel of four texels, each decoded from sRGB (every 8 / 8_8 channel is colour).
+		uint32_t texels[4] {};
+		for (uint32_t index = 0; index < 4u; index++) {
+			const auto value = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(ctx.state), value, gathered,
+			                              index);
+			texels[index] = SrgbToLinear(ctx.state, value);
+		}
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, texels[0],
+		                              texels[1], texels[2], texels[3]);
+		return result;
 	}
 	if (!info.packed_bitfield) {
 		const auto scale  = ConstantF32Value(ctx.state, ScaledFactor(info));

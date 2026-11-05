@@ -50,6 +50,9 @@ bool                       IsFmaskTextureFormat(BufferFormat format);
 bool                       IsDefinedBufferFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
+// KYTY_FMT30_UFLOAT=1 (Erlou93/KytyPS5-Yotei FIX_RT_11_11_10_FLOAT, default on there): format 30
+// (COLOR_11_11_10 UNORM) render targets and textures are packed unsigned floats (B10G11R11_UFLOAT).
+bool                       Fmt30AsFloat();
 
 } // namespace Libs::Graphics::Prospero
 

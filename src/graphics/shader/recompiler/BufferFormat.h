@@ -92,7 +92,10 @@ constexpr ComponentType GetFormatComponentType(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k2_10_10_10UNorm:
 		case Prospero::BufferFormat::k10_10_10_2UNorm:
 		case Prospero::BufferFormat::k8_8_8_8UNorm:
-		case Prospero::BufferFormat::k16_16_16_16UNorm: return ComponentType::Unorm;
+		case Prospero::BufferFormat::k16_16_16_16UNorm:
+		// 8 / 8_8 sRGB textures: UNorm backing, decoded in the shader (IsSrgbFormat, KYTY_SRGB8_DECODE).
+		case Prospero::BufferFormat::k8Srgb:
+		case Prospero::BufferFormat::k8_8Srgb: return ComponentType::Unorm;
 		case Prospero::BufferFormat::k8SNorm:
 		case Prospero::BufferFormat::k16SNorm:
 		case Prospero::BufferFormat::k8_8SNorm:
@@ -136,6 +139,12 @@ constexpr ComponentType GetFormatComponentType(Prospero::BufferFormat format) {
 	}
 }
 
+// The texture formats the shader decodes from sRGB after reading their UNorm backing (Erlou93/
+// KytyPS5-Yotei; KYTY_SRGB8_DECODE): the PS5 sampler converts their colour channels to linear.
+constexpr bool IsSrgbFormat(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb;
+}
+
 constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	const auto type = GetFormatComponentType(format);
 	if (type == ComponentType::Unknown) {
@@ -149,6 +158,7 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k8SScaled:
 		case Prospero::BufferFormat::k8UInt:
 		case Prospero::BufferFormat::k8SInt:
+		case Prospero::BufferFormat::k8Srgb:
 			return {format, type, 1, 1, {8, 0, 0, 0}, {0, 0, 0, 0}, false};
 		case Prospero::BufferFormat::k16UNorm:
 		case Prospero::BufferFormat::k16SNorm:
@@ -164,6 +174,7 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k8_8SScaled:
 		case Prospero::BufferFormat::k8_8UInt:
 		case Prospero::BufferFormat::k8_8SInt:
+		case Prospero::BufferFormat::k8_8Srgb:
 			return {format, type, 2, 2, {8, 8, 0, 0}, {0, 8, 0, 0}, false};
 		case Prospero::BufferFormat::k32UInt:
 		case Prospero::BufferFormat::k32SInt:

@@ -8,6 +8,15 @@
 #include <cstdlib>
 
 namespace Libs::Graphics::Prospero {
+
+bool Fmt30AsFloat() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_FMT30_UFLOAT");
+		return text != nullptr && text[0] == '1';
+	}();
+	return on;
+}
+
 namespace {
 
 struct FormatInfo {
@@ -211,6 +220,9 @@ constexpr auto MakeFormatInfoLookup() {
 constexpr auto kFormatInfoLookup = MakeFormatInfoLookup();
 
 const FormatInfo* FindFormatInfo(BufferFormat format) {
+	if (format == BufferFormat::k11_11_10UNorm && Fmt30AsFloat()) {
+		format = BufferFormat::k11_11_10Float;
+	}
 	const auto index = static_cast<size_t>(format);
 	const auto* info = index < kFormatInfoLookup.size() ? kFormatInfoLookup[index] : nullptr;
 	if (info != nullptr && info->packed_textures_only && !PackedTexturesEnabled()) {
@@ -305,7 +317,8 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 		case BufferFormat::k8_8_8_8SScaled: return BufferFormat::k8_8_8_8SNorm;
 		case BufferFormat::k16_16_16_16UScaled: return BufferFormat::k16_16_16_16UNorm;
 		case BufferFormat::k16_16_16_16SScaled: return BufferFormat::k16_16_16_16SNorm;
-		case BufferFormat::k11_11_10UNorm:
+		// KYTY_FMT30_UFLOAT: format 30 is an unsigned-float texture, not remapped.
+		case BufferFormat::k11_11_10UNorm: return Fmt30AsFloat() ? format : BufferFormat::k32UInt;
 		case BufferFormat::k11_11_10UScaled: return BufferFormat::k32UInt;
 		default: return format;
 	}

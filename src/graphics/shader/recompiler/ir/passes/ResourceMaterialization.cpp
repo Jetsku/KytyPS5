@@ -1078,7 +1078,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		        Prospero::TileMode::kDepth &&
 		    std::ranges::none_of(program.info.sampled_pairs,
 		                         [&](const auto& pair) { return pair.image == i; });
-		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
+		// KYTY_SRGB8_DECODE: a sampled 8 / 8_8 sRGB texture is decoded in the shader (Format::IsSrgbFormat).
+		const bool srgb_decode  = GetCodegenOptions().srgb8_decode && !storage && !base.depth_compare &&
+		                         Format::IsSrgbFormat(format);
+		image.conversion_format = depth_bits || srgb_decode ? format : ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
