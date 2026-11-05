@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::HW {
 
@@ -384,6 +385,16 @@ struct Viewport {
 	bool  viewport_scissor_window_offset_enable = false;
 };
 
+// KYTY_CLIP_RECT_DEFAULT=1 (upstream 4eb5ee110, via Erlou93/KytyPS5-Yotei): clip rects the game never
+// wrote cover (0,0)-(16384,16384), so a clip rule other than 0xffff does not empty the scissor.
+inline int ClipRectDefaultExtent() {
+	static const int extent = [] {
+		const char* value = std::getenv("KYTY_CLIP_RECT_DEFAULT");
+		return value != nullptr && value[0] == '1' ? 16384 : 0;
+	}();
+	return extent;
+}
+
 struct ScreenViewport {
 	Viewport viewports[16];
 	uint32_t transform_control                    = 1087;
@@ -412,8 +423,10 @@ struct ScreenViewport {
 	uint16_t clip_rect_rule                       = 0xffffu;
 	int      clip_rect_left[4]                    = {};
 	int      clip_rect_top[4]                     = {};
-	int      clip_rect_right[4]                   = {};
-	int      clip_rect_bottom[4]                  = {};
+	int      clip_rect_right[4]                   = {ClipRectDefaultExtent(), ClipRectDefaultExtent(),
+	                                                 ClipRectDefaultExtent(), ClipRectDefaultExtent()};
+	int      clip_rect_bottom[4]                  = {ClipRectDefaultExtent(), ClipRectDefaultExtent(),
+	                                                 ClipRectDefaultExtent(), ClipRectDefaultExtent()};
 	bool     clip_rect_window_offset_enable[4]    = {};
 };
 

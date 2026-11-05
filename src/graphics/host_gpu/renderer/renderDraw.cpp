@@ -525,7 +525,7 @@ private:
 // it does not support (the command processor computes the union then, logging it).
 static bool ScissorUnion(const HW::Context& ctx, bool indexed_viewports, bool quiet,
                          vk::Rect2D& result) {
-	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	constexpr uint32_t viewport_slots = std::extent_v<decltype(HW::ScreenViewport::viewports)>;
 	const auto&        vp             = ctx.GetScreenViewport();
 	const vk::Extent2D unbounded {16384, 16384};
 	int64_t            left   = INT64_MAX;
@@ -603,7 +603,7 @@ static vk::Viewport MakeDynamicViewport(const HW::Context& ctx, const vk::Physic
 
 bool DrawPrep::PlanDynamicViewports(const HW::Context& ctx, const vk::PhysicalDeviceLimits& limits,
                                     bool indexed_viewports, DynamicViewportPlan& plan) {
-	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	constexpr uint32_t viewport_slots = std::extent_v<decltype(HW::ScreenViewport::viewports)>;
 	static_assert(viewport_slots <= DynamicViewportPlan::MaxViewports);
 	plan.valid      = false;
 	plan.count      = indexed_viewports ? viewport_slots : 1;
@@ -637,7 +637,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
-	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	constexpr uint32_t viewport_slots = std::extent_v<decltype(HW::ScreenViewport::viewports)>;
 	std::array<vk::Viewport, viewport_slots> viewports {};
 	std::array<vk::Rect2D, viewport_slots>   scissors {};
 	const auto scissor_rect = [](const ScissorRect& final_scissor) {
