@@ -98,6 +98,10 @@ struct BindlessHeap {
 	uint64_t                             touched_frame    = UINT64_MAX;
 	uint32_t                             runtime_next_key = 0;
 	std::vector<std::array<uint32_t, 8>> runtime_dwords;
+	// KYTY_BINDLESS_REFRESH: the last frame every resolved key was looked up again, and the keys
+	// whose image the GPU writes (looked up again by every draw that uses the heap).
+	uint64_t                             refresh_frame = UINT64_MAX;
+	std::vector<uint32_t>                refresh_gpu_keys;
 };
 
 // Descriptor set 1 of every pipeline that samples bindless images: typed arrays of sampled
@@ -187,6 +191,16 @@ public:
 		           ? entry & ~ShaderRecompiler::IR::BindlessSlotFlagMask
 		           : entry;
 	}
+	// The image view slot `slot` of `binding` holds (null: a placeholder or nothing).
+	[[nodiscard]] vk::ImageView SlotView(uint32_t binding, uint32_t slot) const noexcept {
+		return binding < ImageArrays && slot < m_slot_views[binding].size() ? m_slot_views[binding][slot]
+		                                                                     : vk::ImageView {};
+	}
+	// KYTY_BINDLESS_REFRESH: slot `slot` of `binding` now shows `view` of `new_id`; every key that
+	// samples the slot through `old_id` moves its image reference to `new_id` (the shared slot too).
+	// True when `old_id` has no reference left.
+	bool RemapSlotImage(uint32_t binding, uint32_t slot, ImageId old_id, ImageId new_id, vk::ImageView view,
+	                    vk::ImageLayout layout);
 	// Queue a slot for reuse once the GPU is past the current tick (at most once; IDXTRI).
 	void FreeSlot(uint32_t binding, uint32_t slot);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);

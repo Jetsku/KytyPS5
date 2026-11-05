@@ -1214,6 +1214,18 @@ private:
 	std::vector<uint64_t>                               m_bindless_heap_marks;
 	std::vector<ImageId>                       m_bindless_changed;
 	std::vector<uint32_t>                      m_bindless_srt;
+	// KYTY_BINDLESS_REFRESH (Erlou93/KytyPS5-Yotei RefreshBindlessDescriptor): a resolved key's T# is
+	// looked up again once per frame, and by every draw while its image is GPU-written; per slot of
+	// each image array, the frame and draw it was last looked up and whether its image is GPU-written.
+	struct BindlessRefreshState {
+		uint64_t frame       = UINT64_MAX;
+		uint64_t draw        = 0;
+		bool     gpu_written = false;
+	};
+	void RefreshBindlessHeap(BindlessHeap& heap, uint32_t keys);
+	bool RefreshBindlessSlot(BindlessHeap& heap, uint32_t key, BindlessRefreshState& state);
+	std::array<std::vector<BindlessRefreshState>, 4> m_bindless_refresh;
+	uint64_t                                         m_bindless_refresh_draw = 0;
 
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);

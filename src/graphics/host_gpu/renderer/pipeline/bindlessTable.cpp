@@ -1168,6 +1168,53 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key, bool free_slot) {
 	return no_refs;
 }
 
+bool BindlessTable::RemapSlotImage(uint32_t binding, uint32_t slot, ImageId old_id, ImageId new_id,
+                                   vk::ImageView view, vk::ImageLayout layout) {
+	WriteSlot(binding, slot, view, layout);
+	if (old_id == new_id) {
+		return false;
+	}
+	if (const auto words = m_shared_slot_words.find((uint64_t {binding} << 32u) | slot);
+	    words != m_shared_slot_words.end()) {
+		if (const auto shared = m_shared_slots.find(words->second); shared != m_shared_slots.end()) {
+			shared->second.image = new_id;
+		}
+	}
+	std::vector<std::pair<Heap*, uint32_t>> moved;
+	bool                                    no_refs = false;
+	if (const auto found = m_image_refs.find(ImageKey(old_id)); found != m_image_refs.end()) {
+		auto& refs = found->second;
+		std::erase_if(refs, [&](const std::pair<Heap*, uint32_t>& ref) {
+			const auto entry = ref.first->slots[ref.second];
+			if (entry == 0 || SlotBinding(*ref.first, entry) != binding || SlotIndex(entry) != slot) {
+				return false;
+			}
+			moved.push_back(ref);
+			return true;
+		});
+		for (const auto& [heap, key]: moved) {
+			heap->images[key] = new_id;
+			if (std::find(heap->resolved.begin(), heap->resolved.end(), new_id) == heap->resolved.end()) {
+				heap->resolved.push_back(new_id);
+			}
+			heap->unchecked.push_back(new_id);
+			if (std::none_of(refs.begin(), refs.end(), [&](const auto& ref) { return ref.first == heap; })) {
+				std::erase(heap->resolved, old_id);
+				heap->checked_generation = 0;
+			}
+		}
+		if (refs.empty()) {
+			m_image_refs.erase(found);
+			no_refs = true;
+		}
+	}
+	if (!moved.empty()) {
+		auto& refs = m_image_refs[ImageKey(new_id)];
+		refs.insert(refs.end(), moved.begin(), moved.end());
+	}
+	return no_refs;
+}
+
 void BindlessTable::OnImageUnregistered(ImageId id) {
 	const auto found = m_image_refs.find(ImageKey(id));
 	if (found == m_image_refs.end()) {
