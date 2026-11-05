@@ -3019,6 +3019,47 @@ ImageId TextureCache::StencilPlaneDepth(uint64_t plane_address) {
 	return found->second;
 }
 
+// KYTY_STENCIL_READ_PARTNER=1 (default off; Erlou93/KytyPS5-Yotei parity): with KYTY_STENCIL_READ_DEPTH,
+// a sampled read of a plane T# that resolves to a plain 1-byte image (no stencil association) binds
+// the plane its depth image swapped away from when it took this one in, instead of this plane.
+// Ghost of Yotei's Deferred wetness 84f5a0d3 reads plane B (0x50615a0000, the z-fail volume
+// counts, ro[1.1]) and plane A (0x5004850000, the G-buffer classes, ro[1.2]); Erlou swaps plane A
+// back into the D32S8 before the dispatch and binds the D32S8 for both, so its wetness mask is set
+// on every classed pixel that has no G-buffer wetness (zero 0.795 vs ours 0.982 at the torii).
+// Whether the PS5 reads the volume counts there is not known; this switch reproduces Erlou.
+bool TextureCache::StencilReadPartnerEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_READ_PARTNER");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) {
+			LOGF("Stencil planes: a redirected plane read binds the partner plane (KYTY_STENCIL_READ_PARTNER=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+ImageId TextureCache::StencilPlanePartnerRecord(uint64_t plane_address) {
+	std::scoped_lock lock {m_lock};
+	const auto       partner = m_stencil_plane_partner.find(plane_address);
+	const auto       depth   = m_stencil_plane_depth.find(plane_address);
+	if (partner == m_stencil_plane_partner.end() || depth == m_stencil_plane_depth.end()) {
+		return {};
+	}
+	const auto* image = m_slot_images.try_get(depth->second);
+	if (image == nullptr) {
+		return {};
+	}
+	for (const auto record_id: image->stencil_ids) {
+		if (const auto* record = m_slot_images.try_get(record_id);
+		    record != nullptr && record->registered && record->depth_id == depth->second &&
+		    record->info.data.address == partner->second) {
+			return record_id;
+		}
+	}
+	return {};
+}
+
 bool TextureCache::StencilPlaneHeld(const Image& record) const {
 	const auto* depth = record.depth_id ? m_slot_images.try_get(record.depth_id) : nullptr;
 	return depth == nullptr || !SwapsStencilPlanes(*depth) ||
@@ -3038,6 +3079,7 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 	// KYTY_STENCIL_READ_DEPTH: both planes are known to belong to this depth image.
 	m_stencil_plane_depth[previous]   = depth_id;
 	m_stencil_plane_depth[next_plane] = depth_id;
+	m_stencil_plane_partner[next_plane] = previous;
 	// The stencil aspect is saved as it is: a pending refresh of the held plane's record from guest
 	// memory stays pending (its record is not held after the swap, so the refresh is applied when
 	// the plane is swapped back in, after the restore).

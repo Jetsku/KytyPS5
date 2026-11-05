@@ -332,6 +332,11 @@ public:
 	bool FillStencilPlaneSaved(CommandBuffer& command, ImageId depth_id, ImageId record_id, uint8_t value,
 	                           const char* what);
 	[[nodiscard]] ImageId     StencilPlaneDepth(uint64_t plane_address);
+	// KYTY_STENCIL_READ_PARTNER=1 (default off; Erlou93/KytyPS5-Yotei parity, see the .cpp): a sampled
+	// read redirected by KYTY_STENCIL_READ_DEPTH binds the plane the depth image swapped away from
+	// (StencilPlanePartnerRecord: its stencil association record, or none).
+	[[nodiscard]] static bool StencilReadPartnerEnabled();
+	[[nodiscard]] ImageId     StencilPlanePartnerRecord(uint64_t plane_address);
 	// KYTY_STENCIL_ALIAS_COPY=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_ALIAS_COPY,
 	// a logged approximation for dynamic resolution; PPSA26344 preset, default off): a 1-byte
 	// image at a stencil plane's address with another extent than its depth image (the plane read
@@ -782,6 +787,8 @@ private:
 	uint64_t                                        m_stencil_plane_serial = 0;
 	// KYTY_STENCIL_READ_DEPTH: plane address -> the depth image that swapped to or from it.
 	std::unordered_map<uint64_t, ImageId>           m_stencil_plane_depth;
+	// KYTY_STENCIL_READ_PARTNER: plane address -> the plane the depth image held before it.
+	std::unordered_map<uint64_t, uint64_t>          m_stencil_plane_partner;
 	std::shared_ptr<Buffer>                         m_stencil_alias_staging;
 	// KYTY_PRESERVE_STENCIL_RECREATE: the stencil of the last depth image replaced by a colour image.
 	void SaveRecreatedStencil(Image& depth);

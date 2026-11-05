@@ -1452,6 +1452,27 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 			LOGF("KYTY_STENCIL_READ_DEPTH: plane 0x%012" PRIx64 " read as the stencil of depth 0x%012" PRIx64 "\n",
 			     texture_cache.GetImage(found).info.data.address, image->info.data.address);
 		}
+		// KYTY_STENCIL_READ_PARTNER: the plane the depth image swapped away from (Erlou parity).
+		if (TextureCache::StencilReadPartnerEnabled()) {
+			const auto plane_address = texture_cache.GetImage(found).info.data.address;
+			const auto partner       = texture_cache.StencilPlanePartnerRecord(plane_address);
+			if (partner) {
+				bool       plane_copy = false;
+				const auto reader     = texture_cache.StencilPlaneReader(partner, plane_copy);
+				if (plane_copy) {
+					id                    = reader;
+					image                 = &texture_cache.GetImage(id);
+					desc.view_info.format = vk::Format::eR8Uint;
+					desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+				}
+				static std::atomic<uint32_t> partner_logged {0};
+				if (partner_logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+					LOGF("KYTY_STENCIL_READ_PARTNER: plane 0x%012" PRIx64 " read as plane 0x%012" PRIx64 " (%s)\n",
+					     plane_address, texture_cache.GetImage(partner).info.data.address,
+					     plane_copy ? "saved copy" : "held");
+				}
+			}
+		}
 	} else if (stencil_association) {
 		const auto record_id = id;
 		id    = image->depth_id;
