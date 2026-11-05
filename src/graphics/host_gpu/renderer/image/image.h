@@ -141,6 +141,9 @@ public:
 	// A fresh serial from the same sequence, for ordering other writers against image writes
 	// (BufferCache::InvalidateContentRevisions stamps unbounded buffer writers with it).
 	[[nodiscard]] static uint64_t NextContentSerial() noexcept;
+	// KYTY_STENCIL_PLANE_SYNC (TextureCache::SwapStencilPlane): a NextContentSerial() taken at the
+	// last storage binding or colour clear of this image (not at host-side copies); 0: none.
+	uint64_t shader_write_serial = 0;
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(live.address, live.size, vaddr, size)) {

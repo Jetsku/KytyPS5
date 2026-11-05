@@ -324,6 +324,11 @@ public:
 	// KYTY_STENCIL_PLANE_FILL_SAVED (default on): a fill of a plane the depth image does not hold
 	// fills the plane's saved copy (ClearImageFromBuffer).
 	[[nodiscard]] static bool StencilPlaneFillSavedEnabled();
+	// KYTY_STENCIL_PLANE_SYNC=2 (default; =0 off; based on Erlou93/KytyPS5-Yotei
+	// WORKAROUND_STENCIL_PLANE_SYNC level 2): at swap-in, a 1-byte colour image at the plane's address
+	// and the depth image's extent that a shader or clear wrote after the plane's saved copy is the
+	// plane's contents (loaded instead of the stale copy).
+	[[nodiscard]] static int StencilPlaneSyncLevel();
 	bool FillStencilPlaneSaved(CommandBuffer& command, ImageId depth_id, ImageId record_id, uint8_t value,
 	                           const char* what);
 	[[nodiscard]] ImageId     StencilPlaneDepth(uint64_t plane_address);
@@ -768,6 +773,8 @@ private:
 		uint32_t                width  = 0;
 		uint32_t                height = 0;
 		uint64_t                serial = 0;
+		// KYTY_STENCIL_PLANE_SYNC: Image::NextContentSerial() when the copy was last written.
+		uint64_t                content_serial = 0;
 		ImageId                 reader {};
 		uint64_t                reader_serial = 0;
 	};
