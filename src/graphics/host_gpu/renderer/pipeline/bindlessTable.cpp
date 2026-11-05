@@ -621,6 +621,27 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	return true;
 }
 
+uint32_t BindlessViewKeyMode() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_VIEW_KEY");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return mode;
+}
+
+uint64_t BindlessViewKey(const ShaderRecompiler::IR::ImageResource& resource) {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&](uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+	mix(static_cast<uint64_t>(resource.numeric_class));
+	mix(static_cast<uint64_t>(resource.dimension));
+	mix(static_cast<uint64_t>(resource.mip_mode));
+	mix(resource.mip_count);
+	mix(static_cast<uint64_t>(resource.conversion_format));
+	mix(resource.shader_swizzle);
+	mix((resource.depth_compare ? 1u : 0u) | (resource.cube ? 2u : 0u) | (resource.r128 ? 4u : 0u));
+	return hash == 0 ? 1 : hash;
+}
+
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
     uint64_t base, uint32_t table_offset, uint32_t binding, uint32_t entries,
     const ShaderRecompiler::IR::ImageResource& resource, uint32_t stride, uint32_t record_pointer,
@@ -628,14 +649,35 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	if (entries == 0 || m_set == nullptr) {
 		return nullptr;
 	}
-	static const auto no_heaps = std::vector<Heap*> {};
-	const auto        indexed  = m_heaps_by_base.find(base);
+	static const auto no_heaps  = std::vector<Heap*> {};
+	const auto        indexed   = m_heaps_by_base.find(base);
+	const auto        view_mode = BindlessViewKeyMode();
+	const uint64_t    view_key  = view_mode != 0 ? BindlessViewKey(resource) : 0;
 	for (auto* candidate: indexed == m_heaps_by_base.end() ? no_heaps : indexed->second) {
 		auto& heap = *candidate;
 		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding &&
 		    heap.stride == stride && heap.record_pointer == record_pointer &&
 		    heap.nested_vsharp == nested_vsharp && heap.nested_heap == nested_heap &&
-		    heap.nested_keys == nested_keys) {
+		    heap.nested_keys == nested_keys && (view_mode < 2 || heap.view_key == view_key)) {
+			// KYTY_BINDLESS_VIEW_KEY=1: a user that views the heap differently than the user that
+			// created it (whose resource every key is resolved with).
+			if (view_mode == 1 && BindlessViewKey(heap.resource) != view_key) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+					const auto& a = heap.resource;
+					LOGF("Bindless view key: heap 0x%016" PRIx64 "+%u b%u entries %u viewed differently: "
+					     "class %u/%u dim %u/%u mip %u:%u/%u:%u conv %u/%u swz %08x/%08x cmp %d/%d cube %d/%d "
+					     "r128 %d/%d\n",
+					     base, table_offset, binding, heap.entries, static_cast<uint32_t>(a.numeric_class),
+					     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(a.dimension),
+					     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(a.mip_mode), a.mip_count,
+					     static_cast<uint32_t>(resource.mip_mode), resource.mip_count,
+					     static_cast<uint32_t>(a.conversion_format), static_cast<uint32_t>(resource.conversion_format),
+					     a.shader_swizzle, resource.shader_swizzle, a.depth_compare ? 1 : 0,
+					     resource.depth_compare ? 1 : 0, a.cube ? 1 : 0, resource.cube ? 1 : 0, a.r128 ? 1 : 0,
+					     resource.r128 ? 1 : 0);
+				}
+			}
 			// A heap that cannot grow keeps its region (keys beyond it read as out of range).
 			if (entries > heap.entries && !AllocateRegion(heap, entries) && heap.entries == 0) {
 				return nullptr;
@@ -655,6 +697,7 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	heap.nested_keys    = nested_keys;
 	heap.binding        = binding;
 	heap.resource      = resource;
+	heap.view_key      = view_mode >= 2 ? view_key : 0;
 	heap.guest_entries = entries;
 	// KYTY_BINDLESS_SMALL_HEAPS=1 (default 0; PPSA26344 preset): a new heap reserves its guest
 	// entries (at least 16) instead of at least 16 Ki. Ghost of Yotei samples T#s from hundreds
@@ -1087,8 +1130,9 @@ void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 }
 
 const BindlessTable::SharedSlot* BindlessTable::FindSharedSlot(uint32_t binding,
-                                                               const std::array<uint32_t, 8>& words) {
-	const auto found = m_shared_slots.find(SharedSlotKey {binding, words});
+                                                               const std::array<uint32_t, 8>& words,
+                                                               uint64_t view_key) {
+	const auto found = m_shared_slots.find(SharedSlotKey {binding, words, view_key});
 	if (found == m_shared_slots.end()) {
 		return nullptr;
 	}
@@ -1120,7 +1164,7 @@ void BindlessTable::NoteSharedSlot(const Heap& heap, const std::array<uint32_t, 
 	if (entry == 0u) {
 		return;
 	}
-	const SharedSlotKey key {heap.binding, words};
+	const SharedSlotKey key {heap.binding, words, heap.view_key};
 	const uint64_t      slot_key = (uint64_t {SlotBinding(heap, entry)} << 32u) | SlotIndex(entry);
 	// A slot holds one T#; one T# names one slot.
 	if (const auto old = m_shared_slot_words.find(slot_key); old != m_shared_slot_words.end()) {

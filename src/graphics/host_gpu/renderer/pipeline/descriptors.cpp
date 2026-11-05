@@ -2660,7 +2660,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	// KYTY_BINDLESS_SHARE_SLOTS: a T# another key already resolved shares that key's slot.
 	if (BindlessShareSlots() && !heap.runtime) {
-		if (const auto* found = table.FindSharedSlot(heap.binding, heap.descriptors[key]); found != nullptr) {
+		if (const auto* found = table.FindSharedSlot(heap.binding, heap.descriptors[key], heap.view_key); found != nullptr) {
 			const auto id    = found->image;
 			const auto entry = found->entry;
 			auto*      image = m_context.GetTextureCache().m_slot_images.try_get(id);
@@ -2898,7 +2898,7 @@ void RenderExecutor::PrefillBindlessHeap(BindlessHeap& heap, uint32_t entries) {
 			skipped++;
 			continue;
 		}
-		if (const auto* found = table.FindSharedSlot(heap.binding, words); found != nullptr) {
+		if (const auto* found = table.FindSharedSlot(heap.binding, words, heap.view_key); found != nullptr) {
 			const auto id    = found->image;
 			const auto entry = found->entry;
 			auto*      image = cache.m_slot_images.try_get(id);
