@@ -1,5 +1,6 @@
 #include "common/compileWatch.h"
 
+#include "common/kytyEvents.h"
 #include "common/logging/log.h"
 
 #include <algorithm>
@@ -325,12 +326,14 @@ bool Enabled() {
 }
 
 Build::Build(Kind kind, uint64_t hash, uint64_t hash2) {
+	KytyEvents::NoteBuildStart();
 	if (!Enabled()) return;
 	EnsureMonitor();
 	m_slot = Claim(S().builds, kind, nullptr, hash, hash2);
 }
 
 Build::~Build() {
+	KytyEvents::NoteBuildEnd();
 	if (m_slot >= 0) S().builds[static_cast<size_t>(m_slot)].state.store(0, std::memory_order_release);
 }
 
