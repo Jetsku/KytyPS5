@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/guestProbe.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -2662,7 +2663,107 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	return FindActiveSourcesImpl();
 }
 
+// KYTY_SRT_SLOT_WATCH=<shader hash>:<flat slot>[,<flat slot>...] (diagnostic, default off): for
+// that shader, the guest address each listed flat slot's raw read resolves to, the flat value and
+// the guest dwords around it (refreshes 1-4, then every 2000th, at most 80 lines), and a hardware
+// write watch (GuestWatch: lines) on the first listed slot whose value is 0. Trace replay is
+// bypassed for the shader so the walk runs.
+namespace {
+struct SlotWatch {
+	uint64_t              hash = 0;
+	std::vector<uint32_t> slots;
+};
+const SlotWatch& SlotWatchSettings() {
+	static const SlotWatch watch = [] {
+		SlotWatch   parsed;
+		const char* value = std::getenv("KYTY_SRT_SLOT_WATCH");
+		if (value == nullptr || value[0] == '\0') return parsed;
+		char* end   = nullptr;
+		parsed.hash = std::strtoull(value, &end, 16);
+		while (end != nullptr && (*end == ':' || *end == ',')) {
+			parsed.slots.push_back(static_cast<uint32_t>(std::strtoul(end + 1, &end, 10)));
+		}
+		return parsed;
+	}();
+	return watch;
+}
+} // namespace
+
+static uint64_t GetTickCountMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void SrtWalker::DiagWatchSlots(const std::vector<uint32_t>& flat) {
+	static std::mutex mutex;
+	static uint64_t   refreshes = 0;
+	static uint32_t   lines     = 0;
+	static bool       armed     = false;
+	static uint32_t   last_first = 0xdeadbeefu;
+	static auto       last_time  = std::chrono::steady_clock::now();
+	std::scoped_lock  lock(mutex);
+	const auto        n     = ++refreshes;
+	const auto&       slots = SlotWatchSettings().slots;
+	const uint32_t    first = !slots.empty() && slots[0] < flat.size() ? flat[slots[0]] : 0u;
+	const auto        now   = std::chrono::steady_clock::now();
+	// Refreshes 1-4, whenever the first listed slot changes, and every 10 s; at most 160 lines.
+	if (!(n <= 4 || first != last_first || now - last_time >= std::chrono::seconds(10)) || lines >= 160) return;
+	last_first = first;
+	last_time  = now;
+	auto* const saved = m_trace;
+	m_trace           = nullptr;
+	for (const auto slot: slots) {
+		std::string line  = fmt::format("SrtSlotWatch: t={} shader {:016x} refresh {} flat[{}]", GetTickCountMs(),
+		                                m_program.shader_hash, n, slot);
+		uint32_t    index = UINT32_MAX;
+		for (uint32_t i = 0; i < m_program.srt_reads.size(); i++) {
+			if (m_program.srt_reads[i].flat_offset == slot) {
+				index = i;
+				break;
+			}
+		}
+		if (index == UINT32_MAX) {
+			line += " not a flat read";
+		} else {
+			line += fmt::format(" = {:08x} read {}", slot < flat.size() ? flat[slot] : 0u, index);
+			uint32_t    memo    = 0;
+			const auto* inst    = FlatReadInstruction(index, memo);
+			uint64_t    address = 0, available = 0;
+			if (inst == nullptr || (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			                        inst->GetOpcode() != ValueOpcode::ReadConstBuffer)) {
+				line += fmt::format(" derived (op {})", inst != nullptr ? static_cast<int>(inst->GetOpcode()) : -1);
+			} else if (!ResolveRawReadAddress(*inst, address, available)) {
+				line += " address unresolved";
+			} else if (address == OutOfRangeReadAddress) {
+				line += " OUT OF RANGE (reads 0)";
+			} else {
+				line += fmt::format(" {} addr 0x{:x} avail {} mem",
+				                    inst->GetOpcode() == ValueOpcode::ReadConstBuffer ? "cb" : "ptr", address, available);
+				for (int k = -4; k < 8; k++) {
+					uint64_t   word = 0;
+					const auto a    = address + static_cast<uint64_t>(static_cast<int64_t>(k) * 4);
+					line += ReadRawWord(a, word, false) ? fmt::format(" {:08x}", static_cast<uint32_t>(word)) : " ????????";
+				}
+				if (!armed && slot == slots[0] && slot < flat.size() && flat[slot] == 0u) {
+					armed = true;
+					line += " -> write watch armed";
+					Common::GuestProbe::ArmWriteWatch(address & ~uint64_t {7});
+				}
+			}
+		}
+		lines++;
+		Log::WriteToConsoleAndLog(line + "\n");
+	}
+	m_trace = saved;
+}
+
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (SlotWatchSettings().hash != 0 && SlotWatchSettings().hash == m_program.shader_hash) [[unlikely]] {
+		const bool ok = RefreshFlatBufferImpl(flat);
+		if (ok) DiagWatchSlots(flat);
+		return ok;
+	}
 	if (m_trace != nullptr && m_program.srt_plan_complete) [[unlikely]] {
 		return m_trace->FlatBuffer(*this, flat);
 	}

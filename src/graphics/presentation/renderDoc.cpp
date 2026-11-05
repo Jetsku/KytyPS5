@@ -179,9 +179,24 @@ static void AutoCaptureOnFlip() {
 		}
 		return list;
 	}();
-	if (flips.empty()) return;
+	// KYTY_RENDERDOC_CAPTURE_FILE=<path> (default unset): every 8th guest flip the file is checked;
+	// when it exists it is deleted and a capture is requested, so a test runner can capture at an
+	// event (a KYTY_EVENT line) instead of a guessed flip number.
+	static const char* trigger = [] {
+		const auto* value = std::getenv("KYTY_RENDERDOC_CAPTURE_FILE");
+		return value != nullptr && *value != '\0' ? value : nullptr;
+	}();
 	static uint64_t flip = 0;
 	++flip;
+	if (trigger != nullptr && (flip % 8u) == 0u) {
+		std::error_code error;
+		if (std::filesystem::exists(trigger, error) && std::filesystem::remove(trigger, error)) {
+			std::printf("RenderDoc: capture requested by KYTY_RENDERDOC_CAPTURE_FILE at guest flip %llu\n",
+			            static_cast<unsigned long long>(flip));
+			RenderDocRequestCapture();
+		}
+	}
+	if (flips.empty()) return;
 	for (const auto n: flips) {
 		if (n == flip) {
 			std::printf("RenderDoc: automatic capture at guest flip %llu (KYTY_RENDERDOC_CAPTURE_FLIPS)\n",

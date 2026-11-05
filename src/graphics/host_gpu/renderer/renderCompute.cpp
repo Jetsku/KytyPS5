@@ -1498,6 +1498,13 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	RecordHtileRewriteClear(buffer.GetContext().GetTextureCache(), input_info);
 	if (UpdateComputeMetaClears(input_info, buffer, &keep_meta_dispatch) &&
 	    !ComputeMetaClearDispatchEnabled() && !keep_meta_dispatch) {
+		// KYTY_STENCIL_PLANE_SYNC=2: the consumed fill may also cover images at the same address (Ghost
+		// of Yotei zero-fills its z-fail volume stencil plane 0x50615a0000, also an HTile there, every
+		// frame); give them the clear too, or the plane keeps last frame's counts.
+		if (TextureCache::StencilPlaneSyncLevel() >= 2 && TextureCache::PreserveStencilEnabled()) {
+			(void)TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y, thread_group_z,
+			                                  mode);
+		}
 		ResetBindings();
 		return;
 	}

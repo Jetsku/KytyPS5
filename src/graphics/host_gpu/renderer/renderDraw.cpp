@@ -4573,6 +4573,58 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			LOGF("%s\n", text.c_str());
 		}
 	}
+	// KYTY_DRAW_TRACE_CB=<vs hash>[:<max lines>[:<every n frames>]] (diagnostic; default 300 lines, every
+	// 10 frames): for the draws with this vertex program, the first 64 dwords of each PS and VS buffer
+	// from guest memory (with whether a GPU write of them is pending), to compare per-draw constants
+	// (fade/dissolve values) between boots.
+	static const auto trace_cb = [] {
+		std::array<uint64_t, 3> parsed {0, 300, 10};
+		if (const auto* value = std::getenv("KYTY_DRAW_TRACE_CB"); value != nullptr) {
+			char* end = nullptr;
+			parsed[0] = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') {
+				parsed[1] = std::strtoull(end + 1, &end, 10);
+				if (end != nullptr && *end == ':') parsed[2] = std::max<uint64_t>(1, std::strtoull(end + 1, &end, 10));
+			}
+		}
+		return parsed;
+	}();
+	if (trace_cb[0] != 0 && state.vertex_info[0].stage.program != nullptr &&
+	    state.vertex_info[0].stage.program->shader_hash == trace_cb[0]) {
+		static std::atomic<uint32_t> traced {0};
+		static std::atomic<int64_t>  last_frame {-1000000};
+		const auto                   frame = static_cast<int64_t>(m_context.GetGpu().GetFrameNum());
+		const auto                   last  = last_frame.load(std::memory_order_relaxed);
+		if ((frame == last || frame - last >= static_cast<int64_t>(trace_cb[2])) &&
+		    traced.fetch_add(1, std::memory_order_relaxed) < trace_cb[1]) {
+			if (frame != last) last_frame.store(frame, std::memory_order_relaxed);
+			std::string text = fmt::format("DrawTraceCb: frame={} vs=0x{:016x} ps=0x{:016x} n={} inst={}", frame,
+			                               trace_cb[0],
+			                               state.ps_active && state.ps_input_info.stage.program != nullptr
+			                                   ? state.ps_input_info.stage.program->shader_hash
+			                                   : 0,
+			                               draw.index_count, draw.instance_count);
+			const auto dump = [&](const char* stage, const auto* program, const auto* resources) {
+				if (program == nullptr || resources == nullptr) return;
+				text += fmt::format(" | {} ud:", stage);
+				for (const auto word: resources->user_data) text += fmt::format(" {:08x}", word);
+				for (uint32_t i = 0; i < program->info.buffers.size() && i < resources->buffers.size(); i++) {
+					const auto r    = DecodeNativeDescriptor<ShaderBufferResource>(resources->buffers[i]);
+					const auto base = r.Base48();
+					text += fmt::format(" | {}b{}{}=0x{:x}/s{}/n{}", stage, i, program->info.buffers[i].written ? "w" : "",
+					                    base, r.Stride(), r.NumRecords());
+					uint32_t words[64] {};
+					if (base != 0 && LibKernel::Memory::TryReadBacking(base, words, sizeof(words))) {
+						text += fmt::format(" d{}:", m_context.GetBufferCache().HasGpuDirtyBytes(base, sizeof(words)) ? 1 : 0);
+						for (const auto word: words) text += fmt::format(" {:08x}", word);
+					}
+				}
+			};
+			if (state.ps_active) dump("ps", state.ps_input_info.stage.program, state.ps_input_info.stage.resources);
+			dump("vs", state.vertex_info[0].stage.program, state.vertex_info[0].stage.resources);
+			LOGF("%s\n", text.c_str());
+		}
+	}
 	if (WatchRange::Enabled() || WatchRange::CpFaultWritersEnabled()) {
 		WatchRange::SetCurrentOp("draw", state.ps_active && state.ps_input_info.stage.program != nullptr
 		                                     ? state.ps_input_info.stage.program->shader_hash

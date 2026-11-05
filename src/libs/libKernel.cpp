@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/kytyEvents.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -1402,6 +1403,11 @@ static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 
 	if (d > 2) {
 		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
+	}
+
+	// fd 1/2: the game's own console text (dropped before KYTY_GUEST_CONSOLE).
+	if ((d == 1 || d == 2) && size > 0) {
+		KytyEvents::GuestWrite(d, str, static_cast<size_t>(size));
 	}
 
 	int size_int = static_cast<int>(size);

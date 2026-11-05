@@ -330,6 +330,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
 	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                     sync_images, id);
+	if (!resource.written && !sync_images && BufferCache::RawReadImageSyncEnabled()) {
+		// KYTY_RAW_READ_IMAGE_SYNC (BufferCache::SyncRawReadFromWrittenImage).
+		(void)context.GetBufferCache().SyncRawReadFromWrittenImage(*buffer, address, size);
+	}
 	if (lookup_start != 0) {
 		// KYTY_BUFFER_LOOKUP_STATS.
 		const auto outcome = BufferLookupStats::TakeOutcome();
@@ -1473,9 +1477,10 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 				            image->info.data.address, image->backing.extent.width,
 				            image->backing.extent.height, static_cast<int>(image->backing.format));
 			}
-		} else if (TextureCache::PreserveStencilEnabled() && !TextureCache::StencilReadDepthEnabled()) {
+		} else if (TextureCache::PreserveStencilEnabled() &&
+		           (!TextureCache::StencilReadDepthEnabled() || TextureCache::StencilReadHeldEnabled())) {
 			// KYTY_PRESERVE_STENCIL: a plane the depth image does not hold is read from its saved copy
-			// (KYTY_STENCIL_READ_DEPTH: the depth image's stencil instead, as Erlou93/KytyPS5-Yotei).
+			// (KYTY_STENCIL_READ_DEPTH with KYTY_STENCIL_READ_HELD=0: the depth image's stencil instead).
 			bool       plane_copy = false;
 			const auto reader     = texture_cache.StencilPlaneReader(record_id, plane_copy);
 			if (plane_copy) {
@@ -3954,6 +3959,64 @@ static void NoteBufferOutOfBoundsMode(const ShaderBufferResource& descriptor, ui
 	     descriptor.NumRecords(), address);
 }
 
+// KYTY_BUFFER_PEEK=<shader hash hex>[:<begin hex>-<end hex>] (diagnostic, off by default): when
+// that shader binds its buffers, the guest (CPU-side) bytes at each V# base: the first 8
+// bindings, then every 300th. With a range: every binding of a call that binds a buffer
+// overlapping it (at most 200 lines).
+struct BufferPeekConfig {
+	uint64_t hash = 0, begin = 0, end = 0;
+};
+static const BufferPeekConfig& GetBufferPeekConfig() {
+	static const BufferPeekConfig config = [] {
+		BufferPeekConfig c;
+		const char* v = std::getenv("KYTY_BUFFER_PEEK");
+		if (v == nullptr) {
+			return c;
+		}
+		char* end = nullptr;
+		c.hash    = std::strtoull(v, &end, 16);
+		if (end != nullptr && *end == ':') {
+			c.begin = std::strtoull(end + 1, &end, 16);
+			if (end != nullptr && *end == '-') {
+				c.end = std::strtoull(end + 1, nullptr, 16);
+			}
+		}
+		return c;
+	}();
+	return config;
+}
+
+static void BufferPeek(uint64_t shader_hash, uint32_t index, uint64_t address, uint64_t size) {
+	const auto& config = GetBufferPeekConfig();
+	if (config.hash == 0 || shader_hash != config.hash) {
+		return;
+	}
+	static std::atomic<uint32_t> calls {0};
+	const auto n = calls.fetch_add(1, std::memory_order_relaxed);
+	if (config.end != 0) {
+		if (n >= 200) {
+			return;
+		}
+	} else if (n >= 8 && (n % 300u) != 0u) {
+		return;
+	}
+	const auto bytes = std::min<uint64_t>(size, 32);
+	std::string text;
+	if (Libs::LibKernel::Memory::ClampRangeSizeQuiet(address, bytes) == bytes) {
+		for (uint64_t k = 0; k + 4 <= bytes; k += 4) {
+			uint32_t word = 0;
+			std::memcpy(&word, reinterpret_cast<const void*>(address + k), 4);
+			float f = 0.0f;
+			std::memcpy(&f, &word, 4);
+			text += fmt::format(" {:08x}({:.5g})", word, f);
+		}
+	} else {
+		text = " unreadable";
+	}
+	LOGF("BufferPeek: #%u CS 0x%016" PRIx64 " buffer %u 0x%016" PRIx64 "+0x%" PRIx64 ":%s\n", n,
+	     shader_hash, index, address, size, text.c_str());
+}
+
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -3984,6 +4047,27 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	    uint64_t {256} * 1024 * 1024,
 	    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 	        (graphics.StorageMinAlignment() - 1));
+	struct PeekItem {
+		uint32_t index;
+		uint64_t address, size;
+	};
+	std::vector<PeekItem> peek; // KYTY_BUFFER_PEEK
+	const auto            flush_peek = [&] {
+		const auto& config = GetBufferPeekConfig();
+		bool        hit    = config.end == 0;
+		for (const auto& p: peek) {
+			hit = hit || (p.address < config.end && p.address + p.size > config.begin);
+		}
+		if (hit) {
+			for (const auto& p: peek) {
+				BufferPeek(program.shader_hash, p.index, p.address, p.size);
+			}
+		}
+	};
+	struct FlushPeekAtExit {
+		const decltype(flush_peek)& f;
+		~FlushPeekAtExit() { f(); }
+	} flush_peek_at_exit {flush_peek};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint64_t address = 0;
 		uint64_t size    = 0;
@@ -4048,6 +4132,9 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		if (address == 0 && size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
+		}
+		if (GetBufferPeekConfig().hash == program.shader_hash) {
+			peek.push_back({i, address, size});
 		}
 		if (size > unbounded_read_limit &&
 		    (!program.info.buffers[i].written || BufferRangeFixesEnabled()) &&

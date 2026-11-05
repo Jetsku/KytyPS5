@@ -187,6 +187,17 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// KYTY_RAW_READ_IMAGE_SYNC=1 (default off; Ghost of Yotei preset): a shader's raw (unformatted)
+	// read-only binding whose range starts at a GPU-modified image takes the image's contents
+	// first, as a texel read does (SynchronizeBufferFromImage); the caller passes the buffer its
+	// ObtainBuffer returned. Without it such a read sees the buffer's stale bytes: Yotei's CS
+	// 4337635433d63234 copies the sky LUTs that CS 95c013c75f8e77ad writes as storage images
+	// through raw buffers and read zeros (cloud light direction wrong, cloud march skipped, dark
+	// shadow combine and water). Port of Erlou93/KytyPS5-Yotei SyncBufferFromWrittenImage (there
+	// inside ObtainBuffer, minus its image sources). Returns whether bytes were synchronized.
+	// GPU thread, outside every tracker and texture-cache lock.
+	[[nodiscard]] bool SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool RawReadImageSyncEnabled();
 	// KYTY_CP_BINDING_BATCH_PREFETCH (default on, live): a CPU cache hint for the binding memo
 	// slot a later ObtainBuffer(vaddr, size, false, false) on the GPU thread looks up. A stage's
 	// bindings issue all hints first (RenderExecutor::RebindBuffers), so the slots' cache misses

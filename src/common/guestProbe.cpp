@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -140,6 +141,13 @@ std::string Describe(const Probe& probe, const CONTEXT& c) {
 		const uint64_t ret = *reinterpret_cast<const uint64_t*>(c.Rsp);
 		line += fmt::format(" ret={:x}", ret >= g_base ? ret - g_base : ret);
 	}
+	// Low float of each xmm register (the game's float math keeps scalars there).
+	line += " xmm";
+	for (int r = 0; r < 16; r++) {
+		float value = 0.0f;
+		std::memcpy(&value, reinterpret_cast<const uint8_t*>(&c.Xmm0) + static_cast<size_t>(r) * 16u, 4);
+		line += fmt::format("{}{:g}", r == 0 ? "=" : ",", value);
+	}
 	for (const auto& m: probe.mem) {
 		if (m.watch) {
 			line += fmt::format(" watch({}+{:x})", kRegNames[m.reg], m.off);
@@ -250,8 +258,26 @@ LONG WINAPI Handler(PEXCEPTION_POINTERS e) {
 	if (code == EXCEPTION_SINGLE_STEP && (c.Dr6 & 1u) != 0 && g_watch_address.load() != 0) {
 		const auto watch = g_watch_address.load();
 		c.Dr6 &= ~uint64_t {0xf};
-		if (g_watch_logged.fetch_add(1) < 64) {
-			std::string line = fmt::format("GuestWatch: write to 0x{:x} = {:x} by pc {:x} (host {:x}) tid {}:",
+		// Log each (pc, new value) pair once, so a per-frame writer does not use up the lines.
+		const uint64_t watch_pc    = c.Rip >= g_base ? c.Rip - g_base : c.Rip;
+		const uint64_t watch_value = Readable(watch, 8) ? *reinterpret_cast<const uint64_t*>(watch) : 0;
+		bool           seen        = false;
+		{
+			static std::mutex                                 seen_mutex;
+			static std::vector<std::pair<uint64_t, uint64_t>> seen_pairs;
+			std::scoped_lock                                  seen_lock(seen_mutex);
+			for (const auto& p: seen_pairs) {
+				seen = seen || (p.first == watch_pc && p.second == watch_value);
+			}
+			if (!seen && seen_pairs.size() < 4096) {
+				seen_pairs.emplace_back(watch_pc, watch_value);
+			}
+		}
+		if (!seen && g_watch_logged.fetch_add(1) < 200) {
+			std::string line = fmt::format("GuestWatch: t={} write to 0x{:x} = {:x} by pc {:x} (host {:x}) tid {}:",
+			                               std::chrono::duration_cast<std::chrono::milliseconds>(
+			                                   std::chrono::steady_clock::now().time_since_epoch())
+			                                   .count(),
 			                               watch, Readable(watch, 8) ? *reinterpret_cast<const uint64_t*>(watch) : 0,
 			                               c.Rip >= g_base ? c.Rip - g_base : c.Rip, c.Rip,
 			                               GetCurrentThreadId());
@@ -702,6 +728,11 @@ void Arm(uint64_t base, uint64_t size) {
 }
 
 void ArmDeferred(const char* reason) {
+	// KYTY_GUEST_WRITE_WATCH=<hex address> (diagnostic): a hardware write watch on those 8 bytes,
+	// armed with the deferred probes (KYTY_GUEST_PROBE_ARM_LOAD_END).
+	if (const char* watch = std::getenv("KYTY_GUEST_WRITE_WATCH"); watch != nullptr && *watch != '\0') {
+		ArmWriteWatch(std::strtoull(watch, nullptr, 16) & ~uint64_t {7});
+	}
 	std::scoped_lock lock(g_mutex);
 	for (auto& p: g_probes) {
 		if (p.ring && p.armed) {

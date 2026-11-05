@@ -2984,6 +2984,27 @@ bool TextureCache::StencilReadDepthEnabled() {
 	return enabled;
 }
 
+// KYTY_STENCIL_READ_HELD=1 (default on; acts only with KYTY_STENCIL_READ_DEPTH=1 and
+// KYTY_PRESERVE_STENCIL=1): a sampled read of a stencil plane record whose depth image holds
+// another plane reads the plane's saved copy, as without KYTY_STENCIL_READ_DEPTH, instead of the
+// depth image's stencil (the other plane). Ghost of Yotei's Deferred wetness 84f5a0d3 reads plane A
+// (0x5004850000, the G-buffer classes) right after the volume draws swapped plane B (0x50615a0000)
+// in: it read plane B there, wrote a garbage wetness mask and G-buffer (CS Lights checkerboard and
+// stripes, cutscene wall blocks). Erlou93/KytyPS5-Yotei swaps plane A back in for that read.
+// =0 restores the depth image's stencil for every plane.
+bool TextureCache::StencilReadHeldEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_READ_HELD");
+		const bool  on    = value == nullptr || value[0] != '0';
+		if (on && StencilReadDepthEnabled() && PreserveStencilEnabled()) {
+			LOGF("Stencil planes: a plane the depth image does not hold is read from its saved copy "
+			     "(KYTY_STENCIL_READ_HELD=1)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
 ImageId TextureCache::StencilPlaneDepth(uint64_t plane_address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_stencil_plane_depth.find(plane_address);
@@ -3035,11 +3056,59 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, bytes);
 	}
-	held.width  = width;
-	held.height = height;
-	held.serial = ++m_stencil_plane_serial;
+	held.width          = width;
+	held.height         = height;
+	held.serial         = ++m_stencil_plane_serial;
+	held.content_serial = Image::NextContentSerial();
 	m_slot_images[depth_id].Download({&copy, 1}, held.buffer->Handle(), 0, bytes);
 	const auto key   = StencilPlaneKey(depth.info.data.address, next_plane, width, height);
+	const bool trace = MetaTraceAddress() != 0 && (MetaTraceAddress() == next_plane || MetaTraceAddress() == previous);
+	// KYTY_STENCIL_PLANE_SYNC=2: a 1-byte colour image at the incoming plane's address, of this
+	// extent, written by a shader or a clear after the plane's saved copy holds the plane now.
+	const char* loaded = nullptr;
+	if (StencilPlaneSyncLevel() >= 2 || trace) {
+		const auto  saved_it     = m_stencil_planes.find(key);
+		const auto  saved_serial = saved_it != m_stencil_planes.end() ? saved_it->second.content_serial : 0u;
+		ImageId     newer_id {};
+		uint64_t    newer_serial = 0;
+		for (const auto id: FindImagesInRegion(next_plane, 1, false)) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image == nullptr) continue;
+			if (trace && MetaTraceLine()) {
+				LOGF("MetaTrace: swap-in 0x%" PRIx64 " sees image 0x%" PRIx64 "+0x%" PRIx64 " %ux%u bpb %u depth %d record %d "
+				     "samples %u write %" PRIu64 " saved %" PRIu64 "\n",
+				     next_plane, image->info.data.address, image->info.data.size, image->backing.extent.width,
+				     image->backing.extent.height, image->info.bytes_per_block, image->info.IsDepth() ? 1 : 0,
+				     image->depth_id ? 1 : 0, image->backing.samples, image->shader_write_serial, saved_serial);
+			}
+			if (image->depth_id || image->info.IsDepth() || image->info.data.address != next_plane ||
+			    image->info.bytes_per_block != 1u || image->backing.image == nullptr || image->backing.samples != 1u ||
+			    image->backing.extent.width != width || image->backing.extent.height != height ||
+			    image->shader_write_serial <= saved_serial || image->shader_write_serial <= newer_serial) {
+				continue;
+			}
+			newer_id     = id;
+			newer_serial = image->shader_write_serial;
+		}
+		if (newer_id && StencilPlaneSyncLevel() >= 2) {
+			auto& saved = m_stencil_planes[key];
+			if (!saved.buffer || saved.buffer->Size() < bytes) {
+				if (saved.buffer) {
+					m_scheduler.DeferOperation([old = saved.buffer] { (void)old; });
+				}
+				saved.buffer = std::make_shared<Buffer>(
+				    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+				    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, bytes);
+			}
+			saved.width          = width;
+			saved.height         = height;
+			saved.serial         = ++m_stencil_plane_serial;
+			saved.content_serial = newer_serial;
+			const auto color     = StencilPlaneCopy(width, height, vk::ImageAspectFlagBits::eColor);
+			m_slot_images[newer_id].Download({&color, 1}, saved.buffer->Handle(), 0, bytes);
+			loaded = "loaded from a shader-written 1-byte image";
+		}
+	}
 	const auto found = m_stencil_planes.find(key);
 	const bool restored =
 	    found != m_stencil_planes.end() && found->second.buffer && found->second.width == width &&
@@ -3056,12 +3125,109 @@ void TextureCache::SwapStencilPlane(ImageId depth_id, uint64_t next_plane) {
 	NoteImageStateChange();
 	static std::atomic<uint32_t> swaps {0};
 	const auto n = swaps.fetch_add(1, std::memory_order_relaxed) + 1u;
-	if (n <= 8u || std::has_single_bit(n)) {
+	if (n <= 8u || std::has_single_bit(n) || (trace && MetaTraceLine())) {
 		LOGF("Stencil plane swap #%u (KYTY_PRESERVE_STENCIL): depth 0x%012" PRIx64
 		     " %ux%u plane 0x%012" PRIx64 " -> 0x%012" PRIx64 " %s\n",
 		     n, depth.info.data.address, width, height, previous, next_plane,
-		     restored ? "restored" : "first use (guest bytes)");
+		     loaded != nullptr ? loaded : restored ? "restored" : "first use (guest bytes)");
 	}
+	if (loaded != nullptr) {
+		static std::atomic<uint32_t> loads {0};
+		const auto l = loads.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (l <= 8u || std::has_single_bit(l)) {
+			LOGF("Stencil plane sync #%u (KYTY_STENCIL_PLANE_SYNC=2): plane 0x%012" PRIx64 " of depth 0x%012" PRIx64
+			     " %ux%u %s\n",
+			     l, next_plane, depth.info.data.address, width, height, loaded);
+		}
+	}
+}
+
+// KYTY_STENCIL_PLANE_SYNC (default 2; based on Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_PLANE_SYNC):
+// 2 = at swap-in, a 1-byte colour image at the incoming plane's address and the depth image's extent
+// that a storage binding or a colour clear wrote after the plane's saved copy is loaded as the plane
+// (Ghost of Yotei's z-fail volume plane 0x50615a0000: Erlou loads it from the R8 image the game clears
+// every frame, 0 before the volume draws; ours restored the last frame's counts). 0 or 1: off (our
+// StencilPlaneReader already covers Erlou's level 1, shader reads of a plane).
+int TextureCache::StencilPlaneSyncLevel() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_STENCIL_PLANE_SYNC");
+		const int   on    = value == nullptr || value[0] == '\0' ? 2 : (value[0] >= '0' && value[0] <= '9' ? value[0] - '0' : 2);
+		if (on >= 2 && PreserveStencilEnabled()) {
+			LOGF("Stencil planes: a plane written as a 1-byte image is loaded at swap-in (KYTY_STENCIL_PLANE_SYNC=%d)\n",
+			     on);
+		}
+		return on;
+	}();
+	return level;
+}
+
+// KYTY_STENCIL_PLANE_FILL_SAVED (default on; based on Erlou93/KytyPS5-Yotei KYTY_FIX_STENCIL_PLANE_WRITES,
+// its fill part). =0: a fill of a stencil plane record clears the depth image's stencil aspect whatever
+// plane it holds, as before. Not seen to fire in Ghost of Yotei gameplay (2 boots).
+bool TextureCache::StencilPlaneFillSavedEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_STENCIL_PLANE_FILL_SAVED");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_STENCIL_PLANE_FILL_SAVED: a fill of the stencil plane `record_id` of `depth_id` while the depth
+// image holds another plane goes into the plane's saved copy (the next swap-in restores it). False
+// (nothing done) when the depth image holds this plane or the shapes differ. Caller holds m_lock.
+bool TextureCache::FillStencilPlaneSaved(CommandBuffer& command, ImageId depth_id, ImageId record_id, uint8_t value,
+                                         const char* what) {
+	auto* depth  = m_slot_images.try_get(depth_id);
+	auto* record = m_slot_images.try_get(record_id);
+	if (depth == nullptr || record == nullptr || record->depth_id != depth_id || !SwapsStencilPlanes(*depth)) {
+		return false;
+	}
+	const auto width  = depth->backing.extent.width;
+	const auto height = depth->backing.extent.height;
+	const auto bytes  = uint64_t {width} * height;
+	if (depth->info.stencil.address == 0 || depth->info.stencil.address == record->info.data.address ||
+	    record->info.extent.width != width || record->info.extent.height != height ||
+	    record->stencil_subresources.base_layer != 0 || bytes % 4u != 0u) {
+		return false;
+	}
+	const auto depth_address = depth->info.data.address;
+	const auto held_address  = depth->info.stencil.address;
+	const auto plane_address = record->info.data.address;
+	auto&      held          = m_stencil_planes[StencilPlaneKey(depth_address, plane_address, width, height)];
+	if (!held.buffer || held.buffer->Size() < bytes) {
+		if (held.buffer) {
+			m_scheduler.DeferOperation([old = held.buffer] { (void)old; });
+		}
+		held.buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		                                       vk::BufferUsageFlagBits::eTransferSrc |
+		                                           vk::BufferUsageFlagBits::eTransferDst,
+		                                       bytes);
+	}
+	held.width          = width;
+	held.height         = height;
+	held.serial         = ++m_stencil_plane_serial;
+	held.content_serial = Image::NextContentSerial();
+	command.EndRendering();
+	const auto         native = command.Handle();
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	native.pipelineBarrier2(dependency);
+	native.fillBuffer(held.buffer->Handle(), 0, bytes, uint32_t {value} * 0x01010101u);
+	native.pipelineBarrier2(dependency);
+	static std::atomic<uint32_t> fills {0};
+	const auto n = fills.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (n <= 8u || std::has_single_bit(n)) {
+		LOGF("Stencil plane fill #%u (KYTY_STENCIL_PLANE_FILL_SAVED, %s): plane 0x%012" PRIx64 " of depth 0x%012" PRIx64
+		     " (holding 0x%012" PRIx64 ") %ux%u value %u into its saved copy\n",
+		     n, what, plane_address, depth_address, held_address, width, height, static_cast<unsigned>(value));
+	}
+	return true;
 }
 
 bool TextureCache::PreserveStencilRecreateEnabled() {
@@ -6699,6 +6865,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		m_bind_mark = true;
 		MarkImageGpuModified(image);
 		m_bind_mark = false;
+		image.shader_write_serial = Image::NextContentSerial(); // KYTY_STENCIL_PLANE_SYNC
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id, desc.type == BindingType::Storage ? RefreshIntent::Write
@@ -7128,6 +7295,13 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	vk::ImageAspectFlags  aspect {};
 	ImageSubresourceRange subresources;
 	const bool trace_images = address == MetaTraceAddress() && MetaTraceLine();
+	// KYTY_STENCIL_PLANE_SYNC=2: a fill that matches a stencil plane record and other images (an R8
+	// colour alias) goes into the plane's saved copy when its depth image holds another plane
+	// (Erlou93/KytyPS5-Yotei clears the alias and loads it into the plane at swap-in).
+	const bool plane_fill_first = StencilPlaneSyncLevel() >= 2 && PreserveStencilEnabled() &&
+	                              StencilPlaneFillSavedEnabled();
+	std::vector<std::pair<ImageId, ImageId>> plane_records; // (depth, record)
+	bool                                     conflict = false;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (trace_images && owner != nullptr) {
@@ -7167,13 +7341,38 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		if (!candidate) {
 			continue;
 		}
+		if (plane_fill_first && candidate == vk::ImageAspectFlagBits::eStencil && candidate_id != id) {
+			plane_records.emplace_back(candidate_id, id);
+		}
 		if (selected && (selected != candidate_id || subresources != candidate_subresources)) {
-			return false;
+			if (!plane_fill_first) {
+				return false;
+			}
+			conflict = true;
+			continue;
 		}
 		selected     = candidate_id;
 		stencil_id   = candidate == vk::ImageAspectFlagBits::eStencil ? id : ImageId {};
 		aspect       = candidate;
 		subresources = candidate_subresources;
+	}
+	if (conflict) {
+		uint8_t value = 0;
+		if (!DecodePackedStencilClear(packed_clear, value)) {
+			return false;
+		}
+		for (const auto& [depth_id, record_id]: plane_records) {
+			if (FillStencilPlaneSaved(command, depth_id, record_id, value, "fill+alias")) {
+				TrackImage(record_id);
+				CommitGpuWrite(m_slot_images[record_id]);
+				if (trace_images) {
+					LOGF("MetaTrace: clear-from-buffer 0x%" PRIx64 " size 0x%" PRIx64 ": plane saved copy %u\n", address,
+					     size, static_cast<unsigned>(value));
+				}
+				return true;
+			}
+		}
+		return false;
 	}
 	// KYTY_STENCIL_PLANE_FILL_CLEAR: a depth image's stencil plane is not on its registered pages; look
 	// for depth images up to 64 MiB below the fill whose stencil plane is exactly the filled range.
@@ -7209,8 +7408,25 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		const bool wide_fill = g_wide_fill_clear.Get() != 0;
 		// KYTY_10_11_11_RED: the fill word is in the guest's layout.
 		const auto host_clear = GuestColorWordToHost(packed_clear, image.info.GetColorTransform());
-		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
-		                : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
+		// KYTY_STENCIL_PLANE_SYNC=2: a uniform byte fill of an R8 image is its clear (Ghost of Yotei's CS
+		// 2bd3cd12 zero-fills the R8 image at its z-fail volume plane 0x50615a0000 every frame; Erlou93/
+		// KytyPS5-Yotei clears that image and loads it into the plane at swap-in).
+		const uint8_t byte      = static_cast<uint8_t>(packed_clear & 0xffu);
+		const bool    byte_fill = packed_clear == uint32_t {byte} * 0x01010101u;
+		const auto    r8        = image.backing.format;
+		if (StencilPlaneSyncLevel() >= 2 && PreserveStencilEnabled() && byte_fill &&
+		    (r8 == vk::Format::eR8Uint || r8 == vk::Format::eR8Unorm)) {
+			if (r8 == vk::Format::eR8Uint) {
+				clear.color.uint32 = std::array<uint32_t, 4> {byte, 0u, 0u, 0u};
+			} else {
+				clear.color.float32 = std::array<float, 4> {static_cast<float>(byte) / 255.0f, 0.0f, 0.0f, 0.0f};
+			}
+			if (trace_images) {
+				LOGF("MetaTrace: clear-from-buffer 0x%" PRIx64 " size 0x%" PRIx64 ": R8 byte clear %u\n", address, size,
+				     static_cast<unsigned>(byte));
+			}
+		} else if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
+		                       : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
 			return false;
 		}
 	} else {
@@ -7222,6 +7438,17 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			return false;
 		}
 		clear.depthStencil.stencil = stencil_clear;
+	}
+	// KYTY_STENCIL_PLANE_FILL_SAVED (default on, acts with KYTY_PRESERVE_STENCIL; based on
+	// Erlou93/KytyPS5-Yotei KYTY_FIX_STENCIL_PLANE_WRITES): a fill of a stencil plane record whose
+	// depth image holds another plane fills that plane's saved copy, which the next swap-in restores,
+	// instead of clearing the depth image's stencil aspect (the plane it holds).
+	if (stencil_id && aspect == vk::ImageAspectFlagBits::eStencil && PreserveStencilEnabled() &&
+	    StencilPlaneFillSavedEnabled() &&
+	    FillStencilPlaneSaved(command, selected, stencil_id, clear.depthStencil.stencil, "fill")) {
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+		return true;
 	}
 	// A rejected clear (reported) returns false: the guest's own fill shader then runs.
 	if (!ClearImage(command, selected, image.backing.format,
@@ -7336,6 +7563,9 @@ bool TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	// Levels outside the cleared range must hold guest data, and the result is GPU-owned.
 	RequireFullResidency(id);
 	auto& image = m_slot_images[id];
+	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
+		image.shader_write_serial = Image::NextContentSerial(); // KYTY_STENCIL_PLANE_SYNC
+	}
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	const auto layers = image.info.IsVolume()
@@ -7988,6 +8218,53 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	return SynchronizeBufferFromImageCounted(buffer, vaddr, size, nullptr);
+}
+
+bool BufferCache::RawReadImageSyncEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RAW_READ_IMAGE_SYNC");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool BufferCache::SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// A stream-buffer read holds CPU-dirty guest bytes of a range without GPU-written buffer bytes
+	// (as for texel reads, no image download into it). Lock-free: no image registered on the
+	// range's 1 MiB pages (most raw reads).
+	if (&buffer == &m_stream_buffer || !m_texture_cache.MayOverlapImages(vaddr, size)) {
+		return false;
+	}
+	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size, true, true);
+	if (!selected) {
+		return false;
+	}
+	uint32_t width = 0, height = 0, format = 0;
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		const auto*      image = m_texture_cache.m_slot_images.try_get(selected);
+		// Only GPU-written contents differ from the buffer's bytes (a CPU-written image was
+		// uploaded from them).
+		if (image == nullptr || !image->IsGpuModified()) {
+			return false;
+		}
+		width  = image->info.extent.width;
+		height = image->info.extent.height;
+		format = static_cast<uint32_t>(image->backing.format);
+	}
+	const bool synced = SynchronizeBufferFromImage(buffer, vaddr, size);
+	static std::atomic<uint64_t> syncs {0};
+	if (synced) {
+		const auto n = syncs.fetch_add(1, std::memory_order_relaxed) + 1;
+		// The first 16, then at powers of two: how often raw reads take image contents.
+		if (n <= 16 || (n & (n - 1)) == 0) {
+			std::printf("KYTY_RAW_READ_IMAGE_SYNC: #%" PRIu64 " raw read 0x%016" PRIx64 "+0x%" PRIx64
+			            " took a GPU-written image's contents (%ux%u, vk format %u)\n",
+			            n, vaddr, size, width, height, format);
+			std::fflush(stdout);
+		}
+	}
+	return synced;
 }
 
 bool BufferCache::SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,

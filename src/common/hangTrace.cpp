@@ -3,6 +3,7 @@
 #include "common/compileWatch.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
+#include "common/kytyEvents.h"
 
 #include <algorithm>
 #include <array>
@@ -1882,6 +1883,7 @@ void RecordDoneWait(uint64_t wait_ns) {
 void RecordFlip() {
 	HangWatchdog::NoteFlip();
 	CompileWatch::NoteFlip();
+	KytyEvents::NoteFlip();
 	// KYTY_FRAME_TIMES_LOG=<file> (default off, independent of the hang trace): one line per guest
 	// flip, "t_us,interval_us" (present-thread clock), for frame-time percentiles and stutter counts.
 	static FILE* frame_log = [] {

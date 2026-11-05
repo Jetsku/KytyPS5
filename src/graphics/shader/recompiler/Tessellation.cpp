@@ -708,11 +708,19 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	                     : ReflectTessellationStride(control_program, false,
 	                                                 info.output_control_points, info.ls_stride,
 	                                                 control_hash, nullptr, &why,
-	                                                 indexed ? &constant_ranges : nullptr);
+	                                                 &constant_ranges);
 	info.patch_base    = 0;
 	info.patch_size    = 0;
 	info.carried_vgprs = {};
-	if (indexed && info.hs_stride != 0u) {
+	// KYTY_TESS_MERGED_CARRY: a carried pair declares the HS's patch-constant range as well. Without it each
+	// stage bases its patch interface at the lowest address it touches itself: the Yotei 2.x particle HS
+	// stores from 0x7f30 (the factor copies first), its TES reads from 0x7f90, so the TES read the factor
+	// copy (1.0f) where it expects the particle's material index (0x7fb0).
+	if (merged && info.hs_stride != 0u && info.ls_stride != 0u) {
+		info.carried_vgprs = CarriedVgprs(control_program, info, control_hash);
+	}
+	const bool carried = std::ranges::any_of(info.carried_vgprs, [](uint32_t word) { return word != 0u; });
+	if ((indexed || carried) && info.hs_stride != 0u) {
 		// The patch constants: what the HS stores at constant addresses past its control points.
 		// HS and TES declare this range, so their patch interfaces agree whatever each touches.
 		const uint32_t control_end = info.hs_stride * info.output_control_points;
@@ -759,7 +767,6 @@ bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 		     ProgramToString(local_program).c_str(), ProgramToString(control_program).c_str(),
 		     evaluation.empty() ? "" : ProgramToString(evaluation_program).c_str());
 	}
-	if (merged) info.carried_vgprs = CarriedVgprs(control_program, info, control_hash);
 	if (cacheable) {
 		std::array<uint32_t, 12> entry {info.ls_stride, info.hs_stride, info.patch_base, info.patch_size};
 		std::copy_n(info.carried_vgprs.begin(), 8, entry.begin() + 4);
@@ -878,10 +885,10 @@ const char* LowerTessellationMemory(IR::Program& program, const CompileOptions& 
 						EXIT_NOT_IMPLEMENTED(!write && !(indexed && control) &&
 						                     options.stage != ShaderType::TessellationEvaluation);
 						kind = TessellationAttribute::PatchOutput;
-						// KYTY_TESS_INDEXED: within the range the analysis found the HS storing,
-						// which both stages declare.
+						// KYTY_TESS_INDEXED or a carried pair: within the range the analysis found
+						// the HS storing, which both stages declare.
 						const uint64_t first = uint64_t {address.U32()} + memory.offset;
-						if (indexed && tess.patch_size != 0u &&
+						if (tess.patch_size != 0u &&
 						    (first < tess.patch_base ||
 						     first + 4u * BufferComponentCount(inst.GetOpcode()) >
 						         uint64_t {tess.patch_base} + tess.patch_size)) {
