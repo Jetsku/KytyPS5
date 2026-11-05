@@ -7295,6 +7295,13 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	vk::ImageAspectFlags  aspect {};
 	ImageSubresourceRange subresources;
 	const bool trace_images = address == MetaTraceAddress() && MetaTraceLine();
+	// KYTY_STENCIL_PLANE_SYNC=2: a fill that matches a stencil plane record and other images (an R8
+	// colour alias) goes into the plane's saved copy when its depth image holds another plane
+	// (Erlou93/KytyPS5-Yotei clears the alias and loads it into the plane at swap-in).
+	const bool plane_fill_first = StencilPlaneSyncLevel() >= 2 && PreserveStencilEnabled() &&
+	                              StencilPlaneFillSavedEnabled();
+	std::vector<std::pair<ImageId, ImageId>> plane_records; // (depth, record)
+	bool                                     conflict = false;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (trace_images && owner != nullptr) {
@@ -7334,13 +7341,38 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		if (!candidate) {
 			continue;
 		}
+		if (plane_fill_first && candidate == vk::ImageAspectFlagBits::eStencil && candidate_id != id) {
+			plane_records.emplace_back(candidate_id, id);
+		}
 		if (selected && (selected != candidate_id || subresources != candidate_subresources)) {
-			return false;
+			if (!plane_fill_first) {
+				return false;
+			}
+			conflict = true;
+			continue;
 		}
 		selected     = candidate_id;
 		stencil_id   = candidate == vk::ImageAspectFlagBits::eStencil ? id : ImageId {};
 		aspect       = candidate;
 		subresources = candidate_subresources;
+	}
+	if (conflict) {
+		uint8_t value = 0;
+		if (!DecodePackedStencilClear(packed_clear, value)) {
+			return false;
+		}
+		for (const auto& [depth_id, record_id]: plane_records) {
+			if (FillStencilPlaneSaved(command, depth_id, record_id, value, "fill+alias")) {
+				TrackImage(record_id);
+				CommitGpuWrite(m_slot_images[record_id]);
+				if (trace_images) {
+					LOGF("MetaTrace: clear-from-buffer 0x%" PRIx64 " size 0x%" PRIx64 ": plane saved copy %u\n", address,
+					     size, static_cast<unsigned>(value));
+				}
+				return true;
+			}
+		}
+		return false;
 	}
 	// KYTY_STENCIL_PLANE_FILL_CLEAR: a depth image's stencil plane is not on its registered pages; look
 	// for depth images up to 64 MiB below the fill whose stencil plane is exactly the filled range.
@@ -7376,8 +7408,25 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		const bool wide_fill = g_wide_fill_clear.Get() != 0;
 		// KYTY_10_11_11_RED: the fill word is in the guest's layout.
 		const auto host_clear = GuestColorWordToHost(packed_clear, image.info.GetColorTransform());
-		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
-		                : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
+		// KYTY_STENCIL_PLANE_SYNC=2: a uniform byte fill of an R8 image is its clear (Ghost of Yotei's CS
+		// 2bd3cd12 zero-fills the R8 image at its z-fail volume plane 0x50615a0000 every frame; Erlou93/
+		// KytyPS5-Yotei clears that image and loads it into the plane at swap-in).
+		const uint8_t byte      = static_cast<uint8_t>(packed_clear & 0xffu);
+		const bool    byte_fill = packed_clear == uint32_t {byte} * 0x01010101u;
+		const auto    r8        = image.backing.format;
+		if (StencilPlaneSyncLevel() >= 2 && PreserveStencilEnabled() && byte_fill &&
+		    (r8 == vk::Format::eR8Uint || r8 == vk::Format::eR8Unorm)) {
+			if (r8 == vk::Format::eR8Uint) {
+				clear.color.uint32 = std::array<uint32_t, 4> {byte, 0u, 0u, 0u};
+			} else {
+				clear.color.float32 = std::array<float, 4> {static_cast<float>(byte) / 255.0f, 0.0f, 0.0f, 0.0f};
+			}
+			if (trace_images) {
+				LOGF("MetaTrace: clear-from-buffer 0x%" PRIx64 " size 0x%" PRIx64 ": R8 byte clear %u\n", address, size,
+				     static_cast<unsigned>(byte));
+			}
+		} else if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
+		                       : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
 			return false;
 		}
 	} else {
