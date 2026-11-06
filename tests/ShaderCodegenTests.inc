@@ -2442,6 +2442,104 @@ void CheckSplitLdsWriteSync(VulkanHarness *vulkan) {
   }
 }
 
+// KYTY_SPLIT_DPP_LANE: a split wave64 (KYTY_WAVE64_WARPS, one 64-thread workgroup) runs DPP16
+// row_shr:1,2,4,8 scans (BC=0, FI=0, every lane enabled) with v_add_nc_u32, v_add_f32, v_min_f32 and
+// v_max_f32: each lane must get the inclusive scan of its row of 16, in both host subgroups. Before
+// the fix the upper subgroup tested bits 32-63 of its 32-lane ballot and never wrote.
+void CheckSplitDppScan(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenSplitDppScan";
+  // VOP2 opcode, then how the guest combines two lanes (D = src0(shifted) op src1(own)).
+  struct Op {
+    u32 opcode;
+    u32 (*apply)(u32, u32);
+  };
+  const Op ops[] = {
+      {0x25, [](u32 a, u32 b) { return a + b; }},
+      {0x03, [](u32 a, u32 b) { return std::bit_cast<u32>(std::bit_cast<float>(a) + std::bit_cast<float>(b)); }},
+      {0x0f, [](u32 a, u32 b) { return std::bit_cast<u32>(std::min(std::bit_cast<float>(a), std::bit_cast<float>(b))); }},
+      {0x10, [](u32 a, u32 b) { return std::bit_cast<u32>(std::max(std::bit_cast<float>(a), std::bit_cast<float>(b))); }},
+  };
+  constexpr u32 Wave = 64;
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v_lshlrev_b32 v3, 2, v0
+  AppendBufferLoadDword(&code, 1, 3);                  // v1 = data[lane] (integer op input)
+  code.push_back(EncodeVop2(0x25, 3, 255, 3));          // v3 += 256 (float inputs at 64..127)
+  code.push_back(256u);
+  AppendBufferLoadDword(&code, 2, 3);                  // v2 = data[64 + lane]
+  code.push_back(EncodeSopp(0x0c, 0));                 // s_waitcnt 0
+  for (u32 i = 0; i < 4; i++) {
+    const u32 reg = 4u + i;
+    code.push_back(EncodeVop1(0x01, reg, Vgpr(i == 0 ? 1u : 2u))); // v_mov_b32 v(4+i), input
+    for (const u32 shift : {1u, 2u, 4u, 8u}) {
+      code.push_back(EncodeVop2(ops[i].opcode, reg, 250, reg)); // op v, v row_shr:n, v
+      code.push_back(EncodeVop2Dpp(reg, 0x110u + shift));
+    }
+  }
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 4u + i, 0, 128u + i * Wave);
+  }
+  AppendEnd(&code);
+  test.initial.resize(128u + 4u * Wave, 0xdeadbeefu);
+  for (u32 lane = 0; lane < Wave; lane++) {
+    test.initial[lane] = (lane * 2654435761u) >> 4u;
+    test.initial[Wave + lane] =
+        std::bit_cast<u32>((static_cast<float>((lane * 37u) % 101u) - 50.0f) * 0.371f);
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; i++) {
+    std::vector<u32> v(test.initial.begin() + (i == 0 ? 0 : Wave),
+                       test.initial.begin() + (i == 0 ? Wave : 2u * Wave));
+    for (const u32 shift : {1u, 2u, 4u, 8u}) {
+      auto next = v;
+      for (u32 lane = 0; lane < Wave; lane++) {
+        if ((lane & 15u) >= shift) {
+          next[lane] = ops[i].apply(v[lane - shift], v[lane]);
+        }
+      }
+      v = next;
+    }
+    std::copy(v.begin(), v.end(), test.expected.begin() + 128 + i * Wave);
+  }
+  test.compute_info.threads_num[0] = Wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = Wave;
+  test.has_compute_info = true;
+  std::vector<u32> fixed_words;
+  std::vector<u32> legacy_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_warps = true;
+    options.split_dpp_lane = true;
+    options.dpp_skip_inactive = true;
+    options.lane_reductions = false;
+    options.lane_local = false;
+    options.lds_slots = false;
+    ScopedCodegenOptions scope(options);
+    fixed_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_warps = true;
+    options.split_dpp_lane = false;
+    options.dpp_skip_inactive = true;
+    options.lane_reductions = false;
+    options.lane_local = false;
+    options.lds_slots = false;
+    ScopedCodegenOptions scope(options);
+    legacy_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  RequireEqualWords(name, "split wave64 row_shr scans", test.expected, fixed_words);
+  u32 wrong = 0;
+  for (size_t i = 128; i < test.expected.size(); i++) {
+    wrong += legacy_words[i] != test.expected[i] ? 1u : 0u;
+  }
+  std::printf("[codegen] %-32s ok (KYTY_SPLIT_DPP_LANE=0: %u of %u scan results differ)\n", name,
+              wrong, 4u * Wave);
+}
+
 // KYTY_SCALAR_LOAD_GROUPS: S_LOAD_DWORDX4 through a scalar address, once inside one BDA page
 // (one page lookup for the four dwords) and once straddling a page boundary (per-dword path); the
 // results match the memory with and without the switch.
@@ -2492,6 +2590,7 @@ void CheckScalarLoadGroups(VulkanHarness *vulkan) {
 void RunAll(VulkanHarness *vulkan) {
   CheckScalarLoadGroups(vulkan);
   CheckSplitLdsWriteSync(vulkan);
+  CheckSplitDppScan(vulkan);
   CheckLdsAtomicOrder(vulkan);
   CheckGdsM0Base(vulkan);
   CheckKnownBitsMasks(vulkan);

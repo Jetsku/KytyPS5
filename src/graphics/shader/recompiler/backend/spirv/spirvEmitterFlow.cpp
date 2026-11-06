@@ -137,7 +137,10 @@ uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lan
 	auto&      state  = ctx.state;
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
 	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
-	if (ctx.half != 0) {
+	// A split wave64 (KYTY_WAVE64_WARPS) numbers its lanes 0-63 over two 32-lane host subgroups, and
+	// DPP never leaves a half: the source's bit in this subgroup's ballot is lane mod 32
+	// (KYTY_SPLIT_DPP_LANE).
+	if (ctx.half != 0 || (state.split_wave && GetCodegenOptions().split_dpp_lane)) {
 		lane = EmitAndConstant(state, lane, 31);
 	}
 	return EmitNative<spv::OpGroupNonUniformBallotBitExtract, IR::Type::U1>(state, scope, ballot,
