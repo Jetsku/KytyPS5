@@ -20,6 +20,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -73,6 +74,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <string>
+#include <string_view>
 #include <vector>
 #include <xxhash.h>
 
@@ -4432,6 +4435,196 @@ static bool SkipCubeDraw(const CommandBuffer& buffer) {
 	return true;
 }
 
+// KYTY_DRAW_PEEK=<vs hash>[:<max draws>] (hexadecimal hash, diagnostic, default off; default 200000
+// draws): after every draw with this vertex program, copies the first 16 bytes of VS buffer 0, the
+// draw's first indirect argument record and its count (indirect draws) into a host-visible ring and
+// logs them once the tick completed ("DrawPeek", with the frame, the draw's ordinal in the frame and
+// steady-clock ns at recording and at completion, to match screenshots). Ends the rendering
+// instance after each such draw. videoOut.cpp logs a "DrawPeekFlip" marker per guest flip with it.
+static const std::array<uint64_t, 2>& DrawPeekRequest() {
+	static const std::array<uint64_t, 2> request = [] {
+		std::array<uint64_t, 2> parsed {0, 200000};
+		if (const auto* value = std::getenv("KYTY_DRAW_PEEK"); value != nullptr) {
+			char* end = nullptr;
+			parsed[0] = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') parsed[1] = std::strtoull(end + 1, &end, 10);
+		}
+		return parsed;
+	}();
+	return request;
+}
+
+static uint64_t DrawPeekNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// Records the copies after the draw (rendering already ended by the caller).
+static void DrawPeek(RenderContext& context, CommandBuffer& buffer, const DrawCallInfo& draw,
+                     const DrawRenderState& state, const DrawIndirectSource* indirect) {
+	constexpr uint32_t SlotBytes = 64;
+	constexpr uint32_t Slots     = 4096;
+	struct Range {
+		uint64_t address = 0;
+		uint32_t bytes   = 0;
+		uint32_t offset  = 0;
+	};
+	static std::mutex              mutex;
+	static std::unique_ptr<Buffer> download;
+	static uint32_t                next_slot  = 0;
+	static uint64_t                peeked     = 0;
+	static int64_t                 last_frame = -1;
+	static uint32_t                ordinal    = 0;
+	std::scoped_lock               lock(mutex);
+	if (peeked >= DrawPeekRequest()[1]) return;
+	peeked++;
+	const auto frame = static_cast<int64_t>(context.GetGpu().GetFrameNum());
+	if (frame != last_frame) {
+		last_frame = frame;
+		ordinal    = 0;
+	}
+	const auto index = ordinal++;
+	if (download == nullptr) {
+		download = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(),
+		                                    MemoryUsage::Download, 0, AllFlags, uint64_t {SlotBytes} * Slots);
+	}
+	const auto slot = next_slot++ % Slots;
+	std::array<Range, 3> ranges {};
+	const auto* program   = state.vertex_info[0].stage.program;
+	const auto* resources = state.vertex_info[0].stage.resources;
+	if (program != nullptr && resources != nullptr && !program->info.buffers.empty() && !resources->buffers.empty()) {
+		ranges[0] = {DecodeNativeDescriptor<ShaderBufferResource>(resources->buffers[0]).Base48(), 16, 0};
+	}
+	if (indirect != nullptr) {
+		ranges[1] = {indirect->args_addr, indirect->RecordSize(), 16};
+		if (indirect->count_addr != 0) ranges[2] = {indirect->count_addr, 4, 40};
+	}
+	auto& cache = context.GetBufferCache();
+	for (auto& range: ranges) {
+		if (range.address == 0 || range.bytes == 0) continue;
+		const auto [source, offset] = cache.ObtainBuffer(range.address, range.bytes, false);
+		if (source == nullptr) {
+			range.bytes = 0;
+			continue;
+		}
+		download->CopyFrom(buffer, *source, offset, uint64_t {slot} * SlotBytes + range.offset, range.bytes,
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+	}
+	// KYTY_DRAW_PEEK_WINDOW=<hex address>+<hex bytes>[,...] (at most 2 windows of at most 64 KiB, with
+	// KYTY_DRAW_PEEK): at the frame's first peeked draw, the GPU's bytes of each window are appended to
+	// _drawpeek-window.bin in the working directory ({u32 'DPKW', i32 frame, u64 address, u32 bytes,
+	// data} per window and frame), e.g. the instance records the draws read.
+	struct Window {
+		uint64_t address = 0;
+		uint32_t bytes   = 0;
+	};
+	static const std::vector<Window> windows = [] {
+		std::vector<Window> parsed;
+		if (const auto* value = std::getenv("KYTY_DRAW_PEEK_WINDOW"); value != nullptr) {
+			std::string_view text(value);
+			while (!text.empty() && parsed.size() < 2) {
+				const auto comma = text.find(',');
+				const auto item  = std::string(text.substr(0, comma));
+				const auto plus  = item.find('+');
+				if (plus != std::string::npos) {
+					Window window {std::strtoull(item.substr(0, plus).c_str(), nullptr, 16),
+					               static_cast<uint32_t>(std::min<uint64_t>(
+					                   std::strtoull(item.substr(plus + 1).c_str(), nullptr, 16), 0x10000u)) & ~3u};
+					if (window.address != 0 && window.bytes != 0) parsed.push_back(window);
+				}
+				if (comma == std::string_view::npos) break;
+				text.remove_prefix(comma + 1);
+			}
+		}
+		return parsed;
+	}();
+	if (index == 0 && !windows.empty()) {
+		constexpr uint32_t WindowSlots     = 32;
+		constexpr uint32_t WindowSlotBytes = 2 * 0x10000;
+		static std::unique_ptr<Buffer> window_download;
+		static uint32_t                next_window_slot = 0;
+		if (window_download == nullptr) {
+			window_download = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(),
+			                                           MemoryUsage::Download, 0, AllFlags,
+			                                           uint64_t {WindowSlotBytes} * WindowSlots);
+		}
+		const auto wslot  = next_window_slot++ % WindowSlots;
+		auto       copied = windows;
+		for (uint32_t i = 0; i < copied.size(); i++) {
+			const auto [source, offset] = cache.ObtainBuffer(copied[i].address, copied[i].bytes, false);
+			if (source == nullptr) {
+				copied[i].bytes = 0;
+				continue;
+			}
+			window_download->CopyFrom(buffer, *source, offset, uint64_t {wslot} * WindowSlotBytes + i * 0x10000u,
+			                          copied[i].bytes, vk::AccessFlagBits::eMemoryWrite,
+			                          vk::AccessFlagBits::eHostRead,
+			                          vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			                          vk::AccessFlagBits::eHostRead);
+		}
+		context.GetCommandScheduler().DeferOperation([wslot, copied, frame] {
+			static std::FILE* file = std::fopen("_drawpeek-window.bin", "wb");
+			if (file == nullptr) return;
+			window_download->Invalidate(uint64_t {wslot} * WindowSlotBytes, WindowSlotBytes);
+			const auto* bytes = window_download->Mapped().data() + uint64_t {wslot} * WindowSlotBytes;
+			for (uint32_t i = 0; i < copied.size(); i++) {
+				if (copied[i].bytes == 0) continue;
+				const uint32_t magic = 0x574b5044u; // "DPKW"
+				const auto     f32   = static_cast<int32_t>(frame);
+				std::fwrite(&magic, 4, 1, file);
+				std::fwrite(&f32, 4, 1, file);
+				std::fwrite(&copied[i].address, 8, 1, file);
+				std::fwrite(&copied[i].bytes, 4, 1, file);
+				std::fwrite(bytes + i * 0x10000u, 1, copied[i].bytes, file);
+			}
+			std::fflush(file);
+		});
+	}
+	const auto tick    = context.GetCommandScheduler().CurrentTick();
+	const auto queue   = static_cast<int32_t>(HangTrace::CpContextQueue());
+	const auto seq     = HangTrace::CpContextSequence();
+	const auto t_rec   = DrawPeekNowNs();
+	const auto n       = draw.index_count;
+	const auto inst    = draw.instance_count;
+	const auto args    = indirect != nullptr ? indirect->args_addr : 0;
+	const auto count   = indirect != nullptr ? indirect->count_addr : 0;
+	const auto max_cnt = indirect != nullptr ? indirect->max_count : 0;
+	// The VS buffers' bases, strides and record counts (where each draw's instance data lives).
+	std::string vs_buffers;
+	if (program != nullptr && resources != nullptr) {
+		for (uint32_t i = 0; i < program->info.buffers.size() && i < resources->buffers.size() && i < 8; i++) {
+			const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources->buffers[i]);
+			vs_buffers += fmt::format(" vsb{}=0x{:x}/s{}/n{}", i, r.Base48(), r.Stride(), r.NumRecords());
+		}
+	}
+	context.GetCommandScheduler().DeferOperation(
+	    [slot, ranges, frame, index, tick, queue, seq, t_rec, n, inst, args, count, max_cnt,
+	     vs_buffers = std::move(vs_buffers)] {
+		    download->Invalidate(uint64_t {slot} * SlotBytes, SlotBytes);
+		    const auto* bytes = download->Mapped().data() + uint64_t {slot} * SlotBytes;
+		    std::string text  = fmt::format(
+                "DrawPeek: frame={} #{} q={} seq={} tick={} t_rec={} t_done={} n={} inst={} b0=0x{:x} args=0x{:x} "
+                "count=0x{:x} max={}",
+                frame, index, queue, seq, tick, t_rec, DrawPeekNowNs(), n, inst, ranges[0].address, args, count,
+                max_cnt);
+		    static constexpr const char* Names[] = {"blk", "arg", "cnt"};
+		    for (uint32_t i = 0; i < ranges.size(); i++) {
+			    if (ranges[i].bytes == 0) continue;
+			    text += fmt::format(" | {}:", Names[i]);
+			    for (uint32_t word = 0; word < ranges[i].bytes / 4; word++) {
+				    uint32_t value = 0;
+				    std::memcpy(&value, bytes + ranges[i].offset + word * 4u, sizeof(value));
+				    text += fmt::format(" {:08x}", value);
+			    }
+		    }
+		    text += " |" + vs_buffers;
+		    LOGF("%s\n", text.c_str());
+	    });
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -4632,7 +4825,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if ((frame == last || frame - last >= static_cast<int64_t>(trace_cb[2])) &&
 		    traced.fetch_add(1, std::memory_order_relaxed) < trace_cb[1]) {
 			if (frame != last) last_frame.store(frame, std::memory_order_relaxed);
-			std::string text = fmt::format("DrawTraceCb: frame={} vs=0x{:016x} ps=0x{:016x} n={} inst={}", frame,
+			std::string text = fmt::format("DrawTraceCb: frame={} q={} seq={} tick={} vs=0x{:016x} ps=0x{:016x} n={} inst={}", frame,
+			                               static_cast<int32_t>(HangTrace::CpContextQueue()), HangTrace::CpContextSequence(),
+			                               m_context.GetCommandScheduler().CurrentTick(),
 			                               trace_cb[0],
 			                               state.ps_active && state.ps_input_info.stage.program != nullptr
 			                                   ? state.ps_input_info.stage.program->shader_hash
@@ -5458,6 +5653,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	draw_cmd_scope.Stop();
+	// KYTY_DRAW_PEEK (above): the draw's per-draw block and indirect arguments, after it.
+	if (const auto peek_hash = DrawPeekRequest()[0];
+	    peek_hash != 0 && state.vertex_info[0].stage.program != nullptr &&
+	    state.vertex_info[0].stage.program->shader_hash == peek_hash) [[unlikely]] {
+		buffer.EndRendering();
+		m_run_active = false;
+		DrawPeek(m_context, buffer, draw, state, indirect);
+	}
 	// KYTY_PASS_DUMP (renderCompute.cpp): the draw and the targets it wrote.
 	if (PassDump::Capturing()) {
 		PassDump::NoteOp('d', state.ps_active && state.ps_input_info.stage.program
