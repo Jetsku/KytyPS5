@@ -1593,6 +1593,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);
 		translator.SetFlatAperture(flat_aperture);
+		translator.SetFloat64Allowed(options.stage != ShaderType::Compute ||
+		                             options.input_info.compute->float_mode == 0xc0u);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

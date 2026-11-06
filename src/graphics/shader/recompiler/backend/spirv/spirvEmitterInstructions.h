@@ -41,7 +41,10 @@ uint32_t              EmitCompositeExtractU64(EmitterState& state, uint32_t arg0
 uint32_t              EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value arg1);
 inline constexpr auto EmitCompositeExtractU32x3 = EmitCompositeExtractU32x2;
 inline constexpr auto EmitCompositeExtractU32x4 = EmitCompositeExtractU32x2;
-inline constexpr auto EmitPackHalf2x16 = EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32, uint32_t>;
+inline constexpr auto EmitGlslPackHalf2x16 =
+    EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32, uint32_t>;
+// IR PackHalf2x16: GLSL PackHalf2x16, or with KYTY_F16_EXACT_ROUND an integer round-to-nearest-even.
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair);
 inline constexpr auto EmitPackSnorm2x16 =
     EmitGlsl<GLSLstd450PackSnorm2x16, IR::Type::U32, uint32_t>;
 inline constexpr auto EmitPackUnorm2x16 =

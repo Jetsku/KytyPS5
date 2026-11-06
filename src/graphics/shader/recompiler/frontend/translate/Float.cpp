@@ -140,6 +140,36 @@ void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
 	}
+	if (opcode == IR::ValueOpcode::FPFma32 && GetCodegenOptions().f16_exact_round &&
+	    float64_allowed) {
+		// KYTY_F16_EXACT_ROUND: V_FMA_F16/V_FMAC_F16/V_FMA_MIX*_F16 round once to f16 (ISA p.165).
+		// The product of two f32s is exact in f64, the f64 Fma rounds once to 53 bits, and a
+		// round-to-odd step to f32 keeps that rounding from deciding the f16 tie (24 >= 11 + 2), so
+		// the final round to nearest even is the single rounding; it is off only when the addend is so
+		// small that the 53-bit rounding itself lands on a 24-bit value.
+		std::array<IR::Value, 3> wide;
+		for (uint32_t index = 0; index < wide.size(); index++) {
+			wide[index] = ir.Emit(IR::ValueOpcode::ConvertF64F32, {args[index]});
+		}
+		const auto exact  = ir.Emit(IR::ValueOpcode::FPFma64, {wide[0], wide[1], wide[2]});
+		const auto narrow = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F64, {exact}));
+		const auto back   = ir.Emit(IR::ValueOpcode::ConvertF64F32, {narrow});
+		const auto inexact =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdNotEqual64, {back, exact}));
+		const auto above = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan64, {exact, back}));
+		const auto bits  = ir.BitCastU32(narrow);
+		const auto negative =
+		    ir.INotEqual(ir.ShiftRightLogical(bits, IR::U32(IR::Value(31u))), IR::U32(IR::Value(0u)));
+		const auto even =
+		    ir.IEqual(ir.BitwiseAnd(bits, IR::U32(IR::Value(1u))), IR::U32(IR::Value(0u)));
+		// One ulp away from zero when the exact value has the larger magnitude, else toward it.
+		const auto grow = IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {negative, ir.LogicalNot(above), above}));
+		const auto odd  = ir.Select(grow, ir.IAdd(bits, IR::U32(IR::Value(1u))),
+		                            ir.ISub(bits, IR::U32(IR::Value(1u))));
+		const auto rounded = ir.Select(ir.LogicalAnd(inexact, even), odd, bits);
+		WriteF16(DestinationOperand(inst), ir.BitCastF32(rounded));
+		return;
+	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
 }
 

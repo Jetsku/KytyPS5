@@ -935,7 +935,7 @@ uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 			const auto pair = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
 			                          low, high);
-			packed[word] = EmitPackHalf2x16(state, pair);
+			packed[word] = EmitGlslPackHalf2x16(state, pair);
 		}
 	}
 	return ConstructU32Composite(state, components, packed);
@@ -2560,7 +2560,7 @@ static uint32_t PackIndirectFormattedD16(ValueEmitContext& ctx, const IR::Inst& 
 		const auto pair = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
 		                          EmitBitCastF32U32(state, low), EmitBitCastF32U32(state, high));
-		const auto as_half = EmitPackHalf2x16(state, pair);
+		const auto as_half = EmitGlslPackHalf2x16(state, pair);
 		packed[out] = Select(state, TypeU32(state), is_uint, pack_int(as_uint(low), as_uint(high)),
 		                     Select(state, TypeU32(state), is_sint, pack_int(as_sint(low), as_sint(high)), as_half));
 	}

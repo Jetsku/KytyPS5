@@ -1283,6 +1283,185 @@ void CheckMadModes(VulkanHarness *vulkan) {
               bulk.count, differing);
 }
 
+// The f16 bits of s + e (|e| <= ulp(s) / 2, both exact), rounded once to nearest even; f16
+// subnormals kept, overflow to INF. Reference for KYTY_F16_EXACT_ROUND.
+u32 RoundPairToF16(double s, double e) {
+  if (std::isnan(s)) {
+    return 0x7e00u;
+  }
+  const u32 sign = std::signbit(s) ? 0x8000u : 0u;
+  if (std::isinf(s)) {
+    return sign | 0x7c00u;
+  }
+  if (sign != 0u) {
+    s = -s;
+    e = -e;
+  }
+  if (s == 0.0) {
+    return sign;
+  }
+  int exponent = 0;
+  (void)std::frexp(s, &exponent); // s in [2^(exponent-1), 2^exponent)
+  const int ulp_exp = s < std::ldexp(1.0, -14) ? -24 : exponent - 11;
+  const double ulp = std::ldexp(1.0, ulp_exp);
+  const double low = std::floor(s / ulp) * ulp;
+  const double d = (s - low) - ulp / 2.0;
+  const int side = d != 0.0 ? (d > 0.0 ? 1 : -1) : (e > 0.0 ? 1 : (e < 0.0 ? -1 : 0));
+  auto units = static_cast<uint64_t>(low / ulp);
+  if (side > 0 || (side == 0 && (units & 1u) != 0u)) {
+    units++;
+  }
+  const double value = static_cast<double>(units) * ulp;
+  if (value >= 65536.0) {
+    return sign | 0x7c00u;
+  }
+  if (value == 0.0) {
+    return sign;
+  }
+  if (value < std::ldexp(1.0, -14)) {
+    return sign | static_cast<u32>(units);
+  }
+  int vexp = 0;
+  const double mant = std::frexp(value, &vexp); // [0.5, 1)
+  const auto fraction = static_cast<u32>((mant * 2.0 - 1.0) * 1024.0);
+  return sign | (static_cast<u32>(vexp - 1 + 15) << 10u) | fraction;
+}
+
+u32 F16BitsToF32Bits(u32 h) {
+  const u32 sign = (h & 0x8000u) << 16u;
+  const u32 exp = (h >> 10u) & 0x1fu;
+  const u32 frac = h & 0x3ffu;
+  if (exp == 0x1fu) {
+    return sign | 0x7f800000u | (frac << 13u) | (frac != 0u ? 0x400000u : 0u);
+  }
+  if (exp == 0u) {
+    const float magnitude = std::ldexp(static_cast<float>(frac), -24);
+    return sign | std::bit_cast<u32>(magnitude);
+  }
+  return sign | ((exp + 112u) << 23u) | (frac << 13u);
+}
+
+// KYTY_F16_EXACT_ROUND: V_CVT_F16_F32 rounds to nearest even (ties, subnormals, overflow to INF);
+// V_CVT_F16_F32 then V_CVT_F32_F16 quantises (a host that folds the pair keeps f32 precision);
+// V_FMA_MIXLO_F16 with f32 sources rounds a*b+c once (every fourth element is built to land next
+// to an f16 tie, where an f32 Fma rounded again to f16 can differ).
+void CheckF16ExactRound(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF16ExactRound";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> inputs(3);
+  uint64_t seed = 0x2718281828459045ull;
+  const auto next = [&]() {
+    seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+    return static_cast<u32>(seed >> 32u);
+  };
+  while (inputs[0].size() < 16384u) {
+    const float a = std::bit_cast<float>(F16BitsToF32Bits(0x3c00u + next() % 0x0800u));
+    const float b = std::bit_cast<float>(F16BitsToF32Bits(0x3800u + next() % 0x0800u)) *
+                    (1.0f + std::ldexp(static_cast<float>(next() % 4096u), -23));
+    inputs[1].push_back(std::bit_cast<u32>(a));
+    inputs[2].push_back(std::bit_cast<u32>(b));
+    if (inputs[0].size() % 4u == 3u) {
+      // c = f32(tie - a*b): the exact sum sits next to an f16 tie.
+      const double tie = static_cast<double>(std::bit_cast<float>(
+                             F16BitsToF32Bits(0x3c00u + next() % 0x0400u))) +
+                         std::ldexp(1.0, -11);
+      const float c = static_cast<float>(tie - static_cast<double>(a) * static_cast<double>(b));
+      inputs[0].push_back(std::bit_cast<u32>(c));
+      continue;
+    }
+    // A random finite f16 h, then a value at, next to or past the tie above it, as f32.
+    const u32 h = next() % 0x7c00u;
+    const u32 base = F16BitsToF32Bits(h);
+    const u32 tie_step = h >= 0x400u ? 0x1000u : 0u;
+    u32 x = base;
+    switch (next() % 6u) {
+    case 0: x = base + tie_step; break;
+    case 1: x = base + tie_step + 1u; break;
+    case 2: x = base + (tie_step != 0u ? tie_step - 1u : 0u); break;
+    case 3: x = next() & 0x7fffffffu; break;
+    case 4: x = 0x477fe000u + (next() & 0x3fffu); break;
+    default: x = (next() & 0x00ffffffu) | 0x33000000u; break;
+    }
+    if ((next() & 1u) != 0u) {
+      x |= 0x80000000u;
+    }
+    inputs[0].push_back(x);
+  }
+  const auto bulk = MakeBulkCase(
+      name, 3, 3, inputs,
+      [](std::vector<u32> *code) {
+        AppendVMovU32(code, 10, 0u);
+        code->push_back(EncodeVop1(0x0a, 10, Vgpr(2)));         // v_cvt_f16_f32 v10, v2
+        code->push_back(EncodeVop1(0x0a, 11, Vgpr(2)));         // v_cvt_f16_f32 v11, v2
+        code->push_back(EncodeVop1(0x0b, 11, Vgpr(11)));        // v_cvt_f32_f16 v11, v11
+        AppendVMovU32(code, 12, 0u);
+        AppendVop3p(code, 0x21, 12, Vgpr(3), Vgpr(4), Vgpr(2)); // v_fma_mixlo_f16 v12, v3, v4, v2
+      },
+      {O::V_MOV_B32, O::V_CVT_F16_F32, O::V_CVT_F32_F16, O::V_MAD_MIXLO_F16});
+  CodegenOptions options = GetCodegenOptions();
+  options.f16_exact_round = true;
+  options.native_f16 = false;
+  const auto run = RunBulk(vulkan, bulk, options);
+  options.f16_exact_round = false;
+  const auto legacy = RunBulk(vulkan, bulk, options);
+  const auto out_cvt = BulkOutput(bulk, run.words, 0);
+  const auto out_rt = BulkOutput(bulk, run.words, 1);
+  const auto out_mix = BulkOutput(bulk, run.words, 2);
+  const auto old_cvt = BulkOutput(bulk, legacy.words, 0);
+  const auto old_rt = BulkOutput(bulk, legacy.words, 1);
+  const auto old_mix = BulkOutput(bulk, legacy.words, 2);
+  size_t legacy_cvt = 0;
+  size_t legacy_round_trip = 0;
+  size_t legacy_mix = 0;
+  size_t mix_checked = 0;
+  for (u32 e = 0; e < bulk.count; e++) {
+    const u32 x = inputs[0][e];
+    const float xf = std::bit_cast<float>(x);
+    const bool denormal = (x & 0x7f800000u) == 0u;
+    const bool nan = std::isnan(xf);
+    const u32 half =
+        nan ? 0x7e00u | ((x >> 13u) & 0x3ffu) | ((x >> 16u) & 0x8000u)
+            : RoundPairToF16(denormal ? (std::signbit(xf) ? -0.0 : 0.0) : static_cast<double>(xf),
+                             0.0);
+    const u32 trip = F16BitsToF32Bits(half);
+    const auto cvt = out_cvt[e];
+    const auto rt = out_rt[e];
+    if (cvt != half) {
+      Fail(name, "v_cvt_f16_f32",
+           "element " + std::to_string(e) + " (" + Hex(x) + "): got " + Hex(cvt) +
+               ", expected " + Hex(half));
+    }
+    if (!nan && rt != trip) {
+      Fail(name, "cvt round trip",
+           "element " + std::to_string(e) + " (" + Hex(x) + "): got " + Hex(rt) +
+               ", expected " + Hex(trip));
+    }
+    legacy_cvt += old_cvt[e] != half ? 1u : 0u;
+    legacy_round_trip += !nan && old_rt[e] != trip ? 1u : 0u;
+    if (nan || std::isinf(xf) || denormal) {
+      continue;
+    }
+    const double a = std::bit_cast<float>(inputs[1][e]);
+    const double b = std::bit_cast<float>(inputs[2][e]);
+    const double c = xf;
+    const double p = a * b; // exact: two 24-bit significands
+    const double s2 = p + c;
+    const double bb = s2 - p;
+    const double err = (p - (s2 - bb)) + (c - bb);
+    const u32 mix = RoundPairToF16(s2, err);
+    const auto got = out_mix[e];
+    mix_checked++;
+    if ((got & 0xffffu) != mix) {
+      Fail(name, "v_fma_mixlo_f16",
+           "element " + std::to_string(e) + ": got " + Hex(got) + ", expected " + Hex(mix));
+    }
+    legacy_mix += (old_mix[e] & 0xffffu) != mix ? 1u : 0u;
+  }
+  std::printf("[codegen] %-32s ok (%u elements, %zu mix; switch off differs: cvt %zu, round trip "
+              "%zu, mix %zu)\n",
+              name, bulk.count, mix_checked, legacy_cvt, legacy_round_trip, legacy_mix);
+}
+
 // A vertex shader with one MAD feeding the position and one feeding a parameter: which of them
 // are fused, which carry NoContraction, and the Invariant position, per MadMode.
 void CheckMadPositionSlice() {
@@ -2664,6 +2843,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckSplitLdsWriteSync(vulkan);
   CheckSplitDppScan(vulkan);
   CheckMovIntMods(vulkan);
+  CheckF16ExactRound(vulkan);
   CheckLdsAtomicOrder(vulkan);
   CheckGdsM0Base(vulkan);
   CheckKnownBitsMasks(vulkan);

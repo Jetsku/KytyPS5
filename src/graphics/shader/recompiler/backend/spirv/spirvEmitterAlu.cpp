@@ -361,6 +361,60 @@ uint32_t EmitFastF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	return EmitOrU32(state, result, sign);
 }
 
+// KYTY_F16_EXACT_ROUND: f32 bits -> f16 bits, round to nearest even (V_CVT_F16_F32, ISA p.137),
+// in integer arithmetic so that a host compiler cannot fold it against a later UnpackHalf2x16:
+//  - |x| >= 2^-14: rebias the exponent ((e - 112) << 23), add 0xfff plus the kept LSB, shift by 13;
+//    a carry rounds into the exponent, results past the range saturate at 0x7c00 (+-INF).
+//  - |x| < 2^-14: the f16 subnormal (mantissa | hidden) >> s, s = 126 - e limited to 25, rounded
+//    to nearest even with (m + (2^(s-1) - 1) + ((m >> s) & 1)) >> s; f32 zeros and denormals give
+//    a signed zero.
+//  - NaN: quiet (0x7e00) with the top payload bits; INF: 0x7c00.
+uint32_t EmitF32ToF16RteBits(EmitterState& state, uint32_t f32) {
+	const auto bits   = EmitBitcastF32ToU32(state, f32);
+	const auto abs    = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign   = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
+	const auto rebias = Binary(state, spv::OpISub, TypeU32(state), abs, ConstantU32(state, 0x38000000u));
+	const auto keep   = EmitAndConstant(state, EmitShiftRightConstant(state, rebias, 13), 1u);
+	const auto normal = EmitMinMaxU32Value(
+	    state,
+	    EmitShiftRightConstant(
+	        state,
+	        Binary(state, spv::OpIAdd, TypeU32(state),
+	               Binary(state, spv::OpIAdd, TypeU32(state), rebias, ConstantU32(state, 0xfffu)),
+	               keep),
+	        13),
+	    ConstantU32(state, 0x7c00u), false);
+	const auto exponent = EmitShiftRightConstant(state, abs, 23);
+	const auto shift    = EmitMinMaxU32Value(state, EmitSubConstantMinusU32(state, 126, exponent),
+	                                         ConstantU32(state, 25), false);
+	const auto mantissa =
+	    EmitOrU32(state, EmitAndConstant(state, abs, 0x007fffffu), ConstantU32(state, 0x00800000u));
+	const auto half_minus_one = Binary(
+	    state, spv::OpISub, TypeU32(state),
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1u),
+	           Binary(state, spv::OpISub, TypeU32(state), shift, ConstantU32(state, 1u))),
+	    ConstantU32(state, 1u));
+	const auto odd = EmitAndConstant(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), mantissa, shift), 1u);
+	const auto subnormal = Binary(
+	    state, spv::OpShiftRightLogical, TypeU32(state),
+	    Binary(state, spv::OpIAdd, TypeU32(state),
+	           Binary(state, spv::OpIAdd, TypeU32(state), mantissa, half_minus_one), odd),
+	    shift);
+	auto result =
+	    EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
+	                       subnormal, normal);
+	const auto nan = EmitOrU32(state, EmitAndConstant(state, EmitShiftRightConstant(state, abs, 13), 0x3ffu),
+	                           ConstantU32(state, 0x7e00u));
+	const auto special =
+	    EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpUGreaterThan, abs, 0x7f800000u),
+	                       nan, ConstantU32(state, 0x7c00u));
+	result = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u), special,
+	    result);
+	return EmitOrU32(state, result, sign);
+}
+
 uint32_t EmitFastPackFloat2x16Rtz(EmitterState& state, uint32_t x, uint32_t y) {
 	const auto low  = EmitFastF32ToF16RtzBits(state, x);
 	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
@@ -369,6 +423,18 @@ uint32_t EmitFastPackFloat2x16Rtz(EmitterState& state, uint32_t x, uint32_t y) {
 }
 
 } // namespace
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair) {
+	if (!GetCodegenOptions().f16_exact_round) {
+		return EmitGlslPackHalf2x16(state, pair);
+	}
+	const auto x    = EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, pair, 0u);
+	const auto y    = EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, pair, 1u);
+	const auto low  = EmitF32ToF16RteBits(state, x);
+	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                         EmitF32ToF16RteBits(state, y), ConstantU32(state, 16));
+	return EmitOrU32(state, low, high);
+}
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	if (GetCodegenOptions().fast_pkrtz) {

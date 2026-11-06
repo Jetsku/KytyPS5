@@ -109,6 +109,9 @@ private:
 public:
 	// Every block of a program routes FLAT accesses by aperture once any block reads a base/limit.
 	void SetFlatAperture(bool seen) { flat_aperture_seen = seen; }
+	// False for a CS whose FLOAT_MODE is not 0xC0: the SPIR-V backend has no Float64 path there.
+	bool float64_allowed = true;
+	void SetFloat64Allowed(bool allowed) { float64_allowed = allowed; }
 
 private:
 	void FLAT_STORE(const Decoder::Instruction& inst);
