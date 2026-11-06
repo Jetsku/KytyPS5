@@ -584,6 +584,7 @@ private:
 	void NoteJournalPipeline(uint64_t key, std::span<const uint32_t> words, uint32_t snapshot_words,
 	                         std::span<const std::pair<uint64_t, uint64_t>> identities,
 	                         const std::array<uint64_t, 4>& guest);
+	void InitializeMadExactFilter();
 	void InitializeProgramDiskCache();
 	void InitializeShaderPrecompile();
 	void StopShaderPrecompile();

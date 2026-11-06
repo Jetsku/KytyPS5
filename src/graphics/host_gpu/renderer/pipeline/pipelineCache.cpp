@@ -3481,8 +3481,10 @@ struct PipelineCache::ProgramCache {
 		};
 		copy(params.code, code_words);
 		copy(params.back_code, back_code_words);
+		// KYTY_MAD_EXACT_SHADERS: a selected program gets its own records (stage bit 31).
+		const bool mad_exact = ShaderRecompiler::MadExactProgram(static_cast<uint32_t>(options.stage), options.shader_hash);
 		ProgramDiskCache::BuildSourceKey(
-		    {.stage                   = static_cast<uint32_t>(key.stage),
+		    {.stage                   = static_cast<uint32_t>(key.stage) | (mad_exact ? 0x80000000u : 0u),
 		     .hash                    = key.hash,
 		     .user_data_count         = key.user_data_count,
 		     .code_size               = key.code_size,
@@ -7323,6 +7325,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	if (m_driver_cache != nullptr && DriverCacheSaveSettings::Get().enabled) {
 		m_saver = std::make_unique<DriverCacheSaver>(*this);
 	}
+	InitializeMadExactFilter();
 	InitializeProgramDiskCache();
 	InitializeShaderPrecompile();
 	InitializePipelineJournal();
@@ -7526,6 +7529,54 @@ void PipelineCache::InitializeDriverCache() {
 // file; tests use it). Default: ProgramDiskCacheDefault. KYTY_PROGRAM_CACHE_SAVE=0: no periodic
 // saves, only the one at exit. KYTY_PROGRAM_CACHE_VERIFY: see ProgramCache::DiskVerifyMode.
 constexpr bool ProgramDiskCacheDefault = false;
+
+// KYTY_MAD_EXACT_SHADERS=<token>[,<token>...] (diagnostic, default unset): the selected programs
+// are emitted with MadMode::Exact (as KYTY_MAD_MODE=exact) while the others keep KYTY_MAD_MODE, to
+// find which programs need unfused MADs. Tokens: a stage (vs ps cs ls hs es gs; none = every stage),
+// a hex guest hash, or m<mask>:<value> (hex) to select by hash bits (bisection). The setting is not
+// part of the codegen fingerprint; BuildDiskKey salts the disk-cache key of each selected program.
+void PipelineCache::InitializeMadExactFilter() {
+	const char* value = std::getenv("KYTY_MAD_EXACT_SHADERS");
+	if (value == nullptr || *value == ' ') {
+		return;
+	}
+	ShaderRecompiler::MadExactFilter filter;
+	filter.active = true;
+	std::string_view text(value);
+	while (!text.empty()) {
+		const auto comma = text.find(',');
+		std::string token(text.substr(0, comma));
+		text = comma == std::string_view::npos ? std::string_view {} : text.substr(comma + 1);
+		const auto stage_bit = [](ShaderType type) { return 1u << static_cast<uint32_t>(type); };
+		if (token == "vs") {
+			filter.stage_mask |= stage_bit(ShaderType::Vertex);
+		} else if (token == "ps") {
+			filter.stage_mask |= stage_bit(ShaderType::Pixel);
+		} else if (token == "cs") {
+			filter.stage_mask |= stage_bit(ShaderType::Compute);
+		} else if (token == "ls") {
+			filter.stage_mask |= stage_bit(ShaderType::Local);
+		} else if (token == "hs") {
+			filter.stage_mask |= stage_bit(ShaderType::TessellationControl);
+		} else if (token == "es") {
+			filter.stage_mask |= stage_bit(ShaderType::TessellationEvaluation);
+		} else if (token == "gs") {
+			filter.stage_mask |= stage_bit(ShaderType::Mesh);
+		} else if (!token.empty() && token[0] == 'm' && token.find(':') != std::string::npos) {
+			const auto colon  = token.find(':');
+			filter.hash_mask  = std::strtoull(token.substr(1, colon - 1).c_str(), nullptr, 16);
+			filter.hash_value = std::strtoull(token.substr(colon + 1).c_str(), nullptr, 16) & filter.hash_mask;
+		} else if (!token.empty()) {
+			filter.hashes.push_back(std::strtoull(token.c_str(), nullptr, 16));
+		}
+	}
+	if (filter.stage_mask == 0) {
+		filter.stage_mask = ~0u;
+	}
+	PipelineCacheLog("MAD exact filter: stages {:#x}, {} hashes, mask {:016x} value {:016x}", filter.stage_mask,
+	                 filter.hashes.size(), filter.hash_mask, filter.hash_value);
+	ShaderRecompiler::SetMadExactFilter(std::move(filter));
+}
 
 void PipelineCache::InitializeProgramDiskCache() {
 	const auto* setting = std::getenv("KYTY_PROGRAM_CACHE");

@@ -476,6 +476,9 @@ uint32_t EmitFloatBinary(ValueEmitContext& ctx, const IR::Inst& inst, spv::Op op
 // shaders computing the same position (depth pre-pass and main pass) cannot be compiled to
 // different roundings.
 bool NoContraction(EmitterState& state, const IR::Inst& inst) {
+	if (MadExactProgram(static_cast<uint32_t>(state.program.stage), state.program.shader_hash)) {
+		return true;
+	}
 	switch (GetCodegenOptions().mad_mode) {
 		case MadMode::Exact: return true;
 		case MadMode::Fused: return false;

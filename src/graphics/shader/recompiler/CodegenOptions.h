@@ -770,6 +770,22 @@ void               SetHostNativeHalf(bool supported);
 [[nodiscard]] bool NativeHalfActive();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
 // while no shader is being compiled.
+// Diagnostic per-program MadMode::Exact (KYTY_MAD_EXACT_SHADERS, parsed by the pipeline cache,
+// which also salts the program disk-cache key of every program it selects, so the codegen
+// fingerprint and the other programs' cache entries stay as they are): a selected program is
+// emitted as with KYTY_MAD_MODE=exact while the others keep mad_mode. Selection: `stage_mask`
+// (bit = static_cast<uint32_t>(ShaderType)) and, when `hashes` is non-empty or `hash_mask` is
+// non-zero, a hash in `hashes` or (hash & hash_mask) == hash_value. Inactive by default.
+struct MadExactFilter {
+	bool                  active     = false;
+	uint32_t              stage_mask = 0;
+	std::vector<uint64_t> hashes;
+	uint64_t              hash_mask  = 0;
+	uint64_t              hash_value = 0;
+};
+void SetMadExactFilter(MadExactFilter filter);
+// The program uses MadMode::Exact because of the filter (false while it is inactive).
+[[nodiscard]] bool MadExactProgram(uint32_t stage, uint64_t shader_hash);
 void SetCodegenOptions(const CodegenOptions& options);
 
 // The BVH lowering mode in effect on this thread: rt_function, unless this thread overrides it
