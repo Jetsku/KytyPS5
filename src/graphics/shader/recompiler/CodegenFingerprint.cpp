@@ -237,6 +237,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.scalar_load_groups) {
 		b.Text("scalar_load_groups");
 	}
+	if (options.srt_uniform) {
+		b.Text("srt_uniform");
+	}
 	if (options.null_image_keep_dim) {
 		b.Text("null_image_keep_dim");
 	}

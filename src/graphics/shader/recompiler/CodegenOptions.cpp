@@ -102,6 +102,7 @@ CodegenOptions FromEnvironment() {
 	options.storage_table_loose  = EnvFlag("KYTY_STORAGE_TABLE_LOOSE", options.storage_table_loose);
 	options.sampled_table_reads  = EnvFlag("KYTY_SAMPLED_TABLE_READS", options.sampled_table_reads);
 	options.scalar_load_groups   = EnvFlag("KYTY_SCALAR_LOAD_GROUPS", options.scalar_load_groups);
+	options.srt_uniform          = EnvFlag("KYTY_SRT_UNIFORM", options.srt_uniform);
 	options.null_image_keep_dim  = EnvFlag("KYTY_NULL_IMAGE_KEEP_DIM", options.null_image_keep_dim);
 	options.storage_swizzle_canon = EnvFlag("KYTY_STORAGE_SWIZZLE_CANON", options.storage_swizzle_canon);
 	options.raw_small_sint_storage =

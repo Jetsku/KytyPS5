@@ -43,6 +43,10 @@ struct HostBufferRobustness {
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 
+// KYTY_SRT_UNIFORM (CodegenOptions::srt_uniform) on a device with the uniform dword-load path: the
+// flattened SRT binding is a uniform buffer (emitter and descriptor layout agree through this).
+bool SrtUniformEnabled();
+
 // KYTY_BUFFER_PAIR_ATOMIC: the device has 64-bit atomics on storage buffers and physical storage
 // buffers (shaderBufferInt64Atomics) and starts every storage-buffer binding 8-byte aligned
 // (minStorageBufferOffsetAlignment a multiple of 8), so the u64 view's element i of a binding is the

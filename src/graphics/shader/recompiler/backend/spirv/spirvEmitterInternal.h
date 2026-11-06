@@ -210,6 +210,8 @@ struct EmitterState {
 	// the mip_stats binding stays declared, but no sample records GET_LOD_STATS feedback.
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// KYTY_SRT_UNIFORM: flattened_srt_variable is a uniform block (FlattenedSrtElementPointerType).
+	bool                                             flattened_srt_uniform   = false;
 	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
 	// the feedback buffer, and the slot of the image instruction being emitted.
 	std::map<uint32_t, uint32_t>                     bindless_image_variables;
@@ -322,6 +324,9 @@ uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
 uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
+// The pointer type of one dword of flattened_srt_variable (storage buffer, or KYTY_SRT_UNIFORM's
+// uniform block).
+uint32_t FlattenedSrtElementPointerType(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);

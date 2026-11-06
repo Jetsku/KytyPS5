@@ -1102,7 +1102,10 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 	const auto key  = ctx.Def(handle->Arg(0));
 	const auto Load = [&](uint32_t variable, uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          variable == state.flattened_srt_variable
+		                              ? FlattenedSrtElementPointerType(state)
+		                              : TypeStorageBufferElementPointer(state),
 		                          pointer, variable, ConstantU32(state, 0), index);
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);

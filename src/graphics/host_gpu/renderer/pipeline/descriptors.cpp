@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -158,11 +159,14 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Gds:
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
-		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData:
 		case BindingKind::MipStats:
 		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::UniformBuffers: return vk::DescriptorType::eUniformBuffer;
+		case BindingKind::FlattenedSrt:
+		case BindingKind::ShaderData:
+			// KYTY_SRT_UNIFORM: the emitter declares both tables as uniform blocks.
+			return ShaderRecompiler::Spirv::SrtUniformEnabled() ? vk::DescriptorType::eUniformBuffer
+			                                                    : vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -5256,10 +5260,33 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::SharedMemory:
 					case BindingKind::Gds: {
 						const vk::DescriptorBufferInfo* view = &descriptors.gds;
-						if (binding.kind == BindingKind::FlattenedSrt) {
-							view = &descriptors.flattened_srt;
-						} else if (binding.kind == BindingKind::ShaderData) {
-							view = &descriptors.shader_data_buffer;
+						if (binding.kind == BindingKind::FlattenedSrt ||
+						    binding.kind == BindingKind::ShaderData) {
+							view = binding.kind == BindingKind::FlattenedSrt
+							           ? &descriptors.flattened_srt
+							           : &descriptors.shader_data_buffer;
+							if (ShaderRecompiler::Spirv::SrtUniformEnabled()) {
+								// KYTY_SRT_UNIFORM: at most the uniform array the shader declares.
+								EXIT_IF(view->buffer == nullptr);
+								auto uniform  = *view;
+								uniform.range = std::min<vk::DeviceSize>(
+								    uniform.range,
+								    std::min<vk::DeviceSize>(ShaderRecompiler::IR::UniformBufferBytes,
+								                             m_context.GetGraphics()
+								                                 .GetPhysicalDeviceProperties()
+								                                 .limits.maxUniformBufferRange));
+								if (uniform.range < view->range) {
+									static std::atomic<uint32_t> reported {0};
+									if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+										LOGF("KYTY_SRT_UNIFORM: table (kind %u) of %" PRIu64
+										     " bytes cut to the uniform range\n",
+										     static_cast<uint32_t>(binding.kind),
+										     static_cast<uint64_t>(view->range));
+									}
+								}
+								m_descriptor_buffers.push_back(uniform);
+								break;
+							}
 						} else if (binding.kind == BindingKind::SharedMemory) {
 							view = &descriptors.shared_memory;
 						}
