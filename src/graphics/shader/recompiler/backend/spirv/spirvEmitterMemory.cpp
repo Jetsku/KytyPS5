@@ -3387,7 +3387,7 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	state.builder.AddFunction(spv::OpAccessChain, FlattenedSrtElementPointerType(state), pointer,
 	                          state.flattened_srt_variable, ConstantU32(state, 0),
 	                          ctx.Arg(inst, 1));
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);

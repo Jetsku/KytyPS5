@@ -222,6 +222,23 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 	return TypePointer(state, spv::StorageClassStorageBuffer, TypeStorageBufferElement(state, bits));
 }
 
+// KYTY_SRT_UNIFORM: a dword array of the largest uniform range (std430-style,
+// uniformBufferStandardLayout) in a uniform block; the host binds at most that much.
+static uint32_t UniformDwordBlockType(EmitterState& state) {
+	const auto array = state.builder.DecoratedType(
+	    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, TypeU32(state),
+	    ConstantU32(state, IR::UniformBufferBytes / 4u));
+	return state.builder.DecoratedType(spv::OpTypeStruct,
+	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
+	                                   array);
+}
+
+uint32_t FlattenedSrtElementPointerType(EmitterState& state) {
+	return state.flattened_srt_uniform ? TypePointer(state, spv::StorageClassUniform, TypeU32(state))
+	                                   : TypeStorageBufferElementPointer(state);
+}
+
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
@@ -522,13 +539,21 @@ void DefineDescriptors(EmitterState& state) {
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
-				    Define(StorageBufferType(state), "shader_data");
+				    SrtUniformEnabled()
+				        ? Define(UniformDwordBlockType(state), "shader_data", spv::StorageClassUniform)
+				        : Define(StorageBufferType(state), "shader_data");
 				break;
 			case IR::DescriptorBindingKind::MipStats:
 				state.mip_stats_variable = Define(StorageBufferType(state), "mip_stats");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
-				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				if (SrtUniformEnabled()) {
+					state.flattened_srt_variable =
+					    Define(UniformDwordBlockType(state), "flattened_srt", spv::StorageClassUniform);
+					state.flattened_srt_uniform = true;
+				} else {
+					state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				}
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),

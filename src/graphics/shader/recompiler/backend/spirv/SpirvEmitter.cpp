@@ -617,6 +617,11 @@ HostBufferRobustness GetHostBufferRobustness() {
 	            g_uniform_dword_loads_return_zero.load(std::memory_order_relaxed)};
 }
 
+bool SrtUniformEnabled() {
+	return GetCodegenOptions().srt_uniform &&
+	       g_uniform_dword_loads_return_zero.load(std::memory_order_relaxed);
+}
+
 void SetHostBufferPairAtomics(bool supported) {
 	g_buffer_pair_atomics.store(supported, std::memory_order_relaxed);
 }

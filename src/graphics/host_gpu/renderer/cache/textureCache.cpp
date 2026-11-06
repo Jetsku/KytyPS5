@@ -151,6 +151,32 @@ static bool AliasSyncSkipEnabled() {
 	return enabled;
 }
 
+// KYTY_ALIAS_SYNC_DEPTH_PLANE=1 (live, default off): an alias without stencil (R32_SFLOAT or
+// D32_SFLOAT) synchronized by a full copy from a D32_SFLOAT_S8_UINT owner of the same extent,
+// levels and layers adopts the owner's content serial, as lossless copies do. The copy moves the
+// whole depth plane, which is all the alias holds, so equal serials still prove that the alias
+// holds the owner's depth bits (the only bits any alias sync copies; stencil is never copied).
+// Without it (CopyImage: "combined depth/stencil images never compare equal") Ghost of Yotei
+// recopies its 1920x1080 scene depth into the R32 alias before every draw that samples it through a
+// colour T#, although the draws write no depth: ~45-73 copies, 16.5 ms GPU per frame (gpu-yotei
+// 2026-11-05).
+static Live::Switch g_alias_sync_depth_plane("KYTY_ALIAS_SYNC_DEPTH_PLANE",
+                                             [](const char* value) -> int64_t {
+	                                             return value != nullptr && value[0] == '1' ? 1 : 0;
+                                             });
+
+[[nodiscard]] static bool AliasSyncDepthPlane(const Image& alias, const Image& owner) {
+	if (!g_alias_sync_depth_plane.On()) {
+		return false;
+	}
+	const auto& a = alias.backing;
+	const auto& o = owner.backing;
+	return o.format == vk::Format::eD32SfloatS8Uint &&
+	       (a.format == vk::Format::eR32Sfloat || a.format == vk::Format::eD32Sfloat) &&
+	       a.extent == o.extent && a.image_type == o.image_type && a.mip_levels == o.mip_levels &&
+	       a.layers == o.layers && a.samples == o.samples;
+}
+
 // Moves the texel rectangle's dimensions into [0, extent) (empty when outside).
 [[nodiscard]] vk::Rect2D ClampRect(const vk::Rect2D& rect, uint32_t width, uint32_t height) {
 	const int64_t left   = std::clamp<int64_t>(rect.offset.x, 0, width);
@@ -7460,9 +7486,24 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 				return;
 			}
 		}
+		if (WatchRange::Enabled()) {
+			// Diagnostic: why the copy was not skipped (serials, dirty and buffer-owned flags).
+			const auto& owner = m_slot_images[other_id];
+			WatchRange::Note(fmt::format("alias sync copy: alias serial {} owner serial {} alias cpu_dirty {} "
+			                             "alias buffer_mod {} owner buffer_mod {} owner definite {}",
+			                             image.ContentSerial(), owner.ContentSerial(), image.IsCpuDirty(),
+			                             image.IsBufferModified(), owner.IsBufferModified(),
+			                             owner.DefiniteWrites())
+			                     .c_str(),
+			                 image.info.data.address, image.info.data.size);
+		}
 		const bool lossless = CopyImage(id, other_id, "alias-sync");
+		// CopyImage marks the alias buffer-owned instead of copying when the owner's bytes are
+		// in the buffer: then nothing was copied.
+		const bool copied = !image.IsBufferModified();
 		CommitGpuWrite(image);
-		if (lossless && AliasSyncSkipEnabled()) {
+		if ((lossless || (copied && AliasSyncDepthPlane(image, m_slot_images[other_id]))) &&
+		    AliasSyncSkipEnabled()) {
 			image.AdoptContentSerial(m_slot_images[other_id].ContentSerial());
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncCopies);
@@ -9377,6 +9418,13 @@ void TextureCache::RestoreContentIfUnwritten(ImageId id, const ContentMark& mark
 	std::scoped_lock lock {m_lock};
 	auto*            image = m_slot_images.try_get(id);
 	// Only bind-time possible writes happened since the mark: no upload, copy or clear.
+	if (image != nullptr && WatchRange::Enabled()) {
+		WatchRange::Note(fmt::format("depth restore-if-unwritten: mark serial {} now {} definite {} -> {}",
+		                             mark.serial, image->ContentSerial(), mark.definite_writes,
+		                             image->DefiniteWrites())
+		                     .c_str(),
+		                 image->info.data.address, image->info.data.size);
+	}
 	if (image != nullptr && image->DefiniteWrites() == mark.definite_writes) {
 		image->AdoptContentSerial(mark.serial);
 	}

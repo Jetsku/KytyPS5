@@ -433,6 +433,14 @@ struct CodegenOptions {
 	// Erlou93/KytyPS5-Yotei FindScalarLoadGroups): the dwords of one S_LOAD_DWORDXn through a scalar
 	// address share one BDA page lookup when they lie in one page (EmitScalarLoadGroup). Exact.
 	bool scalar_load_groups = false;
+	// KYTY_SRT_UNIFORM=1 (default 0; adapted from Erlou93/KytyPS5-Yotei's uniform constant buffers):
+	// the flattened SRT binding is a uniform buffer instead of a storage buffer (a dword array in a
+	// uniform block, uniformBufferStandardLayout; the host binds the same uploaded words with a range
+	// of at most 64 KiB). Reads of it (S_LOAD of SRT slots, runtime mapping tables) then come from
+	// NVIDIA's constant cache, constant-index reads often as instruction operands, instead of one L1
+	// load each. Same bytes, same results. Needs the uniform dword-load path (KYTY_UNIFORM_BUFFERS'
+	// device requirements); without it the binding stays a storage buffer.
+	bool srt_uniform = false;
 	// KYTY_NULL_IMAGE_KEEP_DIM=1 (default 0; on in the PPSA26344 title preset; TheCruZ 4f1b2ebc): a
 	// null image keeps the shader's dimension instead of the canonical 2D view (fewer program variants).
 	bool null_image_keep_dim = false;

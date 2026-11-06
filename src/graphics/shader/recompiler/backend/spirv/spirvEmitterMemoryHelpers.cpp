@@ -18,7 +18,10 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          SrtUniformEnabled()
+		                              ? TypePointer(state, spv::StorageClassUniform, TypeU32(state))
+		                              : TypeStorageBufferElementPointer(state),
 		                          pointer, state.shader_data_storage_variable,
 		                          ConstantU32(state, 0), ConstantU32(state, dword_index));
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
@@ -37,7 +40,7 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
                                    uint32_t search_iterations, uint32_t default_resource) {
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		state.builder.AddFunction(spv::OpAccessChain, FlattenedSrtElementPointerType(state),
 		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
 		                          index);
 		const auto value = state.builder.AllocateId();
