@@ -1491,6 +1491,10 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	PassCensus::Exec('c', program.shader_hash, 0);
 	WatchRange::SetCurrentOp("CS", program.shader_hash);
 	WatchRange::NoteDispatch(program.shader_hash, async_compute, thread_group_x, thread_group_y, thread_group_z, false);
+	WatchRange::SetCurrentOpDetail(static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
+	                               input_info.stage.resources->user_data.data(),
+	                               static_cast<uint32_t>(input_info.stage.resources->user_data.size()), thread_group_x,
+	                               thread_group_y, thread_group_z);
 	const auto& resources = *input_info.stage.resources;
 	// A recorded metadata clear consumes the dispatch unless KYTY_COMPUTE_META_CLEAR_DISPATCH keeps
 	// its guest writes (upstream 01ce97388).
@@ -1593,6 +1597,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 		~DispatchPrepScope() { buffer.SetDispatchPrep(false); }
 		void End() const { buffer.SetDispatchPrep(false); }
 	} dispatch_prep(buffer);
+	if (program.info.bda_writes) {
+		m_context.GetBufferCache().SnapshotBdaMergePages(program.shader_hash); // KYTY_BDA_CPU_MERGE
+	}
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	if (program.info.uses_dma) {
@@ -2025,6 +2032,15 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	if (input_info.stage.program->info.uses_dma) {
 		PrefaultDmaPointers(m_context.GetBufferCache(), input_info.stage);
 	}
+	if (input_info.stage.program->info.bda_writes) {
+		m_context.GetBufferCache().SnapshotBdaMergePages(input_info.stage.program->shader_hash); // KYTY_BDA_CPU_MERGE
+	}
+	// The writer of the bindings FindBuffers obtains is this dispatch (KYTY_WATCH_RANGE / WRITERS).
+	WatchRange::SetCurrentOp("CS", input_info.stage.program->shader_hash);
+	WatchRange::SetCurrentOpDetail(static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
+	                               input_info.stage.resources->user_data.data(),
+	                               static_cast<uint32_t>(input_info.stage.resources->user_data.size()), 0xffffffffu,
+	                               0xffffffffu, 0xffffffffu);
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;

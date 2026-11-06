@@ -4652,6 +4652,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						text += fmt::format(" d{}:", m_context.GetBufferCache().HasGpuDirtyBytes(base, sizeof(words)) ? 1 : 0);
 						for (const auto word: words) text += fmt::format(" {:08x}", word);
 					}
+					if (base != 0) text += WatchRange::DescribeWriters(base);
+					// The newest writer's first user-data pointer (an upload-copy table): its first 64 dwords, and
+					// 24 dwords at each 0x20xxxxxxxx pointer in it (the copy sources).
+					uint32_t wud0 = 0;
+					uint32_t wud1 = 0;
+					if (base != 0 && WatchRange::NewestWriterUd(base, &wud0, &wud1)) {
+						const uint64_t table = wud0 | (static_cast<uint64_t>(wud1 & 0xffffu) << 32u);
+						uint32_t       tw[64] {};
+						if (table != 0 && LibKernel::Memory::TryReadBacking(table, tw, sizeof(tw))) {
+							text += fmt::format(" table@0x{:x}:", table);
+							for (const auto word: tw) text += fmt::format(" {:08x}", word);
+							uint32_t shown = 0;
+							for (uint32_t k = 0; k + 1 < 64 && shown < 8; k++) {
+								const uint64_t ptr = tw[k] | (static_cast<uint64_t>(tw[k + 1]) << 32u);
+								if ((ptr >> 32u) != 0x20u) continue;
+								uint32_t src[24] {};
+								if (LibKernel::Memory::TryReadBacking(ptr, src, sizeof(src))) {
+									text += fmt::format(" src[{}]@0x{:x}:", k, ptr);
+									for (const auto word: src) text += fmt::format(" {:08x}", word);
+									shown++;
+								}
+							}
+						}
+					}
 				}
 			};
 			if (state.ps_active) dump("ps", state.ps_input_info.stage.program, state.ps_input_info.stage.resources);
