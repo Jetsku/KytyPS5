@@ -2779,7 +2779,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	// KYTY_BINDLESS_SHARE_SLOTS: a T# another key already resolved shares that key's slot.
 	if (BindlessShareSlots() && !heap.runtime) {
-		if (const auto* found = table.FindSharedSlot(heap.binding, heap.descriptors[key]); found != nullptr) {
+		if (const auto* found = table.FindSharedSlot(heap.binding, heap.descriptors[key], heap.view_key); found != nullptr) {
 			const auto id    = found->image;
 			const auto entry = found->entry;
 			auto*      image = m_context.GetTextureCache().m_slot_images.try_get(id);
@@ -3017,7 +3017,7 @@ void RenderExecutor::PrefillBindlessHeap(BindlessHeap& heap, uint32_t entries) {
 			skipped++;
 			continue;
 		}
-		if (const auto* found = table.FindSharedSlot(heap.binding, words); found != nullptr) {
+		if (const auto* found = table.FindSharedSlot(heap.binding, words, heap.view_key); found != nullptr) {
 			const auto id    = found->image;
 			const auto entry = found->entry;
 			auto*      image = cache.m_slot_images.try_get(id);
@@ -3511,6 +3511,69 @@ void RenderExecutor::ProcessRecordHeap(BindlessHeap& heap) {
 		m_bindless_budget_left -= std::min(m_bindless_budget_left, spent);
 	}
 }
+// KYTY_BINDLESS_IDLE_RELEASE=<frames> (startup, default 0 = off; PPSA26344 preset 300; ported from
+// Erlou93/KytyPS5-Yotei v0.1.4 ReleaseUnusedBindlessSlots): a guest heap no draw or dispatch used for
+// that many frames releases its resolved keys: their slots go back to the free lists and their images
+// lose the heap's references; an image no key refers to any more is unpinned, so the texture cache may
+// collect it (KYTY_BINDLESS_GUEST_DROP_FRAMES frees it). Without it every resolved key of every heap
+// stays: Ghost of Yotei creates ~100k small heaps per 10 minutes (per-frame terrain and material
+// tables), each holding its images pinned for the rest of the session (VRAM growth over a long
+// session). A released heap used again resolves its keys again (prefill, or feedback). Runtime and
+// record pointer heaps are left alone. 512 heaps are looked at per frame, round robin.
+void RenderExecutor::ReleaseIdleBindlessHeaps(uint64_t frame) {
+	static const uint64_t idle = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_IDLE_RELEASE");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0};
+	}();
+	if (idle == 0) {
+		return;
+	}
+	auto&        table = m_context.GetBindlessTable();
+	auto&        cache = m_context.GetTextureCache();
+	auto&        heaps = table.Heaps();
+	const size_t count = heaps.size();
+	if (count == 0 || frame < idle) {
+		return;
+	}
+	static uint64_t released_heaps = 0, released_keys = 0, unpinned = 0, logged_frame = 0;
+	constexpr uint32_t HeapBudget = 512;
+	for (uint32_t n = 0; n < HeapBudget && n < count; n++) {
+		if (m_bindless_idle_cursor >= count) {
+			m_bindless_idle_cursor = 0;
+		}
+		auto& heap = heaps[m_bindless_idle_cursor++];
+		if (heap.runtime || heap.record_pointer != UINT32_MAX || heap.resolved.empty() ||
+		    heap.sync_used_frame + idle > frame) {
+			continue;
+		}
+		for (uint32_t key = 0; key < heap.slots.size(); key++) {
+			const auto id = heap.images[key];
+			if (heap.slots[key] == 0 && !id) {
+				continue;
+			}
+			released_keys++;
+			if (table.ReleaseKey(heap, key, true) && id) {
+				if (auto* image = cache.m_slot_images.try_get(id); image != nullptr && image->bindless_pinned) {
+					NoteBindlessStateChange(*image);
+					image->bindless_pinned = false;
+					cache.ReleaseDroppedByGuest(id);
+					unpinned++;
+				}
+			}
+		}
+		heap.prefilled = false; // KYTY_BINDLESS_PREFILL settles it again at its next use
+		heap.refresh_gpu_keys.clear();
+		heap.refresh_frame = UINT64_MAX;
+		released_heaps++;
+	}
+	if (released_heaps != 0 && frame >= logged_frame + 600u) {
+		logged_frame = frame;
+		LOGF("Bindless idle release: frame=%" PRIu64 " heaps %" PRIu64 " keys %" PRIu64 " images unpinned %" PRIu64
+		     " (KYTY_BINDLESS_IDLE_RELEASE=%" PRIu64 ", %zu heaps)\n",
+		     frame, released_heaps, released_keys, unpinned, idle, count);
+	}
+}
+
 void RenderExecutor::ResolveBindlessRequests() {
 	KYTY_PROFILER_FUNCTION();
 	const BindlessHostTimer timer;
@@ -3533,6 +3596,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 	table.ConsumeSnapshot();
 	m_bindless_snapshot_serial++;
 	table.DebugWatchReport(frame);
+	ReleaseIdleBindlessHeaps(frame);
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget    = 128;
 	uint32_t           resolved  = RevalidateBindlessKeys(Budget);
@@ -3672,6 +3736,21 @@ static bool BindlessPatchLogTake() {
 	return value != 0;
 }
 
+// KYTY_BINDLESS_REFRESH=1 (live, default off; ported from Erlou93/KytyPS5-Yotei v0.1.4
+// PrepareBindlessHeaps / RefreshBindlessDescriptor): a bound texture is looked up again by every
+// draw, so the texture cache uploads CPU writes into it and follows GPU-rendered or re-aliased data
+// to the image that holds it now. A settled bindless key was looked up only when its T# words
+// changed or its image was dropped: its slot kept sampling the image (and contents) it was settled
+// to. With the switch, every resolved key of a heap a draw uses is looked up again once per frame
+// (once per slot: keys sharing a slot share the lookup), and by every draw while its image is
+// GPU-written (render targets, depth pyramids: a draw samples what earlier draws of this frame
+// wrote). A key that now maps to another image gets that image's view in its slot.
+// =2: once per frame only (no per-draw lookups of GPU-written images).
+// KYTY_BINDLESS_REFRESH_LOG=1 (diagnostic): lookups / remaps / GPU-written slots every 600 frames.
+static Live::Switch g_bindless_refresh("KYTY_BINDLESS_REFRESH", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+});
+
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings&         prepared) {
 	prepared.bindless_patches.clear();
@@ -3784,10 +3863,165 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 			heap->prefilled = true;
 			PrefillBindlessHeap(*heap, std::min(entries, heap->entries));
 		}
+		// KYTY_BINDLESS_REFRESH: the heap's resolved keys follow the texture cache (CPU writes, aliases).
+		if (g_bindless_refresh.Get() != 0 && !heap->runtime) {
+			RefreshBindlessHeap(*heap, std::min(entries, heap->entries));
+		}
 		prepared.bindless_patches.push_back(
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
 		prepared.bindless_heaps.push_back(heap);
 	}
+}
+
+namespace {
+struct BindlessRefreshStats {
+	std::atomic<uint64_t> lookups {0};
+	std::atomic<uint64_t> draw_lookups {0};
+	std::atomic<uint64_t> remapped {0};
+	std::atomic<uint64_t> view_changed {0};
+	std::atomic<uint64_t> unpinned {0};
+	std::atomic<uint64_t> failed {0};
+	uint64_t              logged_frame = 0;
+} g_bindless_refresh_stats;
+} // namespace
+
+void RenderExecutor::RefreshBindlessHeap(BindlessHeap& heap, uint32_t keys) {
+	const uint64_t frame    = BindlessFrame();
+	const uint64_t draw     = ++m_bindless_refresh_draw;
+	const bool     per_draw = g_bindless_refresh.Get() == 1;
+	keys                    = std::min(keys, static_cast<uint32_t>(heap.slots.size()));
+	const auto state_of     = [&](uint32_t entry) -> BindlessRefreshState& {
+		const auto binding = BindlessTable::SlotBinding(heap, entry);
+		const auto slot    = BindlessTable::SlotIndex(entry);
+		auto&      states  = m_bindless_refresh[binding & 3u];
+		if (states.size() <= slot) {
+			states.resize(static_cast<size_t>(slot) + 1u);
+		}
+		return states[slot];
+	};
+	if (heap.refresh_frame != frame) {
+		heap.refresh_frame = frame;
+		heap.refresh_gpu_keys.clear();
+		for (uint32_t key = 0; key < keys; key++) {
+			const auto entry = heap.slots[key];
+			if (entry == 0 || !heap.images[key]) {
+				continue;
+			}
+			auto& state = state_of(entry);
+			if (state.frame != frame) {
+				state.frame = frame;
+				state.draw  = draw;
+				g_bindless_refresh_stats.lookups.fetch_add(1, std::memory_order_relaxed);
+				if (!RefreshBindlessSlot(heap, key, state)) {
+					continue;
+				}
+			}
+			if (state.gpu_written && per_draw) {
+				heap.refresh_gpu_keys.push_back(key);
+			}
+		}
+	} else if (per_draw) {
+		for (const auto key: heap.refresh_gpu_keys) {
+			if (key >= keys) {
+				continue;
+			}
+			const auto entry = heap.slots[key];
+			if (entry == 0 || !heap.images[key]) {
+				continue;
+			}
+			auto& state = state_of(entry);
+			if (!state.gpu_written || state.draw == draw) {
+				continue;
+			}
+			state.frame = frame;
+			state.draw  = draw;
+			g_bindless_refresh_stats.draw_lookups.fetch_add(1, std::memory_order_relaxed);
+			RefreshBindlessSlot(heap, key, state);
+		}
+	}
+	static const bool log = std::getenv("KYTY_BINDLESS_REFRESH_LOG") != nullptr;
+	if (log && frame >= g_bindless_refresh_stats.logged_frame + 600u) {
+		auto& st        = g_bindless_refresh_stats;
+		st.logged_frame = frame;
+		uint32_t gpu    = 0;
+		for (const auto& states: m_bindless_refresh) {
+			for (const auto& state: states) {
+				gpu += state.gpu_written ? 1u : 0u;
+			}
+		}
+		LOGF("Bindless refresh: frame=%" PRIu64 " lookups %" PRIu64 " per-draw %" PRIu64 " remapped %" PRIu64
+		     " view-changed %" PRIu64 " unpinned %" PRIu64 " failed %" PRIu64 " gpu-written slots %u\n",
+		     frame, st.lookups.exchange(0), st.draw_lookups.exchange(0), st.remapped.exchange(0),
+		     st.view_changed.exchange(0), st.unpinned.exchange(0), st.failed.exchange(0), gpu);
+	}
+}
+
+// One lookup of a resolved key (KYTY_BINDLESS_REFRESH). False when the key has no usable lookup now
+// (left as it is: OnImageUnregistered and revalidation deal with such keys).
+bool RenderExecutor::RefreshBindlessSlot(BindlessHeap& heap, uint32_t key, BindlessRefreshState& state) {
+	auto&       table         = m_context.GetBindlessTable();
+	auto&       texture_cache = m_context.GetTextureCache();
+	const auto  entry         = heap.slots[key];
+	const auto  old_id        = heap.images[key];
+	auto*       old_image     = texture_cache.m_slot_images.try_get(old_id);
+	const auto& words         = heap.descriptors[key];
+	if (old_image == nullptr || !old_image->registered ||
+	    std::ranges::all_of(words, [](uint32_t w) { return w == 0u; })) {
+		return false;
+	}
+	ShaderRecompiler::IR::DescriptorValue value {};
+	value.dword_count = 8u;
+	std::copy_n(words.begin(), 8, value.dwords.begin());
+	auto resource = heap.resource;
+	if ((entry & ShaderRecompiler::IR::BindlessSlotFlagMask) == ShaderRecompiler::IR::BindlessSlotArrayFlag) {
+		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray; // KYTY_BINDLESS_3D_AS_ARRAY
+	}
+	TextureBinding binding;
+	ResolveTexture(resource, value, binding);
+	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || image->info.data.Empty() || !image->registered) {
+		g_bindless_refresh_stats.failed.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	if (image->IsGpuModified()) {
+		state.gpu_written = true;
+	}
+	if (state.gpu_written) {
+		BindImage(binding.image_id, false);
+	}
+	// Uploads CPU writes (RefreshImage) and makes the view's levels resident.
+	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || view == nullptr || !image->registered) {
+		g_bindless_refresh_stats.failed.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	const auto slot_binding = BindlessTable::SlotBinding(heap, entry);
+	const auto slot         = BindlessTable::SlotIndex(entry);
+	if (binding.image_id == old_id && view == table.SlotView(slot_binding, slot)) {
+		return true;
+	}
+	if (binding.image_id == old_id) {
+		g_bindless_refresh_stats.view_changed.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_bindless_refresh_stats.remapped.fetch_add(1, std::memory_order_relaxed);
+	}
+	image->bindless_pinned  = true;
+	image->bindless_self_id = binding.image_id;
+	image->usage.texture    = true;
+	const auto layout       = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                                                : vk::ImageLayout::eShaderReadOnlyOptimal;
+	const bool no_refs = table.RemapSlotImage(slot_binding, slot, old_id, binding.image_id, view, layout);
+	if (no_refs) {
+		if (auto* old = texture_cache.m_slot_images.try_get(old_id); old != nullptr && old->bindless_pinned) {
+			// No key refers to it any more: the texture cache may collect it again (ResettleBindlessKey).
+			NoteBindlessStateChange(*old);
+			old->bindless_pinned = false;
+			texture_cache.ReleaseDroppedByGuest(old_id);
+			g_bindless_refresh_stats.unpinned.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	return true;
 }
 
 void RenderExecutor::MakeBindlessImagesReadable(std::span<BindlessHeap* const> heaps,

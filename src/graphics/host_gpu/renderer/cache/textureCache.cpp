@@ -8589,6 +8589,12 @@ bool BufferCache::SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, ui
 		return false;
 	}
 	uint32_t width = 0, height = 0, format = 0;
+	uint64_t serial = 0;
+	static const bool once = [] {
+		const auto* value = std::getenv("KYTY_RAW_READ_IMAGE_SYNC_ONCE");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint64_t> skipped_once {0};
 	{
 		std::scoped_lock lock {m_texture_cache.m_lock};
 		const auto*      image = m_texture_cache.m_slot_images.try_get(selected);
@@ -8597,23 +8603,53 @@ bool BufferCache::SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, ui
 		if (image == nullptr || !image->IsGpuModified()) {
 			return false;
 		}
+		serial = image->ContentSerial();
+		// KYTY_RAW_READ_IMAGE_SYNC_ONCE: this buffer already holds these contents of the range.
+		if (once && serial != 0 && image->raw_sync_serial == serial && image->raw_sync_buffer == &buffer &&
+		    size <= image->raw_sync_size) {
+			skipped_once.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
 		width  = image->info.extent.width;
 		height = image->info.extent.height;
 		format = static_cast<uint32_t>(image->backing.format);
 	}
 	const bool synced = SynchronizeBufferFromImage(buffer, vaddr, size);
+	if (once && synced) {
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		if (auto* image = m_texture_cache.m_slot_images.try_get(selected);
+		    image != nullptr && image->ContentSerial() == serial) {
+			image->raw_sync_serial = serial;
+			image->raw_sync_size   = size;
+			image->raw_sync_buffer = &buffer;
+		}
+	}
 	static std::atomic<uint64_t> syncs {0};
 	if (synced) {
 		const auto n = syncs.fetch_add(1, std::memory_order_relaxed) + 1;
 		// The first 16, then at powers of two: how often raw reads take image contents.
 		if (n <= 16 || (n & (n - 1)) == 0) {
 			std::printf("KYTY_RAW_READ_IMAGE_SYNC: #%" PRIu64 " raw read 0x%016" PRIx64 "+0x%" PRIx64
-			            " took a GPU-written image's contents (%ux%u, vk format %u)\n",
-			            n, vaddr, size, width, height, format);
+			            " took a GPU-written image's contents (%ux%u, vk format %u; %" PRIu64
+			            " repeated reads skipped)\n",
+			            n, vaddr, size, width, height, format, skipped_once.load(std::memory_order_relaxed));
 			std::fflush(stdout);
 		}
 	}
 	return synced;
+}
+
+void BufferCache::PrepareReadRange(uint64_t vaddr, uint64_t size) {
+	static const bool obtains = [] {
+		const auto* value = std::getenv("KYTY_RAW_READ_IMAGE_SYNC_OBTAINS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!obtains || size == 0 || !RawReadImageSyncEnabled() || !m_texture_cache.MayOverlapImages(vaddr, size)) {
+		return;
+	}
+	if (auto [buffer, offset] = ObtainBuffer(vaddr, size, false); buffer != nullptr) {
+		(void)SyncRawReadFromWrittenImage(*buffer, vaddr, size);
+	}
 }
 
 bool BufferCache::SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,

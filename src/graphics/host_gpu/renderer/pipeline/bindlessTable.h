@@ -37,6 +37,14 @@ class PageManager;
 // Slots of each image array of set 1 (the same count for every array).
 [[nodiscard]] uint32_t BindlessImagesPerArray(const GraphicContext& graphics);
 
+// KYTY_BINDLESS_VIEW_KEY (Erlou93/KytyPS5-Yotei v0.1.4 TableView): what of a shader's image resource
+// changes the view ResolveBindlessKey makes of a T# (numeric class, dimension, mip mode and count,
+// conversion format, swizzle, depth compare, cube, R128), hashed; never 0.
+[[nodiscard]] uint64_t BindlessViewKey(const ShaderRecompiler::IR::ImageResource& resource);
+// 0 off, 1 log heaps whose users view them differently, 2 such users get heaps (and shared slots)
+// of their own.
+[[nodiscard]] uint32_t BindlessViewKeyMode();
+
 // A guest descriptor heap as one view type samples it: a region of the translation (and
 // feedback) buffer, one entry per key, and the textures resolved so far.
 struct BindlessHeap {
@@ -64,6 +72,9 @@ struct BindlessHeap {
 	uint32_t                            watched_entries  = 0;
 	uint64_t                            watch_generation = 0;
 	ShaderRecompiler::IR::ImageResource resource;
+	// KYTY_BINDLESS_VIEW_KEY=2: the view fields of `resource` (BindlessViewKey) are part of the heap's
+	// key; 0 without the switch.
+	uint64_t                            view_key = 0;
 	// Per key, 0 = not resolved; else the translation entry: the slot in this heap's binding, or
 	// (BindlessSlotArrayFlag, KYTY_BINDLESS_3D_AS_ARRAY) in the 2D-array binding.
 	// BindlessTable::SlotBinding/SlotIndex decode it.
@@ -98,6 +109,10 @@ struct BindlessHeap {
 	uint64_t                             touched_frame    = UINT64_MAX;
 	uint32_t                             runtime_next_key = 0;
 	std::vector<std::array<uint32_t, 8>> runtime_dwords;
+	// KYTY_BINDLESS_REFRESH: the last frame every resolved key was looked up again, and the keys
+	// whose image the GPU writes (looked up again by every draw that uses the heap).
+	uint64_t                             refresh_frame = UINT64_MAX;
+	std::vector<uint32_t>                refresh_gpu_keys;
 };
 
 // Descriptor set 1 of every pipeline that samples bindless images: typed arrays of sampled
@@ -187,6 +202,16 @@ public:
 		           ? entry & ~ShaderRecompiler::IR::BindlessSlotFlagMask
 		           : entry;
 	}
+	// The image view slot `slot` of `binding` holds (null: a placeholder or nothing).
+	[[nodiscard]] vk::ImageView SlotView(uint32_t binding, uint32_t slot) const noexcept {
+		return binding < ImageArrays && slot < m_slot_views[binding].size() ? m_slot_views[binding][slot]
+		                                                                     : vk::ImageView {};
+	}
+	// KYTY_BINDLESS_REFRESH: slot `slot` of `binding` now shows `view` of `new_id`; every key that
+	// samples the slot through `old_id` moves its image reference to `new_id` (the shared slot too).
+	// True when `old_id` has no reference left.
+	bool RemapSlotImage(uint32_t binding, uint32_t slot, ImageId old_id, ImageId new_id, vk::ImageView view,
+	                    vk::ImageLayout layout);
 	// Queue a slot for reuse once the GPU is past the current tick (at most once; IDXTRI).
 	void FreeSlot(uint32_t binding, uint32_t slot);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
@@ -237,7 +262,8 @@ public:
 	};
 	// Null when unknown, or when the slot no longer shows an image (a placeholder was written to
 	// it, e.g. ReleaseViews when the image's views were dropped): the words are forgotten then.
-	[[nodiscard]] const SharedSlot* FindSharedSlot(uint32_t binding, const std::array<uint32_t, 8>& words);
+	[[nodiscard]] const SharedSlot* FindSharedSlot(uint32_t binding, const std::array<uint32_t, 8>& words,
+	                                               uint64_t view_key = 0);
 	void NoteSharedSlot(const Heap& heap, const std::array<uint32_t, 8>& words, uint32_t entry, ImageId image);
 	void AddSharedSlotRef(uint32_t binding, uint32_t slot);
 	// Shared slots found holding a placeholder and forgotten (diagnostics).
@@ -343,11 +369,12 @@ private:
 	struct SharedSlotKey {
 		uint32_t                binding = 0;
 		std::array<uint32_t, 8> words {};
+		uint64_t                view = 0; // KYTY_BINDLESS_VIEW_KEY=2: Heap::view_key
 		bool operator==(const SharedSlotKey&) const = default;
 	};
 	struct SharedSlotKeyHash {
 		size_t operator()(const SharedSlotKey& key) const noexcept {
-			uint64_t hash = 0xcbf29ce484222325ull ^ key.binding;
+			uint64_t hash = (0xcbf29ce484222325ull ^ key.binding ^ key.view) * 0x100000001b3ull;
 			for (const auto word: key.words) hash = (hash ^ word) * 0x100000001b3ull;
 			return static_cast<size_t>(hash);
 		}

@@ -1467,6 +1467,11 @@ static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            b
                                                      const DrawIndirectSource& source) {
 	auto&                   cache = buffer.GetContext().GetBufferCache();
 	PreparedIndirectBuffers prepared;
+	// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before either obtain.
+	cache.PrepareReadRange(source.args_addr, source.ArgsSize());
+	if (source.count_addr != 0) {
+		cache.PrepareReadRange(source.count_addr, sizeof(uint32_t));
+	}
 	const auto [args, args_offset] = cache.ObtainBuffer(source.args_addr, source.ArgsSize(), false);
 	EXIT_IF(args == nullptr || (args_offset & 3u) != 0);
 	prepared.args        = args->Handle();
@@ -1679,6 +1684,11 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&                
 	auto& cache = buffer.GetContext().GetBufferCache();
 	std::array<std::pair<Buffer*, uint64_t>, ShaderVertexInputInfo::RES_MAX> acquired {};
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
+		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before every obtain.
+		cache.PrepareReadRange(ranges->merged[i].base_address,
+		                       ranges->merged[i].acquired_end - ranges->merged[i].base_address);
+	}
+	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range = ranges->merged[i];
 		const auto  size  = range.acquired_end - range.base_address;
 		acquired[i]       = cache.ObtainBuffer(range.base_address, size, false);
@@ -1768,6 +1778,11 @@ static void AcquireVertexBuffersInto(CommandBuffer&                   buffer,
 		uint64_t offset;
 	};
 	std::array<Acquired, ShaderVertexInputInfo::RES_MAX> acquired; // [0, merged_count) written
+	for (uint32_t i = 0; i < ranges->merged_count; i++) {
+		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange), before every obtain.
+		cache.PrepareReadRange(ranges->merged[i].base_address,
+		                       ranges->merged[i].acquired_end - ranges->merged[i].base_address);
+	}
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range           = ranges->merged[i];
 		const auto  size            = range.acquired_end - range.base_address;
@@ -2253,6 +2268,15 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 }
 
+// KYTY_OCCLUSION_NO_OUTPUT_DRAWS=1 (live, default off; PPSA26344 preset with KYTY_GPU_OCCLUSION=1; ported from
+// Erlou93/KytyPS5-Yotei v0.1.4 ClassifyNoOutputDraw): a draw that writes no colour target, has no depth/stencil
+// target and no active pixel shader still runs while a guest occlusion query counts it (KYTY_GPU_OCCLUSION): with
+// nothing to test, every covered sample passes and the open query counts it. Ghost of Yotei's bloom draws each
+// sun/moon flare twice, depth-tested and then with the depth test off, and a CS divides the two query results into
+// the flare's visibility; the second draw was dropped here, so the ratio was wrong (flares through walls). Without
+// an open query such a draw is still dropped.
+static Live::Switch g_occlusion_no_output_draws("KYTY_OCCLUSION_NO_OUTPUT_DRAWS", Live::ParseDefaultOff);
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -2388,9 +2412,21 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
-		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
-		                   draw.index_count, 0);
-		return false;
+		auto& occlusion = m_context.GetOcclusionCounter();
+		if (g_occlusion_no_output_draws.On() && OcclusionCounter::Enabled() &&
+		    (occlusion.Active() || occlusion.WouldCount(buffer.GetRegisters().GetDepthCountControl()))) {
+			static std::atomic<uint64_t> counted {0};
+			const auto                   n = counted.fetch_add(1, std::memory_order_relaxed);
+			if (n < 4 || (n & 4095u) == 0) {
+				LOGF("Occlusion: no-output draw %s run for an open query (KYTY_OCCLUSION_NO_OUTPUT_DRAWS, %" PRIu64
+				     " so far)\n",
+				     draw.Name(), n + 1u);
+			}
+		} else {
+			LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
+			                   draw.index_count, 0);
+			return false;
+		}
 	}
 
 	CommitStats::StepMark(CommitStats::Step::MarkBindings);
@@ -3890,6 +3926,8 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		                     "Kyty.IndexBuffer[guest=transient size=0x{:x} type={}]", source.size,
 		                     static_cast<uint32_t>(source.type));
 	} else {
+		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange).
+		buffer.GetContext().GetBufferCache().PrepareReadRange(source.address, source.size);
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
