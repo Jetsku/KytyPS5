@@ -1096,9 +1096,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	}
 	depth_scope.Stop();
 	if (color_count == 0 && !depth.image_id) {
+		// No attachment bounds the area: every fragment lies inside the draw's scissors
+		// (SetGraphicsDynamicParams), so their union bounds it instead of the largest framebuffer,
+		// whose 16384x16384 tiles a tiler walks and sizes its parameter buffer for. A later draw
+		// with other scissors gets an instance of its own (SameRendering compares the size).
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
-		state.width        = limits.maxFramebufferWidth;
-		state.height       = limits.maxFramebufferHeight;
+		const auto  bound  = written != nullptr ? *written
+		                                        : DrawScissorUnion(buffer.GetRegisters(), true);
+		const auto  right  = int64_t {bound.offset.x} + bound.extent.width;
+		const auto  bottom = int64_t {bound.offset.y} + bound.extent.height;
+		state.width  = static_cast<uint32_t>(std::clamp<int64_t>(right, 1, limits.maxFramebufferWidth));
+		state.height = static_cast<uint32_t>(std::clamp<int64_t>(bottom, 1, limits.maxFramebufferHeight));
 	}
 	if (state.num_layers == std::numeric_limits<uint32_t>::max()) {
 		state.num_layers = 1;

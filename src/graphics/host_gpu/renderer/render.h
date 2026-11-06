@@ -1159,7 +1159,8 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
-	// written: DrawScissorUnion of the draw (nullptr: the whole colour targets may be written).
+	// written: DrawScissorUnion of the draw (nullptr: the whole colour targets may be written, and
+	// an attachment-less area is bounded by the union of every viewport slot's scissor).
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
