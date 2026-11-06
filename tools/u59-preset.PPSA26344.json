@@ -68,7 +68,6 @@
   "KYTY_MOV_INT_MODS": "1",
   "KYTY_SPLIT_DPP_LANE": "1",
   "KYTY_MAD_MODE": "exact",
-  "KYTY_F16_EXACT_ROUND": "1",
   "KYTY_MOVREL_FULL_M0": "1",
   "KYTY_OMOD_ZERO": "1",
   "KYTY_CVT_F32_F64_INF": "1",
