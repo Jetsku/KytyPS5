@@ -1283,6 +1283,59 @@ void CheckMadModes(VulkanHarness *vulkan) {
               bulk.count, differing);
 }
 
+// KYTY_WAVE64_HIGH_LANES: a wave64 vertex shader (32-wide host subgroups, no link between them)
+// spills an SGPR to v13 lane 40 and reads it back, and reads lane 41 that nothing wrote. With the
+// switch both reads are resolved at compile time (the spilled value, and 0), so no subgroup
+// shuffle of a lane >= 32 remains; without it the reads stay shuffles.
+void CheckWave64HighLanes() {
+  constexpr const char *name = "CodegenWave64HighLanes";
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 10, 0x40490fdbu);
+  AppendVop3(&code, 0x361, 13, 10, InlineU32(40));   // v_writelane_b32 v13, s10, 40
+  AppendVop3(&code, 0x360, 11, Vgpr(13), InlineU32(40)); // v_readlane_b32 s11, v13, 40
+  AppendVop3(&code, 0x360, 12, Vgpr(13), InlineU32(41)); // v_readlane_b32 s12, v13, 41
+  code.push_back(EncodeVop1(0x01, 4, 11));            // v_mov_b32 v4, s11
+  code.push_back(EncodeVop1(0x01, 5, 12));            // v_mov_b32 v5, s12
+  code.push_back(EncodeExp0(12, 0xf, true));          // exp pos0 v4, v5, v4, v5 done
+  code.push_back(EncodeExp1(4, 5, 4, 5));
+  AppendEnd(&code);
+  const auto compile = [&](bool enabled) {
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_high_lanes = enabled;
+    ScopedCodegenOptions scope(options);
+    std::array<u32, 16> user_data{};
+    ShaderVertexInputInfo vertex;
+    ShaderRecompiler::CompileOptions compile_options;
+    compile_options.stage = ShaderType::Vertex;
+    compile_options.wave_size = 64;
+    compile_options.user_data = user_data;
+    compile_options.input_info.vertex = &vertex;
+    auto translated = ShaderRecompiler::TranslateProgram(code, compile_options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = compile_options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                       specialization),
+            "vertex resources could not be materialized");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
+                                                   specialization);
+    ValidateSpirv(name, result.spirv);
+    return result.spirv;
+  };
+  const auto on = compile(true);
+  const auto off = compile(false);
+  const auto on_shuffles = CountSpirv(on, "OpGroupNonUniformShuffle ");
+  const auto off_shuffles = CountSpirv(off, "OpGroupNonUniformShuffle ");
+  Require(name, "high-lane reads resolved", on_shuffles == 0u,
+          "KYTY_WAVE64_HIGH_LANES left " + std::to_string(on_shuffles) + " shuffles");
+  std::printf("[codegen] %-32s ok (switch off: %zu shuffles)\n", name, off_shuffles);
+}
+
 // The f16 bits of s + e (|e| <= ulp(s) / 2, both exact), rounded once to nearest even; f16
 // subnormals kept, overflow to INF. Reference for KYTY_F16_EXACT_ROUND.
 u32 RoundPairToF16(double s, double e) {
@@ -2895,6 +2948,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckSplitLdsWriteSync(vulkan);
   CheckSplitDppScan(vulkan);
   CheckMovIntMods(vulkan);
+  CheckWave64HighLanes();
   CheckF16ExactRound(vulkan);
   CheckIsaSmallFixes(vulkan);
   CheckLdsAtomicOrder(vulkan);

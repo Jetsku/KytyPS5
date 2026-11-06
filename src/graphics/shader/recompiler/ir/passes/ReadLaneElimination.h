@@ -8,9 +8,17 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 struct ReadLaneStats {
 	uint32_t rewritten_reads = 0;
+	// Reads of lanes 32-63 resolved under unreachable_high_lanes.
+	uint32_t high_lane_reads = 0;
 };
 
-[[nodiscard]] ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size);
+// unreachable_high_lanes (KYTY_WAVE64_HIGH_LANES): the host runs this wave64 program on 32-lane
+// subgroups with no link between them (VS/PS), so lanes 32-63 of a VGPR exist only as V_WRITELANE
+// values. A constant V_READLANE of such a lane then takes the value its write chain gives where
+// one exists, and 0 (defined) on paths that never wrote the lane, instead of a host shuffle of a
+// lane the subgroup lacks.
+[[nodiscard]] ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size,
+                                              bool unreachable_high_lanes = false);
 
 // A wave reduction as RDNA compilers write it: with every lane enabled, four DPP row_shr steps
 // (1, 2, 4, 8) of one operation scan each row of 16 lanes, and v_readlane takes a row's last lane

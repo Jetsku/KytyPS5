@@ -1464,7 +1464,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	// KYTY_WAVE64_HIGH_LANES: a wave64 VS/PS on 32-wide host subgroups (no KYTY_WAVE32_CLUSTERS
+	// wide stage) has no lanes 32-63 to shuffle from.
+	const bool unreachable_high_lanes = [&] {
+		if (!GetCodegenOptions().wave64_high_lanes || ir.wave_size != 64u ||
+		    ShaderWorkgroupInput(ir.stage, options.input_info) != nullptr) {
+			return false;
+		}
+		const auto wide = Spirv::GetHostWaveClusters();
+		return ir.stage == ShaderType::Pixel ? !wide.pixel : !wide.vertex;
+	}();
+	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size, unreachable_high_lanes);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);

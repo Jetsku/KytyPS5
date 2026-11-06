@@ -34,7 +34,7 @@ ChainResult SearchChain(Value value, uint32_t lane, uint32_t wave_size) {
 	}
 }
 
-bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size) {
+bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size, bool relaxed) {
 	std::queue<Value>         queue;
 	std::unordered_set<Inst*> visited;
 	queue.push(source);
@@ -47,6 +47,9 @@ bool IsPossibleToEliminate(Value source, uint32_t lane, uint32_t wave_size) {
 		}
 		auto* inst = chain.value.TryInstruction();
 		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::Phi || inst->NumArgs() == 0) {
+			if (relaxed) {
+				continue;
+			}
 			return false;
 		}
 		if (!visited.insert(inst).second) {
@@ -65,7 +68,8 @@ using PhiMap = std::unordered_map<Inst*, Inst*>;
 // stack instead of recursion (same order, same result): a spill VGPR that crosses thousands of
 // blocks nests as many Phis, and PPSA03671's expanded material kernel 0xe6d76d24f59f8015 overflowed
 // a 1 MiB thread stack at 3,265 levels.
-Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_size) {
+Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_size,
+                   bool relaxed) {
 	struct Frame {
 		Inst*              inst = nullptr; // the guest Phi
 		Inst*              phi  = nullptr; // its lane value
@@ -81,8 +85,14 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 			ready = chain.write->Arg(1);
 			return true;
 		}
-		auto* inst = chain.value.ResolveInstruction();
-		EXIT_IF(inst->GetOpcode() != ValueOpcode::Phi);
+		auto* inst = chain.value.TryInstruction();
+		if (relaxed && (inst == nullptr || inst->GetOpcode() != ValueOpcode::Phi ||
+		                inst->NumArgs() == 0)) {
+			// No V_WRITELANE of this lane on this path: the guest lane is undefined; read 0.
+			ready = Value(0u);
+			return true;
+		}
+		EXIT_IF(inst == nullptr || inst->GetOpcode() != ValueOpcode::Phi);
 		const auto [entry, is_new] = phi_map.try_emplace(inst);
 		if (!is_new) {
 			ready = Value(entry->second);
@@ -315,7 +325,7 @@ std::optional<LaneReduction> MatchLaneReduction(const Inst& read_lane, uint32_t 
 	return std::nullopt;
 }
 
-ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
+ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size, bool unreachable_high_lanes) {
 	ReadLaneStats stats;
 	if (wave_size != 32u && wave_size != 64u) {
 		return stats;
@@ -338,14 +348,22 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 				stats.rewritten_reads++;
 				continue;
 			}
-			auto* producer = chain.value.TryInstruction();
+			const bool relaxed  = unreachable_high_lanes && wave_size == 64u && lane >= 32u;
+			auto*      producer = chain.value.TryInstruction();
+			if (relaxed && (producer == nullptr || producer->GetOpcode() != ValueOpcode::Phi)) {
+				inst.ReplaceUsesWith(Value(0u));
+				stats.rewritten_reads++;
+				stats.high_lane_reads++;
+				continue;
+			}
 			if (producer == nullptr || producer->GetOpcode() != ValueOpcode::Phi ||
-			    !IsPossibleToEliminate(chain.value, lane, wave_size)) {
+			    !IsPossibleToEliminate(chain.value, lane, wave_size, relaxed)) {
 				continue;
 			}
 
 			PhiMap phi_map;
-			inst.ReplaceUsesWith(GetRealValue(phi_map, chain.value, lane, wave_size));
+			stats.high_lane_reads += relaxed ? 1u : 0u;
+			inst.ReplaceUsesWith(GetRealValue(phi_map, chain.value, lane, wave_size, relaxed));
 			stats.rewritten_reads++;
 		}
 	}
