@@ -1500,6 +1500,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		coverage_reduction.pNext                 = const_cast<void*>(create_info.pNext);
 		create_info.pNext                        = &coverage_reduction;
 	}
+	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+		address_binding.reportAddressBinding = VK_TRUE;
+		address_binding.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                    = &address_binding;
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
@@ -2069,6 +2075,7 @@ void WindowContext::CreateVulkan() {
 		default: EXIT("Could not create a Vulkan instance (for unknown reasons)");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+	AddressBindingReportCreateMessenger(graphic_ctx.instance); // KYTY_ADDRESS_BINDING_REPORT
 
 	if (r.enable_validation_layers) {
 		dbg_create_info.pNext = nullptr;
@@ -2207,6 +2214,12 @@ void WindowContext::CreateVulkan() {
 			// KYTY_DEVICE_FAULT_EXT=1 (diagnostic): only VK_EXT_device_fault, no checkpoints or NV
 			// diagnostics config, so the game runs at full speed; a loss prints the fault info.
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		if (AddressBindingReportRequested() &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+		} else if (AddressBindingReportRequested()) {
+			std::printf("KYTY_ADDRESS_BINDING_REPORT: the driver lacks VK_EXT_device_address_binding_report\n");
 		}
 		// KYTY_AFTERMATH=1: Nsight Aftermath crash dumps are enabled before the device is created and
 		// need VK_NV_device_diagnostics_config (its flags are set in VulkanCreateDevice).

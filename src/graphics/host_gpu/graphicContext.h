@@ -47,6 +47,14 @@ struct GraphicContext;
 [[nodiscard]] const void*
 RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 [[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
+// KYTY_ADDRESS_BINDING_REPORT=1 (diagnostic, default off): VK_EXT_device_address_binding_report.
+// Every GPU virtual address range the driver binds or unbinds for an object is recorded (live
+// ranges, plus a ring of the newest events); a device fault then prints the objects that cover the
+// faulting address, end just below it or were unbound there, with their Kyty names (the names are
+// kept for this report even without the debug dump) and how long before the fault they changed.
+[[nodiscard]] bool AddressBindingReportRequested();
+void               AddressBindingReportCreateMessenger(vk::Instance instance);
+void               AddressBindingReportDump(uint64_t address);
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
 // A thread about to exit on a device loss: lets a device-loss report another thread is writing
 // (the VK_EXT_device_fault vendor dump, _device_fault.nv-gpudmp) finish first. Waits up to

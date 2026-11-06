@@ -1296,6 +1296,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
+	ClampImageLevelsToExtent(desc.info, desc.view_info);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	const auto first_layer = desc.view_info.base_layer;
 	if (ArrayViewSubrange() && layered && !storage && first_layer != 0 &&

@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -954,6 +956,35 @@ void Image::CopyBlockMip(Image& source, uint32_t mip, uint32_t layer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command.Identity());
 }
 
+bool ImageLevelClampEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_LEVEL_CLAMP");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool ClampImageLevelsToExtent(ImageInfo& info, ImageViewInfo& view) {
+	if (!ImageLevelClampEnabled() || info.samples > 1) {
+		return false;
+	}
+	const auto valid = static_cast<uint32_t>(std::bit_width(std::max(
+	    {info.extent.width, info.extent.height, info.IsVolume() ? info.extent.depth : 1u})));
+	if (valid == 0 || info.resources.levels <= valid) {
+		return false;
+	}
+	static std::atomic<uint32_t> clamped {0};
+	if (const auto n = clamped.fetch_add(1, std::memory_order_relaxed) + 1u; n <= 4u || std::has_single_bit(n)) {
+		std::printf("KYTY_IMAGE_LEVEL_CLAMP #%u: guest=0x%016" PRIx64 " %ux%ux%u levels %u -> %u (view %u+%u)\n",
+		            n, info.data.address, info.extent.width, info.extent.height, info.extent.depth,
+		            info.resources.levels, valid, view.base_level, view.level_count);
+	}
+	info.resources.levels = valid;
+	view.base_level       = std::min(view.base_level, valid - 1u);
+	view.level_count      = std::max(1u, std::min(view.level_count, valid - view.base_level));
+	return true;
+}
+
 namespace ImageOps {
 
 void Validate(const ImageInfo& info) {
@@ -1128,12 +1159,34 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	// KYTY_ADDRESS_BINDING_REPORT: the image's place in its memory block (the driver reports the
+	// block's range for every image bound in it), and images with more levels than their extent
+	// allows (VUID-VkImageCreateInfo-mipLevels-00958).
+	VmaAllocationInfo placement {};
+	if (AddressBindingReportActive()) {
+		const auto valid = static_cast<uint32_t>(std::bit_width(
+		    std::max({create.extent.width, create.extent.height, create.extent.depth})));
+		if (create.mipLevels > valid) {
+			static std::atomic<uint32_t> invalid {0};
+			const auto n = invalid.fetch_add(1, std::memory_order_relaxed) + 1u;
+			if (n <= 16u || std::has_single_bit(n)) {
+				std::printf("KYTY_ADDRESS_BINDING_REPORT: image #%u with %u levels > %u valid: guest=0x%016" PRIx64
+				            " %ux%ux%u format=%d\n",
+				            n, create.mipLevels, valid, info.data.address, create.extent.width,
+				            create.extent.height, create.extent.depth, static_cast<int>(create.format));
+			}
+		}
+	}
+	if (AddressBindingReportActive() && backing.allocation != nullptr) {
+		vmaGetAllocationInfo(graphics.allocator, backing.allocation, &placement);
+	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,
-	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
+	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={} "
+	    "block_off=0x{:x} alloc=0x{:x}]",
 	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
 	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
-	    info.samples);
+	    info.samples, placement.offset, placement.size);
 }
 
 uint64_t Image::HashGuestEdges() const {

@@ -250,6 +250,15 @@ struct ImageViewInfo {
 	}
 };
 
+// KYTY_IMAGE_LEVEL_CLAMP (default on; =0 off). A T# may give more mip levels than its extent has
+// (Ghost of Yotei: 1x1 RGBA8 textures with 12-14 levels, 513x513 with 14): the PS5 lays out every
+// level, but a Vulkan image may have at most bit_width(max extent) levels
+// (VUID-VkImageCreateInfo-mipLevels-00958). The extra levels are the smallest size again; they are
+// dropped (neither uploaded nor viewed): a view past the last valid level views the last valid
+// one. Returns true when it changed info.resources.levels or the view's level range.
+[[nodiscard]] bool ImageLevelClampEnabled();
+bool               ClampImageLevelsToExtent(ImageInfo& info, ImageViewInfo& view);
+
 struct DepthFormatPolicy {
 	Prospero::DepthFormat     depth_format;
 	Prospero::BufferFormat    guest_format;

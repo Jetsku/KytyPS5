@@ -36,9 +36,24 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 	}
 }
 
+// KYTY_ADDRESS_BINDING_REPORT (graphicContext.h): object names kept for the device-fault report.
+// Only the first name of a handle is kept (per-draw range names would rename game buffers).
+[[nodiscard]] bool AddressBindingReportActive();
+[[nodiscard]] bool AddressBindingReportWantsName(uint64_t handle);
+void               AddressBindingReportNoteName(uint64_t handle, std::string name);
+
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
+	if constexpr (Handle::objectType == vk::ObjectType::eBuffer || Handle::objectType == vk::ObjectType::eImage) {
+		if (AddressBindingReportActive() && handle != nullptr) {
+			const auto key = static_cast<uint64_t>(
+			    reinterpret_cast<uintptr_t>(static_cast<typename Handle::CType>(handle)));
+			if (AddressBindingReportWantsName(key)) {
+				AddressBindingReportNoteName(key, fmt::format(format, std::forward<Args>(args)...));
+			}
+		}
+	}
 	// Names are set for the debug dump and under --rd (RenderDoc shows them: images by guest address).
 	if ((!Config::GraphicsDebugDumpEnabled() && !Config::RenderDocEnabled()) || device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
