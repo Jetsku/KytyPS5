@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -663,9 +664,11 @@ static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& 
 		ordinal = counts[program.shader_hash]++;
 	}
 	if (!frame && ordinal >= request.limit) return;
-	std::string text = fmt::format("{}: hash=0x{:016x} #{} tick={} gpu_tick={}",
+	std::string text = fmt::format("{}: hash=0x{:016x} #{} frame={} q={} seq={} tick={} gpu_tick={}",
 	                               frame ? "FrameTrace CS" : "DispatchTrace",
-	                               program.shader_hash, ordinal,
+	                               program.shader_hash, ordinal, context.GetGpu().GetFrameNum(),
+	                               static_cast<int32_t>(HangTrace::CpContextQueue()),
+	                               HangTrace::CpContextSequence(),
 	                               context.GetCommandScheduler().CurrentTick(),
 	                               context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick());
 	if (groups != nullptr) {

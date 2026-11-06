@@ -1061,6 +1061,14 @@ void SetCpContext(uint32_t queue, uint64_t sequence) {
 	g_cp_sequence = sequence;
 }
 
+uint32_t CpContextQueue() {
+	return g_cp_queue;
+}
+
+uint64_t CpContextSequence() {
+	return g_cp_sequence;
+}
+
 void RecordCp(const CpEvent& event) {
 	if (!CpTraceEnabled()) {
 		return;

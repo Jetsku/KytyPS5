@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -214,10 +215,16 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 	}
 	if (state == RenderDocState::Capturing) {
 		// LOGF does not evaluate its arguments when printf output is Silent.
+		// KYTY_RENDERDOC_CAPTURE_LENGTH=<n> (default 2, diagnostic): guest flips per capture.
+		static const uint32_t length = [] {
+			const auto* value = std::getenv("KYTY_RENDERDOC_CAPTURE_LENGTH");
+			const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 2ul;
+			return static_cast<uint32_t>(std::clamp(n, 1ul, 64ul));
+		}();
 		++g_captured_flips;
-		std::printf("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
+		std::printf("RenderDoc: captured guest flip %u/%u\n", g_captured_flips, length);
 		std::fflush(stdout);
-		if (g_captured_flips < 2) {
+		if (g_captured_flips < length) {
 			return;
 		}
 	}

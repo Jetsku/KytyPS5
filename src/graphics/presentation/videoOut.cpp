@@ -38,6 +38,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -1550,6 +1552,18 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_presenter.Renderer().NotifyGpuProgress();
 
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+		// KYTY_DRAW_PEEK (renderDraw.cpp): a frame and steady-clock marker per guest flip.
+		static const bool draw_peek = [] {
+			const auto* value = std::getenv("KYTY_DRAW_PEEK");
+			return value != nullptr && value[0] != '\0' && value[0] != '0';
+		}();
+		if (draw_peek) [[unlikely]] {
+			LOGF("DrawPeekFlip: frame=%d buffer=%d t=%llu\n", m_presenter.Renderer().GetGpu().GetFrameNum(),
+			     requests[0].index,
+			     static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                         std::chrono::steady_clock::now().time_since_epoch())
+			                                         .count()));
+		}
 		Controller::OnGuestFlip();
 		// A completed guest flip (one per presented layer group), not the polling iterations of
 		// FlipQueue::Flip. This is a CPU presentation marker; it does not measure GPU execution

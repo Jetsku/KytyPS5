@@ -255,6 +255,9 @@ void RecordLodReport(const LodReportEvent& event);
 // sequence it is processing (SetCpContext); events without an explicit queue carry that context.
 [[nodiscard]] bool CpTraceEnabled();
 void               SetCpContext(uint32_t queue, uint64_t sequence);
+// The calling thread's context (UINT32_MAX / 0 outside a submission), for diagnostic lines.
+[[nodiscard]] uint32_t CpContextQueue();
+[[nodiscard]] uint64_t CpContextSequence();
 // Whether [address, address + size) overlaps the CP watch window (never without the CP trace:
 // the window is only set with it). Inlined: checked on every texture-cache image use.
 [[nodiscard]] inline bool CpWatch(uint64_t address, uint64_t size) {
