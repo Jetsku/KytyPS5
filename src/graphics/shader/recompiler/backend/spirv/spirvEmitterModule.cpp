@@ -581,6 +581,20 @@ void DefineDescriptors(EmitterState& state) {
 
 } // namespace
 
+bool ComputeImplicitLod(const EmitterState& state) {
+	if (!state.requirements.implicit_compute_lod || state.program.stage != ShaderType::Compute ||
+	    state.lane_count != 1 || state.split_wave || state.mesh_passes > 1u ||
+	    !GetHostComputeDerivativesLinear() ||
+	    GetHostImageFeatures().compute_derivatives == HostComputeDerivatives::None) {
+		return false;
+	}
+	const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	if (cs == nullptr) return false;
+	const uint32_t threads = std::max(cs->threads_num[0], 1u) * std::max(cs->threads_num[1], 1u) *
+	                         std::max(cs->threads_num[2], 1u);
+	return threads % 4u == 0u;
+}
+
 uint32_t ConstantU32(EmitterState& state, uint32_t value) {
 	return state.builder.Constant(spv::OpConstant, TypeU32(state), value);
 }
@@ -1151,7 +1165,16 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
 		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
-	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+	if (ComputeImplicitLod(state)) {
+		// KYTY_IMPLICIT_LOD_STAGES: implicit-LOD samples (and any IMAGE_GET_LOD) take derivatives
+		// over four consecutive invocations, the RDNA2 lane quad.
+		const auto derivatives = GetHostImageFeatures().compute_derivatives;
+		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
+		state.builder.RequireExtension(derivatives == HostComputeDerivatives::Nv
+		                                   ? "SPV_NV_compute_shader_derivatives"
+		                                   : "SPV_KHR_compute_shader_derivatives");
+	} else if (state.requirements.compute_derivatives &&
+	           state.program.stage == ShaderType::Compute) {
 		// The NV extension declares the same capability (ComputeDerivativeGroupQuadsNV).
 		const auto derivatives = GetHostImageFeatures().compute_derivatives;
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
@@ -1271,6 +1294,14 @@ void DefineModule(EmitterState& state) {
 			state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
 			state.builder.RequireCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePixelInterlockOrderedEXT);
+			static std::mutex         ordered_mutex;
+			static std::set<uint64_t> ordered_logged;
+			std::scoped_lock          ordered_lock(ordered_mutex);
+			if (ordered_logged.size() < 64 && ordered_logged.insert(state.program.shader_hash).second) {
+				LOGF("KYTY_POPS_INTERLOCK: pixel shader 0x%016" PRIx64
+				     " runs as a pixel-ordered interlock section\n",
+				     state.program.shader_hash);
+			}
 		} else if (state.program.info.pops && GetCodegenOptions().pops_interlock) {
 			static std::mutex         mutex;
 			static std::set<uint64_t> logged;
@@ -1283,7 +1314,10 @@ void DefineModule(EmitterState& state) {
 			}
 		}
 	}
-	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+	if (ComputeImplicitLod(state)) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupLinearKHR);
+	} else if (state.requirements.compute_derivatives &&
+	           state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
 	state.builder.AddName(state.main_func, "main");

@@ -1894,10 +1894,15 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                              result_numeric_class, false, mem, true));
 			return;
 		}
-		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
-		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
-		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-		                          state.program.stage != ShaderType::Pixel;
+		const bool own_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
+		                     HasFlag(mem, Decoder::ImageSampleFlagLod) ||
+		                     HasFlag(mem, Decoder::ImageSampleFlagLevelZero);
+		// KYTY_IMPLICIT_LOD_STAGES: compute shaders keep implicit LOD with lane-quad derivatives
+		// (ComputeImplicitLod); other stages without derivatives take LOD 0, or the bias of an
+		// IMAGE_SAMPLE_B (forced_lod).
+		const bool implicit_here = state.program.stage == ShaderType::Pixel || ComputeImplicitLod(state);
+		const bool explicit_lod  = own_lod || !implicit_here;
+		const bool forced_lod    = !own_lod && !implicit_here;
 		auto       opcode       = spv::OpImageSampleImplicitLod;
 		if (explicit_lod) {
 			opcode = dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
@@ -1938,6 +1943,10 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto lod = ZeroF32(state);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
+			} else if (forced_lod && layout.bias != NoImageComponent &&
+			           GetCodegenOptions().implicit_lod_stages) {
+				// IMAGE_SAMPLE_B outside pixel shaders: LOD 0 plus its bias.
+				lod = AddressF32(ctx, mem, *address, layout.bias);
 			}
 			if (lod_clamp != 0u) {
 				const auto clamped = state.builder.AllocateId();
@@ -1980,8 +1989,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 				uint32_t level = ZeroF32(state);
 				if (explicit_lod_value != 0u) {
 					level = explicit_lod_value;
-				} else if (!HasFlag(mem, Decoder::ImageSampleFlagLevelZero) &&
-				           state.program.stage == ShaderType::Pixel) {
+				} else if (!HasFlag(mem, Decoder::ImageSampleFlagLevelZero) && implicit_here) {
 					// The level an implicit or gradient sample reads, relative to the view base.
 					state.builder.RequireCapability(spv::CapabilityImageQuery);
 					const auto query = state.builder.AllocateId();

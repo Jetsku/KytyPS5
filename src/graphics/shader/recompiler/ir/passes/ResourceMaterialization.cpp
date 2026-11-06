@@ -1102,8 +1102,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    std::ranges::none_of(program.info.sampled_pairs,
 		                         [&](const auto& pair) { return pair.image == i; });
 		// KYTY_SRGB8_DECODE: a sampled 8 / 8_8 sRGB texture is decoded in the shader (Format::IsSrgbFormat).
+		// KYTY_SRGB8_VIEW: 8 sRGB is decoded by the sampler (an R8_SRGB view), before filtering.
 		const bool srgb_decode  = GetCodegenOptions().srgb8_decode && !storage && !base.depth_compare &&
-		                         Format::IsSrgbFormat(format);
+		                         Format::IsSrgbFormat(format) &&
+		                         !(format == Prospero::BufferFormat::k8Srgb && Prospero::Srgb8ViewActive());
 		image.conversion_format = depth_bits || srgb_decode ? format : ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);

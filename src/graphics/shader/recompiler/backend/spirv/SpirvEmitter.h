@@ -76,6 +76,11 @@ HostImageFeatures GetHostImageFeatures();
 // fragmentShaderPixelInterlock (set once by the device layer; false until then).
 void SetHostFragmentInterlock(bool supported);
 bool GetHostFragmentInterlock();
+// KYTY_IMPLICIT_LOD_STAGES: the device enabled computeDerivativeGroupLinear (with the compute
+// derivatives extension of HostImageFeatures::compute_derivatives).
+void SetHostComputeDerivativesLinear(bool supported);
+bool GetHostComputeDerivativesLinear();
+
 // The clock S_MEMREALTIME reads (VK_KHR_shader_clock, set once by the device layer). S_MEMREALTIME
 // is a free-running 64-bit counter at 100 MHz. The emitter reads OpReadClockKHR at this scope and
 // shifts the value toward 100 MHz: right by `shift` bits when it is positive, left when negative.

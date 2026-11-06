@@ -269,6 +269,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.buffer_oob_modes) {
 		b.Text("buffer_oob_modes");
 	}
+	if (options.implicit_lod_stages) {
+		b.Text("implicit_lod_stages");
+		b.U8(Spirv::GetHostComputeDerivativesLinear() ? 1u : 0u);
+	}
 	if (options.compare_sampler_split) {
 		b.Text("compare_sampler_split");
 	}
@@ -286,6 +290,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.srgb8_decode) {
 		b.Text("srgb8_decode");
+		if (Prospero::Srgb8ViewActive()) {
+			b.Text("srgb8_view"); // KYTY_SRGB8_VIEW: 8 sRGB decoded by the sampler instead
+		}
 	}
 	if (options.depth_bits_read) {
 		b.Text("depth_bits_read");

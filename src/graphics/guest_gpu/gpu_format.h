@@ -53,6 +53,13 @@ BufferFormat               RemapTextureFormat(BufferFormat format);
 // KYTY_FMT30_UFLOAT=1 (Erlou93/KytyPS5-Yotei FIX_RT_11_11_10_FLOAT, default on there): format 30
 // (COLOR_11_11_10 UNORM) render targets and textures are packed unsigned floats (B10G11R11_UFLOAT).
 bool                       Fmt30AsFloat();
+// KYTY_SRGB8_VIEW=1: a sampled 8 sRGB texture (k8Srgb, an R8_UNORM image) is read through an
+// R8_SRGB view, so the sampler decodes each texel before filtering as the PS5 does (Erlou93/
+// KytyPS5-Yotei); it replaces KYTY_SRGB8_DECODE's decode after filtering for 8 sRGB. Active when
+// the device filters R8_SRGB (SetSrgb8ViewSupported, set once by the device layer). 8_8 sRGB keeps
+// the shader decode: R8G8_SRGB is not a sampled format on the RTX 3090.
+bool                       Srgb8ViewActive();
+void                       SetSrgb8ViewSupported(bool supported);
 
 } // namespace Libs::Graphics::Prospero
 

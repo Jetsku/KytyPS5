@@ -504,6 +504,12 @@ struct CodegenOptions {
 	// accesses bypass the non-coherent caches (the whole-binding Coherent decoration of buffers costs
 	// a lot on NVIDIA). Sampled images (IMAGE_SAMPLE* with GLC) cannot be Coherent: unchanged.
 	bool image_glc_coherent = false;
+	// KYTY_IMPLICIT_LOD_STAGES=1: an implicit-LOD sample outside pixel shaders follows the ISA, which
+	// has no stage restriction: in compute shaders (wave32, device with computeDerivativeGroupLinear)
+	// the LOD comes from the derivatives across each group of four consecutive lanes (the RDNA2
+	// quad, DerivativeGroupLinear); in other stages, and where derivatives are unavailable, it is LOD
+	// 0 as before, but IMAGE_SAMPLE_B keeps its bias (LOD = bias).
+	bool implicit_lod_stages = false;
 	// KYTY_BUFFER_OOB_MODES=1: a bound V# with OOB_SELECT 0 and a stride (Table 35: index >= NUM_RECORDS
 	// or offset >= stride) is out of range for an offset (VGPR + instruction offset, per dword) at or past
 	// the stride, instead of reading the next record (IR::BufferOobOffsetCheck, a specialization bit).

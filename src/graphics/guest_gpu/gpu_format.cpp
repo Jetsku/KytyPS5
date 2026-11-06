@@ -17,6 +17,20 @@ bool Fmt30AsFloat() {
 	return on;
 }
 
+static std::atomic_bool g_srgb8_view_supported {false};
+
+void SetSrgb8ViewSupported(bool supported) {
+	g_srgb8_view_supported.store(supported, std::memory_order_relaxed);
+}
+
+bool Srgb8ViewActive() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_SRGB8_VIEW");
+		return text != nullptr && text[0] == '1';
+	}();
+	return on && g_srgb8_view_supported.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 struct FormatInfo {

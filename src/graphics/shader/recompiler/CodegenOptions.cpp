@@ -123,6 +123,7 @@ CodegenOptions FromEnvironment() {
 	options.indirect_format_all = EnvFlag("KYTY_INDIRECT_FORMAT_ALL", options.indirect_format_all);
 	options.format_store_dst_sel = EnvFlag("KYTY_FORMAT_STORE_DST_SEL", options.format_store_dst_sel);
 	options.image_glc_coherent = EnvFlag("KYTY_IMAGE_GLC_COHERENT", options.image_glc_coherent);
+	options.implicit_lod_stages = EnvFlag("KYTY_IMPLICIT_LOD_STAGES", options.implicit_lod_stages);
 	options.buffer_oob_modes = EnvFlag("KYTY_BUFFER_OOB_MODES", options.buffer_oob_modes);
 	options.srgb8_decode = EnvFlag("KYTY_SRGB8_DECODE", options.srgb8_decode);
 	options.depth_bits_read = EnvFlag("KYTY_DEPTH_BITS_READ", options.depth_bits_read);

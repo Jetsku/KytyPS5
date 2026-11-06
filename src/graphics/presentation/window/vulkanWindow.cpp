@@ -1117,7 +1117,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		physical_device.getFeatures2(&derivatives_query);
 		compute_derivatives.computeDerivativeGroupQuads =
 		    supported_derivatives.computeDerivativeGroupQuads;
+		// KYTY_IMPLICIT_LOD_STAGES: the RDNA2 compute quad is four consecutive lanes.
+		if (compute_derivatives.computeDerivativeGroupQuads == VK_TRUE) {
+			compute_derivatives.computeDerivativeGroupLinear =
+			    supported_derivatives.computeDerivativeGroupLinear;
+		}
 	}
+	ShaderRecompiler::Spirv::SetHostComputeDerivativesLinear(
+	    compute_derivatives.computeDerivativeGroupLinear == VK_TRUE);
 	// KYTY_POPS_INTERLOCK: POPS pixel shaders run their ordered section as a pixel-ordered
 	// fragment shader interlock.
 	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_interlock {};
@@ -1130,8 +1137,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	ShaderRecompiler::Spirv::SetHostFragmentInterlock(fragment_interlock.fragmentShaderPixelInterlock ==
 	                                                  VK_TRUE);
-	LOGF("Vulkan fragment shader pixel interlock (POPS): %s\n",
-	     fragment_interlock.fragmentShaderPixelInterlock == VK_TRUE ? "yes" : "no");
+	// KYTY_SRGB8_VIEW: sampled 8 sRGB textures read through an R8_SRGB view when it filters.
+	const bool r8_srgb_filter = static_cast<bool>(
+	    physical_device.getFormatProperties(vk::Format::eR8Srgb).optimalTilingFeatures &
+	    vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
+	Prospero::SetSrgb8ViewSupported(r8_srgb_filter);
+	LOGF("Vulkan fragment shader pixel interlock (POPS): %s; compute derivative group linear: %s; "
+	     "R8_SRGB filtering: %s\n",
+	     fragment_interlock.fragmentShaderPixelInterlock == VK_TRUE ? "yes" : "no",
+	     compute_derivatives.computeDerivativeGroupLinear == VK_TRUE ? "yes" : "no",
+	     r8_srgb_filter ? "yes" : "no");
 	{
 		namespace Spirv = ShaderRecompiler::Spirv;
 		const auto derivatives = compute_derivatives.computeDerivativeGroupQuads != VK_TRUE

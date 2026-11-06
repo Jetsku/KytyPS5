@@ -70,6 +70,8 @@ struct SpirvRequirements {
 	// Native subgroup reductions of DPP row scans (IR::MatchLaneReduction, KYTY_LANE_REDUCTIONS).
 	bool subgroup_arithmetic          = false;
 	bool compute_derivatives          = false;
+	// KYTY_IMPLICIT_LOD_STAGES: a compute program with implicit-LOD samples (ComputeImplicitLod).
+	bool implicit_compute_lod         = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
 	// KYTY_LDS_SLOTS (CodegenOptions::lds_slots): the element offsets k of a non-compute stage's
@@ -605,6 +607,11 @@ private:
 	EmitterState& m_state;
 	bool          m_saved;
 };
+// KYTY_IMPLICIT_LOD_STAGES: this compute program's implicit-LOD samples keep implicit LOD, with
+// derivatives over groups of four consecutive invocations (DerivativeGroupLinear: the RDNA2 lane
+// quad). Needs one guest lane per invocation (no wave64 split), a workgroup of a multiple of 4
+// invocations and computeDerivativeGroupLinear.
+[[nodiscard]] bool ComputeImplicitLod(const EmitterState& state);
 // KYTY_POPS_INTERLOCK: this pixel program runs its body as a fragment shader interlock section.
 [[nodiscard]] inline bool PopsInterlockActive(const EmitterState& state) {
 	return GetCodegenOptions().pops_interlock && state.program.stage == ShaderType::Pixel &&
