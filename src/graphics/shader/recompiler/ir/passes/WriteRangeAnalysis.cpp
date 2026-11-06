@@ -373,7 +373,8 @@ void AnalyzeBufferWriteRanges(Program& program, ShaderStageInputInfo input_info)
 		}
 		BufferWriteRange entry;
 		entry.buffer        = index;
-		entry.packed_stride = buffers[index].packed_stride;
+		// (KYTY_BUFFER_OOB_MODES' flag is not part of the descriptor's PackedStride.)
+		entry.packed_stride = buffers[index].packed_stride & ~BufferOobOffsetCheck;
 		entry.bounded = !global_failure && !failed[index] && !accesses[index].empty() &&
 		                !builder.Overflowed();
 		if (entry.bounded) {

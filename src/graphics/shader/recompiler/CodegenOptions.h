@@ -504,6 +504,12 @@ struct CodegenOptions {
 	// accesses bypass the non-coherent caches (the whole-binding Coherent decoration of buffers costs
 	// a lot on NVIDIA). Sampled images (IMAGE_SAMPLE* with GLC) cannot be Coherent: unchanged.
 	bool image_glc_coherent = false;
+	// KYTY_BUFFER_OOB_MODES=1: a bound V# with OOB_SELECT 0 and a stride (Table 35: index >= NUM_RECORDS
+	// or offset >= stride) is out of range for an offset (VGPR + instruction offset, per dword) at or past
+	// the stride, instead of reading the next record (IR::BufferOobOffsetCheck, a specialization bit).
+	// OOB_SELECT 1 with stride 0 (index only) is not modelled: the binding range (NUM_RECORDS bytes)
+	// still bounds the offset.
+	bool buffer_oob_modes = false;
 	// KYTY_DEPTH_BITS_READ=1 (default 0; re-applies upstream aafe014d0, which a merge dropped): a raw
 	// load of a kDepth k16UInt T# reads the D16 surface's codes: the host binds it as UNorm and the
 	// shader converts back (ReadsDepthBits). Before, such loads failed the depth view check (null).

@@ -990,6 +990,12 @@ static bool SpecializeBuffer(const ResourcePlan& program, const BufferResource& 
 	} else if (!swizzle) {
 		packed_stride &= ~(3u << 16u);
 	}
+	// KYTY_BUFFER_OOB_MODES: OOB_SELECT 0 with a stride also checks offset < stride (Table 35);
+	// BufferOobOffsetCheck marks such a V# for the emitter (ByteAddress).
+	if (GetCodegenOptions().buffer_oob_modes && descriptor.OutOfBounds() == 0u && stride != 0u &&
+	    !swizzle) {
+		packed_stride |= BufferOobOffsetCheck;
+	}
 	specialization.buffers.push_back({
 	    .packed_stride     = packed_stride,
 	    .descriptor_format = buffer.formatted

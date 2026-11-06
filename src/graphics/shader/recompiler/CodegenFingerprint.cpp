@@ -266,6 +266,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.image_glc_coherent) {
 		b.Text("image_glc_coherent");
 	}
+	if (options.buffer_oob_modes) {
+		b.Text("buffer_oob_modes");
+	}
 	if (options.compare_sampler_split) {
 		b.Text("compare_sampler_split");
 	}

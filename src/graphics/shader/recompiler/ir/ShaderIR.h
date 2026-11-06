@@ -183,6 +183,11 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// KYTY_BUFFER_OOB_MODES: BufferResource::packed_stride flag (above ShaderBufferResource::PackedStride's
+// bits): the V# has OOB_SELECT 0 and a stride (no swizzle), so an offset at or past the stride is out
+// of range (RDNA2 ISA Table 35).
+inline constexpr uint32_t BufferOobOffsetCheck = 1u << 23u;
+
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;

@@ -279,9 +279,24 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
-		return Select(ctx.state, TypeU32(ctx.state),
-		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
-		              address, ConstantU32(ctx.state, UINT32_MAX));
+		auto in_range =
+		    Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix);
+		// KYTY_BUFFER_OOB_MODES: OOB_SELECT 0 with a stride: an offset (VGPR offset + instruction
+		// offset, per dword of a DWORDX2-4) at or past the stride is out of range (Table 35), not
+		// the next record.
+		if (const auto packed = StorageBufferPackedStride(ctx.state, mem);
+		    (packed & IR::BufferOobOffsetCheck) != 0u && !mem.typed) {
+			auto offset = ctx.Arg(inst, 2);
+			if (mem.offset != 0u) {
+				offset = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), offset,
+				                ConstantU32(ctx.state, mem.offset));
+			}
+			in_range = AndCondition(ctx.state, in_range,
+			                        Binary(ctx.state, spv::OpULessThan, TypeBool(ctx.state), offset,
+			                               ConstantU32(ctx.state, packed & 0x3fffu)));
+		}
+		return Select(ctx.state, TypeU32(ctx.state), in_range, address,
+		              ConstantU32(ctx.state, UINT32_MAX));
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
