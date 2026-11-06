@@ -1010,6 +1010,23 @@ bool CommandProcessor::MaybeFlushPeriodic(bool dispatch) {
 	return true;
 }
 
+// KYTY_SUBMIT_EVERY=<n> (live, default 0 = the rules above; Erlou93/KytyPS5-Yotei
+// commandScheduler.cpp NoteGpuCommandBatched, adapted): batch submits from the GPU's state.
+//  - Idle early: armed only when the recording's first draw/dispatch after a non-batch submit (a
+//    slice end, wait, flip, readback, ...) finds the GPU idle; then the recording is submitted once
+//    it holds KYTY_IDLE_FLUSH_DRAWS commands (4x inside a rendering instance) and the GPU is still
+//    idle: at most one extra submit per such event. After a batch submit an idle GPU only means
+//    the command processor is the bottleneck, which more submits would slow down. Our default
+//    re-arms after every submit, its own included: up to one submit every 8 draws on a CP-bound
+//    frame (Yotei torii: 274 command buffers per frame against Erlou's ~86-100).
+//  - Every n draws/dispatches: submitted when the GPU is idle there; while it is busy, at the
+//    first later command that finds it idle, at the latest after 8n.
+// Only submission points move; what is recorded and the order of GPU work are unchanged.
+static Live::Switch g_submit_every("KYTY_SUBMIT_EVERY", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 65536ul));
+});
+
 void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
 	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
@@ -1020,6 +1037,10 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 		return;
 	}
 	if (MaybeFlushPeriodic(dispatch)) {
+		return;
+	}
+	if (const auto every = static_cast<uint32_t>(g_submit_every.Get()); every != 0) {
+		MaybeFlushBatched(every);
 		return;
 	}
 	const auto min_draws = IdleFlushMinDraws();
@@ -1057,6 +1078,62 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	Profiler::CountFrameEvent(in_pass ? Profiler::FrameEvent::IdleFlushesInPass
 	                                  : Profiler::FrameEvent::IdleFlushes);
 	BufferFlush();
+}
+
+// KYTY_SUBMIT_EVERY (above): the batched submit rules.
+void CommandProcessor::MaybeFlushBatched(uint32_t every) {
+	auto&      scheduler = GetScheduler();
+	const auto current   = scheduler.CurrentTick();
+	auto&      master    = scheduler.GetMasterSemaphore();
+	const auto count     = current != m_idle_flush_tick ? 1u : m_idle_flush_draws + 1u;
+	// GPU idle: everything submitted before this recording finished. The timeline value is
+	// refreshed (a driver query) only every 4th check that finds it behind.
+	const auto gpu_idle = [&](bool refresh) {
+		if (master.KnownGpuTick() + 1u >= current) {
+			return true;
+		}
+		if (!refresh) {
+			return false;
+		}
+		master.Refresh();
+		return master.KnownGpuTick() + 1u >= current;
+	};
+	if (count == 1) {
+		m_idle_flush_tick  = current;
+		// The first command after a non-batch submit: did the GPU run dry before it?
+		m_idle_flush_armed = current != m_batch_flush_tick && gpu_idle(true);
+	}
+	m_idle_flush_draws = count;
+	const bool in_pass = CurrentBuffer().ActiveRenderingSerial() != 0;
+	const auto flush   = [&](bool idle_early) {
+		if (!OptionalSubmitAllowed()) {
+			return false;
+		}
+		if (idle_early) {
+			Profiler::CountFrameEvent(in_pass ? Profiler::FrameEvent::IdleFlushesInPass
+			                                  : Profiler::FrameEvent::IdleFlushes);
+		}
+		BufferFlush();
+		m_batch_flush_tick = GetScheduler().CurrentTick();
+		m_idle_flush_armed = false;
+		return true;
+	};
+	const auto min_draws = IdleFlushMinDraws();
+	if (m_idle_flush_armed && min_draws != 0 && count > (in_pass ? min_draws * 4u : min_draws)) {
+		if (gpu_idle((count % 4u) == 0) && flush(true)) {
+			return;
+		}
+	}
+	if (count <= every) {
+		return;
+	}
+	if (gpu_idle(count == every + 1u || (count % 4u) == 0)) {
+		(void)flush(false);
+		return;
+	}
+	if (uint64_t {count} > uint64_t {every} * 8u) {
+		(void)flush(false);
+	}
 }
 
 // KYTY_GFX_SLICE_DRAWS (default 128, 0 disables): one GPU thread runs the graphics queue and all

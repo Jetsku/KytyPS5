@@ -119,6 +119,20 @@ void TestLayouts() {
 		      "cp+recorder: 12 general processors");
 	}
 	{
+		const auto layout = ComputeCpuLayout(lasso, CpuReserveMode::Stages, -1);
+		Check(layout.reserved && layout.cp_mask == 0xC && layout.recorder_mask == 0xC00 &&
+		          Count(layout.sequencer_mask) == 2 && layout.sequencer_ids.size() == 2 &&
+		          (layout.sequencer_mask & (0xC0Cu | 0x3u)) == 0 && layout.sequencer_core >= 0,
+		      "stages: the sequencer gets a third whole core (not core 0)");
+		Check(layout.general_mask == (0xFFFFu & ~(0xC0Cu | layout.sequencer_mask)) &&
+		          layout.general_ids.size() == 10,
+		      "stages: 10 general processors");
+		Check(ComputeCpuLayout(MachineTable(0xFFF), CpuReserveMode::Stages, -1).reserved,
+		      "12 processors: stages leave 6 (the minimum)");
+		Check(!ComputeCpuLayout(MachineTable(0x3FF), CpuReserveMode::Stages, -1).reserved,
+		      "10 processors: no stages");
+	}
+	{
 		// Before Process Lasso's mask: both caches hold 16, the lower index (V-cache) wins.
 		const auto layout = ComputeCpuLayout(MachineTable(0xFFFFFFFF), CpuReserveMode::Cp, -1);
 		Check(layout.reserved && layout.cp_mask == 0xC && Count(layout.general_mask) == 30,
@@ -378,6 +392,9 @@ void TestAffinityAndModes() {
 	Check(Common::ParseCpuReserveMode("cp+recorder", &valid) == CpuReserveMode::CpRecorder && valid,
 	      "mode cp+recorder");
 	Check(Common::ParseCpuReserveMode("2", &valid) == CpuReserveMode::CpRecorder && valid, "mode 2");
+	Check(Common::ParseCpuReserveMode("stages", &valid) == CpuReserveMode::Stages && valid,
+	      "mode stages");
+	Check(Common::ParseCpuReserveMode("3", &valid) == CpuReserveMode::Stages && valid, "mode 3");
 	Check(Common::ParseCpuReserveMode("off", &valid) == CpuReserveMode::Off && valid, "mode off");
 	Check(Common::ParseCpuReserveMode(nullptr, &valid) == CpuReserveMode::Off && valid, "unset");
 	Check(Common::ParseCpuReserveMode("bogus", &valid) == CpuReserveMode::Off && !valid,

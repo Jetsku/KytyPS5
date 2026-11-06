@@ -18,6 +18,10 @@
 // process default CPU sets: guest threads, draw-prep workers, service and completion threads, the
 // CP recorder, and driver threads alike.
 // cp+recorder: the CP recorder thread (KYTY_CP_RECORDER=1) gets a second core the same way.
+// stages (also 3): every GPU stage thread gets a whole core: the CP (resolver and execution), the
+// CP recorder, and the CP sequencer (KYTY_CP_SEQ=1, the PM4 front end), as Erlou93/TheCruZ's
+// gpuStageCores places their CP, resolve, execution and recorder threads (+18% at Yotei's gate on
+// theirs). Draw-prep workers stay on the general processors.
 //
 // Details:
 // - The allowed processors are read at runtime: the process affinity mask (Process Lasso pins
@@ -85,7 +89,7 @@
 namespace Common {
 
 enum class ThreadRole : uint8_t { Cp = 0, Recorder = 1, Guest = 2, Host = 3, Count = 4 };
-enum class CpuReserveMode : uint8_t { Off, Cp, CpRecorder };
+enum class CpuReserveMode : uint8_t { Off, Cp, CpRecorder, Stages };
 
 // One logical processor as GetSystemCpuSetInformation reports it.
 struct CpuSetInfo {
@@ -102,11 +106,14 @@ struct CpuLayout {
 	bool                  reserved      = false; // a CP core is reserved
 	int                   cp_core       = -1;
 	int                   recorder_core = -1;
+	int                   sequencer_core = -1;
 	std::vector<uint32_t> cp_ids;            // CPU set ids of the CP's core
-	std::vector<uint32_t> recorder_ids;      // of the recorder's core (cp+recorder)
+	std::vector<uint32_t> recorder_ids;      // of the recorder's core (cp+recorder, stages)
+	std::vector<uint32_t> sequencer_ids;     // of the sequencer's core (stages)
 	std::vector<uint32_t> general_ids;       // every other allowed processor
 	uint64_t              cp_mask       = 0; // group 0 logical processors of the above
 	uint64_t              recorder_mask = 0;
+	uint64_t              sequencer_mask = 0;
 	uint64_t              general_mask  = 0;
 	std::string           description; // the choice, or why nothing was reserved
 	// KYTY_VCACHE_PLACEMENT: general_ids/general_mask are the hot processors (the V-cache CCD
@@ -171,7 +178,7 @@ inline constexpr uint32_t kMinGeneralProcessors = 6;
 // (the CPU sets narrow it), otherwise every general processor.
 [[nodiscard]] uint64_t GeneralPoolAffinity(uint64_t affinity, const CpuLayout& layout);
 
-// KYTY_CPU_RESERVE=off|cp|cp+recorder (also 0|1|2); nullptr is off. `valid` false: unknown text.
+// KYTY_CPU_RESERVE=off|cp|cp+recorder|stages (also 0|1|2|3); nullptr is off. `valid` false: unknown text.
 [[nodiscard]] CpuReserveMode ParseCpuReserveMode(const char* text, bool* valid = nullptr);
 [[nodiscard]] CpuReserveMode GetCpuReserveMode(); // KYTY_CPU_RESERVE, evaluated once
 // Pure (tested): "0-15", "16-31", "0-7,16-23", "5" as a mask of logical processors 0..63; 0 with
@@ -192,6 +199,9 @@ void MaintainCpuPlacement();
 // core in cp+recorder mode, otherwise the general processors. Other roles keep the process
 // default. No-op when nothing is reserved.
 void PlaceCurrentThread(ThreadRole role);
+// The CP sequencer thread (KYTY_CP_SEQ=1): its own core with KYTY_CPU_RESERVE=stages, otherwise the
+// process default. No-op when nothing is reserved.
+void PlaceCurrentThreadSequencer();
 // A cold thread (compile and pipeline workers, file I/O, audio, diagnostics): with the V-cache
 // placement it runs on the other CCD, otherwise nothing changes. Idempotent per thread and cheap
 // after the first call; the thread is forgotten when it exits. Never call it from a thread that
