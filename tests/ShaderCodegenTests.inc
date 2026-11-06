@@ -1259,6 +1259,26 @@ void CheckMadModes(VulkanHarness *vulkan) {
       }
     }
   }
+  {
+    // KYTY_MAD_FLUSH on normal operands: still round(round(a*b)+c), a denormal sum flushed.
+    CodegenOptions options = GetCodegenOptions();
+    options.mad_mode = ShaderRecompiler::MadMode::Exact;
+    options.mad_flush = true;
+    const auto run = RunBulk(vulkan, bulk, options);
+    for (u32 o = 0; o < 4u; o++) {
+      const auto out = BulkOutput(bulk, run.words, o);
+      for (u32 e = 0; e < bulk.count; e++) {
+        auto expected = reference(o, e, false);
+        if ((expected & 0x7f800000u) == 0u) {
+          expected &= 0x80000000u;
+        }
+        if (out[e] != expected) {
+          Fail(name, names[o], "KYTY_MAD_FLUSH element " + std::to_string(e) + ": got " +
+                                   Hex(out[e]) + ", expected " + Hex(expected));
+        }
+      }
+    }
+  }
   std::printf("[codegen] %-32s ok (%u elements, %zu where fused and unfused differ)\n", name,
               bulk.count, differing);
 }

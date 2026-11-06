@@ -506,17 +506,28 @@ uint32_t EmitFPMul32(ValueEmitContext& ctx, const IR::Inst& inst) {
 // MadMode::Position off the position data flow) keep the cheaper fused FMA of the old code.
 uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
-	const auto a     = ctx.Def(inst.Arg(0));
-	const auto b     = ctx.Def(inst.Arg(1));
-	const auto c     = ctx.Def(inst.Arg(2));
+	auto       a     = ctx.Def(inst.Arg(0));
+	auto       b     = ctx.Def(inst.Arg(1));
+	auto       c     = ctx.Def(inst.Arg(2));
 	if (!NoContraction(state, inst)) {
 		return EmitExt(state, TypeF32(state), GLSLstd450Fma, {a, b, c});
 	}
-	const auto product = Binary(state, spv::OpFMul, TypeF32(state), a, b);
+	// KYTY_MAD_FLUSH: the legacy MAD has no f32 denormal support; flush its operands, the rounded
+	// product and the sum in the shader (a module with DenormFlushToZero 32 already does).
+	const bool flush = GetCodegenOptions().mad_flush;
+	if (flush) {
+		a = EmitFlushF32DenormToSignedZero(state, a);
+		b = EmitFlushF32DenormToSignedZero(state, b);
+		c = EmitFlushF32DenormToSignedZero(state, c);
+	}
+	auto product = Binary(state, spv::OpFMul, TypeF32(state), a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+	if (flush) {
+		product = EmitFlushF32DenormToSignedZero(state, product);
+	}
 	const auto sum = Binary(state, spv::OpFAdd, TypeF32(state), product, c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return sum;
+	return flush ? EmitFlushF32DenormToSignedZero(state, sum) : sum;
 }
 
 uint32_t EmitFPMin32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1) {
