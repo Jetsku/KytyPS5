@@ -2560,6 +2560,58 @@ void CheckSplitDppScan(VulkanHarness *vulkan) {
               wrong, 4u * Wave);
 }
 
+// KYTY_MOV_INT_MODS: V_MOV_B32 and V_CNDMASK_B32 neg/abs flip or clear the sign bit (ISA p.137,
+// p.131), bit exact for f32 denormals, which a host flushing f32 denormals in OpFNegate/OpFAbs
+// would turn into signed zeros.
+void CheckMovIntMods(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenMovIntMods";
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 0x00000001u);
+  AppendVMovU32(&code, 2, 0x80000005u);
+  AppendVMovU32(&code, 3, 0x00400000u);
+  AppendVMovU32(&code, 4, 0x3f800000u);
+  AppendVop3(&code, 0x181, 10, Vgpr(1), 0, 0, 0, 0, false, 0, 1); // v_mov_b32 v10, -v1
+  AppendVop3(&code, 0x181, 11, Vgpr(2), 0, 0, 1);                 // v_mov_b32 v11, |v2|
+  AppendVop3(&code, 0x181, 12, Vgpr(2), 0, 0, 1, 0, false, 0, 1); // v_mov_b32 v12, -|v2|
+  AppendVop3(&code, 0x181, 13, Vgpr(4), 0, 0, 0, 0, false, 0, 1); // v_mov_b32 v13, -v4 (-1.0)
+  code.push_back(EncodeSMovB32(20, 193));                         // s_mov_b32 s20, -1
+  code.push_back(EncodeSMovB32(21, 128));                         // s_mov_b32 s21, 0
+  AppendVop3(&code, 0x101, 14, Vgpr(1), Vgpr(3), 20, 0, 0, false, 0, 2); // v_cndmask v14, v1, -v3, s20
+  AppendVop3(&code, 0x101, 15, Vgpr(2), Vgpr(3), 21, 1);                 // v_cndmask v15, |v2|, v3, s21
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+  test.initial.assign(6, 0xdeadbeefu);
+  test.expected = {0x80000001u, 0x00000005u, 0x80000005u, 0xbf800000u, 0x80400000u, 0x00000005u};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  std::vector<u32> on_words;
+  std::vector<u32> off_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.mov_int_mods = true;
+    options.mov_no_float_mods = false;
+    ScopedCodegenOptions scope(options);
+    on_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.mov_int_mods = false;
+    options.mov_no_float_mods = false;
+    ScopedCodegenOptions scope(options);
+    off_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  RequireEqualWords(name, "integer sign modifiers", test.expected, on_words);
+  std::printf("[codegen] %-32s ok (float path: -denormal %08x, cndmask -denormal %08x)\n", name,
+              off_words[0], off_words[4]);
+}
+
 // KYTY_SCALAR_LOAD_GROUPS: S_LOAD_DWORDX4 through a scalar address, once inside one BDA page
 // (one page lookup for the four dwords) and once straddling a page boundary (per-dword path); the
 // results match the memory with and without the switch.
@@ -2611,6 +2663,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckScalarLoadGroups(vulkan);
   CheckSplitLdsWriteSync(vulkan);
   CheckSplitDppScan(vulkan);
+  CheckMovIntMods(vulkan);
   CheckLdsAtomicOrder(vulkan);
   CheckGdsM0Base(vulkan);
   CheckKnownBitsMasks(vulkan);

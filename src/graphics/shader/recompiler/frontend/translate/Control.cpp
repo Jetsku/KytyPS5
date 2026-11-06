@@ -351,6 +351,13 @@ void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modi
 		WriteOperand(DestinationOperand(inst), ReadOperand(source, IR::Type::U32));
 		return;
 	}
+	if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute) &&
+	    GetCodegenOptions().mov_int_mods) {
+		// KYTY_MOV_INT_MODS (ISA p.137: D.u = S0.u, the modifiers act on the sign bit): a U32 read
+		// applies abs/neg as AND 0x7fffffff / XOR 0x80000000, bit exact under host flush-to-zero.
+		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::U32));
+		return;
+	}
 	if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute)) {
 		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));
 	} else {

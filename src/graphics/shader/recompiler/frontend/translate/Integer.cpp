@@ -581,7 +581,8 @@ void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
 	}
 	const auto condition = ReadMask(mask_operand);
 	IR::Value  result;
-	if (inst.src0.negate || inst.src0.absolute || inst.src1.negate || inst.src1.absolute) {
+	if ((inst.src0.negate || inst.src0.absolute || inst.src1.negate || inst.src1.absolute) &&
+	    !GetCodegenOptions().mov_int_mods) {
 		result =
 		    ir.Emit(IR::ValueOpcode::SelectF32, {condition, ReadOperand(inst.src1, IR::Type::F32),
 		                                         ReadOperand(inst.src0, IR::Type::F32)});
