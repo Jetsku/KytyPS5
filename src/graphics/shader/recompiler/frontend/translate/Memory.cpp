@@ -174,6 +174,16 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.coherent = (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::Flat ||
 	                   memory.kind == ResourceKind::Global) &&
 	                  !buffer_atomic && (decoded.glc || decoded.dlc);
+	// KYTY_IMAGE_GLC_COHERENT: IMAGE_LOAD* / IMAGE_STORE* with GLC/DLC (Tables 29/41) are coherent
+	// too; ResourceTracking reads such an IMAGE_LOAD through the storage image.
+	if (GetCodegenOptions().image_glc_coherent && memory.kind == ResourceKind::Image &&
+	    (decoded.glc || decoded.dlc) &&
+	    (decoded.opcode == Decoder::Opcode::IMAGE_LOAD ||
+	     decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
+	     decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
+	     decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP)) {
+		memory.coherent = true;
+	}
 	// KYTY_VOLATILE_LOADS=1 (diagnostic): every buffer access is Volatile, so a guest loop polling memory
 	// another workgroup or dispatch writes always rereads it (CodegenOptions::volatile_loads).
 	if (GetCodegenOptions().volatile_loads && !buffer_atomic &&
@@ -861,8 +871,17 @@ void Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageRead, {resource, address, ir.GetExec()},
-	                              AddMemoryInfo(memory, inst.pc));
+	// KYTY_IMAGE_GLC_COHERENT (a GLC/DLC load) / KYTY_POPS_INTERLOCK (a load in a POPS program):
+	// read through the storage image, which can be Coherent; single-sample images only (FMASK and
+	// MSAA loads keep the sampled fetch).
+	const bool multisampled = memory.image_dimension == Decoder::ImageDimension::Dim2DMsaa ||
+	                          memory.image_dimension == Decoder::ImageDimension::Dim2DMsaaArray;
+	const bool storage_read =
+	    !multisampled && ((GetCodegenOptions().image_glc_coherent && memory.coherent) ||
+	                      (GetCodegenOptions().pops_interlock && program.info.pops));
+	const auto result =
+	    ir.Emit(storage_read ? IR::ValueOpcode::ImageReadStorage : IR::ValueOpcode::ImageRead,
+	            {resource, address, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
 	WriteImageComponents(inst.dst, result, memory, 4u);
 	WriteFetchStatus(inst, memory);
 }

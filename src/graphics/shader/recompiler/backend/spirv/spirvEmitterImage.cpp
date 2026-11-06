@@ -1715,7 +1715,53 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 		        }));
 		return;
 	}
+	if (op == IR::ValueOpcode::ImageReadStorage) {
+		// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: IMAGE_LOAD* through the storage image, its
+		// Coherent alias when the access is coherent.
+		if (image.indirect_root == mem.resource && !image.bindless &&
+		    image.indirect_resources.size() >= 2u) {
+			ctx.Fail(inst, "reads a storage image table (not supported)");
+			return;
+		}
+		state.builder.RequireCapability(spv::CapabilityStorageImageReadWithoutFormat);
+		const auto  dimension      = image.dimension;
+		const auto& dimension_info = ImageDimensionInfoFor(dimension);
+		const auto  numeric_class  = image.numeric_class;
+		const auto  condition      = ctx.Arg(inst, 2);
+		ctx.Define(
+		    inst,
+		    EmitValueOrDefaultIfCondition(
+		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
+		        [&]() {
+			        const auto coord     = CoordU32(ctx, mem, *address, dimension);
+			        const auto read_type = ImageVectorType(state, numeric_class, 4);
+			        const auto EmitRead  = [&](uint32_t mip) {
+				        const CoherentImageScope scope(state, ImageAccessCoherent(state, mem));
+				        const auto descriptor = LoadImageDescriptor(state, mem.resource, mip);
+				        const auto color      = state.builder.AllocateId();
+				        if (dimension_info.multisampled != 0u) {
+					        state.builder.AddFunction(
+					            spv::OpImageRead, read_type, color, descriptor, coord,
+					            spv::ImageOperandsSampleMask,
+					            AddressU32(ctx, mem, *address, dimension_info.coordinate_components));
+				        } else {
+					        state.builder.AddFunction(spv::OpImageRead, read_type, color, descriptor,
+					                                  coord);
+				        }
+				        return color;
+			        };
+			        const auto color =
+			            image.mip_mode == IR::ImageMipMode::Dynamic
+			                ? EmitIndexSwitch(state, LodU32(ctx, mem, *address, dimension),
+			                                  image.mip_count, read_type, EmitRead)
+			                : EmitRead(0);
+			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class, false,
+			                            mem);
+		        }));
+		return;
+	}
 	if (op == IR::ValueOpcode::ImageWrite) {
+		const CoherentImageScope coherent_write(state, ImageAccessCoherent(state, mem));
 		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
 		const auto dimension  = image.dimension;
 		// KYTY_WORKGROUP_IMAGES: a table of enumerated storage images (one per workgroup); the

@@ -2329,7 +2329,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			EXIT_IF(memory.resource >= images.size());
 			const auto& image = images[memory.resource];
 			if (specialization.images[memory.resource].fmask) {
-				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
+				EXIT_IF((inst.GetOpcode() != ValueOpcode::ImageRead &&
+				         inst.GetOpcode() != ValueOpcode::ImageReadStorage) ||
+				        memory.data_bits != 32u);
 				// The host image holds one sample per guest fragment. FMASK's four-bit fragment
 				// indices map coverage sample i to host sample i, or with EQAA (fewer fragments
 				// than samples, KYTY_EQAA_MIXED) to i mod fragments, so every index names a
@@ -2362,6 +2364,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite &&
+			        inst.GetOpcode() != ValueOpcode::ImageReadStorage &&
 			        !(inst.GetOpcode() == ValueOpcode::ImageRead &&
 			          GetCodegenOptions().sampled_table_reads));
 		}

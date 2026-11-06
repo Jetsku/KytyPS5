@@ -35,6 +35,7 @@ std::atomic_bool     g_uniform_dword_loads_return_zero {false};
 std::atomic_bool     g_buffer_pair_atomics {false};
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
+std::atomic_bool     g_fragment_interlock {false};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
 std::atomic_bool     g_guard_vertex_outputs {false};
@@ -643,6 +644,14 @@ HostImageFeatures GetHostImageFeatures() {
 	return {.min_lod             = g_image_min_lod.load(std::memory_order_relaxed),
 	        .compute_derivatives = static_cast<HostComputeDerivatives>(
 	            g_compute_derivatives.load(std::memory_order_relaxed))};
+}
+
+void SetHostFragmentInterlock(bool supported) {
+	g_fragment_interlock.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostFragmentInterlock() {
+	return g_fragment_interlock.load(std::memory_order_relaxed);
 }
 
 void SetHostGeometryGuard(const HostGeometryGuard& guard) {

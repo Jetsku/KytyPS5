@@ -245,6 +245,11 @@ struct EmitterState {
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: Coherent aliases of storage image bindings with
+	// coherent accesses (0: none), and whether the access being emitted uses them
+	// (CoherentImageScope, ImageDescriptorPointer).
+	std::array<uint32_t, IR::ImageBindingCount>      image_coherent_variables {};
+	bool                                             coherent_image_access = false;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
@@ -582,6 +587,28 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 // the host subgroup's lane (lane & 31): two lanes per invocation or a split wave.
 [[nodiscard]] inline bool HalfWaveHost(const EmitterState& state) {
 	return state.lane_count == 2 || state.split_wave;
+}
+// KYTY_IMAGE_GLC_COHERENT: a GLC/DLC storage image access; KYTY_POPS_INTERLOCK: any storage image
+// access of a POPS program (its ordered read-modify-write must see the previous fragment's store).
+[[nodiscard]] bool ImageAccessCoherent(const EmitterState& state, const IR::MemoryInfo& mem);
+// Sets EmitterState::coherent_image_access for the descriptor loads of one image access.
+class CoherentImageScope {
+public:
+	CoherentImageScope(EmitterState& state, bool coherent)
+	    : m_state(state), m_saved(state.coherent_image_access) {
+		state.coherent_image_access = coherent;
+	}
+	~CoherentImageScope() { m_state.coherent_image_access = m_saved; }
+	CoherentImageScope(const CoherentImageScope&)            = delete;
+	CoherentImageScope& operator=(const CoherentImageScope&) = delete;
+private:
+	EmitterState& m_state;
+	bool          m_saved;
+};
+// KYTY_POPS_INTERLOCK: this pixel program runs its body as a fragment shader interlock section.
+[[nodiscard]] inline bool PopsInterlockActive(const EmitterState& state) {
+	return GetCodegenOptions().pops_interlock && state.program.stage == ShaderType::Pixel &&
+	       state.program.info.pops && GetHostFragmentInterlock();
 }
 // The invocation's lane in its host subgroup (0-31 for a split wave).
 uint32_t EmitHostSubgroupLane(EmitterState& state);

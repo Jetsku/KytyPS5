@@ -1,7 +1,12 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
+#include <mutex>
+#include <tuple>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -112,6 +117,8 @@ CodegenOptions FromEnvironment() {
 	options.wave64_present_exec = EnvFlag("KYTY_WAVE64_PRESENT_EXEC", options.wave64_present_exec);
 	options.embedded_fetch_no_sgpr_offset = EnvFlag("KYTY_EMBEDDED_FETCH_NO_SGPR_OFFSET", options.embedded_fetch_no_sgpr_offset);
 	options.mov_no_float_mods = EnvFlag("KYTY_MOV_NO_FLOAT_MODS", options.mov_no_float_mods);
+	options.pops_interlock = EnvFlag("KYTY_POPS_INTERLOCK", options.pops_interlock);
+	options.image_glc_coherent = EnvFlag("KYTY_IMAGE_GLC_COHERENT", options.image_glc_coherent);
 	options.srgb8_decode = EnvFlag("KYTY_SRGB8_DECODE", options.srgb8_decode);
 	options.depth_bits_read = EnvFlag("KYTY_DEPTH_BITS_READ", options.depth_bits_read);
 	options.bindless_3d_as_array =

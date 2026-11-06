@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 
 #include "common/rendererBatch.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -248,6 +249,13 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.point_integer_images) {
 		b.Text("point_integer_images");
+	}
+	if (options.pops_interlock) {
+		b.Text("pops_interlock");
+		b.U8(Spirv::GetHostFragmentInterlock() ? 1u : 0u);
+	}
+	if (options.image_glc_coherent) {
+		b.Text("image_glc_coherent");
 	}
 	if (options.compare_sampler_split) {
 		b.Text("compare_sampler_split");

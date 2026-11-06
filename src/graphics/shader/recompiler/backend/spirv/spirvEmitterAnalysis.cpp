@@ -219,6 +219,10 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	return sampled_image;
 }
 
+bool ImageAccessCoherent(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return (GetCodegenOptions().image_glc_coherent && mem.coherent) || PopsInterlockActive(state);
+}
+
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip,
                                 uint32_t array_index) {
 	const auto& image = ImageResourceAt(state, resource);
@@ -230,7 +234,11 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	}
 	const auto pointer_type = state.builder.Type(
 	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image));
-	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	if (state.coherent_image_access && image.resource_class == IR::ImageResourceClass::Storage &&
+	    state.image_coherent_variables[IR::ImageBindingIndex(*kind)] != 0u) {
+		variable = state.image_coherent_variables[IR::ImageBindingIndex(*kind)];
+	}
 	return DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
 	                                "image descriptor array was not emitted");
 }

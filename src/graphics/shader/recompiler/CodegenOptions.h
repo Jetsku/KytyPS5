@@ -476,6 +476,21 @@ struct CodegenOptions {
 	// 8 or 8_8 sRGB texture (UNorm backing, vulkanCommon.cpp) is decoded from sRGB in the shader on
 	// every fetch, gather and sample (after filtering; Erlou samples 8 sRGB through an R8_SRGB view).
 	bool srgb8_decode = false;
+	// ISA-check fixes (RDNA2 ISA REPORT-ISA-2/3, claude/u59-isa-fix-b; default 0, on in the PPSA26344
+	// title preset):
+	// KYTY_POPS_INTERLOCK=1: a pixel shader with a POPS section (S_SETREG_B32 hwreg(POPS_PACKER),
+	// the pops_exiting_wave_id wait, S_SENDMSG MSG_ORDERED_PS_DONE; IR::ShaderInfo::pops) runs its
+	// whole body inside a VK_EXT_fragment_shader_interlock critical section, pixel ordered
+	// (PixelInterlockOrderedEXT): overlapping fragments execute in primitive order, as the guest's
+	// ordered section makes its image read-modify-write. The device must expose
+	// fragmentShaderPixelInterlock (Spirv::HostFragmentInterlock); without it such programs keep
+	// the unordered code and are named once.
+	bool pops_interlock = false;
+	// KYTY_IMAGE_GLC_COHERENT=1: IMAGE_LOAD* / IMAGE_STORE* with GLC or DLC (ISA Tables 29/41, the
+	// buffer meaning) access the storage image through a Coherent alias of its binding, so only those
+	// accesses bypass the non-coherent caches (the whole-binding Coherent decoration of buffers costs
+	// a lot on NVIDIA). Sampled images (IMAGE_SAMPLE* with GLC) cannot be Coherent: unchanged.
+	bool image_glc_coherent = false;
 	// KYTY_DEPTH_BITS_READ=1 (default 0; re-applies upstream aafe014d0, which a merge dropped): a raw
 	// load of a kDepth k16UInt T# reads the D16 surface's codes: the host binds it as UNorm and the
 	// shader converts back (ReadsDepthBits). Before, such loads failed the depth view check (null).

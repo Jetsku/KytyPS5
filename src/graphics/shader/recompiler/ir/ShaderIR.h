@@ -689,6 +689,9 @@ struct ShaderInfo {
 	// writes through BDA). Implies uses_dma and has_address_writes; the renderer settles each of
 	// its dispatches synchronously.
 	bool                             bda_writes         = false;
+	// KYTY_POPS_INTERLOCK: a pixel shader that writes hwreg(POPS_PACKER) with S_SETREG_B32, the start
+	// of a primitive-ordered pixel shading section (RDNA2 ISA Table 16; REPORT-ISA-2 M1).
+	bool                             pops               = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

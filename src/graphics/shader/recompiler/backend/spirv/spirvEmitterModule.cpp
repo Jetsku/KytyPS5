@@ -380,6 +380,30 @@ void DefineBindlessImages(EmitterState& state) {
 	}
 }
 
+// Whether a storage image access to one of `resources` is coherent (ImageAccessCoherent).
+template <typename Resources>
+bool StorageBindingHasCoherentAccess(const EmitterState& state, const Resources& resources) {
+	if (!GetCodegenOptions().image_glc_coherent && !PopsInterlockActive(state)) {
+		return false;
+	}
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::ImageOpcodeInfoOf(inst.GetOpcode()).resource_class !=
+			    IR::ImageResourceClass::Storage) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= state.program.memory_info.size()) continue;
+			const auto& mem = state.program.memory_info[index];
+			if (ImageAccessCoherent(state, mem) &&
+			    std::find(resources.begin(), resources.end(), mem.resource) != resources.end()) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void DefineDescriptors(EmitterState& state) {
 	DefineBindlessImages(state);
 	const bool user_clip_planes = state.program.stage != ShaderType::Pixel &&
@@ -532,6 +556,16 @@ void DefineDescriptors(EmitterState& state) {
 				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
 				    Define(ArrayType(ImageType(state, image)), name.c_str(),
 				           spv::StorageClassUniformConstant);
+				if (image.resource_class == IR::ImageResourceClass::Storage &&
+				    StorageBindingHasCoherentAccess(state, binding.resources)) {
+					// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: a Coherent alias of the same
+					// binding for the coherent accesses only (ImageDescriptorPointer).
+					const auto alias = Define(ArrayType(ImageType(state, image)),
+					                          (name + "_coherent").c_str(),
+					                          spv::StorageClassUniformConstant);
+					state.builder.AddAnnotation(spv::OpDecorate, alias, spv::DecorationCoherent);
+					state.image_coherent_variables[IR::ImageBindingIndex(binding.kind)] = alias;
+				}
 				if (image.dimension == ImageDimension::Dim1D ||
 				    image.dimension == ImageDimension::Dim1DArray) {
 					state.builder.RequireCapability(image.resource_class ==
@@ -1229,6 +1263,24 @@ void DefineModule(EmitterState& state) {
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		}
+		if (PopsInterlockActive(state)) {
+			// KYTY_POPS_INTERLOCK: the body runs between OpBegin/OpEndInvocationInterlockEXT
+			// (EmitProgram, EmitReturn). Pixel ordered covers the guest's per-pixel and per-sample
+			// POPS modes (sample order is the weaker guarantee).
+			state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
+			state.builder.RequireCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePixelInterlockOrderedEXT);
+		} else if (state.program.info.pops && GetCodegenOptions().pops_interlock) {
+			static std::mutex         mutex;
+			static std::set<uint64_t> logged;
+			std::scoped_lock          lock(mutex);
+			if (logged.size() < 64 && logged.insert(state.program.shader_hash).second) {
+				LOGF("KYTY_POPS_INTERLOCK: pixel shader 0x%016" PRIx64
+				     " has a POPS section but the device has no fragmentShaderPixelInterlock; "
+				     "it runs unordered\n",
+				     state.program.shader_hash);
+			}
 		}
 	}
 	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {

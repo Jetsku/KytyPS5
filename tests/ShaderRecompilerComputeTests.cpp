@@ -59073,6 +59073,64 @@ void CheckCpSeqOps(RenderContext &renderer) {
 
 namespace Libs::Graphics {
 
+// KYTY_POPS_INTERLOCK: a pixel shader with a POPS section (S_SETREG_B32 hwreg(POPS_PACKER, 0, 3),
+// S_SENDMSG MSG_ORDERED_PS_DONE) runs between OpBegin/OpEndInvocationInterlockEXT with
+// PixelInterlockOrderedEXT, and only with the switch on and a device with pixel interlock.
+void CheckPopsInterlock() {
+  constexpr const char *name = "PopsInterlock";
+  const auto disassemble = [&](const std::vector<u32> &spirv) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble SPIR-V");
+    return text;
+  };
+  GraphicsCase test;
+  test.name = "GraphicsPopsSection";
+  test.fragment_code.push_back(0xb9801019u); // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s0
+  AppendVMovLiteral(&test.fragment_code, 0, 0x3f800000u);
+  test.fragment_code.push_back(0xbf900007u); // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(0, 0, 0, 0));
+  AppendEnd(&test.fragment_code);
+  GraphicsCase plain = test;
+  plain.name = "GraphicsNoPopsSection";
+  plain.fragment_code.erase(plain.fragment_code.begin());
+
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  const auto compile = [&](const GraphicsCase &which, bool option, bool device) {
+    auto options = saved;
+    options.pops_interlock = option;
+    ShaderRecompiler::SetCodegenOptions(options);
+    ShaderRecompiler::Spirv::SetHostFragmentInterlock(device);
+    auto compiled = CompileFragmentCase(which);
+    Require(name, "pops flag", compiled.program.info.pops == (&which == &test),
+            "ShaderInfo::pops does not follow the S_SETREG_B32 POPS_PACKER write");
+    return disassemble(compiled.spirv);
+  };
+  const auto ordered = [](const std::string &text) {
+    const auto begin = text.find("OpBeginInvocationInterlockEXT");
+    const auto end = text.find("OpEndInvocationInterlockEXT");
+    return begin != std::string::npos && end != std::string::npos && begin < end &&
+           text.find("PixelInterlockOrderedEXT") != std::string::npos &&
+           text.find("FragmentShaderPixelInterlockEXT") != std::string::npos;
+  };
+  const auto none = [](const std::string &text) {
+    return text.find("InvocationInterlock") == std::string::npos &&
+           text.find("InterlockOrdered") == std::string::npos;
+  };
+  Require(name, "on", ordered(compile(test, true, true)),
+          "a POPS pixel shader did not get a pixel-ordered interlock section");
+  Require(name, "switch off", none(compile(test, false, true)),
+          "the interlock was emitted with KYTY_POPS_INTERLOCK off");
+  Require(name, "no device support", none(compile(test, true, false)),
+          "the interlock was emitted on a device without fragmentShaderPixelInterlock");
+  Require(name, "no POPS section", none(compile(plain, true, true)),
+          "a pixel shader without POPS got an interlock");
+  ShaderRecompiler::Spirv::SetHostFragmentInterlock(false);
+  ShaderRecompiler::SetCodegenOptions(saved);
+}
+
 // KYTY_EQAA_MIXED (usa-ratt/KytyPS5-GT7 827bc377d, test c88a47a2f): EQAA through NV mixed
 // samples must not shade per sample, and a SampleId input does. The per-pixel copy of such a pixel
 // shader (SpirvWithoutSampleId) is valid SPIR-V with no SampleId built-in; before SPIR-V 1.4 the
@@ -61274,6 +61332,7 @@ int main(int argc, char **argv) {
     Libs::Graphics::EnsureConfigInitialized();
     Libs::Graphics::CheckPixelRateSampleIdVariant();
     Libs::Graphics::CheckNormalizedExplicitLod();
+    Libs::Graphics::CheckPopsInterlock();
     return 0;
   }
   // CPU only: heap-indexed T#s through bindless images (ShaderBindlessTests.inc).

@@ -671,6 +671,7 @@ void Write(CodecWriter& w, const ShaderInfo& v) {
 	w.Bool(v.uses_dma);
 	w.Bool(v.uses_bvh);
 	w.Bool(v.bda_writes);
+	w.Bool(v.pops);
 }
 
 void Read(CodecReader& r, ShaderInfo& v) {
@@ -690,6 +691,7 @@ void Read(CodecReader& r, ShaderInfo& v) {
 	v.uses_dma             = r.Bool();
 	v.uses_bvh             = r.Bool();
 	v.bda_writes           = r.Bool();
+	v.pops                 = r.Bool();
 }
 
 void Write(CodecWriter& w, const BindingLayout& v) {
