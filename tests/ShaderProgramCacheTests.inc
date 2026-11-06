@@ -246,6 +246,15 @@ void CheckFingerprint() {
   options_differ("dpp_skip_inactive",
                  [](CodegenOptions &o) { o.dpp_skip_inactive = !o.dpp_skip_inactive; });
   options_differ("lane_reductions", [](CodegenOptions &o) { o.lane_reductions = !o.lane_reductions; });
+  options_differ("split_dpp_lane", [](CodegenOptions &o) { o.split_dpp_lane = !o.split_dpp_lane; });
+  options_differ("mov_int_mods", [](CodegenOptions &o) { o.mov_int_mods = !o.mov_int_mods; });
+  options_differ("mad_flush", [](CodegenOptions &o) { o.mad_flush = !o.mad_flush; });
+  options_differ("f16_exact_round", [](CodegenOptions &o) { o.f16_exact_round = !o.f16_exact_round; });
+  options_differ("movrel_full_m0", [](CodegenOptions &o) { o.movrel_full_m0 = !o.movrel_full_m0; });
+  options_differ("omod_zero", [](CodegenOptions &o) { o.omod_zero = !o.omod_zero; });
+  options_differ("cvt_f32_f64_inf", [](CodegenOptions &o) { o.cvt_f32_f64_inf = !o.cvt_f32_f64_inf; });
+  options_differ("bfm_defined", [](CodegenOptions &o) { o.bfm_defined = !o.bfm_defined; });
+  options_differ("wave64_high_lanes", [](CodegenOptions &o) { o.wave64_high_lanes = !o.wave64_high_lanes; });
   options_differ("dispatcher_cap", [](CodegenOptions &o) { o.dispatcher_cap++; });
   options_differ("ir_linear_uses", [](CodegenOptions &o) { o.ir_linear_uses = !o.ir_linear_uses; });
   options_differ("fold_lane_masks", [](CodegenOptions &o) { o.fold_lane_masks = !o.fold_lane_masks; });

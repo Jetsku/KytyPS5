@@ -550,6 +550,41 @@ struct CodegenOptions {
 	// so does a lane the host subgroup lacks. A work-list loop whose DPP row scan then yields a
 	// wrong minimum never ends (a GPU hang). Not for DPP8 or fetch-inactive. Exact.
 	bool dpp_skip_inactive = true;
+	// KYTY_SPLIT_DPP_LANE=1 (default 0; RDNA2 ISA check 2026-11-06): in a split wave64 (KYTY_WAVE64_WARPS)
+	// the EXEC test of a DPP source lane (EmitSourceLaneActive) reads the host subgroup's 32-lane ballot
+	// with the source lane taken mod 32. Off, lanes 32-63 test bits 32-63 of a 32-lane ballot (zero), so
+	// a BC=0 row_shr scan never writes the upper half.
+	bool split_dpp_lane = false;
+	// KYTY_MOV_INT_MODS=1 (default 0; ISA p.137/p.131): the neg/abs modifiers of V_MOV_B32 and
+	// V_CNDMASK_B32 flip/clear the sign bit as integer XOR/AND (D.u = S0.u with the sign changed), bit
+	// exact under any host float mode, instead of OpFNegate/OpFAbs. Replaces KYTY_MOV_NO_FLOAT_MODS.
+	bool mov_int_mods = false;
+	// KYTY_MAD_FLUSH=1 (default 0): with unfused MADs (KYTY_MAD_MODE=exact/position slice), flush f32
+	// denormal operands, the rounded product and the sum to signed zero in the shader (legacy MAD has
+	// no denormal support). Equivalent when the module declares DenormFlushToZero 32 (FLOAT_MODE 0xC0).
+	bool mad_flush = false;
+	// KYTY_F16_EXACT_ROUND=1 (default 0): f32 -> f16 results (V_CVT_F16_F32, f16 VOP1/VOP2/VOP3, MAD_MIX,
+	// V_FMA_F16, f32-path packed f16) use an integer round-to-nearest-even conversion that a host
+	// compiler cannot fold away against a later UnpackHalf2x16; MAD_MIXLO/HI round once (f64 Fma;
+	// not in a CS with FLOAT_MODE != 0xC0, which has no Float64 path).
+	bool f16_exact_round = false;
+	// KYTY_MOVREL_FULL_M0=1 (default 0; ISA 3.6.1/3.7): V_MOVRELS/V_MOVRELD/V_MOVRELSD index with the
+	// whole 32-bit M0 instead of M0[7:0]: an out-of-range source reads v0, an out-of-range destination
+	// writes nothing.
+	bool movrel_full_m0 = false;
+	// KYTY_OMOD_ZERO=1 (default 0; ISA p.44): an OMOD multiply/divide turns a -0 result into +0.
+	bool omod_zero = false;
+	// KYTY_CVT_F32_F64_INF=1 (default 0): V_CVT_F32_F64 overflow (|x| above the f32 range after
+	// rounding) gives +-INF (round to nearest, FLOAT_MODE 0xC0) instead of +-FLT_MAX.
+	bool cvt_f32_f64_inf = false;
+	// KYTY_BFM_DEFINED=1 (default 0): S_BFM_B32 is ((1 << S0[4:0]) - 1) << S1[4:0] computed with
+	// shifts, defined (bits past 31 dropped) when offset + count > 32, instead of OpBitFieldInsert.
+	bool bfm_defined = false;
+	// KYTY_WAVE64_HIGH_LANES=1 (default 0): in a graphics wave64 (VS/PS) run on 32-wide host subgroups,
+	// a constant V_READLANE of lane >= 32 resolves through the V_WRITELANE chain of that lane
+	// (ReadLaneElimination unreachable_high_lanes), 0 on paths that never wrote it, instead of an
+	// undefined subgroup shuffle id. Runtime (SGPR) lane selectors >= 32 stay undefined.
+	bool wave64_high_lanes = false;
 	// KYTY_LANE_REDUCTIONS=0: a V_READLANE of the last lane of a DPP row scan with every lane enabled
 	// (IR::MatchLaneReduction) stays an emulated scan instead of a native subgroup reduction over the
 	// row or row pair. A partly filled host subgroup lacks lanes the scan would read; the reduction

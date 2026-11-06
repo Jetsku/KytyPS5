@@ -171,6 +171,15 @@ CodegenOptions FromEnvironment() {
 	options.call_trace_wave32 = EnvFlag("KYTY_CALL_TRACE_WAVE32", options.call_trace_wave32);
 	options.realtime_clock   = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
 	options.dpp_skip_inactive = EnvFlag("KYTY_DPP_SKIP_INACTIVE", options.dpp_skip_inactive);
+	options.split_dpp_lane    = EnvFlag("KYTY_SPLIT_DPP_LANE", options.split_dpp_lane);
+	options.mov_int_mods      = EnvFlag("KYTY_MOV_INT_MODS", options.mov_int_mods);
+	options.mad_flush         = EnvFlag("KYTY_MAD_FLUSH", options.mad_flush);
+	options.f16_exact_round   = EnvFlag("KYTY_F16_EXACT_ROUND", options.f16_exact_round);
+	options.movrel_full_m0    = EnvFlag("KYTY_MOVREL_FULL_M0", options.movrel_full_m0);
+	options.omod_zero         = EnvFlag("KYTY_OMOD_ZERO", options.omod_zero);
+	options.cvt_f32_f64_inf   = EnvFlag("KYTY_CVT_F32_F64_INF", options.cvt_f32_f64_inf);
+	options.bfm_defined       = EnvFlag("KYTY_BFM_DEFINED", options.bfm_defined);
+	options.wave64_high_lanes = EnvFlag("KYTY_WAVE64_HIGH_LANES", options.wave64_high_lanes);
 	options.lane_reductions   = EnvFlag("KYTY_LANE_REDUCTIONS", options.lane_reductions);
 	options.ir_linear_uses    = EnvFlag("KYTY_IR_LINEAR_USES", options.ir_linear_uses);
 	options.fold_lane_masks   = EnvFlag("KYTY_FOLD_LANE_MASKS", options.fold_lane_masks);
