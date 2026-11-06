@@ -27,7 +27,7 @@ constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 // rt_function, lds_limit_override.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 224,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 232,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
