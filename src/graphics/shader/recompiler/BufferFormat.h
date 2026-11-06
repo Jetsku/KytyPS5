@@ -33,11 +33,25 @@ struct FormattedSource {
 	uint32_t            component = 0;
 };
 
-constexpr FormattedSource ResolveFormattedSource(const BufferFormatInfo& info, uint32_t selector) {
+// True when dst_sel `selector` (4-7 = X-W) names a channel the format does not have.
+constexpr bool FormattedSelectorMissing(const BufferFormatInfo& info, uint32_t selector) {
+	return selector >= 4u && selector <= 7u && info.component_count != 0u &&
+	       selector - 4u >= info.component_count;
+}
+
+// canonical (KYTY_FORMAT_MISSING_CANON): a channel the format lacks reads as the texture unit's
+// canonical RGBA expansion fills it, 0 for X/Y/Z and 1 for W (RDNA2 ISA 8.2.5 "filling in zero or one
+// for missing components"; Table 31: BUFFER_LOAD_FORMAT_* take DST_SEL from the V#). Without it the
+// selector wraps onto the format's components (upstream b34b2ec09).
+constexpr FormattedSource ResolveFormattedSource(const BufferFormatInfo& info, uint32_t selector,
+                                                 bool canonical = false) {
 	if (selector == 0u) return {};
 	if (selector == 1u) return {FormattedSourceKind::One, 0};
 	if (selector < 4u || selector > 7u || info.component_count == 0u) {
 		return {FormattedSourceKind::Invalid, 0};
+	}
+	if (canonical && FormattedSelectorMissing(info, selector)) {
+		return selector == 7u ? FormattedSource {FormattedSourceKind::One, 0} : FormattedSource {};
 	}
 	// Formatted decoding expands source channels before applying the swizzle.
 	return {FormattedSourceKind::Memory, (selector - 4u) % info.component_count};

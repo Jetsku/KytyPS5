@@ -61,6 +61,7 @@
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/BvhReference.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
@@ -59131,6 +59132,30 @@ void CheckPopsInterlock() {
   ShaderRecompiler::SetCodegenOptions(saved);
 }
 
+// KYTY_FORMAT_MISSING_CANON: a dst_sel naming a channel the format lacks reads 0 (X/Y/Z) or 1 (W),
+// RDNA2 ISA 8.2.5; without the switch it wraps (upstream b34b2ec09).
+void CheckFormattedMissingChannels() {
+  constexpr const char *name = "FormattedMissingChannels";
+  namespace F = ShaderRecompiler::Format;
+  const auto two = F::GetFormatInfo(Prospero::BufferFormat::k16_16Float);
+  const auto three = F::GetFormatInfo(Prospero::BufferFormat::k32_32_32Float);
+  const auto is = [](F::FormattedSource s, F::FormattedSourceKind kind, u32 component = 0) {
+    return s.kind == kind && (kind != F::FormattedSourceKind::Memory || s.component == component);
+  };
+  Require(name, "canonical", is(F::ResolveFormattedSource(two, 6, true), F::FormattedSourceKind::Zero) &&
+                               is(F::ResolveFormattedSource(two, 7, true), F::FormattedSourceKind::One) &&
+                               is(F::ResolveFormattedSource(three, 7, true), F::FormattedSourceKind::One) &&
+                               is(F::ResolveFormattedSource(three, 6, true), F::FormattedSourceKind::Memory, 2) &&
+                               is(F::ResolveFormattedSource(two, 5, true), F::FormattedSourceKind::Memory, 1),
+          "missing channels do not read 0/1 with KYTY_FORMAT_MISSING_CANON");
+  Require(name, "wrap", is(F::ResolveFormattedSource(two, 6, false), F::FormattedSourceKind::Memory, 0) &&
+                          is(F::ResolveFormattedSource(three, 7, false), F::FormattedSourceKind::Memory, 0),
+          "the default no longer wraps");
+  Require(name, "missing", F::FormattedSelectorMissing(two, 6) && !F::FormattedSelectorMissing(two, 5) &&
+                             !F::FormattedSelectorMissing(two, 1),
+          "FormattedSelectorMissing is wrong");
+}
+
 // KYTY_EQAA_MIXED (usa-ratt/KytyPS5-GT7 827bc377d, test c88a47a2f): EQAA through NV mixed
 // samples must not shade per sample, and a SampleId input does. The per-pixel copy of such a pixel
 // shader (SpirvWithoutSampleId) is valid SPIR-V with no SampleId built-in; before SPIR-V 1.4 the
@@ -61333,6 +61358,7 @@ int main(int argc, char **argv) {
     Libs::Graphics::CheckPixelRateSampleIdVariant();
     Libs::Graphics::CheckNormalizedExplicitLod();
     Libs::Graphics::CheckPopsInterlock();
+    Libs::Graphics::CheckFormattedMissingChannels();
     return 0;
   }
   // CPU only: heap-indexed T#s through bindless images (ShaderBindlessTests.inc).

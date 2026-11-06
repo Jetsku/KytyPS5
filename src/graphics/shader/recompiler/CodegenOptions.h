@@ -486,6 +486,19 @@ struct CodegenOptions {
 	// fragmentShaderPixelInterlock (Spirv::HostFragmentInterlock); without it such programs keep
 	// the unordered code and are named once.
 	bool pops_interlock = false;
+	// KYTY_FORMAT_MISSING_CANON=1: a formatted buffer load whose V# dst_sel names a channel the
+	// format lacks reads 0 (X/Y/Z) or 1 (W), the canonical RGBA expansion (ISA 8.2.5, Table 31),
+	// instead of wrapping onto the format's channels (Format::ResolveFormattedSource). Bound V#s,
+	// computed V#s and embedded vertex fetches. Bound V#s that hit it are logged (first 32).
+	bool format_missing_canonical = false;
+	// KYTY_INDIRECT_FORMAT_ALL=1: a formatted load through a computed V# decodes every buffer format
+	// (USCALED/SSCALED, the non-float 10_11_11/11_11_10 and 2_10_10_10 UINT/SINT) instead of reading
+	// 0 outside the vertex-format list (IndirectFormatDecoded).
+	bool indirect_format_all = false;
+	// KYTY_FORMAT_STORE_DST_SEL=1: BUFFER_STORE_FORMAT_* through a bound V# honour the V# dst_sel
+	// (Table 31): memory channel c takes the data component whose dst_sel names it (0 if none), the
+	// inverse map image stores already apply (StoreTexel).
+	bool format_store_dst_sel = false;
 	// KYTY_IMAGE_GLC_COHERENT=1: IMAGE_LOAD* / IMAGE_STORE* with GLC or DLC (ISA Tables 29/41, the
 	// buffer meaning) access the storage image through a Coherent alias of its binding, so only those
 	// accesses bypass the non-coherent caches (the whole-binding Coherent decoration of buffers costs
@@ -802,6 +815,10 @@ inline constexpr uint32_t LoopGuardHashGdsFromEnd = RtNodeStatsGdsFromEnd + RtNo
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
+// KYTY_FORMAT_MISSING_CANON: logs a formatted access whose V# dst_sel names a channel the format
+// lacks (the first 32 programs/formats, then a running count). format: Prospero::BufferFormat.
+void NoteFormattedSelectorMissing(uint64_t shader_hash, uint32_t format, uint32_t swizzle,
+                                  const char* where);
 // KYTY_LANE_LOCAL needs every compute subgroup of a wave64 program to be exactly 32 lanes: a device
 // whose subgroup size is fixed at 32, or one whose compute pipelines require 32 (the device layer sets
 // it once; false until then, which keeps lane-local programs off).

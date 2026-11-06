@@ -505,9 +505,14 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 		           ? FormattedSource {FormattedSourceKind::Memory, output_component}
 		           : FormattedSource {};
 	}
-	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
-	                                output_component);
-	const auto source = Format::ResolveFormattedSource(info, selector);
+	const auto swizzle  = ctx.state.program.info.buffers[mem.resource].descriptor_swizzle;
+	const auto selector = GetDstSel(swizzle, output_component);
+	if (Format::FormattedSelectorMissing(info, selector)) {
+		NoteFormattedSelectorMissing(ctx.state.program.shader_hash,
+		                             static_cast<uint32_t>(info.format), swizzle, "bound V#");
+	}
+	const auto source = Format::ResolveFormattedSource(
+	    info, selector, GetCodegenOptions().format_missing_canonical);
 	if (source.kind == FormattedSourceKind::Invalid) {
 		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer descriptor has reserved dst_sel");
@@ -991,19 +996,33 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	// RDNA2 formatted stores transfer the entire format, zero-filling missing VGPRs.
 	const auto count = mem.data_bits == 16u ? mem.component_count : components;
 	const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
+	// KYTY_FORMAT_STORE_DST_SEL: memory channel c takes the data component whose V# dst_sel names
+	// it (Table 31), the first such component; none: 0.
+	const bool dst_sel = GetCodegenOptions().format_store_dst_sel && !mem.typed &&
+	                     mem.resource < ctx.state.program.info.buffers.size();
+	const auto source_of = [&](uint32_t channel) {
+		if (!dst_sel) return channel;
+		const auto swizzle = ctx.state.program.info.buffers[mem.resource].descriptor_swizzle;
+		for (uint32_t source = 0; source < 4u; source++) {
+			if (GetDstSel(swizzle, source) == 4u + channel) return source;
+		}
+		return UINT32_MAX;
+	};
 	EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
 		auto packed = ConstantU32(ctx.state, 0);
-		for (uint32_t component = 0; component < info.component_count; component++) {
+		for (uint32_t channel = 0; channel < info.component_count; channel++) {
+			const auto component = channel;
+			const auto source    = source_of(channel);
 			auto value = ConstantU32(ctx.state, 0);
-			if (component < count) {
-				const auto word = mem.data_bits == 16u ? component / 2u : component;
+			if (source < count) {
+				const auto word = mem.data_bits == 16u ? source / 2u : source;
 				value = data;
 				if (components != 1u) {
 					value = ctx.state.builder.AllocateId();
 					ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state),
 					                              value, data, word);
 				}
-				if (mem.data_bits == 16u && (component & 1u) != 0u)
+				if (mem.data_bits == 16u && (source & 1u) != 0u)
 					value = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), value,
 					               ConstantU32(ctx.state, 16u));
 			}
@@ -1687,6 +1706,13 @@ uint32_t EmitIndirectAtomic(ValueEmitContext& ctx, const IR::Inst& inst, bool wi
 // 8, 16 and 32 bits per component, packed 10/11-bit ones): every other format reads 0.
 static bool IndirectFormatDecoded(Prospero::BufferFormat format) {
 	using F = Prospero::BufferFormat;
+	// KYTY_INDIRECT_FORMAT_ALL: every buffer format the bound path decodes (ISA 8.1.4 lists no
+	// restriction for computed V#s).
+	if (GetCodegenOptions().indirect_format_all) {
+		const auto info = Format::GetFormatInfo(format);
+		return info.type != Format::ComponentType::Unknown && info.component_count != 0u &&
+		       info.component_count <= 4u;
+	}
 	switch (format) {
 		case F::k8UNorm: case F::k8SNorm: case F::k8UInt: case F::k8SInt:
 		case F::k16UNorm: case F::k16SNorm: case F::k16UInt: case F::k16SInt: case F::k16Float:
@@ -1756,6 +1782,9 @@ uint32_t IndirectFormatCompactDescriptor(uint32_t format) {
 		case Format::ComponentType::Unorm: kind = 2; break;
 		case Format::ComponentType::Snorm: kind = 3; break;
 		case Format::ComponentType::Float: kind = 4; break;
+		// KYTY_INDIRECT_FORMAT_ALL (IndirectFormatDecoded only admits them with it).
+		case Format::ComponentType::Uscaled: kind = 5; break;
+		case Format::ComponentType::Sscaled: kind = 6; break;
 		default: return 0;
 	}
 	uint32_t descriptor = (kind << 24u) | (info.component_count << 27u);
@@ -1987,6 +2016,17 @@ static void DefineIndirectFormatCompactBody(EmitterState& state, uint32_t functi
 		value      = Select(state, u32, is_kind(2), Unary(state, spv::OpBitcast, u32, unorm), value);
 		value      = Select(state, u32, is_kind(3), Unary(state, spv::OpBitcast, u32, snorm), value);
 		value      = Select(state, u32, is_kind(4), float_bits, value);
+		if (GetCodegenOptions().indirect_format_all) {
+			// uscaled / sscaled: the integer as a float.
+			value = Select(state, u32, is_kind(5),
+			               Unary(state, spv::OpBitcast, u32,
+			                     Unary(state, spv::OpConvertUToF, f32, unsigned_value)),
+			               value);
+			value = Select(state, u32, is_kind(6),
+			               Unary(state, spv::OpBitcast, u32,
+			                     Unary(state, spv::OpConvertSToF, f32, signed_value)),
+			               value);
+		}
 		components[component] = value;
 		offset = Binary(state, spv::OpIAdd, u32, offset, width);
 	}
@@ -2005,6 +2045,13 @@ static void DefineIndirectFormatCompactBody(EmitterState& state, uint32_t functi
 		auto picked = components[0];
 		for (uint32_t component = 1; component < 4u; ++component) {
 			picked = Select(state, u32, equal(which, constant(component)), components[component], picked);
+		}
+		if (GetCodegenOptions().format_missing_canonical) {
+			// KYTY_FORMAT_MISSING_CANON: a channel past the format's reads 0, or 1 for W.
+			const auto past = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+			                         Binary(state, spv::OpISub, u32, sel, constant(4)), safe_count);
+			picked = Select(state, u32, past,
+			                Select(state, u32, equal(sel, constant(7)), one, constant(0)), picked);
 		}
 		const auto fixed = Select(state, u32, equal(sel, constant(1)), one, constant(0));
 		const auto value = Select(state, u32,
@@ -2342,6 +2389,17 @@ static void DefineIndirectFormatFunctionBody(EmitterState& state, uint32_t funct
 			        state, TypeU32(state),
 			        Binary(state, spv::OpIEqual, TypeBool(state), sel, ConstantU32(state, 1)), one,
 			        ConstantU32(state, 0));
+			    if (GetCodegenOptions().format_missing_canonical && info.component_count < 4u) {
+				    // KYTY_FORMAT_MISSING_CANON: a channel past the format's reads 0, or 1 for W.
+				    const auto missing = Select(
+				        state, TypeU32(state),
+				        Binary(state, spv::OpIEqual, TypeBool(state), sel, ConstantU32(state, 7)), one,
+				        ConstantU32(state, 0));
+				    picked = Select(state, TypeU32(state),
+				                    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), sel,
+				                           ConstantU32(state, 4u + info.component_count)),
+				                    missing, picked);
+			    }
 			    channels[channel] = Select(
 			        state, TypeU32(state),
 			        Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), sel, ConstantU32(state, 4)),
