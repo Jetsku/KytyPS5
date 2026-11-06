@@ -299,6 +299,9 @@ void EmitLoopGuardReport(EmitterState& state) {
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitLoopGuardReport(ctx.state);
 	EmitBvhNodeReport(ctx.state);
+	if (PopsInterlockActive(ctx.state)) {
+		ctx.state.builder.AddFunction(spv::OpEndInvocationInterlockEXT);
+	}
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
@@ -1795,6 +1798,12 @@ void EmitProgram(EmitterState& state) {
 		                                      ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
+	if (PopsInterlockActive(state)) {
+		// KYTY_POPS_INTERLOCK: the guest's POPS section (S_SETREG POPS_PACKER .. S_SENDMSG
+		// ORDERED_PS_DONE) widened to the whole program, so Begin and End each run exactly once in
+		// uniform control flow; EmitReturn ends it.
+		state.builder.AddFunction(spv::OpBeginInvocationInterlockEXT);
+	}
 	if (state.objprim_output_variable != 0) {
 		EmitObjprimIdOutput(state);
 	}

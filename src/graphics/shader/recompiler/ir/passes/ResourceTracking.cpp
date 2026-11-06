@@ -2119,7 +2119,8 @@ private:
 			return 0u;
 		}
 		switch (op) {
-			case ValueOpcode::ImageRead: return ImageTableAccessRead;
+			case ValueOpcode::ImageRead:
+			case ValueOpcode::ImageReadStorage: return ImageTableAccessRead;
 			case ValueOpcode::ImageWrite: return ImageTableAccessWrite;
 			case ValueOpcode::ImageSampleRaw: {
 				// Gradients and offsets take the instruction's dimension (not a candidate's); an

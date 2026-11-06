@@ -357,6 +357,9 @@ VALUE_OPCODE(SwizzleU32, U32, U32, U32, U1)
 VALUE_OPCODE(ImageQueryDimensions, U32x4, ImageResource, ImageAddress)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)
+// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: IMAGE_LOAD* through the storage image (OpImageRead),
+// so a GLC load or a POPS read-modify-write sees the stores of other invocations.
+VALUE_OPCODE(ImageReadStorage, U32x4, ImageResource, ImageAddress, U1)
 VALUE_OPCODE(ImageWrite, Void, ImageResource, ImageAddress, U32x4, U1)
 VALUE_OPCODE(ImageSampleRaw, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageGatherRaw, U32x4, ImageResource, SamplerResource, ImageAddress, U32, U32, U32, U32)

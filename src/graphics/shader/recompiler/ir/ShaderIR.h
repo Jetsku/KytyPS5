@@ -183,6 +183,11 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// KYTY_BUFFER_OOB_MODES: BufferResource::packed_stride flag (above ShaderBufferResource::PackedStride's
+// bits): the V# has OOB_SELECT 0 and a stride (no swizzle), so an offset at or past the stride is out
+// of range (RDNA2 ISA Table 35).
+inline constexpr uint32_t BufferOobOffsetCheck = 1u << 23u;
+
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
@@ -689,6 +694,9 @@ struct ShaderInfo {
 	// writes through BDA). Implies uses_dma and has_address_writes; the renderer settles each of
 	// its dispatches synchronously.
 	bool                             bda_writes         = false;
+	// KYTY_POPS_INTERLOCK: a pixel shader that writes hwreg(POPS_PACKER) with S_SETREG_B32, the start
+	// of a primitive-ordered pixel shading section (RDNA2 ISA Table 16; REPORT-ISA-2 M1).
+	bool                             pops               = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

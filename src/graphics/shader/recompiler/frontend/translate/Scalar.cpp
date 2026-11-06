@@ -26,7 +26,14 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
 			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
 			return;
-		case O::S_SETREG_B32: EmitControlNop(); return;
+		case O::S_SETREG_B32:
+			// hwreg id = SIMM16[5:0]; 25 = POPS_PACKER opens a POPS (primitive-ordered pixel
+			// shading) section (KYTY_POPS_INTERLOCK, ShaderInfo::pops). The write itself stays a no-op.
+			if (program.stage == ShaderType::Pixel && (inst.src1.value & 0x3fu) == 25u) {
+				program.info.pops = true;
+			}
+			EmitControlNop();
+			return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: S_WAITCNT(inst); return;
 

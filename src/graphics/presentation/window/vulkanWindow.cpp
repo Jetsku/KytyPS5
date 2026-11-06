@@ -10,6 +10,7 @@
 #include "common/textureSparseResidency.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1116,7 +1117,36 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		physical_device.getFeatures2(&derivatives_query);
 		compute_derivatives.computeDerivativeGroupQuads =
 		    supported_derivatives.computeDerivativeGroupQuads;
+		// KYTY_IMPLICIT_LOD_STAGES: the RDNA2 compute quad is four consecutive lanes.
+		if (compute_derivatives.computeDerivativeGroupQuads == VK_TRUE) {
+			compute_derivatives.computeDerivativeGroupLinear =
+			    supported_derivatives.computeDerivativeGroupLinear;
+		}
 	}
+	ShaderRecompiler::Spirv::SetHostComputeDerivativesLinear(
+	    compute_derivatives.computeDerivativeGroupLinear == VK_TRUE);
+	// KYTY_POPS_INTERLOCK: POPS pixel shaders run their ordered section as a pixel-ordered
+	// fragment shader interlock.
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_interlock {};
+	if (HasExtension(device_extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT supported_interlock {};
+		vk::PhysicalDeviceFeatures2                          interlock_query {};
+		interlock_query.pNext = &supported_interlock;
+		physical_device.getFeatures2(&interlock_query);
+		fragment_interlock.fragmentShaderPixelInterlock = supported_interlock.fragmentShaderPixelInterlock;
+	}
+	ShaderRecompiler::Spirv::SetHostFragmentInterlock(fragment_interlock.fragmentShaderPixelInterlock ==
+	                                                  VK_TRUE);
+	// KYTY_SRGB8_VIEW: sampled 8 sRGB textures read through an R8_SRGB view when it filters.
+	const bool r8_srgb_filter = static_cast<bool>(
+	    physical_device.getFormatProperties(vk::Format::eR8Srgb).optimalTilingFeatures &
+	    vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
+	Prospero::SetSrgb8ViewSupported(r8_srgb_filter);
+	LOGF("Vulkan fragment shader pixel interlock (POPS): %s; compute derivative group linear: %s; "
+	     "R8_SRGB filtering: %s\n",
+	     fragment_interlock.fragmentShaderPixelInterlock == VK_TRUE ? "yes" : "no",
+	     compute_derivatives.computeDerivativeGroupLinear == VK_TRUE ? "yes" : "no",
+	     r8_srgb_filter ? "yes" : "no");
 	{
 		namespace Spirv = ShaderRecompiler::Spirv;
 		const auto derivatives = compute_derivatives.computeDerivativeGroupQuads != VK_TRUE
@@ -1517,6 +1547,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (compute_derivatives.computeDerivativeGroupQuads == VK_TRUE) {
 		compute_derivatives.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext         = &compute_derivatives;
+	}
+	if (fragment_interlock.fragmentShaderPixelInterlock == VK_TRUE) {
+		fragment_interlock.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext        = &fragment_interlock;
 	}
 	if (graphics.shader_image_int64_atomics_enabled) {
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
@@ -2221,6 +2255,10 @@ void WindowContext::CreateVulkan() {
 		} else if (HasExtension(available_extensions,
 		                        VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+		}
+		// POPS pixel shaders (KYTY_POPS_INTERLOCK): fragment shader interlock.
+		if (HasExtension(available_extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 		}
 		// Native 8-bit index buffers for indirect draws; the KHR and EXT features are identical.
 		if (HasExtension(available_extensions, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME)) {

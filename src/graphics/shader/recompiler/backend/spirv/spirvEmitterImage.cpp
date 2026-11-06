@@ -1715,7 +1715,53 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 		        }));
 		return;
 	}
+	if (op == IR::ValueOpcode::ImageReadStorage) {
+		// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: IMAGE_LOAD* through the storage image, its
+		// Coherent alias when the access is coherent.
+		if (image.indirect_root == mem.resource && !image.bindless &&
+		    image.indirect_resources.size() >= 2u) {
+			ctx.Fail(inst, "reads a storage image table (not supported)");
+			return;
+		}
+		state.builder.RequireCapability(spv::CapabilityStorageImageReadWithoutFormat);
+		const auto  dimension      = image.dimension;
+		const auto& dimension_info = ImageDimensionInfoFor(dimension);
+		const auto  numeric_class  = image.numeric_class;
+		const auto  condition      = ctx.Arg(inst, 2);
+		ctx.Define(
+		    inst,
+		    EmitValueOrDefaultIfCondition(
+		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
+		        [&]() {
+			        const auto coord     = CoordU32(ctx, mem, *address, dimension);
+			        const auto read_type = ImageVectorType(state, numeric_class, 4);
+			        const auto EmitRead  = [&](uint32_t mip) {
+				        const CoherentImageScope scope(state, ImageAccessCoherent(state, mem));
+				        const auto descriptor = LoadImageDescriptor(state, mem.resource, mip);
+				        const auto color      = state.builder.AllocateId();
+				        if (dimension_info.multisampled != 0u) {
+					        state.builder.AddFunction(
+					            spv::OpImageRead, read_type, color, descriptor, coord,
+					            spv::ImageOperandsSampleMask,
+					            AddressU32(ctx, mem, *address, dimension_info.coordinate_components));
+				        } else {
+					        state.builder.AddFunction(spv::OpImageRead, read_type, color, descriptor,
+					                                  coord);
+				        }
+				        return color;
+			        };
+			        const auto color =
+			            image.mip_mode == IR::ImageMipMode::Dynamic
+			                ? EmitIndexSwitch(state, LodU32(ctx, mem, *address, dimension),
+			                                  image.mip_count, read_type, EmitRead)
+			                : EmitRead(0);
+			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class, false,
+			                            mem);
+		        }));
+		return;
+	}
 	if (op == IR::ValueOpcode::ImageWrite) {
+		const CoherentImageScope coherent_write(state, ImageAccessCoherent(state, mem));
 		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
 		const auto dimension  = image.dimension;
 		// KYTY_WORKGROUP_IMAGES: a table of enumerated storage images (one per workgroup); the
@@ -1848,10 +1894,15 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                              result_numeric_class, false, mem, true));
 			return;
 		}
-		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
-		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
-		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-		                          state.program.stage != ShaderType::Pixel;
+		const bool own_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
+		                     HasFlag(mem, Decoder::ImageSampleFlagLod) ||
+		                     HasFlag(mem, Decoder::ImageSampleFlagLevelZero);
+		// KYTY_IMPLICIT_LOD_STAGES: compute shaders keep implicit LOD with lane-quad derivatives
+		// (ComputeImplicitLod); other stages without derivatives take LOD 0, or the bias of an
+		// IMAGE_SAMPLE_B (forced_lod).
+		const bool implicit_here = state.program.stage == ShaderType::Pixel || ComputeImplicitLod(state);
+		const bool explicit_lod  = own_lod || !implicit_here;
+		const bool forced_lod    = !own_lod && !implicit_here;
 		auto       opcode       = spv::OpImageSampleImplicitLod;
 		if (explicit_lod) {
 			opcode = dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
@@ -1892,6 +1943,10 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto lod = ZeroF32(state);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
+			} else if (forced_lod && layout.bias != NoImageComponent &&
+			           GetCodegenOptions().implicit_lod_stages) {
+				// IMAGE_SAMPLE_B outside pixel shaders: LOD 0 plus its bias.
+				lod = AddressF32(ctx, mem, *address, layout.bias);
 			}
 			if (lod_clamp != 0u) {
 				const auto clamped = state.builder.AllocateId();
@@ -1934,8 +1989,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 				uint32_t level = ZeroF32(state);
 				if (explicit_lod_value != 0u) {
 					level = explicit_lod_value;
-				} else if (!HasFlag(mem, Decoder::ImageSampleFlagLevelZero) &&
-				           state.program.stage == ShaderType::Pixel) {
+				} else if (!HasFlag(mem, Decoder::ImageSampleFlagLevelZero) && implicit_here) {
 					// The level an implicit or gradient sample reads, relative to the view base.
 					state.builder.RequireCapability(spv::CapabilityImageQuery);
 					const auto query = state.builder.AllocateId();

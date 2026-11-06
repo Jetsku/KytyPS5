@@ -990,6 +990,12 @@ static bool SpecializeBuffer(const ResourcePlan& program, const BufferResource& 
 	} else if (!swizzle) {
 		packed_stride &= ~(3u << 16u);
 	}
+	// KYTY_BUFFER_OOB_MODES: OOB_SELECT 0 with a stride also checks offset < stride (Table 35);
+	// BufferOobOffsetCheck marks such a V# for the emitter (ByteAddress).
+	if (GetCodegenOptions().buffer_oob_modes && descriptor.OutOfBounds() == 0u && stride != 0u &&
+	    !swizzle) {
+		packed_stride |= BufferOobOffsetCheck;
+	}
 	specialization.buffers.push_back({
 	    .packed_stride     = packed_stride,
 	    .descriptor_format = buffer.formatted
@@ -1096,8 +1102,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    std::ranges::none_of(program.info.sampled_pairs,
 		                         [&](const auto& pair) { return pair.image == i; });
 		// KYTY_SRGB8_DECODE: a sampled 8 / 8_8 sRGB texture is decoded in the shader (Format::IsSrgbFormat).
+		// KYTY_SRGB8_VIEW: 8 sRGB is decoded by the sampler (an R8_SRGB view), before filtering.
 		const bool srgb_decode  = GetCodegenOptions().srgb8_decode && !storage && !base.depth_compare &&
-		                         Format::IsSrgbFormat(format);
+		                         Format::IsSrgbFormat(format) &&
+		                         !(format == Prospero::BufferFormat::k8Srgb && Prospero::Srgb8ViewActive());
 		image.conversion_format = depth_bits || srgb_decode ? format : ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
@@ -2329,7 +2337,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			EXIT_IF(memory.resource >= images.size());
 			const auto& image = images[memory.resource];
 			if (specialization.images[memory.resource].fmask) {
-				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
+				EXIT_IF((inst.GetOpcode() != ValueOpcode::ImageRead &&
+				         inst.GetOpcode() != ValueOpcode::ImageReadStorage) ||
+				        memory.data_bits != 32u);
 				// The host image holds one sample per guest fragment. FMASK's four-bit fragment
 				// indices map coverage sample i to host sample i, or with EQAA (fewer fragments
 				// than samples, KYTY_EQAA_MIXED) to i mod fragments, so every index names a
@@ -2362,6 +2372,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite &&
+			        inst.GetOpcode() != ValueOpcode::ImageReadStorage &&
 			        !(inst.GetOpcode() == ValueOpcode::ImageRead &&
 			          GetCodegenOptions().sampled_table_reads));
 		}

@@ -1212,9 +1212,14 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	                                 : small_sint_view && format == Prospero::BufferFormat::k8SInt
 	                                     ? vk::Format::eR8Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
-	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
-	                                     ? storage_view_format
-	                                     : pixel_format;
+	auto view_format = storage && storage_view_format != vk::Format::eUndefined ? storage_view_format
+	                                                                            : pixel_format;
+	// KYTY_SRGB8_VIEW: a sampled 8 sRGB texture reads its R8_UNORM image (MUTABLE_FORMAT) through an
+	// R8_SRGB view: the sampler decodes before filtering, as the PS5 does.
+	if (!storage && !resource.depth_compare && format == Prospero::BufferFormat::k8Srgb &&
+	    pixel_format == vk::Format::eR8Unorm && Prospero::Srgb8ViewActive()) {
+		view_format = vk::Format::eR8Srgb;
+	}
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};

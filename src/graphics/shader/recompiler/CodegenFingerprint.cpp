@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 
 #include "common/rendererBatch.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -249,6 +250,29 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.point_integer_images) {
 		b.Text("point_integer_images");
 	}
+	if (options.pops_interlock) {
+		b.Text("pops_interlock");
+		b.U8(Spirv::GetHostFragmentInterlock() ? 1u : 0u);
+	}
+	if (options.format_missing_canonical) {
+		b.Text("format_missing_canonical");
+	}
+	if (options.indirect_format_all) {
+		b.Text("indirect_format_all");
+	}
+	if (options.format_store_dst_sel) {
+		b.Text("format_store_dst_sel");
+	}
+	if (options.image_glc_coherent) {
+		b.Text("image_glc_coherent");
+	}
+	if (options.buffer_oob_modes) {
+		b.Text("buffer_oob_modes");
+	}
+	if (options.implicit_lod_stages) {
+		b.Text("implicit_lod_stages");
+		b.U8(Spirv::GetHostComputeDerivativesLinear() ? 1u : 0u);
+	}
 	if (options.compare_sampler_split) {
 		b.Text("compare_sampler_split");
 	}
@@ -293,6 +317,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	if (options.srgb8_decode) {
 		b.Text("srgb8_decode");
+		if (Prospero::Srgb8ViewActive()) {
+			b.Text("srgb8_view"); // KYTY_SRGB8_VIEW: 8 sRGB decoded by the sampler instead
+		}
 	}
 	if (options.depth_bits_read) {
 		b.Text("depth_bits_read");

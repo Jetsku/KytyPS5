@@ -250,6 +250,8 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageSampleRaw:
 		case ValueOpcode::ImageGatherRaw:
 			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
+		case ValueOpcode::ImageReadStorage:
+			return {ImageAccess::Read, ImageResourceClass::Storage, false};
 		case ValueOpcode::ImageWrite:
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
 		case ValueOpcode::ImageAtomicSwap32:

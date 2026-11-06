@@ -35,6 +35,8 @@ std::atomic_bool     g_uniform_dword_loads_return_zero {false};
 std::atomic_bool     g_buffer_pair_atomics {false};
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
+std::atomic_bool     g_fragment_interlock {false};
+std::atomic_bool     g_compute_derivatives_linear {false};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
 std::atomic_bool     g_guard_vertex_outputs {false};
@@ -541,6 +543,21 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					}
 					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
+				case IR::ValueOpcode::ImageSampleRaw: {
+					// KYTY_IMPLICIT_LOD_STAGES: an implicit-LOD sample of a compute shader takes its
+					// LOD from lane-quad derivatives (ComputeImplicitLod decides per module).
+					if (!GetCodegenOptions().implicit_lod_stages ||
+					    program.stage != ShaderType::Compute) {
+						break;
+					}
+					const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+					if (memory_index >= program.memory_info.size()) break;
+					const auto flags = program.memory_info[memory_index].image_sample_flags;
+					requirements.implicit_compute_lod |=
+					    (flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagLod |
+					              Decoder::ImageSampleFlagLevelZero)) == 0u;
+					break;
+				}
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;
 					break;
@@ -643,6 +660,22 @@ HostImageFeatures GetHostImageFeatures() {
 	return {.min_lod             = g_image_min_lod.load(std::memory_order_relaxed),
 	        .compute_derivatives = static_cast<HostComputeDerivatives>(
 	            g_compute_derivatives.load(std::memory_order_relaxed))};
+}
+
+void SetHostFragmentInterlock(bool supported) {
+	g_fragment_interlock.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostFragmentInterlock() {
+	return g_fragment_interlock.load(std::memory_order_relaxed);
+}
+
+void SetHostComputeDerivativesLinear(bool supported) {
+	g_compute_derivatives_linear.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostComputeDerivativesLinear() {
+	return g_compute_derivatives_linear.load(std::memory_order_relaxed);
 }
 
 void SetHostGeometryGuard(const HostGeometryGuard& guard) {

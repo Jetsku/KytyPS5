@@ -55,8 +55,14 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 	for (uint32_t component = 0; component < component_count; component++) {
 		auto source = Format::FormattedSource {Format::FormattedSourceKind::Memory, component};
 		if (inst.formatted && !inst.typed) {
-			source = Format::ResolveFormattedSource(
-			    format, GetDstSel(resource.DstSelXYZW(), component));
+			const auto selector = GetDstSel(resource.DstSelXYZW(), component);
+			if (Format::FormattedSelectorMissing(format, selector)) {
+				NoteFormattedSelectorMissing(program.shader_hash,
+				                             static_cast<uint32_t>(format.format),
+				                             resource.DstSelXYZW(), "vertex fetch V#");
+			}
+			source = Format::ResolveFormattedSource(format, selector,
+			                                        GetCodegenOptions().format_missing_canonical);
 			if (source.kind == Format::FormattedSourceKind::Invalid) {
 				EXIT("invalid formatted vertex input %u at pc 0x%08x: component=%u "
 				     "format=%u selector=%u descriptor=%08x,%08x,%08x,%08x",

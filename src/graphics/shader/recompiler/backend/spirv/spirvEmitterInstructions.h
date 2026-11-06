@@ -389,6 +389,7 @@ void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;
+inline constexpr auto EmitImageReadStorage     = EmitImage;
 inline constexpr auto EmitImageWrite           = EmitImage;
 inline constexpr auto EmitImageSampleRaw       = EmitImage;
 inline constexpr auto EmitImageGatherRaw       = EmitImage;

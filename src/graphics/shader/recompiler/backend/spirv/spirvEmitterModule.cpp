@@ -380,6 +380,30 @@ void DefineBindlessImages(EmitterState& state) {
 	}
 }
 
+// Whether a storage image access to one of `resources` is coherent (ImageAccessCoherent).
+template <typename Resources>
+bool StorageBindingHasCoherentAccess(const EmitterState& state, const Resources& resources) {
+	if (!GetCodegenOptions().image_glc_coherent && !PopsInterlockActive(state)) {
+		return false;
+	}
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::ImageOpcodeInfoOf(inst.GetOpcode()).resource_class !=
+			    IR::ImageResourceClass::Storage) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= state.program.memory_info.size()) continue;
+			const auto& mem = state.program.memory_info[index];
+			if (ImageAccessCoherent(state, mem) &&
+			    std::find(resources.begin(), resources.end(), mem.resource) != resources.end()) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void DefineDescriptors(EmitterState& state) {
 	DefineBindlessImages(state);
 	const bool user_clip_planes = state.program.stage != ShaderType::Pixel &&
@@ -532,6 +556,16 @@ void DefineDescriptors(EmitterState& state) {
 				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
 				    Define(ArrayType(ImageType(state, image)), name.c_str(),
 				           spv::StorageClassUniformConstant);
+				if (image.resource_class == IR::ImageResourceClass::Storage &&
+				    StorageBindingHasCoherentAccess(state, binding.resources)) {
+					// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: a Coherent alias of the same
+					// binding for the coherent accesses only (ImageDescriptorPointer).
+					const auto alias = Define(ArrayType(ImageType(state, image)),
+					                          (name + "_coherent").c_str(),
+					                          spv::StorageClassUniformConstant);
+					state.builder.AddAnnotation(spv::OpDecorate, alias, spv::DecorationCoherent);
+					state.image_coherent_variables[IR::ImageBindingIndex(binding.kind)] = alias;
+				}
 				if (image.dimension == ImageDimension::Dim1D ||
 				    image.dimension == ImageDimension::Dim1DArray) {
 					state.builder.RequireCapability(image.resource_class ==
@@ -546,6 +580,20 @@ void DefineDescriptors(EmitterState& state) {
 }
 
 } // namespace
+
+bool ComputeImplicitLod(const EmitterState& state) {
+	if (!state.requirements.implicit_compute_lod || state.program.stage != ShaderType::Compute ||
+	    state.lane_count != 1 || state.split_wave || state.mesh_passes > 1u ||
+	    !GetHostComputeDerivativesLinear() ||
+	    GetHostImageFeatures().compute_derivatives == HostComputeDerivatives::None) {
+		return false;
+	}
+	const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	if (cs == nullptr) return false;
+	const uint32_t threads = std::max(cs->threads_num[0], 1u) * std::max(cs->threads_num[1], 1u) *
+	                         std::max(cs->threads_num[2], 1u);
+	return threads % 4u == 0u;
+}
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value) {
 	return state.builder.Constant(spv::OpConstant, TypeU32(state), value);
@@ -1117,7 +1165,16 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
 		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
-	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+	if (ComputeImplicitLod(state)) {
+		// KYTY_IMPLICIT_LOD_STAGES: implicit-LOD samples (and any IMAGE_GET_LOD) take derivatives
+		// over four consecutive invocations, the RDNA2 lane quad.
+		const auto derivatives = GetHostImageFeatures().compute_derivatives;
+		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
+		state.builder.RequireExtension(derivatives == HostComputeDerivatives::Nv
+		                                   ? "SPV_NV_compute_shader_derivatives"
+		                                   : "SPV_KHR_compute_shader_derivatives");
+	} else if (state.requirements.compute_derivatives &&
+	           state.program.stage == ShaderType::Compute) {
 		// The NV extension declares the same capability (ComputeDerivativeGroupQuadsNV).
 		const auto derivatives = GetHostImageFeatures().compute_derivatives;
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
@@ -1230,8 +1287,37 @@ void DefineModule(EmitterState& state) {
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
+		if (PopsInterlockActive(state)) {
+			// KYTY_POPS_INTERLOCK: the body runs between OpBegin/OpEndInvocationInterlockEXT
+			// (EmitProgram, EmitReturn). Pixel ordered covers the guest's per-pixel and per-sample
+			// POPS modes (sample order is the weaker guarantee).
+			state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
+			state.builder.RequireCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePixelInterlockOrderedEXT);
+			static std::mutex         ordered_mutex;
+			static std::set<uint64_t> ordered_logged;
+			std::scoped_lock          ordered_lock(ordered_mutex);
+			if (ordered_logged.size() < 64 && ordered_logged.insert(state.program.shader_hash).second) {
+				LOGF("KYTY_POPS_INTERLOCK: pixel shader 0x%016" PRIx64
+				     " runs as a pixel-ordered interlock section\n",
+				     state.program.shader_hash);
+			}
+		} else if (state.program.info.pops && GetCodegenOptions().pops_interlock) {
+			static std::mutex         mutex;
+			static std::set<uint64_t> logged;
+			std::scoped_lock          lock(mutex);
+			if (logged.size() < 64 && logged.insert(state.program.shader_hash).second) {
+				LOGF("KYTY_POPS_INTERLOCK: pixel shader 0x%016" PRIx64
+				     " has a POPS section but the device has no fragmentShaderPixelInterlock; "
+				     "it runs unordered\n",
+				     state.program.shader_hash);
+			}
+		}
 	}
-	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+	if (ComputeImplicitLod(state)) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupLinearKHR);
+	} else if (state.requirements.compute_derivatives &&
+	           state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
 	state.builder.AddName(state.main_func, "main");

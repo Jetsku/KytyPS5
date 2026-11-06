@@ -695,7 +695,7 @@ add_executable(lane_local_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/LaneLocal.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 )
-target_link_libraries(lane_local_tests fmt::fmt)
+target_link_libraries(lane_local_tests common fmt::fmt)
 target_include_directories(lane_local_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL

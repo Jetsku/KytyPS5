@@ -1,7 +1,12 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
+#include <mutex>
+#include <tuple>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -112,6 +117,14 @@ CodegenOptions FromEnvironment() {
 	options.wave64_present_exec = EnvFlag("KYTY_WAVE64_PRESENT_EXEC", options.wave64_present_exec);
 	options.embedded_fetch_no_sgpr_offset = EnvFlag("KYTY_EMBEDDED_FETCH_NO_SGPR_OFFSET", options.embedded_fetch_no_sgpr_offset);
 	options.mov_no_float_mods = EnvFlag("KYTY_MOV_NO_FLOAT_MODS", options.mov_no_float_mods);
+	options.pops_interlock = EnvFlag("KYTY_POPS_INTERLOCK", options.pops_interlock);
+	options.format_missing_canonical =
+	    EnvFlag("KYTY_FORMAT_MISSING_CANON", options.format_missing_canonical);
+	options.indirect_format_all = EnvFlag("KYTY_INDIRECT_FORMAT_ALL", options.indirect_format_all);
+	options.format_store_dst_sel = EnvFlag("KYTY_FORMAT_STORE_DST_SEL", options.format_store_dst_sel);
+	options.image_glc_coherent = EnvFlag("KYTY_IMAGE_GLC_COHERENT", options.image_glc_coherent);
+	options.implicit_lod_stages = EnvFlag("KYTY_IMPLICIT_LOD_STAGES", options.implicit_lod_stages);
+	options.buffer_oob_modes = EnvFlag("KYTY_BUFFER_OOB_MODES", options.buffer_oob_modes);
 	options.srgb8_decode = EnvFlag("KYTY_SRGB8_DECODE", options.srgb8_decode);
 	options.depth_bits_read = EnvFlag("KYTY_DEPTH_BITS_READ", options.depth_bits_read);
 	options.bindless_3d_as_array =
@@ -337,6 +350,35 @@ uint32_t RtFunctionMode() {
 
 void SetThreadRtFunctionOverride(int mode) {
 	g_rt_function_override = mode;
+}
+
+void NoteFormattedSelectorMissing(uint64_t shader_hash, uint32_t format, uint32_t swizzle,
+                                  const char* where) {
+	// Counted per compiled formatted channel; the first 32 distinct (program, format, dst_sel)
+	// combinations are named.
+	static std::atomic<uint64_t> total {0};
+	static std::atomic<uint32_t> named {0};
+	static std::mutex            mutex;
+	static std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> seen;
+	const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	std::scoped_lock lock(mutex);
+	const auto key = std::make_tuple(shader_hash, format, swizzle);
+	if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+		return;
+	}
+	if (named.load(std::memory_order_relaxed) >= 32u) {
+		if ((count & (count - 1u)) == 0u) {
+			LOGF("Format: dst_sel past the format's channels, %" PRIu64 " formatted channels so far\n",
+			     count);
+		}
+		return;
+	}
+	seen.push_back(key);
+	named.fetch_add(1, std::memory_order_relaxed);
+	LOGF("Format: %s dst_sel 0x%03x names a channel format %u lacks (program 0x%016" PRIx64
+	     ", %s; %" PRIu64 " formatted channels so far)\n",
+	     where, swizzle & 0xfffu, format, shader_hash,
+	     GetCodegenOptions().format_missing_canonical ? "reads 0/1" : "wraps", count);
 }
 
 ComputeLdsPlan PlanComputeLds(uint32_t requested_dwords, uint32_t device_limit_bytes) {

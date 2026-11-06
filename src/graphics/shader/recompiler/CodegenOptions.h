@@ -476,6 +476,46 @@ struct CodegenOptions {
 	// 8 or 8_8 sRGB texture (UNorm backing, vulkanCommon.cpp) is decoded from sRGB in the shader on
 	// every fetch, gather and sample (after filtering; Erlou samples 8 sRGB through an R8_SRGB view).
 	bool srgb8_decode = false;
+	// ISA-check fixes (RDNA2 ISA REPORT-ISA-2/3, claude/u59-isa-fix-b; default 0, on in the PPSA26344
+	// title preset):
+	// KYTY_POPS_INTERLOCK=1: a pixel shader with a POPS section (S_SETREG_B32 hwreg(POPS_PACKER),
+	// the pops_exiting_wave_id wait, S_SENDMSG MSG_ORDERED_PS_DONE; IR::ShaderInfo::pops) runs its
+	// whole body inside a VK_EXT_fragment_shader_interlock critical section, pixel ordered
+	// (PixelInterlockOrderedEXT): overlapping fragments execute in primitive order, as the guest's
+	// ordered section makes its image read-modify-write. The device must expose
+	// fragmentShaderPixelInterlock (Spirv::HostFragmentInterlock); without it such programs keep
+	// the unordered code and are named once.
+	bool pops_interlock = false;
+	// KYTY_FORMAT_MISSING_CANON=1: a formatted buffer load whose V# dst_sel names a channel the
+	// format lacks reads 0 (X/Y/Z) or 1 (W), the canonical RGBA expansion (ISA 8.2.5, Table 31),
+	// instead of wrapping onto the format's channels (Format::ResolveFormattedSource). Bound V#s,
+	// computed V#s and embedded vertex fetches. Bound V#s that hit it are logged (first 32).
+	bool format_missing_canonical = false;
+	// KYTY_INDIRECT_FORMAT_ALL=1: a formatted load through a computed V# decodes every buffer format
+	// (USCALED/SSCALED, the non-float 10_11_11/11_11_10 and 2_10_10_10 UINT/SINT) instead of reading
+	// 0 outside the vertex-format list (IndirectFormatDecoded).
+	bool indirect_format_all = false;
+	// KYTY_FORMAT_STORE_DST_SEL=1: BUFFER_STORE_FORMAT_* through a bound V# honour the V# dst_sel
+	// (Table 31): memory channel c takes the data component whose dst_sel names it (0 if none), the
+	// inverse map image stores already apply (StoreTexel).
+	bool format_store_dst_sel = false;
+	// KYTY_IMAGE_GLC_COHERENT=1: IMAGE_LOAD* / IMAGE_STORE* with GLC or DLC (ISA Tables 29/41, the
+	// buffer meaning) access the storage image through a Coherent alias of its binding, so only those
+	// accesses bypass the non-coherent caches (the whole-binding Coherent decoration of buffers costs
+	// a lot on NVIDIA). Sampled images (IMAGE_SAMPLE* with GLC) cannot be Coherent: unchanged.
+	bool image_glc_coherent = false;
+	// KYTY_IMPLICIT_LOD_STAGES=1: an implicit-LOD sample outside pixel shaders follows the ISA, which
+	// has no stage restriction: in compute shaders (wave32, device with computeDerivativeGroupLinear)
+	// the LOD comes from the derivatives across each group of four consecutive lanes (the RDNA2
+	// quad, DerivativeGroupLinear); in other stages, and where derivatives are unavailable, it is LOD
+	// 0 as before, but IMAGE_SAMPLE_B keeps its bias (LOD = bias).
+	bool implicit_lod_stages = false;
+	// KYTY_BUFFER_OOB_MODES=1: a bound V# with OOB_SELECT 0 and a stride (Table 35: index >= NUM_RECORDS
+	// or offset >= stride) is out of range for an offset (VGPR + instruction offset, per dword) at or past
+	// the stride, instead of reading the next record (IR::BufferOobOffsetCheck, a specialization bit).
+	// OOB_SELECT 1 with stride 0 (index only) is not modelled: the binding range (NUM_RECORDS bytes)
+	// still bounds the offset.
+	bool buffer_oob_modes = false;
 	// KYTY_DEPTH_BITS_READ=1 (default 0; re-applies upstream aafe014d0, which a merge dropped): a raw
 	// load of a kDepth k16UInt T# reads the D16 surface's codes: the host binds it as UNorm and the
 	// shader converts back (ReadsDepthBits). Before, such loads failed the depth view check (null).
@@ -822,6 +862,10 @@ inline constexpr uint32_t LoopGuardHashGdsFromEnd = RtNodeStatsGdsFromEnd + RtNo
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
+// KYTY_FORMAT_MISSING_CANON: logs a formatted access whose V# dst_sel names a channel the format
+// lacks (the first 32 programs/formats, then a running count). format: Prospero::BufferFormat.
+void NoteFormattedSelectorMissing(uint64_t shader_hash, uint32_t format, uint32_t swizzle,
+                                  const char* where);
 // KYTY_LANE_LOCAL needs every compute subgroup of a wave64 program to be exactly 32 lanes: a device
 // whose subgroup size is fixed at 32, or one whose compute pipelines require 32 (the device layer sets
 // it once; false until then, which keeps lane-local programs off).
