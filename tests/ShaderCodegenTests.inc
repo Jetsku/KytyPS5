@@ -1462,6 +1462,58 @@ void CheckF16ExactRound(VulkanHarness *vulkan) {
               name, bulk.count, mix_checked, legacy_cvt, legacy_round_trip, legacy_mix);
 }
 
+// RDNA2 ISA check small items, each with its switch on and off: S_BFM_B32 with offset + count > 32
+// (KYTY_BFM_DEFINED), OMOD of a -0 result (KYTY_OMOD_ZERO), V_CVT_F32_F64 overflow
+// (KYTY_CVT_F32_F64_INF), and V_MOVRELS/V_MOVRELD with M0 = 257 (KYTY_MOVREL_FULL_M0: out of range,
+// so the source reads v0 and the destination is not written; the legacy M0[7:0] = 1).
+void CheckIsaSmallFixes(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenIsaSmallFixes";
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeSop2(0x24, 10, InlineU32(20), InlineU32(16))); // s_bfm_b32 s10, 20, 16
+  AppendVop3(&code, 0x108, 14, 128, 243, 0, 0, 0, false, 1);        // v_mul_f32 v14, 0, -1.0 mul:2
+  AppendVMovU32(&code, 16, 0u);
+  AppendVMovU32(&code, 17, 0x7e300000u);                             // v[16:17] = 2^996
+  code.push_back(EncodeVop1(0x0f, 15, Vgpr(16)));                    // v_cvt_f32_f64 v15, v[16:17]
+  AppendVMovU32(&code, 2, 0x22u);
+  AppendVMovU32(&code, 3, 0x33u);
+  AppendVMovU32(&code, 4, 0x44u);
+  AppendVMovU32(&code, 5, 0x55u);
+  AppendVMovU32(&code, 6, 0x66u);
+  AppendSMovLiteral(&code, 124, 257u);                                // s_mov_b32 m0, 257
+  code.push_back(EncodeVop1(0x43, 20, Vgpr(2)));                     // v_movrels_b32 v20, v2
+  code.push_back(EncodeVop1(0x42, 4, Vgpr(6)));                      // v_movreld_b32 v4, v6
+  AppendStoreSgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 14, 1);
+  AppendStoreVgpr(&code, 15, 2);
+  AppendStoreVgpr(&code, 20, 3);
+  AppendStoreVgpr(&code, 5, 4);
+  AppendEnd(&code);
+  test.initial.assign(5, 0xdeadbeefu);
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  const auto run = [&](bool enabled) {
+    CodegenOptions options = GetCodegenOptions();
+    options.bfm_defined = enabled;
+    options.omod_zero = enabled;
+    options.cvt_f32_f64_inf = enabled;
+    options.movrel_full_m0 = enabled;
+    ScopedCodegenOptions scope(options);
+    return RunCollect(vulkan, test, test.initial.size());
+  };
+  const auto on = run(true);
+  const auto off = run(false);
+  const std::vector<u32> expected = {0xffff0000u, 0x00000000u, 0x7f800000u, 0x00000000u, 0x55u};
+  RequireEqualWords(name, "switches on", expected, on);
+  std::printf("[codegen] %-32s ok (off: bfm %08x, omod %08x, cvt %08x, movrels %08x, movreld "
+              "%08x)\n",
+              name, off[0], off[1], off[2], off[3], off[4]);
+}
+
 // A vertex shader with one MAD feeding the position and one feeding a parameter: which of them
 // are fused, which carry NoContraction, and the Invariant position, per MadMode.
 void CheckMadPositionSlice() {
@@ -2844,6 +2896,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckSplitDppScan(vulkan);
   CheckMovIntMods(vulkan);
   CheckF16ExactRound(vulkan);
+  CheckIsaSmallFixes(vulkan);
   CheckLdsAtomicOrder(vulkan);
   CheckGdsM0Base(vulkan);
   CheckKnownBitsMasks(vulkan);

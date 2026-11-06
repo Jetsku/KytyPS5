@@ -498,8 +498,10 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
 	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
+	// KYTY_MOVREL_FULL_M0 (ISA 3.7): M0 is a 32-bit index; the legacy mask keeps M0[7:0].
+	const bool full_m0  = GetCodegenOptions().movrel_full_m0;
+	const auto m0_value = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
+	const auto m0       = full_m0 ? m0_value : ir.BitwiseAnd(m0_value, IR::U32(IR::Value(0xffu)));
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
@@ -508,7 +510,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	// RDNA2 3.6.1: an out-of-range source VGPR reads VGPR0. VGPRs at or above the highest one the
 	// program names are never written, so reading VGPR0 there is as valid as any value. Constant
 	// propagation drops this select when the M0 value set stays below the limit.
-	if (GetCodegenOptions().movrel_range && base != 0u && base < current_vector_limit) {
+	if ((GetCodegenOptions().movrel_range || full_m0) && base != 0u && base < current_vector_limit) {
 		const auto in_range = ir.ULessThan(m0, IR::U32(IR::Value(current_vector_limit - base)));
 		selected = ir.Select(in_range, selected, ir.GetVectorReg(static_cast<IR::VectorReg>(0)));
 	}
@@ -526,8 +528,11 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 	const auto base  = inst.dst.reg;
 	const auto value = ReadU32(inst.src0);
-	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                 IR::U32(IR::Value(0xffu)));
+	// KYTY_MOVREL_FULL_M0: an index past the last VGPR (any M0 bit) writes nothing.
+	const auto m0_value = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
+	const auto m0       = GetCodegenOptions().movrel_full_m0
+	                          ? m0_value
+	                          : ir.BitwiseAnd(m0_value, IR::U32(IR::Value(0xffu)));
 	for (uint32_t index = base; index < current_vector_limit; index++) {
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));

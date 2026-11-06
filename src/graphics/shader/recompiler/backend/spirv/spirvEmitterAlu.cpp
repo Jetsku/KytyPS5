@@ -288,8 +288,11 @@ uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
 	           EmitCompareU32Constant(state, spv::OpUGreaterThan, exponent, 0x47e00000u),
 	           EmitCompareU32Constant(state, spv::OpULessThan, exponent, 0x7ff00000u));
-	const auto clamped = EmitOrU32(state, EmitAndConstant(state, source, 0x80000000u),
-	                               ConstantU32(state, 0x7f7fffffu));
+	// KYTY_CVT_F32_F64_INF: round to nearest (FLOAT_MODE 0xC0) overflows to +-INF; the legacy result
+	// saturates at +-FLT_MAX.
+	const auto clamped = EmitOrU32(
+	    state, EmitAndConstant(state, source, 0x80000000u),
+	    ConstantU32(state, GetCodegenOptions().cvt_f32_f64_inf ? 0x7f800000u : 0x7f7fffffu));
 	return EmitFlushF32DenormToSignedZero(
 	    state, Select(state, TypeF32(state), overflow,
 	                  Unary(state, spv::OpBitcast, TypeF32(state), clamped), converted));

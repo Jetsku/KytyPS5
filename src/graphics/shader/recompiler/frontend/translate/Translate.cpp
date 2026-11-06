@@ -375,6 +375,12 @@ IR::F32 Translator::ApplyF32ResultModifiers(const Decoder::Operand& operand, IR:
 			default: break;
 		}
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(multiplier)}));
+		if (GetCodegenOptions().omod_zero) {
+			// KYTY_OMOD_ZERO (ISA p.44): OMOD turns a -0 result into +0.
+			const auto bits = ir.BitCastU32(value);
+			value = ir.BitCastF32(ir.Select(ir.IEqual(bits, IR::U32(IR::Value(0x80000000u))),
+			                                IR::U32(IR::Value(0u)), bits));
+		}
 	}
 	if (operand.clamp) {
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPSaturate32, {value}));
@@ -563,6 +569,10 @@ IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_la
 	auto bits             = ReadRawU32(operand);
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
+		// A 16-bit float inline constant is the 32-bit value 0x0000hhhh, so OP_SEL/OP_SEL_HI high reads
+		// 0, and an integer inline constant is sign-extended to 32 bits (high = 0 or 0xffff). That is
+		// LLVM's gfx10 encoding rule (isInlinableLiteralV2F16/V2I16: a splat needs op_sel_hi = 0, which
+		// is what Yotei's compiler emits); the RDNA2 guide defines neither (ISA check 2026-11-06).
 		const auto value = operand.value;
 		bits             = IR::U32(IR::Value(value == 0x3e22f983u
 		                                         ? 0x3118u

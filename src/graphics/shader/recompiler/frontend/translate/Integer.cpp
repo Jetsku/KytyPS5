@@ -404,6 +404,17 @@ void Translator::S_QUADMASK_B64(const Decoder::Instruction& inst) {
 void Translator::BFM_B32(const Decoder::Instruction& inst) {
 	const auto count  = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(31u)));
 	const auto offset = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
+	if (GetCodegenOptions().bfm_defined) {
+		// KYTY_BFM_DEFINED: ((1 << count) - 1) << offset with 32-bit shifts, defined for any
+		// offset + count (bits past 31 dropped); OpBitFieldInsert is undefined past 32.
+		const auto ones = ir.ShiftRightLogical(
+		    IR::U32(IR::Value(0xffffffffu)),
+		    ir.BitwiseAnd(ir.ISub(IR::U32(IR::Value(32u)), count), IR::U32(IR::Value(31u))));
+		const auto mask =
+		    ir.Select(ir.IEqual(count, IR::U32(IR::Value(0u))), IR::U32(IR::Value(0u)), ones);
+		WriteOperand(DestinationOperand(inst), ir.ShiftLeftLogical(mask, offset));
+		return;
+	}
 	const auto result = ir.Emit(IR::ValueOpcode::BitFieldInsert,
 	                            {IR::Value(0u), IR::Value(0xffffffffu), offset, count});
 	WriteOperand(DestinationOperand(inst), result);
@@ -506,6 +517,9 @@ void Translator::S_BITCMP_B64(const Decoder::Instruction& inst, bool expected) {
 void Translator::V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset) {
 	const auto hi = ReadU32(inst.src0);
 	const auto lo = ReadU32(inst.src1);
+	// V_ALIGNBYTE_B32 shifts by 8 * S2[1:0] (LLVM's gfx10 definition and the only shifts that keep
+	// the result inside {S0, S1}); the RDNA2 guide's "8 * S2.u[4:0]" (p.170) would shift up to 248
+	// bits of a 64-bit value and is taken as a typo (RDNA2 ISA check 2026-11-06).
 	auto shift    = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(byte_offset ? 3u : 31u)));
 	if (byte_offset) shift = ir.ShiftLeftLogical(shift, IR::U32(IR::Value(3u)));
 	const auto lo_part = ir.ShiftRightLogical(lo, shift);
