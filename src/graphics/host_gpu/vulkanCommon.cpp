@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/host_gpu/vramStats.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <spirv-tools/libspirv.hpp>
 
@@ -225,7 +226,12 @@ std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint6
 			messages += "; ";
 		}
 	});
-	const bool valid = tools.Validate(shrunk);
+	// Uniform blocks of dword arrays (KYTY_UNIFORM_BUFFERS, KYTY_SRT_UNIFORM) need the standard
+	// layout rules the device enables for them (as the pipeline cache validates).
+	spvtools::ValidatorOptions options;
+	options.SetUniformBufferStandardLayout(
+	    Libs::Graphics::ShaderRecompiler::Spirv::GetHostBufferRobustness().uniform_dword_loads_return_zero);
+	const bool valid = tools.Validate(shrunk.data(), shrunk.size(), options);
 	static std::mutex                   log_mutex;
 	static std::set<std::string>        logged;
 	std::string                         arrays;
