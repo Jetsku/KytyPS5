@@ -337,6 +337,10 @@ public:
 	// processor continues) and takes every page it wrote into GPU ownership exactly as a writable
 	// binding over the page would, so no later reader sees the page as clean. GPU thread.
 	void SettleBdaWrites(uint64_t shader_hash);
+	// KYTY_BDA_CPU_MERGE=1 (default 0): before a BDA-writing dispatch is prepared (before any
+	// upload), the guest bytes of the pages this shader's earlier settles found CPU-dirty
+	// (the guest wrote them while the dispatch ran). GPU thread.
+	void SnapshotBdaMergePages(uint64_t shader_hash);
 	// KYTY_CP_FAULT_WRITERS=1 (diagnostics): a read fault the command processor took on GPU-written
 	// bytes, with its handler time: aggregated by the newest recorded GPU writer of the address
 	// (shader, ticks between that write and the fault) and the op being prepared, every 10 s.
@@ -369,6 +373,11 @@ private:
 	};
 	std::deque<PendingBdaSettle>                 m_bda_pending;
 	std::unordered_map<uint64_t, BdaPrediction>  m_bda_predict;
+	// KYTY_BDA_CPU_MERGE: per shader, the pages its settles found CPU-dirty; the snapshots of them
+	// taken before the current dispatch (page -> 4 KiB); a host-visible page for the GPU bytes.
+	std::unordered_map<uint64_t, std::vector<uint64_t>> m_bda_merge_pages;
+	std::unordered_map<uint64_t, std::vector<uint8_t>>  m_bda_merge_snapshots;
+	std::unique_ptr<Buffer>                             m_bda_merge_download;
 	// KYTY_CP_FAULT_WRITERS
 	struct CpFaultWriter {
 		uint64_t    vaddr = 0, size = 0, tick = 0, hash = 0;
@@ -717,6 +726,11 @@ private:
 		std::vector<uint8_t>    snapshot; // verify: their guest bytes when the pages were released
 		bool                    verify = false;
 	};
+	// KYTY_BDA_CPU_MERGE: a settled page the guest also wrote during the dispatch keeps both
+	// writers' bytes, as on the hardware: the dwords the dispatch changed (GPU bytes unlike the
+	// snapshot) are written into guest memory before the page's upload. False: no snapshot (the
+	// guest's page wins, as before).
+	bool MergeBdaCpuDirtyPage(Buffer& buffer, uint64_t page, uint64_t shader_hash);
 	// SettleBdaWrites for the written pages [vaddr, vaddr + size): the parts inside cache buffers.
 	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
 	                           uint64_t& settled_pages);

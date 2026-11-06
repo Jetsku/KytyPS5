@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <mutex>
 #include <tuple>
+#include <utility>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -333,6 +334,26 @@ bool LoopGuardApplies(uint64_t shader_hash) {
 	return options.loop_guard_budget != 0 &&
 	       (options.loop_guard_all || std::ranges::find(options.loop_guard_shaders, shader_hash) !=
 	                                      options.loop_guard_shaders.end());
+}
+
+namespace {
+MadExactFilter g_mad_exact_filter;
+} // namespace
+
+void SetMadExactFilter(MadExactFilter filter) {
+	g_mad_exact_filter = std::move(filter);
+}
+
+bool MadExactProgram(uint32_t stage, uint64_t shader_hash) {
+	const auto& filter = g_mad_exact_filter;
+	if (!filter.active || stage >= 32 || (filter.stage_mask & (1u << stage)) == 0) {
+		return false;
+	}
+	if (filter.hashes.empty() && filter.hash_mask == 0) {
+		return true;
+	}
+	return std::ranges::find(filter.hashes, shader_hash) != filter.hashes.end() ||
+	       (filter.hash_mask != 0 && (shader_hash & filter.hash_mask) == filter.hash_value);
 }
 
 void SetCodegenOptions(const CodegenOptions& options) {

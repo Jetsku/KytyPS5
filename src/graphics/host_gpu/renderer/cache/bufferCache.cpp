@@ -4908,6 +4908,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 		// dirty bytes are never cached clean. The tracker GPU bits that SynchronizeBuffer just
 		// set are only ever set together with this Add; clean-read verdicts never read them.
 		// A range already contained is left as it is (the Add would change nothing).
+		WatchRange::NoteWriter("bind", vaddr, size);
 		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
 			CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtyAdd);
 			WatchRange::Note("GPU-modified range #1", vaddr, size);
@@ -4949,6 +4950,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false, nullptr,
 		                        "written-binding");
 		PreserveImagesForGpuWrite(id, range.address, range.size);
+		WatchRange::NoteWriter("written-range", range.address, range.size);
 		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
 			CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::BufferDirtyAdd);
 			WatchRange::Note("GPU-modified range #2", range.address, range.size);
@@ -5340,6 +5342,7 @@ void BufferCache::CommitImageBytes(Buffer& buffer, const RangeSet& ranges) {
 			CleanVerdict::Invalidate(begin, size, Coherence::Source::BufferDirtyAdd);
 		}
 		WatchRange::Note("GPU-modified range #3", begin, size);
+		WatchRange::NoteWriter("image-bytes", begin, size);
 		m_gpu_modified_ranges.Add(begin, size);
 		NoteBufferContentWrite(begin, size);
 		ForgetKnownFills(begin, size);
@@ -6819,6 +6822,100 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 	}
 }
 
+// KYTY_BDA_CPU_MERGE=1 (default 0): see BufferCache::MergeBdaCpuDirtyPage.
+// Ghost of Yotei's Proxy Set Cull (CS 0x039ed97b41485281) writes its results through BDA into
+// pages of CPU memory the game writes in the same frame; the settle's upload of the guest page
+// replaced the shader's bytes there, so those cull results were lost every frame.
+static bool BdaCpuMergeEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BDA_CPU_MERGE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::SnapshotBdaMergePages(uint64_t shader_hash) {
+	if (!BdaCpuMergeEnabled()) return;
+	m_bda_merge_snapshots.clear();
+	const auto it = m_bda_merge_pages.find(shader_hash);
+	if (it == m_bda_merge_pages.end()) return;
+	for (const auto page: it->second) {
+		// Guest bytes equal the page's GPU bytes unless the GPU owns newer ones.
+		if (m_memory_tracker.IsRegionGpuModified(page, CACHING_PAGESIZE) ||
+		    m_gpu_modified_ranges.Intersects(page, CACHING_PAGESIZE) ||
+		    HasPendingBackingPublication(page, CACHING_PAGESIZE)) {
+			continue;
+		}
+		std::vector<uint8_t> bytes(CACHING_PAGESIZE);
+		if (Libs::LibKernel::Memory::TryReadBacking(page, bytes.data(), bytes.size())) {
+			m_bda_merge_snapshots.emplace(page, std::move(bytes));
+		}
+	}
+}
+
+bool BufferCache::MergeBdaCpuDirtyPage(Buffer& buffer, uint64_t page, uint64_t shader_hash) {
+	static std::atomic<uint32_t> lines {0};
+	const auto snapshot = m_bda_merge_snapshots.find(page);
+	if (snapshot == m_bda_merge_snapshots.end() || !buffer.IsInBounds(page, CACHING_PAGESIZE)) {
+		if (lines.fetch_add(1, std::memory_order_relaxed) < 64u) {
+			Log::WriteToConsoleAndLog(fmt::format("KYTY_BDA_CPU_MERGE: CS 0x{:016x} page 0x{:x}: no snapshot, the guest's "
+			                                      "page wins\n",
+			                                      shader_hash, page));
+		}
+		return false;
+	}
+	if (m_bda_merge_download == nullptr) {
+		m_bda_merge_download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                                vk::BufferUsageFlagBits::eTransferDst, CACHING_PAGESIZE);
+	}
+	// The GPU bytes of the page: the dispatch completed (the synchronous settle waited for it).
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+	                       nullptr, 1, &before, 0, nullptr);
+	vk::BufferCopy copy {buffer.Offset(page), 0, CACHING_PAGESIZE};
+	native.copyBuffer(buffer.Handle(), m_bda_merge_download->Handle(), 1, &copy);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = m_bda_merge_download->Handle();
+	after.size          = CACHING_PAGESIZE;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+	                       &after, 0, nullptr);
+	m_scheduler.Wait(m_scheduler.CurrentTick());
+	m_bda_merge_download->Invalidate(0, CACHING_PAGESIZE);
+	const auto* gpu      = reinterpret_cast<const uint32_t*>(m_bda_merge_download->Mapped().data());
+	const auto* original = reinterpret_cast<const uint32_t*>(snapshot->second.data());
+	uint32_t    merged   = 0;
+	uint32_t    both     = 0;
+	for (uint32_t i = 0; i < CACHING_PAGESIZE / sizeof(uint32_t); i++) {
+		if (gpu[i] == original[i]) continue;
+		const uint64_t address = page + uint64_t {i} * sizeof(uint32_t);
+		uint32_t       guest   = 0;
+		if (!Libs::LibKernel::Memory::TryReadBacking(address, &guest, sizeof(guest)) || guest == gpu[i]) continue;
+		both += guest != original[i] ? 1u : 0u;
+		const uint32_t value = gpu[i];
+		if (Libs::LibKernel::Memory::TryWriteBacking(address, &value, sizeof(value))) merged++;
+	}
+	m_bda_merge_snapshots.erase(snapshot);
+	if (lines.fetch_add(1, std::memory_order_relaxed) < 64u) {
+		Log::WriteToConsoleAndLog(fmt::format("KYTY_BDA_CPU_MERGE: CS 0x{:016x} page 0x{:x}: {} GPU dword(s) merged into "
+		                                      "the guest page ({} the guest wrote too)\n",
+		                                      shader_hash, page, merged, both));
+	}
+	return true;
+}
+
 void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
                                         uint64_t& settled_pages) {
 	// Collect first: settling a part may create or merge buffers (not here, but keep the loop
@@ -6884,6 +6981,18 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 				dirty_pages += m_memory_tracker.IsRegionCpuModified(first, last - first) ? 1u : 0u;
 			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettleCpuDirtyPages, dirty_pages);
+			// KYTY_BDA_ALIAS_DIAG=1 (diagnostic): every such overlap, at most 400 lines.
+			{
+				static const bool cpu_dirty_diag = [] {
+					const auto* value = std::getenv("KYTY_BDA_ALIAS_DIAG");
+					return value != nullptr && std::strcmp(value, "1") == 0;
+				}();
+				static std::atomic<uint32_t> cpu_dirty_lines {0};
+				if (cpu_dirty_diag && cpu_dirty_lines.fetch_add(1, std::memory_order_relaxed) < 400u) {
+					Log::WriteToConsoleAndLog(fmt::format("BdaCpuDirtyDiag: CS 0x{:016x} wrote 0x{:x}+0x{:x}, {} page(s) CPU-dirty\n",
+					                                      shader_hash, start, bytes, dirty_pages));
+				}
+			}
 			if (FirstBdaWriteNote(shader_hash, 3)) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "KYTY_BDA_WRITES: CS shader 0x{:016x} wrote 0x{:x}+0x{:x}, which the guest also "
@@ -6896,6 +7005,20 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 				     shader_hash, start, bytes);
 			}
 		}
+		if (BdaCpuMergeEnabled() && m_memory_tracker.IsRegionCpuModified(start, bytes)) {
+			auto& merge_buffer = m_slot_buffers[id];
+			for (uint64_t page = Common::AlignDown(start, CACHING_PAGESIZE); page < start + bytes;
+			     page += CACHING_PAGESIZE) {
+				const auto first = std::max(page, start);
+				const auto last  = std::min(page + CACHING_PAGESIZE, start + bytes);
+				if (!m_memory_tracker.IsRegionCpuModified(first, last - first)) continue;
+				auto& known = m_bda_merge_pages[shader_hash];
+				if (std::find(known.begin(), known.end(), page) == known.end() && known.size() < 256u) {
+					known.push_back(page);
+				}
+				(void)MergeBdaCpuDirtyPage(merge_buffer, page, shader_hash);
+			}
+		}
 		// What a writable binding over the range records (ObtainBuffer), after the fact: the
 		// dispatch has completed, so the pages become GPU-owned before anything else is recorded
 		// or read.
@@ -6906,6 +7029,7 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 			CleanVerdict::Invalidate(start, bytes, Coherence::Source::BufferDirtyAdd);
 		}
 		WatchRange::Note("GPU-modified range #4", start, bytes);
+		WatchRange::NoteWriter("bda-settle", start, bytes);
 		m_gpu_modified_ranges.Add(start, bytes);
 		NoteBufferContentWrite(start, bytes);
 		ForgetKnownFills(start, bytes);

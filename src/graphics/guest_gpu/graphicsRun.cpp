@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/gpuTouchedPages.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/readFaultDiag.h"
+#include "graphics/host_gpu/watchRange.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
@@ -3099,6 +3100,29 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	m_num_instances = args.instance_count;
 	NoteCpuIndirectArgs("indexed", args_addr, sizeof(DrawIndexedIndirectArgs), args.index_count_per_instance,
 	                    args.instance_count);
+	// KYTY_INDIRECT_TRACE_COUNT=<index count> (diagnostic): CPU-path indexed indirect draws with this index
+	// count: the argument address and values, how a clean read stands and the writers of the argument page
+	// (KYTY_WATCH_WRITERS), at most 200 lines.
+	{
+		static const uint32_t trace_count = [] {
+			const auto* value = std::getenv("KYTY_INDIRECT_TRACE_COUNT");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+		}();
+		static std::atomic<uint32_t> traced {0};
+		if (trace_count != 0 && args.index_count_per_instance == trace_count &&
+		    traced.fetch_add(1, std::memory_order_relaxed) < 200u) {
+			uint32_t   probe = 0;
+			const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &probe, sizeof(probe));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "IndirectTrace: args 0x{:x} count {} inst {} start_index {} base_vertex {} start_inst {} clean_read {} "
+			    "gpu_dirty {}: {}{}\n",
+			    args_addr, args.index_count_per_instance, args.instance_count, args.start_index_location,
+			    args.base_vertex_location, args.start_instance_location, clean ? 1 : 0,
+			    m_renderer.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(DrawIndexedIndirectArgs)) ? 1 : 0,
+			    LibKernel::Memory::DescribeGpuBackingForRead(args_addr, sizeof(DrawIndexedIndirectArgs)),
+			    Libs::Graphics::WatchRange::DescribeWriters(args_addr)));
+		}
+	}
 	// KYTY_TRACE_PASS_CENSUS: which indirect draws took the CPU path (args not tracked as GPU-written).
 	Libs::Graphics::PassCensus::Drop('i', 0, index_count == 0 || args.instance_count == 0
 	                                             ? "info: indexed indirect draw, CPU path, args read zero"
@@ -3239,6 +3263,25 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		}
 
 		m_num_instances = args.instance_count;
+		{
+			// KYTY_INDIRECT_TRACE_COUNT (see ExecDrawIndirect): the same for multi-draw records.
+			static const uint32_t trace_count = [] {
+				const auto* value = std::getenv("KYTY_INDIRECT_TRACE_COUNT");
+				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+			}();
+			static std::atomic<uint32_t> traced {0};
+			if (trace_count != 0 && args.index_count_per_instance == trace_count &&
+			    traced.fetch_add(1, std::memory_order_relaxed) < 200u) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "IndirectTraceMulti: record {}/{} count_addr 0x{:x} args 0x{:x} count {} inst {} start_index {} "
+				    "base_vertex {} start_inst {} gpu_dirty {}: {}{}\n",
+				    i, draw_count, count_addr, args_addr, args.index_count_per_instance, args.instance_count,
+				    args.start_index_location, args.base_vertex_location, args.start_instance_location,
+				    m_renderer.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(DrawIndexedIndirectArgs)) ? 1 : 0,
+				    LibKernel::Memory::DescribeGpuBackingForRead(args_addr, sizeof(DrawIndexedIndirectArgs)),
+				    Libs::Graphics::WatchRange::DescribeWriters(args_addr)));
+			}
+		}
 		ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
 		                                   static_cast<int32_t>(args.base_vertex_location),
 		                                   args.start_instance_location, op.index_type_and_size));

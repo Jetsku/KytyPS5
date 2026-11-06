@@ -384,6 +384,7 @@ bool MemoryTracker::GpuMirrorMatches(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	WatchRange::Note("tracker CPU-modified", vaddr, size);
+	WatchRange::NoteWriter("cpu-fault", vaddr, size);
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
@@ -394,6 +395,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	WatchRange::Note("tracker GPU-modified", vaddr, size);
+	WatchRange::NoteWriter("tracker-gpu", vaddr, size);
 	CheckNotInUploadCallback();
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuMark);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
