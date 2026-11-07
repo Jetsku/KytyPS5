@@ -41,6 +41,9 @@ void NoteBuildEnd();
 
 [[nodiscard]] uint64_t Frames();
 [[nodiscard]] double   Seconds();
+// Steady-clock nanoseconds (std::chrono::steady_clock epoch) at which the n-th (1-based, n <= 4)
+// loading-end event was printed; 0 until then (or with KYTY_EVENTS=0).
+[[nodiscard]] int64_t LoadingEndNs(uint32_t n);
 
 struct Params {
 	double   load_on_mbps  = 48.0;

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/hostInputTrace.h"
+#include "common/kytyEvents.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -241,7 +242,9 @@ static int TriggerTravel(const ControllerState& state, Axis axis) {
 // Analogue sticks: "lstick=<x>/<y>" or "rstick=<x>/<y>" (0..255 per axis, 128 = centre, y 0 = up).
 // Any entry may end in ":<ms>", the hold time (default 300 ms), e.g. "40:lstick=128/0:2500,41:r2:2000"
 // holds the left stick up for 2.5 s and R2 for 2 s. While several entries hold one stick, the latest
-// fired wins.
+// fired wins. "swipe=<from>/<to>[:<ms>]" moves one finger over the touch pad (per mille of its
+// height, 0 = top), e.g. "f9000:swipe=900/100:400" is a swipe up (Erlou93/KytyPS5-Yotei v0.1.5:
+// the Ghost of Yotei 2.002 cutscene after the Snake fight waits for one).
 // KYTY_PAD_TRIGGER_FILE=<path> (default unset): while the game reads the pad, the file is polled
 // every 250 ms; when it exists, the entries it names without a time ("cross", "lstick=128/0:2000",
 // separated by commas or spaces) fire at once and the file is deleted, so a test runner can press
@@ -257,6 +260,10 @@ struct PadScriptEvent {
 	uint8_t  stick_x  = 128;
 	uint8_t  stick_y  = 128;
 	uint64_t hold_us  = 300000;
+	// "swipe=<from>/<to>" (per mille of the touch pad's height, 0 = top): one finger moves over
+	// the touch pad's horizontal centre from <from> to <to> during the hold.
+	int16_t  swipe_from = -1;
+	int16_t  swipe_to   = -1;
 	bool     fired    = false;
 	uint64_t fired_us = 0;
 };
@@ -300,6 +307,16 @@ bool PadScriptParseAction(const char* p, size_t len, PadScriptEvent* event) {
 		if (end == text.c_str() + colon + 1 || *end != '\0' || !(ms > 0.0) || ms > 600000.0) return false;
 		event->hold_us = static_cast<uint64_t>(ms * 1000.0);
 		name.resize(colon);
+	}
+	if (name.starts_with("swipe=")) {
+		int from = -1, to = -1;
+		if (std::sscanf(name.c_str() + 6, "%d/%d", &from, &to) != 2 || from < 0 || from > 1000 || to < 0 ||
+		    to > 1000) {
+			return false;
+		}
+		event->swipe_from = static_cast<int16_t>(from);
+		event->swipe_to   = static_cast<int16_t>(to);
+		return true;
 	}
 	if (name.starts_with("lstick=") || name.starts_with("rstick=")) {
 		char*      end = nullptr;
@@ -390,6 +407,9 @@ struct PadScriptHeld {
 	std::array<bool, 2>    stick {};
 	std::array<uint8_t, 2> x {};
 	std::array<uint8_t, 2> y {};
+	// "swipe=<from>/<to>": one finger on the touch pad, y in touch-pad units.
+	bool     touch   = false;
+	uint16_t touch_y = 0;
 };
 
 // The controls held at <now_us> (pad-script clock) and guest flip <flip>; fires due events.
@@ -415,6 +435,13 @@ PadScriptHeld PadScriptHeldAt(uint64_t now, uint64_t flip) {
 			continue;
 		}
 		held.buttons |= event.button;
+		if (event.swipe_from >= 0) {
+			const double t = std::clamp(static_cast<double>(now - event.fired_us) / static_cast<double>(event.hold_us),
+			                            0.0, 1.0);
+			const double y = event.swipe_from + t * (event.swipe_to - event.swipe_from);
+			held.touch     = true;
+			held.touch_y   = static_cast<uint16_t>(y * 943.0 / 1000.0);
+		}
 		if (event.stick != 0) {
 			const int s = event.stick - 1;
 			// The latest fired entry wins.
@@ -451,6 +478,146 @@ void PadScriptApply(PadData* data) {
 		data->right_stick_x = held.x[1];
 		data->right_stick_y = held.y[1];
 	}
+	if (held.touch) {
+		data->touch_data.touch_num   = 1;
+		data->touch_data.touch[0].x  = 960;
+		data->touch_data.touch[0].y  = held.touch_y;
+		data->touch_data.touch[0].id = 100;
+		data->touch_data.touch[1]    = {};
+	}
+}
+
+// KYTY_TEST_PAD_RECORD=<file> / KYTY_TEST_PAD_REPLAY=<file> (test tool, adapted from
+// Erlou93/KytyPS5-Yotei v0.1.5): reproducible routes without host input. Times count in ms from
+// an anchor, KYTY_TEST_PAD_ANCHOR (default 2): the n-th KYTY_EVENT loading-end (Ghost of Yotei:
+// 1 = title menu, 2 = gameplay), 0 = pad initialization. Time, not frames: the game moves in real
+// time, so another frame rate does not shift the route.
+// RECORD writes every change of the pad state the game reads (before KYTY_PAD_SCRIPT), one line
+// "<ms> <buttons hex> LX LY RX RY L2 R2" (Erlou's format, so their recordings replay here).
+// REPLAY: from the anchor on, the state at each read is the recorded one at that time (centred
+// sticks and no buttons before the first record; the last record holds after the end); the pad
+// reports connected. KYTY_PAD_SCRIPT still adds on top (e.g. menu presses before the anchor).
+struct PadRecord {
+	int64_t                ms      = 0;
+	uint32_t               buttons = 0;
+	std::array<int, 6>     axes {};
+};
+
+uint32_t PadAnchorEvent() {
+	static const uint32_t anchor = [] {
+		const char* value = std::getenv("KYTY_TEST_PAD_ANCHOR");
+		return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u;
+	}();
+	return anchor;
+}
+
+// ms since the anchor, -1 before it.
+int64_t PadMsSinceAnchor() {
+	const auto anchor = PadAnchorEvent();
+	if (anchor == 0) {
+		return static_cast<int64_t>((PadScriptNowUs() - g_pad_start_us) / 1000);
+	}
+	const int64_t start = KytyEvents::LoadingEndNs(anchor);
+	if (start == 0) return -1;
+	return (std::chrono::steady_clock::now().time_since_epoch().count() - start) / 1000000;
+}
+
+FILE* PadRecordFile() {
+	static FILE* const file = [] {
+		const char* path = std::getenv("KYTY_TEST_PAD_RECORD");
+		FILE*       f    = path != nullptr && *path != '\0' ? std::fopen(path, "w") : nullptr;
+		if (f != nullptr) {
+			LOGF("Kyty: KYTY_TEST_PAD_RECORD %s (anchor: loading-end #%u)\n", path, PadAnchorEvent());
+		}
+		return f;
+	}();
+	return file;
+}
+
+void PadRecordState(const PadData& data) {
+	FILE* file = PadRecordFile();
+	if (file == nullptr) return;
+	const int64_t ms = PadMsSinceAnchor();
+	if (ms < 0) return;
+	const std::array<int, 6> axes = {data.left_stick_x,      data.left_stick_y,     data.right_stick_x,
+	                                 data.right_stick_y,     data.analog_buttons_l2, data.analog_buttons_r2};
+	Common::LockGuard  lock(g_pad_script_mutex);
+	static PadRecord   last {-1, 0xffffffffu, {-1, -1, -1, -1, -1, -1}};
+	if (data.buttons == last.buttons && axes == last.axes) return;
+	last = {ms, data.buttons, axes};
+	std::fprintf(file, "%lld %x %d %d %d %d %d %d\n", static_cast<long long>(ms), data.buttons, axes[0], axes[1],
+	             axes[2], axes[3], axes[4], axes[5]);
+	std::fflush(file);
+}
+
+const std::vector<PadRecord>& PadReplay() {
+	static const std::vector<PadRecord> records = [] {
+		std::vector<PadRecord> out;
+		const char*            path = std::getenv("KYTY_TEST_PAD_REPLAY");
+		FILE*                  f    = path != nullptr && *path != '\0' ? std::fopen(path, "r") : nullptr;
+		if (f == nullptr) {
+			if (path != nullptr && *path != '\0') LOGF("Kyty: KYTY_TEST_PAD_REPLAY %s: cannot open\n", path);
+			return out;
+		}
+		long long ms      = 0;
+		unsigned  buttons = 0;
+		int       a[6]    = {};
+		while (std::fscanf(f, "%lld %x %d %d %d %d %d %d", &ms, &buttons, &a[0], &a[1], &a[2], &a[3], &a[4], &a[5]) == 8) {
+			PadRecord r;
+			r.ms      = ms;
+			r.buttons = buttons;
+			for (int k = 0; k < 6; k++) r.axes[k] = std::clamp(a[k], 0, 255);
+			if (!out.empty() && r.ms < out.back().ms) r.ms = out.back().ms; // keep the times sorted
+			out.push_back(r);
+		}
+		std::fclose(f);
+		LOGF("Kyty: KYTY_TEST_PAD_REPLAY %s records=%zu last_ms=%lld (anchor: loading-end #%u)\n", path, out.size(),
+		     out.empty() ? 0ll : static_cast<long long>(out.back().ms), PadAnchorEvent());
+		return out;
+	}();
+	return records;
+}
+
+// True when a replay is loaded and the anchor passed: the recorded state replaces the pad state.
+bool PadReplayApply(PadData* data) {
+	const auto& records = PadReplay();
+	if (records.empty()) return false;
+	const int64_t ms = PadMsSinceAnchor();
+	if (ms < 0) return false;
+	// Binary search: reads come from several threads and handles, so no shared cursor.
+	const auto next = std::upper_bound(records.begin(), records.end(), ms,
+	                                   [](int64_t t, const PadRecord& r) { return t < r.ms; });
+	if (next == records.begin()) {
+		data->buttons           = 0;
+		data->left_stick_x      = 128;
+		data->left_stick_y      = 128;
+		data->right_stick_x     = 128;
+		data->right_stick_y     = 128;
+		data->analog_buttons_l2 = 0;
+		data->analog_buttons_r2 = 0;
+	} else {
+		const auto& r           = *(next - 1);
+		data->buttons           = r.buttons;
+		data->left_stick_x      = static_cast<uint8_t>(r.axes[0]);
+		data->left_stick_y      = static_cast<uint8_t>(r.axes[1]);
+		data->right_stick_x     = static_cast<uint8_t>(r.axes[2]);
+		data->right_stick_y     = static_cast<uint8_t>(r.axes[3]);
+		data->analog_buttons_l2 = static_cast<uint8_t>(r.axes[4]);
+		data->analog_buttons_r2 = static_cast<uint8_t>(r.axes[5]);
+	}
+	static std::atomic<bool> started {false};
+	if (!started.exchange(true, std::memory_order_relaxed)) {
+		LOGF("Kyty: KYTY_TEST_PAD_REPLAY started\n");
+	}
+	if (next == records.end()) {
+		static std::atomic<bool> ended {false};
+		if (!ended.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Kyty: KYTY_TEST_PAD_REPLAY reached its last record at %lld ms\n", static_cast<long long>(ms));
+		}
+	}
+	data->connected       = true;
+	data->connected_count = std::max<uint8_t>(data->connected_count, 1);
+	return true;
 }
 
 } // namespace
@@ -494,6 +661,8 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
 	data->device_unique_data_len = 0;
+	PadRecordState(*data);        // KYTY_TEST_PAD_RECORD: the real pad, before any script
+	(void)PadReplayApply(data);   // KYTY_TEST_PAD_REPLAY
 	PadScriptApply(data);
 }
 
