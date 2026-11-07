@@ -1300,6 +1300,27 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 		image = m_slot_images.try_get(id);
 	}
+	// KYTY_STENCIL_STORAGE_SHADOW: a depth image deleted before its shadow is copied back has no
+	// stencil left to take it (Erlou crashed copying into one, slotVector.h:71). Its pending pairs
+	// and its shadow image go with it, so a later image in the same slot never receives the copy.
+	if (!m_stencil_shadows.empty() || !m_pending_stencil_shadows.empty()) [[unlikely]] {
+		const auto dropped = std::erase_if(m_pending_stencil_shadows,
+		                                   [id](const auto& pair) { return pair.second == id; });
+		if (dropped != 0) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				LOGF("Stencil storage shadow: depth 0x%012" PRIx64
+				     " deleted before the copy back, %zu pair(s) skipped\n",
+				     image->info.data.address, static_cast<size_t>(dropped));
+			}
+		}
+		if (const auto shadow = m_stencil_shadows.find(id); shadow != m_stencil_shadows.end()) {
+			const auto shadow_id = shadow->second;
+			m_stencil_shadows.erase(shadow);
+			ReleaseUnregisteredImage(shadow_id);
+			image = m_slot_images.try_get(id);
+		}
+	}
 	if (HangTrace::Enabled()) {
 		const auto tick = m_scheduler.CurrentTick();
 		HangTrace::RecordImageFree(image->info.data.address, image->info.extent.width,
@@ -3604,7 +3625,7 @@ void TextureCache::FlushStencilStorageShadows() {
 	for (const auto& [shadow_id, depth_id]: m_pending_stencil_shadows) {
 		auto* shadow = m_slot_images.try_get(shadow_id);
 		auto* depth  = m_slot_images.try_get(depth_id);
-		if (shadow == nullptr || depth == nullptr || !SwapsStencilPlanes(*depth) ||
+		if (shadow == nullptr || depth == nullptr || !depth->registered || !SwapsStencilPlanes(*depth) ||
 		    depth->backing.extent.width != shadow->info.extent.width ||
 		    depth->backing.extent.height != shadow->info.extent.height) {
 			continue;
