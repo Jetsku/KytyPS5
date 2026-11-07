@@ -2445,6 +2445,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 // once with only them, each pass keeping its slots' masks and blends. KYTY_MRT_SPLIT=0 binds them
 // together as before.
 static Live::Switch g_mrt_split("KYTY_MRT_SPLIT", Live::ParseDefaultOn); // live
+static Live::Switch g_draw_skip_vs("KYTY_DRAW_SKIP_VS", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoull(value, nullptr, 16)) : 0;
+}); // live, diagnostic
 
 static bool MrtSplitEnabled() {
 	return g_mrt_split.Get() != 0;
@@ -5659,7 +5662,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                          : 0);
 		vk_buffer.insertDebugLabel(text);
 	}
-	if (mesh_indirect) {
+	// KYTY_DRAW_SKIP_VS=<hex vs hash> (diagnostic, live, default off): draws with this vertex program
+	// record their state but emit no draw command (to see which object a draw renders).
+	const bool skip_draw = g_draw_skip_vs.Get() != 0 && state.vertex_info[0].stage.program != nullptr &&
+	                       state.vertex_info[0].stage.program->shader_hash ==
+	                           static_cast<uint64_t>(g_draw_skip_vs.Get());
+	if (skip_draw) [[unlikely]] {
+	} else if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
 		// parameter block (a record the draw does not need has no workgroups). Indirect draws are
 		// never split: the block's dword 6 is 0.
