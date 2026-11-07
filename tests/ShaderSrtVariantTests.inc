@@ -584,6 +584,33 @@ void CallIsSkipped() {
   std::printf("[compute] CallIsSkipped                     ok\n");
 }
 
+// KYTY_HUGE_HELPER_OUTLINE: a helper with 16 call sites in a module of 100,000 words becomes
+// DontInline; fewer calls or a smaller module leave its function control alone.
+void HugeHelperOutlineControl() {
+  const auto module = [](size_t words, u32 calls) {
+    std::vector<u32> m = {0x07230203u, 0x00010300u, 0u, 100u, 0u};
+    m.insert(m.end(), {(5u << 16) | 54u, 1u, 10u, 0u, 2u}); // %10 = OpFunction %1 None %2
+    m.insert(m.end(), {(5u << 16) | 54u, 1u, 11u, 0u, 2u}); // %11, never called
+    for (u32 c = 0; c < calls; c++) {
+      m.insert(m.end(), {(5u << 16) | 57u, 1u, 20u + c, 10u, 3u}); // OpFunctionCall %1 %10 %3
+    }
+    m.resize(std::max(words, m.size()), (1u << 16) | 0u); // OpNop padding
+    return m;
+  };
+  const std::array<u32, 2> helpers{10u, 11u};
+  auto huge = module(100000, 16);
+  ShaderRecompiler::Spirv::OutlineHugeModuleHelpers(huge, helpers);
+  Require("HugeHelperOutline", "outlined", huge[8] == 2u && huge[13] == 0u,
+          "a helper with 16 calls in a huge module was not made DontInline (or an uncalled one was)");
+  auto few = module(100000, 15);
+  ShaderRecompiler::Spirv::OutlineHugeModuleHelpers(few, helpers);
+  Require("HugeHelperOutline", "few calls", few[8] == 0u, "a helper with 15 calls was changed");
+  auto little = module(99999, 16);
+  ShaderRecompiler::Spirv::OutlineHugeModuleHelpers(little, helpers);
+  Require("HugeHelperOutline", "small module", little[8] == 0u, "a helper of a small module was changed");
+  std::printf("[compute] HugeHelperOutlineControl          ok\n");
+}
+
 // Flat SRT reads through a pointer that is null, or points nowhere, when the plan is evaluated
 // before the dispatch: Astro Bot's tiled lighting (78af8e26) loads a TLAS pointer from its SRT and
 // header fields through it (s_load_dwordx2 s[10:11], s[8:9], 0x30), on a path only lanes that
@@ -1193,6 +1220,7 @@ void RunAll(VulkanHarness *vulkan) {
       RunCase(vulkan, test);
     }
     CallIsSkipped();
+    HugeHelperOutlineControl();
     CallTargetsFromUserData();
     CallTablesTraced();
     CallTablesTracedWave32();

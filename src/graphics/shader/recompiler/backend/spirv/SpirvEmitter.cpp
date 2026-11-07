@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_set>
 
@@ -748,6 +749,46 @@ int32_t RealtimeClockShift(double timestamp_period_ns) {
 	return shift;
 }
 
+// KYTY_HUGE_HELPER_OUTLINE (CodegenOptions::huge_helper_outline): in a module of at least
+// HugeHelperWords words that already calls DontInline helpers, each of `helpers` with at least
+// HugeHelperCalls call sites gets the DontInline function control (the NVIDIA compiler spent 10-35 s
+// inlining them at every site). Only the function control word changes.
+void OutlineHugeModuleHelpers(std::vector<uint32_t>& words, std::span<const uint32_t> helpers) {
+	constexpr size_t   HugeHelperWords = 100'000;
+	constexpr uint32_t HugeHelperCalls = 16;
+	if (words.size() < HugeHelperWords) {
+		return;
+	}
+	std::array<uint32_t, 4> calls {};
+	EXIT_IF(helpers.size() > calls.size());
+	for (size_t i = 5; i < words.size();) {
+		const uint32_t op    = words[i] & 0xffffu;
+		const uint32_t count = words[i] >> 16u;
+		if (count == 0u || i + count > words.size()) {
+			return; // malformed: leave the module as it is
+		}
+		if (op == spv::OpFunctionCall && count >= 4u) {
+			for (size_t h = 0; h < helpers.size(); h++) {
+				calls[h] += helpers[h] != 0u && words[i + 3] == helpers[h] ? 1u : 0u;
+			}
+		}
+		i += count;
+	}
+	for (size_t i = 5; i < words.size();) {
+		const uint32_t op    = words[i] & 0xffffu;
+		const uint32_t count = words[i] >> 16u;
+		if (op == spv::OpFunction && count >= 5u) {
+			for (size_t h = 0; h < helpers.size(); h++) {
+				if (helpers[h] != 0u && words[i + 2] == helpers[h] && calls[h] >= HugeHelperCalls) {
+					words[i + 3] = (words[i + 3] & ~static_cast<uint32_t>(spv::FunctionControlInlineMask)) |
+					               spv::FunctionControlDontInlineMask;
+				}
+			}
+		}
+		i += count;
+	}
+}
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records) {
 	using namespace Emitter;
@@ -853,7 +894,13 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto words = state.builder.Build();
+	if (GetCodegenOptions().huge_helper_outline && !state.indirect_raw_functions.empty()) {
+		const std::array<uint32_t, 2> helpers {state.indirect_format_compact_function,
+		                                       state.bda_pointer_function};
+		OutlineHugeModuleHelpers(words, helpers);
+	}
+	return words;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

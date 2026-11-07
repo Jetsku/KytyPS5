@@ -293,6 +293,15 @@ struct CodegenOptions {
 	// dword at every load (adapted from Erlou93/KytyPS5-Yotei F1, indirect_raw_dword / _x<N>). Same
 	// results. Ghost of Yotei's 0x4ca0cf7e5a0c4757 has ~500 such loads; its driver compile took 65 s.
 	bool indirect_raw_outline = false;
+	// KYTY_HUGE_HELPER_OUTLINE=0 turns off (default on; only acts with KYTY_INDIRECT_RAW_OUTLINE): in a
+	// module of at least 100,000 words that already holds the DontInline raw-load functions, the
+	// compact formatted-load decoder and get_bda_pointer become DontInline when they have at least 16
+	// call sites. The NVIDIA compiler spent 10-35 s inlining them at every call site (Ghost of Yotei
+	// CS 0xc1989e057150728f: 132 decoder calls, 27-34 s -> 4 s offline on an RTX 3090; 0x4ca0cf7e5a0c4757
+	// 19 s -> 3.5 s; 0xe8e383355f93ab53, 169 get_bda_pointer calls, 11 s -> 4 s). Same results; the
+	// helpers run as calls. Limited to modules that already call DontInline helpers because DontInline
+	// decoders lost the device in other titles' huge kernels (see indirect_format_inline).
+	bool huge_helper_outline = true;
 	// KYTY_NULL_BUFFER_SHARE=1 (default 0): a null buffer V# (all zeros) specializes like the last live
 	// V# of its slot (ResourceMaterialization.cpp SpecializeBuffer), so a shader whose slots are null in
 	// some dispatches and live in others has one permutation instead of one per null/live combination

@@ -87,6 +87,7 @@ CodegenOptions FromEnvironment() {
 	options.cfg_clone_exits   = EnvFlag("KYTY_CFG_CLONE_EXITS", options.cfg_clone_exits);
 	options.cfg_clone_regions = EnvFlag("KYTY_CFG_CLONE_REGIONS", options.cfg_clone_regions);
 	options.indirect_raw_outline = EnvFlag("KYTY_INDIRECT_RAW_OUTLINE", options.indirect_raw_outline);
+	options.huge_helper_outline  = EnvFlag("KYTY_HUGE_HELPER_OUTLINE", options.huge_helper_outline);
 	options.null_buffer_share    = EnvFlag("KYTY_NULL_BUFFER_SHARE", options.null_buffer_share);
 	options.bounded_key_images   = EnvFlag("KYTY_BOUNDED_KEY_IMAGES", options.bounded_key_images);
 	options.drop_graphics_indirect_stores =

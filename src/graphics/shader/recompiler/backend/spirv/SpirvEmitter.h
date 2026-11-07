@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -145,6 +146,10 @@ HostWaveClusters GetHostWaveClusters();
 // atomics, which force depth/stencil tests after the shader for a shader that can discard).
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records = true);
+
+// KYTY_HUGE_HELPER_OUTLINE: in a module of at least 100,000 words, each of `helpers` (function
+// ids, 0 = none, at most 4) with at least 16 call sites gets the DontInline function control.
+void OutlineHugeModuleHelpers(std::vector<uint32_t>& words, std::span<const uint32_t> helpers);
 
 // Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
 [[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);

@@ -1853,6 +1853,9 @@ static void DefineIndirectFormatCompactBody(EmitterState& state, uint32_t functi
 	}
 
 	state.builder.AddName(function_id, "indirect_formatted_load_compact");
+	if (control_mode == nullptr) {
+		state.indirect_format_compact_function = function_id;
+	}
 	state.builder.AddFunction(spv::OpFunction, result, function_id, control, function_type);
 	std::array<uint32_t, 7> parameters {};
 	for (auto& id: parameters) {
