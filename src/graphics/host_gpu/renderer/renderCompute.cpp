@@ -569,9 +569,35 @@ void NoteOp(char kind, uint64_t hash) {
 	s.seg_ops[{kind, hash}]++;
 }
 
+// KYTY_PASS_DUMP_ADDRS=<hex address>[,...] (diagnostic, live, default off: every image; at most 8):
+// only images at these guest addresses are read back, so texels of one target can be kept for many
+// consecutive frames.
+namespace {
+std::array<std::atomic<uint64_t>, 8> g_pass_dump_addrs {};
+Live::Switch                         g_pass_dump_addr_count("KYTY_PASS_DUMP_ADDRS", [](const char* value) -> int64_t {
+	uint32_t n = 0;
+	while (value != nullptr && *value != '\0' && n < g_pass_dump_addrs.size()) {
+		char*      end     = nullptr;
+		const auto address = std::strtoull(value, &end, 16);
+		if (end == value) break;
+		if (address != 0) g_pass_dump_addrs[n++].store(address, std::memory_order_relaxed);
+		if (*end != ',') break;
+		value = end + 1;
+	}
+	return n;
+}); // live, diagnostic
+} // namespace
+
 void NoteOutput(uint64_t address, uint32_t width, uint32_t height, int aspect) {
 	auto& s = Get();
 	if (!s.capturing || address == 0) return;
+	if (const auto n = g_pass_dump_addr_count.Get(); n > 0) {
+		bool listed = false;
+		for (int64_t i = 0; i < n && !listed; i++) {
+			listed = g_pass_dump_addrs[static_cast<size_t>(i)].load(std::memory_order_relaxed) == address;
+		}
+		if (!listed) return;
+	}
 	for (const auto& o: s.seg_outputs) {
 		if (o.address == address && o.aspect == aspect) return;
 	}
