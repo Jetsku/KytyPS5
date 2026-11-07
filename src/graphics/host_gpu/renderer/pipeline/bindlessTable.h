@@ -290,7 +290,17 @@ public:
 
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.
-	void OnImageUnregistered(ImageId id);
+	// replaced (TextureCache::ExpandImage): another image holds the contents now; with
+	// KYTY_BINDLESS_REPLACED_RESOLVE (default on) the keys are kept for TakeReplacedKeys, which
+	// resolves them before the next draw or dispatch that uses bindless images, instead of their
+	// sampling the placeholder until the GPU feedback asks for them a few frames later.
+	void OnImageUnregistered(ImageId id, bool replaced = false);
+	// The keys OnImageUnregistered made pending for a replaced image (taken once).
+	void TakeReplacedKeys(std::vector<std::pair<Heap*, uint32_t>>& keys) {
+		keys.swap(m_replaced_keys);
+		m_replaced_keys.clear();
+	}
+	[[nodiscard]] bool HasReplacedKeys() const noexcept { return !m_replaced_keys.empty(); }
 	// Keys made pending because the texture cache dropped their image (statistics; reset on read).
 	[[nodiscard]] uint64_t TakeUnregisteredKeys() noexcept {
 		return std::exchange(m_unregistered_keys, 0);
@@ -354,6 +364,7 @@ private:
 	std::atomic<uint64_t> m_watch_high {0};
 	std::atomic<uint64_t> m_watch_generation {1};
 	uint64_t              m_unregistered_keys = 0;
+	std::vector<std::pair<Heap*, uint32_t>> m_replaced_keys;
 	std::deque<Heap>      m_heaps;
 	std::vector<uint32_t> m_resized_heaps; // TakeResizedHeaps()
 	// FindOrCreateHeap's heaps by guest base (KYTY_BINDLESS_SMALL_HEAPS: Ghost of Yotei creates

@@ -3773,6 +3773,17 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		return; // region 0, count 0: every key samples the placeholder
 	}
 	ResolveBindlessRequests();
+	// KYTY_BINDLESS_REPLACED_RESOLVE: keys whose image the texture cache replaced (ExpandImage)
+	// are resolved again now, before this draw or dispatch samples them.
+	if (table.HasReplacedKeys()) {
+		m_bindless_replaced_keys.clear();
+		table.TakeReplacedKeys(m_bindless_replaced_keys);
+		for (const auto& [heap, key]: m_bindless_replaced_keys) {
+			if (key < heap->settled.size() && heap->settled[key] == 0) {
+				(void)ResolveBindlessKey(*heap, key);
+			}
+		}
+	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.image >= program.info.images.size()) {
 			continue;

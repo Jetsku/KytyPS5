@@ -1266,12 +1266,28 @@ bool BindlessTable::RemapSlotImage(uint32_t binding, uint32_t slot, ImageId old_
 	return no_refs;
 }
 
-void BindlessTable::OnImageUnregistered(ImageId id) {
+// KYTY_BINDLESS_REPLACED_RESOLVE (default on; =0 off): see OnImageUnregistered in the header.
+// Ghost of Yotei's leaf carpet samples a terrain height tile through a runtime T#; an expansion of
+// that tile's image left the key on the placeholder for a few frames, and leaves spawned then kept
+// the "no ground" height for good (a flat carpet).
+static bool ReplacedResolveEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_REPLACED_RESOLVE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void BindlessTable::OnImageUnregistered(ImageId id, bool replaced) {
 	const auto found = m_image_refs.find(ImageKey(id));
 	if (found == m_image_refs.end()) {
 		return;
 	}
+	const bool keep = replaced && ReplacedResolveEnabled();
 	for (const auto& [heap, key]: found->second) {
+		if (keep) {
+			m_replaced_keys.emplace_back(heap, key);
+		}
 		if (heap->slots[key] != 0) {
 			// Placeholder 0 of the slot's own view type (the 2D-array binding for a
 			// KYTY_BINDLESS_3D_AS_ARRAY entry).

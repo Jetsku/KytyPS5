@@ -1346,7 +1346,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		NoteBindlessStateChange(*image);
 		image->bindless_pinned = false;
 		if (on_bindless_unregister) {
-			on_bindless_unregister(id);
+			on_bindless_unregister(id, m_freeing_replaced);
 		}
 	}
 	if (on_image_views_dropped && !image->views.empty()) {
@@ -1389,6 +1389,20 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	                              reason == HangTrace::ImageFreeReason::PressureCollect ||
 	                              reason == HangTrace::ImageFreeReason::ResidentIdle)) {
 		return;
+	}
+	// KYTY_BINDLESS_FREE_LOG=<n> (diagnostic): the first n frees of bindless-pinned images.
+	if (image.bindless_pinned) {
+		static const uint32_t limit = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_FREE_LOG");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+		}();
+		static std::atomic<uint32_t> logged = 0;
+		if (limit != 0 && logged.fetch_add(1, std::memory_order_relaxed) < limit) {
+			LOGF("Bindless free: reason %u image %u 0x%" PRIx64 "+0x%" PRIx64 " %ux%u vk%u gpu=%d\n",
+			     static_cast<uint32_t>(reason), id.index, image.info.data.address, image.info.data.size,
+			     image.info.extent.width, image.info.extent.height,
+			     static_cast<uint32_t>(image.backing.format), image.IsGpuModified() ? 1 : 0);
+		}
 	}
 	if (VramStats::Enabled() && image.registered) {
 		NoteVramFree(image, reason);
@@ -4689,7 +4703,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		(void)CopyImage(expanded_id, source_id, "expand");
 	}
+	m_freeing_replaced = true;
 	FreeImage(source_id, HangTrace::ImageFreeReason::Expand);
+	m_freeing_replaced = false;
 	return expanded_id;
 }
 

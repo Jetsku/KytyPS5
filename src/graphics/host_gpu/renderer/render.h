@@ -1152,6 +1152,8 @@ private:
 	// Bindless heaps (Senaxx; descriptors.cpp): register the stage's heaps, patch their regions,
 	// and once per frame resolve the keys draws asked for.
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// KYTY_BINDLESS_REPLACED_RESOLVE: PrepareBindlessHeaps' scratch list.
+	std::vector<std::pair<BindlessHeap*, uint32_t>> m_bindless_replaced_keys;
 	void ResolveBindlessRequests();
 	void SyncWrittenBindlessEntries();
 	// Compares keys [first, last) of a heap with the T#s now in guest memory and settles the

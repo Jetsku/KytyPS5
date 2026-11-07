@@ -718,6 +718,9 @@ struct DispatchPeekRange {
 	// s<N>[@<offset>]: the 48-bit address in user SGPRs N and N + 1 (a V# base or a pointer),
 	// plus offset; UINT32_MAX for a fixed address.
 	uint32_t user_sgpr = UINT32_MAX;
+	// b<N>[@<offset>]: the base of the program's buffer binding N (as DispatchTrace lists them),
+	// plus offset; UINT32_MAX otherwise.
+	uint32_t buffer_slot = UINT32_MAX;
 };
 static const std::vector<DispatchPeekRange>& DispatchPeekRanges() {
 	static const std::vector<DispatchPeekRange> ranges = [] {
@@ -731,8 +734,9 @@ static const std::vector<DispatchPeekRange>& DispatchPeekRanges() {
 				if (plus != std::string::npos) {
 					DispatchPeekRange range;
 					const auto base = item.substr(0, plus);
-					if (!base.empty() && base[0] == 's') {
-						range.user_sgpr = static_cast<uint32_t>(std::strtoul(base.c_str() + 1, nullptr, 10));
+					if (!base.empty() && (base[0] == 's' || base[0] == 'b')) {
+						const auto slot = static_cast<uint32_t>(std::strtoul(base.c_str() + 1, nullptr, 10));
+						(base[0] == 's' ? range.user_sgpr : range.buffer_slot) = slot;
 						const auto at   = base.find('@');
 						range.address =
 						    at == std::string::npos ? 0 : std::strtoull(base.c_str() + at + 1, nullptr, 16);
@@ -742,7 +746,7 @@ static const std::vector<DispatchPeekRange>& DispatchPeekRanges() {
 					range.bytes   = std::min<uint32_t>(
                         static_cast<uint32_t>(std::strtoul(item.substr(plus + 1).c_str(), nullptr, 0)),
                         64u) & ~3u;
-					if ((range.address != 0 || range.user_sgpr != UINT32_MAX) && range.bytes != 0) {
+					if ((range.address != 0 || range.user_sgpr != UINT32_MAX || range.buffer_slot != UINT32_MAX) && range.bytes != 0) {
 						parsed.push_back(range);
 					}
 				}
@@ -783,7 +787,16 @@ static void DispatchPeek(RenderContext& context, CommandBuffer& command,
 	const auto slot   = next_slot++ % Slots;
 	auto ranges = DispatchPeekRanges();
 	const auto& user_data = input_info.stage.resources->user_data;
+	const auto& program = *input_info.stage.program;
 	for (auto& range: ranges) {
+		if (range.buffer_slot != UINT32_MAX) {
+			range.address += range.buffer_slot < program.info.buffers.size()
+			                     ? DecodeNativeDescriptor<ShaderBufferResource>(
+			                           input_info.stage.resources->buffers[range.buffer_slot])
+			                           .Base48()
+			                     : 0;
+			continue;
+		}
 		if (range.user_sgpr == UINT32_MAX) continue;
 		const auto low  = range.user_sgpr < user_data.size() ? user_data[range.user_sgpr] : 0u;
 		const auto high = range.user_sgpr + 1 < user_data.size() ? user_data[range.user_sgpr + 1] : 0u;
@@ -791,6 +804,7 @@ static void DispatchPeek(RenderContext& context, CommandBuffer& command,
 	}
 	command.EndRendering();
 	for (uint32_t i = 0; i < ranges.size(); i++) {
+		if (ranges[i].address < 0x100000000ull) continue; // a null binding
 		const auto [source, offset] = cache.ObtainBuffer(ranges[i].address, ranges[i].bytes, false);
 		if (source == nullptr) continue;
 		download->CopyFrom(command, *source, offset, uint64_t {slot} * SlotBytes + i * 64u,

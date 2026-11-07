@@ -126,8 +126,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// Bindless table (Senaxx): images the texture cache drops leave the table's slots first.
-	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
-		m_bindless_table.OnImageUnregistered(id);
+	m_texture_cache.on_bindless_unregister = [this](ImageId id, bool replaced) {
+		m_bindless_table.OnImageUnregistered(id, replaced);
 	};
 	m_texture_cache.on_image_views_dropped = [this](std::span<const CachedImageView> views) {
 		return m_bindless_table.ReleaseViews(views);

@@ -72,7 +72,9 @@ public:
 	// Bindless table hooks (Senaxx; RenderContext sets them). DeleteImage, on the GPU thread, calls
 	// on_bindless_unregister for a bindless-pinned image and then on_image_views_dropped with the
 	// image's views, before it unregisters it; its destruction waits for the current tick.
-	std::function<void(ImageId)>                          on_bindless_unregister;
+	// replaced: another image already holds the dropped image's contents (ExpandImage), so the
+	// keys that sampled it can be resolved again at once.
+	std::function<void(ImageId, bool replaced)>           on_bindless_unregister;
 	std::function<bool(std::span<const CachedImageView>)> on_image_views_dropped;
 
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
@@ -879,6 +881,8 @@ private:
 	bool             m_gc_filter_candidates  = true;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t>::Cursor m_pressure_gc_cursor;
 	uint64_t m_pressure_retirement_bytes = 0;
+	// ExpandImage is freeing the image it copied into a new one (on_bindless_unregister's replaced).
+	bool m_freeing_replaced = false;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_direct_dirty_image_query = false;
 	struct CleanImagePageProof {
