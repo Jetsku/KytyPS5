@@ -2,6 +2,7 @@
 
 #include "common/kytyEvents.h"
 #include "common/logging/log.h"
+#include "common/paceLog.h"
 
 #include <algorithm>
 #include <array>
@@ -327,6 +328,11 @@ bool Enabled() {
 
 Build::Build(Kind kind, uint64_t hash, uint64_t hash2) {
 	KytyEvents::NoteBuildStart();
+	if (PaceLog::StallTraceEnabled()) {
+		m_begin_ns = PaceLog::NowNs();
+		m_hash     = hash;
+		m_kind     = kind;
+	}
 	if (!Enabled()) return;
 	EnsureMonitor();
 	m_slot = Claim(S().builds, kind, nullptr, hash, hash2);
@@ -334,16 +340,30 @@ Build::Build(Kind kind, uint64_t hash, uint64_t hash2) {
 
 Build::~Build() {
 	KytyEvents::NoteBuildEnd();
+	if (m_begin_ns != 0) {
+		PaceLog::NoteStall(m_begin_ns, PaceLog::NowNs(), PaceLog::StallBuild, m_hash, static_cast<int>(m_kind),
+		                   KindName(m_kind));
+	}
 	if (m_slot >= 0) S().builds[static_cast<size_t>(m_slot)].state.store(0, std::memory_order_release);
 }
 
 Wait::Wait(const char* who, Kind kind, uint64_t hash, uint64_t hash2) {
+	if (PaceLog::StallTraceEnabled()) {
+		m_begin_ns = PaceLog::NowNs();
+		m_hash     = hash;
+		m_kind     = kind;
+		m_who      = who;
+	}
 	if (!Enabled()) return;
 	EnsureMonitor();
 	m_slot = Claim(S().waits, kind, who, hash, hash2);
 }
 
 Wait::~Wait() {
+	if (m_begin_ns != 0) {
+		PaceLog::NoteStall(m_begin_ns, PaceLog::NowNs(), PaceLog::StallCompileWait, m_hash, static_cast<int>(m_kind),
+		                   m_who);
+	}
 	if (m_slot < 0) return;
 	auto& slot = S().waits[static_cast<size_t>(m_slot)];
 	if (slot.reported.load(std::memory_order_relaxed)) {

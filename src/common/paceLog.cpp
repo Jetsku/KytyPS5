@@ -9,6 +9,13 @@
 #include <mutex>
 #include <string>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace PaceLog {
 
 namespace {
@@ -145,6 +152,33 @@ void NoteWait(uint64_t begin_ns, uint64_t end_ns, int tid, int filter, uint64_t 
 	if ((++lines & 255u) == 0) {
 		std::fflush(g_waits);
 	}
+}
+
+bool StallTraceEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STALL_TRACE");
+		return value != nullptr && value[0] == '1' && Enabled() && g_waits != nullptr;
+	}();
+	return enabled;
+}
+
+void NoteStall(uint64_t begin_ns, uint64_t end_ns, StallCode code, uint64_t hash, int kind, const char* name) {
+	static const uint64_t min_ns = [] {
+		const auto* value = std::getenv("KYTY_STALL_TRACE_MIN_MS");
+		return (value != nullptr && value[0] != 0 ? std::strtoull(value, nullptr, 10) : 20ull) * 1'000'000ull;
+	}();
+	if (!StallTraceEnabled() || end_ns < begin_ns || end_ns - begin_ns < min_ns) {
+		return;
+	}
+#ifdef _WIN32
+	const int tid = static_cast<int>(GetCurrentThreadId());
+#else
+	const int tid = 0;
+#endif
+	std::lock_guard lock(g_mutex);
+	std::fprintf(g_waits, "%" PRIu64 ",%" PRIu64 ",%d,%d,0x%" PRIx64 ",%d,%s\n", Rel(begin_ns), Rel(end_ns), tid,
+	             static_cast<int>(code), hash, kind, name != nullptr ? name : "");
+	std::fflush(g_waits);
 }
 
 void NotePresent(uint64_t request_id, uint64_t vblank, uint64_t tick_ns, uint64_t present_ns) {

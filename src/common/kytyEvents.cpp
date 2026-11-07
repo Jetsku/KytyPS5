@@ -44,6 +44,9 @@ std::atomic<uint64_t> g_frames {0};
 std::atomic<uint64_t> g_read_bytes {0};
 std::atomic<uint64_t> g_builds_started {0};
 std::atomic<int64_t>  g_builds_in_flight {0};
+// Steady-clock nanoseconds (since its epoch) of the first loading-end events (LoadingEndNs).
+std::array<std::atomic<int64_t>, 4> g_load_end_ns {};
+std::atomic<uint32_t>               g_load_ends {0};
 
 constexpr size_t MaxPartial = 4096; // a line without a newline is printed once this long
 
@@ -85,6 +88,13 @@ std::string EventLine(const char* name, uint64_t frame, uint64_t now_ms, const s
 }
 
 void Print(const std::string& line) {
+	if (line.find("KYTY_EVENT: loading-end") != std::string::npos) {
+		const auto index = g_load_ends.fetch_add(1, std::memory_order_relaxed);
+		if (index < g_load_end_ns.size()) {
+			g_load_end_ns[index].store(std::chrono::steady_clock::now().time_since_epoch().count(),
+			                           std::memory_order_release);
+		}
+	}
 	Log::WriteToConsoleAndLog(line + "\n");
 	// KYTY_GUEST_PROBE_ARM_LOAD_END=<n> (diagnostic): arm the deferred ('^') guest probes at the n-th
 	// loading-end event (Ghost of Yotei: 1 = title menu, 2 = gameplay), so per-frame probes do not slow the load.
@@ -164,6 +174,11 @@ uint64_t Frames() {
 
 double Seconds() {
 	return static_cast<double>(ClockMs()) / 1000.0;
+}
+
+int64_t LoadingEndNs(uint32_t n) {
+	if (n == 0 || n > g_load_end_ns.size()) return 0;
+	return g_load_end_ns[n - 1].load(std::memory_order_acquire);
 }
 
 void GuestWrite(int fd, const void* data, size_t size) {

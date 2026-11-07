@@ -2724,11 +2724,14 @@ static bool DrawRunProgramEligible(const ShaderRecompiler::IR::CompiledShaderInf
 // left no run record for this reason, ~740 of them followed by a draw with the same key.
 static Live::Switch g_draw_run_fault_buffer("KYTY_DRAW_RUN_FAULT_BUFFER", Live::ParseDefaultOff);
 
-// KYTY_PIPELINE_SKIP_FAULT_BUFFER=1 (default off; on in the GT7 preset): a program whose only
-// "write" is the fault buffer may have its draws skipped while their pipeline builds. Every program
-// that reads memory through BDA gets that binding (BindingLayout, info.uses_dma): it reports pages
-// that must be faulted in, and a skipped draw loses only that report (the next draw that runs
-// reports them again). Most of GT7's draws have it, so they all waited for their pipelines.
+// KYTY_PIPELINE_SKIP_FAULT_BUFFER=1 (default off; on in the GT7 and Ghost of Yotei presets): a
+// program whose only "write" is the fault buffer may have its draws skipped while their pipeline
+// builds. Every program that reads memory through BDA gets that binding (BindingLayout,
+// info.uses_dma): it reports pages that must be faulted in, and a skipped draw loses only that
+// report (the next draw that runs reports them again). Most of GT7's draws have it, so they all
+// waited for their pipelines; in Ghost of Yotei 881 of 883 refusing programs refused only for it,
+// and on a cold cache the command processor built their pipelines unoptimized for 0.1-0.7 s each
+// while the game stood still.
 static bool SkipFaultBufferEnabled() {
 	static const bool on = [] {
 		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_FAULT_BUFFER");
