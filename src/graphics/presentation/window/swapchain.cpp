@@ -9,7 +9,9 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -23,12 +25,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include <limits>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -1313,6 +1318,114 @@ static bool PresentUnlocked() {
 
 Presenter::~Presenter() = default;
 
+// KYTY_FRAME_DUMP=<frames>[:<x>,<y>,<w>,<h>] (diagnostic, default off): each time the file
+// KYTY_FRAME_DUMP_TRIGGER (default _framedump.go in the working directory) appears, it is removed
+// and the next <frames> prepared video-out frames (every prepared frame, also ones that are not
+// shown; optional crop) are read back and appended to _framedump.bin ({u32 'KFDM', u32 dump
+// ordinal, i32 guest frame, u32 width, u32 height, u32 vk format, u32 bytes per pixel, u64
+// steady-clock ns at recording, pixels} per frame), to tell one-frame jumps from motion.
+static void FrameDump(RenderContext& renderer, CommandBuffer& command_buffer, Presenter::Frame& frame) {
+	struct Request {
+		uint32_t    frames = 0;
+		uint32_t    x = 0, y = 0, w = 0, h = 0;
+		std::string trigger;
+	};
+	static const Request request = [] {
+		Request parsed;
+		if (const auto* value = std::getenv("KYTY_FRAME_DUMP"); value != nullptr) {
+			char* end     = nullptr;
+			parsed.frames = static_cast<uint32_t>(std::strtoul(value, &end, 10));
+			if (end != nullptr && *end == ':') {
+				std::array<uint32_t, 4> rect {};
+				for (auto& v: rect) {
+					v = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+					if (end == nullptr || *end != ',') break;
+				}
+				parsed.x = rect[0];
+				parsed.y = rect[1];
+				parsed.w = rect[2];
+				parsed.h = rect[3];
+			}
+		}
+		const auto* trigger = std::getenv("KYTY_FRAME_DUMP_TRIGGER");
+		parsed.trigger      = trigger != nullptr && trigger[0] != '\0' ? trigger : "_framedump.go";
+		return parsed;
+	}();
+	if (request.frames == 0) [[likely]] {
+		return;
+	}
+	static uint32_t remaining = 0;
+	static uint32_t ordinal   = 0;
+	if (remaining == 0) {
+		std::error_code error;
+		if (!std::filesystem::exists(request.trigger, error)) {
+			return;
+		}
+		std::filesystem::remove(request.trigger, error);
+		remaining = request.frames;
+	}
+	remaining--;
+	const auto         format = frame.image.format;
+	const uint32_t     bpp    = format == vk::Format::eR16G16B16A16Sfloat ? 8u : 4u;
+	const auto         ex     = frame.image.extent;
+	const uint32_t     x      = std::min(request.x, ex.width - 1);
+	const uint32_t     y      = std::min(request.y, ex.height - 1);
+	const uint32_t     w      = request.w == 0 ? ex.width - x : std::min(request.w, ex.width - x);
+	const uint32_t     h      = request.h == 0 ? ex.height - y : std::min(request.h, ex.height - y);
+	const uint64_t     bytes  = uint64_t {w} * h * bpp;
+	constexpr uint32_t Slots  = 16;
+	static std::unique_ptr<Buffer> download;
+	static uint64_t                slot_bytes = 0;
+	if (download == nullptr || bytes > slot_bytes) {
+		auto& scheduler = renderer.GetCommandScheduler();
+		if (download != nullptr) {
+			scheduler.Wait(scheduler.CurrentTick() - 1);
+			scheduler.PopPendingOperations();
+		}
+		slot_bytes = bytes;
+		download   = std::make_unique<Buffer>(renderer.GetGraphics(), scheduler, MemoryUsage::Download, 0,
+		                                      AllFlags, slot_bytes * Slots);
+	}
+	const auto slot    = ordinal % Slots;
+	const auto number  = ordinal++;
+	auto       command = command_buffer.Handle();
+	frame.Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset     = slot * slot_bytes;
+	copy.imageSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageOffset      = vk::Offset3D {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
+	copy.imageExtent      = vk::Extent3D {w, h, 1};
+	command.copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal, download->Handle(),
+	                          copy);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download->Handle();
+	barrier.offset              = copy.bufferOffset;
+	barrier.size                = bytes;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, {},
+	                        barrier, {});
+	const auto guest_frame = renderer.GetGpu().GetFrameNum();
+	const auto t_ns        = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+	const auto vk_format   = static_cast<uint32_t>(format);
+	renderer.GetCommandScheduler().DeferOperation(
+	    [slot, number, guest_frame, w, h, vk_format, bpp, t_ns, bytes] {
+		    static std::FILE* file = std::fopen("_framedump.bin", "wb");
+		    if (file == nullptr) return;
+		    download->Invalidate(slot * slot_bytes, bytes);
+		    const uint32_t header[7] = {0x4d44464bu, number, static_cast<uint32_t>(guest_frame), w, h, vk_format,
+		                                bpp};
+		    std::fwrite(header, sizeof(header), 1, file);
+		    std::fwrite(&t_ns, sizeof(t_ns), 1, file);
+		    std::fwrite(download->Mapped().data() + slot * slot_bytes, 1, bytes, file);
+		    std::fflush(file);
+	    });
+}
+
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
                                           bool headset) {
 	KYTY_PROFILER_FUNCTION();
@@ -1334,6 +1447,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	FrameDump(m_impl->renderer, buffer, *frame);
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,

@@ -2445,6 +2445,43 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 // once with only them, each pass keeping its slots' masks and blends. KYTY_MRT_SPLIT=0 binds them
 // together as before.
 static Live::Switch g_mrt_split("KYTY_MRT_SPLIT", Live::ParseDefaultOn); // live
+// KYTY_DRAW_SKIP_VS / KYTY_DRAW_SKIP_PS=<hex hash>[,<hex hash>...] (diagnostic, live, default off, up
+// to 64 hashes each): draws with one of these vertex / pixel programs emit no draw command.
+struct DrawSkipSet {
+	static constexpr uint32_t             Max = 64;
+	std::array<std::atomic<uint64_t>, Max> hashes {};
+	std::atomic<uint32_t>                 count {0};
+
+	// Stores the list, returns its size (the switch's value).
+	int64_t Parse(const char* value) {
+		uint32_t n = 0;
+		while (value != nullptr && *value != '\0' && n < Max) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(value, &end, 16);
+			if (end == value) break;
+			if (hash != 0) hashes[n++].store(hash, std::memory_order_relaxed);
+			value = (*end == ',') ? end + 1 : end;
+			if (*end != ',') break;
+		}
+		count.store(n, std::memory_order_release);
+		return n;
+	}
+	[[nodiscard]] bool Contains(uint64_t hash) const {
+		const auto n = count.load(std::memory_order_acquire);
+		for (uint32_t i = 0; i < n; i++) {
+			if (hashes[i].load(std::memory_order_relaxed) == hash) return true;
+		}
+		return false;
+	}
+};
+static DrawSkipSet  g_draw_skip_vs_set;
+static DrawSkipSet  g_draw_skip_ps_set;
+static Live::Switch g_draw_skip_vs("KYTY_DRAW_SKIP_VS", [](const char* value) -> int64_t {
+	return g_draw_skip_vs_set.Parse(value);
+}); // live, diagnostic
+static Live::Switch g_draw_skip_ps("KYTY_DRAW_SKIP_PS", [](const char* value) -> int64_t {
+	return g_draw_skip_ps_set.Parse(value);
+}); // live, diagnostic
 
 static bool MrtSplitEnabled() {
 	return g_mrt_split.Get() != 0;
@@ -4932,6 +4969,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    static_cast<int>(m_context.GetGpu().GetFrameNum()),
 		    state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0,
 		    ps != nullptr ? ps->shader_hash : 0, draw.index_count, draw.instance_count);
+		text += fmt::format(" q={} seq={}", static_cast<int32_t>(HangTrace::CpContextQueue()), HangTrace::CpContextSequence());
+		// The vertex program's images (vt<i>[w]: written).
+		if (const auto* vs = state.vertex_info[0].stage.program;
+		    vs != nullptr && state.vertex_info[0].stage.resources != nullptr) {
+			const auto& vs_resources = *state.vertex_info[0].stage.resources;
+			for (uint32_t i = 0; i < vs->info.images.size() && i < vs_resources.images.size(); i++) {
+				const auto r = DecodeNativeDescriptor<ShaderTextureResource>(vs_resources.images[i]);
+				text += fmt::format(" | vt{}{}=0x{:x}/f{}/{}x{}", i, vs->info.images[i].written ? "w" : "", r.Base40(),
+				                    static_cast<uint32_t>(r.Format()), static_cast<uint32_t>(r.Width5()) + 1u,
+				                    static_cast<uint32_t>(r.Height5()) + 1u);
+			}
+		}
 		for (uint32_t i = 0; i < state.color_count; i++) {
 			const auto& info = state.color_info[i].desc.info;
 			text += fmt::format(" | c{}=0x{:x}/vk{}/{}x{}", i, info.data.address,
@@ -5662,7 +5711,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                          : 0);
 		vk_buffer.insertDebugLabel(text);
 	}
-	if (mesh_indirect) {
+	// KYTY_DRAW_SKIP_VS / KYTY_DRAW_SKIP_PS (diagnostic, live, default off): draws with one of these
+	// programs record their state but emit no draw command (to see which object a draw renders).
+	const bool skip_draw =
+	    (g_draw_skip_vs.Get() != 0 && state.vertex_info[0].stage.program != nullptr &&
+	     g_draw_skip_vs_set.Contains(state.vertex_info[0].stage.program->shader_hash)) ||
+	    (g_draw_skip_ps.Get() != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	     g_draw_skip_ps_set.Contains(state.ps_input_info.stage.program->shader_hash));
+	if (skip_draw) [[unlikely]] {
+	} else if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
 		// parameter block (a record the draw does not need has no workgroups). Indirect draws are
 		// never split: the block's dword 6 is 0.
