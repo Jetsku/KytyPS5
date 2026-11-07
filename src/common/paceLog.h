@@ -41,6 +41,22 @@ void NoteWait(uint64_t begin_ns, uint64_t end_ns, int tid, int filter, uint64_t 
 // Presented flip: writes the line.
 void NotePresent(uint64_t request_id, uint64_t vblank, uint64_t tick_ns, uint64_t present_ns);
 
+// KYTY_STALL_TRACE=1 (diagnostic, default off; needs KYTY_PACE_LOG): host-side blocking spans of at
+// least KYTY_STALL_TRACE_MIN_MS (default 20) go to the same .waits.csv, so a late frame can be
+// matched with what blocked the command processor. Rows: filter = the span code below, ident = the
+// shader hash (or 0), events = the CompileWatch kind (or 0), name = a static description.
+enum StallCode : int {
+	StallCompileWait   = -100, // a thread waited for a shader or pipeline build (CompileWatch::Wait)
+	StallBuild         = -101, // a build ran on this thread (CompileWatch::Build)
+	StallOptimize      = -102, // a background optimized pipeline compile (fast-first)
+	StallPipelineMutex = -103, // waited for the pipeline cache lock
+	StallProbe         = -104, // a driver-cache probe (fast-first, known key)
+	StallFastBuild     = -105, // an unoptimized pipeline build (fast-first)
+};
+[[nodiscard]] bool StallTraceEnabled();
+// begin_ns/end_ns from NowNs(); spans shorter than the minimum are dropped.
+void NoteStall(uint64_t begin_ns, uint64_t end_ns, StallCode code, uint64_t hash, int kind, const char* name);
+
 } // namespace PaceLog
 
 #endif

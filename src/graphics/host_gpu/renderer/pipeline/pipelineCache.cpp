@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pixelRateVariant.h"
 #include "graphics/host_gpu/renderer/pipeline/aaMaskCoverage.h"
 #include "common/ramStats.h"
+#include "common/paceLog.h"
 
 #include "common/assert.h"
 #include "common/compileWatch.h"
@@ -5488,6 +5489,7 @@ struct PipelineCache::FastFirstState {
 			const auto   probed =
 			    device.createGraphicsPipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
 			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
+			PaceLog::NoteStall(probe_begin, CompileClockNs(), PaceLog::StallProbe, 0, 0, "driver cache probe");
 			if (probed == vk::Result::eSuccess && cached != nullptr) {
 				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
 				out.cache_hit = true;
@@ -5522,6 +5524,12 @@ struct PipelineCache::FastFirstState {
 		}
 		out.snapshot = std::move(snapshot);
 		out.fast_ns  = CompileClockNs() - begin;
+		if (PaceLog::StallTraceEnabled()) {
+			uint64_t words = 0;
+			for (uint32_t i = 0; i < info.stageCount; i++) words += g_shader_modules.WordsOf(info.pStages[i].module);
+			PaceLog::NoteStall(begin, begin + out.fast_ns, PaceLog::StallFastBuild, outer.a,
+			                   static_cast<int>(words), "unoptimized graphics pipeline build");
+		}
 		out.key      = content.key;
 		counters.graphics_fast.fetch_add(1, std::memory_order_relaxed);
 		counters.fast_ns.fetch_add(out.fast_ns, std::memory_order_relaxed);
@@ -5551,6 +5559,7 @@ struct PipelineCache::FastFirstState {
 			const auto   probed =
 			    device.createComputePipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
 			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
+			PaceLog::NoteStall(probe_begin, CompileClockNs(), PaceLog::StallProbe, 0, 0, "driver cache probe");
 			if (probed == vk::Result::eSuccess && cached != nullptr) {
 				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
 				out.cache_hit = true;
@@ -5580,6 +5589,9 @@ struct PipelineCache::FastFirstState {
 		}
 		out.snapshot = std::move(snapshot);
 		out.fast_ns  = CompileClockNs() - begin;
+		PaceLog::NoteStall(begin, begin + out.fast_ns, PaceLog::StallFastBuild, outer.a,
+		                   static_cast<int>(g_shader_modules.WordsOf(info.stage.module)),
+		                   "unoptimized compute pipeline build");
 		out.key      = key;
 		counters.compute_fast.fetch_add(1, std::memory_order_relaxed);
 		counters.fast_ns.fetch_add(out.fast_ns, std::memory_order_relaxed);
@@ -5657,6 +5669,7 @@ struct PipelineCache::FastFirstState {
 	template <class Replace>
 	void Finish(vk::Result result, vk::Pipeline optimized, uint64_t begin, Replace&& replace) {
 		const auto ns = CompileClockNs() - begin;
+		PaceLog::NoteStall(begin, begin + ns, PaceLog::StallOptimize, 0, 0, "optimized pipeline compile");
 		Profiler::AddFrameWait(Profiler::FrameWait::PipelineOptimize, 1, ns);
 		if (result != vk::Result::eSuccess || optimized == nullptr) {
 			// The unoptimized pipeline stays; it renders the same state.
@@ -9633,7 +9646,12 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 		ready = m_prefetch->Take(key);
 		if (ready.pipeline != nullptr) ready_from = m_prefetch.get();
 	}
+	const auto        lock_begin = PaceLog::StallTraceEnabled() ? CompileClockNs() : 0;
 	Common::LockGuard lock(m_mutex);
+	if (lock_begin != 0) {
+		PaceLog::NoteStall(lock_begin, CompileClockNs(), PaceLog::StallPipelineMutex, watch_vs_hash, 0,
+		                   "graphics pipeline lock");
+	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		if (ready.pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(ready.pipeline->pipeline, nullptr);
@@ -9821,7 +9839,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		}
 	}
 
+	const auto        lock_begin = PaceLog::StallTraceEnabled() ? CompileClockNs() : 0;
 	Common::LockGuard lock(m_mutex);
+	if (lock_begin != 0) {
+		PaceLog::NoteStall(lock_begin, CompileClockNs(), PaceLog::StallPipelineMutex, 0, 1, "compute pipeline lock");
+	}
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {

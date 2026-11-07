@@ -36,7 +36,10 @@ public:
 	Build& operator=(const Build&) = delete;
 
 private:
-	int m_slot = -1;
+	int      m_slot     = -1;
+	uint64_t m_begin_ns = 0; // KYTY_STALL_TRACE (PaceLog::NoteStall)
+	uint64_t m_hash     = 0;
+	Kind     m_kind     = Kind::Count;
 };
 
 // This thread (who: "draw", "dispatch", ...) cannot go on until a build of `hash` is done.
@@ -48,7 +51,11 @@ public:
 	Wait& operator=(const Wait&) = delete;
 
 private:
-	int m_slot = -1;
+	int         m_slot     = -1;
+	uint64_t    m_begin_ns = 0; // KYTY_STALL_TRACE (PaceLog::NoteStall)
+	uint64_t    m_hash     = 0;
+	Kind        m_kind     = Kind::Count;
+	const char* m_who      = nullptr;
 };
 
 // Builds queued and not yet started, shown by name in the periodic line. Registered for its
