@@ -714,8 +714,8 @@ static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& 
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto r =
 		    DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]);
-		text += fmt::format(" | b{}{}=0x{:x}/s{}/n{}", i, program.info.buffers[i].written ? "w" : "",
-		                    r.Base48(), r.Stride(), r.NumRecords());
+		text += fmt::format(" | b{}{}=0x{:x}/s{}/n{}/f{}/d{:03x}", i, program.info.buffers[i].written ? "w" : "",
+		                    r.Base48(), r.Stride(), r.NumRecords(), r.RawFormat(), r.DstSelXYZW());
 	}
 	// The images: t<i>[w][s] = written, sampled; base, format, extent, tile mode.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {

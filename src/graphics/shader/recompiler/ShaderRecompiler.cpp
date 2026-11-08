@@ -34,7 +34,10 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <string_view>
+#include <tuple>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1247,9 +1250,56 @@ ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code, const Comp
 	return analysis;
 }
 
+// KYTY_DIAG_CODE_PATCH=<hash>:<byte offset>=<word>[,<byte offset>=<word>...][;<hash>:...] (diagnostic,
+// all hex): the listed program's guest code words are replaced before decoding (an instruction turned
+// into S_NOPs, a constant changed) to bisect a translation in game. Pair it with KYTY_SHADER_DUMP for
+// that hash so the persistent program cache does not serve the unpatched translation.
+static bool DiagCodePatch(uint64_t hash, std::span<const uint32_t> code, std::vector<uint32_t>& patched) {
+	static const auto patches = [] {
+		std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> parsed;
+		const char* value = std::getenv("KYTY_DIAG_CODE_PATCH");
+		if (value == nullptr) return parsed;
+		std::string_view text(value);
+		while (!text.empty()) {
+			const auto end   = text.find(';');
+			auto       group = text.substr(0, end);
+			text             = end == std::string_view::npos ? std::string_view() : text.substr(end + 1);
+			const auto colon = group.find(':');
+			if (colon == std::string_view::npos) continue;
+			const auto program = std::strtoull(std::string(group.substr(0, colon)).c_str(), nullptr, 16);
+			group              = group.substr(colon + 1);
+			while (!group.empty()) {
+				const auto comma = group.find(',');
+				const auto item  = std::string(group.substr(0, comma));
+				group            = comma == std::string_view::npos ? std::string_view() : group.substr(comma + 1);
+				const auto equal = item.find('=');
+				if (equal == std::string::npos) continue;
+				parsed.emplace_back(program,
+				                    static_cast<uint32_t>(std::strtoul(item.substr(0, equal).c_str(), nullptr, 16)),
+				                    static_cast<uint32_t>(std::strtoul(item.substr(equal + 1).c_str(), nullptr, 16)));
+			}
+		}
+		return parsed;
+	}();
+	bool applied = false;
+	for (const auto& [program, offset, word]: patches) {
+		if (program != hash || offset % 4u != 0u || offset / 4u >= code.size()) continue;
+		if (!applied) patched.assign(code.begin(), code.end());
+		applied              = true;
+		patched[offset / 4u] = word;
+		std::fprintf(stderr, "DIAG_CODE_PATCH hash=0x%016llx offset=0x%x word=0x%08x (was 0x%08x)\n",
+		             static_cast<unsigned long long>(hash), offset, word, code[offset / 4u]);
+	}
+	return applied;
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
+	}
+	std::vector<uint32_t> diag_patched;
+	if (DiagCodePatch(options.shader_hash, code, diag_patched)) {
+		code = diag_patched;
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
 	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
