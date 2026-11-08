@@ -17,6 +17,8 @@ IR::U32 Translator::ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, f
 	const auto safe_low  = SelectF32(ir.LogicalOr(nan, low), zero, truncated);
 	const auto safe      = SelectF32(high, IR::F32(IR::Value::F32(safe_upper)), safe_low);
 	const auto converted = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32F32, {safe}));
+	// (65535 and 255 convert to their results already.)
+	if (static_cast<uint32_t>(safe_upper) == upper_result) return converted;
 	return ir.Select(high, IR::U32(IR::Value(upper_result)), converted);
 }
 
@@ -32,10 +34,14 @@ IR::U32 Translator::ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, f
 	const auto safe_low     = SelectF32(low, IR::F32(IR::Value::F32(lower_bound)), truncated);
 	const auto safe_high    = SelectF32(high, IR::F32(IR::Value::F32(safe_upper)), safe_low);
 	const auto safe         = SelectF32(nan, IR::F32(IR::Value::F32(0.0f)), safe_high);
-	const auto converted    = IR::U32(ir.Emit(IR::ValueOpcode::ConvertS32F32, {safe}));
-	const auto clamped_high = ir.Select(high, IR::U32(IR::Value(upper_result)), converted);
-	const auto clamped      = ir.Select(low, IR::U32(IR::Value(lower_result)), clamped_high);
-	return ir.Select(nan, IR::U32(IR::Value(0u)), clamped);
+	auto       result       = IR::U32(ir.Emit(IR::ValueOpcode::ConvertS32F32, {safe}));
+	// The safe operand of NaN (0, and no ordered compare holds) and of a bound whose result its conversion gives
+	// (-2^31, -32768, 32767) converts to the result already: those need no select.
+	if (static_cast<uint32_t>(static_cast<int32_t>(safe_upper)) != upper_result)
+		result = ir.Select(high, IR::U32(IR::Value(upper_result)), result);
+	if (static_cast<uint32_t>(static_cast<int32_t>(lower_bound)) != lower_result)
+		result = ir.Select(low, IR::U32(IR::Value(lower_result)), result);
+	return result;
 }
 
 void Translator::V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index) {
