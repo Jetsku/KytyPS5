@@ -6842,6 +6842,9 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 // Ghost of Yotei's Proxy Set Cull (CS 0x039ed97b41485281) writes its results through BDA into
 // pages of CPU memory the game writes in the same frame; the settle's upload of the guest page
 // replaced the shader's bytes there, so those cull results were lost every frame.
+// On in the Yotei preset: standing at the ruined-village spawn, grass shadows flickered (one-frame
+// dark leaf-shaped shadows on the ground; gone with the shadow-pass draws skipped); 240 s with the
+// switch on vs off, same build: see the preset commit for the counts.
 static bool BdaCpuMergeEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_BDA_CPU_MERGE");
