@@ -849,6 +849,130 @@ static void DispatchDump(RenderContext& context, CommandBuffer& command,
 	});
 }
 
+// KYTY_CS_VERIFY=<cs hash> (hexadecimal, diagnostic, default off): for every dispatch of this compute
+// program, right before the dispatch command, the GPU's bytes (the registered cache buffer, no
+// synchronization) of the job table its user data 0/1 point at (256 bytes) and of the source records
+// at the table's first qword (up to 64 KiB, at most to the buffer's end) are copied to a host-visible
+// ring and, once the tick completed, compared with the guest's bytes read when the dispatch was
+// recorded and with the guest's bytes then. "CsVerify" lines: per frame a summary, per dispatch whose
+// GPU bytes differ from the recorded guest bytes the first differing offset and counts. Finds a CPU
+// write the GPU copy missed (stale source data read through BDA). Local logs only.
+static uint64_t CsVerifyHash() {
+	static const uint64_t hash = [] {
+		const auto* value = std::getenv("KYTY_CS_VERIFY");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t {0};
+	}();
+	return hash;
+}
+static void CsVerifyDispatch(RenderContext& context, CommandBuffer& command, const ShaderComputeInputInfo& input_info,
+                             uint32_t groups) {
+	constexpr uint64_t TableBytes = 256;
+	constexpr uint64_t SrcBytes   = 64 * 1024;
+	constexpr uint64_t SlotBytes  = TableBytes + SrcBytes;
+	constexpr uint32_t Slots      = 1024;
+	static std::unique_ptr<Buffer> download;
+	static uint32_t                next_slot = 0;
+	static int64_t                 last_frame = -1;
+	static uint32_t                ordinal = 0, unregistered = 0, dispatches = 0;
+	static std::shared_ptr<std::atomic<uint32_t>> mismatched = std::make_shared<std::atomic<uint32_t>>(0);
+	const auto& ud = input_info.stage.resources->user_data;
+	if (ud.size() < 2) return;
+	const auto frame = static_cast<int64_t>(context.GetGpu().GetFrameNum());
+	if (frame != last_frame) {
+		if (last_frame >= 0) {
+			LOGF("CsVerify: frame=%" PRId64 " dispatches=%u unregistered=%u mismatched_so_far=%u\n", last_frame, dispatches,
+			     unregistered, mismatched->load());
+		}
+		last_frame = frame;
+		ordinal = dispatches = unregistered = 0;
+	}
+	const auto index = ordinal++;
+	dispatches++;
+	const uint64_t table = ud[0] | (static_cast<uint64_t>(ud[1] & 0xffffu) << 32u);
+	if (table == 0) return;
+	const auto* table_alias = LibKernel::Memory::GuestBackingAlias(table, TableBytes);
+	if (table_alias == nullptr) return;
+	uint64_t src = 0;
+	std::memcpy(&src, table_alias, sizeof(src));
+	src &= 0xffffffffffffull;
+	auto& cache = context.GetBufferCache();
+	struct Piece {
+		uint64_t address = 0, bytes = 0, slot_offset = 0;
+		std::vector<uint8_t> guest;
+		bool registered = false;
+	};
+	auto pieces = std::make_shared<std::array<Piece, 2>>();
+	(*pieces)[0].address = table;
+	(*pieces)[0].bytes   = TableBytes;
+	(*pieces)[1].address = src;
+	(*pieces)[1].bytes   = 0;
+	if (src != 0) {
+		uint64_t bytes = SrcBytes;
+		while (bytes > 256 && cache.DebugPeekBuffer(src, bytes).first == nullptr) bytes /= 2;
+		(*pieces)[1].bytes = bytes;
+	}
+	if (download == nullptr) {
+		download = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(), MemoryUsage::Download, 0,
+		                                    AllFlags, SlotBytes * Slots);
+	}
+	const auto slot = next_slot++ % Slots;
+	for (uint32_t k = 0; k < 2; k++) {
+		auto& piece = (*pieces)[k];
+		if (piece.address == 0 || piece.bytes == 0) continue;
+		piece.slot_offset = uint64_t {slot} * SlotBytes + (k == 0 ? 0 : TableBytes);
+		const auto* alias = LibKernel::Memory::GuestBackingAlias(piece.address, piece.bytes);
+		if (alias == nullptr) continue;
+		piece.guest.assign(static_cast<const uint8_t*>(alias), static_cast<const uint8_t*>(alias) + piece.bytes);
+		const auto [source, offset] = cache.DebugPeekBuffer(piece.address, piece.bytes);
+		if (source == nullptr) {
+			unregistered++;
+			continue;
+		}
+		piece.registered = true;
+		download->CopyFrom(command, *source, offset, piece.slot_offset, piece.bytes, vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+	}
+	const bool table_cpu_dirty = cache.DebugCpuDirty(table, TableBytes);
+	const bool src_cpu_dirty   = src != 0 && (*pieces)[1].bytes != 0 && cache.DebugCpuDirty(src, (*pieces)[1].bytes);
+	auto       counter         = mismatched;
+	context.GetCommandScheduler().DeferOperation([pieces, frame, index, groups, table_cpu_dirty, src_cpu_dirty, counter] {
+		std::string text;
+		for (uint32_t k = 0; k < 2; k++) {
+			const auto& piece = (*pieces)[k];
+			if (!piece.registered || piece.guest.empty()) continue;
+			download->Invalidate(piece.slot_offset, piece.bytes);
+			const auto* gpu   = download->Mapped().data() + piece.slot_offset;
+			uint32_t    diff  = 0;
+			uint64_t    first = UINT64_MAX;
+			for (uint64_t w = 0; w + 4 <= piece.bytes; w += 4) {
+				if (std::memcmp(gpu + w, piece.guest.data() + w, 4) != 0) {
+					if (first == UINT64_MAX) first = w;
+					diff++;
+				}
+			}
+			if (diff == 0) continue;
+			uint32_t    now_diff = 0;
+			const auto* alias    = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(piece.address, piece.bytes));
+			if (alias != nullptr) {
+				for (uint64_t w = 0; w + 4 <= piece.bytes; w += 4) {
+					if (std::memcmp(gpu + w, alias + w, 4) != 0) now_diff++;
+				}
+			}
+			uint32_t g = 0, h = 0;
+			std::memcpy(&g, gpu + first, 4);
+			std::memcpy(&h, piece.guest.data() + first, 4);
+			text += fmt::format(" | {} 0x{:x}+0x{:x}: {} dwords differ (vs guest now {}), first +0x{:x} gpu {:08x} guest {:08x}",
+			                    k == 0 ? "table" : "src", piece.address, piece.bytes, diff, now_diff, first, g, h);
+		}
+		if (!text.empty()) {
+			counter->fetch_add(1);
+			LOGF("CsVerify: frame=%" PRId64 " #%u groups=%u cpu_dirty_at_record table=%d src=%d%s\n", frame, index, groups,
+			     table_cpu_dirty ? 1 : 0, src_cpu_dirty ? 1 : 0, text.c_str());
+		}
+	});
+}
+
 // phase 0 = before the dispatch, 1 = after it.
 static void DispatchPeek(RenderContext& context, CommandBuffer& command,
                          const ShaderComputeInputInfo& input_info, uint32_t phase) {
@@ -1870,6 +1994,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 			}
 		}
 	} else {
+		if (CsVerifyHash() != 0 && program.shader_hash == CsVerifyHash()) [[unlikely]] {
+			CsVerifyDispatch(m_context, buffer, input_info, thread_group_x * thread_group_y * thread_group_z);
+		}
 		buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

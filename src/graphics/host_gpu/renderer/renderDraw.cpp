@@ -4703,6 +4703,154 @@ static void DrawPeek(RenderContext& context, CommandBuffer& buffer, const DrawCa
 	    });
 }
 
+// KYTY_DRAW_STATS=<file> (diagnostic, default off): every draw with a depth target it writes is
+// wrapped in a pipeline-statistics query (input-assembly primitives, clipping primitives, fragment
+// shader invocations). The results are read when the query slot's frame comes round again (a ring
+// of 8 frames) and appended to <file> as binary records: kind 1 = draw (frame, ordinal in the frame,
+// flags, vs/ps hashes, counts, depth and colour-0 addresses, the three statistics), kind 2 = the
+// first recorded draw of a frame (frame, steady_clock ns: QPC-based, comparable to a window
+// capture's SystemRelativeTime). Finds the draw whose geometry blows up in one frame (a draw that
+// suddenly covers the screen shows as a jump of its fragment count). Needs pipelineStatisticsQuery
+// and hostQueryReset (enabled at device creation when the variable is set). Local files only.
+namespace DrawStats {
+struct Pending {
+	uint32_t frame          = 0;
+	uint32_t ordinal        = 0;
+	uint32_t flags          = 0;
+	uint32_t index_count    = 0;
+	uint32_t instance_count = 0;
+	uint64_t vs             = 0;
+	uint64_t ps             = 0;
+	uint64_t depth          = 0;
+	uint64_t color0         = 0;
+};
+#pragma pack(push, 1)
+struct Record {
+	uint32_t kind;
+	uint32_t frame;
+	uint32_t ordinal;
+	uint32_t flags;
+	uint64_t vs;
+	uint64_t ps;
+	uint32_t index_count;
+	uint32_t instance_count;
+	uint64_t depth;
+	uint64_t color0;
+	uint64_t stats[3];
+};
+#pragma pack(pop)
+static_assert(sizeof(Record) == 80);
+constexpr uint32_t Slots    = 8;
+constexpr uint32_t Capacity = 16384;
+struct Slot {
+	vk::QueryPool        pool = nullptr;
+	std::vector<Pending> pending;
+};
+struct State {
+	std::mutex  mutex;
+	std::FILE*  file = nullptr;
+	vk::Device  device;
+	Slot        slots[Slots];
+	uint32_t    current = 0;
+	int64_t     frame   = -1;
+	uint64_t    dropped = 0;
+	bool        failed  = false;
+};
+static const char* Path() {
+	static const char* path = [] {
+		const auto* value = std::getenv("KYTY_DRAW_STATS");
+		return value != nullptr && value[0] != '\0' ? value : static_cast<const char*>(nullptr);
+	}();
+	return path;
+}
+static State& Get() {
+	static State s;
+	return s;
+}
+static void Flush(State& s, Slot& slot) {
+	const auto used = static_cast<uint32_t>(slot.pending.size());
+	if (used == 0) return;
+	std::vector<uint64_t> results(static_cast<size_t>(used) * 3u);
+	const auto result = s.device.getQueryPoolResults(slot.pool, 0, used, results.size() * sizeof(uint64_t), results.data(),
+	                                                 3u * sizeof(uint64_t),
+	                                                 vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+	std::vector<Record> records(used);
+	for (uint32_t i = 0; i < used; i++) {
+		const auto& p = slot.pending[i];
+		auto&       r = records[i];
+		r.kind           = 1;
+		r.frame          = p.frame;
+		r.ordinal        = p.ordinal;
+		r.flags          = p.flags | (result == vk::Result::eSuccess ? 0u : 0x80000000u);
+		r.vs             = p.vs;
+		r.ps             = p.ps;
+		r.index_count    = p.index_count;
+		r.instance_count = p.instance_count;
+		r.depth          = p.depth;
+		r.color0         = p.color0;
+		for (uint32_t k = 0; k < 3; k++) r.stats[k] = results[i * 3u + k];
+	}
+	std::fwrite(records.data(), sizeof(Record), records.size(), s.file);
+	std::fflush(s.file);
+	s.device.resetQueryPool(slot.pool, 0, Capacity);
+	slot.pending.clear();
+}
+// The query index for this draw (UINT32_MAX: not recorded).
+static uint32_t Begin(RenderContext& context, const CommandSink& sink, const Pending& draw) {
+	auto& s = Get();
+	std::scoped_lock lock(s.mutex);
+	if (s.failed) return UINT32_MAX;
+	if (s.file == nullptr) {
+		s.device = context.GetGraphics().device;
+		s.file   = std::fopen(Path(), "wb");
+		vk::QueryPoolCreateInfo create {};
+		create.queryType          = vk::QueryType::ePipelineStatistics;
+		create.queryCount         = Capacity;
+		create.pipelineStatistics = vk::QueryPipelineStatisticFlagBits::eInputAssemblyPrimitives |
+		                            vk::QueryPipelineStatisticFlagBits::eClippingPrimitives |
+		                            vk::QueryPipelineStatisticFlagBits::eFragmentShaderInvocations;
+		for (auto& slot: s.slots) {
+			if (s.file == nullptr || s.device.createQueryPool(&create, nullptr, &slot.pool) != vk::Result::eSuccess) {
+				s.failed = true;
+				std::printf("DrawStats: setup failed\n");
+				return UINT32_MAX;
+			}
+			s.device.resetQueryPool(slot.pool, 0, Capacity);
+			slot.pending.reserve(Capacity);
+		}
+		std::printf("DrawStats: recording to %s\n", Path());
+	}
+	if (static_cast<int64_t>(draw.frame) != s.frame) {
+		s.frame   = draw.frame;
+		s.current = (s.current + 1u) % Slots;
+		Flush(s, s.slots[s.current]);
+		Record r {};
+		r.kind     = 2;
+		r.frame    = draw.frame;
+		r.stats[0] = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+		        .count());
+		r.stats[1] = s.dropped;
+		std::fwrite(&r, sizeof(r), 1, s.file);
+	}
+	auto& slot = s.slots[s.current];
+	if (slot.pending.size() >= Capacity) {
+		s.dropped++;
+		return UINT32_MAX;
+	}
+	const auto query = static_cast<uint32_t>(slot.pending.size());
+	slot.pending.push_back(draw);
+	slot.pending.back().ordinal = query;
+	sink.beginQuery(slot.pool, query, {});
+	return query;
+}
+static void End(const CommandSink& sink, uint32_t query) {
+	if (query == UINT32_MAX) return;
+	auto& s = Get();
+	sink.endQuery(s.slots[s.current].pool, query);
+}
+} // namespace DrawStats
+
 // KYTY_DRAW_VERIFY_VSB=<vs hash>:<buffer index>[,<buffer index>] (hexadecimal hash, diagnostic,
 // default off): after every draw with this vertex program, the GPU's bytes of those VS buffers
 // (stride x records, at most 256 KiB each) are copied to a host-visible ring and, once the tick
@@ -4781,6 +4929,14 @@ static void VerifyVsbDraw(RenderContext& context, CommandBuffer& buffer, const D
 		                                              index, inst] {
 			download->Invalidate(uint64_t {slot} * MaxBytes, bytes);
 			const auto*    gpu    = download->Mapped().data() + uint64_t {slot} * MaxBytes;
+			// KYTY_DRAW_VERIFY_VSB_DIR=<folder>: the GPU bytes are also written to a file per draw and buffer.
+			if (const auto* dir = std::getenv("KYTY_DRAW_VERIFY_VSB_DIR"); dir != nullptr && dir[0] != '\0') {
+				const auto path = fmt::format("{}/f{}_d{}_vsb{}_{:x}_s{}.bin", dir, frame, draw_index, index, base, stride);
+				if (auto* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+					std::fwrite(gpu, 1, bytes, f);
+					std::fclose(f);
+				}
+			}
 			const uint32_t record = stride != 0 ? stride : 16u;
 			uint32_t       diff = 0, first = UINT32_MAX;
 			const uint64_t records = bytes / record;
@@ -4801,10 +4957,23 @@ static void VerifyVsbDraw(RenderContext& context, CommandBuffer& buffer, const D
 					}
 				}
 			}
+			// The GPU bytes as floats: the largest magnitude and the NaN/Inf count (garbage instance data).
+			float    max_abs    = 0.0f;
+			uint32_t non_finite = 0;
+			for (uint64_t w = 0; w < bytes / 4u; w++) {
+				float value = 0.0f;
+				std::memcpy(&value, gpu + w * 4u, 4);
+				if (!std::isfinite(value)) {
+					non_finite++;
+				} else {
+					max_abs = std::max(max_abs, std::fabs(value));
+				}
+			}
 			std::string text = fmt::format(
 			    "VsbVerify: frame={} #{} vsb{} base=0x{:x} stride={} records={} inst={} clean={} diff={} "
-			    "guest_changed_by_completion={}",
-			    frame, draw_index, index, base, stride, records, inst, clean ? 1 : 0, diff, now_diff);
+			    "guest_changed_by_completion={} gpu_max_abs={:g} gpu_non_finite={}",
+			    frame, draw_index, index, base, stride, records, inst, clean ? 1 : 0, diff, now_diff, max_abs,
+			    non_finite);
 			if (diff != 0) {
 				text += fmt::format(" first={} gpu:", first);
 				for (uint32_t w = 0; w < std::min<uint32_t>(record, 32u) / 4u; w++) {
@@ -5839,6 +6008,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	     g_draw_skip_vs_set.Contains(state.vertex_info[0].stage.program->shader_hash)) ||
 	    (g_draw_skip_ps.Get() != 0 && state.ps_active && state.ps_input_info.stage.program != nullptr &&
 	     g_draw_skip_ps_set.Contains(state.ps_input_info.stage.program->shader_hash));
+	uint32_t stats_query = UINT32_MAX;
+	if (DrawStats::Path() != nullptr && !skip_draw && state.depth_info.desc.info.data.address != 0 &&
+	    state.depth_info.depth_write_enable) [[unlikely]] {
+		DrawStats::Pending p;
+		p.frame          = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+		p.flags          = (indirect != nullptr ? 1u : 0u) | (mesh_active ? 2u : 0u) | (mesh_indirect ? 4u : 0u) |
+		                   (state.ps_active ? 8u : 0u) | (state.color_count << 8u);
+		p.index_count    = draw.index_count;
+		p.instance_count = draw.instance_count;
+		p.vs             = state.vertex_info[0].stage.program ? state.vertex_info[0].stage.program->shader_hash : 0;
+		p.ps             = state.ps_active && state.ps_input_info.stage.program ? state.ps_input_info.stage.program->shader_hash : 0;
+		p.depth          = state.depth_info.desc.info.data.address;
+		p.color0         = state.color_count != 0 ? state.color_info[0].desc.info.data.address : 0;
+		stats_query      = DrawStats::Begin(m_context, vk_buffer, p);
+	}
 	if (skip_draw) [[unlikely]] {
 	} else if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
@@ -5895,6 +6079,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	DrawStats::End(vk_buffer, stats_query);
 	draw_cmd_scope.Stop();
 	// KYTY_DRAW_PEEK (above): the draw's per-draw block and indirect arguments, after it.
 	if (const auto peek_hash = DrawPeekRequest()[0];

@@ -762,6 +762,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto features12  = WindowContext::RequiredVulkan12Features();
 	features12.pNext = &features11;
 	// drawIndirectCount is set below, once the supported features are known.
+	// KYTY_DRAW_STATS (renderDraw.cpp, diagnostic): host query resets for its statistics pools.
+	if (const auto* stats = std::getenv("KYTY_DRAW_STATS"); stats != nullptr && stats[0] != '\0') {
+		features12.hostQueryReset = VK_TRUE;
+	}
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 
@@ -1333,6 +1337,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.occlusionQueryPrecise = supported_features2.features.occlusionQueryPrecise;
+	if (const auto* stats = std::getenv("KYTY_DRAW_STATS"); stats != nullptr && stats[0] != '\0') {
+		device_features.pipelineStatisticsQuery = supported_features2.features.pipelineStatisticsQuery;
+	}
 	device_features.drawIndirectFirstInstance =
 	    graphics.draw_indirect_first_instance_enabled ? VK_TRUE : VK_FALSE;
 	device_features.multiDrawIndirect = graphics.multi_draw_indirect_enabled ? VK_TRUE : VK_FALSE;

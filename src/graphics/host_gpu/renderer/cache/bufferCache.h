@@ -278,6 +278,11 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Diagnostics (KYTY_CS_VERIFY): the registered cache buffer holding [vaddr, vaddr + size) and the
+	// offset there, without any synchronization (nullptr: none). GPU thread.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> DebugPeekBuffer(uint64_t vaddr, uint64_t size);
+	// Diagnostics: whether [vaddr, vaddr + size) has CPU-modified (not yet uploaded) bytes.
+	[[nodiscard]] bool DebugCpuDirty(uint64_t vaddr, uint64_t size);
 	// KYTY_SRT_GPU_FILL (GPU thread): the guest dword at `vaddr` is GPU-written bytes that one
 	// registered buffer holds, with nothing newer elsewhere (no image over it, no pending
 	// publication or early release), so a GPU copy from that buffer reads its current value.

@@ -5396,6 +5396,22 @@ bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.GpuMirrorMatches(vaddr, size);
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::DebugPeekBuffer(uint64_t vaddr, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		return {nullptr, 0};
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (buffer.is_deleted || !buffer.IsInBounds(vaddr, size)) {
+		return {nullptr, 0};
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+bool BufferCache::DebugCpuDirty(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+}
+
 bool BufferCache::GpuFillSource(uint64_t vaddr, vk::Buffer* handle, uint64_t* offset) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	constexpr uint64_t size = sizeof(uint32_t);
