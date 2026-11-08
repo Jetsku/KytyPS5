@@ -761,7 +761,8 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// `done` (optional) is set once the downloaded bytes are in guest memory (the deferred write-back ran).
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic_bool> done = nullptr);
 	// KYTY_IMAGE_WRITEBACK_GUARD: a recorded image download not yet written into guest memory. It
 	// watches the pages it has not given up (`watched`); a CPU write to them before the write-back
 	// releases them and marks them CPU-written, and the write-back leaves those to the CPU.
@@ -821,6 +822,31 @@ private:
 	bool               RunBudgetGarbageCollector(uint64_t frame);
 	uint64_t           m_budget_frame       = UINT64_MAX;
 	uint64_t           m_budget_freed_bytes = 0;
+	// KYTY_VRAM_GC_FIX (textureCache.cpp, CollectGpuWrittenImages; adapted from Erlou93/KytyPS5-Yotei):
+	// GPU-written colour images the budget collector downloads into guest memory and frees once the
+	// bytes are there, if the image was neither written nor used since.
+	struct GcFixEviction {
+		ImageId                           id;
+		uint64_t                          serial = 0; // content serial when the download was recorded
+		uint64_t                          frame  = 0; // frame of the recording
+		uint64_t                          bytes  = 0;
+		std::shared_ptr<std::atomic_bool> done;
+	};
+	struct GcFixStats {
+		uint64_t downloads = 0, download_bytes = 0, freed = 0, freed_bytes = 0, cancelled = 0;
+		uint64_t failed = 0, skip_budget = 0, verify_exact = 0, verify_mismatch = 0, verify_skipped = 0;
+	};
+	uint64_t           CollectGpuWrittenImages(uint64_t frame, uint64_t min_age, uint64_t enough, bool critical);
+	void               FinishGcFixEvictions(uint64_t frame);
+	[[nodiscard]] bool GcFixEligible(const Image& image, uint64_t frame, uint64_t min_age);
+	// KYTY_VRAM_GC_FIX_VERIFY: the native texels of the image and of an image rebuilt from the
+	// downloaded guest bytes are compared before the free (1: equal, 0: differ, -1: not checked).
+	int                VerifyGcFixRoundTrip(ImageId id);
+	[[nodiscard]] uint64_t LimitTickForAge(uint64_t frame, uint64_t min_age) const;
+	std::vector<GcFixEviction>   m_gc_fix_pending;
+	std::unordered_set<uint32_t> m_gc_fix_pending_ids; // ImageId indices in m_gc_fix_pending
+	GcFixStats                   m_gc_fix_stats;
+	uint64_t                     m_gc_fix_log_frame = 0;
 	uint64_t           m_budget_freed       = 0;
 	uint64_t           m_budget_last        = 0; // planning budget at the last collection
 	std::deque<std::pair<uint64_t, uint64_t>> m_frame_ticks;

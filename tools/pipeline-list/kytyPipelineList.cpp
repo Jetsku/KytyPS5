@@ -1,11 +1,17 @@
 // kyty_pipeline_list: makes and checks KYPLST1 pipeline lists (pipelineList.h, KYTY_PIPELINE_LIST).
 //
 //   export --out <list> --game <app0 dir> (--shaders <shader journal> --pipelines <pipeline journal>)...
-//          [--exe <executable>] [--producer <text>] [--data <file relative to app0>]...
+//          [--exe <executable>] [--producer <text>] [--data <file relative to app0>]... [--scan]
 //       Merges recorded journals (_PipelineCache/<title>.shaders.journal and .pipelines.journal of one
 //       or more recording runs) into a list. Shaders are located in the game executable, else in the
 //       --data files (Insomniac titles: d/material, d/materialgraph); the list keeps their file,
 //       offsets and hashes, never their code.
+//       --scan: the codes still not found are looked for in every other file of the game folder by
+//       their footer (adapted from Erlou93/KytyPS5-Yotei's shader hints): PS5 shader binaries end in a
+//       48-byte block that starts with "barefoot"; every such block in a file is a candidate end of a
+//       code, which is kept when the bytes before it have the code's size and hashes. The files that
+//       hold codes join the list's data files, so no --data names are needed (codes without the footer
+//       still need --exe/--data).
 //   merge --out <list> <list>...        Union of lists of the same title, version and input layout.
 //   info <list>                         Header, counts, levels, section sizes.
 //   check <list> --game <app0 dir> [--exe <executable>]
@@ -14,8 +20,10 @@
 //       The no-code proof: no 64-byte window of the listed shaders' code (read from the executable)
 //       or of any journaled shader's code occurs in the file or in any decompressed section.
 //       Exit code 1 when one does.
+#include "common/stringUtils.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -24,8 +32,20 @@
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <xxhash.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
+#endif
 
 using namespace Libs::Graphics;
 
@@ -35,7 +55,66 @@ struct Arguments {
 	std::string                                      command;
 	std::string                                      out, game, exe, producer = "kyty_pipeline_list";
 	std::vector<std::string>                         shaders, pipelines, inputs, data;
+	bool                                             scan = false;
 };
+
+// --scan: the footer every PS5 shader binary ends with (48 bytes, starting with "barefoot").
+constexpr size_t FooterBytes   = 48;
+constexpr char   FooterText[8] = {'b', 'a', 'r', 'e', 'f', 'o', 'o', 't'};
+
+// XXH3-64 of a code's footer (| 1, never 0); 0 when the code does not end with one.
+uint64_t FooterHash(std::span<const uint8_t> code) {
+	if (code.size() < FooterBytes) return 0;
+	const auto* footer = code.data() + code.size() - FooterBytes;
+	if (std::memcmp(footer, FooterText, sizeof(FooterText)) != 0) return 0;
+	return XXH3_64bits(footer, FooterBytes) | 1u;
+}
+
+// Calls fn(file offset of the byte after the footer, bytes ending there (at most max_before + footer))
+// for every footer in the file, reading it in 64 MiB chunks. False when the file cannot be read.
+template <typename Fn>
+bool ForEachFooter(const std::filesystem::path& path, size_t max_before, Fn&& fn) {
+	std::ifstream in(path, std::ios::binary);
+	if (!in) return false;
+	constexpr size_t     Chunk = size_t {64} << 20u;
+	std::vector<uint8_t> buffer;
+	std::vector<uint8_t> chunk(Chunk);
+	uint64_t             buffer_start = 0; // file offset of buffer[0]
+	size_t               searched     = 0; // buffer positions below this were searched already
+	for (;;) {
+		in.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+		const auto got = static_cast<size_t>(in.gcount());
+		if (got == 0) break;
+		buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
+		size_t pos = searched;
+		while (pos + FooterBytes <= buffer.size()) {
+			const auto* hit = static_cast<const uint8_t*>(std::memchr(buffer.data() + pos, 'b', buffer.size() - FooterBytes + 1 - pos));
+			if (hit == nullptr) break;
+			pos = static_cast<size_t>(hit - buffer.data());
+			if (std::memcmp(hit, FooterText, sizeof(FooterText)) == 0) {
+				const size_t end   = pos + FooterBytes;
+				const size_t begin = end > max_before + FooterBytes ? end - max_before - FooterBytes : 0;
+				fn(buffer_start + end, std::span<const uint8_t>(buffer.data() + begin, end - begin));
+			}
+			pos++;
+		}
+		searched = buffer.size() >= FooterBytes ? buffer.size() - FooterBytes + 1 : 0;
+		// Keep what a code ending in the next chunk may start in, and the unsearched tail.
+		const size_t keep = std::min(buffer.size(), max_before + FooterBytes);
+		const size_t drop = buffer.size() - keep;
+		buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(drop));
+		buffer_start += drop;
+		searched = searched > drop ? searched - drop : 0;
+		if (got < chunk.size()) break;
+	}
+	return true;
+}
+
+// Arguments and list file names are UTF-8; paths are built from them as such (characters outside the code
+// page survive; adapted from Erlou93/KytyPS5-Yotei d5b030b).
+std::filesystem::path U8(const std::string& text) {
+	return Common::PathFromUtf8(text);
+}
 
 bool ReadFile(const std::filesystem::path& path, std::vector<uint8_t>& bytes) {
 	std::ifstream   in(path, std::ios::binary);
@@ -65,7 +144,7 @@ bool ReadParam(const std::filesystem::path& game, std::string& title, std::strin
 }
 
 std::filesystem::path Executable(const Arguments& args) {
-	return args.exe.empty() ? std::filesystem::path(args.game) / "eboot.bin" : std::filesystem::path(args.exe);
+	return args.exe.empty() ? U8(args.game) / "eboot.bin" : U8(args.exe);
 }
 
 // "kyty shader journal; device ...; input infos A B C" -> {A, B, C}.
@@ -103,7 +182,7 @@ void PrintExport(const PipelineList::ExportStats& s) {
 
 int Write(const PipelineList::File& file, const std::string& out) {
 	const auto bytes = PipelineList::Encode(file);
-	if (!WriteFile(out, bytes)) {
+	if (!WriteFile(U8(out), bytes)) {
 		std::fprintf(stderr, "cannot write %s\n", out.c_str());
 		return 1;
 	}
@@ -118,7 +197,7 @@ int Export(const Arguments& args) {
 		return 2;
 	}
 	PipelineList::Info info;
-	if (!ReadParam(args.game, info.title_id, info.app_version)) {
+	if (!ReadParam(U8(args.game), info.title_id, info.app_version)) {
 		std::fprintf(stderr, "cannot read the title and version from %s/sce_sys/param.json\n", args.game.c_str());
 		return 2;
 	}
@@ -127,7 +206,7 @@ int Export(const Arguments& args) {
 	info.state_format = PipelineList::StateFormat;
 	std::vector<uint8_t> image;
 	if (!ReadFile(Executable(args), image)) {
-		std::fprintf(stderr, "cannot read %s\n", Executable(args).string().c_str());
+		std::fprintf(stderr, "cannot read %s\n", Common::PathToString(Executable(args)).c_str());
 		return 2;
 	}
 	std::printf("%s %s, executable %zu bytes\n", info.title_id.c_str(), info.app_version.c_str(), image.size());
@@ -162,14 +241,14 @@ int Export(const Arguments& args) {
 		auto& shared = loaded_shaders[args.shaders[i]];
 		if (shared == nullptr) {
 			ShaderJournal::Settings shader_settings;
-			shader_settings.path              = args.shaders[i];
+			shader_settings.path              = U8(args.shaders[i]);
 			shader_settings.identity          = shader_identity;
 			shader_settings.background_writer = false;
 			shared                            = std::make_shared<ShaderJournal>(std::move(shader_settings));
 		}
 		run.shaders = shared;
 		PipelineJournal::Settings pipeline_settings;
-		pipeline_settings.path              = args.pipelines[i];
+		pipeline_settings.path              = U8(args.pipelines[i]);
 		pipeline_settings.identity          = pipeline_identity;
 		pipeline_settings.background_writer = false;
 		pipeline_settings.sealed_writes     = true; // never writes
@@ -214,7 +293,7 @@ int Export(const Arguments& args) {
 		}
 		if (rest.empty()) break;
 		std::vector<uint8_t> data_image;
-		if (!ReadFile(std::filesystem::path(args.game) / data, data_image)) {
+		if (!ReadFile(U8(args.game) / U8(data), data_image)) {
 			std::fprintf(stderr, "cannot read %s in %s\n", data.c_str(), args.game.c_str());
 			return 2;
 		}
@@ -228,6 +307,70 @@ int Export(const Arguments& args) {
 			in_file++;
 		}
 		std::printf("located %zu more in %s\n", in_file, data.c_str());
+	}
+	if (args.scan) {
+		// Wanted: footer hash -> query; the largest code bounds the bytes kept before a footer.
+		std::unordered_multimap<uint64_t, size_t> wanted;
+		size_t                                    max_before = 0, no_footer = 0, rest = 0;
+		std::vector<uint64_t>                     footer_of(queries.size(), 0);
+		for (const auto& [path, journal]: loaded_shaders) {
+			(void)path;
+			for (const auto& source: journal->Sources()) {
+				for (const auto* code: {&source.code, &source.back_code}) {
+					if (code->empty()) continue;
+					const std::span bytes(reinterpret_cast<const uint8_t*>(code->data()), code->size() * 4);
+					const auto      hash = PipelineList::CodeHash(bytes);
+					const auto      q    = query_of.at({hash.low, hash.high});
+					if (have[q] || footer_of[q] != 0) continue;
+					footer_of[q] = FooterHash(bytes);
+					if (footer_of[q] == 0) {
+						no_footer++;
+						footer_of[q] = 1; // counted once; never matches a real footer hash (they are odd but not 1)
+						continue;
+					}
+					wanted.emplace(footer_of[q], q);
+					max_before = std::max<size_t>(max_before, bytes.size() - FooterBytes);
+					rest++;
+				}
+			}
+		}
+		std::printf("scan: %zu codes not found yet have a footer, %zu have none\n", rest, no_footer);
+		// eboot.bin was searched; the other files, smaller first, until every code is found.
+		std::vector<std::pair<uint64_t, std::filesystem::path>> files;
+		std::error_code                                         ec;
+		const std::filesystem::path                             root = U8(args.game);
+		for (auto it = std::filesystem::recursive_directory_iterator(root, ec); !ec && it != std::filesystem::recursive_directory_iterator();
+		     it.increment(ec)) {
+			if (!it->is_regular_file(ec) || it->path().filename() == "eboot.bin") continue;
+			files.emplace_back(it->file_size(ec), it->path());
+		}
+		std::sort(files.begin(), files.end());
+		size_t   found_total = 0;
+		uint64_t read_bytes  = 0;
+		for (const auto& [size, path]: files) {
+			if (found_total == rest) break;
+			const auto relative = Common::PathToGenericString(std::filesystem::relative(path, root, ec));
+			size_t     in_file  = 0;
+			read_bytes += size;
+			ForEachFooter(path, max_before, [&](uint64_t end, std::span<const uint8_t> before) {
+				const auto footer = XXH3_64bits(before.data() + before.size() - FooterBytes, FooterBytes) | 1u;
+				const auto [first, last] = wanted.equal_range(footer);
+				for (auto it = first; it != last; ++it) {
+					const auto  q    = it->second;
+					const auto& want = queries[q];
+					if (have[q] || want.size_bytes > before.size()) continue;
+					const auto code = before.subspan(before.size() - want.size_bytes);
+					if (!(PipelineList::CodeHash(code) == want.hash)) continue;
+					where[q] = {builder.AddFile(relative), end - want.size_bytes};
+					have[q]  = true;
+					in_file++;
+					found_total++;
+				}
+			});
+			if (in_file != 0) std::printf("scan: located %zu in %s\n", in_file, relative.c_str());
+		}
+		std::printf("scan: located %zu of %zu (%zu files, %.1f GB read)\n", found_total, rest, files.size(),
+		            static_cast<double>(read_bytes) / 1e9);
 	}
 	const PipelineList::Builder::LocateFn locate =
 	    [&](std::span<const uint32_t> code) -> std::optional<PipelineList::Builder::Location> {
@@ -247,7 +390,7 @@ int Export(const Arguments& args) {
 bool Load(const std::string& path, PipelineList::File& file) {
 	std::vector<uint8_t> bytes;
 	std::string          error;
-	if (!ReadFile(path, bytes)) {
+	if (!ReadFile(U8(path), bytes)) {
 		std::fprintf(stderr, "cannot read %s\n", path.c_str());
 		return false;
 	}
@@ -288,7 +431,7 @@ int Merge(const Arguments& args) {
 int Info(const Arguments& args) {
 	if (args.inputs.size() != 1) return 2;
 	std::vector<uint8_t> bytes;
-	if (!ReadFile(args.inputs[0], bytes)) return 2;
+	if (!ReadFile(U8(args.inputs[0]), bytes)) return 2;
 	PipelineList::File file;
 	if (!Load(args.inputs[0], file)) return 2;
 	std::printf("%s: %zu bytes\n  title %s, version %s, producer %s, input infos %u %u %u, created %llu, pipeline "
@@ -324,7 +467,7 @@ int Info(const Arguments& args) {
 PipelineList::Resolved ResolveAgainst(const Arguments& args, const PipelineList::File& file, std::vector<uint8_t>& image,
                                       PipelineList::ResolveStats& stats) {
 	if (!ReadFile(Executable(args), image)) {
-		std::fprintf(stderr, "cannot read %s\n", Executable(args).string().c_str());
+		std::fprintf(stderr, "cannot read %s\n", Common::PathToString(Executable(args)).c_str());
 		image.clear();
 	}
 	// Data files: read once when first named.
@@ -336,7 +479,7 @@ PipelineList::Resolved ResolveAgainst(const Arguments& args, const PipelineList:
 		if (index != 0) {
 			auto [it, added] = data_images->try_emplace(index);
 			if (added && (index > file.files.size() ||
-			              !ReadFile(std::filesystem::path(args.game) / file.files[index - 1], it->second))) {
+			              !ReadFile(U8(args.game) / U8(file.files[index - 1]), it->second))) {
 				it->second.clear();
 			}
 			source = &it->second;
@@ -353,9 +496,12 @@ int Check(const Arguments& args) {
 	PipelineList::File file;
 	if (!Load(args.inputs[0], file)) return 2;
 	std::string title, version;
-	if (!ReadParam(args.game, title, version)) return 2;
+	if (!ReadParam(U8(args.game), title, version)) return 2;
 	std::printf("list for %s %s; game %s %s%s\n", file.info.title_id.c_str(), file.info.app_version.c_str(), title.c_str(),
 	            version.c_str(), title == file.info.title_id && version == file.info.app_version ? "" : ": MISMATCH (ignored at run time)");
+	if (title != file.info.title_id || version != file.info.app_version) {
+		return 2; // as the emulator: another title or game version is not resolved (no game file is read)
+	}
 	std::vector<uint8_t>       image;
 	PipelineList::ResolveStats stats;
 	const auto                 resolved = ResolveAgainst(args, file, image, stats);
@@ -374,7 +520,7 @@ int Verify(const Arguments& args) {
 	if (args.inputs.size() != 1 || args.game.empty()) return 2;
 	std::vector<uint8_t> bytes;
 	PipelineList::File   file;
-	if (!ReadFile(args.inputs[0], bytes) || !Load(args.inputs[0], file)) return 2;
+	if (!ReadFile(U8(args.inputs[0]), bytes) || !Load(args.inputs[0], file)) return 2;
 	std::vector<uint8_t>       image;
 	PipelineList::ResolveStats stats;
 	const auto                 resolved = ResolveAgainst(args, file, image, stats);
@@ -394,7 +540,7 @@ int Verify(const Arguments& args) {
 			return 2;
 		}
 		ShaderJournal::Settings settings;
-		settings.path              = path;
+		settings.path              = U8(path);
 		settings.identity          = identity;
 		settings.background_writer = false;
 		ShaderJournal journal(std::move(settings));
@@ -436,10 +582,20 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr, "usage: kyty_pipeline_list export|merge|info|check|verify ... (see the source header)\n");
 		return 2;
 	}
-	args.command = argv[1];
+	// The arguments as UTF-8 (Windows: from the wide command line; the narrow argv loses characters outside the code page).
+	std::vector<std::string> utf8(argv, argv + argc);
+#if defined(_WIN32)
+	int  wide_count = 0;
+	auto wide       = CommandLineToArgvW(GetCommandLineW(), &wide_count);
+	if (wide != nullptr && wide_count == argc) {
+		for (int i = 0; i < argc; i++) utf8[i] = Common::PathToString(std::filesystem::path(wide[i]));
+	}
+	if (wide != nullptr) LocalFree(wide);
+#endif
+	args.command = utf8[1];
 	for (int i = 2; i < argc; i++) {
-		const std::string arg   = argv[i];
-		const auto        value = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
+		const std::string arg   = utf8[i];
+		const auto        value = [&]() -> std::string { return i + 1 < argc ? utf8[++i] : std::string(); };
 		if (arg == "--out") {
 			args.out = value();
 		} else if (arg == "--game") {
@@ -454,6 +610,8 @@ int main(int argc, char** argv) {
 			args.pipelines.push_back(value());
 		} else if (arg == "--data") {
 			args.data.push_back(value());
+		} else if (arg == "--scan") {
+			args.scan = true;
 		} else {
 			args.inputs.push_back(arg);
 		}
