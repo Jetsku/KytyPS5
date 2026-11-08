@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,7 @@ std::atomic_bool     g_fragment_interlock {false};
 std::atomic_bool     g_compute_derivatives_linear {false};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
+std::atomic_uint32_t g_shader_clock_divisor {1};
 std::atomic_bool     g_guard_vertex_outputs {false};
 std::atomic_bool     g_guard_mesh_outputs {false};
 std::atomic_uint8_t  g_wave_clusters {0}; // HostWaveClusters: bit 0 vertex, 1 pixel, 2 mesh
@@ -747,11 +749,13 @@ HostGeometryGuard GetHostGeometryGuard() {
 void SetHostShaderClock(const HostShaderClock& clock) {
 	g_shader_clock_scope.store(static_cast<uint8_t>(clock.scope), std::memory_order_relaxed);
 	g_shader_clock_shift.store(std::clamp(clock.shift, -8, 8), std::memory_order_relaxed);
+	g_shader_clock_divisor.store(std::clamp(clock.divisor, 1u, 1024u), std::memory_order_relaxed);
 }
 
 HostShaderClock GetHostShaderClock() {
 	return {.scope = static_cast<HostClockScope>(g_shader_clock_scope.load(std::memory_order_relaxed)),
-	        .shift = g_shader_clock_shift.load(std::memory_order_relaxed)};
+	        .shift   = g_shader_clock_shift.load(std::memory_order_relaxed),
+	        .divisor = g_shader_clock_divisor.load(std::memory_order_relaxed)};
 }
 
 void SetHostWaveClusters(const HostWaveClusters& clusters) {
@@ -837,6 +841,23 @@ void OutlineHugeModuleHelpers(std::vector<uint32_t>& words, std::span<const uint
 		}
 		i += count;
 	}
+}
+
+HostShaderClock RealtimeClockScale(double timestamp_period_ns, bool exact) {
+	HostShaderClock clock {};
+	clock.shift = RealtimeClockShift(timestamp_period_ns);
+	if (!exact || clock.shift <= 0 || timestamp_period_ns <= 0.0) {
+		return clock;
+	}
+	const auto period_ps = static_cast<uint32_t>(std::lround(timestamp_period_ns * 1000.0));
+	const auto divisor   = RealtimeClockDivisor(period_ps);
+	if (std::has_single_bit(divisor)) {
+		clock.shift = std::countr_zero(divisor);
+	} else {
+		clock.shift   = 0;
+		clock.divisor = divisor;
+	}
+	return clock;
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

@@ -29,8 +29,8 @@ struct GraphicContext;
 // is 1, 2, 4, 8 or 16 bytes is supported.
 class DccClearHelper final {
 public:
-	// Codes in palette order.
-	static constexpr std::array<uint8_t, 5> ClearCodes {0x00, 0x20, 0x40, 0x80, 0xC0};
+	// Codes in palette order. 0x10: the PS5 register clear (KYTY_DCC_CLEAR_KEY_10, textureCache.cpp).
+	static constexpr std::array<uint8_t, 6> ClearCodes {0x00, 0x20, 0x40, 0x80, 0xC0, 0x10};
 	// The CPU decoder's clear value per code in ClearCodes order; nullopt: the code is rejected.
 	using ClearValues = std::array<std::optional<vk::ClearColorValue>, ClearCodes.size()>;
 

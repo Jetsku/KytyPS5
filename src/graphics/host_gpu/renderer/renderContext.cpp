@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/cruzStats.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -230,12 +231,35 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+static bool FaultWatchedOutsideEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FAULT_WATCHED_OUTSIDE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
+		// KYTY_FAULT_WATCHED_OUTSIDE=1 (default off; TheCruZ/KytyPS5-GTA b7961f66): cache tracking may
+		// still protect a page whose range left the GPU-mapped set; that fault is ours to resolve,
+		// not a guest access violation.
+		if (!FaultWatchedOutsideEnabled() || !GuestRange {fault_vaddr, fault_size}.Valid()) {
+			return false;
+		}
+		const auto watched = m_page_manager.CountWatchedPages(fault_vaddr, fault_size);
+		if (watched.write == 0 && watched.access == 0) {
+			return false;
+		}
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("RenderContext: resolving a fault on a watched page outside the GPU-mapped ranges "
+			            "(0x%016" PRIx64 ")\n",
+			            fault_vaddr);
+		}
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
 	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
@@ -586,11 +610,37 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// KYTY_UNMAP_DRAIN_SKIP=1 (default off; adapted from TheCruZ/KytyPS5-GTA 1f331bb7): the full
+		// GPU drain is skipped when nothing in the range is owned by GPU work or written by a pending
+		// completion: no GPU-dirty buffer bytes, no GPU-modified image, no pending backing
+		// publication (downloads, side readbacks) and no deferred label write. The GPU never reads
+		// guest memory itself (uploads copy it into cache buffers and images, freed by tick), and
+		// the guest unmaps memory only after the labels of the work that used it. Streaming games
+		// drained the GPU many times per frame here (GTA V: 5-8 ms per frame).
+		static const bool drain_skip = [] {
+			const auto* value = std::getenv("KYTY_UNMAP_DRAIN_SKIP");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		const bool skip_drain = drain_skip && m_command_scheduler.Active() && GuestRange {vaddr, size}.Valid() &&
+		                        !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+		                        !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+		                        !m_buffer_cache.HasPendingBackingPublication(vaddr, size) &&
+		                        (m_gpu == nullptr || m_gpu->DeferredLabelTick(vaddr, size) == 0);
+		Common::CruzStats::Add(Common::CruzStats::Counter::UnmapCalls);
+		if (skip_drain) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::UnmapDrainSkips);
+			Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrainSkips);
+		} else if (m_command_scheduler.Active()) {
 			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitUnmap);
+			const auto                    drain_start = Common::CruzStats::Enabled() ? Common::CruzStats::NowNs() : 0;
 			const auto                    tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			if (drain_start != 0) {
+				Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrainNs,
+				                       static_cast<uint64_t>(Common::CruzStats::NowNs() - drain_start));
+				Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrains);
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

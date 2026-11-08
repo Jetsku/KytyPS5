@@ -120,6 +120,8 @@ enum class HostClockScope : uint8_t { None, Subgroup, Device };
 struct HostShaderClock {
 	HostClockScope scope = HostClockScope::None;
 	int32_t        shift = 0;
+	// > 1: divide the clock by this instead of shifting (shift is then 0). See RealtimeClockDivisor.
+	uint32_t divisor = 1;
 };
 
 void            SetHostShaderClock(const HostShaderClock& clock);
@@ -164,6 +166,20 @@ HostWaveClusters GetHostWaveClusters();
 // its timestamp counter, so the shift is taken from timestampPeriod: the one that brings the rate
 // into [66.7, 133.3) MHz (3 at 1 GHz, 0 at 100 MHz, -2 at 19.2 MHz), between -8 and 8.
 [[nodiscard]] int32_t RealtimeClockShift(double timestamp_period_ns);
+// KYTY_MEMREALTIME_EXACT=1 (default off; TheCruZ/KytyPS5-GTA dcd6c059): the whole divisor nearest to
+// rate / 100 MHz (10 at 1 GHz, 8 at 800 MHz, 1 at 100 MHz and slower), 1..1024. The shift above
+// makes a 1 GHz clock 125 MHz (25% fast): guest timeouts and frame pacers that compare counter
+// differences with intervals in 100 MHz ticks expire early.
+[[nodiscard]] constexpr uint32_t RealtimeClockDivisor(uint32_t period_ps) {
+	if (period_ps == 0u) {
+		return 1u;
+	}
+	const uint32_t divisor = (10000u + period_ps / 2u) / period_ps;
+	return divisor < 1u ? 1u : (divisor > 1024u ? 1024u : divisor);
+}
+// The clock setting for a device clock with this timestamp period: the shift (RealtimeClockShift),
+// or with exact = true and a clock faster than 100 MHz the divisor (a power of two stays a shift).
+[[nodiscard]] HostShaderClock RealtimeClockScale(double timestamp_period_ns, bool exact);
 
 // mip_stats_records=false emits the plain variant of a GET_LOD_STATS-instrumented pixel shader:
 // the same bindings and code, without the per-sample feedback (and so without its storage-buffer

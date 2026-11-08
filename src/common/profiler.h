@@ -1249,6 +1249,14 @@ enum class FrameEvent : uint32_t {
 	VariantPlanSkips,
 	// KYTY_BDA_STORE_LOG: stores a BDA-writing dispatch logged for pages without a cache buffer.
 	BdaLoggedStores,
+	// KYTY_DISCARDED_TARGET_SKIP: new targets not initialized from a discarded target's stale bytes.
+	TextureDiscardedTargetSkips,
+	// KYTY_UNMAP_DRAIN_SKIP: guest unmaps that skipped the full GPU drain (nothing GPU-owned there).
+	UnmapDrainSkips,
+	// KYTY_CLAMP_RANGE_BITMAP: ClampRangeSize answers from the committed-page bitmap.
+	ClampRangeBitmapHits,
+	// KYTY_WRITE_DATA_GPU_RELEASE: GPU-timeline WRITE_DATA bytes taken out of the GPU-written ranges.
+	WriteDataGpuReleased,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

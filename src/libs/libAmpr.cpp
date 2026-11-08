@@ -273,6 +273,16 @@ void InvalidateFailedResolves() {
 	}
 }
 
+// KYTY_APR_ONE_QUERY=1 (default off; TheCruZ/KytyPS5-GTA 102766ce): a path's first resolution asks
+// the host once (File::GetInfo: exists, file or not, size) instead of up to three times. Same result.
+static bool AprOneQueryEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_APR_ONE_QUERY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) {
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -295,7 +305,18 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		info.file_id         = AprShared::ComputeFileId(guest_path);
 		info.host_path       = real_path;
 
-		if (Common::File::IsDirectoryExisting(real_path)) {
+		if (AprOneQueryEnabled()) {
+			// One attribute query per path: games resolve every file of their package this way
+			// (Demon's Souls ~224,000 at boot, a query each for directory, file and size before).
+			if (const auto host = Common::File::GetInfo(real_path); host && host->is_file) {
+				info.file_size = host->size;
+			} else if (host || Common::File::IsDirectoryExisting(real_path)) {
+				info.is_dir    = true;
+				info.file_size = 0x10000;
+			} else {
+				info.result = LibKernel::KERNEL_ERROR_ENOENT;
+			}
+		} else if (Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
 		} else if (Common::File::IsFileExisting(real_path)) {

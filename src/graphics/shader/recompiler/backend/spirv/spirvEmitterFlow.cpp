@@ -1452,6 +1452,11 @@ uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto uniform = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32Vector(state, 2), uniform,
 	                          ConstantU32(state, spv::ScopeSubgroup), read);
+	if (clock.divisor > 1u) {
+		// KYTY_MEMREALTIME_EXACT: the whole divisor nearest to 100 MHz (10 for a 1 GHz clock).
+		const auto value = Unary(state, spv::OpBitcast, TypeU64(state), uniform);
+		return Binary(state, spv::OpUDiv, TypeU64(state), value, ConstantU64(state, clock.divisor));
+	}
 	if (clock.shift == 0) {
 		return Unary(state, spv::OpBitcast, TypeU64(state), uniform);
 	}

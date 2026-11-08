@@ -2205,6 +2205,72 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// KYTY_CLAMP_RANGE_BITMAP: ClampRangeSize answers from the committed-page bitmap, which follows
+// every map, unmap and replacement (the answers equal the locked lookup's).
+void TestClampRangeBitmapFollowsMappings() {
+	const char* test = "ClampRangeBitmapFollowsMappings";
+	Libs::LibKernel::Memory::TestSetClampRangeBitmap(true);
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base  = reinterpret_cast<uint64_t>(reserve);
+	void*      left  = reinterpret_cast<void*>(base);
+	void*      right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &left, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "bitmap_left"),
+	        "KernelMapNamedFlexibleMemory(left)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "bitmap_right"),
+	        "KernelMapNamedFlexibleMemory(right)");
+	using Libs::LibKernel::Memory::ClampRangeSize;
+	using Libs::LibKernel::Memory::ClampRangeSizeQuiet;
+	const auto crossing = base + SceKernelPageSize - 0x100;
+
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200,
+	      "a range across two adjacent committed mappings was clamped");
+	Check(test, ClampRangeSize(base + 0x10, 0x20) == 0x20, "a range inside a mapping was clamped");
+	Check(test, ClampRangeSize(base + SceKernelPageSize, SceKernelPageSize * 2) == SceKernelPageSize,
+	      "a range into a reserved page was not clamped at the committed run's end");
+	Check(test, ClampRangeSizeQuiet(base + SceKernelPageSize * 2, 0x10) == 0,
+	      "a reserved page counted as committed");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(right)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x100, "a lookup after an unmap used the old run");
+	Check(test, ClampRangeSizeQuiet(base + SceKernelPageSize, 0x10) == 0,
+	      "an unmapped page counted as committed");
+	right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "bitmap_right"),
+	        "KernelMapNamedFlexibleMemory(right again)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200, "a lookup after a map used the old run");
+	// MAP_FIXED over a committed page keeps it committed.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "bitmap_right"),
+	        "KernelMapNamedFlexibleMemory(right replaced)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200, "a replaced mapping lost its pages");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(base), SceKernelPageSize,
+	                                                SceKernelProtCpuRead),
+	        "KernelMprotect(left)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200, "a protection change altered the run");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2), "KernelMunmap(both)");
+	Check(test, ClampRangeSizeQuiet(base, 0x10) == 0 && ClampRangeSizeQuiet(crossing, 0x200) == 0,
+	      "pages unmapped together still counted as committed");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
+	        "KernelMunmap(reserved page)");
+	Libs::LibKernel::Memory::TestSetClampRangeBitmap(false);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 // KYTY_CLAMP_RANGE_MEMO: ClampRangeSize answers repeated lookups from the calling thread's cache
 // of committed runs, and every change of the ranges (unmap, map, protection) retires it: the
 // answers always equal the locked lookup's (verify mode counts no mismatch).
@@ -5234,6 +5300,103 @@ void TestTlsStubsPreserveFlags() {
 // tests/TrinityTests.cpp (upstream 651ef73a0), linked into this test.
 int RunTrinityTests();
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+std::atomic<uint64_t> g_transient_unmap_retries {0};
+
+// The part of the runtime linker's fault handler that retries accesses to a replaced mapping.
+LONG CALLBACK TransientUnmapFaultHandler(EXCEPTION_POINTERS* info) {
+	const auto* record = info->ExceptionRecord;
+	if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const auto address = static_cast<uint64_t>(record->ExceptionInformation[1]);
+	const auto window  = Libs::LibKernel::Memory::WaitForTransientUnmap(address);
+	if (window != 0 && Libs::LibKernel::Memory::RetryTransientUnmapFault(address, window)) {
+		g_transient_unmap_retries.fetch_add(1, std::memory_order_relaxed);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// KYTY_TRANSIENT_UNMAP_RETRY (TheCruZ/KytyPS5-GTA 355f5de3): on the console, unmapping part of a
+// mapping and MAP_FIXED over a mapping leave the rest of the memory usable by other threads. The
+// emulator briefly unmaps it (Windows view splits, unmap then map for MAP_FIXED); a thread using it
+// meanwhile must not fault for good.
+void TestAccessDuringMappingReplacement() {
+	const char*   test  = "AccessDuringMappingReplacement";
+	constexpr int Pages = 64;
+	Libs::LibKernel::Memory::SetTransientUnmapRetryForTest(true);
+	auto* handler = AddVectoredExceptionHandler(1, TransientUnmapFaultHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+	g_transient_unmap_retries = 0;
+
+	const auto flexible =
+	    MapNamedFlexible(test, SceKernelPageSize * Pages, SceKernelProtCpuRw, "transient_split");
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
+	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* direct_addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&direct_addr, SceKernelPageSize,
+	                                                            SceKernelProtCpuRw, 0, phys_addr,
+	                                                            SceKernelPageSize, "transient_fixed"),
+	        "KernelMapNamedDirectMemory");
+	const auto direct = reinterpret_cast<uint64_t>(direct_addr);
+
+	std::atomic<bool>     stop {false};
+	std::atomic<uint64_t> mismatches {0};
+	std::atomic<uint64_t> accesses {0};
+	std::thread           worker([&] {
+		auto*    kept     = reinterpret_cast<volatile uint64_t*>(flexible);
+		auto*    replaced = reinterpret_cast<volatile uint64_t*>(direct);
+		uint64_t i        = 0;
+		for (; !stop.load(std::memory_order_relaxed); i++) {
+			kept[i % 512]     = i;
+			replaced[i % 512] = i;
+			if (kept[i % 512] != i || replaced[i % 512] != i) {
+				mismatches.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		accesses = i;
+	});
+
+	// Each unmap is a partial unmap of the view that holds the worker's page.
+	for (int page = Pages - 1; page >= 1; page--) {
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMunmap(flexible + SceKernelPageSize * page, SceKernelPageSize),
+		        "KernelMunmap(split)");
+	}
+	for (int i = 0; i < 256; i++) {
+		void* fixed = direct_addr;
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&fixed, SceKernelPageSize,
+		                                                            SceKernelProtCpuRw, SceKernelMapFixed,
+		                                                            phys_addr, SceKernelPageSize,
+		                                                            "transient_fixed"),
+		        "KernelMapNamedDirectMemory(fixed)");
+		Check(test, fixed == direct_addr, "MAP_FIXED moved the mapping");
+	}
+	stop = true;
+	worker.join();
+	RemoveVectoredExceptionHandler(handler);
+	Libs::LibKernel::Memory::SetTransientUnmapRetryForTest(false);
+
+	Check(test, mismatches == 0, "memory changed while its mapping was replaced");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(flexible, SceKernelPageSize),
+	        "KernelMunmap(flexible cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(direct, SceKernelPageSize),
+	        "KernelMunmap(direct cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok (%" PRIu64 " accesses, %" PRIu64 " retried)\n", test,
+	            accesses.load(), g_transient_unmap_retries.load());
+}
+#endif
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
@@ -5259,6 +5422,9 @@ int main(int argc, char** argv) {
 #endif
 	RunTest(TestGuestBackingCommitPolicy);
 	RunTest(TestFlexibleBackingDemandZero);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestAccessDuringMappingReplacement);
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
@@ -5339,6 +5505,7 @@ int main(int argc, char** argv) {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestClampRangeMemoFollowsMappings);
+	RunTest(TestClampRangeBitmapFollowsMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestAmmUnmapAcceptsHolesAndRestoresGpuRange);
 	RunTest(TestOrdinaryMappingsAvoidAmmWindow);

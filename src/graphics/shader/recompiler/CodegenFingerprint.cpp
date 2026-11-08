@@ -470,6 +470,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	const auto shader_clock = Spirv::GetHostShaderClock();
 	b.U8(static_cast<uint8_t>(shader_clock.scope));
 	b.U32(static_cast<uint32_t>(shader_clock.shift));
+	if (shader_clock.divisor > 1u) {
+		b.U32(shader_clock.divisor); // KYTY_MEMREALTIME_EXACT (absent otherwise: fingerprints unchanged)
+	}
 	const auto wave_clusters = Spirv::GetHostWaveClusters();
 	b.U8(wave_clusters.vertex ? 1u : 0u);
 	b.U8(wave_clusters.pixel ? 1u : 0u);

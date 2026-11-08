@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 
 #include <algorithm>
 #include <array>
@@ -47,6 +48,9 @@ PipelineLayoutHandles CreateLayouts(GraphicContext&                             
 	set_create.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&set_create, nullptr, &handles.set_layout) !=
 	        vk::Result::eSuccess);
+	if (!push_descriptors) {
+		DescriptorHeap::RegisterLayout(handles.set_layout, bindings); // KYTY_DESCRIPTOR_FIT
+	}
 
 	const vk::PushConstantRange  push_constants {push_stages, 0, push_size};
 	vk::PipelineLayoutCreateInfo layout_create {};

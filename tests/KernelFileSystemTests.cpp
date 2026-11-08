@@ -788,6 +788,15 @@ void TestFsync() {
   Check(FileSystem::KernelClose(fd) == OK && fsync(fd) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "closed fsync descriptor reports POSIX EBADF");
+
+  // FreeBSD syncs read-only descriptors, directories and the standard streams without error.
+  const int read_only = FileSystem::KernelOpen(Path, 0, 0);
+  Check(read_only >= 3 && fsync(read_only) == OK && FileSystem::KernelClose(read_only) == OK,
+        "fsync succeeds on a read-only descriptor");
+  const int directory = FileSystem::KernelOpen("/savedata0", 0x00020000, 0);
+  Check(directory >= 3 && fsync(directory) == OK && FileSystem::KernelClose(directory) == OK,
+        "fsync succeeds on a directory descriptor");
+  Check(fsync(1) == OK && fsync(2) == OK, "fsync succeeds on stdout and stderr");
 }
 
 void TestSaveTruncate() {

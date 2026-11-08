@@ -3,6 +3,7 @@
 #include "common/prepPhases.h"
 
 #include "common/assert.h"
+#include "common/cruzStats.h"
 #include "common/hangTrace.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
@@ -42,6 +43,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -396,6 +398,120 @@ struct ClampRangeMemoTotals {
 
 thread_local ClampRangeMemoTotals t_clamp_totals;
 
+// KYTY_CLAMP_RANGE_BITMAP=1 (default off; adapted from TheCruZ/KytyPS5-GTA 1f331bb7): ClampRangeSize
+// answers from a lock-free bitmap of committed 4 KiB pages below 1 TiB, kept under the ranges'
+// lock by every coverage change. Streaming changes the mappings many times per frame, which
+// retires KYTY_CLAMP_RANGE_MEMO's per-thread runs, and the misses take the ranges' lock (GTA V:
+// 15-35 ms per frame on the GPU threads). Tests force it with TestSetClampRangeBitmap.
+std::atomic<int> g_clamp_range_bitmap {-1};
+
+bool ClampRangeBitmapEnabled() {
+	auto value = g_clamp_range_bitmap.load(std::memory_order_relaxed);
+	if (value < 0) {
+		const auto* env = std::getenv("KYTY_CLAMP_RANGE_BITMAP");
+		value           = env != nullptr && std::strcmp(env, "1") == 0 ? 1 : 0;
+		g_clamp_range_bitmap.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
+
+// One bit per committed 4 KiB page of [0, 1 TiB). Pages change under the owner's lock; leaves are
+// allocated on first use and live as long as the map. A query racing a change orders as if it
+// preceded or followed it (bits are set before they are cleared, never the reverse).
+class CommittedPageMap {
+public:
+	static constexpr uint64_t Unknown = UINT64_MAX;
+
+	CommittedPageMap() = default;
+	~CommittedPageMap() {
+		for (auto& leaf: m_leaves) {
+			delete[] leaf.load(std::memory_order_relaxed);
+		}
+	}
+	KYTY_CLASS_NO_COPY(CommittedPageMap);
+
+	// Owner's lock held. A range that is not page aligned makes the map imprecise for good (every
+	// query then takes the locked path); outside the window nothing is recorded.
+	void Set(uint64_t start, uint64_t size, bool committed) {
+		if (size == 0) {
+			return;
+		}
+		if (((start | size) & PageMask) != 0) {
+			m_imprecise.store(true, std::memory_order_relaxed);
+			return;
+		}
+		if (size > WindowSize || start > WindowSize - size) {
+			return;
+		}
+		const auto first = start >> PageBits;
+		const auto end   = (start + size) >> PageBits;
+		for (auto page = first; page < end;) {
+			const auto leaf_end = std::min(end, (page / LeafPages + 1) * LeafPages);
+			auto*      words    = Leaf(page / LeafPages, committed);
+			if (words == nullptr) {
+				page = leaf_end;
+				continue;
+			}
+			while (page < leaf_end) {
+				const auto bit   = page % 64u;
+				const auto count = std::min<uint64_t>(64u - bit, leaf_end - page);
+				const auto mask  = (count == 64u ? ~uint64_t {0} : ((uint64_t {1} << count) - 1u)) << bit;
+				auto&      word  = words[(page % LeafPages) / 64u];
+				if (committed) {
+					word.fetch_or(mask, std::memory_order_release);
+				} else {
+					word.fetch_and(~mask, std::memory_order_release);
+				}
+				page += count;
+			}
+		}
+	}
+
+	// How many bytes from `address` (at most `size`) lie in contiguous committed pages, or Unknown
+	// when the map cannot tell.
+	[[nodiscard]] uint64_t CommittedRun(uint64_t address, uint64_t size) const {
+		if (m_imprecise.load(std::memory_order_relaxed) || size == 0 || address >= WindowSize ||
+		    size > WindowSize - address) {
+			return Unknown;
+		}
+		const auto first = address >> PageBits;
+		const auto end   = (address + size + PageMask) >> PageBits;
+		for (auto page = first; page < end;) {
+			const auto* words = m_leaves[page / LeafPages].load(std::memory_order_acquire);
+			const auto  bit   = page % 64u;
+			const auto  count = std::min<uint64_t>(64u - bit, end - page);
+			const auto  word  = words == nullptr ? 0 : words[(page % LeafPages) / 64u].load(std::memory_order_acquire);
+			// The first page of the run that is not committed.
+			const auto missing = ~(word >> bit) & (count == 64u ? ~uint64_t {0} : ((uint64_t {1} << count) - 1u));
+			if (missing != 0) {
+				const auto run_end = (page + static_cast<uint64_t>(std::countr_zero(missing))) << PageBits;
+				return run_end <= address ? 0 : std::min(size, run_end - address);
+			}
+			page += count;
+		}
+		return size;
+	}
+
+private:
+	static constexpr uint64_t PageBits   = 12;
+	static constexpr uint64_t PageMask   = (uint64_t {1} << PageBits) - 1u;
+	static constexpr uint64_t WindowSize = uint64_t {1} << 40u;
+	static constexpr uint64_t LeafPages  = uint64_t {1} << 19u; // 2 GiB, 64 KiB of bits
+	static constexpr uint64_t LeafCount  = (WindowSize >> PageBits) / LeafPages;
+
+	std::atomic<uint64_t>* Leaf(uint64_t index, bool create) {
+		auto* leaf = m_leaves[index].load(std::memory_order_relaxed);
+		if (leaf == nullptr && create) {
+			leaf = new std::atomic<uint64_t>[LeafPages / 64u] {};
+			m_leaves[index].store(leaf, std::memory_order_release);
+		}
+		return leaf;
+	}
+
+	std::array<std::atomic<std::atomic<uint64_t>*>, LeafCount> m_leaves {};
+	std::atomic_bool                                            m_imprecise {false};
+};
+
 } // namespace
 
 class VirtualRanges {
@@ -440,6 +556,7 @@ public:
 		const auto index = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, r);
 		MergeAroundUnlocked(index);
+		RefreshCommittedUnlocked(start, size);
 		return true;
 	}
 
@@ -450,11 +567,14 @@ public:
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
 			m_ranges.erase(position);
+			RefreshCommittedUnlocked(start, size);
 			return true;
 		}
 		// RemoveUnlocked keeps the ranges sorted and merged (it used to be followed by a full
 		// MergeUnlocked sort, which only re-did that).
-		return RemoveUnlocked(start, size);
+		const bool removed = RemoveUnlocked(start, size);
+		RefreshCommittedUnlocked(start, size);
+		return removed;
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
@@ -542,6 +662,7 @@ public:
 		const auto index = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, replacement);
 		MergeAroundUnlocked(index);
+		RefreshCommittedUnlocked(start, size);
 		return true;
 	}
 
@@ -644,6 +765,19 @@ public:
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+		Common::CruzStats::Add(Common::CruzStats::Counter::ClampCalls);
+		if (ClampRangeBitmapEnabled()) {
+			const auto generation = ClampGenerationUnlocked(std::memory_order_acquire);
+			if (const auto run = m_committed.CommittedRun(virtual_addr, size); run != CommittedPageMap::Unknown) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ClampRangeBitmapHits);
+				Common::CruzStats::Add(Common::CruzStats::Counter::ClampBitmapHits);
+				t_clamp_totals.hits++;
+				if (ClampRangeMemoVerifyMode() != 0) {
+					VerifyClampHit(virtual_addr, size, run, generation);
+				}
+				return run;
+			}
+		}
 		if (ClampRangeMemoEnabled()) {
 			const auto generation = ClampGenerationUnlocked(std::memory_order_acquire);
 			for (const auto& run: t_clamp_runs.entries) {
@@ -660,6 +794,7 @@ public:
 					break; // beyond the part of the run that was walked
 				}
 				t_clamp_totals.hits++;
+				Common::CruzStats::Add(Common::CruzStats::Counter::ClampMemoHits);
 				if (ClampRangeMemoVerifyMode() != 0) {
 					VerifyClampHit(virtual_addr, size, clamped, generation);
 				}
@@ -668,6 +803,7 @@ public:
 			t_clamp_totals.misses++;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ClampRangeMemoMisses);
 		}
+		Common::CruzStats::Add(Common::CruzStats::Counter::ClampLocked);
 		Common::LockGuard lock(m_mutex);
 		return ClampRangeSizeUnlocked(virtual_addr, size, ClampRangeMemoEnabled());
 	}
@@ -764,6 +900,42 @@ private:
 	[[nodiscard]] uint64_t ClampGenerationUnlocked(std::memory_order order) const noexcept {
 		return ClampCoverageGenerationEnabled() ? m_coverage_generation.load(order)
 		                                        : m_generation.load(order);
+	}
+
+	// KYTY_CLAMP_RANGE_BITMAP: the committed-page bits of [start, start + size) as m_ranges has them
+	// now; callers hold m_mutex. Committed pages are set before uncommitted ones are cleared.
+	void RefreshCommittedUnlocked(uint64_t start, uint64_t size) {
+		if (!ClampRangeBitmapEnabled() || start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return;
+		}
+		const auto end   = start + size;
+		auto       first = std::upper_bound(m_ranges.begin(), m_ranges.end(), start,
+		                                    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (first != m_ranges.begin()) {
+			--first;
+		}
+		uint64_t                                   covered = start;
+		std::vector<std::pair<uint64_t, uint64_t>> gaps;
+		for (auto it = first; it != m_ranges.end() && it->start < end; ++it) {
+			const auto from = std::max(start, it->start);
+			const auto to   = std::min(end, End(it->start, it->size));
+			if (from >= to) {
+				continue;
+			}
+			if (IsCommittedRangeType(it->type)) {
+				m_committed.Set(from, to - from, true);
+				if (from > covered) {
+					gaps.emplace_back(covered, from - covered);
+				}
+				covered = to;
+			}
+		}
+		if (covered < end) {
+			gaps.emplace_back(covered, end - covered);
+		}
+		for (const auto& [gap, bytes]: gaps) {
+			m_committed.Set(gap, bytes, false);
+		}
 	}
 
 	// ClampRangeSize's lookup; callers hold m_mutex. `remember`: record the run for this thread.
@@ -1071,6 +1243,7 @@ private:
 	std::atomic<uint64_t> m_generation {1};
 	// Advanced before every change that can change committed coverage (KYTY_CLAMP_COVERAGE_GEN).
 	std::atomic<uint64_t> m_coverage_generation {1};
+	CommittedPageMap      m_committed; // KYTY_CLAMP_RANGE_BITMAP
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -2373,6 +2546,37 @@ bool TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const vo
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+}
+
+uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept {
+	return TransientUnmapRetryEnabled() ? TransientUnmapWindows::Wait(fault_vaddr) : 0;
+}
+
+bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept {
+	// A page that keeps faulting after it was mapped again is a real access violation.
+	constexpr uint32_t    MaxRetries  = 16;
+	thread_local uint64_t last_page   = 0;
+	thread_local uint64_t last_window = 0;
+	thread_local uint32_t retries     = 0;
+	const auto            page        = fault_vaddr & ~uint64_t {0x3fff};
+	retries     = (page == last_page && window == last_window ? retries + 1 : 1);
+	last_page   = page;
+	last_window = window;
+	if (retries > MaxRetries) {
+		return false;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("Memory: retried a guest access to 0x%016" PRIx64
+		            " made while its mapping was being replaced\n",
+		            fault_vaddr);
+		std::fflush(stdout);
+	}
+	return true;
+}
+
+void SetTransientUnmapRetryForTest(bool enabled) noexcept {
+	g_transient_unmap_retry.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
 struct PrtAperture {
@@ -3796,6 +4000,10 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		EXIT("unknown prot: %d\n", prot);
 	}
 
+	// KYTY_TRANSIENT_UNMAP_RETRY: guest threads may use a mapping that MAP_FIXED replaces: until
+	// the new one is in place, their faults wait and are retried.
+	std::optional<TransientUnmapWindows::Scope> replacing;
+
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
 	uint64_t out_addr        = 0;
 	bool     reserved_target = false;
@@ -3816,6 +4024,9 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 			UnmapGpuRange(in_addr, len);
 			reserved_target = true;
 			out_addr        = in_addr;
+		}
+		if (!reserved_target && TransientUnmapRetryEnabled()) {
+			replacing.emplace(in_addr, in_addr + len);
 		}
 		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
 			reserved_target = true;
@@ -4628,6 +4839,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_ENOMEM;
 	}
 
+	// KYTY_TRANSIENT_UNMAP_RETRY: guest threads may use a mapping that MAP_FIXED replaces: until
+	// the new one is in place, their faults wait and are retried.
+	std::optional<TransientUnmapWindows::Scope> replacing;
+
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr);
 	uint64_t out_addr        = 0;
 	bool     shared_backing  = false;
@@ -4714,6 +4929,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			    })) {
 				UnmapGpuRange(in_addr, len);
 				reserved_target = true;
+			}
+			if (!reserved_target && TransientUnmapRetryEnabled()) {
+				replacing.emplace(in_addr, in_addr + len);
 			}
 			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
 				reserved_target = true;
@@ -5154,6 +5372,10 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+void TestSetClampRangeBitmap(bool enabled) {
+	g_clamp_range_bitmap.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 TestClampTotals TestClampRangeMemoTotals() {
 	const auto& totals = t_clamp_totals;
 	return {totals.hits, totals.misses, totals.verify_checks, totals.verify_mismatches,
