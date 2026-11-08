@@ -121,6 +121,8 @@ CodegenOptions FromEnvironment() {
 	options.embedded_fetch_no_sgpr_offset = EnvFlag("KYTY_EMBEDDED_FETCH_NO_SGPR_OFFSET", options.embedded_fetch_no_sgpr_offset);
 	options.mov_no_float_mods = EnvFlag("KYTY_MOV_NO_FLOAT_MODS", options.mov_no_float_mods);
 	options.pops_interlock = EnvFlag("KYTY_POPS_INTERLOCK", options.pops_interlock);
+	options.barrier_acquire_stores =
+	    EnvFlag("KYTY_BARRIER_ACQUIRE_STORES", options.barrier_acquire_stores);
 	options.format_missing_canonical =
 	    EnvFlag("KYTY_FORMAT_MISSING_CANON", options.format_missing_canonical);
 	options.indirect_format_all = EnvFlag("KYTY_INDIRECT_FORMAT_ALL", options.indirect_format_all);
