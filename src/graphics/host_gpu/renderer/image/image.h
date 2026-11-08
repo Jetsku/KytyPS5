@@ -118,6 +118,9 @@ public:
 	void CopyImage(Image& source);
 	// vkCmdCopyImage between a depth aspect and a compatible color format (VK_KHR_maintenance8).
 	void CopyDepthColorImage(Image& source);
+	// As CopyImage, with the stencil aspect too (both images have the same depth/stencil format).
+	// The copy covers the smaller of the two extents (KYTY_DEPTH_GROW_RECREATE).
+	void CopyDepthStencilImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
@@ -639,7 +642,7 @@ private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
-	void                                      CopyImageRegions(Image& source);
+	void                                      CopyImageRegions(Image& source, bool stencil = false);
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
