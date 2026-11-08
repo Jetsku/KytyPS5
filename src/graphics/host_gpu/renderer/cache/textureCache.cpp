@@ -1110,7 +1110,7 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 static bool ResidentIdleKeepBindless() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_RESIDENT_IDLE_KEEP_BINDLESS");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
 	}();
 	return on;
 }

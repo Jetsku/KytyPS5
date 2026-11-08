@@ -1037,7 +1037,7 @@ void Image::CopyBlockMip(Image& source, uint32_t mip, uint32_t layer) {
 bool ImageLevelClampEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_IMAGE_LEVEL_CLAMP");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }

@@ -1348,7 +1348,7 @@ bool BindlessTable::RemapSlotImage(uint32_t binding, uint32_t slot, ImageId old_
 static bool ReplacedResolveEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BINDLESS_REPLACED_RESOLVE");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
 	}();
 	return enabled;
 }
@@ -1390,7 +1390,7 @@ void BindlessTable::OnImageUnregistered(ImageId id, bool replaced) {
 // KYTY_BINDLESS_UNMAP_RERESOLVE=1 (live; default off since int22, on in the Miles Morales preset
 // PPSA01417 where it was tested): see bindlessTable.h.
 static Live::Switch g_unmap_reresolve("KYTY_BINDLESS_UNMAP_RERESOLVE", [](const char* value) -> int64_t {
-	return value != nullptr && value[0] != ' ' && value[0] != '0' ? 1 : 0;
+	return value != nullptr && value[0] != '\0' && value[0] != '0' ? 1 : 0;
 });
 
 bool BindlessTable::UnmapReresolve() {

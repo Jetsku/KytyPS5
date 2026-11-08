@@ -408,7 +408,7 @@ static const AVCodec* find_decoder(AVCodecID codec_id) {
 	return decoder;
 }
 
-// KYTY_AVPLAYER_THREADS=auto|<n> (default auto): FFmpeg frame and slice threads per video decoder.
+// KYTY_AVPLAYER_THREADS=auto|<n> (default 1 when unset; auto in the Astro Bot title presets): FFmpeg frame and slice threads per video decoder.
 // One thread decoded ASTRO's PLAYROOM's 3840x2160 HEVC intro at 45-49 frames/s, behind its 59.94 fps
 // and the audio. 0 or 1: one thread, as before. auto: half of the processors the emulator's threads
 // may use outside the cores KYTY_CPU_RESERVE keeps for the CP and the recorder, from 2 to 8; every
@@ -443,14 +443,16 @@ static uint32_t UsableProcessors() {
 static uint32_t VideoDecoderThreads() {
 	static const uint32_t threads = [] {
 		const auto usable = UsableProcessors();
-		const auto n      = ParseVideoDecoderThreads(std::getenv("KYTY_AVPLAYER_THREADS"), usable);
+		// Unset: one thread, as before int22 (per-title presets set auto; Astro Bot tested it).
+		const auto* env   = std::getenv("KYTY_AVPLAYER_THREADS");
+		const auto n      = ParseVideoDecoderThreads(env != nullptr ? env : "1", usable);
 		::printf("AvPlayer: %u video decoder thread(s) (KYTY_AVPLAYER_THREADS, %u usable processors)\n",
 		         n, usable);
 		return n;
 	}();
 	return threads;
 }
-// KYTY_AVPLAYER_DROP_LATE=0|1|<ms> (default 1 = 20 ms): Video() skips a due frame when the frame
+// KYTY_AVPLAYER_DROP_LATE=0|1|<ms> (unset: 0; 1 = 20 ms in the Astro Bot title presets): Video() skips a due frame when the frame
 // after it is already this late, so a slow decoder cannot let the picture drift behind the audio.
 // The tolerance keeps a decoder that does keep up from skipping on timing jitter: with a 60 Hz game
 // polling a 60 fps video, frame times sit on the poll boundary, and skipping at 0 ms alternated
@@ -467,7 +469,9 @@ static uint64_t ParseLateDropMs(const char* text) {
 	return value == 0 ? UINT64_MAX : static_cast<uint64_t>(value);
 }
 static uint64_t LateDropMs() {
-	static const uint64_t ms = ParseLateDropMs(std::getenv("KYTY_AVPLAYER_DROP_LATE"));
+	// Unset: no skipping, as before int22 (per-title presets set 1; Astro Bot tested it).
+	const auto*           env = std::getenv("KYTY_AVPLAYER_DROP_LATE");
+	static const uint64_t ms  = ParseLateDropMs(env != nullptr ? env : "0");
 	return ms;
 }
 // KYTY_AVPLAYER_STATS=1: a video decode statistics line every 5 s while a video plays (one line

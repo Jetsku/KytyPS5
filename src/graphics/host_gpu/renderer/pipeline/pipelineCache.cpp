@@ -930,7 +930,7 @@ struct ShaderReadAttempt {
 static std::array<std::atomic<uint64_t>, 8> g_drop_cs_list {};
 static Live::Switch g_drop_cs_hashes("KYTY_DROP_CS_HASHES", [](const char* value) -> int64_t {
 	size_t count = 0;
-	for (const char* text = value; text != nullptr && *text != ' ' && count < g_drop_cs_list.size();) {
+	for (const char* text = value; text != nullptr && *text != '\0' && count < g_drop_cs_list.size();) {
 		char*      end  = nullptr;
 		const auto hash = std::strtoull(text, &end, 16);
 		if (end == text) break;
@@ -8318,7 +8318,7 @@ constexpr bool ProgramDiskCacheDefault = false;
 // part of the codegen fingerprint; BuildDiskKey salts the disk-cache key of each selected program.
 void PipelineCache::InitializeMadExactFilter() {
 	const char* value = std::getenv("KYTY_MAD_EXACT_SHADERS");
-	if (value == nullptr || *value == ' ') {
+	if (value == nullptr || *value == '\0') {
 		return;
 	}
 	ShaderRecompiler::MadExactFilter filter;

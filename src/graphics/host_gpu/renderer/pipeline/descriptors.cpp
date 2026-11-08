@@ -343,7 +343,7 @@ static uint64_t StorageRangeCap(const GraphicContext& graphics) {
 static bool ReadBufferTail() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_READ_BUFFER_TAIL");
-		return value == nullptr || value[0] == '\0' || value[0] != '0';
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
 	}();
 	return enabled;
 }
@@ -2943,7 +2943,7 @@ static uint32_t BindlessResolveBudget() {
 }
 // KYTY_BINDLESS_RECORD_RETRY (live; ResolveBindlessKey).
 static Live::Switch g_bindless_record_retry("KYTY_BINDLESS_RECORD_RETRY", [](const char* value) -> int64_t {
-	return value == nullptr || value[0] != '0' ? 1 : 0;
+	return value != nullptr && value[0] != '\0' && value[0] != '0' ? 1 : 0;
 });
 
 // KYTY_BINDLESS_SHARE_SLOTS=1 (startup, default off): every key resolved through ResolveBindlessKey (feedback,
@@ -2956,7 +2956,7 @@ static Live::Switch g_bindless_record_retry("KYTY_BINDLESS_RECORD_RETRY", [](con
 static bool BindlessTouchImages() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BINDLESS_TOUCH");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
 	}();
 	return enabled;
 }
