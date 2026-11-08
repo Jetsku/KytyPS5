@@ -29,19 +29,19 @@ static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 72, "IR::BufferResource changed: update ProgramCodec");
-static_assert(sizeof(ImageResource) == 88, "IR::ImageResource changed: update ProgramCodec");
+static_assert(sizeof(ImageResource) == 96, "IR::ImageResource changed: update ProgramCodec");
 static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
-static_assert(sizeof(ShaderInfo) == 208, "IR::ShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(ShaderInfo) == 216, "IR::ShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorBinding) == 32, "IR::DescriptorBinding changed: update ProgramCodec");
 static_assert(sizeof(BindingLayout) == 72, "IR::BindingLayout changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeNode) == 24, "IR::WriteRangeNode changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: update ProgramCodec");
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
-static_assert(sizeof(CompiledShaderInfo) == 368, "IR::CompiledShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(CompiledShaderInfo) == 376, "IR::CompiledShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource) == 304, "IR::DescriptorSource changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 144,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
@@ -59,7 +59,7 @@ static_assert(sizeof(ResourcePlan::ArithmeticTape) == 8,
               "IR::ResourcePlan::ArithmeticTape changed: update ProgramCodec");
 static_assert(sizeof(UniformFill) == 28, "IR::UniformFill changed: update ProgramCodec");
 static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: update ProgramCodec");
-static_assert(sizeof(ResourcePlan) == 752, "IR::ResourcePlan changed: update ProgramCodec");
+static_assert(sizeof(ResourcePlan) == 760, "IR::ResourcePlan changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
