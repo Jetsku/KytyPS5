@@ -889,6 +889,15 @@ add_executable(kyty_pipeline_list EXCLUDE_FROM_ALL
 target_link_libraries(kyty_pipeline_list xxhash libzstd_static nlohmann_json::nlohmann_json)
 target_include_directories(kyty_pipeline_list PRIVATE ${inc_headers})
 
+# kyty_shaderlist_export: a window for players that runs kyty_pipeline_list export + verify on their
+# recorded journals (tools/pipeline-list/kytyShaderListExport.cpp). Windows only, built on request.
+if(WIN32)
+	add_executable(kyty_shaderlist_export WIN32 EXCLUDE_FROM_ALL
+		"${CMAKE_CURRENT_SOURCE_DIR}/tools/pipeline-list/kytyShaderListExport.cpp"
+	)
+	target_link_libraries(kyty_shaderlist_export nlohmann_json::nlohmann_json ole32 shell32 comctl32)
+endif()
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})

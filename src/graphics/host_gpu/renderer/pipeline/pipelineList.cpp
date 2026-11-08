@@ -1020,6 +1020,36 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 	return out;
 }
 
+void UpgradeVertexInputInfos(File& file, const VertexLayoutUpgrade& upgrade, uint32_t to_size, UpgradeStats& stats) {
+	size_t added = 0;
+	for (const auto& insert: upgrade.inserts) added += insert.bytes.size();
+	if (upgrade.from_size + added != to_size || upgrade.from_size == to_size) return;
+	for (auto& shader: file.shaders) {
+		if (shader.kind != ShaderJournal::Kind::Vertex || shader.input_info.size() != upgrade.from_size) continue;
+		if (upgrade.skip_if_nonzero_at + 4ull <= shader.input_info.size()) {
+			uint32_t value = 0;
+			std::memcpy(&value, shader.input_info.data() + upgrade.skip_if_nonzero_at, sizeof(value));
+			if (value != 0) {
+				stats.skipped++;
+				continue;
+			}
+		}
+		std::vector<uint8_t> out;
+		out.reserve(to_size);
+		size_t from = 0;
+		for (const auto& insert: upgrade.inserts) {
+			out.insert(out.end(), shader.input_info.begin() + static_cast<ptrdiff_t>(from),
+			           shader.input_info.begin() + static_cast<ptrdiff_t>(insert.at));
+			out.insert(out.end(), insert.bytes.begin(), insert.bytes.end());
+			from = insert.at;
+		}
+		out.insert(out.end(), shader.input_info.begin() + static_cast<ptrdiff_t>(from), shader.input_info.end());
+		shader.input_info = std::move(out);
+		stats.upgraded++;
+	}
+	if (stats.upgraded != 0 && stats.skipped == 0) file.info.input_info_sizes[0] = to_size;
+}
+
 // No-code verification ------------------------------------------------------------------------------
 
 namespace {

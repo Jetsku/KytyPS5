@@ -1193,6 +1193,29 @@ bool DecodeSpecialization(std::span<const uint8_t> bytes, ResourceSpecialization
 	return reader.AtEnd();
 }
 
+bool DecodeSpecializationInt21(std::span<const uint8_t> bytes, ResourceSpecialization& value) {
+	CodecReader reader(bytes);
+	ReadVector(reader, value.buffers);
+	const auto count = reader.Count(1);
+	value.images.clear();
+	value.images.resize(count);
+	for (auto& v: value.images) {
+		// int21's image record: the fields up to fmask (the later ones keep their defaults).
+		v.numeric_class              = EnumFrom<Prospero::TextureNumericClass>(reader.U32());
+		v.dimension                  = EnumFrom<Decoder::ImageDimension>(reader.U32());
+		v.mip_count                  = reader.U32();
+		v.conversion_format          = EnumFrom<Prospero::BufferFormat>(reader.U32());
+		v.shader_swizzle             = reader.U32();
+		v.indirect_root              = reader.U32();
+		v.indirect_mapping_offset    = reader.U32();
+		v.indirect_search_iterations = reader.U32();
+		v.cube                       = reader.Bool();
+		v.fmask                      = reader.Bool();
+		if (reader.Failed()) return false;
+	}
+	return reader.AtEnd();
+}
+
 void EncodeCompiledShaderInfo(const CompiledShaderInfo& value, std::vector<uint8_t>& out) {
 	CodecWriter w(out);
 	w.U32(EnumBits(value.stage));

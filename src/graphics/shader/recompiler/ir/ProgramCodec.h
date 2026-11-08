@@ -91,6 +91,9 @@ private:
 void EncodeSpecialization(const ResourceSpecialization& value, std::vector<uint8_t>& out);
 [[nodiscard]] bool DecodeSpecialization(std::span<const uint8_t> bytes,
                                         ResourceSpecialization& value);
+// A specialization as int21 (744705ee1) journals stored it: image records end after `fmask`.
+[[nodiscard]] bool DecodeSpecializationInt21(std::span<const uint8_t> bytes,
+                                             ResourceSpecialization& value);
 
 void EncodeCompiledShaderInfo(const CompiledShaderInfo& value, std::vector<uint8_t>& out);
 [[nodiscard]] bool DecodeCompiledShaderInfo(std::span<const uint8_t> bytes,

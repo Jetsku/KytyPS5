@@ -555,10 +555,42 @@ void TestDataFiles() {
 	CHECK(again.files == file.files && again.shaders[1].file == material);
 }
 
+// A list of an earlier vertex input layout gets the added fields inserted; a shader the layout
+// cannot describe (non-zero skip dword), other stages and other sizes keep their bytes.
+void TestUpgradeVertexLayout() {
+	PipelineList::VertexLayoutUpgrade upgrade;
+	upgrade.from_size          = 16;
+	upgrade.inserts            = {{4, {0xA1, 0xA2}}, {12, {0xB1, 0xB2, 0xB3, 0xB4}}};
+	upgrade.skip_if_nonzero_at = 8;
+	PipelineList::File file;
+	file.info.input_info_sizes = {16, 8, 8};
+	const auto shader          = [](ShaderJournal::Kind kind, std::vector<uint8_t> bytes) {
+		PipelineList::Shader s;
+		s.kind       = kind;
+		s.input_info = std::move(bytes);
+		return s;
+	};
+	file.shaders.push_back(shader(ShaderJournal::Kind::Vertex, {0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 12, 13, 14, 15}));
+	file.shaders.push_back(shader(ShaderJournal::Kind::Pixel, {0, 1, 2, 3, 4, 5, 6, 7}));
+	file.shaders.push_back(shader(ShaderJournal::Kind::Vertex, {0, 1, 2, 3, 4, 5, 6, 7, 1, 0, 0, 0, 12, 13, 14, 15}));
+	PipelineList::UpgradeStats stats;
+	PipelineList::UpgradeVertexInputInfos(file, upgrade, 22, stats);
+	CHECK(stats.upgraded == 1 && stats.skipped == 1);
+	CHECK(file.shaders[0].input_info ==
+	      std::vector<uint8_t>({0, 1, 2, 3, 0xA1, 0xA2, 4, 5, 6, 7, 0, 0, 0, 0, 0xB1, 0xB2, 0xB3, 0xB4, 12, 13, 14, 15}));
+	CHECK(file.shaders[1].input_info.size() == 8 && file.shaders[2].input_info.size() == 16);
+	CHECK(file.info.input_info_sizes[0] == 16); // one shader left in the old layout
+	// Inserts that do not add up to the target size change nothing.
+	PipelineList::UpgradeStats none;
+	PipelineList::UpgradeVertexInputInfos(file, upgrade, 30, none);
+	CHECK(none.upgraded == 0 && file.shaders[2].input_info.size() == 16);
+}
+
 } // namespace
 
 int main() {
 	TestExportAndRoundTrip();
+	TestUpgradeVertexLayout();
 	TestDataFiles();
 	TestResolve();
 	TestMergedStage();

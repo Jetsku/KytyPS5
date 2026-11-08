@@ -265,6 +265,26 @@ struct Resolved {
 [[nodiscard]] Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_sizes, const ReadCodeFn& read,
                                const ReadImageFn& read_image, ResolveStats& stats);
 
+// A stored vertex input info layout of an earlier release and the fields this build added to it:
+// `bytes` go in at byte `at` of the old layout (inserts in ascending order). A shader whose dword at
+// `skip_if_nonzero_at` (old layout) is not zero keeps its old bytes, so Resolve counts it as another
+// input layout (fields that cannot be filled in without the guest registers).
+struct VertexLayoutUpgrade {
+	struct Insert {
+		uint32_t             at = 0;
+		std::vector<uint8_t> bytes;
+	};
+	uint32_t            from_size = 0;
+	std::vector<Insert> inserts;
+	uint32_t            skip_if_nonzero_at = UINT32_MAX;
+};
+struct UpgradeStats {
+	uint64_t upgraded = 0, skipped = 0;
+};
+// Rewrites the vertex input infos of `upgrade.from_size` bytes to `to_size` bytes; nothing when the
+// inserts do not add up to `to_size`.
+void UpgradeVertexInputInfos(File& file, const VertexLayoutUpgrade& upgrade, uint32_t to_size, UpgradeStats& stats);
+
 // The "no game code" proof: every 64-byte window of known shader code (any byte offset), minus
 // low-entropy windows (fewer than 8 distinct byte values, e.g. zero runs that also occur in plain
 // data), is searched for at every byte offset of the data.

@@ -7038,8 +7038,35 @@ void PipelineCache::StopBackgroundPipelines() {
 
 namespace {
 
+// The vertex input info that int21 (744705ee1) journals and lists stored: this build added the mesh
+// fast launch flag and passes, and the tessellation clamp levels and carried VGPRs. Tessellation
+// stages are left out (their clamp levels come from guest registers the list does not keep).
+PipelineList::VertexLayoutUpgrade Int21VertexLayout() {
+	static_assert(sizeof(ShaderMeshInputInfo) == 64 && sizeof(ShaderTessellationInputInfo) == 76 &&
+	                  ShaderStoredInputInfoSize<ShaderVertexInputInfo>() == 10216,
+	              "the vertex input info changed again: describe the int21 layout from the new one");
+	const ShaderVertexInputInfo info;
+	const auto offset = [&](const void* field) {
+		return static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(field) - reinterpret_cast<const uint8_t*>(&info));
+	};
+	// Defaults of the added fields as a draw of an ordinary vertex shader sets them.
+	const auto mesh_at    = offset(&info.mesh.fast_launch);
+	const auto mesh_added = offset(&info.tess) - mesh_at;
+	const auto tess_at    = offset(&info.tess.min_tess_level);
+	const auto tess_added = offset(&info.fetch_external) - tess_at;
+	std::vector<uint8_t> mesh_bytes(mesh_added, 0);
+	const uint32_t       passes = info.mesh.passes;
+	std::memcpy(mesh_bytes.data() + (offset(&info.mesh.passes) - mesh_at), &passes, sizeof(passes));
+	PipelineList::VertexLayoutUpgrade upgrade;
+	upgrade.from_size = ShaderStoredInputInfoSize<ShaderVertexInputInfo>() - mesh_added - tess_added;
+	upgrade.inserts.push_back({mesh_at, std::move(mesh_bytes)});
+	upgrade.inserts.push_back({tess_at - mesh_added, std::vector<uint8_t>(tess_added, 0)});
+	upgrade.skip_if_nonzero_at = offset(&info.tess.input_control_points) - mesh_added;
+	return upgrade;
+}
+
 // A pipeline list source's device-dependent stage input fields for this device (the host subgroup
-// size of compute and mesh stages, mesh group splitting; as GetComputeProgram and FinishMeshStage
+// size of compute and mesh stages, mesh group splitting and passes; as GetComputeProgram and FinishMeshStage
 // set them), and its static key derived again from the input info, as BuildKey does. False when the
 // source cannot be used on this device.
 bool NormalizeListSource(const GraphicContext& graphics, ShaderJournal::Source& source) {
@@ -7069,6 +7096,8 @@ bool NormalizeListSource(const GraphicContext& graphics, ShaderJournal::Source& 
 				mesh.host_subgroup_size = required != 0 ? required : graphics.subgroup_size;
 				const auto& limits      = graphics.mesh_shader_properties;
 				mesh.split_groups = limits.maxMeshWorkGroupCount[0] < limits.maxMeshWorkGroupTotalCount ? 1u : 0u;
+				mesh.passes = mesh.PassesFor(std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
+				if (mesh.passes == 0) return false;
 			}
 			store(*info);
 			return true;
@@ -7176,6 +7205,26 @@ void PipelineCache::InitializePipelineList() {
 	const std::array<uint32_t, 3> sizes {ShaderStoredInputInfoSize<ShaderVertexInputInfo>(),
 	                                     ShaderStoredInputInfoSize<ShaderPixelInputInfo>(),
 	                                     ShaderStoredInputInfoSize<ShaderComputeInputInfo>()};
+	const auto                 int21 = Int21VertexLayout();
+	PipelineList::UpgradeStats upgrade_stats;
+	if (file.info.input_info_sizes[0] == int21.from_size) {
+		PipelineList::UpgradeVertexInputInfos(file, int21, sizes[0], upgrade_stats);
+		// Its image specializations end after `fmask`; they are encoded again in this build's format.
+		uint64_t specializations = 0;
+		for (auto& permutation: file.permutations) {
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			if (ShaderRecompiler::IR::DecodeSpecialization(permutation.specialization, specialization) ||
+			    !ShaderRecompiler::IR::DecodeSpecializationInt21(permutation.specialization, specialization)) {
+				continue;
+			}
+			permutation.specialization.clear();
+			ShaderRecompiler::IR::EncodeSpecialization(specialization, permutation.specialization);
+			specializations++;
+		}
+		PipelineCacheLog("Pipeline list: int21 layout: {} vertex input infos upgraded ({} tessellation ones left "
+		                 "out), {} specializations upgraded",
+		                 upgrade_stats.upgraded, upgrade_stats.skipped, specializations);
+	}
 	PipelineList::ResolveStats stats;
 	auto resolved = PipelineList::Resolve(file, sizes, read, read_image, stats);
 	if (stats.resolved * 2 < stats.shaders) {
