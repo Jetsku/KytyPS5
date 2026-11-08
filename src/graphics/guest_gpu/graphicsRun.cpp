@@ -180,6 +180,295 @@ void ReadGuestForCp(uint64_t vaddr, uint64_t size, void* dst) {
 	std::memcpy(dst, reinterpret_cast<const void*>(vaddr), size);
 }
 
+// KYTY_CP_DECISION_MEMORY (live; default 0): the command processor answers its decisions
+// (WAIT_REG_MEM, COND_EXEC, SET_PREDICATION on memory, conditional INDIRECT_BUFFER, register reads)
+// from the values of command-processor writes it has already parsed, when such a write is still the
+// newest write of every byte read and its value is known. Based on Erlou93/KytyPS5-Yotei's decision
+// memory (GuestGpu::ReadDecisionMemory / NoteGuestWrite): GPU-written bytes, unknown values and
+// pending end-of-pipe labels are still read (and waited for) as before, so it is exact, not
+// speculative. Bits:
+//   1 resolver: a WRITE_DATA the command processor put on the GPU timeline (KYTY_WRITE_DATA_GPU,
+//     BufferCache::TryWriteDataGpu) keeps its value in a journal; a decision read of bytes it still
+//     holds (BufferCache::CpValueUnwritten: no GPU write, upload, invalidation or CPU modification since,
+//     no deferred label pending over them) takes the value instead of synchronizing the GPU-dirty
+//     bytes (a GPU drain), and SET_PREDICATION's wait is skipped for such a value.
+//   2 sequencer front (KYTY_CP_SEQ=1): the WRITE_DATA values (and plain label data, for waits only)
+//     emitted since the front's last wait or stop answer its lockstep ops without stopping the parse:
+//     a WAIT_REG_MEM whose known value passes is emitted and left to the resolver (which still waits
+//     in order), a COND_EXEC / predicate / branch / register read on known bytes is answered at once.
+//   0x100 verify (with the bits): the real read / stop still runs, its answer is used, and every known
+//     answer is compared with it ("CP decision verify" lines, totals in the stats line).
+// "verify" = 0x103. KYTY_CP_DECISION_STATS=1 (startup): "CpDecide" lines every 10 s on the CP flip:
+// per decision site, the reads by class (clean = no drain needed, known = a journal value covers
+// them, label = a deferred label is pending over them, unknown = GPU-dirty or larger than 64 bytes)
+// with their read time (including the drain), WAIT_REG_MEM suspensions by class (first failed
+// evaluation to the pass), and the front's stops by class with their time.
+namespace CpDecide {
+
+static int64_t ParseMode(const char* value) {
+	if (value == nullptr) {
+		return 0;
+	}
+	if (std::strcmp(value, "verify") == 0) {
+		return 0x103;
+	}
+	return std::strtoll(value, nullptr, 0);
+}
+static Live::Switch g_mode("KYTY_CP_DECISION_MEMORY", ParseMode);
+constexpr int64_t ModeResolver = 1;
+constexpr int64_t ModeFront    = 2;
+constexpr int64_t ModeVerify   = 0x100;
+
+static bool StatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_DECISION_STATS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+enum Site : uint32_t { SiteWait, SiteCondExec, SitePredication, SiteBranch, SiteRegRead, SiteCount };
+static const char* const kSiteNames[SiteCount] = {"wait", "condexec", "predication", "branch", "regread"};
+enum Class : uint32_t { ClassClean, ClassKnown, ClassLabel, ClassUnknown, ClassCount };
+static const char* const kClassNames[ClassCount] = {"clean", "known", "label", "unknown"};
+// Front stop classes: known (the answer avoids the stop), known-fail (a known wait value that fails),
+// pending (a pending CP write of unknown value overlaps), other (no pending CP write over the bytes).
+enum FrontClass : uint32_t { FrontKnown, FrontKnownFail, FrontPending, FrontOther, FrontCount };
+static const char* const kFrontNames[FrontCount] = {"known", "knownfail", "pending", "other"};
+
+struct Stats {
+	std::atomic<uint64_t> reads[SiteCount][ClassCount] {};
+	std::atomic<uint64_t> read_ns[SiteCount][ClassCount] {};
+	std::atomic<uint64_t> served[SiteCount] {};
+	std::atomic<uint64_t> suspended[ClassCount] {};
+	std::atomic<uint64_t> suspended_ns[ClassCount] {};
+	std::atomic<uint64_t> pred_drains[ClassCount] {};
+	std::atomic<uint64_t> pred_drain_ns[ClassCount] {};
+	std::atomic<uint64_t> pred_drains_skipped {0};
+	std::atomic<uint64_t> stops[SiteCount][FrontCount] {};
+	std::atomic<uint64_t> stop_ns[SiteCount][FrontCount] {};
+	std::atomic<uint64_t> front_served[SiteCount] {};
+	std::atomic<uint64_t> verify_checks {0};
+	std::atomic<uint64_t> verify_mismatches {0};
+	std::atomic<uint64_t> journal_adds {0};
+	std::atomic<uint64_t> journal_large {0};
+	std::atomic<uint64_t> journal_waits {0}; // KYTY_CP_WAIT_JOURNAL's self-label waits (no stop)
+	std::atomic<uint64_t> write_through {0}; // KYTY_CP_WRITE_THROUGH writes
+};
+static Stats g_stats;
+
+static void Add(std::atomic<uint64_t>& counter, uint64_t value = 1) {
+	counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+static void NoteMismatch(const char* where, uint64_t address, uint64_t size, uint64_t known, uint64_t real) {
+	const auto n = g_stats.verify_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 32) {
+		std::printf("CP decision verify MISMATCH #%" PRIu64 " %s 0x%" PRIx64 " size %" PRIu64
+		            " known 0x%" PRIx64 " real 0x%" PRIx64 "\n",
+		            n, where, address, size, known, real);
+	}
+}
+
+// The resolver's journal: command-processor writes put on the GPU timeline with known values. Entries
+// never overlap (a newer write drops the older ones it overlaps).
+struct Entry {
+	uint64_t address = 0;
+	uint32_t size    = 0;
+	bool     valid   = false;
+	uint8_t  value[64] {};
+};
+constexpr size_t      JournalSize = 64;
+static std::mutex     g_journal_mutex;
+static Entry          g_journal[JournalSize];
+static size_t         g_journal_next = 0;
+static std::atomic<uint32_t> g_journal_valid {0};
+
+static bool Overlaps(const Entry& e, uint64_t address, uint64_t size) {
+	return e.valid && e.address < address + size && address < e.address + e.size;
+}
+
+static void ForgetLocked(uint64_t address, uint64_t size) {
+	for (auto& e: g_journal) {
+		if (Overlaps(e, address, size)) {
+			e.valid = false;
+			g_journal_valid.fetch_sub(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+// Any command-processor write to guest memory (NoteCpWrite): the journal's values under it are old.
+static void Forget(uint64_t address, uint64_t size) {
+	if (g_journal_valid.load(std::memory_order_relaxed) == 0 || size == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_journal_mutex);
+	ForgetLocked(address, size);
+}
+
+static void Record(BufferCache& cache, uint64_t address, const void* data, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_journal_mutex);
+	ForgetLocked(address, size);
+	if (size > sizeof(Entry::value)) {
+		Add(g_stats.journal_large);
+		return;
+	}
+	auto& e = g_journal[g_journal_next];
+	if (e.valid) {
+		g_journal_valid.fetch_sub(1, std::memory_order_relaxed);
+	}
+	g_journal_next = (g_journal_next + 1) % JournalSize;
+	e.address      = address;
+	e.size         = static_cast<uint32_t>(size);
+	e.valid        = true;
+	std::memcpy(e.value, data, size);
+	g_journal_valid.fetch_add(1, std::memory_order_relaxed);
+	cache.WatchCpValue(address, size);
+	Add(g_stats.journal_adds);
+}
+
+// All of [address, address + size) is held by journal values nothing wrote over since.
+static bool Lookup(BufferCache& cache, uint64_t address, uint64_t size, void* dst) {
+	if (g_journal_valid.load(std::memory_order_relaxed) == 0 || size == 0 || size > 64) {
+		return false;
+	}
+	const uint64_t   all     = size == 64 ? UINT64_MAX : (uint64_t {1} << size) - 1u;
+	uint64_t         covered = 0;
+	std::scoped_lock lock(g_journal_mutex);
+	for (auto& e: g_journal) {
+		if (!Overlaps(e, address, size)) {
+			continue;
+		}
+		if (!cache.CpValueUnwritten(e.address, e.size)) {
+			e.valid = false;
+			g_journal_valid.fetch_sub(1, std::memory_order_relaxed);
+			return false;
+		}
+		const uint64_t lo = std::max(e.address, address);
+		const uint64_t hi = std::min(e.address + e.size, address + size);
+		std::memcpy(static_cast<uint8_t*>(dst) + (lo - address), e.value + (lo - e.address), hi - lo);
+		const uint64_t n = hi - lo;
+		covered |= (n == 64 ? UINT64_MAX : ((uint64_t {1} << n) - 1u)) << (lo - address);
+	}
+	return covered == all;
+}
+
+static uint64_t FirstBytes(const void* data, uint64_t size) {
+	uint64_t value = 0;
+	std::memcpy(&value, data, std::min<uint64_t>(size, sizeof(value)));
+	return value;
+}
+
+static void Report() {
+	if (!StatsEnabled()) {
+		return;
+	}
+	static uint64_t last_ns    = 0;
+	static uint64_t last_flips = 0;
+	const auto      now        = NowNs();
+	if (last_ns == 0) {
+		last_ns    = now;
+		last_flips = Live::Testing::CpFlips();
+		return;
+	}
+	if (now - last_ns < 10'000'000'000ull) {
+		return;
+	}
+	const auto flips  = Live::Testing::CpFlips();
+	const auto frames = std::max<double>(1.0, static_cast<double>(flips - last_flips));
+	const auto secs   = static_cast<double>(now - last_ns) / 1e9;
+	last_ns           = now;
+	last_flips        = flips;
+	std::string line;
+	char        text[256];
+	std::snprintf(text, sizeof(text), "CpDecide %.1fs %.0f frames mode 0x%" PRIx64 ":", secs, frames,
+	              static_cast<uint64_t>(g_mode.Get()));
+	line += text;
+	for (uint32_t s = 0; s < SiteCount; s++) {
+		bool any = false;
+		for (uint32_t c = 0; c < ClassCount; c++) {
+			const auto n  = g_stats.reads[s][c].exchange(0, std::memory_order_relaxed);
+			const auto ns = g_stats.read_ns[s][c].exchange(0, std::memory_order_relaxed);
+			if (n == 0) {
+				continue;
+			}
+			std::snprintf(text, sizeof(text), "%s %s %s %.2f/f %.3f ms/f", any ? "," : " |", any ? "" : kSiteNames[s],
+			              kClassNames[c], static_cast<double>(n) / frames, static_cast<double>(ns) / 1e6 / frames);
+			line += text;
+			any = true;
+		}
+		if (const auto served = g_stats.served[s].exchange(0, std::memory_order_relaxed); served != 0) {
+			std::snprintf(text, sizeof(text), ", served %.2f/f", static_cast<double>(served) / frames);
+			line += text;
+		}
+	}
+	for (uint32_t c = 0; c < ClassCount; c++) {
+		const auto n  = g_stats.suspended[c].exchange(0, std::memory_order_relaxed);
+		const auto ns = g_stats.suspended_ns[c].exchange(0, std::memory_order_relaxed);
+		if (n != 0) {
+			std::snprintf(text, sizeof(text), " | wait-suspended %s %.2f/f %.3f ms/f", kClassNames[c],
+			              static_cast<double>(n) / frames, static_cast<double>(ns) / 1e6 / frames);
+			line += text;
+		}
+	}
+	for (uint32_t c = 0; c < ClassCount; c++) {
+		const auto n  = g_stats.pred_drains[c].exchange(0, std::memory_order_relaxed);
+		const auto ns = g_stats.pred_drain_ns[c].exchange(0, std::memory_order_relaxed);
+		if (n != 0) {
+			std::snprintf(text, sizeof(text), " | pred-drain %s %.2f/f %.3f ms/f", kClassNames[c],
+			              static_cast<double>(n) / frames, static_cast<double>(ns) / 1e6 / frames);
+			line += text;
+		}
+	}
+	if (const auto n = g_stats.pred_drains_skipped.exchange(0, std::memory_order_relaxed); n != 0) {
+		std::snprintf(text, sizeof(text), " | pred-drain skipped %.2f/f", static_cast<double>(n) / frames);
+		line += text;
+	}
+	for (uint32_t s = 0; s < SiteCount; s++) {
+		for (uint32_t c = 0; c < FrontCount; c++) {
+			const auto n  = g_stats.stops[s][c].exchange(0, std::memory_order_relaxed);
+			const auto ns = g_stats.stop_ns[s][c].exchange(0, std::memory_order_relaxed);
+			if (n != 0) {
+				std::snprintf(text, sizeof(text), " | front %s %s %.2f/f %.3f ms/f", kSiteNames[s], kFrontNames[c],
+				              static_cast<double>(n) / frames, static_cast<double>(ns) / 1e6 / frames);
+				line += text;
+			}
+		}
+		if (const auto n = g_stats.front_served[s].exchange(0, std::memory_order_relaxed); n != 0) {
+			std::snprintf(text, sizeof(text), " | front %s answered %.2f/f", kSiteNames[s],
+			              static_cast<double>(n) / frames);
+			line += text;
+		}
+	}
+	if (const auto n = g_stats.journal_waits.exchange(0, std::memory_order_relaxed); n != 0) {
+		std::snprintf(text, sizeof(text), " | front wait-journal answered %.2f/f", static_cast<double>(n) / frames);
+		line += text;
+	}
+	if (const auto n = g_stats.write_through.exchange(0, std::memory_order_relaxed); n != 0) {
+		std::snprintf(text, sizeof(text), " | write-through %.2f/f", static_cast<double>(n) / frames);
+		line += text;
+	}
+	std::snprintf(text, sizeof(text), " | journal adds %.2f/f large %.2f/f | verify %" PRIu64 " checks %" PRIu64
+	              " mismatches (total)",
+	              static_cast<double>(g_stats.journal_adds.exchange(0, std::memory_order_relaxed)) / frames,
+	              static_cast<double>(g_stats.journal_large.exchange(0, std::memory_order_relaxed)) / frames,
+	              g_stats.verify_checks.load(std::memory_order_relaxed),
+	              g_stats.verify_mismatches.load(std::memory_order_relaxed));
+	line += text;
+	std::printf("%s\n", line.c_str());
+}
+
+} // namespace CpDecide
+
 class GpuMutexLock final {
 public:
 	explicit GpuMutexLock(Common::Mutex& mutex): m_mutex(mutex) {
@@ -1312,7 +1601,8 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 	const auto  ref   = static_cast<T>(op.ref);
 	const auto  mask  = static_cast<T>(op.mask);
 	const auto  func  = op.func;
-	auto        value  = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
+	T           value  = 0;
+	const auto  cls    = ReadDecision(CpDecide::SiteWait, reinterpret_cast<uint64_t>(addr), sizeof(T), &value);
 	bool        passed = TestWaitRegMemValue(value, ref, mask, func);
 	// KYTY_LABEL_MODE=split: the guest sees end-of-pipe labels at completion, the command
 	// processor's own waits at record time, as in record mode (Kyty orders the GPU work itself).
@@ -1328,6 +1618,19 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 		LogCpAddress("wait-suspend", op.addr, static_cast<uint64_t>(value), sizeof(T), queue);
 	}
 	blocked.Observed(static_cast<uint64_t>(value));
+	if (CpDecide::StatsEnabled()) {
+		// The suspension of a wait: its first failed evaluation to its pass, by the first one's class.
+		if (!passed && m_decide_fail_ns == 0) {
+			const bool label   = g_gpu_state != nullptr &&
+			                   g_gpu_state->DeferredLabelTick(reinterpret_cast<uint64_t>(addr), sizeof(T)) != 0;
+			m_decide_fail_ns    = CpDecide::NowNs();
+			m_decide_fail_class = label ? CpDecide::ClassLabel : cls;
+		} else if (passed && m_decide_fail_ns != 0) {
+			CpDecide::Add(CpDecide::g_stats.suspended[m_decide_fail_class]);
+			CpDecide::Add(CpDecide::g_stats.suspended_ns[m_decide_fail_class], CpDecide::NowNs() - m_decide_fail_ns);
+			m_decide_fail_ns = 0;
+		}
+	}
 	if (passed)
 		HangWatchdog::ClearQueueWait(queue);
 	else
@@ -1486,6 +1789,12 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 		        ? cache.TryWriteDataGpu(address, src + (dw_num - 1u), sizeof(uint32_t))
 		        : cache.TryWriteDataGpu(address, src, uint64_t {dw_num} * sizeof(uint32_t));
 		if (written) {
+			// KYTY_CP_DECISION_MEMORY: the value is known; guest memory gets it only when the GPU did.
+			if (CpDecide::g_mode.Get() != 0 || CpDecide::StatsEnabled()) {
+				const auto* bytes = write_one_address ? src + (dw_num - 1u) : src;
+				CpDecide::Record(cache, address, bytes,
+				                 write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * sizeof(uint32_t));
+			}
 			if (g_gpu_state != nullptr) {
 				g_gpu_state->DropCpVisibleLabels(
 				    address, write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * sizeof(uint32_t));
@@ -1527,6 +1836,13 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 	             m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1));
 
 	StreamCopyDefer::NoteGuestWrite(op.dst, write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * 4u);
+	// KYTY_CP_WRITE_THROUGH=1: into the backing and the cached GPU copy, without the fault.
+	if (BufferCache::CpWriteThroughEnabled() &&
+	    m_renderer.GetBufferCache().TryCpWriteThrough(op.dst, write_one_address ? src + (dw_num - 1u) : src, cpu_bytes)) {
+		CpDecide::Add(CpDecide::g_stats.write_through);
+		NoteCpWrite(op.dst, cpu_bytes);
+		return;
+	}
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -2623,8 +2939,39 @@ CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payl
 		} break;
 		case 0x03:
 			if (wait_op != 0 && !PredicationNoDrain()) {
-				Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
-				BufferFlushAndWait();
+				// KYTY_CP_DECISION_MEMORY bit 1: a predicate value the journal holds is final (no GPU
+				// write, label or CPU write over it since), so waiting for the GPU cannot change it.
+				const auto mode  = CpDecide::g_mode.Get();
+				const bool stats = CpDecide::StatsEnabled();
+				if ((mode & CpDecide::ModeResolver) != 0 || stats) {
+					uint8_t    known[8];
+					const auto vaddr = reinterpret_cast<uint64_t>(address);
+					const bool label = g_gpu_state != nullptr && g_gpu_state->DeferredLabelTick(vaddr, 8) != 0;
+					const bool have  = !label && CpDecide::Lookup(m_renderer.GetBufferCache(), vaddr, 8, known);
+					if (have && (mode & CpDecide::ModeResolver) != 0 && (mode & CpDecide::ModeVerify) == 0) {
+						if (stats) {
+							CpDecide::Add(CpDecide::g_stats.pred_drains_skipped);
+						}
+						(void)ReadDecision(CpDecide::SitePredication, vaddr, sizeof(value), &value);
+						break;
+					}
+					if (stats) {
+						const auto cls   = have ? CpDecide::ClassKnown : label ? CpDecide::ClassLabel : CpDecide::ClassUnknown;
+						const auto start = CpDecide::NowNs();
+						{
+							Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
+							BufferFlushAndWait();
+						}
+						CpDecide::Add(CpDecide::g_stats.pred_drains[cls]);
+						CpDecide::Add(CpDecide::g_stats.pred_drain_ns[cls], CpDecide::NowNs() - start);
+					} else {
+						Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
+						BufferFlushAndWait();
+					}
+				} else {
+					Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
+					BufferFlushAndWait();
+				}
 				// Labels deferred to completion (defer-label / KYTY_LABEL_MODE=completion) are
 				// written by commands the completion runner posts: run them before reading.
 				if (g_gpu_state != nullptr &&
@@ -2635,7 +2982,7 @@ CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payl
 				}
 			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = ReadGuestForCp<uint64_t>(reinterpret_cast<uint64_t>(address));
+			(void)ReadDecision(CpDecide::SitePredication, reinterpret_cast<uint64_t>(address), sizeof(value), &value);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -4047,6 +4394,12 @@ static void WriteEopLabel(RenderContext& renderer, void* dst, const void* value,
 		const auto* v = std::getenv("KYTY_LABEL_BACKING");
 		return v != nullptr && std::strcmp(v, "1") == 0;
 	}();
+	// KYTY_CP_WRITE_THROUGH=1: into the backing and the cached GPU copy (BufferCache::TryCpWriteThrough).
+	if (BufferCache::CpWriteThroughEnabled() &&
+	    renderer.GetBufferCache().TryCpWriteThrough(reinterpret_cast<uint64_t>(dst), value, size)) {
+		CpDecide::Add(CpDecide::g_stats.write_through);
+		return;
+	}
 	if (enabled) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(dst);
 		auto&      buffers = renderer.GetBufferCache();
@@ -4760,7 +5113,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, flip.handle, flip.index,
 			                               flip.flip_mode, flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
+			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); // the frame boundary: live switches (KYTY_LIVE_FILE)
 			return;
 		}
 		case CpSeq::FlipVariant::Label: {
@@ -4787,7 +5140,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			                                 flip.handle, flip.index, flip.flip_mode,
 			                                 flip.flip_arg, request);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
+			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip();
 			return;
 		}
 		case CpSeq::FlipVariant::LabelInterrupt: {
@@ -4819,7 +5172,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				                                 flip.handle, flip.index, flip.flip_mode,
 				                                 flip.flip_arg, request);
 				GetScheduler().Flush();
-				Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
+				Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip();
 				return;
 			}
 			StreamCopyDefer::NoteGuestWrite(op.dst, sizeof(value));
@@ -4831,7 +5184,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
 			    flip.index, flip.flip_mode, flip.flip_arg, request, m_interrupt_event_id);
 			GetScheduler().Flush();
-			Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip();
+			Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip();
 			return;
 		}
 	}
@@ -4854,7 +5207,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
-	Live::OnCpFlip(); Libs::Graphics::PageManager::NoteCpFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
+	Live::OnCpFlip(); CpDecide::Report(); Libs::Graphics::PageManager::NoteCpFlip(); // a CPU-submitted flip's frame boundary (KYTY_LIVE_FILE)
 }
 
 void CommandProcessor::SynchronizeGpu() {
@@ -5151,7 +5504,12 @@ bool CommandProcessor::CondExec(uint64_t address) {
 }
 
 CpSeq::Result CommandProcessor::ExecCondExec(const CpSeq::CondExecOp& op) {
-	return {false, *reinterpret_cast<const volatile uint32_t*>(op.address) != 0 ? 1u : 0u};
+	if (CpDecide::g_mode.Get() == 0 && !CpDecide::StatsEnabled()) {
+		return {false, *reinterpret_cast<const volatile uint32_t*>(op.address) != 0 ? 1u : 0u};
+	}
+	uint32_t value = 0;
+	(void)ReadDecision(CpDecide::SiteCondExec, op.address, sizeof(value), &value);
+	return {false, value != 0 ? 1u : 0u};
 }
 
 bool CommandProcessor::Branch(uint64_t compare_addr, uint64_t mask, uint64_t reference,
@@ -5170,9 +5528,9 @@ bool CommandProcessor::Branch(uint64_t compare_addr, uint64_t mask, uint64_t ref
 }
 
 CpSeq::Result CommandProcessor::ExecBranch(const CpSeq::BranchOp& op) {
-	const bool taken =
-	    TestWaitRegMemValue(ReadGuestForCp<uint64_t>(op.compare_addr), op.reference, op.mask,
-	                        op.function);
+	uint64_t value = 0;
+	(void)ReadDecision(CpDecide::SiteBranch, op.compare_addr, sizeof(value), &value);
+	const bool taken = TestWaitRegMemValue(value, op.reference, op.mask, op.function);
 	return {false, taken ? 1u : 0u};
 }
 
@@ -5191,7 +5549,7 @@ const uint32_t* CommandProcessor::ReadRegisterPairs(uint64_t address, uint32_t n
 			std::memset(m_register_pairs.data(), 0, bytes);
 		}
 	} else {
-		ReadGuestForCp(address, bytes, m_register_pairs.data());
+		(void)ReadDecision(CpDecide::SiteRegRead, address, bytes, m_register_pairs.data());
 	}
 	// P3c: the bytes a parse after a wait read are part of its draws' adoption key.
 	TrackAdoptInputs(m_register_pairs.data(), bytes, address);
@@ -5304,6 +5662,8 @@ void NoteCpWrite(uint64_t address, uint64_t size) {
 	if (g_gpu_state != nullptr && address != 0 && size != 0) {
 		g_gpu_state->DropCpVisibleLabels(address, size);
 	}
+	// KYTY_CP_DECISION_MEMORY: so does the decision journal's.
+	CpDecide::Forget(address, size);
 	// KYTY_LABEL_WAKE: a guest thread may sleep on the written word.
 	LibKernel::SyncOnAddress::WakeAfterEmulatorWrite(reinterpret_cast<volatile void*>(address), size);
 }
@@ -5462,6 +5822,9 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 			              [executed](const PendingWrite& write) { return write.op < executed; });
 		}
 		m_pending_writes.push_back({begin, end, sequence});
+		if ((CpDecide::g_mode.Get() & CpDecide::ModeFront) != 0 || CpDecide::StatsEnabled()) {
+			NoteFrontValue(kind, payload, data, data_size, begin, end);
+		}
 		if (execution != nullptr) {
 			for (auto& cursor: execution->m_buffer_stack) {
 				const auto rest_begin =
@@ -5480,6 +5843,54 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		// P3c: speculative slots the real parse has not adopted by an ordering point are stale (a
 		// speculation stops at the first one); the resolver retires them before this op.
 		DropSpeculativeSlots();
+	}
+	// KYTY_CP_DECISION_MEMORY bit 2: a condition on bytes whose newest write is a WRITE_DATA value
+	// emitted since the last stop is answered here; the op is not emitted (it only reads).
+	const auto decide_mode  = CpDecide::g_mode.Get();
+	const bool decide_stats = CpDecide::StatsEnabled();
+	uint32_t   decide_site  = CpDecide::SiteCount;
+	bool       decide_known = false;
+	bool       decide_pend  = false;
+	uint64_t   decide_value = 0;
+	if ((decide_mode & CpDecide::ModeFront) != 0 || decide_stats) {
+		uint64_t bytes = 0;
+		if (kind == CpSeq::OpKind::CondExec) {
+			const auto& op = *static_cast<const CpSeq::CondExecOp*>(payload);
+			decide_site    = CpDecide::SiteCondExec;
+			uint32_t v     = 0;
+			decide_known   = FrontKnown(op.address, sizeof(v), &v, false, &decide_pend);
+			decide_value   = v != 0 ? 1u : 0u;
+		} else if (kind == CpSeq::OpKind::Branch) {
+			const auto& op = *static_cast<const CpSeq::BranchOp*>(payload);
+			decide_site    = CpDecide::SiteBranch;
+			decide_known   = FrontKnown(op.compare_addr, sizeof(bytes), &bytes, false, &decide_pend);
+			decide_value   = TestWaitRegMemValue(bytes, op.reference, op.mask, op.function) ? 1u : 0u;
+		} else if (kind == CpSeq::OpKind::Predication) {
+			const auto& op = *static_cast<const CpSeq::PredicationOp*>(payload);
+			decide_site    = CpDecide::SitePredication;
+			if (op.op == 0x03u && (op.condition == 0u || op.condition == 1u)) {
+				decide_known = FrontKnown(op.address, sizeof(bytes), &bytes, false, &decide_pend);
+				decide_value = (op.condition == 0u ? bytes != 0 : bytes == 0) ? 1u : 0u;
+			}
+		} else if (kind == CpSeq::OpKind::WaitRegMem) {
+			const auto& op = *static_cast<const CpSeq::WaitRegMemOp*>(payload);
+			decide_site    = CpDecide::SiteWait;
+			decide_known   = FrontKnown(op.addr, op.size, &bytes, true, &decide_pend);
+			if (op.size == sizeof(uint32_t)) {
+				bytes &= 0xffffffffu;
+			}
+			decide_value = decide_known && TestWaitRegMemValue(bytes, op.ref, op.mask, op.func) ? 1u : 0u;
+		}
+		if (decide_known && kind != CpSeq::OpKind::WaitRegMem && (decide_mode & CpDecide::ModeFront) != 0 &&
+		    (decide_mode & CpDecide::ModeVerify) == 0 && CpSeq::VerifyMode() == 0) {
+			if (decide_stats) {
+				CpDecide::Add(CpDecide::g_stats.front_served[decide_site]);
+			}
+			if ((flags & CpSeq::FlagAdvanceEpoch) != 0) {
+				m_epoch_pending = true; // carried by the next op emitted
+			}
+			return {false, decide_value};
+		}
 	}
 	(void)m_ops->Emit(kind, payload, payload_size, data, data_size,
 	                  execution != nullptr ? execution->m_packets : 0,
@@ -5528,6 +5939,24 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 			            count);
 		}
 		m_adopt_tracking = false;
+		m_front_values.clear();
+		if (decide_stats) {
+			CpDecide::Add(CpDecide::g_stats.journal_waits);
+		}
+		return {false, 0};
+	}
+	// KYTY_CP_DECISION_MEMORY bit 2: a WAIT_REG_MEM whose known value (a WRITE_DATA or plain label data
+	// emitted since the last stop) passes is left to the resolver, which still waits in order; the
+	// front keeps parsing (as KYTY_CP_WAIT_JOURNAL does for the self-label idiom). Values written
+	// before a wait are not used after it (GPU work before the wait may have written the bytes).
+	if (kind == CpSeq::OpKind::WaitRegMem && decide_known && decide_value != 0 &&
+	    (decide_mode & CpDecide::ModeFront) != 0 && (decide_mode & CpDecide::ModeVerify) == 0 &&
+	    CpSeq::VerifyMode() == 0) {
+		if (decide_stats) {
+			CpDecide::Add(CpDecide::g_stats.front_served[CpDecide::SiteWait]);
+		}
+		m_adopt_tracking = false;
+		m_front_values.clear();
 		return {false, 0};
 	}
 	// P3c (KYTY_CP_SEQ_PREFETCH): at a wait on the label this stream just wrote, parse ahead on a
@@ -5538,7 +5967,28 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 		RunPrefetch(sequence);
 	}
 	// An ordering point: the resolver executes everything before it, then this op.
-	const auto value = m_sequencer->AwaitAnswer(sequence);
+	const auto decide_start = decide_stats ? CpDecide::NowNs() : 0;
+	const auto value        = m_sequencer->AwaitAnswer(sequence);
+	if (decide_site != CpDecide::SiteCount) {
+		if (decide_stats) {
+			const auto cls = decide_known ? (kind == CpSeq::OpKind::WaitRegMem && decide_value == 0
+			                                     ? CpDecide::FrontKnownFail
+			                                     : CpDecide::FrontKnown)
+			                 : decide_pend ? CpDecide::FrontPending
+			                               : CpDecide::FrontOther;
+			CpDecide::Add(CpDecide::g_stats.stops[decide_site][cls]);
+			CpDecide::Add(CpDecide::g_stats.stop_ns[decide_site][cls], CpDecide::NowNs() - decide_start);
+		}
+		// Verify: a known condition answer must equal the resolver's (a wait's pass is not compared:
+		// the resolver answers a wait only once it passed).
+		if (decide_known && kind != CpSeq::OpKind::WaitRegMem && (decide_mode & CpDecide::ModeVerify) != 0) {
+			CpDecide::Add(CpDecide::g_stats.verify_checks);
+			if ((value != 0) != (decide_value != 0)) {
+				CpDecide::NoteMismatch(CpDecide::kSiteNames[decide_site], 0, 0, decide_value, value);
+			}
+		}
+	}
+	m_front_values.clear();
 	m_pending_writes.clear();
 	m_barrier_epoch++;
 	if (m_draw_prep != nullptr) {
@@ -5589,6 +6039,44 @@ bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* 
 	if (size == 0) {
 		return true;
 	}
+	// KYTY_CP_DECISION_MEMORY bit 2: bytes held by WRITE_DATA values emitted since the last stop.
+	const auto mode    = CpDecide::g_mode.Get();
+	const bool stats   = CpDecide::StatsEnabled();
+	bool       pending = false;
+	bool       have    = false;
+	uint8_t    known[64];
+	if ((mode & CpDecide::ModeFront) != 0 || stats) {
+		have = FrontKnown(address, size, known, false, &pending);
+	}
+	if (have && (mode & CpDecide::ModeFront) != 0 && (mode & CpDecide::ModeVerify) == 0 &&
+	    CpSeq::VerifyMode() == 0) {
+		std::memcpy(dst, known, size);
+		if (stats) {
+			CpDecide::Add(CpDecide::g_stats.front_served[CpDecide::SiteRegRead]);
+		}
+		return true;
+	}
+	const bool overlap = stats && std::any_of(m_pending_writes.begin(), m_pending_writes.end(),
+	                                          [&](const PendingWrite& w) { return w.begin < address + size && address < w.end; });
+	const bool touched = stats && GpuTouched::AnyTouched(g_seq_fine_reads.On(), address, address + size);
+	const auto start   = stats ? CpDecide::NowNs() : 0;
+	const bool ok      = ReadGuestForFrontSerial(address, size, dst);
+	if (stats && (overlap || touched)) {
+		const auto cls = have ? CpDecide::FrontKnown : pending ? CpDecide::FrontPending : CpDecide::FrontOther;
+		CpDecide::Add(CpDecide::g_stats.stops[CpDecide::SiteRegRead][cls]);
+		CpDecide::Add(CpDecide::g_stats.stop_ns[CpDecide::SiteRegRead][cls], CpDecide::NowNs() - start);
+	}
+	if (ok && have && (mode & CpDecide::ModeVerify) != 0) {
+		CpDecide::Add(CpDecide::g_stats.verify_checks);
+		if (std::memcmp(dst, known, size) != 0) {
+			CpDecide::NoteMismatch("front-regread", address, size, CpDecide::FirstBytes(known, size),
+			                       CpDecide::FirstBytes(dst, size));
+		}
+	}
+	return ok;
+}
+
+bool CommandProcessor::ReadGuestForFrontSerial(uint64_t address, uint64_t size, void* dst) {
 	if (!AwaitPendingWrites(address, address + size)) {
 		return false;
 	}
@@ -5622,8 +6110,142 @@ bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* 
 }
 
 CpSeq::Result CommandProcessor::ExecLockstepRead(const CpSeq::LockstepReadOp& op) {
-	ReadGuestForCp(op.address, op.size, reinterpret_cast<void*>(op.destination));
+	(void)ReadDecision(CpDecide::SiteRegRead, op.address, op.size, reinterpret_cast<void*>(op.destination));
 	return {};
+}
+
+uint32_t CommandProcessor::ReadDecision(uint32_t site, uint64_t vaddr, uint64_t size, void* dst) {
+	const auto mode  = CpDecide::g_mode.Get();
+	const bool stats = CpDecide::StatsEnabled();
+	if ((mode & CpDecide::ModeResolver) == 0 && !stats) {
+		ReadGuestForCp(vaddr, size, dst);
+		return CpDecide::ClassClean;
+	}
+	EXIT_IF(vaddr == 0 || dst == nullptr);
+	if (LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size)) {
+		if (stats) {
+			CpDecide::Add(CpDecide::g_stats.reads[site][CpDecide::ClassClean]);
+		}
+		return CpDecide::ClassClean;
+	}
+	uint8_t    known[64];
+	const bool label = g_gpu_state != nullptr && g_gpu_state->DeferredLabelTick(vaddr, size) != 0;
+	const bool have  = !label && CpDecide::Lookup(m_renderer.GetBufferCache(), vaddr, size, known);
+	const auto cls   = have ? CpDecide::ClassKnown : label ? CpDecide::ClassLabel : CpDecide::ClassUnknown;
+	if (have && (mode & CpDecide::ModeResolver) != 0 && (mode & CpDecide::ModeVerify) == 0) {
+		std::memcpy(dst, known, size);
+		if (stats) {
+			CpDecide::Add(CpDecide::g_stats.reads[site][cls]);
+			CpDecide::Add(CpDecide::g_stats.served[site]);
+		}
+		return cls;
+	}
+	const auto start = stats ? CpDecide::NowNs() : 0;
+	if (!(LibKernel::Memory::SynchronizeGpuBackingForRead(vaddr, size) &&
+	      LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size))) {
+		std::memcpy(dst, reinterpret_cast<const void*>(vaddr), size);
+	}
+	if (stats) {
+		CpDecide::Add(CpDecide::g_stats.reads[site][cls]);
+		CpDecide::Add(CpDecide::g_stats.read_ns[site][cls], CpDecide::NowNs() - start);
+	}
+	if (have && (mode & CpDecide::ModeVerify) != 0) {
+		CpDecide::Add(CpDecide::g_stats.verify_checks);
+		if (std::memcmp(dst, known, size) != 0) {
+			CpDecide::NoteMismatch(CpDecide::kSiteNames[site], vaddr, size, CpDecide::FirstBytes(known, size),
+			                       CpDecide::FirstBytes(dst, size));
+		}
+	}
+	return cls;
+}
+
+void CommandProcessor::NoteFrontValue(CpSeq::OpKind kind, const void* payload, const void* data,
+                                      uint32_t data_size, uint64_t begin, uint64_t end) {
+	FrontValue value;
+	value.begin = begin;
+	value.end   = end;
+	if (kind == CpSeq::OpKind::WriteData) {
+		const auto& op       = *static_cast<const CpSeq::WriteDataOp*>(payload);
+		const bool  one_addr = ((op.write_control >> 16u) & 0x1u) != 0;
+		const auto  bytes    = one_addr ? uint64_t {sizeof(uint32_t)} : uint64_t {op.dw_num} * 4u;
+		if (data != nullptr && op.dw_num != 0 && bytes <= sizeof(value.value) &&
+		    data_size >= op.dw_num * sizeof(uint32_t)) {
+			const auto* src = static_cast<const uint8_t*>(data) + (one_addr ? (op.dw_num - 1u) * 4u : 0u);
+			std::memcpy(value.value, src, bytes);
+			value.end   = begin + bytes;
+			value.known = true;
+		}
+	} else if (kind == CpSeq::OpKind::EndOfPipe) {
+		const auto& op   = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
+		const bool  data = op.event_write_source == 0x02u ||
+		                  (op.event_write_source == 0x01u && op.size == sizeof(uint32_t) && op.eop_event_type == 0x04u);
+		if (data && (op.size == sizeof(uint32_t) || op.size == sizeof(uint64_t))) {
+			std::memcpy(value.value, &op.value, op.size);
+			value.end   = begin + op.size;
+			value.known = true;
+			value.label = true;
+		}
+	} else if (kind == CpSeq::OpKind::ReleaseMem) {
+		const auto& op       = *static_cast<const CpSeq::ReleaseMemOp*>(payload);
+		const auto  data_sel = (op.body[1] >> 29u) & 0x7u;
+		if (data_sel == 1u || data_sel == 2u) {
+			const uint64_t v = data_sel == 1u ? uint64_t {op.body[4]} : (op.body[4] | (uint64_t {op.body[5]} << 32u));
+			const uint32_t n = data_sel == 1u ? 4u : 8u;
+			std::memcpy(value.value, &v, n);
+			value.end   = begin + n;
+			value.known = true;
+			value.label = true;
+		}
+	}
+	if (m_front_values.size() >= 64u) {
+		// The oldest go: their bytes then read as before (not known).
+		m_front_values.erase(m_front_values.begin());
+		FrontValue lost;
+		lost.begin = 0;
+		lost.end   = UINT64_MAX; // conservatively: every byte has an unknown older write now
+		m_front_values.insert(m_front_values.begin(), lost);
+	}
+	m_front_values.push_back(value);
+}
+
+bool CommandProcessor::FrontKnown(uint64_t address, uint64_t size, void* dst, bool allow_labels,
+                                  bool* pending) const {
+	*pending = false;
+	if (size == 0 || size > 64 || m_front_values.empty()) {
+		for (const auto& v: m_front_values) {
+			if (v.begin < address + size && address < v.end) {
+				*pending = true;
+				break;
+			}
+		}
+		return false;
+	}
+	const uint64_t all     = size == 64 ? UINT64_MAX : (uint64_t {1} << size) - 1u;
+	uint64_t       decided = 0;
+	for (auto it = m_front_values.rbegin(); it != m_front_values.rend() && decided != all; ++it) {
+		if (it->begin >= address + size || address >= it->end) {
+			continue;
+		}
+		*pending          = true;
+		const uint64_t lo = std::max(it->begin, address);
+		const uint64_t hi = std::min(it->end, address + size);
+		const uint64_t n  = hi - lo;
+		const uint64_t mask = (n >= 64 ? UINT64_MAX : ((uint64_t {1} << n) - 1u)) << (lo - address);
+		if ((mask & ~decided) == 0) {
+			continue;
+		}
+		if (!it->known || (it->label && !allow_labels)) {
+			return false; // the newest write of some byte has no usable value
+		}
+		for (uint64_t at = lo; at < hi; at++) {
+			const uint64_t bit = uint64_t {1} << (at - address);
+			if ((decided & bit) == 0) {
+				static_cast<uint8_t*>(dst)[at - address] = it->value[at - it->begin];
+			}
+		}
+		decided |= mask;
+	}
+	return decided == all;
 }
 
 bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {

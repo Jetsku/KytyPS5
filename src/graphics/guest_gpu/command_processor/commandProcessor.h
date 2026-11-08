@@ -307,6 +307,29 @@ private:
 	[[nodiscard]] bool AwaitPendingWrites(uint64_t begin, uint64_t end);
 	// Sequencer thread: reads guest bytes the resolver may have to read in order (lockstep).
 	[[nodiscard]] bool ReadGuestForFront(uint64_t address, uint64_t size, void* dst);
+	[[nodiscard]] bool ReadGuestForFrontSerial(uint64_t address, uint64_t size, void* dst);
+	// KYTY_CP_DECISION_MEMORY (graphicsRun.cpp). Resolver: a decision read of guest bytes (the
+	// journal of known CP-write values, else ReadGuestForCp); returns its stats class.
+	uint32_t ReadDecision(uint32_t site, uint64_t vaddr, uint64_t size, void* dst);
+	// Sequencer: the CP writes emitted since the front's last wait or stop, with their values when
+	// known (WRITE_DATA; plain label data marked as a label).
+	struct FrontValue {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		bool     known = false;
+		bool     label = false;
+		uint8_t  value[64] {};
+	};
+	std::vector<FrontValue> m_front_values;
+	void NoteFrontValue(CpSeq::OpKind kind, const void* payload, const void* data, uint32_t data_size,
+	                    uint64_t begin, uint64_t end);
+	// All of [address, address + size) has known values (labels only with `allow_labels`);
+	// `pending`: some CP write emitted since overlaps the bytes.
+	[[nodiscard]] bool FrontKnown(uint64_t address, uint64_t size, void* dst, bool allow_labels,
+	                              bool* pending) const;
+	// Resolver: the first failed evaluation of the current WAIT_REG_MEM (stats).
+	uint64_t m_decide_fail_ns    = 0;
+	uint32_t m_decide_fail_class = 0;
 	// Sequencer thread: a snapshot of the front registers for an op; its index.
 	[[nodiscard]] uint32_t TakeSnapshot();
 	// Sequencer thread: waits for a free draw-prep window slot. False: stopping.
