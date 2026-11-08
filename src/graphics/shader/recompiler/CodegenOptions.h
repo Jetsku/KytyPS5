@@ -516,6 +516,12 @@ struct CodegenOptions {
 	// (Table 31): memory channel c takes the data component whose dst_sel names it (0 if none), the
 	// inverse map image stores already apply (StoreTexel).
 	bool format_store_dst_sel = false;
+	// KYTY_BARRIER_ACQUIRE_STORES=1 (default 0): S_BARRIER in a compute-like program that stores to
+	// buffers or images (bound or computed V#s, storage images) also orders buffer and image memory
+	// (UniformMemory | ImageMemory semantics, workgroup scope), not only LDS: waves read the other
+	// waves' stores with plain loads right after the barrier (mainline ceb154d9e; Erlou93's Yotei
+	// cloth modules carry it). Not the cause of Ghost of Yotei's stiff menu banner (A/B 2026-11-08).
+	bool barrier_acquire_stores = false;
 	// KYTY_IMAGE_GLC_COHERENT=1: IMAGE_LOAD* / IMAGE_STORE* with GLC or DLC (ISA Tables 29/41, the
 	// buffer meaning) access the storage image through a Coherent alias of its binding, so only those
 	// accesses bypass the non-coherent caches (the whole-binding Coherent decoration of buffers costs

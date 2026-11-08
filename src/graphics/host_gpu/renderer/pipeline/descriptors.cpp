@@ -328,17 +328,21 @@ static uint64_t StorageRangeCap(const GraphicContext& graphics) {
 	return on ? uint64_t {0x7ffffffc} : std::numeric_limits<uint64_t>::max();
 }
 
-// KYTY_READ_BUFFER_TAIL=1 (default off; usa-ratt/KytyPS5-GT7 d875ff10f, round 84): a read-only
+// KYTY_READ_BUFFER_TAIL (default on, =0 off; usa-ratt/KytyPS5-GT7 d875ff10f, round 84): a read-only
 // storage binding's range, which the shaders' bounds checks floor to whole dwords, is rounded up to
 // whole dwords instead of down. Byte and halfword reads index up to four and two times that
 // length, so a range ending inside a dword hid its last bytes: GT7's car glass reads a
 // 17,370-byte table (one byte per control point of its 965 patches), its last patch read the last
 // two bytes as zero and one corner rose half a metre above the roof (the roof spike). A written
 // binding keeps the rounding down, so a dword store cannot reach past its range.
+// Default on since claude/u59-yoter7-cloth (=0: off): Ghost of Yotei's menu cloth solver reads its
+// per-particle inverse masses as 8_UNORM bytes from a 70-byte V# (cs 0x79b0066f0cd1f3cd); bytes
+// 68-69 read as zero, the 68-69 distance constraint divided 0 by 0, and the NaN guard reset the
+// upper banner to its skinned pose every frame (stiff, sideways katana banner).
 static bool ReadBufferTail() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_READ_BUFFER_TAIL");
-		return value != nullptr && value[0] != '\0' && value[0] != '0';
+		return value == nullptr || value[0] == '\0' || value[0] != '0';
 	}();
 	return enabled;
 }
@@ -417,7 +421,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	// and halfword reads of the last partial dword are not hidden by the dword bounds checks.
 	if (ReadBufferTail() && !resource.written && (size + adjustment) % 4u != 0) {
 		const auto whole = Common::AlignUp(size + adjustment, uint64_t {4});
-		if (aligned_offset + whole <= buffer->Size()) {
+		// The rounded range must still fit the host buffer and the device's descriptor limit.
+		if (aligned_offset + whole <= buffer->Size() && whole <= max_range) {
 			range = std::min(whole, StorageRangeCap(graphics));
 		}
 	}

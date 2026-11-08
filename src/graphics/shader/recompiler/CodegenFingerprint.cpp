@@ -269,6 +269,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.format_store_dst_sel) {
 		b.Text("format_store_dst_sel");
 	}
+	if (options.barrier_acquire_stores) {
+		b.Text("barrier_acquire_stores");
+	}
 	if (options.image_glc_coherent) {
 		b.Text("image_glc_coherent");
 	}

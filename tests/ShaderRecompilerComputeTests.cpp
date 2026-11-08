@@ -25267,11 +25267,20 @@ public:
           const auto &source = reader_bindings.buffer_sources[0];
           const auto &binding = reader_bindings.buffers[0];
           const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
-          // Our storage bindings cover whole dwords (199fc678b; see the halfword case above).
+          // Our storage bindings cover whole dwords (199fc678b; see the halfword case above). A
+          // read-only binding rounds its partial last dword up when the host buffer and the
+          // device limit have room (KYTY_READ_BUFFER_TAIL, default on), otherwise down.
           const auto bound = expected + owner.Offset(address) - binding.offset;
+          const auto up = (bound + 3u) & ~uint64_t{3};
+          const auto device_limit =
+              context.GetGraphics().physical_device_properties.limits.maxStorageBufferRange;
+          const auto expected_range =
+              bound % 4u != 0u && binding.offset + up <= owner.Size() && up <= device_limit
+                  ? up
+                  : (bound >= 4u ? bound & ~uint64_t{3} : bound);
           Require(name, description, source.address == address && source.size == expected &&
                       binding.buffer == owner.Handle() && binding.offset <= owner.Offset(address) &&
-                      binding.range == (bound >= 4u ? bound & ~uint64_t{3} : bound),
+                      binding.range == expected_range,
                   "descriptor discovery or rebind changed the read boundary or base adjustment");
         };
         check_range(mapped_tail, "read-only sentinel preserves mapped tail");

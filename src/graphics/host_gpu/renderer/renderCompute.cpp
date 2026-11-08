@@ -714,8 +714,8 @@ static void TraceDispatch(RenderContext& context, const ShaderComputeInputInfo& 
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto r =
 		    DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]);
-		text += fmt::format(" | b{}{}=0x{:x}/s{}/n{}", i, program.info.buffers[i].written ? "w" : "",
-		                    r.Base48(), r.Stride(), r.NumRecords());
+		text += fmt::format(" | b{}{}=0x{:x}/s{}/n{}/f{}/d{:03x}", i, program.info.buffers[i].written ? "w" : "",
+		                    r.Base48(), r.Stride(), r.NumRecords(), r.RawFormat(), r.DstSelXYZW());
 	}
 	// The images: t<i>[w][s] = written, sampled; base, format, extent, tile mode.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -785,18 +785,80 @@ static const std::vector<DispatchPeekRange>& DispatchPeekRanges() {
 	return ranges;
 }
 
+// KYTY_DISPATCH_DUMP_DIR=<folder> (diagnostic, with KYTY_DISPATCH_TRACE): around every traced dispatch
+// (within the trace limit) the GPU's bytes of each bound buffer (at most 256 KiB each) are written to
+// <folder>/d<ordinal>_<before|after>_<hash>_b<binding>_<base>.bin once the tick completed.
+static const std::string& DispatchDumpDir() {
+	static const std::string dir = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_DUMP_DIR");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	return dir;
+}
+
 static bool DispatchPeekWanted(const ShaderComputeInputInfo& input_info) {
 	const auto& request = DispatchTrace();
-	if (DispatchPeekRanges().empty() || request.hashes.empty()) return false;
+	if ((DispatchPeekRanges().empty() && DispatchDumpDir().empty()) || request.hashes.empty()) return false;
 	const auto hash = input_info.stage.program->shader_hash;
 	const bool all  = std::ranges::find(request.hashes, uint64_t {0}) != request.hashes.end();
 	return all || std::ranges::find(request.hashes, hash) != request.hashes.end();
+}
+
+static void DispatchDump(RenderContext& context, CommandBuffer& command,
+                         const ShaderComputeInputInfo& input_info, uint32_t phase, uint32_t ordinal) {
+	const auto& program = *input_info.stage.program;
+	auto&       cache   = context.GetBufferCache();
+	struct Piece {
+		uint32_t binding = 0;
+		uint64_t base    = 0;
+		uint64_t offset  = 0;
+		uint64_t bytes   = 0;
+	};
+	std::vector<Piece> pieces;
+	uint64_t           total = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto r     = DecodeNativeDescriptor<ShaderBufferResource>(input_info.stage.resources->buffers[i]);
+		const auto bytes = std::min<uint64_t>(r.GetSize(), 256u * 1024u) & ~uint64_t {3};
+		if (r.Base48() < 0x100000000ull || bytes == 0) continue;
+		pieces.push_back({i, r.Base48(), total, bytes});
+		total += (bytes + 255u) & ~uint64_t {255};
+	}
+	if (pieces.empty()) return;
+	auto download = std::make_shared<Buffer>(context.GetGraphics(), context.GetCommandScheduler(),
+	                                         MemoryUsage::Download, 0, AllFlags, total);
+	command.EndRendering();
+	for (const auto& piece: pieces) {
+		const auto [source, offset] = cache.ObtainBuffer(piece.base, piece.bytes, false);
+		if (source == nullptr) continue;
+		download->CopyFrom(command, *source, offset, piece.offset, piece.bytes, vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+	}
+	const auto hash = program.shader_hash;
+	context.GetCommandScheduler().DeferOperation([download, pieces, hash, phase, ordinal, total] {
+		download->Invalidate(0, total);
+		for (const auto& piece: pieces) {
+			const auto name = fmt::format("{}/d{:03}_{}_{:016x}_b{}_{:x}.bin", DispatchDumpDir(), ordinal,
+			                              phase == 0 ? "before" : "after", hash, piece.binding, piece.base);
+			if (FILE* file = std::fopen(name.c_str(), "wb"); file != nullptr) {
+				std::fwrite(download->Mapped().data() + piece.offset, 1, piece.bytes, file);
+				std::fclose(file);
+			}
+		}
+	});
 }
 
 // phase 0 = before the dispatch, 1 = after it.
 static void DispatchPeek(RenderContext& context, CommandBuffer& command,
                          const ShaderComputeInputInfo& input_info, uint32_t phase) {
 	const auto hash = input_info.stage.program->shader_hash;
+	if (!DispatchDumpDir().empty()) {
+		static std::unordered_map<uint64_t, uint32_t> dumps;
+		const auto                                    ordinal = dumps[hash]++;
+		if (ordinal < DispatchTrace().limit * 2) DispatchDump(context, command, input_info, phase, ordinal / 2);
+		if (DispatchPeekRanges().empty()) return;
+	}
 	constexpr uint32_t SlotBytes = 4 * 64;
 	constexpr uint32_t Slots     = 512;
 	static std::unique_ptr<Buffer>                 download;

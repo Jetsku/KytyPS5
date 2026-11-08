@@ -1835,6 +1835,26 @@ void TestShaderStageBarriers() {
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
   CheckSpirvBinaryValidates(result.spirv);
 
+  // KYTY_BARRIER_ACQUIRE_STORES: s_barrier in a program that stores to a buffer also acquires
+  // the other waves' buffer and image stores.
+  const uint32_t buffer_store[] = {
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0), // buffer_store_dword
+      EncodeSopp(0x0a, 0),                                 // s_barrier
+      EncodeSopp(0x01, 0),                                 // s_endpgm
+  };
+  const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+  auto       acquire_options = saved_options;
+  acquire_options.barrier_acquire_stores = true;
+  ShaderRecompiler::SetCodegenOptions(acquire_options);
+  const auto store_result =
+      RecompileForTest(buffer_store, MakeCompileOptions(ShaderType::Compute));
+  ShaderRecompiler::SetCodegenOptions(saved_options);
+  CheckSpirvBinaryValidates(store_result.spirv);
+  // AcquireRelease | UniformMemory | WorkgroupMemory | ImageMemory.
+  Check(DisassembleSpirvBinary(store_result.spirv)
+                .find("OpControlBarrier %uint_2 %uint_2 %uint_2376") != std::string::npos,
+        "s_barrier after buffer stores does not acquire buffer memory");
+
   const auto vertex_result =
       RecompileForTest(shader, MakeCompileOptions(ShaderType::Vertex));
   CheckSpirvBinaryValidates(vertex_result.spirv);

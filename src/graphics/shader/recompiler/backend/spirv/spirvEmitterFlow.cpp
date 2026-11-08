@@ -896,9 +896,18 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	auto memory = LdsMemorySemantics(state);
+	// KYTY_BARRIER_ACQUIRE_STORES: waves read the other waves' buffer and image stores with plain
+	// loads right after S_BARRIER (mainline ceb154d9e), so a program that stores also orders them.
+	const auto written = [](const auto& resource) { return resource.written; };
+	if (GetCodegenOptions().barrier_acquire_stores &&
+	    (state.requirements.buffer_writes || state.requirements.image_writes ||
+	     std::ranges::any_of(state.program.info.buffers, written) ||
+	     std::ranges::any_of(state.program.info.images, written))) {
+		memory = memory | spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsImageMemoryMask;
+	}
 	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
-	                                    : spv::MemorySemanticsAcquireReleaseMask |
-	                                          LdsMemorySemantics(state);
+	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	NoteWaveSync(state);
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
