@@ -259,6 +259,10 @@ public:
 	static constexpr uint32_t ProbeMark = 2;
 	void                      ArmUsageProbe();
 	void                      CollectUnusedImages(std::vector<ImageId>& unused);
+	// The host-mapped translation buffer (diagnostics).
+	[[nodiscard]] const uint32_t* TranslationWords() const noexcept {
+		return m_translation != nullptr ? reinterpret_cast<const uint32_t*>(m_translation->Mapped().data()) : nullptr;
+	}
 	void                   AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;
@@ -317,6 +321,13 @@ public:
 		m_replaced_keys.clear();
 	}
 	[[nodiscard]] bool HasReplacedKeys() const noexcept { return !m_replaced_keys.empty(); }
+	// KYTY_BINDLESS_UNMAP_RERESOLVE: the keys OnImageUnregistered sent back to pending, of heap,
+	// to settle again without waiting for a shader to flag them; taken (cleared) by the call.
+	void TakeReresolve(const Heap* heap, std::vector<uint32_t>& keys);
+	// KYTY_BINDLESS_UNMAP_RERESOLVE (live, default off; Miles preset): the guest unmaps part of a streamed texture,
+	// the texture cache frees the image, and its keys went back to pending until a shader flagged
+	// them and the flag came round (several frames of placeholder, on alternate call tables).
+	[[nodiscard]] static bool UnmapReresolve();
 	// Keys made pending because the texture cache dropped their image (statistics; reset on read).
 	[[nodiscard]] uint64_t TakeUnregisteredKeys() noexcept {
 		return std::exchange(m_unregistered_keys, 0);
@@ -410,6 +421,8 @@ private:
 	std::atomic<uint64_t> m_watch_generation {1};
 	uint64_t              m_unregistered_keys = 0;
 	std::vector<std::pair<Heap*, uint32_t>> m_replaced_keys;
+	std::mutex                                 m_reresolve_mutex;
+	std::vector<std::pair<const Heap*, uint32_t>> m_reresolve;
 	std::deque<Heap>      m_heaps;
 	std::vector<uint32_t> m_resized_heaps; // TakeResizedHeaps()
 	// FindOrCreateHeap's heaps by guest base (KYTY_BINDLESS_SMALL_HEAPS: Ghost of Yotei creates

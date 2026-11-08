@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -788,11 +789,12 @@ uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
 	return m_next_slot[binding]++;
 }
 
+// KYTY_BINDLESS_SLOT_REUSE=0 (live, default 1): freed slots are not given to other keys.
+static Live::Switch g_bindless_slot_reuse("KYTY_BINDLESS_SLOT_REUSE", [](const char* value) -> int64_t {
+	return value == nullptr || value[0] != '0' ? 1 : 0;
+});
+
 void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
-	static const bool reuse = [] {
-		const char* value = std::getenv("KYTY_BINDLESS_SLOT_REUSE");
-		return value == nullptr || value[0] != '0';
-	}();
 	// KYTY_BINDLESS_PREFILL: a shared slot stays while another key holds it; its last key frees it.
 	if (!m_shared_slot_words.empty() || !m_shared_slot_refs.empty()) {
 		const uint64_t shared_key = (uint64_t {binding} << 32u) | slot;
@@ -807,7 +809,7 @@ void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot) {
 			m_shared_slot_words.erase(words);
 		}
 	}
-	if (!reuse || binding >= ImageArrays || slot < PlaceholderColors) {
+	if (g_bindless_slot_reuse.Get() == 0 || binding >= ImageArrays || slot < PlaceholderColors) {
 		return;
 	}
 	auto& flags = m_slot_free[binding];
@@ -1377,8 +1379,32 @@ void BindlessTable::OnImageUnregistered(ImageId id, bool replaced) {
 		std::erase(heap->resolved, id);
 		heap->checked_generation = 0;
 		m_unregistered_keys++;
+		if (UnmapReresolve()) {
+			std::scoped_lock lock {m_reresolve_mutex};
+			if (m_reresolve.size() < (1u << 16u)) m_reresolve.emplace_back(heap, key);
+		}
 	}
 	m_image_refs.erase(found);
+}
+
+// KYTY_BINDLESS_UNMAP_RERESOLVE=1 (live; default off since int22, on in the Miles Morales preset
+// PPSA01417 where it was tested): see bindlessTable.h.
+static Live::Switch g_unmap_reresolve("KYTY_BINDLESS_UNMAP_RERESOLVE", [](const char* value) -> int64_t {
+	return value != nullptr && value[0] != ' ' && value[0] != '0' ? 1 : 0;
+});
+
+bool BindlessTable::UnmapReresolve() {
+	return g_unmap_reresolve.Get() != 0;
+}
+
+void BindlessTable::TakeReresolve(const Heap* heap, std::vector<uint32_t>& keys) {
+	keys.clear();
+	std::scoped_lock lock {m_reresolve_mutex};
+	std::erase_if(m_reresolve, [&](const auto& item) {
+		if (item.first != heap) return false;
+		keys.push_back(item.second);
+		return true;
+	});
 }
 
 bool BindlessTable::RuntimeImagesEnabled() {
