@@ -34,14 +34,14 @@ static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: updat
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
-static_assert(sizeof(ShaderInfo) == 192, "IR::ShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(ShaderInfo) == 208, "IR::ShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorBinding) == 32, "IR::DescriptorBinding changed: update ProgramCodec");
 static_assert(sizeof(BindingLayout) == 72, "IR::BindingLayout changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeNode) == 24, "IR::WriteRangeNode changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: update ProgramCodec");
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
-static_assert(sizeof(CompiledShaderInfo) == 352, "IR::CompiledShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(CompiledShaderInfo) == 368, "IR::CompiledShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource) == 272, "IR::DescriptorSource changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 112,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
@@ -59,7 +59,7 @@ static_assert(sizeof(ResourcePlan::ArithmeticTape) == 8,
               "IR::ResourcePlan::ArithmeticTape changed: update ProgramCodec");
 static_assert(sizeof(UniformFill) == 28, "IR::UniformFill changed: update ProgramCodec");
 static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: update ProgramCodec");
-static_assert(sizeof(ResourcePlan) == 736, "IR::ResourcePlan changed: update ProgramCodec");
+static_assert(sizeof(ResourcePlan) == 752, "IR::ResourcePlan changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
@@ -676,6 +676,11 @@ void Write(CodecWriter& w, const ShaderInfo& v) {
 	w.Bool(v.uses_bvh);
 	w.Bool(v.bda_writes);
 	w.Bool(v.pops);
+	w.U32(v.ray_query_sites);
+	w.U32(v.ray_query_user_sgpr);
+	w.U32(v.ray_query_vsharp_offset);
+	w.U32(v.ray_query_header_offset);
+	w.U32(v.ray_query_root);
 }
 
 void Read(CodecReader& r, ShaderInfo& v) {
@@ -696,6 +701,11 @@ void Read(CodecReader& r, ShaderInfo& v) {
 	v.uses_bvh             = r.Bool();
 	v.bda_writes           = r.Bool();
 	v.pops                 = r.Bool();
+	v.ray_query_sites         = r.U32();
+	v.ray_query_user_sgpr     = r.U32();
+	v.ray_query_vsharp_offset = r.U32();
+	v.ray_query_header_offset = r.U32();
+	v.ray_query_root          = r.U32();
 }
 
 void Write(CodecWriter& w, const BindingLayout& v) {

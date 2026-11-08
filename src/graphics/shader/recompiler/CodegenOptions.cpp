@@ -248,6 +248,8 @@ CodegenOptions FromEnvironment() {
 		options.rt_node_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));
 	}
 	options.rt_node_stats = EnvFlag("KYTY_RT_NODE_STATS", options.rt_node_stats);
+	options.rt_hw         = EnvFlag("KYTY_RT_HW", options.rt_hw);
+	options.rt_hw_verify  = options.rt_hw && EnvFlag("KYTY_RT_HW_VERIFY", options.rt_hw_verify);
 	if (const auto* mode = std::getenv("KYTY_LDS_WAITCNT_BARRIER"); mode != nullptr && mode[0] != '\0') {
 		options.lds_waitcnt_barrier = std::strcmp(mode, "0") == 0 || std::strcmp(mode, "off") == 0
 		                                  ? LdsWaitcntBarrier::Off

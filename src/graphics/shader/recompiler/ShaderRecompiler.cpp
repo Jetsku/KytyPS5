@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
@@ -1387,6 +1388,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, decoded, decode_bvh);
+		// KYTY_RT_HW: sce::Psr traversal loops trace with host ray queries (RayTracingPatch.h).
+		if (options.stage == ShaderType::Compute && decode_bvh && GetCodegenOptions().rt_hw) {
+			Decoder::RayTracingPatch patch;
+			const bool found   = Decoder::DeriveRayTracingPatch(decoded, patch);
+			const bool applied = found && Decoder::ApplyRayTracingPatch(patch, decoded, GetCodegenOptions().rt_hw_verify);
+			if (found || patch.unmatched != 0) {
+				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64 " unmatched=%u applied=%d%s\n",
+				     GetDumpLabel(options), options.shader_hash, static_cast<uint64_t>(patch.sites.size()),
+				     patch.unmatched, applied ? 1 : 0, patch.report.c_str());
+			}
+		}
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
@@ -1549,6 +1561,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	MarkCallLoopHeaders(decoded, ir);
+	// The TLAS of the native ray tracing patch (NativeRayTracing::Prepare reads it).
+	if (decoded.ray_tracing_source.valid && ir.info.ray_query_sites != 0) {
+		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
+		ir.info.ray_query_vsharp_offset = decoded.ray_tracing_source.vsharp_offset;
+		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
+		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

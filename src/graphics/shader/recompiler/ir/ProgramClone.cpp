@@ -35,8 +35,8 @@ namespace {
 // the SSA scratch arrays; ResourcePlan 29; Program 14 beyond ResourcePlan.
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update CloneProgram");
 static_assert(sizeof(Block) == 9256, "IR::Block changed: update CloneProgram");
-static_assert(sizeof(ResourcePlan) == 736, "IR::ResourcePlan changed: update CloneProgram");
-static_assert(sizeof(Program) == 1040, "IR::Program changed: update CloneProgram");
+static_assert(sizeof(ResourcePlan) == 752, "IR::ResourcePlan changed: update CloneProgram");
+static_assert(sizeof(Program) == 1056, "IR::Program changed: update CloneProgram");
 static_assert(sizeof(BlockInfo) == 192, "IR::BlockInfo changed: update CloneProgram");
 static_assert(sizeof(DescriptorSource) == 272, "IR::DescriptorSource changed: update CloneProgram");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update CloneProgram");

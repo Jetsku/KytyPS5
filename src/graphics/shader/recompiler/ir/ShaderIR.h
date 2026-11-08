@@ -703,6 +703,15 @@ struct ShaderInfo {
 	// KYTY_POPS_INTERLOCK: a pixel shader that writes hwreg(POPS_PACKER) with S_SETREG_B32, the start
 	// of a primitive-ordered pixel shading section (RDNA2 ISA Table 16; REPORT-ISA-2 M1).
 	bool                             pops               = false;
+	// KYTY_RT_HW (RayTracingPatch.h): the native ray tracing sites of the program (bit per site)
+	// and their guest TLAS: the header address is the 64-bit value at the base of the V# at user
+	// data pointer `ray_query_user_sgpr` + `ray_query_vsharp_offset`, plus
+	// `ray_query_header_offset`; the root node `ray_query_root`.
+	uint32_t                         ray_query_sites         = 0;
+	uint32_t                         ray_query_user_sgpr     = 0;
+	uint32_t                         ray_query_vsharp_offset = 0;
+	uint32_t                         ray_query_header_offset = 0;
+	uint32_t                         ray_query_root          = 0;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

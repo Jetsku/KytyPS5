@@ -203,6 +203,15 @@ struct EmitterState {
 	uint32_t                                         bda_pointer_function    = 0;
 	// KYTY_RT_FUNCTION: the module's one software BVH node test function (DefineBvhNodeTestFunction).
 	uint32_t                                         bvh_node_test_function  = 0;
+	// Native ray tracing (spirvEmitterRayQuery.cpp): function variables per site and emulated half.
+	struct RayQuerySiteVariables {
+		std::array<uint32_t, 2> query {}, state {}, instance {}, node {}, word {}, saved_t {}, saved_node {},
+		    saved_inst {}, nodes {}, slots {}, keep {};
+		uint32_t selected = 0;
+		uint32_t rounds   = 0;
+	};
+	std::array<RayQuerySiteVariables, 4>             ray_query {};
+	bool                                             ray_query_keep = false;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -115,6 +116,13 @@ void RenderMutex::RequesterUnlock() {
 	}
 	m_requested.store(0, std::memory_order_release);
 	m_mutex.Unlock();
+}
+
+NativeRayTracing& RenderContext::GetNativeRayTracing() {
+	if (m_native_ray_tracing == nullptr) {
+		m_native_ray_tracing = std::make_unique<NativeRayTracing>(m_graphics, m_command_scheduler, m_buffer_cache);
+	}
+	return *m_native_ray_tracing;
 }
 
 RenderContext::RenderContext(GraphicContext& graphics)

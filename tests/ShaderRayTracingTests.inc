@@ -595,8 +595,8 @@ int ValidateBvhShaderFiles(int argc, char **argv) {
         info.group_id[0] = info.group_id[1] = info.group_id[2] = true;
         info.workgroup_register = 16;
         // KYTY_HARNESS_SCRATCH_DWORDS=<n>: the per-thread scratch size (programs with scratch
-        // or a FLAT traversal stack fail resource tracking without one).
-        if (const char *scratch = std::getenv("KYTY_HARNESS_SCRATCH_DWORDS"); scratch != nullptr) {
+        // or a FLAT traversal stack fail resource tracking without one). KYTY_HARNESS_SCRATCH (hwrt) is the same.
+        if (const char *scratch = std::getenv("KYTY_HARNESS_SCRATCH_DWORDS") != nullptr ? std::getenv("KYTY_HARNESS_SCRATCH_DWORDS") : std::getenv("KYTY_HARNESS_SCRATCH"); scratch != nullptr) {
           info.scratch_size_dwords = static_cast<uint32_t>(std::strtoul(scratch, nullptr, 10));
         }
         auto options = MakeCompileOptions(ShaderType::Compute);

@@ -1289,6 +1289,13 @@ void BufferCache::EnsureBdaPageTableInitialized() {
 	m_bda_pagetable_initialized = true;
 }
 
+void BufferCache::EnsureBdaPageTableEntry(uint64_t index) {
+	EnsureBdaPageTableInitialized();
+	if (m_bda_sparse != nullptr) {
+		m_bda_sparse->EnsureResident(index * sizeof(vk::DeviceAddress), sizeof(vk::DeviceAddress));
+	}
+}
+
 Buffer* BufferCache::GetBdaPageTableBuffer() {
 	EnsureBdaPageTableInitialized();
 	return &m_bda_pagetable_buffer;
@@ -1622,7 +1629,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE, false, false,
+                             BDA_PAGETABLE_ALLOCATION,
+                             false, false,
                              graphics.sparse_residency_buffer_enabled),
       m_bda_incremental_sync(IncrementalBdaSyncEnabled()),
       m_bda_hot_sync(m_bda_incremental_sync && BdaHotSyncEnabled()),
@@ -1684,7 +1692,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	}
 	if (m_bda_pagetable_buffer.IsSparse()) {
 		m_bda_sparse = std::make_unique<SparsePageTable>(m_graphics, m_bda_pagetable_buffer.Handle(),
-		                                                 BDA_PAGETABLE_SIZE);
+		                                                 BDA_PAGETABLE_ALLOCATION);
 	}
 	// Buffers have their own switches: shaders reach guest memory through BDA pointers without a
 	// binding, which never touches a buffer's LRU entry, so "unused for N frames" can be wrong for a

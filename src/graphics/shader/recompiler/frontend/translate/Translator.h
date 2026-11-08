@@ -302,6 +302,7 @@ private:
 	void EmitVector(const Decoder::Instruction& inst);
 	void EmitInterpolation(const Decoder::Instruction& inst);
 	void EmitMemory(const Decoder::Instruction& inst);
+	void EmitRayTracing(const Decoder::Instruction& inst);
 	static void FailMissingTranslation(const Decoder::Instruction& inst);
 
 	IR::Program&    program;

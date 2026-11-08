@@ -782,6 +782,15 @@ enum class Opcode {
 	EXP,
 	// Added after EXP so the values of the earlier opcodes stay the same.
 	FLAT_LOAD_SHORT_D16_HI,
+	// Pseudo instructions of the native ray tracing patch (RayTracingPatch.h, KYTY_RT_HW); they
+	// never come from guest code. Instruction::offset is the site.
+	RT_INIT,
+	RT_SELECT,
+	RT_LEAF,
+	RT_RESOLVE,
+	RT_EXIT,
+	RT_VERIFY_SAVE,
+	RT_VERIFY_CHECK,
 	COUNT
 };
 
@@ -939,6 +948,9 @@ struct Instruction {
 	bool           tfe                                          = false;
 	bool           lwe                                          = false;
 	uint32_t       branch_target                                = 0;
+	// The pc the instruction had in the decoded guest code when a rewrite moved it (the native
+	// ray tracing patch); S_GETPC_B64 returns the address after it. UINT32_MAX: not moved.
+	uint32_t       guest_pc                                     = UINT32_MAX;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;
@@ -953,6 +965,16 @@ struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_bvh = false;
+	// The guest TLAS of the native ray tracing patch (RayTracingPatch.h), when applied: the
+	// header address is the 64-bit value at the base of the V# at user data pointer `user_sgpr`
+	// + `vsharp_offset`, plus `header_offset`.
+	struct RayTracingSource {
+		uint32_t user_sgpr     = 0;
+		uint32_t vsharp_offset = 0;
+		uint32_t header_offset = 0;
+		uint32_t root          = 0;
+		bool     valid         = false;
+	} ray_tracing_source;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

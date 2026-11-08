@@ -795,12 +795,18 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 &&
 	    (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
+	     // Native ray tracing: the wave's next instance is chosen once for both halves.
+	     inst.GetOpcode() == IR::ValueOpcode::RayQueryNext ||
 	     // Upstream 8cc5f5364: SMEM loads (SGPR operands, no EXEC) are identical in both halves.
 	     inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer ||
 	     (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32 &&
 	      ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Both operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
+	if (ctx.half != 0 && inst.GetOpcode() == IR::ValueOpcode::RayQueryCount) {
+		// Counted once for both halves (EmitRayQueryCount).
 		return;
 	}
 	if ((inst.GetOpcode() == IR::ValueOpcode::SelectU32 ||
@@ -1824,6 +1830,7 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.bvh_node_count_variable, spv::StorageClassFunction);
 	}
+	DeclareRayQueryVariables(state);
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -1863,6 +1870,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.call_loop_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.call_loop_variable, ConstantU32(state, 0));
 	}
+	InitializeRayQueryVariables(state);
 	EmitGeometryOutputDefaults(state);
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		// The workgroup's LDS region is the one of its index in the dispatch, x + nx * (y + ny * z),

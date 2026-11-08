@@ -549,6 +549,25 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${gpu_call_bin_header}")
+# Native ray tracing (KYTY_RT_HW, renderer/nativeRayTracing.h): the guest BVH walks that build the
+# host acceleration structures.
+foreach(rt_walk IN ITEMS rt_tlas_walk rt_blas_walk)
+	set(rt_walk_source "${gpu_tiler_shader_dir}/${rt_walk}.comp")
+	set(rt_walk_spv "${gpu_tiler_generated_dir}/${rt_walk}.spv")
+	set(rt_walk_header "${gpu_tiler_generated_dir}/${rt_walk}_spv.h")
+	string(TOUPPER "${rt_walk}_SPV" rt_walk_symbol)
+	add_custom_command(
+		OUTPUT "${rt_walk_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DCACHING_PAGEBITS=14
+		        "-I${gpu_tiler_shader_dir}" -o "${rt_walk_spv}" "${rt_walk_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_walk_spv} -DOUTPUT=${rt_walk_header}
+		        -DSYMBOL=${rt_walk_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${rt_walk_source}" "${gpu_tiler_shader_dir}/rt_common.inc"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${rt_walk_header}")
+endforeach()
 
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
@@ -1329,6 +1348,8 @@ add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
 target_link_libraries(psml_tests common kyty_test_gtest)
 target_include_directories(psml_tests PRIVATE ${inc_headers})
+# Native ray tracing patch (KYTY_RT_HW, frontend/decode/RayTracingPatch.h) on a synthetic program.
+add_kyty_full_emulator_test(rt_patch_tests "${KYTY_TESTS_DIR}/RtPatchTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -1382,6 +1403,7 @@ if(BUILD_TESTING)
 	add_test(NAME call_split COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --call-split-only)
 	add_test(NAME rt_hardware_cpu COMMAND $<TARGET_FILE:rt_hardware_tests> --cpu-only)
 	add_test(NAME rt_hardware_gpu COMMAND $<TARGET_FILE:rt_hardware_tests>)
+	add_test(NAME rt_patch COMMAND $<TARGET_FILE:rt_patch_tests>)
 	set_tests_properties(registered_shader_code_cert PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME lane_local COMMAND $<TARGET_FILE:lane_local_tests>)
