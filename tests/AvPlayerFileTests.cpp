@@ -265,6 +265,12 @@ void CheckTwoVideoBuffers() {
 }
 
 int main() {
+	// The late-frame skip is a title-preset setting since int22 (unset: off); the test covers it on.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	_putenv_s("KYTY_AVPLAYER_DROP_LATE", "1");
+#else
+	setenv("KYTY_AVPLAYER_DROP_LATE", "1", 1);
+#endif
 	const auto root = std::filesystem::temp_directory_path() /
 	    ("kyty_avio_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	Check(std::filesystem::create_directories(root), "create fixture directory");

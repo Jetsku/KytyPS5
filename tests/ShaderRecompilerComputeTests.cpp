@@ -25810,13 +25810,15 @@ public:
           const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
           // Our storage bindings cover whole dwords (199fc678b; see the halfword case above). A
           // read-only binding rounds its partial last dword up when the host buffer and the
-          // device limit have room (KYTY_READ_BUFFER_TAIL, default on), otherwise down.
+          // device limit have room (KYTY_READ_BUFFER_TAIL=1; default off since int22), otherwise down.
           const auto bound = expected + owner.Offset(address) - binding.offset;
           const auto up = (bound + 3u) & ~uint64_t{3};
+          const char *tail_env = std::getenv("KYTY_READ_BUFFER_TAIL");
+          const bool tail_on = tail_env != nullptr && tail_env[0] != '\0' && tail_env[0] != '0';
           const auto device_limit =
               context.GetGraphics().physical_device_properties.limits.maxStorageBufferRange;
           const auto expected_range =
-              bound % 4u != 0u && binding.offset + up <= owner.Size() && up <= device_limit
+              tail_on && bound % 4u != 0u && binding.offset + up <= owner.Size() && up <= device_limit
                   ? up
                   : (bound >= 4u ? bound & ~uint64_t{3} : bound);
           Require(name, description, source.address == address && source.size == expected &&
