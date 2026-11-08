@@ -365,8 +365,22 @@ bool BindlessTable::CreatePlaceholders() {
         return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
 		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, opaque}};
 	};
-	const std::array<vk::ClearColorValue, PlaceholderColors> colors {
+	std::array<vk::ClearColorValue, PlaceholderColors> colors {
 	    color(0.5f, 0.5f, 0.5f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f)};
+	// KYTY_BINDLESS_PLACEHOLDER_RGBA=<r,g,b,a>[;<r,g,b,a>[;<r,g,b,a>]] (diagnostic, startup, default
+	// off): the colours of placeholder slots 0 (not resident), 1 (key outside its heap) and 2
+	// (pending), in that order; a slot left out keeps its colour above.
+	if (const char* rgba = std::getenv("KYTY_BINDLESS_PLACEHOLDER_RGBA"); rgba != nullptr) {
+		const char* p = rgba;
+		for (uint32_t slot = 0; slot < PlaceholderColors && p != nullptr && *p != '\0'; slot++) {
+			float v[4] {};
+			if (std::sscanf(p, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4) {
+				colors[slot] = vk::ClearColorValue {std::array<float, 4> {v[0], v[1], v[2], v[3]}};
+			}
+			p = std::strchr(p, ';');
+			if (p != nullptr) p++;
+		}
+	}
 	for (uint32_t i = 0; i < Placeholders; i++) {
 		sink.clearColorImage(m_placeholders[i].image, vk::ImageLayout::eTransferDstOptimal,
 		                     &colors[i / ImageArrays], 1, &to_transfer[i].subresourceRange);
