@@ -23,6 +23,7 @@
 #include "graphics/shader/shader.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -93,9 +94,35 @@ constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t DEFAULT_GUEST_MEMORY_SIZE    = 13824ull * 1024ull * 1024ull;
+// PS5 Pro mode (--trinity on a title that supports it; upstream 651ef73a0): more guest memory.
+constexpr uint64_t TRINITY_EXTRA_MEMORY_SIZE = 1216ull * 1024ull * 1024ull;
 
+// KYTY_UPSTREAM_MEMORY_DEFAULTS=1 (default off; upstream 09753bf8f, 0a140911a): upstream's memory
+// sizes. A game gets 12.5 GiB; a fixed 64 MiB cache and the mapping table memory its param.json
+// asks for past the 64 MiB included for each of the CPU, GPU and AMM tables come off the top;
+// flexible memory defaults to 448 MiB and loaded modules' segments are charged to it; the page
+// table stats report the param.json table sizes. Off: 13.5 GiB, 1 GiB flexible memory by default,
+// module segments not charged, a fixed 4 GiB page table pool per side (as before).
+static bool UpstreamMemoryDefaults() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPSTREAM_MEMORY_DEFAULTS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+constexpr uint64_t UPSTREAM_GUEST_MEMORY_BUDGET   = 12800ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_DEFAULT_FLEXIBLE_SIZE = 448ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_RESERVED_CACHE_SIZE   = 64ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_INCLUDED_TABLE_MEMORY = 64ull * 1024ull * 1024ull;
+constexpr uint64_t UPSTREAM_MAPPING_TABLE_SIZE    = 4ull * 1024ull;
+
+static uint64_t                      g_guest_memory_size           = DEFAULT_GUEST_MEMORY_SIZE;
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
+// Page table entries per side (KernelGetPageTableStats).
+static uint64_t g_cpu_page_table_entries = PAGE_TABLE_POOL_ENTRIES;
+static uint64_t g_gpu_page_table_entries = PAGE_TABLE_POOL_ENTRIES;
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
@@ -645,6 +672,44 @@ public:
 		return ClampRangeSizeUnlocked(virtual_addr, size, ClampRangeMemoEnabled());
 	}
 
+	// The committed parts of [start, start + size), adjacent ranges merged, in order. False (and
+	// none) when there are more than max_spans.
+	bool CommittedSpans(uint64_t start, uint64_t size, size_t max_spans,
+	                    std::vector<std::pair<uint64_t, uint64_t>>* spans) {
+		spans->clear();
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return true;
+		}
+		const auto        end = start + size;
+		Common::LockGuard lock(m_mutex);
+		auto              next = std::upper_bound(
+            m_ranges.begin(), m_ranges.end(), start,
+            [](uint64_t value, const Range& candidate) { return value < candidate.start; });
+		if (next != m_ranges.begin()) {
+			--next;
+		}
+		for (; next != m_ranges.end() && next->start < end; ++next) {
+			if (!IsCommittedRangeType(next->type) || next->size == 0) {
+				continue;
+			}
+			const auto from = std::max(start, next->start);
+			const auto to   = std::min(end, End(next->start, next->size));
+			if (from >= to) {
+				continue;
+			}
+			if (!spans->empty() && spans->back().first + spans->back().second == from) {
+				spans->back().second += to - from;
+				continue;
+			}
+			if (spans->size() >= max_spans) {
+				spans->clear();
+				return false;
+			}
+			spans->emplace_back(from, to - from);
+		}
+		return true;
+	}
+
 	// The generation every change advances before it starts (acquire): an unchanged value later
 	// means every ClampRangeSize answer made after this read still holds.
 	[[nodiscard]] uint64_t Generation() const noexcept {
@@ -1068,8 +1133,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
-	static uint64_t           Size() {
+	static uint64_t TotalSize() { return g_guest_memory_size; }
+	static uint64_t Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;
 	}
@@ -1138,6 +1203,8 @@ public:
 
 	static uint64_t Size() { return g_flexible_memory_size; }
 	uint64_t        Available();
+	void            Charge(uint64_t size);
+	void            Release(uint64_t size);
 
 	bool Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mode mode, GpuAccessMode gpu_mode,
 	         const char* name);
@@ -1399,8 +1466,69 @@ static bool GpuCleanGate(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+// KYTY_DRAW_PREP_PRIVATE_READS=1 (default off): a clean read (draw-prep worker reads, their commit-
+// time certificate checks, the command processor's clean reads) of bytes in private mappings, which
+// have no backing (the program image: GT7 keeps its shaders and their AGC metadata in it), copies
+// them in place instead of failing. Only ranges the GPU has not mapped (GpuResources::IsMapped): the GPU
+// never writes them, so they are never protected against reads, and the serial path reads them in
+// place anyway.
+// Without it every GT7 stage preparation fails ("backing", ~1/3 of draws at the title, ~45% in
+// races) and runs serially on the command processor.
+static bool PrivateReadsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_PRIVATE_READS");
+		return value != nullptr && (value[0] == '1' || value[0] == '2');
+	}();
+	return enabled;
+}
+
+// Whether every page of the range is readable by the host now (not protected against reads, as the
+// page tracker protects GPU-written pages): the in-place copy then cannot fault.
+static bool HostReadable(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto end = vaddr + size;
+	for (auto at = vaddr; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info) ||
+		    info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 ||
+		    (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+		                     PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) == 0) {
+			return false;
+		}
+		at = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+#else
+	(void)vaddr;
+	(void)size;
+	return false;
+#endif
+}
+
+static bool TryReadPrivate(uint64_t vaddr, void* data, uint64_t size) {
+	if (!PrivateReadsEnabled() || g_guest_address_space == nullptr) {
+		return false;
+	}
+	// GPU-mapped private memory (GT7's program image holds its shader code): none of it may be
+	// GPU-written or waiting for a publication (the lock-free mirror on workers; the command
+	// processor's callers passed the exact gate before).
+	if (g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size)) {
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.IsRegionGpuModifiedRelaxed(vaddr, size) || buffers.HasPendingBackingPublication(vaddr, size)) {
+			return false;
+		}
+	}
+	// KYTY_DRAW_PREP_PRIVATE_READS=2 also checks each page's host protection first (VirtualQuery: slow under
+	// the address-space lock the fault handlers' protection changes take).
+	static const bool check = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_PRIVATE_READS");
+		return value != nullptr && value[0] == '2';
+	}();
+	return (!check || HostReadable(vaddr, size)) && g_guest_address_space->TryReadPrivateInPlace(vaddr, data, size);
+}
+
 static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t size) {
-	return GpuCleanGate(vaddr, size) && TryReadBacking(vaddr, data, size);
+	return GpuCleanGate(vaddr, size) && (TryReadBacking(vaddr, data, size) || TryReadPrivate(vaddr, data, size));
 }
 
 bool BackingInPlaceEnabled() {
@@ -1422,6 +1550,15 @@ static bool TryInspectBacking(uint64_t vaddr, uint64_t size, Inspect& inspect,
 	if (stats != nullptr) {
 		stats->inspected++;
 		stats->locked += locked ? 1u : 0u;
+	}
+	if (!done && PrivateReadsEnabled() && size <= 64u * 1024u * 1024u) {
+		// KYTY_DRAW_PREP_PRIVATE_READS: bytes of private mappings, inspected from a copy.
+		static thread_local std::vector<uint8_t> copy;
+		copy.resize(static_cast<size_t>(size));
+		if (TryReadPrivate(vaddr, copy.data(), size)) {
+			inspect(static_cast<const uint8_t*>(copy.data()));
+			return true;
+		}
 	}
 	return done;
 }
@@ -1675,6 +1812,66 @@ static void NoteBackingFailure(uint64_t vaddr, uint64_t size, uint64_t caller) {
 	std::fflush(stdout);
 }
 
+// KYTY_DRAW_PREP_BACKING_DIAG=1 (diagnostic, default off): draw-prep worker reads that found no
+// backing (DrawPrep fallback "backing"), by 1 MiB region, with the size, the calling host code
+// (module offset) and whether the first byte alone has a backing; one console line every 10 s.
+static void NoteDrawPrepBackingDiag(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_BACKING_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	struct Site {
+		uint64_t count = 0, size = 0, caller = 0, vaddr = 0;
+		bool     first_byte = false;
+		bool     gpu = false, priv = false;
+	};
+	static std::mutex                               mutex;
+	static std::unordered_map<uint64_t, Site>       sites;
+	static uint64_t                                 last_ns = 0;
+	uint8_t    byte  = 0;
+	const bool first = TryReadBacking(vaddr, &byte, 1);
+	const auto now   = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	std::scoped_lock lock(mutex);
+	auto&            site = sites[(vaddr >> 20u) ^ (static_cast<uint64_t>(first) << 63u)];
+	site.count++;
+	site.size       = size;
+	site.vaddr      = vaddr;
+	site.first_byte = first;
+	site.gpu        = g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size);
+	uint8_t probe   = 0;
+	site.priv       = g_guest_address_space != nullptr && g_guest_address_space->TryReadPrivateInPlace(vaddr, &probe, 1);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	site.caller = caller - reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+#else
+	site.caller = caller;
+#endif
+	if (last_ns == 0) {
+		last_ns = now;
+	}
+	if (now - last_ns < 10'000'000'000ull) {
+		return;
+	}
+	last_ns = now;
+	std::vector<std::pair<uint64_t, Site>> top(sites.begin(), sites.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	std::string text;
+	for (size_t i = 0; i < top.size() && i < 8; i++) {
+		const auto& s = top[i].second;
+		char line[160];
+		std::snprintf(line, sizeof(line), " | %" PRIu64 " x 0x%" PRIx64 "+%" PRIu64 " caller +0x%" PRIx64 "%s%s%s",
+		              s.count, s.vaddr, s.size, s.caller, s.first_byte ? " (first byte backed)" : "",
+		              s.gpu ? " gpu-range" : "", s.priv ? " private" : " not-private");
+		text += line;
+	}
+	std::printf("DrawPrep backing misses 10s:%s\n", text.c_str());
+	sites.clear();
+}
+
 // A backing read that failed after the gate (exact reads fail as Unclean, as before).
 static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
     const Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, uint64_t size, uint64_t caller) {
@@ -1683,6 +1880,7 @@ static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
 		if (BackingFailLogEnabled()) [[unlikely]] {
 			NoteBackingFailure(vaddr, size, caller);
 		}
+		NoteDrawPrepBackingDiag(vaddr, size, caller);
 		return ReadFailure::Backing;
 	}
 	NoteDrawPrepUnclean(Profiler::FrameEvent::DrawPrepUncleanBacking, "backing", vaddr, size,
@@ -1704,7 +1902,7 @@ static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vad
 		reads.Fail(failure);
 		return false;
 	}
-	if (!TryReadBacking(vaddr, data, size)) {
+	if (!TryReadBacking(vaddr, data, size) && !TryReadPrivate(vaddr, data, size)) {
 		reads.Fail(DrawPrepBackingFailure(recorder, vaddr, size, caller));
 		return false;
 	}
@@ -1931,6 +2129,19 @@ std::string DescribeAddressForCrash(uint64_t vaddr) {
 	return out;
 }
 
+bool DescribeVirtualRange(uint64_t vaddr, uint64_t* start, uint64_t* size, char* name, uint64_t name_size) {
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->Query(vaddr, 0, &range)) {
+		return false;
+	}
+	*start = range.start;
+	*size  = range.size;
+	if (name != nullptr && name_size != 0) {
+		std::snprintf(name, static_cast<size_t>(name_size), "%.*s", static_cast<int>(sizeof(range.name)), range.name);
+	}
+	return true;
+}
+
 static bool IsInPrtAperture(uint64_t address, uint64_t size);
 
 // The committed, non-private, GPU-mapped allocation containing vaddr (not sparse/PRT).
@@ -2056,6 +2267,24 @@ std::string DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 
 uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
+}
+
+bool CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
+                    std::vector<std::pair<uint64_t, uint64_t>>* spans) {
+	EXIT_IF(spans == nullptr);
+	if (g_virtual_ranges == nullptr) {
+		spans->assign(1, {vaddr, size});
+		return true;
+	}
+	return g_virtual_ranges->CommittedSpans(vaddr, size, max_spans, spans);
+}
+
+uint64_t CommittedExtent(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!CommittedSpans(vaddr, size, SIZE_MAX, &spans) || spans.empty()) {
+		return 0;
+	}
+	return spans.back().first + spans.back().second - vaddr;
 }
 
 uint64_t VirtualRangesGeneration() noexcept {
@@ -2244,7 +2473,41 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
+// The memory sizes from the game's param.json (Loader::SystemContentGetMemoryParams); it replaces
+// the emulator's SetFlexibleMemorySize call, which upstream removed with its param.json reader.
+static void InitializeMemorySizes() {
+	const auto params        = Loader::SystemContentGetMemoryParams();
+	const auto trinity_extra = Loader::SystemContentIsTrinityMode() ? TRINITY_EXTRA_MEMORY_SIZE : 0;
+	if (UpstreamMemoryDefaults()) {
+		g_flexible_memory_size = params.flexible_size != 0 ? params.flexible_size : UPSTREAM_DEFAULT_FLEXIBLE_SIZE;
+		const auto cpu_tables  = std::max(params.cpu_table_memory, UPSTREAM_INCLUDED_TABLE_MEMORY);
+		const auto gpu_tables  = std::max(params.gpu_table_memory, UPSTREAM_INCLUDED_TABLE_MEMORY);
+		const auto amm_tables  = std::max(params.amm_table_memory, UPSTREAM_INCLUDED_TABLE_MEMORY);
+		const auto overhead    = cpu_tables + gpu_tables + amm_tables - 3 * UPSTREAM_INCLUDED_TABLE_MEMORY;
+		const auto budget      = UPSTREAM_GUEST_MEMORY_BUDGET + trinity_extra;
+		EXIT_IF(g_flexible_memory_size + overhead >= budget - UPSTREAM_RESERVED_CACHE_SIZE);
+		g_guest_memory_size      = budget - UPSTREAM_RESERVED_CACHE_SIZE - overhead;
+		g_cpu_page_table_entries = cpu_tables / UPSTREAM_MAPPING_TABLE_SIZE;
+		g_gpu_page_table_entries = gpu_tables / UPSTREAM_MAPPING_TABLE_SIZE;
+	} else {
+		g_guest_memory_size = DEFAULT_GUEST_MEMORY_SIZE + trinity_extra;
+		if (params.flexible_size != 0) {
+			constexpr uint64_t GuestPageSize = 0x4000;
+			EXIT_IF((params.flexible_size & (GuestPageSize - 1u)) != 0 ||
+			        params.flexible_size >= g_guest_memory_size);
+			g_flexible_memory_size = params.flexible_size;
+		}
+	}
+	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB%s\n",
+	     g_flexible_memory_size / (1024ull * 1024ull),
+	     (g_guest_memory_size - g_flexible_memory_size) / (1024ull * 1024ull),
+	     UpstreamMemoryDefaults() ? " (KYTY_UPSTREAM_MEMORY_DEFAULTS)" : "");
+}
+
 void Initialize() {
+	if (!g_flexible_memory_size_frozen) {
+		InitializeMemorySizes();
+	}
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize() +
@@ -3252,6 +3515,19 @@ void FlexibleMemory::SetVirtualRangeName(uint64_t vaddr, uint64_t len, const cha
 	}
 }
 
+void FlexibleMemory::Charge(uint64_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	m_allocated_total += size;
+}
+
+void FlexibleMemory::Release(uint64_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	EXIT_IF(size > m_allocated_total);
+	m_allocated_total -= size;
+}
+
 uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
@@ -3944,17 +4220,15 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 	const auto gpu_used =
 	    (g_virtual_ranges != nullptr ? g_virtual_ranges->CountPageTableEntries(true) : 0);
 
-	*cpu_total     = PAGE_TABLE_POOL_ENTRIES;
-	*gpu_total     = PAGE_TABLE_POOL_ENTRIES;
-	*cpu_available = PAGE_TABLE_POOL_ENTRIES -
-	                 static_cast<int>(std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES));
-	*gpu_available = PAGE_TABLE_POOL_ENTRIES -
-	                 static_cast<int>(std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES));
+	const uint64_t cpu_entries = g_cpu_page_table_entries;
+	const uint64_t gpu_entries = g_gpu_page_table_entries;
+	*cpu_total                 = static_cast<int>(cpu_entries);
+	*gpu_total                 = static_cast<int>(gpu_entries);
+	*cpu_available = static_cast<int>(cpu_entries - std::min<uint64_t>(cpu_used, cpu_entries));
+	*gpu_available = static_cast<int>(gpu_entries - std::min<uint64_t>(gpu_used, gpu_entries));
 	if (Profiler::LoadingEnabled()) {
-		const auto cpu_free = PAGE_TABLE_POOL_ENTRIES -
-		                      std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES);
-		const auto gpu_free = PAGE_TABLE_POOL_ENTRIES -
-		                      std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES);
+		const auto cpu_free = cpu_entries - std::min<uint64_t>(cpu_used, cpu_entries);
+		const auto gpu_free = gpu_entries - std::min<uint64_t>(gpu_used, gpu_entries);
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableStatsSuccesses);
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableCpuAvailableSum, cpu_free);
 		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableGpuAvailableSum, gpu_free);
@@ -4187,6 +4461,28 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 	if (g_free_callback != nullptr) {
 		for (const auto& alias: mapped_aliases) {
 			g_free_callback(alias.map_vaddr, alias.map_size);
+		}
+	}
+
+	// KYTY_DROP_RELEASED=1 (default off; GT7 fork 7717116d8): the released range's host pages go
+	// back to the system; its views are unmapped above, and a later allocation gets undefined bytes (as
+	// on the console: zeros or the old ones). GT7 peaked
+	// at 9.8 GB of direct memory while using 3.5 GB, and the rest stayed resident.
+	static const bool drop_released = [] {
+		const char* value = std::getenv("KYTY_DROP_RELEASED");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (drop_released) {
+		static std::atomic<uint64_t> dropped_total {0};
+		uint64_t                     dropped = 0;
+		for (const auto& block: allocated_span) {
+			dropped += g_guest_address_space->DropBacking(block.start_addr, block.size);
+		}
+		const auto total = dropped_total.fetch_add(dropped) + dropped;
+		if (dropped >= (uint64_t {64} << 20u)) {
+			LOGF("Direct memory: %" PRIu64 " MiB of released memory handed back to the system (%" PRIu64
+			     " MiB so far, KYTY_DROP_RELEASED)\n",
+			     dropped >> 20u, total >> 20u);
 		}
 	}
 
@@ -5133,6 +5429,24 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	return vaddr;
 }
 
+// Upstream 0a140911a, only with KYTY_UPSTREAM_MEMORY_DEFAULTS=1: loaded modules' segments use
+// flexible memory without taking its backing. Returns the size charged (0 when off).
+uint64_t ChargeFlexibleMemory(uint64_t size) {
+	if (!UpstreamMemoryDefaults() || size == 0 || g_flexible_memory == nullptr) {
+		return 0;
+	}
+
+	g_flexible_memory->Charge(size);
+	return size;
+}
+
+void ReleaseFlexibleMemory(uint64_t size) {
+	if (size != 0 && g_flexible_memory != nullptr) {
+		g_flexible_memory->Release(size);
+	}
+
+}
+
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
                                const char* name) {
 	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
@@ -5766,7 +6080,8 @@ DebugStats GetDebugStats() {
 	stats.direct_total       = PhysicalMemory::Size();
 	stats.flexible_total     = FlexibleMemory::Size();
 	stats.pool_committed     = g_memory_pool_committed.load(std::memory_order_relaxed);
-	stats.page_entries_total = PAGE_TABLE_POOL_ENTRIES;
+	stats.cpu_page_entries_total = g_cpu_page_table_entries;
+	stats.gpu_page_entries_total = g_gpu_page_table_entries;
 	if (g_physical_memory != nullptr) {
 		Common::LockGuard lock(g_physical_memory->GetMutex());
 		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {

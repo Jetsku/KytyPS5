@@ -157,7 +157,8 @@ struct RegisterIndirectRange {
 				case Pm4::R_WRITE_DATA:
 				case Pm4::R_DMA_DATA: return FenceKind::DataWrite;
 				case Pm4::R_WAIT_FLIP_DONE: return FenceKind::Wait;
-				case Pm4::R_DISPATCH_RESET: return FenceKind::Dispatch;
+				case Pm4::R_DISPATCH_RESET:
+				case Pm4::R_PSSR: return FenceKind::Dispatch;
 				default: return FenceKind::Marker;
 			}
 		default: break;

@@ -13,6 +13,8 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/host_gpu/renderer/image/nanScrubber.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
@@ -66,9 +68,10 @@ namespace Libs::Graphics {
 
 namespace {
 
-// KYTY_WIDE_FILL_CLEAR=1 (default off, live): see the fill-to-clear conversion below.
+// KYTY_WIDE_FILL_CLEAR=1 or 2 (default off, live): see the fill-to-clear conversion below.
 Live::Switch g_wide_fill_clear("KYTY_WIDE_FILL_CLEAR", [](const char* value) -> int64_t {
-	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
+	if (value == nullptr) return 0;
+	return std::strcmp(value, "1") == 0 ? 1 : std::strcmp(value, "2") == 0 ? 2 : 0;
 });
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
@@ -575,6 +578,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
 			m_dcc_gpu_refresh_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
+	}
+	m_dcc_gpu_wide      = static_cast<uint32_t>(ParseDccGpuWide(std::getenv("KYTY_DCC_GPU_WIDE")));
+	if (const auto* verify = std::getenv("KYTY_DCC_GPU_WIDE_VERIFY");
+	    verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+		m_dcc_gpu_wide_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
@@ -1406,7 +1414,8 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	HangTrace::SetImageFreeReason(reason);
 	auto& image = m_slot_images[id];
 	// Bindless-pinned images (a heap key samples them through set 1) are never collected.
-	if (image.bindless_pinned && (reason == HangTrace::ImageFreeReason::GarbageCollect ||
+	if (image.bindless_pinned && !m_bindless_evicting &&
+	    (reason == HangTrace::ImageFreeReason::GarbageCollect ||
 	                              reason == HangTrace::ImageFreeReason::PressureCollect ||
 	                              reason == HangTrace::ImageFreeReason::ResidentIdle)) {
 		return;
@@ -3907,6 +3916,58 @@ void TextureCache::NoteLightGridShape(const ImageInfo& info) {
 	}
 }
 
+bool TextureCache::LightGridProbeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIGHT_GRID_PROBE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void TextureCache::ProbeLightGrid(const ImageInfo& info, uint64_t shader_hash) {
+	if (!LightGridFormat(info)) {
+		return;
+	}
+	const auto range = info.data;
+	thread_local std::vector<uint8_t> guest;
+	guest.resize(static_cast<size_t>(range.size));
+	if (!LibKernel::Memory::TryReadBacking(range.address, guest.data(), range.size)) {
+		return;
+	}
+	const auto row     = std::max(info.pitch, info.extent.width);
+	const auto layers  = info.resources.layers;
+	const auto garbage = ScanLightGrid(guest.data(), range.size, info.extent.width,
+	                                   info.extent.height, layers, row, false);
+	// Largest count and the sum of counts (low 16 bits of each cell's second word).
+	uint32_t       most = 0;
+	uint64_t       sum  = 0;
+	const uint64_t layer_bytes = layers != 0 ? range.size / layers : 0;
+	for (uint32_t l = 0; l < layers; l++) {
+		for (uint32_t y = 0; y < info.extent.height; y++) {
+			for (uint32_t x = 0; x < info.extent.width; x++) {
+				const uint64_t at = l * layer_bytes + (static_cast<uint64_t>(y) * row + x) * 8u + 4u;
+				if (at + 4u > guest.size()) continue;
+				uint32_t packed = 0;
+				std::memcpy(&packed, guest.data() + at, sizeof(packed));
+				most = std::max(most, packed & 0xffffu);
+				sum += packed & 0xffffu;
+			}
+		}
+	}
+	static std::atomic<uint64_t> probes {0};
+	static std::atomic<uint64_t> bad {0};
+	const auto n = probes.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto b = garbage != 0 ? bad.fetch_add(1, std::memory_order_relaxed) + 1
+	                            : bad.load(std::memory_order_relaxed);
+	if ((garbage != 0 && (b <= 64 || b % 256 == 0)) || n <= 16 || n % 4096 == 0) {
+		LOGF("LightGridProbe: ps 0x%016" PRIx64 " grid 0x%012" PRIx64 "+0x%" PRIx64
+		     " (%ux%u, %u layers, pitch %u): guest bytes %u cells > %u lights, max %u, sum %" PRIu64
+		     " (probe %" PRIu64 ", %" PRIu64 " with garbage)\n",
+		     shader_hash, range.address, range.size, info.extent.width, info.extent.height, layers,
+		     info.pitch, garbage, LightGridMostLights, most, sum, n, b);
+	}
+}
+
 void TextureCache::RepairLightGridUpload(const Image& image, Buffer& source,
                                          uint64_t source_offset) {
 	const auto& info  = image.info;
@@ -4168,16 +4229,21 @@ void TextureCache::RefreshCopySource(ImageId id) {
 bool TextureCache::CopyD16(Image& destination, Image& source) {
 	// Scratch buffers from the tiler stay alive until this operation's last tick (tiler.h).
 	const TileManager::ScratchHold scratch_hold(m_tiler);
-	const bool source_depth      = source.info.IsDepth();
-	const bool destination_depth = destination.info.IsDepth();
-	if (source_depth == destination_depth) {
+	// Converts guest D16 between a four-byte host depth aspect (D24/D32, stenciled) and two-byte
+	// color or native D16 depth (upstream 0685bffb2: D16 <-> D24/D32 depth copies exited).
+	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
+	if (source_wide ==
+	    (DepthAspectTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
 		return false;
 	}
-	auto&      depth          = source_depth ? source : destination;
-	auto&      color          = source_depth ? destination : source;
-	const auto transfer_bytes = DepthAspectTransferBytes(depth.backing.format);
+	const bool source_depth   = source_wide;
+	auto&      depth          = source_wide ? source : destination;
+	auto&      color          = source_wide ? destination : source;
+	const auto transfer_bytes = sizeof(uint32_t);
+	const auto narrow_aspect  = color.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                                                 : vk::ImageAspectFlagBits::eColor;
 	if (depth.info.bytes_per_block != sizeof(uint16_t) ||
-	    color.info.bytes_per_block != sizeof(uint16_t) || transfer_bytes != sizeof(uint32_t)) {
+	    color.info.bytes_per_block != sizeof(uint16_t)) {
 		return false;
 	}
 	EXIT_IF(source.backing.samples != 1 || destination.backing.samples != 1 ||
@@ -4204,7 +4270,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 		color_copies[layer].bufferOffset      = color_slice * layer;
 		color_copies[layer].bufferRowLength   = color.info.pitch;
 		color_copies[layer].bufferImageHeight = color.info.extent.height;
-		color_copies[layer].imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, layer, 1};
+		color_copies[layer].imageSubresource  = {narrow_aspect, 0, layer, 1};
 		color_copies[layer].imageExtent       = color.info.extent;
 	}
 
@@ -4964,6 +5030,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
+static bool HashGuestBytes(uint64_t address, uint64_t size, uint64_t& hash);
+
 void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 	auto& image = m_slot_images[id];
 	ImageWatch("image initialize", image);
@@ -4981,6 +5049,11 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	// KYTY_PENDING_FILLS: a fresh target inside a GPU fill starts as the fill.
+	if (upload && !image.WasEverUploaded() && BufferCache::PendingFillsEnabled() &&
+	    ClearFromKnownFill(id)) {
+		return;
+	}
 	bool       guest_refresh = false;
 	// KYTY_IMAGE_PARTIAL_GPU_WRITE: only GPU buffer writes over known ranges changed the image's
 	// bytes; it moves bytes through the buffer for those ranges only (UploadGpuWrittenRanges).
@@ -5044,21 +5117,34 @@ void TextureCache::InitializeImage(ImageId id, RefreshIntent intent) {
 		// KYTY_LIGHT_GRID_CAP: a light grid is uploaded here, from bytes it can repair.
 		const bool light_grid = LightGridCapEnabled() && image.FullyResident() &&
 		                        IsLightGridShape(image.info);
-		if (!partial.done && (light_grid || !TryAsyncFullUpload(image))) {
+		// KYTY_GUEST_HASH_IMAGES_KB: the guest bytes are hashed before they are staged (a CPU write
+		// between the two leaves the hash older than the upload, so the next comparison uploads once
+		// more rather than missing it), and the upload takes them whatever buffer covers them.
+		uint64_t   guest_hash = 0;
+		const bool hash_guest = !partial.done && image.FullyResident() && ChecksGuestContent(image) &&
+		                        HashGuestBytes(live.address, live.size, guest_hash);
+		image.content_hash_valid = false;
+		if (!partial.done && (light_grid || hash_guest || !TryAsyncFullUpload(image))) {
 			const bool cached_source = m_buffer_cache.IsRegionRegistered(live.address, live.size) ||
 			                           m_buffer_cache.IsRegionGpuModified(live.address, live.size);
 			Profiler::CountFrameEvent(cached_source ? Profiler::FrameEvent::TextureUploadBytesBuffer
 			                                        : Profiler::FrameEvent::TextureUploadBytesStaging,
 			                          live.size);
 			const auto [source, source_offset] =
-			    m_buffer_cache.ObtainBufferForImage(live.address, live.size);
+			    hash_guest ? m_buffer_cache.StageGuestBytesForImage(live.address, live.size)
+			               : m_buffer_cache.ObtainBufferForImage(live.address, live.size);
 			if (source == nullptr) {
 				EXIT("TextureCache: failed to obtain image upload source\n");
 			}
-			if (light_grid && !cached_source) {
+			if (light_grid && (hash_guest || !cached_source)) {
 				RepairLightGridUpload(image, *source, source_offset);
 			}
 			UploadImage(image, *source, source_offset);
+			if (hash_guest) {
+				image.content_hash             = guest_hash;
+				image.content_hash_valid       = true;
+				image.content_check_submission = SyncEpoch::CurrentSubmission();
+			}
 		}
 		const auto uploaded = partial.done ? partial.bytes : live.size;
 		image.residency_refresh = false;
@@ -5434,19 +5520,27 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 		return Event::DccFallbackDisabled;
 	}
 	// The video-out path does not consume its clear key; it stays on the CPU inspection unless
-	// KYTY_DCC_GPU_VIDEOOUT=1 (default off; Ghost of Yotei preset): the native inspection then
-	// checks the keys in the command stream and clears the image as the CPU fallback would, but
-	// leaves the keys as the guest wrote them (no consumption, no retained inspection). Ghost of
-	// Yotei's compute pass 0x1ed5a1e735be2f6a rewrites its flip target's keys every frame, so the
-	// CPU inspection read them back from the GPU at every flip (~10.8 ms of waiting per frame at
-	// the torii). Adapted from Erlou93/KytyPS5-Yotei KYTY_PERF_DCC_GPU_ALL
-	// (TextureCache::MaterializeDccClearOnGpu: video-out keys checked every time, never consumed). Live.
-	const bool video_out = desc.type == BindingType::VideoOut;
-	if (video_out && !g_dcc_gpu_video_out.On()) {
+	// KYTY_DCC_GPU_VIDEOOUT=1 (default off; Ghost of Yotei preset) or KYTY_DCC_GPU_WIDE 4 (GT7
+	// preset): the native inspection then checks the keys in the command stream and clears the
+	// image as the CPU fallback would, but leaves the keys as the guest wrote them (no consumption,
+	// no retained inspection). Ghost of Yotei's compute pass 0x1ed5a1e735be2f6a rewrites its flip
+	// target's keys every frame, so the CPU inspection read them back from the GPU at every flip
+	// (~10.8 ms of waiting per frame at the torii). VIDEOOUT adapted from Erlou93/KytyPS5-Yotei
+	// KYTY_PERF_DCC_GPU_ALL (TextureCache::MaterializeDccClearOnGpu: video-out keys checked every
+	// time, never consumed). Live.
+	const bool keep_keys          = desc.type == BindingType::VideoOut;
+	const bool video_out_any_kind = keep_keys && g_dcc_gpu_video_out.On();
+	if (keep_keys && !video_out_any_kind && (DccGpuWide() & 4u) == 0) {
 		return Event::DccFallbackBinding;
 	}
-	// The CPU fallback treats a compressed video-out description like any other (its keys decide).
-	if (!video_out && desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+	// KYTY_DCC_GPU_VIDEOOUT: the CPU fallback treats a compressed video-out description like any
+	// other (its keys decide). KYTY_DCC_GPU_WIDE 8 (with 4): a DCC-compressed video-out surface
+	// (GT7's flips) is inspected too. The fallback decides it from the same bytes and the same way
+	// (first key a decodable clear code and every byte equal to it), whatever the compression.
+	const bool compressed_flip = video_out_any_kind ||
+	                             (keep_keys && (DccGpuWide() & 8u) != 0 &&
+	                              desc.info.metadata.compression != VideoOutCompression::Unsupported);
+	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed && !compressed_flip) {
 		return Event::DccFallbackShape;
 	}
 	// The CPU decoder's result for every clear code under this binding (ClearCodes order).
@@ -5460,16 +5554,78 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 		}
 	}
 	return TryMaterializeGpuMetadataClear(*m_dcc_clear, id, desc, desc.info.metadata.range,
-	                                      metadata_base_layer, values, decodable, false,
-	                                      !video_out);
+	                                      metadata_base_layer, values, decodable, false, keep_keys);
+}
+
+// KYTY_DCC_GPU_ALIASED=1|2 (default off, read once): images registered over a target's metadata bytes
+// no longer send the metadata inspection to the CPU fallback (a download that drains the GPU: GT7
+// races, ~3.6 a frame at 1-5 ms each, metadata written by a compute dispatch of the same frame) as
+// long as none of them is GPU-modified (its newest bytes would be in the image, not in the buffer
+// the inspection reads) and none is the target itself. The inspection reads and rewrites the
+// metadata through the canonical buffer as a GPU write (ObtainBuffer), which invalidates the images
+// over those bytes as any buffer write does. Other images keep the old path.
+// =2 also accepts GPU-modified images over the metadata (not the target itself), as usa-ratt's GPU
+// clear check does (no aliasing test): GT7 registers an 8.4 MiB image 0x60000 past a 2048x1024 target
+// whose range covers that target's DCC bytes; it is GPU-modified, so =1 keeps that inspection on the
+// CPU (a drain per bind). Accuracy cost: bytes of the metadata such an image wrote and has not
+// written back would be missed by the inspection (the buffer copy is read).
+bool TextureCache::MetadataAliasBlocks(ImageId id, GuestRange range, bool* aliased) {
+	const auto images = FindImagesInRegion(range.address, range.size, false);
+	if (images.size() == 0) {
+		return false;
+	}
+	static const int relaxed_env = [] {
+		const auto* value = std::getenv("KYTY_DCC_GPU_ALIASED");
+		return value == nullptr ? 0 : std::clamp(std::atoi(value), 0, 2);
+	}();
+	// KYTY_DCC_GPU_WIDE 1 (textureCache.h): as =2.
+	const int relaxed = (DccGpuWide() & 1u) != 0 ? 2 : relaxed_env;
+	if (relaxed == 0) {
+		return true;
+	}
+	for (const auto other: images) {
+		const auto* image = m_slot_images.try_get(other);
+		if (other == id || image == nullptr || (relaxed == 1 && image->IsGpuModified())) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::fprintf(stderr,
+				             "DCC aliased metadata 0x%016" PRIx64 "+0x%" PRIx64 " kept on the CPU path: image "
+				             "data 0x%016" PRIx64 "+0x%" PRIx64 " %s\n",
+				             range.address, range.size, image != nullptr ? image->info.data.address : 0,
+				             image != nullptr ? image->info.data.size : 0,
+				             other == id ? "is the target" : image == nullptr ? "gone" : "is GPU-modified");
+			}
+			return true;
+		}
+	}
+	if (aliased != nullptr) {
+		*aliased = true;
+	}
+	static std::atomic<uint64_t> accepted {0};
+	if (const auto n = accepted.fetch_add(1, std::memory_order_relaxed) + 1;
+	    relaxed_env != 0 && (n & (n - 1)) == 0) {
+		const auto* image = m_slot_images.try_get(*images.begin());
+		std::fprintf(stderr,
+		             "DCC aliased metadata inspected on the GPU (KYTY_DCC_GPU_ALIASED): %" PRIu64
+		             " times; e.g. metadata 0x%016" PRIx64 "+0x%" PRIx64 " under image data 0x%016" PRIx64
+		             "+0x%" PRIx64 " %ux%u\n",
+		             n, range.address, range.size, image != nullptr ? image->info.data.address : 0,
+		             image != nullptr ? image->info.data.size : 0, image != nullptr ? image->info.extent.width : 0,
+		             image != nullptr ? image->info.extent.height : 0);
+	}
+	return false;
 }
 
 Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
     DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
     uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-    bool cmask, bool consume) {
+    bool cmask, bool keep_keys) {
 	using Event = Profiler::FrameEvent;
 	using Support = DccClearHelper::Support;
+	// KYTY_DCC_GPU_WIDE (textureCache.h): what this inspection was accepted through.
+	bool wide_aliased  = false;
+	bool wide_mismatch = false;
+	bool watch_reused  = false; // reused only through the metadata watch (KYTY_DCC_GPU_WIDE)
 	const auto& view = desc.view_info;
 	if (!helper.Available()) {
 		return Event::DccFallbackDisabled;
@@ -5496,30 +5652,83 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	};
 	{
 		std::scoped_lock lock {m_lock};
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		if (MetadataAliasBlocks(id, range, &wide_aliased)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
 		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
 		// than that one reads the same bytes to the same no-op, for any image or layer; only the
 		// metadata processing is skipped, the caller still refreshes this image normally.
-		// Kept keys (consume=false) prove nothing about a later use: never reused.
-		bool reusable = consume;
+		// Kept keys (video-out) are never retained: a clear they select clears again each time.
+		// KYTY_DCC_GPU_WIDE also takes a slice nothing wrote since its inspection (byte-exact
+		// watch, BufferCache::MetadataUnwritten) as unchanged: the buffer's content revision moves
+		// with any write anywhere in the buffer, and every binding would inspect again.
+		bool       reusable = !keep_keys;
+		const bool watched  = DccGpuWide() != 0;
 		for (uint32_t slice = 0; reusable && slice < count; ++slice) {
 			const auto metadata = slice_range(slice);
 			const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
 			const auto found    = m_gpu_dcc_inspections.find(metadata.address);
-			reusable = revision && found != m_gpu_dcc_inspections.end() &&
-			           found->second.metadata == metadata && found->second.revision == *revision &&
-			           (decodable & ~found->second.decodable_mask) == 0;
+			const bool same     = found != m_gpu_dcc_inspections.end() && found->second.metadata == metadata &&
+			                  (decodable & ~found->second.decodable_mask) == 0;
+			const bool by_revision = same && revision && found->second.revision == *revision;
+			const bool by_watch =
+			    same && !by_revision && watched && m_buffer_cache.MetadataUnwritten(metadata.address, metadata.size);
+			watch_reused |= by_watch;
+			reusable = by_revision || by_watch;
 		}
-		if (reusable) {
+		// KYTY_DCC_GPU_WIDE_VERIFY: a reuse through the watch is checked below against the bytes
+		// (after a drain): a retained inspection left them deciding "no clear" (consumed keys,
+		// nonuniform bytes or a rejected code); a clear there means the watch missed a write.
+		if (reusable && !(watch_reused && m_dcc_gpu_wide_verify != 0)) {
 			if (!cmask) {
 				m_gpu_dcc_reuses += count;
 				Profiler::CountFrameEvent(Event::DccGpuReuses, count);
 			}
 			return Event::DccGpuReuses;
 		}
+	}
+	if (watch_reused && m_dcc_gpu_wide_verify != 0) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		std::vector<uint8_t> bytes(slice_size);
+		uint32_t             wrong = 0;
+		bool                 all   = true;
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			if (!LibKernel::Memory::TryReadBacking(slice_range(slice).address, bytes.data(), bytes.size())) {
+				all = false;
+				break;
+			}
+			uint32_t index = 0;
+			while (index < DccClearHelper::ClearCodes.size() && DccClearHelper::ClearCodes[index] != bytes[0]) {
+				index++;
+			}
+			wrong += index < DccClearHelper::ClearCodes.size() && (decodable & (1u << index)) != 0 &&
+			                 std::all_of(bytes.begin(), bytes.end(), [&](uint8_t byte) { return byte == bytes[0]; })
+			             ? 1u
+			             : 0u;
+		}
+		if (all) {
+			m_dcc_wide_totals.verify_checks.fetch_add(count, std::memory_order_relaxed);
+			if (wrong == 0) {
+				if (!cmask) {
+					m_gpu_dcc_reuses += count;
+					Profiler::CountFrameEvent(Event::DccGpuReuses, count);
+				}
+				return Event::DccGpuReuses;
+			}
+			m_dcc_wide_totals.verify_mismatches.fetch_add(wrong, std::memory_order_relaxed);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "DCC wide verify: %u slice(s) of metadata 0x%016" PRIx64
+				             " reused through the watch hold a clear (a write the watch missed)\n",
+				             wrong, range.address);
+			}
+			if (m_dcc_gpu_wide_verify == 2) {
+				EXIT("DCC wide verify: a watched metadata reuse missed a write\n");
+			}
+		}
+		// Not reused: inspected below as usual.
 	}
 	if (ImageRangeOverlaps(range, desc.info.data)) {
 		return Event::DccFallbackMetadataAliased;
@@ -5528,15 +5737,19 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	// is fully resident is accepted while waiting for a refresh or not GPU-owned; it is refreshed
 	// right before the inspection, as the CPU fallback's ClearImage refreshes it.
 	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
-	if (!consume && m_dcc_gpu_refresh_verify != 0) {
+	if (keep_keys && m_dcc_gpu_refresh_verify != 0) {
 		// The refresh verification expects consumed keys; the video-out path keeps them.
 		return Event::DccFallbackBinding;
 	}
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
+		const bool  exact = image != nullptr && image->info.data == desc.info.data &&
+		                   image->info.extent == desc.info.extent;
+		// KYTY_DCC_GPU_WIDE 2: the image found for the binding, whatever its range and extent; its
+		// whole layer is inspected, as the CPU fallback's ClearImage(id) clears it.
+		wide_mismatch = !exact && (DccGpuWide() & 2u) != 0;
 		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
-		                     image->info.data == desc.info.data &&
-		                     image->info.extent == desc.info.extent;
+		                     (exact || wide_mismatch);
 		if (!matches ||
 		    (!SafeToDownload(*image) && !(refresh_allowed && image->FullyResident()))) {
 			// Which condition refused it (DccImageState* counters, MaterializeDccClear). The
@@ -5560,8 +5773,8 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			}
 			return Event::DccFallbackImageState;
 		}
-		if (image->backing.extent.width != desc.info.extent.width ||
-		    image->backing.extent.height != desc.info.extent.height ||
+		if ((!wide_mismatch && (image->backing.extent.width != desc.info.extent.width ||
+		                        image->backing.extent.height != desc.info.extent.height)) ||
 		    view.base_layer >= image->backing.layers ||
 		    count > image->backing.layers - view.base_layer) {
 			return Event::DccFallbackShape;
@@ -5572,7 +5785,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			case Support::Format: return Event::DccFallbackFormat;
 			case Support::Unsupported: return Event::DccFallbackUnsupported;
 		}
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		if (MetadataAliasBlocks(id, range, &wide_aliased)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		return std::nullopt;
@@ -5608,9 +5821,31 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			    std::all_of(bytes, bytes + slice_size, [&](uint8_t byte) { return byte == bytes[0]; });
 		}
 	}
+	// KYTY_DCC_GPU_WIDE_VERIFY: the CPU fallback's decision per slice, from the bytes it would read
+	// (after the same drain), for an inspection accepted only through KYTY_DCC_GPU_WIDE.
+	const bool           wide_used = wide_aliased || wide_mismatch || keep_keys;
+	std::vector<uint8_t> wide_expected;
+	if (wide_used && m_dcc_gpu_wide_verify != 0) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		wide_expected.resize(count);
+		std::vector<uint8_t> bytes(slice_size);
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			if (!LibKernel::Memory::TryReadBacking(slice_range(slice).address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read colour metadata for the wide verification\n");
+			}
+			uint32_t index = 0;
+			while (index < DccClearHelper::ClearCodes.size() && DccClearHelper::ClearCodes[index] != bytes[0]) {
+				index++;
+			}
+			wide_expected[slice] =
+			    index < DccClearHelper::ClearCodes.size() && (decodable & (1u << index)) != 0 &&
+			    std::all_of(bytes.begin(), bytes.end(), [&](uint8_t byte) { return byte == bytes[0]; });
+		}
+	}
 	// Use the canonical buffer and its normal GPU-write tracking. No CPU shadow of the
 	// clear value is trusted. Acquiring it may upload/submit, so hold no texture lock.
-	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, true, false);
+	// Kept keys are only read.
+	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, !keep_keys, false);
 	if (buffer == nullptr) {
 		return Event::DccFallbackUnsupported;
 	}
@@ -5628,13 +5863,38 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	TrackImage(id);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
+		uint8_t*   decisions = nullptr;
+		vk::Buffer decision_buffer {};
+		uint64_t   decision_offset = 0;
+		if (!wide_expected.empty()) {
+			auto& download                 = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+			const auto [mapped, mapped_at] = download.Map(uint64_t {16} * count, 64);
+			if (mapped == nullptr) {
+				EXIT("TextureCache: DCC wide verification exceeds the download ring\n");
+			}
+			download.Commit();
+			decisions       = mapped;
+			decision_buffer = download.Handle();
+			decision_offset = mapped_at;
+		}
 		for (uint32_t slice = 0; slice < count; ++slice) {
 			helper.RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
-			                         offset + slice_size * (first + slice), slice_size, values,
-			                         consume);
+			                   offset + slice_size * (first + slice), slice_size, values, keep_keys,
+			                   decision_buffer, decision_offset + uint64_t {16} * slice);
+		}
+		if (decisions != nullptr) {
+			RecordDccWideVerify(decisions, decision_offset, std::move(wide_expected), range,
+			                    static_cast<uint32_t>(desc.type));
 		}
 	}
 	CommitGpuWrite(image);
+	if (wide_used) {
+		(keep_keys       ? m_dcc_wide_totals.video_out
+		 : wide_mismatch ? m_dcc_wide_totals.mismatch
+		                 : m_dcc_wide_totals.aliased)
+		    .fetch_add(count, std::memory_order_relaxed);
+		ReportDccWide();
+	}
 	if (refreshed) {
 		m_dcc_refresh_totals.refreshes += count;
 		Profiler::CountFrameEvent(Event::DccGpuRefreshes, count);
@@ -5647,7 +5907,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		m_gpu_dcc_records += count;
 		Profiler::CountFrameEvent(Event::DccGpuRecords, count);
 	}
-	for (uint32_t slice = 0; consume && slice < count; ++slice) {
+	for (uint32_t slice = 0; !keep_keys && slice < count; ++slice) {
 		const auto metadata = slice_range(slice);
 		if (const auto revision =
 		        m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {
@@ -5658,6 +5918,9 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			}
 			m_gpu_dcc_inspections.insert_or_assign(
 			    metadata.address, GpuDccInspection {metadata, *revision, decodable});
+			if (DccGpuWide() != 0) {
+				m_buffer_cache.WatchMetadata(metadata.address, metadata.size);
+			}
 		} else {
 			m_gpu_dcc_inspections.erase(metadata.address);
 		}
@@ -5675,6 +5938,66 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	                   static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type), first,
 	                   count, m_scheduler.CurrentTick());
 	return Event::DccGpuRecords;
+}
+
+// KYTY_DCC_GPU_WIDE (textureCache.h) is also a live switch (common/liveSwitch.h): the mask used is the
+// startup value (read when the cache is created) or'ed with the live value, so live control (A/B) turns
+// bits on and off when the run starts with 0. Every inspection decides with the current mask, and both
+// paths leave the metadata in a state the other reads the same way, so a change between two
+// inspections is safe.
+int64_t TextureCache::ParseDccGpuWide(const char* value) {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 0) & 15u) : 0;
+}
+static Live::Switch g_dcc_gpu_wide("KYTY_DCC_GPU_WIDE", &TextureCache::ParseDccGpuWide);
+
+uint32_t TextureCache::DccGpuWide() const {
+	return m_dcc_gpu_wide | static_cast<uint32_t>(g_dcc_gpu_wide.Get());
+}
+
+void TextureCache::ReportDccWide() {
+	const auto aliased  = m_dcc_wide_totals.aliased.load(std::memory_order_relaxed);
+	const auto mismatch = m_dcc_wide_totals.mismatch.load(std::memory_order_relaxed);
+	const auto flips    = m_dcc_wide_totals.video_out.load(std::memory_order_relaxed);
+	const auto n        = aliased + mismatch + flips;
+	if (n != 0 && (n & (n - 1)) == 0) {
+		std::fprintf(stderr,
+		             "DCC wide (KYTY_DCC_GPU_WIDE=%u): %" PRIu64 " slices inspected on the GPU instead of a "
+		             "drain: %" PRIu64 " under aliasing images, %" PRIu64 " of a differing image, %" PRIu64
+		             " video-out; verify %" PRIu64 " checks, %" PRIu64 " mismatches\n",
+		             DccGpuWide(), n, aliased, mismatch, flips,
+		             m_dcc_wide_totals.verify_checks.load(std::memory_order_relaxed),
+		             m_dcc_wide_totals.verify_mismatches.load(std::memory_order_relaxed));
+	}
+}
+
+void TextureCache::RecordDccWideVerify(const uint8_t* decisions, uint64_t download_offset,
+                                       std::vector<uint8_t> expected, GuestRange range, uint32_t type) {
+	auto& download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	m_scheduler.DeferOperation([this, &download, decisions, download_offset,
+	                            expected = std::move(expected), range, type] {
+		download.Invalidate(download_offset, uint64_t {16} * expected.size());
+		uint32_t wrong = 0;
+		for (size_t slice = 0; slice < expected.size(); ++slice) {
+			uint32_t groups = 0;
+			std::memcpy(&groups, decisions + 16 * slice, sizeof(groups));
+			wrong += (groups != 0) != (expected[slice] != 0) ? 1u : 0u;
+		}
+		m_dcc_wide_totals.verify_checks.fetch_add(expected.size(), std::memory_order_relaxed);
+		if (wrong == 0) {
+			return;
+		}
+		m_dcc_wide_totals.verify_mismatches.fetch_add(wrong, std::memory_order_relaxed);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr,
+			             "DCC wide verify: %u of %zu slice(s) of metadata 0x%016" PRIx64 " size=0x%" PRIx64
+			             " (binding type %u) decided differently from the CPU fallback\n",
+			             wrong, expected.size(), range.address, range.size, type);
+		}
+		if (m_dcc_gpu_wide_verify == 2) {
+			EXIT("DCC wide verify: an inspection differs from the CPU fallback\n");
+		}
+	});
 }
 
 void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
@@ -6432,6 +6755,313 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 }
 
 // TextureBindingMemo::RefreshIsNoOp mirrors when this is a no-op; keep them in sync.
+// KYTY_GUEST_HASH_IMAGES_KB=N (default 0: off; adapted from usa-ratt/KytyPS5-GT7 1a344cd80, whose
+// default is 256): linear images up to N KiB that the GPU neither wrote nor covers with its writes
+// are compared with their guest bytes (a hash) the first time each guest submission refreshes them,
+// and uploaded again, straight from guest memory, when the bytes changed. What the game wrote
+// before submitting is then visible to all of that submission's commands, as on the console. The
+// page tracking alone misses CPU writes to an image's first and last pages once a write next to the
+// image untracked them, and an upload from a cached buffer over the range is only as fresh as that
+// buffer: GT7's light grids, rewritten by the CPU every frame in memory shared with other data,
+// were found stale (dark screen tiles in tunnels and at night).
+static uint64_t GuestHashImageBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GUEST_HASH_IMAGES_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
+	}();
+	return bytes;
+}
+
+// KYTY_GUEST_HASH_TILED_KB=N (default 0: off; the experiment of usa-ratt/KytyPS5-GT7 95b1f059f):
+// the same per-submission guest-byte check for tiled images up to N KiB.
+static uint64_t GuestHashTiledBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GUEST_HASH_TILED_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
+	}();
+	return bytes;
+}
+
+// KYTY_GUEST_HASH_IMAGES_KB: the hash of the guest bytes of [address, address + size); false when
+// they cannot be read.
+static bool HashGuestBytes(uint64_t address, uint64_t size, uint64_t& hash) {
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	if (size == 0 || !Libs::LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		return false;
+	}
+	hash = XXH3_64bits(bytes.data(), static_cast<size_t>(size));
+	return true;
+}
+
+bool TextureCache::ClearFromKnownFill(ImageId id) {
+	auto&       image = m_slot_images[id];
+	const auto& info  = image.info;
+	// A target the binding is about to write, made from scratch: a texture may hold what the CPU
+	// wrote into memory a fill's holes left unmapped (those stores are not seen); a target's bytes
+	// are the GPU's.
+	if (image.depth_id || image.backing.image == nullptr || info.samples != 1 ||
+	    image.backing.samples != 1 || info.data.Empty() || info.IsVolume() || info.HasStencil() ||
+	    !(image.usage.render_target || image.usage.depth_target) || image.usage.texture ||
+	    image.usage.storage || image.usage.video_out ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	uint32_t value = 0;
+	if (!m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, false)) {
+		return false;
+	}
+	vk::ClearValue       clear {};
+	vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor;
+	if (info.IsDepth()) {
+		aspect = ImageViewOps::DepthAspectMask(image.backing.format);
+		if (info.pixel_format == vk::Format::eD16Unorm) {
+			// Two texels a dword: both the same.
+			if ((value >> 16u) != (value & 0xffffu)) {
+				return false;
+			}
+			clear.depthStencil.depth = static_cast<float>(value & 0xffffu) / 65535.0f;
+		} else if (!DecodePackedDepthClear(info.pixel_format, value, clear.depthStencil.depth)) {
+			return false;
+		}
+		clear.depthStencil.stencil = 0;
+	} else if (!DecodeColorDwordFill(info.pixel_format, value, clear.color)) {
+		return false;
+	}
+	if (!ClearImage(m_scheduler.Current(), id, image.backing.format,
+	                {aspect, 0, info.resources.levels, 0, image.backing.layers}, clear,
+	                "pending-fill")) {
+		return false;
+	}
+	(void)m_buffer_cache.FillOfNewImage(info.data.address, info.data.size, value, true);
+	static std::atomic<uint64_t> cleared {0};
+	if (const auto count = cleared.fetch_add(1, std::memory_order_relaxed) + 1;
+	    count <= 32 || std::has_single_bit(count)) {
+		LOGF("TextureCache: %s 0x%012" PRIx64 "+0x%" PRIx64 " %ux%u layers %u mips %u created inside "
+		     "a GPU fill with 0x%08x: starts as the fill, not as its memory (%" PRIu64
+		     " so far; KYTY_PENDING_FILLS)\n",
+		     info.IsDepth() ? "depth target" : "render target", info.data.address, info.data.size,
+		     info.extent.width, info.extent.height, info.resources.layers, info.resources.levels,
+		     value, count);
+	}
+	return true;
+}
+
+// KYTY_NAN_SCRUB=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 9bbca0635 and the
+// scan of c5511faad, without its NaN-count diagnostics): the B10G11R11 and half-float arrays of six
+// layers or more that the GPU writes (light probes, cube maps), up to KYTY_NAN_SCRUB_MB (default
+// 64) in all their mips, have their texels that are not finite rewritten on the GPU at a frame end
+// (one image a frame, each at most every 30 frames and only once it changed): a NaN becomes zero,
+// an infinity the largest finite value, what the guest GPU stores for a value out of range. A probe
+// relit every frame from its last value keeps such texels for good, and the surfaces that reflect
+// it shade black or NaN, which the temporal and blur passes spread (GT7).
+static bool NanScrubEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NAN_SCRUB");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static uint64_t NanScrubMaxBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_NAN_SCRUB_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
+	}();
+	return bytes;
+}
+
+// The scrub's packing of an image's host format and its bytes per texel; nullopt for others.
+static std::optional<std::pair<NanScrubber::Packing, uint32_t>> NanScrubFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32: return std::pair {NanScrubber::Packing::B10G11R11, 4u};
+		case vk::Format::eR16G16Sfloat: return std::pair {NanScrubber::Packing::TwoHalves, 4u};
+		case vk::Format::eR16G16B16A16Sfloat: return std::pair {NanScrubber::Packing::TwoHalves, 8u};
+		default: return std::nullopt;
+	}
+}
+
+// The bytes of every mip of `image`, tightly packed (0 when it is not eligible for the scrub).
+static uint64_t NanScrubBytes(const Image& image) {
+	const auto&    backing      = image.backing;
+	const auto     format       = NanScrubFormat(backing.format);
+	constexpr auto TransferBoth = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	if (!format || backing.image == nullptr || backing.layers < 6u ||
+	    backing.image_type != vk::ImageType::e2D || backing.samples != 1 || image.depth_id ||
+	    image.info.IsDepth() || !image.FullyResident() || (backing.usage & TransferBoth) != TransferBoth) {
+		return 0;
+	}
+	uint64_t total = 0;
+	for (uint32_t mip = 0; mip < std::max(backing.mip_levels, 1u); mip++) {
+		total += uint64_t {std::max(backing.extent.width >> mip, 1u)} *
+		         std::max(backing.extent.height >> mip, 1u) * backing.layers * format->second;
+	}
+	return total <= NanScrubMaxBytes() ? total : 0;
+}
+
+void TextureCache::NoteNanScrubCandidate(const Image& image) {
+	if (!NanScrubEnabled() || image.info.data.Empty() || NanScrubBytes(image) == 0) {
+		return;
+	}
+	const auto address = image.info.data.address;
+	if (std::ranges::any_of(m_nan_candidates,
+	                        [address](const NanScrubCandidate& c) { return c.address == address; })) {
+		return;
+	}
+	if (m_nan_candidates.size() >= 256) {
+		m_nan_candidates.erase(m_nan_candidates.begin());
+	}
+	m_nan_candidates.push_back({address, image.info.data.size, UINT64_MAX, 0});
+}
+
+void TextureCache::RunNanScrub() {
+	if (!NanScrubEnabled()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       frame = m_frame.load(std::memory_order_relaxed);
+	if (frame == m_nan_frame || m_nan_candidates.empty() || !m_scheduler.Active()) {
+		return;
+	}
+	m_nan_frame = frame;
+	if (m_nan_scrubber == nullptr) {
+		m_nan_scrubber = std::make_unique<NanScrubber>(m_graphics);
+	}
+	if (!m_nan_scrubber->Valid()) {
+		return;
+	}
+	for (size_t tries = 0; tries < m_nan_candidates.size();) {
+		m_nan_next      = (m_nan_next + 1) % m_nan_candidates.size();
+		auto& candidate = m_nan_candidates[m_nan_next];
+		Image* image    = nullptr;
+		for (const auto id: FindImagesInRegion(candidate.address, candidate.size, false)) {
+			auto* found = m_slot_images.try_get(id);
+			if (found != nullptr && found->registered && found->info.data.address == candidate.address &&
+			    NanScrubBytes(*found) != 0) {
+				image = found;
+				break;
+			}
+		}
+		if (image == nullptr) {
+			// Gone: forget it.
+			m_nan_candidates.erase(m_nan_candidates.begin() + static_cast<std::ptrdiff_t>(m_nan_next));
+			if (m_nan_candidates.empty()) {
+				return;
+			}
+			m_nan_next = (m_nan_next + m_nan_candidates.size() - 1) % m_nan_candidates.size();
+			continue;
+		}
+		tries++;
+		if ((candidate.frame != 0 && frame - candidate.frame < 30) ||
+		    image->ContentSerial() == candidate.serial) {
+			continue;
+		}
+		const auto  total   = NanScrubBytes(*image);
+		const auto  format  = NanScrubFormat(image->backing.format);
+		const auto& backing = image->backing;
+		std::vector<vk::BufferImageCopy> regions;
+		uint64_t                         offset = 0;
+		for (uint32_t mip = 0; mip < std::max(backing.mip_levels, 1u); mip++) {
+			const uint32_t      width  = std::max(backing.extent.width >> mip, 1u);
+			const uint32_t      height = std::max(backing.extent.height >> mip, 1u);
+			vk::BufferImageCopy region {};
+			region.bufferOffset     = offset;
+			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, backing.layers};
+			region.imageExtent      = vk::Extent3D {width, height, 1};
+			regions.push_back(region);
+			offset += uint64_t {width} * height * backing.layers * format->second;
+		}
+		if (m_nan_scratch == nullptr || m_nan_scratch->Size() < total) {
+			// The previous one stays alive in the deferred release of the scrub that used it.
+			m_nan_scratch = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+			                                         AllFlags, Common::AlignUp(total, uint64_t {4} << 20u));
+		}
+		image->Download(regions, m_nan_scratch->Handle(), 0, total);
+		m_nan_scrubber->Scrub(m_scheduler.Current(), m_nan_scratch->Handle(), 0, total, format->first);
+		image->Upload(regions, m_nan_scratch->Handle(), 0, total);
+		m_scheduler.DeferOperation([scratch = m_nan_scratch] {});
+		candidate.serial = image->ContentSerial();
+		candidate.frame  = frame;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("TextureCache: NaN scrub of 0x%012" PRIx64 " %ux%u, %u layers, %u mips, format %d "
+			     "(KYTY_NAN_SCRUB)\n",
+			     candidate.address, backing.extent.width, backing.extent.height, backing.layers,
+			     backing.mip_levels, static_cast<int>(backing.format));
+		}
+		return;
+	}
+}
+
+bool TextureCache::LightGridGuestEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIGHT_GRID_GUEST");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool TextureCache::LightGridGuestApplies(const Image& image) {
+	return LightGridGuestEnabled() && LightGridCapEnabled() && IsLightGridShape(image.info) &&
+	       image.FullyResident() && !image.IsGpuModified() && !image.depth_id;
+}
+
+bool TextureCache::ChecksGuestContent(const Image& image) {
+	const auto& info  = image.info;
+	// KYTY_LIGHT_GRID_GUEST: a light grid is checked against (and uploaded from) its guest bytes
+	// even where GPU writes to other data shared its memory.
+	if (LightGridGuestApplies(image)) {
+		return true;
+	}
+	const auto  limit = info.IsTiled() ? GuestHashTiledBytes() : GuestHashImageBytes();
+	return limit != 0 && !info.data.Empty() && info.data.size <= limit &&
+	       info.samples == 1 && !image.depth_id && !info.IsDepth() &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed && image.FullyResident() &&
+	       !image.IsGpuModified() && !image.IsBufferModified() &&
+	       !m_buffer_cache.IsRegionGpuModified(info.data.address, info.data.size);
+}
+
+void TextureCache::RefreshByContent(ImageId id, RefreshIntent intent) {
+	auto&      image = m_slot_images[id];
+	const auto range = image.info.data;
+	TrackImage(id);
+	const auto submission = SyncEpoch::CurrentSubmission();
+	if (image.content_check_submission == submission && !image.IsCpuDirty()) {
+		return;
+	}
+	uint64_t hash = 0;
+	if (!HashGuestBytes(range.address, range.size, hash)) {
+		image.content_hash_valid = false;
+		RefreshImage(id, intent);
+		return;
+	}
+	image.content_check_submission = submission;
+	if (hash == image.content_hash) {
+		// The GPU holds these bytes already, whatever the tracking marked.
+		if (image.IsDefinitelyCpuDirty()) {
+			image.RefreshComplete();
+		} else if (image.IsMaybeCpuDirty()) {
+			image.ClearMaybeCpuDirty();
+		}
+		return;
+	}
+	if (!image.IsDefinitelyCpuDirty()) {
+		// What this check is for: the first few, then every 1000th.
+		static std::atomic<uint64_t> unseen {0};
+		if (const auto count = unseen.fetch_add(1, std::memory_order_relaxed) + 1;
+		    count <= 16 || count % 1000 == 0) {
+			LOGF("TextureCache: guest bytes of 0x%012" PRIx64 "+0x%" PRIx64
+			     " (%ux%u, %u layers) changed unseen by the page tracking%s: uploaded again (%" PRIu64
+			     " so far; KYTY_GUEST_HASH_IMAGES_KB)\n",
+			     range.address, range.size, image.info.extent.width, image.info.extent.height,
+			     image.info.resources.layers,
+			     image.IsMaybeCpuDirty() ? " (a neighbour's write marked it maybe-dirty)" : "", count);
+		}
+	}
+	image.MarkResidencyDirty();
+	InitializeImage(id, intent);
+}
+
 void TextureCache::RefreshImage(ImageId id, RefreshIntent intent) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
@@ -6442,6 +7072,10 @@ void TextureCache::RefreshImage(ImageId id, RefreshIntent intent) {
 	// KYTY_PRESERVE_STENCIL: a plane the depth image does not hold is refreshed when it is swapped
 	// back in (its guest bytes would land on the held plane).
 	if (image.depth_id && PreserveStencilEnabled() && !StencilPlaneHeld(image)) {
+		return;
+	}
+	if (image.content_hash_valid && ChecksGuestContent(image)) {
+		RefreshByContent(id, intent);
 		return;
 	}
 	TrackImage(id);
@@ -6536,6 +7170,74 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+// KYTY_VIEW_PLACEMENT=1 (default off; adapted from usa-ratt/KytyPS5-GT7 rounds 71 and 74,
+// 509d22411 / e0200a03a): a texture or target the overlap loop finds inside an older, larger image
+// is viewed from its own place in the image the loop ends with (where its memory starts there, or
+// the last overlap's place when that overlap placed the binding itself), plus its descriptor's own
+// first mip and layer (BASE_LEVEL / BASE_ARRAY, a target's SLICE_START). Without it the last
+// overlap's place is used, whichever image that overlap was given, and the binding's own first
+// layer is dropped: GT7's reflection faces read their light grids through T#s of one 48-layer
+// grid with BASE_ARRAY 0, 8, ... 40, and a face whose grid lay inside an older image read the
+// first face's layers or other data (light counts of 65535 a pixel). A binding with no place, or
+// one its view does not fit in, gets an image of its own (logged).
+bool TextureCache::ViewPlacementEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_VIEW_PLACEMENT");
+		const bool  set   = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		if (set) {
+			LOGF("TextureCache: bindings inside larger images keep their own place and first layer "
+			     "(KYTY_VIEW_PLACEMENT)\n");
+		}
+		return set;
+	}();
+	return on;
+}
+
+void TextureCache::PlaceBindingView(const ImageDesc& desc, ImageId& result, bool loop_own,
+                                    int32_t& view_mip, int32_t& view_layer) const {
+	const auto& found      = m_slot_images[result].info;
+	const auto  loop_mip   = view_mip;
+	const auto  loop_layer = view_layer;
+	view_mip               = -1;
+	view_layer             = -1;
+	if (found.data.address == desc.info.data.address) {
+		if (loop_own) {
+			view_mip   = loop_mip;
+			view_layer = loop_layer;
+		}
+		return;
+	}
+	if (const auto mip = desc.info.MipOf(found); mip >= 0) {
+		view_mip   = mip;
+		view_layer = desc.info.SliceOf(found, mip);
+	} else if (loop_own) {
+		view_mip   = loop_mip;
+		view_layer = loop_layer;
+	}
+	const bool fits = view_mip >= 0 && view_layer >= 0 &&
+	                  static_cast<uint64_t>(view_mip) + desc.view_info.base_level + desc.view_info.level_count <=
+	                      found.resources.levels &&
+	                  static_cast<uint64_t>(view_layer) + desc.view_info.base_layer + desc.view_info.layer_count <=
+	                      found.resources.layers;
+	if (fits) {
+		return;
+	}
+	static std::atomic<uint64_t> unplaced {0};
+	const auto                   count = unplaced.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 16u || (count & (count - 1u)) == 0u) {
+		LOGF("TextureCache: 0x%012" PRIx64 " (%ux%u, mips %u, layers %u, view mips %u+%u layers %u+%u) lies "
+		     "in 0x%012" PRIx64 " (%ux%u, mips %u, layers %u) at mip %d layer %d, where its view does not "
+		     "fit: given an image of its own (%" PRIu64 " so far, KYTY_VIEW_PLACEMENT)\n",
+		     desc.info.data.address, desc.info.extent.width, desc.info.extent.height, desc.info.resources.levels,
+		     desc.info.resources.layers, desc.view_info.base_level, desc.view_info.level_count,
+		     desc.view_info.base_layer, desc.view_info.layer_count, found.data.address, found.extent.width,
+		     found.extent.height, found.resources.levels, found.resources.layers, view_mip, view_layer, count);
+	}
+	view_mip   = -1;
+	view_layer = -1;
+	result     = {};
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup* record) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	if (record != nullptr) {
@@ -6607,16 +7309,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			}
 			constexpr size_t CrowdedOverlap = 24;
 			m_overlap_crowded = candidates.size() > CrowdedOverlap;
+			const bool placement  = ViewPlacementEnabled();
+			ImageId    placed_in  = {};
+			bool       placed_raw = false; // placed against the binding's own address
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
+				if (!placement) {
+					view_mip   = -1;
+					view_layer = -1;
+				}
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				const bool  direct      = merged_info.data.address == desc.info.data.address;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+					result = overlap.image;
+					if (!placement || overlap.mip >= 0 || overlap.layer >= 0) {
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
+					placed_in  = overlap.mip >= 0 || overlap.layer >= 0 ? overlap.image : ImageId {};
+					placed_raw = direct;
 				}
+			}
+			if (result && placement) {
+				PlaceBindingView(desc, result, placed_in == result && placed_raw, view_mip, view_layer);
 			}
 		}
 
@@ -6632,6 +7347,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 		}
 		if (!result) {
 			first_page_answer = false;
+			if (ViewPlacementEnabled()) {
+				// The binding gets an image of its own: no place in another one applies.
+				view_mip   = -1;
+				view_layer = -1;
+			}
 			// A prefix computed as not applicable (0) keeps the image fully resident; InsertImage
 			// computes it when this lookup did not.
 			result = InsertImage(desc.info,
@@ -6644,11 +7364,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			}
 		}
 		auto& image = m_slot_images[result];
+		// KYTY_VIEW_PLACEMENT: the binding's view starts at its place plus its own first mip and
+		// layer (the T#'s BASE_LEVEL and BASE_ARRAY, a target's SLICE_START) when they fit;
+		// otherwise (and without the switch) at its place alone.
+		const bool keep_own = ViewPlacementEnabled();
 		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+			auto level = static_cast<uint32_t>(view_mip);
+			if (keep_own && level + desc.view_info.base_level + desc.view_info.level_count <=
+			                    image.info.resources.levels) {
+				level += desc.view_info.base_level;
+			}
+			desc.view_info.base_level = level;
 		}
 		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+			auto layer = static_cast<uint32_t>(view_layer);
+			if (keep_own && layer + desc.view_info.base_layer + desc.view_info.layer_count <=
+			                    image.info.resources.layers) {
+				layer += desc.view_info.base_layer;
+			}
+			desc.view_info.base_layer = layer;
 		}
 		// Every level the (adjusted) view can sample must be resident: a finer MIN_LOD than
 		// before extends the image, any non-sampling binding makes the whole chain resident.
@@ -7562,6 +8296,14 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	// KYTY_GUEST_HASH_IMAGES_KB: the GPU's pixels from now on, not the guest bytes an upload took.
+	image.content_hash_valid = false;
+	NoteNanScrubCandidate(image); // KYTY_NAN_SCRUB
+	// KYTY_PENDING_FILLS: its pixels are newer than a fill of its memory, so an image made there
+	// later must not start as that fill (ClearFromKnownFill).
+	if (!image.depth_id && !image.info.data.Empty()) {
+		m_buffer_cache.ForgetFillsUnder(image.info.data.address, image.info.data.size);
+	}
 	if (AliasBytesEnabled() && !image.depth_id && !image.info.data.Empty()) {
 		// Single owner per byte: this write takes the claimed bytes (the whole image, or the
 		// blocks under a draw's scissor) from every other image, which keeps the rest of its
@@ -7666,6 +8408,123 @@ bool StencilPlaneFillClearEnabled() {
 		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
+}
+
+void TextureCache::ResetUnmappedDepth(ImageId id, float empty) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_HOLES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || !id) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            found = m_slot_images.try_get(id);
+	if (found == nullptr || found->sparse_checked_serial == found->ContentSerial()) {
+		return;
+	}
+	auto&       image           = *found;
+	const auto& info            = image.info;
+	image.sparse_checked_serial = image.ContentSerial();
+	const auto     format       = image.backing.format;
+	const uint32_t bytes        = format == vk::Format::eD16Unorm    ? 2u
+	                              : format == vk::Format::eD32Sfloat ? 4u
+	                                                                 : 0u;
+	constexpr uint64_t BlockBytes = 0x10000u;
+	if (bytes == 0 || image.backing.image == nullptr || image.depth_id || info.data.Empty() ||
+	    info.tile_mode != Prospero::TileMode::kDepth || info.HasStencil() || info.IsVolume() ||
+	    info.resources.levels != 1 || info.resources.layers != 1 || image.backing.samples != 1 ||
+	    image.backing.mip_levels != 1 || (info.data.address % BlockBytes) != 0 ||
+	    !(image.backing.usage & vk::ImageUsageFlagBits::eTransferDst)) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	if (!Libs::LibKernel::Memory::CommittedSpans(info.data.address, info.data.size, 1u << 20u,
+	                                             &spans)) {
+		return;
+	}
+	uint64_t committed = 0;
+	for (const auto& span: spans) {
+		committed += span.second;
+	}
+	if (committed >= info.data.size) {
+		return; // all mapped: the common case
+	}
+	TileBlockLayout block {};
+	if (!TileGetBlockLayout(TileBlockFamily::Depth64KB, bytes, block) ||
+	    block.block_size != BlockBytes || block.block_depth != 1 || block.block_width == 0 ||
+	    block.block_height == 0) {
+		return;
+	}
+	const uint32_t width          = std::max(image.backing.extent.width, 1u);
+	const uint32_t height         = std::max(image.backing.extent.height, 1u);
+	const uint32_t blocks_per_row = (width + block.block_width - 1u) / block.block_width;
+	const uint32_t block_rows     = (height + block.block_height - 1u) / block.block_height;
+	const uint64_t blocks         = uint64_t {blocks_per_row} * block_rows;
+	if (blocks * BlockBytes > info.data.size) {
+		return; // not the layout assumed here (64 KB blocks, row by row)
+	}
+	// Whether each block is mapped: any byte of it is (a block partly mapped keeps its texels).
+	std::vector<bool> mapped(blocks, false);
+	for (const auto& [start, size]: spans) {
+		const uint64_t first = (start - info.data.address) / BlockBytes;
+		const uint64_t end   = std::min<uint64_t>(
+            (start + size - info.data.address + BlockBytes - 1u) / BlockBytes, blocks);
+		for (uint64_t b = first; b < end; b++) {
+			mapped[b] = true;
+		}
+	}
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         largest = 0;
+	uint64_t                         holes   = 0;
+	for (uint32_t row = 0; row < block_rows; row++) {
+		for (uint32_t column = 0; column < blocks_per_row;) {
+			if (mapped[uint64_t {row} * blocks_per_row + column]) {
+				column++;
+				continue;
+			}
+			uint32_t end = column;
+			while (end < blocks_per_row && !mapped[uint64_t {row} * blocks_per_row + end]) {
+				end++;
+			}
+			holes += end - column;
+			const uint32_t      x = column * block.block_width;
+			const uint32_t      y = row * block.block_height;
+			vk::BufferImageCopy region {};
+			region.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+			region.imageOffset      = vk::Offset3D {static_cast<int32_t>(x), static_cast<int32_t>(y), 0};
+			region.imageExtent      = vk::Extent3D {std::min(end * block.block_width, width) - x,
+                                               std::min(block.block_height, height - y), 1};
+			largest = std::max<uint64_t>(largest, uint64_t {region.imageExtent.width} *
+			                                          region.imageExtent.height * bytes);
+			regions.push_back(region);
+			column = end;
+		}
+	}
+	if (regions.empty()) {
+		return;
+	}
+	// One passing-depth source for every region (each reads it from its start).
+	const uint64_t source_size = Common::AlignUp(largest, uint64_t {4});
+	auto           source      = std::make_shared<Buffer>(
+        m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+        vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc, source_size);
+	const uint32_t empty_word =
+	    bytes == 2u ? (empty >= 1.0f ? 0xffffffffu : 0u) : std::bit_cast<uint32_t>(empty);
+	source->Fill(0, source_size, empty_word);
+	image.Upload(regions, source->Handle(), 0, source_size);
+	m_scheduler.DeferOperation([source] {});
+	image.sparse_checked_serial = image.ContentSerial();
+	static std::mutex                   logged_mutex;
+	static std::unordered_set<uint64_t> logged;
+	std::lock_guard                     logged_lock(logged_mutex);
+	if (logged.size() < 32 &&
+	    logged.insert(info.data.address ^ (uint64_t {width} << 40u) ^ (holes << 20u)).second) {
+		LOGF("Sparse depth: 0x%012" PRIx64 " %ux%u: %" PRIu64 " of %" PRIu64
+		     " 64 KB blocks unmapped, reset to depth %.1f (%zu regions; KYTY_SPARSE_HOLES)\n",
+		     info.data.address, width, height, holes, blocks, static_cast<double>(empty),
+		     regions.size());
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -7791,7 +8650,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
 		// KYTY_WIDE_FILL_CLEAR (default off, live): a fill of an image with 64- or 128-bit texels is a clear
 		// too; otherwise only a zero RGBA16F fill and the 32-bit formats are.
-		const bool wide_fill = g_wide_fill_clear.Get() != 0;
+		// KYTY_WIDE_FILL_CLEAR=2 (GT7 fork 83707d403): the fill words of more formats (DecodeFillWord).
+		const auto wide_fill = g_wide_fill_clear.Get();
 		// KYTY_10_11_11_RED: the fill word is in the guest's layout.
 		const auto host_clear = GuestColorWordToHost(packed_clear, image.info.GetColorTransform());
 		// KYTY_STENCIL_PLANE_SYNC=2: a uniform byte fill of an R8 image is its clear (Ghost of Yotei's CS
@@ -7811,8 +8671,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 				LOGF("MetaTrace: clear-from-buffer 0x%" PRIx64 " size 0x%" PRIx64 ": R8 byte clear %u\n", address, size,
 				     static_cast<unsigned>(byte));
 			}
-		} else if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
-		                       : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
+		} else if (!(wide_fill == 2   ? DecodeFillWord(image.info.pixel_format, host_clear, clear.color)
+		             : wide_fill == 1 ? DecodeFilledColorClear(image.info.pixel_format, host_clear, clear.color)
+		                              : DecodeColorDwordFill(image.info.pixel_format, host_clear, clear.color))) {
 			return false;
 		}
 	} else {
@@ -9425,6 +10286,8 @@ void TextureCache::InvalidateCleanImageProofs(uint64_t address, uint64_t size,
 }
 
 void TextureCache::MarkImageGpuModified(Image& image) {
+	// KYTY_GUEST_HASH_IMAGES_KB: the GPU's pixels from now on, not the guest bytes an upload took.
+	image.content_hash_valid = false;
 	if (HangTrace::CpWatch(image.info.data.address, image.info.data.size)) {
 		HangTrace::CpEvent event;
 		event.event   = "gpuwrite-image";
@@ -10157,6 +11020,59 @@ void TextureCache::FreeGuestDroppedImages(uint64_t frame) {
 	}
 }
 
+uint64_t TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {
+	std::scoped_lock lock {m_lock};
+	m_bindless_evictable.assign(ids.begin(), ids.end());
+	uint64_t bytes = 0;
+	for (const auto id: m_bindless_evictable) {
+		if (const auto* image = m_slot_images.try_get(id); image != nullptr && image->registered) {
+			bytes += image->AccountedSize();
+		}
+	}
+	return bytes;
+}
+
+void TextureCache::FreeBindlessEvictable(uint64_t frame) {
+	if (m_bindless_evictable.empty() || !BindlessUnderPressure()) {
+		return;
+	}
+	constexpr size_t     PerCall = 64;
+	constexpr uint64_t   MinAge  = 16; // frames since a bound (non-bindless) use
+	size_t               freed   = 0;
+	std::vector<ImageId> later;
+	for (const auto id: m_bindless_evictable) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || !image->bindless_pinned) {
+			continue; // gone, or no key refers to it any more (the regular collectors' now)
+		}
+		if (freed == PerCall || !BindlessUnderPressure()) {
+			later.push_back(id);
+			continue;
+		}
+		if (image->depth_id || image->IsGpuModified() || image->binding.is_bound ||
+		    image->binding.is_target || image->usage.video_out ||
+		    frame - std::min(frame, image->frame_accessed_last) <= MinAge) {
+			continue; // its contents are not in guest memory, or it is in use otherwise
+		}
+		m_bindless_evicted++;
+		m_bindless_evicted_bytes += image->AccountedSize();
+		m_bindless_evicting = true;
+		FreeImage(id, HangTrace::ImageFreeReason::PressureCollect);
+		m_bindless_evicting = false;
+		freed++;
+	}
+	m_bindless_evictable = std::move(later);
+	if (freed != 0) {
+		static uint64_t last_log = 0;
+		if (frame >= last_log + 600) {
+			last_log = frame;
+			LOGF("TexBindlessEvict: frame=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64
+			     " MB) (KYTY_BINDLESS_EVICT)\n",
+			     frame, m_bindless_evicted, m_bindless_evicted_bytes >> 20u);
+		}
+	}
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	RetireIdlePartialImages();
@@ -10166,6 +11082,7 @@ void TextureCache::RunGarbageCollector() {
 	}
 	const auto frame = m_frame.load(std::memory_order_relaxed);
 	FreeGuestDroppedImages(frame);
+	FreeBindlessEvictable(frame);
 	// Always (one entry per frame): KYTY_VRAM_GC_BUDGET is a live switch and needs recent frames.
 	NoteFrameTick(frame, tick);
 	if (m_idle_frames != 0 && frame >= m_idle_next_frame) {

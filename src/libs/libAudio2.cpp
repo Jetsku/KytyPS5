@@ -60,6 +60,26 @@ uint32_t AudioOut2BuzzThresholdBlocks(uint32_t sampling_freq, uint32_t frames_pe
 	return std::max<uint32_t>(1, static_cast<uint32_t>((static_cast<uint64_t>(sampling_freq) + frames_per_block - 1) / frames_per_block));
 }
 
+static bool AudioOut2EnvOn(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static AudioOut2Switches& AudioOut2SwitchState() {
+	static AudioOut2Switches switches {AudioOut2EnvOn("KYTY_AUDIO2_CONSUME_PCM"),
+	                                   AudioOut2EnvOn("KYTY_AUDIO2_EXACT_GRAIN"),
+	                                   AudioOut2EnvOn("KYTY_AUDIO2_SDK_DEFAULTS")};
+	return switches;
+}
+
+const AudioOut2Switches& AudioOut2GetSwitches() {
+	return AudioOut2SwitchState();
+}
+
+void AudioOut2SetSwitchesForTest(const AudioOut2Switches& switches) {
+	AudioOut2SwitchState() = switches;
+}
+
 } // namespace AudioInternal
 
 namespace AudioOut2 {
@@ -330,6 +350,22 @@ static uint32_t audioout2_grain_micros(uint32_t grains) {
 	return std::max<uint32_t>((sample_count * 1000000u) / 48000u, 1000u);
 }
 
+// The clock of the modelled queue (last_update): microseconds, or with KYTY_AUDIO2_EXACT_GRAIN
+// (upstream 7ff8aff5e) sixths of a microsecond, in which one 48 kHz sample lasts exactly 125, so
+// a grain drains at its exact playing time (the microsecond grain truncates, and its 1 ms floor
+// slowed grains under 48 samples).
+static uint64_t audioout2_clock() {
+	const auto now = LibKernel::KernelGetProcessTime();
+	return AudioInternal::AudioOut2GetSwitches().exact_grain ? now * 6 : now;
+}
+
+static uint64_t audioout2_grain_ticks(uint32_t grains) {
+	if (AudioInternal::AudioOut2GetSwitches().exact_grain) {
+		return uint64_t {grains == 0 ? 512u : grains} * 125u;
+	}
+	return audioout2_grain_micros(grains);
+}
+
 static uint8_t audioout2_data_format_channels(uint32_t data_format) {
 	const auto channels = (data_format >> 8u) & 0xffu;
 	return static_cast<uint8_t>(channels == 0 ? 2u : std::min(channels, 16u));
@@ -394,13 +430,13 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
-	const auto now = LibKernel::KernelGetProcessTime();
+	const auto now = audioout2_clock();
 	if (state->last_update == 0 || state->queued == 0) {
 		state->last_update = now;
 		return;
 	}
 
-	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+	const auto grain_micros = audioout2_grain_ticks(state->num_grains);
 	if (now <= state->last_update || grain_micros == 0) {
 		return;
 	}
@@ -777,7 +813,21 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		}
 	}
 
+	// KYTY_AUDIO2_CONSUME_PCM (upstream 64a554dea): a port's PCM covers one grain, so the push
+	// consumes it and a port the game stops feeding falls silent instead of replaying its last
+	// block. Locked push: the backend reads the ports' own PCM, so it is dropped after the call.
+	const bool consume = AudioInternal::AudioOut2GetSwitches().consume_pcm;
+	const auto consume_pcm = [&] {
+		for (auto& state: g_audioout2_ports) {
+			if (state.used && state.context == ctx && !audioout2_port_type_is_object(state.port_type)) {
+				state.pcm_data.clear();
+			}
+		}
+	};
 	if (out != nullptr) {
+		if (consume) {
+			consume_pcm(); // the submission holds copies
+		}
 		g_audioout2_port_mutex.Unlock();
 		if (!params.empty()) {
 			(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
@@ -789,6 +839,9 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	if (!params.empty()) {
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
 		                                     blocking);
+	}
+	if (consume) {
+		consume_pcm();
 	}
 	g_audioout2_port_mutex.Unlock();
 }
@@ -811,6 +864,14 @@ int KYTY_SYSV_ABI AudioOut2ContextResetParam(AudioOut2ContextParam* params) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 
 	std::memset(params, 0, sizeof(AudioOut2ContextParam));
+	if (AudioInternal::AudioOut2GetSwitches().sdk_defaults) {
+		// KYTY_AUDIO2_SDK_DEFAULTS (upstream 2efd31443): the library's own defaults. A game that
+		// keeps them sets 256-sample grains, which the old 512 read past.
+		params->max_ports   = 8;
+		params->queue_depth = 1;
+		params->num_grains  = 256;
+		return OK;
+	}
 	params->max_ports              = 256;
 	params->max_object_ports       = 256;
 	params->guarantee_object_ports = 0;
@@ -864,7 +925,7 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 	state->queue_depth = (params->queue_depth == 0 ? 4u : params->queue_depth);
 	state->queued      = 0;
 	state->num_grains  = (params->num_grains == 0 ? 512u : params->num_grains);
-	state->last_update = LibKernel::KernelGetProcessTime();
+	state->last_update = audioout2_clock();
 	state->max_ports        = params->max_ports;
 	state->max_object_ports = params->max_object_ports;
 	g_audioout2_context_mutex.Unlock();
@@ -1073,7 +1134,7 @@ static int AudioOut2ContextPushImpl(AudioOut2ContextHandle ctx, uint32_t blockin
 			sleep_micros = audioout2_grain_micros(state->num_grains);
 			if (state->queued < state->queue_depth || use_device_clock) {
 				if (state->queued == 0) {
-					state->last_update = LibKernel::KernelGetProcessTime();
+					state->last_update = audioout2_clock();
 				}
 				if (state->queued < state->queue_depth) {
 					state->queued++;

@@ -15,9 +15,11 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -629,6 +631,54 @@ void SetHostBufferPairAtomics(bool supported) {
 
 bool GetHostBufferPairAtomics() {
 	return g_buffer_pair_atomics.load(std::memory_order_relaxed);
+}
+
+static std::atomic<bool> g_mesh_layer_drop {false};
+void SetHostMeshLayerDrop(bool drop) {
+	g_mesh_layer_drop.store(drop, std::memory_order_relaxed);
+}
+bool GetHostMeshLayerDrop() {
+	return g_mesh_layer_drop.load(std::memory_order_relaxed);
+}
+
+static std::atomic<bool> g_coherent_load_vendor_barrier {false};
+void SetCoherentLoadVendorDefault(bool barrier) {
+	g_coherent_load_vendor_barrier.store(barrier, std::memory_order_relaxed);
+}
+
+CoherentLoadMode GetCoherentLoadMode() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_MODE");
+		if (value == nullptr) return -1;
+		const std::string_view mode(value);
+		if (mode == "barrier") return static_cast<int>(CoherentLoadMode::Barrier);
+		if (mode == "acquire") return static_cast<int>(CoherentLoadMode::Acquire);
+		if (mode == "relaxed") return static_cast<int>(CoherentLoadMode::Relaxed);
+		if (mode == "plain" || mode == "off") return static_cast<int>(CoherentLoadMode::Plain);
+		return -1;
+	}();
+	if (forced >= 0) {
+		return static_cast<CoherentLoadMode>(forced);
+	}
+	static const int acquire = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_ACQUIRE");
+		if (value == nullptr) return 0;
+		const std::string_view setting(value);
+		return setting == "1" ? 1 : setting == "auto" ? 2 : 0;
+	}();
+	const bool barrier =
+	    acquire == 1 || (acquire == 2 && g_coherent_load_vendor_barrier.load(std::memory_order_relaxed));
+	return barrier ? CoherentLoadMode::Barrier : CoherentLoadMode::Plain;
+}
+
+const char* CoherentLoadModeName(CoherentLoadMode mode) {
+	switch (mode) {
+		case CoherentLoadMode::Plain: return "plain";
+		case CoherentLoadMode::Barrier: return "barrier";
+		case CoherentLoadMode::Acquire: return "acquire";
+		case CoherentLoadMode::Relaxed: return "relaxed";
+	}
+	return "?";
 }
 
 static std::atomic<uint64_t> g_indirect_format_count_address {0};

@@ -170,6 +170,12 @@ void Translator::V_CVT_PK_U8_F32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(base, ir.ShiftLeftLogical(byte, shift)));
 }
 
+void Translator::V_CVT_PK_16_32(const Decoder::Instruction& inst, bool signed_value) {
+	WriteOperand(DestinationOperand(inst),
+	             PackU16Lanes(Saturate16(ReadU32(inst.src0), signed_value),
+	                          Saturate16(ReadU32(inst.src1), signed_value)));
+}
+
 void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
 	const auto low = Read16LaneBits(inst.src0, false);
 	const auto high =
@@ -181,6 +187,14 @@ IR::U32 Translator::PackU16Lanes(IR::U32 low, IR::U32 high) {
 	const auto mask = IR::U32(IR::Value(0xffffu));
 	return ir.BitwiseOr(ir.BitwiseAnd(low, mask),
 	                    ir.ShiftLeftLogical(ir.BitwiseAnd(high, mask), IR::U32(IR::Value(16u))));
+}
+
+IR::U32 Translator::Saturate16(IR::U32 value, bool signed_value) {
+	if (!signed_value) {
+		return IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {value, IR::Value(0xffffu)}));
+	}
+	const auto low = ir.Emit(IR::ValueOpcode::SMax32, {value, IR::Value(0xffff8000u)});
+	return IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)}));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

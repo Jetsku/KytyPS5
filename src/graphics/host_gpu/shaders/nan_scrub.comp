@@ -1,0 +1,55 @@
+#version 450
+
+// KYTY_NAN_SCRUB (NanScrubber, TextureCache::RunNanScrub): the words of an image's mips, copied
+// tightly packed into the bound buffer, have each float field that is not finite rewritten in
+// place: a NaN to zero, an infinity to the largest finite value of its sign (what the guest GPU's
+// conversion gives for a finite value out of range). The caller copies the words back into the
+// image. PACKING 0: B10G11R11 (an 11-bit red and green, a 10-bit blue); 1: two halves.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint PACKING = 0u;
+
+layout(std430, binding = 0) buffer Words {
+    uint w[];
+};
+
+// One float field of `word` at bit `at`: `mantissa` mantissa bits under 5 exponent bits (and a sign
+// bit above them when `sign`). A NaN becomes zero, an infinity the largest finite value.
+uint ScrubField(uint word, uint at, uint mantissa, bool sign) {
+    const uint exponent_mask = 0x1fu << (at + mantissa);
+    if ((word & exponent_mask) != exponent_mask) {
+        return word;
+    }
+    const uint mantissa_mask = ((1u << mantissa) - 1u) << at;
+    const uint field_mask    = exponent_mask | mantissa_mask;
+    const uint largest       = ((0x1eu << mantissa) | ((1u << mantissa) - 1u)) << at;
+    if ((word & mantissa_mask) != 0u) {
+        // NaN: zero, the sign too.
+        const uint sign_mask = sign ? (1u << (at + mantissa + 5u)) : 0u;
+        return word & ~(field_mask | sign_mask);
+    }
+    return (word & ~field_mask) | largest;
+}
+
+uint Scrub(uint word) {
+    if (PACKING == 0u) {
+        word = ScrubField(word, 0u, 6u, false);
+        word = ScrubField(word, 11u, 6u, false);
+        return ScrubField(word, 22u, 5u, false);
+    }
+    word = ScrubField(word, 0u, 10u, true);
+    return ScrubField(word, 16u, 10u, true);
+}
+
+void main() {
+    const uint total  = uint(w.length());
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        const uint word     = w[i];
+        const uint scrubbed = Scrub(word);
+        if (scrubbed != word) {
+            w[i] = scrubbed;
+        }
+    }
+}

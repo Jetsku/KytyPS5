@@ -22,13 +22,12 @@ void Translator::Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpco
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
 
-void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
-	const auto lhs    = ReadU16AsU32(inst.src0, true);
-	const auto rhs    = ReadU16AsU32(inst.src1, true);
-	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, true));
+void Translator::Integer16Mad(const Decoder::Instruction& inst, bool sign) {
+	const auto lhs    = ReadU16AsU32(inst.src0, sign);
+	const auto rhs    = ReadU16AsU32(inst.src1, sign);
+	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, sign));
 	if (inst.dst.clamp) {
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
+		result = Saturate16(result, sign);
 	}
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
@@ -152,6 +151,12 @@ void Translator::SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode
 		const auto arg_type = IR::ArgTypeOf(opcode, index);
 		const auto& operand = SourceAt(inst, reverse && index < 2u ? 1u - index : index);
 		args[index]         = ReadOperand(operand, arg_type == IR::Type::Void ? type : arg_type);
+		if (opcode == IR::ValueOpcode::ShiftRightArithmetic64 && index == 0u &&
+		    operand.kind == Decoder::OperandKind::LiteralConstant) {
+			args[index] = ir.ConstructU64(
+			    ReadU32(operand),
+			    IR::U32(IR::Value((operand.value & 0x80000000u) ? 0xffffffffu : 0u)));
+		}
 		if (mask_shift_count && index == 1u) {
 			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(31u)));
 		}
@@ -240,18 +245,35 @@ void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero) 
 
 void Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
 	const auto source = ReadU32(inst.src0);
-	const auto value  = sign ? ir.BitwiseXor(
-	                              source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))))
-	                         : source;
-	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {value}));
+	if (sign) {
+		// Bits equal to the sign become zero; FindILsb of the reversed bits is ~0 when none.
+		const auto bits =
+		    ir.BitwiseXor(source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))));
+		const auto reversed = ir.Emit(IR::ValueOpcode::BitReverse32, {bits});
+		WriteOperand(DestinationOperand(inst),
+		             IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {reversed})));
+		return;
+	}
+	// ResourceTracking matches this 31 - FindUMsb32 form.
+	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {source}));
 	const auto position = ir.ISub(IR::U32(IR::Value(31u)), msb);
-	const auto result   = ir.Select(ir.INotEqual(value, IR::U32(IR::Value(0u))), position,
+	const auto result   = ir.Select(ir.INotEqual(source, IR::U32(IR::Value(0u))), position,
 	                                IR::U32(IR::Value(0xffffffffu)));
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst) {
-	const auto source   = ReadU64(inst.src0);
+void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign) {
+	auto words = ReadU32Pair(inst.src0);
+	if (sign) {
+		// S_FLBIT_I32_I64 (upstream ecc30a1f2): a signed source sign-extends a literal; then bits
+		// equal to the sign become zero, so the search finds the first bit that differs from it.
+		if (inst.src0.kind == Decoder::OperandKind::LiteralConstant) {
+			words[1] = ir.ShiftRightArithmetic(words[0], IR::U32(IR::Value(31u)));
+		}
+		const auto mask = ir.ShiftRightArithmetic(words[1], IR::U32(IR::Value(31u)));
+		words           = {ir.BitwiseXor(words[0], mask), ir.BitwiseXor(words[1], mask)};
+	}
+	const auto source   = ir.ConstructU64(words[0], words[1]);
 	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb64, {source}));
 	const auto position = ir.ISub(IR::U32(IR::Value(63u)), msb);
 	const auto nonzero =
@@ -261,7 +283,7 @@ void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool addend) {
+void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high) {
 	const auto extract24 = [&](IR::U32 value) {
 		return IR::U32(
 		    ir.Emit(sign ? IR::ValueOpcode::BitFieldSExtract : IR::ValueOpcode::BitFieldUExtract,
@@ -269,7 +291,9 @@ void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool add
 	};
 	const auto lhs    = extract24(ReadU32(inst.src0));
 	const auto rhs    = extract24(ReadU32(inst.src1));
-	auto       result = ir.IMul(lhs, rhs);
+	const auto multiply = high ? (sign ? IR::ValueOpcode::SMulHi : IR::ValueOpcode::UMulHi)
+	                           : IR::ValueOpcode::IMul32;
+	auto result = IR::U32(ir.Emit(multiply, {lhs, rhs}));
 	if (addend) {
 		result = ir.IAdd(result, ReadU32(inst.src2));
 	}
@@ -288,7 +312,9 @@ void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
 	if (inst.dst2.kind != Decoder::OperandKind::Null &&
 	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
 		// The 32x32 product fits in 64 bits, so only the addition can carry.
-		WriteMask(inst.dst2, IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product})));
+		// Like every VOP3B carry-out, lanes outside EXEC write zero mask bits.
+		const auto carry = IR::U1(ir.Emit(IR::ValueOpcode::ULessThan64, {result, product}));
+		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
 	}
 }
 
@@ -380,7 +406,7 @@ void Translator::S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), ir.ConstructU64(replicate(low), replicate(high)));
 }
 
-void Translator::S_QUADMASK_B64(const Decoder::Instruction& inst) {
+void Translator::S_QUADMASK(const Decoder::Instruction& inst, bool is64) {
 	const auto compact = [&](IR::U32 value) {
 		auto bits = ir.BitwiseOr(value, ir.ShiftRightLogical(value, IR::U32(IR::Value(1u))));
 		bits      = ir.BitwiseOr(bits, ir.ShiftRightLogical(bits, IR::U32(IR::Value(2u))));
@@ -393,12 +419,17 @@ void Translator::S_QUADMASK_B64(const Decoder::Instruction& inst) {
 		    ir.BitwiseOr(bits, ir.ShiftRightLogical(bits, IR::U32(IR::Value(12u)))),
 		    IR::U32(IR::Value(0xffu)));
 	};
-	const auto source = ReadU32Pair(inst.src0);
-	const auto quads  = ir.BitwiseOr(
-	    compact(source[0]), ir.ShiftLeftLogical(compact(source[1]), IR::U32(IR::Value(8u))));
-	const auto result = ir.ConstructU64(quads, IR::U32(IR::Value(0u)));
-	WriteOperand(DestinationOperand(inst), result);
-	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
+	IR::U32 quads;
+	if (is64) {
+		const auto source = ReadU32Pair(inst.src0);
+		quads = ir.BitwiseOr(
+		    compact(source[0]), ir.ShiftLeftLogical(compact(source[1]), IR::U32(IR::Value(8u))));
+		WriteOperand(DestinationOperand(inst), ir.ConstructU64(quads, IR::U32(IR::Value(0u))));
+	} else {
+		quads = compact(ReadU32(inst.src0));
+		WriteOperand(DestinationOperand(inst), quads);
+	}
+	ir.SetScc(ir.INotEqual(quads, IR::U32(IR::Value(0u))));
 }
 
 void Translator::BFM_B32(const Decoder::Instruction& inst) {

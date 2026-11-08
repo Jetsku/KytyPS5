@@ -38,6 +38,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class Buffer;
+class NanScrubber;
 class BufferCache;
 
 // KYTY_META_CLEAR_COVER / KYTY_META_TRACE (textureCache.cpp).
@@ -232,6 +233,18 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// KYTY_SPARSE_HOLES=1 (default off; adapted from usa-ratt/KytyPS5-GT7 89be9768d): a depth image
+	// over memory only partly mapped (sparse, in 64 KB blocks), sampled with a depth comparison,
+	// has the texels of its unmapped blocks reset to `empty`, the depth that passes the comparison
+	// (1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL), once each time its contents change. The
+	// console drops the writes that land there and reports reads there as not resident, which the
+	// shaders sampling such shadow maps take as lit. Without it the host's texels there, drawn
+	// into, shadow the ground in noisy patches with straight edges (GT7).
+	void               ResetUnmappedDepth(ImageId id, float empty);
+	// KYTY_NAN_SCRUB=1 (textureCache.cpp), GPU thread, at a guest flip's preparation: one changed
+	// GPU-written B10G11R11 or half-float array of six layers or more has its texels that are not
+	// finite rewritten (a NaN to zero, an infinity to the largest finite value).
+	void               RunNanScrub();
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// KYTY_IMAGE_EXACT_RANGE_INVALIDATE (default off; =1 on, =count dry run): when a GPU buffer
@@ -400,11 +413,32 @@ public:
 	// comes from guest bytes (not from a GPU-written cache buffer). Any thread.
 	[[nodiscard]] static bool LightGridCapEnabled();
 	static void NoteLightGridShape(const ImageInfo& info);
+	// KYTY_LIGHT_GRID_PROBE=1 (diagnostics, default off): every light grid a pixel shader binds
+	// (descriptors.cpp) has its guest bytes scanned at bind time and logged (garbage cells, the
+	// largest and summed light counts). Any thread.
+	[[nodiscard]] static bool LightGridProbeEnabled();
+	// KYTY_LIGHT_GRID_GUEST=1 (default off; needs KYTY_LIGHT_GRID_CAP): a light grid's image is
+	// compared with its guest bytes once per guest submission and uploaded from them (repaired)
+	// when they changed, even when GPU writes of other data covered the grid's memory, which
+	// otherwise makes the refresh take the stale GPU-written bytes of the buffer cache.
+	[[nodiscard]] static bool LightGridGuestEnabled();
+	[[nodiscard]] static bool LightGridGuestApplies(const Image& image);
+	static void ProbeLightGrid(const ImageInfo& info, uint64_t shader_hash);
 	void RunGarbageCollector();
 	// KYTY_BINDLESS_GUEST_DROP_FRAMES: no heap key refers to this bindless image any more (the
 	// guest replaced or cleared its entries): free it once no draw has used it for that many
 	// frames, whatever the memory pressure (RunGarbageCollector). Any thread but m_lock's holder.
 	void ReleaseDroppedByGuest(ImageId id);
+	// KYTY_BINDLESS_EVICT: bindless images no draw sampled during the last usage probe
+	// (RenderExecutor::UpdateBindlessUsageProbe); replaces the previous list. They stay pinned,
+	// but while the cache is under pressure RunGarbageCollector frees the clean, unbound ones.
+	// Returns their accounted bytes. GPU thread; takes m_lock.
+	uint64_t SetBindlessEvictable(std::span<const ImageId> ids);
+	// Whether the cache's images (or, with a reported budget, the device's usage) are at its
+	// pressure threshold.
+	[[nodiscard]] bool BindlessUnderPressure() const noexcept {
+		return m_total_used_memory >= m_pressure_gc_memory;
+	}
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
 	void ReportVram();
@@ -579,6 +613,10 @@ private:
 	[[nodiscard]] bool SafeToSyncIntoBuffer(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
+	// KYTY_DCC_GPU_ALIASED: whether images over a target's metadata keep its inspection on the CPU
+	// (m_lock held).
+	// *aliased: images lie over the metadata and were accepted (KYTY_DCC_GPU_WIDE / _ALIASED=2).
+	[[nodiscard]] bool          MetadataAliasBlocks(ImageId id, GuestRange range, bool* aliased = nullptr);
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
@@ -588,7 +626,20 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	// KYTY_VIEW_PLACEMENT: where a binding the overlap loop found inside `result` lies in it
+	// (loop_own: the loop's last overlap placed the binding itself there, at view_mip/view_layer);
+	// clears `result` when it has no place there its view fits in (it gets an image of its own).
+	[[nodiscard]] static bool   ViewPlacementEnabled();
+	void                        PlaceBindingView(const ImageDesc& desc, ImageId& result, bool loop_own,
+	                                             int32_t& view_mip, int32_t& view_layer) const;
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// KYTY_GUEST_HASH_IMAGES_KB: small linear images the CPU writes, compared with their guest bytes
+	// once per guest submission instead of trusting the page tracking alone.
+	[[nodiscard]] bool          ChecksGuestContent(const Image& image);
+	void                        RefreshByContent(ImageId id, RefreshIntent intent);
+	// KYTY_PENDING_FILLS (BufferCache::FillOfNewImage), caller holds m_lock: a fresh target made
+	// inside a known GPU fill is cleared to it; false when nothing was done (the caller uploads).
+	bool                        ClearFromKnownFill(ImageId id);
 	void                        RefreshImage(ImageId id,
 	                                         RefreshIntent intent = RefreshIntent::Read);
 	// `noop` (optional): how the decision can be repeated (MetadataNoop), reset first.
@@ -629,7 +680,7 @@ private:
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuMetadataClear(
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-	    bool cmask, bool consume = true);
+	    bool cmask, bool keep_keys = false);
 	// KYTY_LIGHT_GRID_CAP: a light grid's staged upload bytes, repaired before the copy is recorded.
 	void RepairLightGridUpload(const Image& image, Buffer& source, uint64_t source_offset);
 	void                        InitializeImage(ImageId id,
@@ -748,6 +799,12 @@ private:
 	uint64_t                                  m_guest_dropped_freed       = 0;
 	uint64_t                                  m_guest_dropped_freed_bytes = 0;
 	void                                      FreeGuestDroppedImages(uint64_t frame);
+	// KYTY_BINDLESS_EVICT (SetBindlessEvictable).
+	std::vector<ImageId> m_bindless_evictable;
+	uint64_t             m_bindless_evicted       = 0;
+	uint64_t             m_bindless_evicted_bytes = 0;
+	bool                 m_bindless_evicting      = false; // FreeImage frees a pinned image
+	void                 FreeBindlessEvictable(uint64_t frame);
 	uint64_t           m_pressure_frames      = 0;
 	uint64_t           m_pressure_frame       = 0;
 	uint64_t           m_pressure_freed_bytes = 0;
@@ -1019,6 +1076,47 @@ private:
 	void RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
 	                            std::vector<uint8_t> before, std::vector<uint8_t> clears,
 	                            GuestRange range);
+	// KYTY_DCC_GPU_WIDE=<mask> (default 0 = off, needs KYTY_DCC_GPU=1): GPU-written colour metadata
+	// that the native inspection used to refuse, so that the CPU fallback drained the GPU for it
+	// (a command-processor wait for the current recording, ~2 ms each, 6-8 ms per GT7 race frame),
+	// is inspected on the GPU too. The CPU fallback reads the metadata from the buffer cache
+	// (BufferCache::ReadMemory downloads buffer bytes only, never an image's), and the inspection
+	// reads the same buffer bytes in queue order, so both take the same decision; the image layer
+	// cleared and the keys consumed are the ones the fallback's ClearImage + key write would touch.
+	//  1: images registered over the metadata bytes (any, also GPU-modified ones; not the target
+	//     itself) no longer refuse (KYTY_DCC_GPU_ALIASED=2 does the same for DCC only);
+	//  2: the image found for the binding differs from the description (data range or extent, e.g.
+	//     a texture view of a larger target): the image's whole layer is inspected and cleared, as
+	//     the fallback's ClearImage(id) clears it;
+	//  4: video-out bindings (flips): inspected without consuming the keys (the fallback leaves a
+	//     flip's keys as they are), never reused from an earlier inspection.
+	//  8: with 4, also video-out surfaces with DCC compression (GT7's 3840x2160 flips, whose
+	//     fallback was a side readback of their metadata at every flip, on the command processor).
+	// KYTY_DCC_GPU_WIDE_VERIFY=1|exit: for an inspection accepted only through these, also take the
+	// CPU fallback's decision (after a drain) and compare it with the inspection's decision copied
+	// out behind it: "DCC wide verify" mismatches are counted and logged (exit stops).
+	uint32_t m_dcc_gpu_wide        = 0;
+	int      m_dcc_gpu_wide_verify = 0;
+	[[nodiscard]] uint32_t DccGpuWide() const;
+
+public:
+	[[nodiscard]] static int64_t ParseDccGpuWide(const char* value);
+
+private:
+	struct DccWideTotals {
+		std::atomic<uint64_t> aliased {0};   // inspections accepted with images over the metadata
+		std::atomic<uint64_t> mismatch {0};  // inspections of an image that differs from the binding
+		std::atomic<uint64_t> video_out {0}; // flip inspections (keys kept)
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	DccWideTotals m_dcc_wide_totals;
+	// Caller holds m_lock, after the slices' RecordSlice copied their decisions to `decisions`
+	// (16 bytes per slice, download ring): compares them with the fallback's (`expected`) at
+	// completion.
+	void RecordDccWideVerify(const uint8_t* decisions, uint64_t download_offset, std::vector<uint8_t> expected,
+	                         GuestRange range, uint32_t type);
+	void ReportDccWide();
 	struct GpuWriteSkipTotals {
 		std::atomic<uint64_t> skips {0};
 		std::atomic<uint64_t> verify_checks {0};
@@ -1084,6 +1182,21 @@ private:
 	[[nodiscard]] uint64_t PageVersion(uint64_t page) const noexcept {
 		return m_page_versions ? m_page_versions[page] : 0;
 	}
+
+	// KYTY_NAN_SCRUB: the arrays the GPU wrote (by address), when each was last scrubbed (content
+	// serial, frame), the round-robin position, the last frame a scrub ran, its pipeline and scratch.
+	struct NanScrubCandidate {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t serial  = UINT64_MAX;
+		uint64_t frame   = 0;
+	};
+	void                           NoteNanScrubCandidate(const Image& image);
+	std::vector<NanScrubCandidate> m_nan_candidates;
+	size_t                         m_nan_next  = 0;
+	uint64_t                       m_nan_frame = UINT64_MAX;
+	std::unique_ptr<NanScrubber>   m_nan_scrubber;
+	std::shared_ptr<Buffer>        m_nan_scratch;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

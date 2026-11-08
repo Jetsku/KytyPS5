@@ -142,7 +142,7 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 		return workgroup->lds_size_dwords;
 	}
 	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr) {
-		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
+		return std::max<uint32_t>(state.input_info.pixel->lds_size_dwords, 1u);
 	}
 	if (state.program.stage == ShaderType::Vertex && state.input_info.vertex != nullptr) {
 		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
@@ -560,6 +560,17 @@ uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo
 			                                           static_cast<float>(max_signed)),
 			                        max_unsigned);
 		case Format::ComponentType::Float:
+			if (bits < 16u && GetCodegenOptions().ufloat_store_rtz) {
+				// KYTY_UFLOAT_STORE_RTZ=1 (upstream 59d8256b3): truncate to f16, whose bias the
+				// unsigned 11/10-bit floats share, and drop mantissa bits; negatives and NaN, whose
+				// f16 bits lie above +inf, store zero.
+				const auto half = EmitF32BitsToF16RtzBits(state, raw);
+				return Select(state, TypeU32(state),
+				              EmitCompareU32Constant(state, spv::OpUGreaterThan, half, 0x7c00u),
+				              ConstantU32(state, 0),
+				              EmitBinaryU32(state, spv::OpShiftRightLogical, half,
+				                            ConstantU32(state, 15u - bits)));
+			}
 			return bits == 16u ? EmitF32ToHalfBits(state, raw)
 			                   : EmitF32ToUFloatBits(state, raw, bits);
 		default: return raw;

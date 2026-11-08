@@ -51,6 +51,9 @@ struct Terminator {
 	uint32_t              goto_variable = UINT32_MAX;
 	int32_t               goto_value    = -1;
 	bool                  loop_header   = false;
+	// KYTY_CALL_LOOP_CAP: a loop header inside a bracketed callee body (Decoder::ShaderCallLoopBodyBegin);
+	// its rounds draw on the invocation's call-loop budget. Set on the IR's block info only.
+	bool                  call_loop     = false;
 };
 
 struct BasicBlock {

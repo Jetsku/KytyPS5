@@ -98,6 +98,19 @@ void NoteOp(char kind, uint64_t hash);
 void NoteOutput(uint64_t address, uint32_t width, uint32_t height, int aspect);
 } // namespace PassDump
 
+// KYTY_GPU_INSTANCE_COUNT=1 (default off, live; GT7 fork dcac2bb4f): a draw without its own
+// instance count inherits the one a native indirect draw left in GPU memory. The command processor
+// read it there (NumInstances), which drains the GPU; with the switch, when the newest native
+// indirect draw decides the count alone, a vertex-pipeline draw becomes a one-record indirect draw
+// whose instance count the GPU copies from the guest record. Mesh pipelines and quad lists still
+// read it on the CPU.
+static Live::Switch g_gpu_instance_count("KYTY_GPU_INSTANCE_COUNT", Live::ParseDefaultOff);
+static std::atomic<uint64_t> g_gpu_instance_draws {0};
+
+bool RenderExecutor::GpuInstanceCountEnabled() {
+	return g_gpu_instance_count.On();
+}
+
 static bool MeshRestartEnabled() {
 	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
 	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
@@ -1394,6 +1407,9 @@ struct DrawEmitInfo {
 	// (meshIndirect.h) with these inputs.
 	bool                 mesh_indirect = false;
 	MeshIndirect::Inputs mesh_inputs;
+	// KYTY_GPU_INSTANCE_COUNT: nonzero, a vertex-pipeline draw whose instance count the GPU
+	// copies from this guest dword into a one-record indirect draw (draw.instance_count unused).
+	uint64_t gpu_instance_address = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1955,6 +1971,205 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// Whether `count` indices of `element_size` bytes hold `value`: blocks of 256 without an early exit
+// inside, which the compiler vectorizes.
+static bool HoldsIndex(const uint8_t* bytes, uint64_t count, uint32_t element_size, uint32_t value) {
+	constexpr uint64_t Block = 256;
+	for (uint64_t at = 0; at < count; at += Block) {
+		const uint64_t n   = std::min(Block, count - at);
+		bool           hit = false;
+		if (element_size == 2) {
+			const auto wanted = static_cast<uint16_t>(value);
+			for (uint64_t i = 0; i < n; i++) {
+				uint16_t index = 0;
+				std::memcpy(&index, bytes + (at + i) * 2u, 2);
+				hit |= index == wanted;
+			}
+		} else {
+			for (uint64_t i = 0; i < n; i++) {
+				uint32_t index = 0;
+				std::memcpy(&index, bytes + (at + i) * 4u, 4);
+				hit |= index == value;
+			}
+		}
+		if (hit) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// KYTY_LIST_RESET=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 589d2d821): an
+// indexed point, line, triangle or patch list draw with the guest's primitive reset on, whose
+// indices hold the reset index, is drawn as the console assembles it: the primitive the reset
+// index falls in is dropped and the next starts after it (GE_MULTI_PRIM_IB_RESET_EN applies to
+// lists as to strips). Vulkan restarts strips and fans only, so the index was drawn as a vertex
+// past the mesh (a suspect for spikes on GT7's glass roofs). The kept indices are drawn from the
+// stream buffer. Indirect draws, 8-bit indices, mesh-shader vertex stages (they read the guest's
+// indices themselves), lists over 16 MB and indices the GPU wrote (or whose download is still to
+// land) are left as they are.
+//
+// Returns the count of indices kept (written to `rewritten`, in the guest's element size), or
+// UINT32_MAX when the draw is left as it is.
+static uint32_t RewriteListReset(const CommandBuffer& buffer, BufferCache& cache,
+                                 const DrawIndexBufferSource& source, uint32_t index_count,
+                                 std::vector<uint8_t>& rewritten) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIST_RESET");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return UINT32_MAX;
+	}
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	if ((control & 0x1u) == 0 || (control & ~0x3u) != 0) {
+		return UINT32_MAX;
+	}
+	const auto prim_type     = buffer.GetUserConfig().GetPrimType();
+	uint32_t   per_primitive = 0;
+	switch (prim_type) {
+		case Prospero::PrimitiveType::kPointList: per_primitive = 1; break;
+		case Prospero::PrimitiveType::kLineList: per_primitive = 2; break;
+		case Prospero::PrimitiveType::kTriList: per_primitive = 3; break;
+		case Prospero::PrimitiveType::kPatch:
+			// The patch's input control points (VGT_LS_HS_CONFIG.HS_NUM_INPUT_CP).
+			per_primitive = (buffer.GetRegisters().GetShaderRegisters().m_vgtLsHsConfig >> 8u) & 0x3fu;
+			if (per_primitive == 0 || per_primitive > 32) {
+				return UINT32_MAX;
+			}
+			break;
+		default: return UINT32_MAX;
+	}
+	const auto         element_size = source.guest_element_size;
+	constexpr uint64_t MaxBytes     = 16ull << 20u;
+	if ((element_size != 2 && element_size != 4) || source.address == 0 || source.size == 0 ||
+	    source.size > MaxBytes || source.host_data != nullptr || index_count == 0) {
+		return UINT32_MAX;
+	}
+	const uint32_t index_mask = element_size == 2 ? 0xffffu : 0xffffffffu;
+	const auto     reset      = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset & ~index_mask) != 0) {
+		return UINT32_MAX; // matches no index of this size
+	}
+	const uint32_t restart = reset & index_mask;
+
+	// What each index buffer held when it was last looked at. One without the reset index is
+	// looked at again once its pages are CPU-dirty, and a quarter of a second after it was last
+	// looked at anyway. One with it keeps its bytes and the indices kept, used again while the
+	// guest bytes are the same.
+	struct Key {
+		uint64_t address;
+		uint64_t size;
+		uint32_t element_size;
+		uint32_t restart;
+		uint32_t per_primitive;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const noexcept {
+			return static_cast<size_t>((key.address * 0x9e3779b97f4a7c15ull) ^ (key.size << 7u) ^
+			                           key.restart ^ (uint64_t {key.per_primitive} << 48u) ^
+			                           (static_cast<uint64_t>(key.element_size) << 60u));
+		}
+	};
+	struct Seen {
+		bool                                  holds_reset = false;
+		std::chrono::steady_clock::time_point scanned {};
+		std::vector<uint8_t>                  original;  // holds_reset: the guest's bytes
+		std::vector<uint8_t>                  rewritten; // holds_reset: the indices kept
+	};
+	constexpr auto     RescanAfter    = std::chrono::milliseconds(250);
+	constexpr uint64_t MaxCachedBytes = 64ull << 20u;
+	thread_local std::unordered_map<Key, Seen, KeyHash> seen;
+	thread_local uint64_t                               cached_bytes = 0;
+	thread_local std::vector<uint8_t>                   guest;
+	const Key  key {source.address, source.size, element_size, restart, per_primitive};
+	auto       found = seen.find(key);
+	const auto now   = std::chrono::steady_clock::now();
+	if (found != seen.end() && !found->second.holds_reset &&
+	    now - found->second.scanned < RescanAfter &&
+	    !cache.IsRegionCpuModified(source.address, source.size)) {
+		return UINT32_MAX;
+	}
+	// The guest's bytes, as the console reads them: not when the GPU wrote them (they would need
+	// a download first).
+	if (cache.HasGpuDirtyBytes(source.address, source.size) ||
+	    cache.HasPendingBackingPublication(source.address, source.size)) {
+		return UINT32_MAX;
+	}
+	const uint64_t count      = std::min<uint64_t>(index_count, source.size / element_size);
+	const uint64_t byte_count = count * element_size;
+	guest.resize(byte_count);
+	if (!LibKernel::Memory::TryReadBacking(source.address, guest.data(), byte_count)) {
+		return UINT32_MAX;
+	}
+	const uint8_t* bytes = guest.data();
+	if (found != seen.end() && found->second.holds_reset && found->second.original.size() == byte_count &&
+	    std::memcmp(found->second.original.data(), bytes, byte_count) == 0) {
+		rewritten = found->second.rewritten;
+		return static_cast<uint32_t>(rewritten.size() / element_size);
+	}
+	if (seen.size() >= 65536 || cached_bytes > MaxCachedBytes) {
+		seen.clear();
+		cached_bytes = 0;
+	}
+	auto& entry = seen[key];
+	cached_bytes -= std::min<uint64_t>(cached_bytes, entry.original.size() + entry.rewritten.size());
+	std::vector<uint8_t>().swap(entry.original);
+	std::vector<uint8_t>().swap(entry.rewritten);
+	entry.scanned     = now;
+	entry.holds_reset = HoldsIndex(bytes, count, element_size, restart);
+	if (!entry.holds_reset) {
+		return UINT32_MAX;
+	}
+	entry.original.assign(bytes, bytes + byte_count);
+
+	// A reset index drops the primitive it falls in and the next starts after it; each complete
+	// primitive is copied whole.
+	const auto read = [&](uint64_t i) -> uint32_t {
+		if (element_size == 2) {
+			uint16_t value = 0;
+			std::memcpy(&value, bytes + i * 2u, 2);
+			return value;
+		}
+		uint32_t value = 0;
+		std::memcpy(&value, bytes + i * 4u, 4);
+		return value;
+	};
+	rewritten.resize(byte_count);
+	uint64_t kept   = 0;
+	uint64_t resets = 0;
+	uint64_t filled = 0;
+	for (uint64_t i = 0; i < count; i++) {
+		if (read(i) == restart) {
+			resets++;
+			filled = 0;
+			continue;
+		}
+		if (++filled < per_primitive) {
+			continue;
+		}
+		std::memcpy(rewritten.data() + kept * element_size,
+		            bytes + (i + 1 - per_primitive) * element_size, per_primitive * element_size);
+		kept += per_primitive;
+		filled = 0;
+	}
+	rewritten.resize(kept * element_size);
+	entry.rewritten = rewritten;
+	cached_bytes += entry.original.size() + entry.rewritten.size();
+
+	static std::atomic<uint64_t> lists {0};
+	if (const auto n = lists.fetch_add(1, std::memory_order_relaxed) + 1; n <= 16 || std::has_single_bit(n)) {
+		LOGF("Draw: an indexed list (primitive type %u, %u indices a primitive) at 0x%016" PRIx64
+		     " holds the primitive reset index 0x%x %" PRIu64 " times in %" PRIu64
+		     " indices: drawn with the %" PRIu64 " indices of the primitives it keeps (%" PRIu64
+		     " such lists; KYTY_LIST_RESET)\n",
+		     static_cast<uint32_t>(prim_type), per_primitive, source.address, restart, resets, count,
+		     kept, n);
+	}
+	return static_cast<uint32_t>(kept);
+}
+
 // KYTY_RENDER_STATE_FAST vertex (renderDraw.h): copies a vertex input as the used prefixes of its
 // arrays (and of each buffer's attribute list) and the fields after the arrays, and resets the
 // entries the destination used past the source's counts. Entries past the counts hold their
@@ -2105,9 +2320,9 @@ static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::Sta
 	auto& [a_resources, a_specialization, a_permutation] = a;
 	auto& [b_resources, b_specialization, b_permutation] = b;
 	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill, a_gpu_fills,
-	       a_bindless_heaps] = a_resources;
+	       a_bindless_heaps, a_bindless_sampler_heaps] = a_resources;
 	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill, b_gpu_fills,
-	       b_bindless_heaps] = b_resources;
+	       b_bindless_heaps, b_bindless_sampler_heaps] = b_resources;
 	auto& [a_spec_buffers, a_spec_images] = a_specialization;
 	auto& [b_spec_buffers, b_spec_images] = b_specialization;
 	a_buffers.swap(b_buffers);
@@ -2118,6 +2333,7 @@ static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::Sta
 	std::swap(a_fill, b_fill);
 	a_gpu_fills.swap(b_gpu_fills);
 	a_bindless_heaps.swap(b_bindless_heaps);
+	a_bindless_sampler_heaps.swap(b_bindless_sampler_heaps);
 	a_spec_buffers.swap(b_spec_buffers);
 	a_spec_images.swap(b_spec_images);
 	std::swap(a_permutation, b_permutation);
@@ -2164,6 +2380,12 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 	state.ps_input_info = prepared.pixel_info;
 	SwapPreparedStage(state.stage_preps.vertex[0], prepared.vertex_prep);
 	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
+	// KYTY_DRAW_PREP_TESS: a tessellated draw's HS and TES stages.
+	for (uint32_t i = 1; i < prepared.vertex_stages; i++) {
+		CopyPreparedVertexInfo(state.vertex_info[i], prepared.tess_info[i - 1]);
+		SwapPreparedStage(state.stage_preps.vertex[i], prepared.tess_prep[i - 1]);
+		state.vertex_info[i].stage.resources = &state.stage_preps.vertex[i].resources;
+	}
 	if (prepared.pixel_active) {
 		SwapPreparedStage(state.stage_preps.pixel, prepared.pixel_prep);
 		state.ps_input_info.stage.resources = &state.stage_preps.pixel.resources;
@@ -2172,6 +2394,51 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 
 static bool AsyncTranslationDrawAllowed(CommandBuffer& buffer);
 static void NoteAsyncTranslationRefusals(const DrawRenderState& state);
+
+// KYTY_SKIP_OCCLUSION_VISIBLE=1 (default off; adapted from usa-ratt/KytyPS5-GT7 round 141,
+// 3adca0037): draws inside a counting occlusion query may be skipped while their pipelines build
+// (KYTY_PIPELINE_SKIP) or their shaders translate (KYTY_ASYNC_TRANSLATION), and such a skipped draw
+// counts as visible: it adds 1024 samples to what later dumps publish (OcclusionCounter::
+// AddSkippedSamples). With 0 samples the game would take the object for occluded and might stop
+// drawing it, so it stayed missing after its pipeline was ready. Without the switch such draws are
+// not skipped (they wait for their pipeline). A fixed count, not the draw's coverage: enough for
+// visibility tests; a flare sized by samples flickers until the pipeline is ready.
+static bool SkipOcclusionVisibleEnabled() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_SKIP_OCCLUSION_VISIBLE");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+// KYTY_CP_PIPELINE_PREFETCH_SKIP=1 (default off): the command processor does not request the
+// draw's pipeline early (PipelineCache::PrefetchGraphicsPipeline before the bindings) when the
+// draw has no planned pipeline. The prefetch is only a compile hint: the lookup after the bindings
+// (TryGetGraphicsPipeline) builds the same key, finds the pipeline or requests its compile. With a
+// warm pipeline cache the early request only built and looked up the key a second time (GT7 title:
+// ~0.34 us of a ~6.3 us commit). DrawPrep workers still prefetch while planning (PlanPipeline).
+static bool CpPipelinePrefetchSkipped() {
+	static const bool on = [] {
+		const auto* value = std::getenv("KYTY_CP_PIPELINE_PREFETCH_SKIP");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
+static void NoteSkippedOcclusionDraw(RenderContext& context, CommandBuffer& buffer) {
+	if (!SkipOcclusionVisibleEnabled()) return;
+	auto& occlusion = context.GetOcclusionCounter();
+	if (occlusion.WouldCount(buffer.GetRegisters().GetDepthCountControl())) {
+		constexpr uint64_t SkippedSamples = 1024;
+		occlusion.AddSkippedSamples(SkippedSamples);
+		const auto skipped = occlusion.SkippedDraws();
+		if (skipped == 1 || (skipped & (skipped - 1u)) == 0) {
+			LOGF("Occlusion: %" PRIu64 " draws skipped while compiling inside counting queries, counted "
+			     "visible (KYTY_SKIP_OCCLUSION_VISIBLE)\n",
+			     skipped);
+		}
+	}
+}
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
@@ -2231,8 +2498,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.vertex_stages_written = PipelineCache::TessellationActive(buffer.GetUserConfig()) ? 3u : 1u;
 	// Draw-prep: use the draw's speculative preparation when its certificate holds now.
 	CommitStats::StepMark(CommitStats::Step::TakePrepared);
+	// KYTY_DRAW_PREP_TESS: the preparation has the draw's vertex stages (both come from the draw's
+	// register snapshot, so they always agree once Validate holds).
 	const bool prepared_valid =
-	    prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping);
+	    prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping) &&
+	    prepared->vertex_stages == state.vertex_stages_written;
 	CommitStats::StepMark(CommitStats::Step::Validate);
 	if (prepared_valid) {
 		ApplyPreparedDraw(*prepared, state);
@@ -2297,6 +2567,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		// or recalled across it.
 		g_frame_pipeline_skips.fetch_add(1, std::memory_order_relaxed);
 		PassCensus::Drop('d', 0, "skipped: stage translation pending (KYTY_ASYNC_TRANSLATION)");
+		NoteSkippedOcclusionDraw(m_context, buffer);
 		m_run.valid        = false;
 		m_run_active       = false;
 		m_run_targets_kept = false;
@@ -2918,7 +3189,7 @@ static SkipRefusal DrawSkipRefusal(RenderContext& context, const DrawRenderState
 	if (mesh_active || (vertex_stages.size() != 1 && !tess_ok)) {
 		return SkipRefusal::Stages;
 	}
-	if (context.GetOcclusionCounter().Active()) {
+	if (context.GetOcclusionCounter().Active() && !SkipOcclusionVisibleEnabled()) {
 		return SkipRefusal::Occlusion;
 	}
 	if (SkipRecurrentTargetsOnly() && !TargetsRecurrent(context, state) &&
@@ -2964,7 +3235,7 @@ static bool AsyncTranslationDrawAllowed(CommandBuffer& buffer) {
 	auto&       ctx   = buffer.GetRegisters();
 	auto&       rc    = buffer.GetContext();
 	const auto& depth = ctx.GetDepthControl();
-	if (!depth.z_enable || rc.GetOcclusionCounter().Active()) return false;
+	if (!depth.z_enable || (rc.GetOcclusionCounter().Active() && !SkipOcclusionVisibleEnabled())) return false;
 	const auto& render = ctx.GetRenderControl();
 	if (render.depth_clear_enable || render.stencil_clear_enable) return false;
 	struct Seen {
@@ -4417,6 +4688,9 @@ static CommitStats::DrawShape MakeCommitShape(
 	}
 	words.Add(draw.index_count);
 	words.Add(draw.instance_count);
+	// KYTY_GPU_INSTANCE_COUNT: instance_count is a placeholder; the GPU reads the count there.
+	words.Add(static_cast<uint32_t>(emit.gpu_instance_address));
+	words.Add(static_cast<uint32_t>(emit.gpu_instance_address >> 32u));
 	words.Add(static_cast<uint32_t>(emit.vertex_offset));
 	words.Add(emit.first_vertex);
 	words.Add(emit.first_instance);
@@ -5339,7 +5613,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	// CommitStats: image transitions recorded while this draw is committed.
 	const auto stats_transitions = CommitStats::Enabled() ? Image::RecordedTransitions() : uint64_t {0};
-	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() &&
+	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() && !CpPipelinePrefetchSkipped() &&
 	    (m_binding_plan == nullptr || m_binding_plan->pipeline == nullptr)) {
 		const CommitStats::SubScope prefetch_scope(CommitStats::Sub::Prefetch);
 		m_context.GetPipelineCache().PrefetchGraphicsPipeline(
@@ -5424,6 +5698,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto* indirect = emit.indirect;
 	EXIT_IF(indirect != nullptr && mesh_active && !mesh_indirect);
+	EXIT_IF(emit.gpu_instance_address != 0 && (mesh_active || indirect != nullptr));
+	if (emit.gpu_instance_address != 0) {
+		// Acquired before the bindings resolve, as the indirect records below.
+		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_instance_address, sizeof(uint32_t),
+		                                              false);
+	}
 	if (indirect != nullptr) {
 		// ObtainBuffer can merge cache buffers, which must not retire buffers that the shader
 		// bindings below already resolved. Acquire the argument, count and whole index ranges
@@ -5521,6 +5801,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (indirect != nullptr) {
 		indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
 	}
+	// KYTY_GPU_INSTANCE_COUNT: a one-record indirect draw in the stream ring with the known counts
+	// and offsets (still preparation: the ring may wait here); the GPU copies the instance count in
+	// right before the draw.
+	vk::Buffer     instance_record        = nullptr;
+	vk::DeviceSize instance_record_offset = 0;
+	if (emit.gpu_instance_address != 0) {
+		auto&          stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		const uint32_t record[5] {draw.index_count, 0u,
+		                          draw.IsIndexed() ? 0u : emit.first_vertex,
+		                          draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                                           : emit.first_instance,
+		                          emit.first_instance};
+		instance_record        = stream.Handle();
+		instance_record_offset = stream.Copy(record, draw.IsIndexed() ? 20u : 16u, 16u);
+	}
 	CommitStats::StepMark(CommitStats::Step::IndexPrepare);
 	CommitStats::Mark(CommitStats::Phase::VertexIndex);
 	if (draw.IsIndexed()) {
@@ -5533,8 +5828,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// bindings, which are made again after it (their reservations follow the image identities).
 	// KYTY_DRAW_RUN_INDIRECT: an indirect continuation also needs the argument barrier of this
 	// rendering instance (recording one ends rendering, which a continuation never does).
+	// KYTY_GPU_INSTANCE_COUNT: its copy ends rendering too.
 	const bool run_indirect_barrier =
-	    indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering;
+	    (indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering) ||
+	    instance_record;
 	// KYTY_DRAW_RUN_TARGETS: kept targets whose attachments changed during the buffer work are
 	// resolved now, with the same repeated binding work as a continuation's fallback.
 	const bool targets_late = m_run_targets_kept &&
@@ -5688,6 +5985,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			NotePipelineWait(std::chrono::steady_clock::now() - pipeline_begin);
 		}
 		if (pipeline_object == nullptr) {
+			NoteSkippedOcclusionDraw(m_context, buffer);
 			// KYTY_PIPELINE_SKIP: skipped until its pipeline is built. Nothing was recorded; no
 			// draw-run record may be continued or recalled across it (its bindings replaced the
 			// record's).
@@ -5910,6 +6208,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x400u);
 	}
+	// KYTY_GPU_INSTANCE_COUNT: the GPU copies the instance count into the prepared record (outside
+	// rendering).
+	if (instance_record) {
+		const auto [source, source_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    emit.gpu_instance_address, sizeof(uint32_t), false);
+		EXIT_IF(source == nullptr);
+		m_context.GetCommandScheduler().EndRendering();
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllCommands,
+		                            vk::AccessFlagBits2::eMemoryWrite,
+		                            vk::PipelineStageFlagBits2::eCopy,
+		                            vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+		                            BarrierOrigin::IndirectArgs);
+		const vk::BufferCopy copy {source_offset, instance_record_offset + sizeof(uint32_t),
+		                           sizeof(uint32_t)};
+		buffer.Sink().copyBuffer(source->Handle(), instance_record, 1, &copy);
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eCopy,
+		                            vk::AccessFlagBits2::eTransferWrite,
+		                            vk::PipelineStageFlagBits2::eDrawIndirect,
+		                            vk::AccessFlagBits2::eIndirectCommandRead,
+		                            BarrierOrigin::IndirectArgs);
+		g_gpu_instance_draws.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (indirect != nullptr) {
 		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
 		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
@@ -6076,6 +6396,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	} else if (indirect != nullptr) {
 		EmitIndirectDraw(vk_buffer, *indirect, indirect_buffers);
+	} else if (instance_record) {
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(instance_record, instance_record_offset, 1, 20u);
+		} else {
+			vk_buffer.drawIndirect(instance_record, instance_record_offset, 1, 16u);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -6402,6 +6728,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
+// KYTY_GPU_INSTANCE_COUNT: the inherited instance count read on the CPU after all (mesh pipelines,
+// quad lists), synchronizing its GPU write; 0 when it cannot be read.
+static uint32_t ReadInheritedInstances(RenderContext& context, uint64_t address) {
+	uint32_t instances = 0;
+	if (!context.SynchronizeGpuBackingForRead(address, sizeof(instances)) ||
+	    !LibKernel::Memory::TryReadBacking(address, &instances, sizeof(instances))) {
+		return 0;
+	}
+	return instances;
+}
+
+// KYTY_GPU_INSTANCE_COUNT: whether a draw inheriting its instance count reads it on the GPU (vertex
+// pipelines, primitive types drawn with one command, not a depth-to-colour copy).
+static bool GpuInstanceCountApplies(CommandBuffer& buffer, const HW::UserConfig& ucfg,
+                                    const DrawRenderState& state) {
+	return state.vertex_info[0].stage.program->stage != ShaderType::Mesh &&
+	       ucfg.GetPrimType() != Prospero::PrimitiveType::kQuadListLegacy &&
+	       !buffer.GetRegisters().GetRenderControl().copy_depth_to_color;
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_GPU_OP_SITE("draw.index");
@@ -6507,8 +6853,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance};
 	// The member state is reused; the render mutex held above makes it exclusive to this draw.
 	auto& state = *m_draw_state;
 	state.Reset();
@@ -6522,6 +6868,17 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
+	}
+	// KYTY_GPU_INSTANCE_COUNT: the inherited instance count, on the GPU or read here after all.
+	uint64_t gpu_instance_address = args.gpu_instance_address;
+	if (gpu_instance_address != 0 && !GpuInstanceCountApplies(buffer, ucfg, state)) {
+		draw.instance_count  = ReadInheritedInstances(m_context, gpu_instance_address);
+		gpu_instance_address = 0;
+		if (draw.instance_count == 0) {
+			m_mrt_split_slots = 0;
+			ResetBindings();
+			return;
+		}
 	}
 
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source,
@@ -6539,6 +6896,24 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
+	// KYTY_LIST_RESET (RewriteListReset): after the draw's programs are known, as a mesh-shader
+	// vertex stage reads the guest's indices itself.
+	std::vector<uint8_t> list_reset_indices;
+	if (args.offset_source != DrawOffsetSource::IndirectArgs &&
+	    state.vertex_info[0].stage.program->stage != ShaderType::Mesh) {
+		if (const auto kept = RewriteListReset(buffer, m_context.GetBufferCache(), index_source,
+		                                       args.index_count, list_reset_indices);
+		    kept != UINT32_MAX) {
+			if (kept == 0) {
+				ResetBindings();
+				return;
+			}
+			index_source.host_data = list_reset_indices.data();
+			index_source.size      = list_reset_indices.size();
+			draw.index_count       = kept;
+		}
+	}
+
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 
@@ -6550,6 +6925,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	emit.gpu_instance_address = gpu_instance_address;
 
 	CommitStats::StepMark(CommitStats::Step::Restart);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
@@ -6651,7 +7027,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	RunDrawChecks(buffer, ucfg, m_binding_plan);
 	CommitStats::StepMark(CommitStats::Step::DrawChecks);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
@@ -6672,6 +7048,17 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		m_mrt_split_slots = 0;
 		ResetBindings();
 		return;
+	}
+	// KYTY_GPU_INSTANCE_COUNT: the inherited instance count, on the GPU or read here after all.
+	uint64_t gpu_instance_address = args.gpu_instance_address;
+	if (gpu_instance_address != 0 && !GpuInstanceCountApplies(buffer, ucfg, state)) {
+		draw.instance_count  = ReadInheritedInstances(m_context, gpu_instance_address);
+		gpu_instance_address = 0;
+		if (draw.instance_count == 0) {
+			m_mrt_split_slots = 0;
+			ResetBindings();
+			return;
+		}
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
@@ -6698,6 +7085,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	emit.gpu_instance_address = gpu_instance_address;
 
 	DrawIndexBufferSource index_source {};
 	CommitStats::StepMark(CommitStats::Step::Restart);

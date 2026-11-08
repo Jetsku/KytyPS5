@@ -659,6 +659,7 @@ constexpr int SAVE_DATA_ERROR_LIMITATION_OVER                      = -2137063401
 constexpr int SAVE_DATA_ERROR_EVENT_BUSY                           = -2137063400; /* 0x809F0018 */
 constexpr int SAVE_DATA_ERROR_PARAMSFO_TRANSFER_TITLE_ID_NOT_FOUND = -2137063399; /* 0x809F0019 */
 constexpr int SAVE_DATA_ERROR_NO_NEED_CONVERT                      = -2137063394; /* 0x809F001E */
+constexpr int SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC                = -2137063392; /* 0x809F0020 */
 
 } // namespace SaveData
 

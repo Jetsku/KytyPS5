@@ -34,6 +34,13 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
+uint32_t MrtOutputType(EmitterState& state, uint32_t index) {
+	const auto& pixel = *state.input_info.pixel;
+	if ((pixel.target_sint_mask & (1u << index)) != 0u) return TypeI32Vector(state, 4);
+	if ((pixel.target_uint_mask & (1u << index)) != 0u) return TypeU32Vector(state, 4);
+	return TypeF32Vector(state, 4);
+}
+
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
 	if (exp.kind == IR::ExportTargetKind::Position && exp.index == 0) {
 		return state.per_vertex_variable;
@@ -186,11 +193,23 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 }
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
 	const auto pointer_type =
 	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
+	if (state.program.info.samplers.at(sampler).bindless) {
+		// KYTY_BINDLESS_SAMPLERS: the slot EmitImage looked up for this instruction.
+		EXIT_IF(state.bindless_sampler_variable == 0 || state.bindless_sampler_slot == 0);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer,
+		                          state.bindless_sampler_variable, state.bindless_sampler_slot);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		const auto sampler_id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
+		state.builder.AddAnnotation(spv::OpDecorate, sampler_id, spv::DecorationNonUniform);
+		return sampler_id;
+	}
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto pointer = DescriptorElementPointer(
 	    state, pointer_type, state.sampler_variable, ConstantU32(state, array_index),
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
@@ -213,7 +232,7 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
-	} else if (image_resource.bindless) {
+	} else if (image_resource.bindless || state.bindless_sampler_slot != 0u) {
 		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;

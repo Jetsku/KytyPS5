@@ -21,6 +21,7 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -1336,15 +1337,7 @@ static void* KYTY_SYSV_ABI KernelGetProcParam() {
 }
 
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
-	static std::atomic_uint32_t call_count {0};
-
-	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
-	if (count < 8 || (count % 1024) == 0) {
-		PRINT_NAME();
-		LOGF("\tcall = %u, return = 0 (base PS5 mode)\n", count + 1);
-	}
-
-	return 0;
+	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
@@ -1357,8 +1350,8 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 		const char* value = std::getenv("KYTY_POWER_SAVER");
 		return value != nullptr && value[0] == '1';
 	}();
-	*mode    = 2;                   // PS5 Base
-	*submode = power_saver ? 1 : 0; // power saver mode (KYTY_POWER_SAVER=1) or none
+	*mode    = Loader::SystemContentIsTrinityMode() ? 3 : 2; // PS5 Pro (experimental Pro mode) or Base
+	*submode = power_saver ? 1 : 0;                          // power saver mode (KYTY_POWER_SAVER=1) or none
 	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
 	return OK;
 }
@@ -1392,27 +1385,26 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 	[[maybe_unused]] auto* heap_posix_memalign = api[6];
 }
 
-static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
-	// PRINT_NAME();
+// _write to descriptors 0-2: upstream e0c5ae090 sends it through KernelWrite (printed and flushed). That
+// changes what a title that writes a lot to stdout costs, so it is opt-in here: KYTY_GUEST_STDOUT=1;
+// by default the bytes are dropped and reported as written, as before.
+static bool GuestStdoutEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_STDOUT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
-	EXIT_NOT_IMPLEMENTED(d < 0);
-
-	if (Network::Net::IsSocket(d)) {
-		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
+static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	// fd 1/2: the game's own console text (KYTY_GUEST_CONSOLE, common/kytyEvents.h).
+	if ((d == 1 || d == 2) && nbytes > 0 && buf != nullptr) {
+		KytyEvents::GuestWrite(d, buf, nbytes);
 	}
-
-	if (d > 2) {
-		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
+	if (d >= 0 && d <= 2 && !GuestStdoutEnabled()) {
+		return static_cast<int64_t>(nbytes);
 	}
-
-	// fd 1/2: the game's own console text (dropped before KYTY_GUEST_CONSOLE).
-	if ((d == 1 || d == 2) && size > 0) {
-		KytyEvents::GuestWrite(d, str, static_cast<size_t>(size));
-	}
-
-	int size_int = static_cast<int>(size);
-
-	return size_int;
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {

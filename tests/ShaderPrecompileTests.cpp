@@ -296,6 +296,7 @@ void TestReplayDriver() {
 		ShaderPrecompiler precompiler(journal, settings, [&](const auto& source, const auto& entry) {
 			order.push_back(entry.push_data_cursor);
 			Expect(source.code.size() == source.code_size, "replay gets the entry's source");
+			if (entry.push_data_cursor == 0) return ShaderPrecompiler::Outcome::Reloaded;
 			return entry.push_data_cursor % 4 == 0   ? ShaderPrecompiler::Outcome::Compiled
 			       : entry.push_data_cursor % 4 == 1 ? ShaderPrecompiler::Outcome::Present
 			       : entry.push_data_cursor % 4 == 2 ? ShaderPrecompiler::Outcome::Skipped
@@ -304,7 +305,7 @@ void TestReplayDriver() {
 		precompiler.Wait();
 		const auto progress = precompiler.GetProgress();
 		Expect(progress.finished && progress.total == 100 && progress.done == 100, "progress totals");
-		Expect(progress.compiled == 25 && progress.present == 25 && progress.skipped == 25 &&
+		Expect(progress.compiled == 24 && progress.reloaded == 1 && progress.present == 25 && progress.skipped == 25 &&
 		           progress.failed == 25,
 		       "outcome counts");
 		bool in_order = order.size() == 100;
@@ -365,6 +366,30 @@ void TestReplayDriver() {
 		precompiler.Wait();
 		Expect(calls == 1 && precompiler.GetProgress().done == 1, "Stop drops entries not started");
 		Expect(!lines.empty() && lines.back().find("stopped") != std::string::npos, "a stopped replay says so");
+	}
+	// used_entry: the used entries first (file order), then the rest; replay_unused=false drops the rest.
+	{
+		for (const bool unused: {true, false}) {
+			std::vector<uint32_t> order;
+			ShaderPrecompiler::Settings settings;
+			settings.threads       = 1;
+			settings.used_entry    = [](const auto&, const auto& entry) { return entry.push_data_cursor % 10 == 3; };
+			settings.replay_unused = unused;
+			ShaderPrecompiler precompiler(journal, settings, [&](const auto&, const auto& entry) {
+				order.push_back(entry.push_data_cursor);
+				return ShaderPrecompiler::Outcome::Reloaded;
+			});
+			precompiler.Wait();
+			bool used_first = order.size() == (unused ? 100u : 10u);
+			for (uint32_t i = 0; used_first && i < 10; i++) used_first = order[i] == i * 10 + 3;
+			for (uint32_t i = 10, next = 0; used_first && i < order.size(); i++, next++) {
+				if (next % 10 == 3) next++;
+				used_first = order[i] == next;
+			}
+			Expect(used_first && precompiler.GetProgress().total == order.size(),
+			       unused ? "used entries replay first, then the rest in file order"
+			              : "replay_unused=false replays only the used entries");
+		}
 	}
 	// An empty journal finishes at once.
 	{

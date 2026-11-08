@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "common/debugCounters.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 
@@ -206,6 +207,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                        : reason == Profiler::FrameWait::GpuWaitOcclusion
 	                            ? CpGaps::Cat::GpuWaitOcclusion
 	                            : CpGaps::Cat::GpuWaitOther);
+	// KYTY_WAIT_ATTRIB: the command processor's GPU waits by call site, reason and readback.
+	FaultCost::AttribScope attrib(FaultCost::AttribKind::GpuWait, false);
+	attrib.SetReason(static_cast<uint8_t>(reason));
 	// Attribute CP-thread blocking to its caller (Profiler::ScopedGpuWaitReason). Other threads
 	// (the completion runner, guest threads) wait here by design and are not counted.
 	std::optional<Profiler::ScopedFrameWait> frame_wait;

@@ -390,6 +390,34 @@ inline void NestedNs(Cat cat, uint64_t ns) noexcept {
 	}
 }
 
+// The sequencer's parse stops (any thread; the line's "stops/f"): lockstep ops by kind, and the
+// pending-write stops. A lockstep read also records its guest address (the 2 MiB regions most read).
+enum class Stop : uint8_t {
+	WaitSelfLabel,
+	WaitOther,
+	FlipWait,
+	Predication,
+	CondExec,
+	Branch,
+	RegisterRead,  // LockstepRead of register pairs (GPU-touched pages)
+	CommandBytes,  // LockstepRead of command bytes
+	PendingWrite,  // a front read under a pending CP write
+	RegisterReadFineClean, // diagnostic: a RegisterRead the 1 KiB marks call untouched
+	// KYTY_CLEAN_UNTOUCHED_DIAG: the marking sources of a RegisterRead's pages (GpuTouched::DiagSource order)
+	RegisterReadByBufferDirty,
+	RegisterReadByTrackerGpu,
+	RegisterReadByImageGpu,
+	RegisterReadByPublication,
+	Count
+};
+constexpr size_t StopCount = static_cast<size_t>(Stop::Count);
+void NoteStopSlow(Stop stop, uint64_t address) noexcept;
+inline void NoteStop(Stop stop, uint64_t address = 0) noexcept {
+	if (Enabled()) [[unlikely]] {
+		NoteStopSlow(stop, address);
+	}
+}
+
 // GPU thread: starts the accounting on the calling thread (when enabled).
 void AttachThread();
 // GPU thread: a guest frame boundary (the processor reset after sceAgcSuspendPoint); prints the

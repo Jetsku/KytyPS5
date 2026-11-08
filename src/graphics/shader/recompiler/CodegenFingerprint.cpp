@@ -22,12 +22,12 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 45 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
-// loop_guard_budget, loop_guard_shaders, bda_force_shaders, dispatcher_cap, rt_node_budget,
-// rt_function, lds_limit_override.
+// Members: the bools and enums of both the Yotei/Insomniac and the GT7 lines (int22 merge), MadMode,
+// PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer, loop_guard_budget, loop_guard_shaders,
+// bda_force_shaders, dispatcher_cap, rt_node_budget, rt_function, lds_limit_override, call_loop_cap.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 232,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 240,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -102,6 +102,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 		}
 	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
+	b.U8(options.srt_image_reach ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
 	b.U8(options.movrel_known_zeros ? 1u : 0u);
 	b.U8(options.movrel_switch ? 1u : 0u);
@@ -174,6 +175,15 @@ std::vector<uint8_t> CodegenFingerprint() {
 			b.Text("indirect_format_compare");
 			b.Text(compare);
 		}
+	}
+	// KYTY_COHERENT_LOAD_MODE / _ACQUIRE: coherent loads made otherwise than as plain loads.
+	if (const auto mode = Spirv::GetCoherentLoadMode(); mode != Spirv::CoherentLoadMode::Plain) {
+		b.Text("coherent_load");
+		b.Text(Spirv::CoherentLoadModeName(mode));
+	}
+	// KYTY_MESH_LAYER: mesh modules without their Layer output.
+	if (Spirv::GetHostMeshLayerDrop()) {
+		b.Text("mesh_layer_drop");
 	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
@@ -339,11 +349,26 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.runtime_images) {
 		b.Text("runtime_images");
 	}
+	if (options.runtime_int_images) {
+		b.Text("runtime_int_images");
+	}
 	if (options.bindless_strided) {
 		b.Text("bindless_strided");
 	}
+	if (options.bindless_samplers) {
+		b.Text("bindless_samplers");
+	}
 	if (options.workgroup_images) {
 		b.Text("workgroup_images");
+	}
+	if (options.table_key_bounds) {
+		b.Text("table_key_bounds");
+	}
+	if (options.native_wave64_branch) {
+		b.Text("native_wave64_branch");
+	}
+	if (options.sampler_reads_deferred) {
+		b.Text("sampler_reads_deferred");
 	}
 	if (options.wave64_warps) {
 		b.Text("wave64_warps");
@@ -403,9 +428,31 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.tess_indexed) {
 		b.Text("tess_indexed");
 	}
+	if (options.int_mrt_outputs) {
+		b.Text("int_mrt_outputs");
+	}
+	if (options.ufloat_store_rtz) {
+		b.Text("ufloat_store_rtz");
+	}
+	if (options.fract_clamp) {
+		b.Text("fract_clamp");
+	}
+	if (options.ps_exec_words) {
+		b.Text("ps_exec_words");
+	}
 	if (options.denorm_flush_skip != 0u) {
 		b.Text("denorm_flush_skip");
 		b.U8(options.denorm_flush_skip);
+	}
+	if (options.call_loop_cap != 0u) {
+		b.Text("call_loop_cap");
+		b.U32(options.call_loop_cap);
+	}
+	if (!options.call_loops) {
+		b.Text("call_loops_off");
+	}
+	if (options.call_waterfall_clear) {
+		b.Text("call_waterfall_clear");
 	}
 
 	// Host device state the emitter reads (set once by the device layer).

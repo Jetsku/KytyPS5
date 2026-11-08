@@ -10,10 +10,12 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <string_view>
 #include <system_error>
 #include <utility>
 #include <xxhash.h>
+#include <zstd.h>
 
 namespace Libs::Graphics {
 
@@ -70,6 +72,7 @@ public:
 	}
 
 	std::span<const uint8_t> Sized() { return Take(Get<uint32_t>()); }
+	std::span<const uint8_t> Rest() { return Take(m_failed ? 0 : m_bytes.size() - m_position); }
 	std::span<const uint8_t> SizedWords() { return Take(uint64_t {Get<uint32_t>()} * 4u); }
 
 	[[nodiscard]] bool   Failed() const { return m_failed; }
@@ -146,7 +149,8 @@ bool ProgramDiskCache::ParseRecord(std::span<const uint8_t> bytes, Record& recor
 	const auto size     = header.Get<uint64_t>();
 	const auto checksum = header.Get<uint64_t>();
 	if (header.Failed() || magic != RecordMagic ||
-	    (kind != RecordSource && kind != RecordPermutation) ||
+	    (kind != RecordSource && kind != RecordPermutation && kind != RecordPermutationPacked &&
+	     kind != RecordSourcePacked) ||
 	    size != bytes.size() - RecordHeaderBytes) {
 		return false;
 	}
@@ -160,11 +164,21 @@ bool ProgramDiskCache::ParseRecord(std::span<const uint8_t> bytes, Record& recor
 	Cursor c(payload);
 	const auto digest = c.Take(record.digest.size());
 	if (!digest.empty()) std::memcpy(record.digest.data(), digest.data(), digest.size());
-	if (kind == RecordSource) {
+	if (IsSourceKind(kind)) {
 		record.key                = c.Sized();
 		const auto skip           = c.Get<uint8_t>();
 		record.skip_dispatch      = skip == 1u;
-		record.plan               = c.Sized();
+		if (kind == RecordSourcePacked) {
+			record.raw_size = c.Get<uint32_t>();
+			record.packed   = c.Rest();
+			record.expanded = false;
+			if (c.Failed() || record.raw_size == 0 || record.packed.empty() ||
+			    ZSTD_getFrameContentSize(record.packed.data(), record.packed.size()) != record.raw_size) {
+				return false;
+			}
+		} else {
+			record.plan = c.Sized();
+		}
 		if (skip > 1u) return false;
 		// The digest must be the key's own (a record cannot be filed under another key).
 		const auto own = XXH3_128bits(record.key.data(), record.key.size());
@@ -175,19 +189,94 @@ bool ProgramDiskCache::ParseRecord(std::span<const uint8_t> bytes, Record& recor
 	} else {
 		record.cursor         = c.Get<uint32_t>();
 		record.specialization = c.Sized();
-		record.info           = c.Sized();
-		record.spirv          = c.SizedWords();
-		record.spirv_plain    = c.SizedWords();
-		if (record.spirv.empty()) return false;
+		if (kind == RecordPermutationPacked) {
+			record.raw_size = c.Get<uint32_t>();
+			record.packed   = c.Rest();
+			record.expanded = false;
+			// The frame must declare the body size (checked again when it is expanded).
+			return !c.Failed() && record.raw_size != 0 && !record.packed.empty() &&
+			       ZSTD_getFrameContentSize(record.packed.data(), record.packed.size()) ==
+			           record.raw_size;
+		}
+		return !c.Failed() && ParseBody(c.Rest(), record);
 	}
 	return c.AtEnd();
+}
+
+bool ProgramDiskCache::ParseBody(std::span<const uint8_t> body, Record& record) {
+	Cursor c(body);
+	record.info        = c.Sized();
+	record.spirv       = c.SizedWords();
+	record.spirv_plain = c.SizedWords();
+	return !record.spirv.empty() && c.AtEnd();
+}
+
+std::shared_ptr<std::vector<uint8_t>> ProgramDiskCache::Unpack(std::span<const uint8_t> packed,
+                                                               uint32_t raw_size) {
+	auto       body = std::make_shared<std::vector<uint8_t>>(raw_size);
+	const auto size = ZSTD_decompress(body->data(), body->size(), packed.data(), packed.size());
+	if (ZSTD_isError(size) != 0 || size != body->size()) return nullptr;
+	return body;
+}
+
+std::vector<uint8_t> ProgramDiskCache::Pack(std::span<const uint8_t> body) const {
+	// The frame carries its content checksum: a damaged frame fails to expand instead of
+	// returning wrong bytes.
+	thread_local std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context(ZSTD_createCCtx(),
+	                                                                           &ZSTD_freeCCtx);
+	if (context == nullptr || body.empty() || body.size() > UINT32_MAX ||
+	    ZSTD_isError(ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel,
+	                                        m_settings.compress_level)) != 0 ||
+	    ZSTD_isError(ZSTD_CCtx_setParameter(context.get(), ZSTD_c_checksumFlag, 1)) != 0) {
+		return {};
+	}
+	std::vector<uint8_t> packed(ZSTD_compressBound(body.size()));
+	const auto size = ZSTD_compress2(context.get(), packed.data(), packed.size(), body.data(), body.size());
+	if (ZSTD_isError(size) != 0 || size + 8u >= body.size()) return {};
+	packed.resize(size);
+	return packed;
+}
+
+void ProgramDiskCache::InvalidateLocked(uint32_t id) {
+	auto& record = m_records[id];
+	if (record.invalid) return;
+	record.invalid = true;
+	if (!record.evicted) m_bytes -= record.bytes.size();
+	m_changes++;
+	m_last_change_ns = NowNs();
+	m_stats.invalidated++;
+}
+
+bool ProgramDiskCache::ExpandSource(uint32_t id, std::unique_lock<std::mutex>& lock) {
+	if (m_records[id].expanded) return true;
+	const auto packed   = m_records[id].packed; // immutable storage (m_file or m_added)
+	const auto raw_size = m_records[id].raw_size;
+	lock.unlock();
+	const auto begin = NowNs();
+	auto       body  = Unpack(packed, raw_size);
+	const auto ns    = NowNs() - begin;
+	lock.lock();
+	auto& record = m_records[id];
+	if (record.expanded) return true; // another lookup expanded it meanwhile
+	if (body == nullptr) {
+		InvalidateLocked(id);
+		return false;
+	}
+	// A moved vector keeps its buffer.
+	const auto& stored = m_expanded.emplace_back(std::move(*body));
+	record.plan        = stored;
+	record.expanded    = true;
+	m_stats.expanded++;
+	m_stats.expanded_bytes += raw_size;
+	m_stats.expand_ns += ns;
+	return true;
 }
 
 bool ProgramDiskCache::IndexRecord(uint32_t id) {
 	auto& record = m_records[id];
 	if (m_ambiguous.contains(record.digest)) return false;
 	// Records dropped by verification no longer count (a fresh one may replace them).
-	if (record.kind == RecordSource) {
+	if (IsSourceKind(record.kind)) {
 		auto& candidates = m_sources[record.digest];
 		std::erase_if(candidates, [&](uint32_t other) { return m_records[other].invalid; });
 		for (const auto other: candidates) {
@@ -281,7 +370,7 @@ void ProgramDiskCache::Load() {
 				const auto id = static_cast<uint32_t>(m_records.size());
 				m_records.push_back(record);
 				if (IndexRecord(id)) {
-					if (record.kind == RecordSource) m_stats.loaded_sources++;
+					if (IsSourceKind(record.kind)) m_stats.loaded_sources++;
 					else m_stats.loaded_permutations++;
 				} else {
 					// Duplicate or ambiguous: kept out of the index and out of later saves.
@@ -293,6 +382,7 @@ void ProgramDiskCache::Load() {
 		} else {
 			m_bytes = 0;
 		}
+		m_loaded_count = static_cast<uint32_t>(m_records.size());
 		// A damaged tail or dropped records are rewritten at the next save. A file with another
 		// identity is left alone until this run has records of its own to save in its place.
 		if (rejected != 0 || m_stats.ambiguous != 0) {
@@ -324,52 +414,95 @@ void ProgramDiskCache::Load() {
 	}
 }
 
-std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const SourceKey& key) {
+std::optional<ProgramDiskCache::SourceRecord> ProgramDiskCache::FindSource(const SourceKey& key, bool note_use) {
 	WaitLoaded();
-	std::scoped_lock lock(m_mutex);
-	if (!m_ambiguous.contains(key.digest)) {
-		if (const auto found = m_sources.find(key.digest); found != m_sources.end()) {
-			for (const auto id: found->second) {
-				const auto& record = m_records[id];
-				if (!record.invalid && Equal(record.key, key.bytes)) {
-					m_stats.source_hits++;
-					return SourceRecord {.id = id, .skip_dispatch = record.skip_dispatch,
-					                     .plan = record.plan};
+	std::unique_lock lock(m_mutex);
+	for (;;) {
+		auto match = UINT32_MAX;
+		if (!m_ambiguous.contains(key.digest)) {
+			if (const auto found = m_sources.find(key.digest); found != m_sources.end()) {
+				for (const auto id: found->second) {
+					const auto& record = m_records[id];
+					if (!record.invalid && Equal(record.key, key.bytes)) {
+						match = id;
+						break;
+					}
 				}
 			}
 		}
+		if (match == UINT32_MAX) {
+			m_stats.source_misses++;
+			return std::nullopt;
+		}
+		// A packed plan whose frame turns out damaged is invalidated: look again.
+		if (!ExpandSource(match, lock) || m_records[match].invalid) continue;
+		m_stats.source_hits++;
+		if (note_use) NoteUsed(match);
+		const auto& record = m_records[match];
+		return SourceRecord {.id = match, .skip_dispatch = record.skip_dispatch, .plan = record.plan};
 	}
-	m_stats.source_misses++;
-	return std::nullopt;
 }
 
 std::optional<ProgramDiskCache::PermutationRecord>
 ProgramDiskCache::FindPermutation(const Digest& source, uint32_t push_data_cursor,
-                                  std::span<const uint8_t> specialization) {
+                                  std::span<const uint8_t> specialization, bool note_use) {
 	WaitLoaded();
-	std::scoped_lock lock(m_mutex);
-	if (!m_ambiguous.contains(source)) {
-		if (const auto found = m_permutations.find(source); found != m_permutations.end()) {
-			for (const auto id: found->second) {
-				const auto& record = m_records[id];
-				if (!record.invalid && record.cursor == push_data_cursor &&
-				    Equal(record.specialization, specialization)) {
-					m_stats.permutation_hits++;
-					return PermutationRecord {.id = id, .info = record.info, .spirv = record.spirv,
-					                          .spirv_plain = record.spirv_plain};
+	std::unique_lock lock(m_mutex);
+	for (;;) {
+		auto match = UINT32_MAX;
+		if (!m_ambiguous.contains(source)) {
+			if (const auto found = m_permutations.find(source); found != m_permutations.end()) {
+				for (const auto id: found->second) {
+					const auto& record = m_records[id];
+					if (!record.invalid && record.cursor == push_data_cursor &&
+					    Equal(record.specialization, specialization)) {
+						match = id;
+						break;
+					}
 				}
 			}
 		}
+		if (match == UINT32_MAX) {
+			m_stats.permutation_misses++;
+			return std::nullopt;
+		}
+		if (m_records[match].kind != RecordPermutationPacked) {
+			m_stats.permutation_hits++;
+			if (note_use) NoteUsed(match);
+			const auto& record = m_records[match];
+			return PermutationRecord {.id = match, .info = record.info, .spirv = record.spirv,
+			                          .spirv_plain = record.spirv_plain};
+		}
+		// Packed: expanded unlocked into a buffer the returned record owns.
+		const auto packed   = m_records[match].packed; // immutable storage
+		const auto raw_size = m_records[match].raw_size;
+		lock.unlock();
+		const auto begin = NowNs();
+		auto       body  = Unpack(packed, raw_size);
+		Record     parsed;
+		const bool ok    = body != nullptr && ParseBody(*body, parsed);
+		const auto ns    = NowNs() - begin;
+		lock.lock();
+		if (!ok) {
+			InvalidateLocked(match); // a damaged frame: look again
+			continue;
+		}
+		if (m_records[match].invalid) continue;
+		m_stats.expanded++;
+		m_stats.expanded_bytes += raw_size;
+		m_stats.expand_ns += ns;
+		m_stats.permutation_hits++;
+		if (note_use) NoteUsed(match);
+		return PermutationRecord {.id = match, .info = parsed.info, .spirv = parsed.spirv,
+		                          .spirv_plain = parsed.spirv_plain, .body = std::move(body)};
 	}
-	m_stats.permutation_misses++;
-	return std::nullopt;
 }
 
 void ProgramDiskCache::AppendRecord(uint32_t kind, const std::vector<uint8_t>& payload,
                                     const Digest& digest) {
 	// Requires m_mutex.
 	const auto total = RecordHeaderBytes + payload.size();
-	if (m_bytes + total > m_settings.max_file_bytes) {
+	if (m_bytes + total > m_settings.max_file_bytes && !MakeRoom(total)) {
 		if (!m_stats.over_capacity && !m_settings.quiet) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Program cache: {} would exceed {} MiB; new programs are no longer added\n",
@@ -399,7 +532,7 @@ void ProgramDiskCache::AppendRecord(uint32_t kind, const std::vector<uint8_t>& p
 	m_bytes += total;
 	m_changes++;
 	m_last_change_ns = NowNs();
-	if (kind == RecordSource) m_stats.added_sources++;
+	if (IsSourceKind(kind)) m_stats.added_sources++;
 	else m_stats.added_permutations++;
 }
 
@@ -411,10 +544,21 @@ void ProgramDiskCache::AddSource(const SourceKey& key, bool skip_dispatch,
 	payload.insert(payload.end(), key.digest.begin(), key.digest.end());
 	PutBytes(payload, key.bytes);
 	Put<uint8_t>(payload, skip_dispatch ? 1u : 0u);
-	PutBytes(payload, plan);
+	auto                 kind = RecordSource;
+	std::vector<uint8_t> packed;
+	if (m_settings.compress_level > 0 && plan.size() >= 256u) {
+		packed = Pack(plan);
+	}
+	if (!packed.empty()) {
+		kind = RecordSourcePacked;
+		Put<uint32_t>(payload, static_cast<uint32_t>(plan.size()));
+		payload.insert(payload.end(), packed.begin(), packed.end());
+	} else {
+		PutBytes(payload, plan);
+	}
 	{
 		std::scoped_lock lock(m_mutex);
-		AppendRecord(RecordSource, payload, key.digest);
+		AppendRecord(kind, payload, key.digest);
 	}
 	m_saver_cv.notify_all();
 }
@@ -431,24 +575,93 @@ void ProgramDiskCache::AddPermutation(const Digest& source, uint32_t push_data_c
 	payload.insert(payload.end(), source.begin(), source.end());
 	Put<uint32_t>(payload, push_data_cursor);
 	PutBytes(payload, specialization);
+	const auto key_size = payload.size();
 	PutBytes(payload, info);
 	PutWords(payload, spirv);
 	PutWords(payload, spirv_plain);
+	auto     kind      = RecordPermutation;
+	uint64_t pack_ns   = 0;
+	uint64_t raw_bytes = 0;
+	if (m_settings.compress_level > 0) {
+		// Packed: the key stays plain (the index reads it), the body becomes one zstd frame.
+		const auto begin = NowNs();
+		const auto body  = std::span<const uint8_t>(payload).subspan(key_size);
+		const auto frame = Pack(body);
+		if (!frame.empty()) {
+			std::vector<uint8_t> packed(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(key_size));
+			Put<uint32_t>(packed, static_cast<uint32_t>(body.size()));
+			packed.insert(packed.end(), frame.begin(), frame.end());
+			raw_bytes = payload.size();
+			payload   = std::move(packed);
+			kind      = RecordPermutationPacked;
+		}
+		pack_ns = NowNs() - begin;
+	}
 	{
 		std::scoped_lock lock(m_mutex);
-		AppendRecord(RecordPermutation, payload, source);
+		const auto added = m_stats.added_permutations;
+		AppendRecord(kind, payload, source);
+		if (kind == RecordPermutationPacked && m_stats.added_permutations != added) {
+			m_stats.packed_added++;
+			m_stats.packed_raw_bytes += raw_bytes;
+			m_stats.packed_bytes += payload.size();
+		}
+		m_stats.pack_ns += pack_ns;
 	}
 	m_saver_cv.notify_all();
 }
 
 void ProgramDiskCache::Invalidate(uint32_t id) {
 	std::scoped_lock lock(m_mutex);
-	if (id >= m_records.size() || m_records[id].invalid) return;
-	m_records[id].invalid = true;
-	m_bytes -= m_records[id].bytes.size();
-	m_changes++;
-	m_last_change_ns = NowNs();
-	m_stats.invalidated++;
+	if (id >= m_records.size()) return;
+	InvalidateLocked(id);
+}
+
+void ProgramDiskCache::NoteUsed(uint32_t id) {
+	// Requires m_mutex.
+	if (!m_settings.evict_unused || id >= m_records.size()) return;
+	auto& record = m_records[id];
+	if (!record.used && id < m_loaded_count) {
+		m_order_dirty = true; // its place in the file moves to the used group (saved at exit)
+	}
+	record.used = true;
+	// An evicted record used again is kept if it still fits (else a later run translates it).
+	if (record.evicted && m_bytes + record.bytes.size() <= m_settings.max_file_bytes) {
+		record.evicted = false;
+		m_bytes += record.bytes.size();
+		m_stats.restored++;
+		m_changes++;
+	}
+}
+
+bool ProgramDiskCache::MakeRoom(uint64_t bytes) {
+	// Requires m_mutex.
+	if (!m_settings.evict_unused || bytes > m_settings.max_file_bytes) return false;
+	uint64_t available = 0;
+	for (uint32_t id = 0; id < m_loaded_count && m_bytes + bytes > m_settings.max_file_bytes + available; id++) {
+		const auto& record = m_records[id];
+		if (!record.used && !record.evicted && !record.invalid) available += record.bytes.size();
+	}
+	if (m_bytes + bytes > m_settings.max_file_bytes + available) return false;
+	uint64_t freed = 0;
+	for (uint32_t id = 0; id < m_loaded_count && m_bytes + bytes > m_settings.max_file_bytes; id++) {
+		auto& record = m_records[id];
+		if (record.used || record.evicted || record.invalid) continue;
+		record.evicted = true;
+		m_bytes -= record.bytes.size();
+		freed += record.bytes.size();
+		m_stats.evicted++;
+		m_stats.evicted_bytes += record.bytes.size();
+	}
+	if (freed != 0) {
+		m_changes++;
+		if (m_stats.evicted_bytes == freed && !m_settings.quiet) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Program cache: {} is at {} MiB; records this run has not used are dropped for new ones\n",
+			    Common::PathToString(m_settings.path), m_settings.max_file_bytes >> 20u));
+		}
+	}
+	return true;
 }
 
 bool ProgramDiskCache::Due(uint64_t now) const {
@@ -489,7 +702,7 @@ bool ProgramDiskCache::Flush() {
 	WaitLoaded();
 	{
 		std::scoped_lock lock(m_mutex);
-		if (m_changes == m_saved_changes) return true;
+		if (m_changes == m_saved_changes && !m_order_dirty) return true;
 	}
 	return Save(true);
 }
@@ -502,12 +715,27 @@ bool ProgramDiskCache::Save(bool final_save) {
 	uint64_t                              changes = 0;
 	{
 		std::scoped_lock lock(m_mutex);
-		if (m_changes == m_saved_changes) return true;
+		if (m_changes == m_saved_changes && !(final_save && m_order_dirty)) return true;
 		changes = m_changes;
+		m_order_dirty = false;
 		records.reserve(m_records.size());
-		for (const auto& record: m_records) {
-			if (!record.invalid && !m_ambiguous.contains(record.digest)) {
-				records.push_back(record.bytes);
+		const auto keep = [&](const Record& record) {
+			return !record.invalid && !record.evicted && !m_ambiguous.contains(record.digest);
+		};
+		if (m_settings.evict_unused) {
+			// Order of last use: unused loaded records, used loaded ones, this run's.
+			for (uint32_t pass = 0; pass < 2; pass++) {
+				for (uint32_t id = 0; id < m_loaded_count; id++) {
+					const auto& record = m_records[id];
+					if (keep(record) && record.used == (pass == 1)) records.push_back(record.bytes);
+				}
+			}
+			for (uint32_t id = m_loaded_count; id < m_records.size(); id++) {
+				if (keep(m_records[id])) records.push_back(m_records[id].bytes);
+			}
+		} else {
+			for (const auto& record: m_records) {
+				if (keep(record)) records.push_back(record.bytes);
 			}
 		}
 	}
@@ -581,11 +809,25 @@ bool ProgramDiskCache::Save(bool final_save) {
 	}
 	if (!m_settings.quiet) {
 		if (ok) {
+			std::string packing;
+			{
+				std::scoped_lock lock(m_mutex);
+				if (m_stats.packed_added != 0 || m_stats.expanded != 0) {
+					packing = fmt::format(
+					    "; packed {} new permutations {:.1f} -> {:.1f} MiB in {:.0f} ms, expanded {} "
+					    "({:.1f} MiB) in {:.0f} ms",
+					    m_stats.packed_added, static_cast<double>(m_stats.packed_raw_bytes) / (1024.0 * 1024.0),
+					    static_cast<double>(m_stats.packed_bytes) / (1024.0 * 1024.0),
+					    static_cast<double>(m_stats.pack_ns) / 1.0e6, m_stats.expanded,
+					    static_cast<double>(m_stats.expanded_bytes) / (1024.0 * 1024.0),
+					    static_cast<double>(m_stats.expand_ns) / 1.0e6);
+				}
+			}
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Program cache: saved {} records ({:.1f} MiB) to {} ({}, {:.1f} ms)\n",
+			    "Program cache: saved {} records ({:.1f} MiB) to {} ({}, {:.1f} ms{})\n",
 			    records.size(), static_cast<double>(written) / (1024.0 * 1024.0),
 			    Common::PathToString(path), final_save ? "exit" : "periodic",
-			    static_cast<double>(ns) / 1.0e6));
+			    static_cast<double>(ns) / 1.0e6, packing));
 		} else {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Program cache: failed to write {}{}\n", Common::PathToString(path),

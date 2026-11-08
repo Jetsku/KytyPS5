@@ -24,6 +24,7 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/wheelHost.h"
 #include "loader/additionalContent.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
@@ -102,10 +103,6 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
-		if (const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
-		    flexible_memory_size != 0) {
-			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
-		}
 	}
 	if (cfg.splash_enabled) {
 		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
@@ -121,6 +118,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
+	// After the window: SDL is initialised there, on this thread.
+	subsystems.Initialize<Libs::Wheel::Lifecycle>();
 }
 
 static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,
@@ -203,7 +202,7 @@ void Run(const RunOptions& options) {
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, title_id);
+	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 

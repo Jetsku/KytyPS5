@@ -171,13 +171,15 @@ void EmitGeometryOutputDefaults(EmitterState& state) {
 void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                        uint32_t cull_distance_count) {
 	const auto& mesh = state.input_info.vertex->mesh;
+	// KYTY_MESH_LAYER (SetHostMeshLayerDrop): no Layer output; the workgroup copy below stays.
+	const bool drop_layer = GetHostMeshLayerDrop();
 	for (auto& output: state.outputs) {
 		const auto type = MeshOutputType(state, output.kind);
 		const bool clip = output.kind == IR::StageOutputKind::ClipDistance;
 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
 		auto& variable = clip ? state.clip_distance_variable
 		                 : cull ? state.cull_distance_variable : output.variable_id;
-		if (variable == 0) {
+		if (variable == 0 && !(drop_layer && output.kind == IR::StageOutputKind::Layer)) {
 			const auto element_type = clip || cull
 			                              ? state.builder.Type(spv::OpTypeArray, type,
 			                                                   ConstantU32(state, clip ? clip_distance_count
@@ -471,7 +473,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			                                      TypeBool(state), index),
 			                          culled);
 			for (const auto& output: state.outputs) {
-				if (output.kind != IR::StageOutputKind::Layer) {
+				if (output.kind != IR::StageOutputKind::Layer || output.variable_id == 0) {
 					continue;
 				}
 				const auto layer = MeshLoad(state, output.mesh_data_variable,

@@ -94,6 +94,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// KYTY_GPU_INSTANCE_COUNT: nonzero, the instance count is the guest dword the GPU reads there
+	// (instance_count is then 1, a placeholder).
+	uint64_t         gpu_instance_address       = 0;
 };
 
 // GPU-resident draw arguments for vkCmdDraw*Indirect*. Guest DrawIndexedIndirect (20 bytes) and
@@ -125,6 +128,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// KYTY_GPU_INSTANCE_COUNT: as in DrawIndexArgs.
+	uint64_t         gpu_instance_address       = 0;
 };
 
 // Barrier batcher (KYTY_BARRIER_BATCH, default on; KYTY_BARRIER_BATCH=0 restores the direct
@@ -1109,6 +1114,12 @@ public:
 	                    bool async_compute = false);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute = false);
+	// KYTY_INDIRECT_THREADS_GPU (renderCompute.cpp): thread-dimension indirect dispatches go to
+	// DispatchIndirect, converted on the GPU, instead of a CPU read of their counts.
+	[[nodiscard]] static bool IndirectThreadsOnGpu();
+	// KYTY_GPU_INSTANCE_COUNT (renderDraw.cpp): draws inheriting a native indirect draw's instance
+	// count read it on the GPU (DrawIndexArgs/DrawAutoArgs::gpu_instance_address).
+	[[nodiscard]] static bool GpuInstanceCountEnabled();
 
 	// plan: the committed draw's binding plan for this stage (KYTY_DRAW_PREP_BINDINGS), or null.
 	// keep_images (KYTY_DRAW_RUN continuation): the stage's texture and sampler bindings are the
@@ -1154,6 +1165,7 @@ private:
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// KYTY_BINDLESS_REPLACED_RESOLVE: PrepareBindlessHeaps' scratch list.
 	std::vector<std::pair<BindlessHeap*, uint32_t>> m_bindless_replaced_keys;
+	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void ResolveBindlessRequests();
 	void SyncWrittenBindlessEntries();
 	// Compares keys [first, last) of a heap with the T#s now in guest memory and settles the
@@ -1205,6 +1217,12 @@ private:
 	std::unordered_set<uint64_t>               m_bindless_surveyed; // base ^ table offset << 48
 	uint64_t                                   m_bindless_frame          = UINT64_MAX;
 	uint64_t                                   m_bindless_snapshot_frame = 0;
+	// KYTY_BINDLESS_EVICT usage probe (UpdateBindlessUsageProbe): the frame it was armed in
+	// (0 = idle) and the first frame the next may start.
+	uint64_t                                   m_bindless_probe_frame = 0;
+	uint64_t                                   m_bindless_next_probe  = 0;
+	std::vector<ImageId>                       m_bindless_unused;
+	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
 	std::vector<uint32_t>                      m_bindless_requests;
 	// KYTY_RUNTIME_IMAGES: T#s (and bindings) shaders requested, taken from the snapshot.
 	std::vector<std::pair<std::array<uint32_t, 8>, uint32_t>> m_runtime_image_requests;
@@ -1336,7 +1354,8 @@ private:
 	                                                  bool* keep_dispatch = nullptr);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                              uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                                              uint64_t code_address = 0);
 
 	// KYTY_LDS_DEVICE_BUFFER: binds the LDS regions of a compute program whose LDS lives in a device
 	// buffer (a SharedMemory binding): one region per workgroup of `groups` (null: an indirect

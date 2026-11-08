@@ -18,7 +18,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -219,6 +221,20 @@ public:
 	    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
 	    StagePrep& vertex_prep, StagePrep& pixel_prep, GraphicsPrograms& programs,
 	    uint64_t* compile_ns = nullptr);
+	// KYTY_DRAW_PREP_TESS=1 (default 0; adapted from usa-ratt/KytyPS5-GT7 59bd41633): a
+	// tessellated draw prepared as PrepareGraphicsProgramsSpeculative prepares the others, with
+	// GetGraphicsPrograms' tessellation path (PrepareTessellationPrograms; the pixel stage, then
+	// LS, HS and TES bound in that order, unlinked). vertex_info and vertex_preps are the LS, HS
+	// and TES stages. Ineligible for a set the serial path would skip or end on, a user clip plane
+	// or O15 resource reuse.
+	[[nodiscard]] static bool DrawPrepTessEnabled();
+	[[nodiscard]] SpeculativeResult PrepareTessellatedProgramsSpeculative(
+	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	    bool pixel_active, std::array<ShaderVertexInputInfo*, 3> vertex_info,
+	    ShaderPixelInputInfo& pixel_info, std::array<StagePrep*, 3> vertex_preps,
+	    StagePrep& pixel_prep, GraphicsPrograms& programs, uint64_t* compile_ns = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);
@@ -536,6 +552,25 @@ private:
 	// long in all for their new pipelines (each still at most KYTY_PIPELINE_SKIP_WAIT_US).
 	uint64_t                       m_skip_frame_budget_ns = 0;
 	uint64_t                       m_skip_frame = 0, m_skip_frame_used = 0;
+	// KYTY_PIPELINE_SKIP_PROBE: a skippable draw's new pipeline is first looked up in the driver
+	// cache alone on this thread (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
+	bool                           m_skip_probe = false;
+	std::atomic<uint64_t>          m_skip_probe_hits {0}, m_skip_probe_misses {0}, m_skip_probe_ns {0};
+	// KYTY_PIPELINE_ADOPT=1 (default off; upstream ec8b75b24's boot prewarm, adapted): pipelines the
+	// journal replay built are kept by content key (GraphicsContent::key) instead of destroyed, and a
+	// draw whose create info has that key takes the object instead of calling the driver. At most
+	// KYTY_PIPELINE_ADOPT_MAX (default 12000) wait; the rest are destroyed as before. Guarded by
+	// m_adopt_mutex; the objects not taken are destroyed with the cache.
+	bool                                     m_adopt     = false;
+	uint64_t                                 m_adopt_max = 0;
+	std::mutex                               m_adopt_mutex;
+	std::unordered_map<uint64_t, vk::Pipeline> m_adopted;
+	std::atomic<uint64_t>                    m_adopt_offered {0}, m_adopt_taken {0}, m_adopt_refused {0};
+	// The adopted pipeline with this content key (removed from the set), or null.
+	[[nodiscard]] vk::Pipeline TakeAdoptedPipeline(uint64_t key);
+	// Keeps a replay-built pipeline for adoption; false (the caller destroys it) when off or full.
+	[[nodiscard]] bool OfferAdoptedPipeline(uint64_t key, vk::Pipeline pipeline);
+	[[nodiscard]] std::string AdoptReport();
 	Pipeline* GetGraphicsPipelineImpl(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                                  std::span<const ShaderVertexInputInfo> vertex_info,
 	                                  CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
@@ -553,6 +588,11 @@ private:
 	// permutations' inputs and the background replay of the entries an earlier run left in it.
 	std::unique_ptr<ShaderJournal>     m_shader_journal;
 	std::unique_ptr<ShaderPrecompiler> m_shader_precompiler;
+	// The 20 s "Shader precompile stats" line (KYTY_SHADER_PRECOMPILE_STATS=1); null when off.
+	struct PrecompileStats;
+	std::unique_ptr<PrecompileStats> m_precompile_stats;
+	// KYTY_SHADER_PRECOMPILE_USED: permutation identities loaded from <journal>.used.
+	uint64_t m_used_loaded = 0;
 	// Bumped whenever a cached pipeline object is replaced (a linked pipeline by its optimized
 	// build), so that per-thread lookup memos do not keep returning the replaced object. Starts in
 	// a range of its own per cache instance, so memos never match another instance.
@@ -626,7 +666,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache,
-                            const GraphicsPipelineCreateHook*      create_hook = nullptr);
+                            const GraphicsPipelineCreateHook*      create_hook = nullptr,
+                            // Not null: a failed creation is returned here (and cleaned up)
+                            // instead of stopping the emulator.
+                            vk::Result*                            result_out  = nullptr);
 // Creates a compute pipeline from the complete create info instead of vkCreateComputePipelines
 // (KYTY_PIPELINE_FAST_FIRST). The create info and its chained structures live only for the call.
 using ComputePipelineCreateHook =

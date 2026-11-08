@@ -19,10 +19,10 @@ namespace {
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
 // Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
-// ImageResource 22; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// ImageResource 22; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
-// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
-// 16, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (BindlessSampler 2, IndirectDescriptor
+// 18, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
 // ResourceSpecialization 2 (Buffer 3, Image 12).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
@@ -30,7 +30,7 @@ static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 72, "IR::BufferResource changed: update ProgramCodec");
 static_assert(sizeof(ImageResource) == 88, "IR::ImageResource changed: update ProgramCodec");
-static_assert(sizeof(SamplerResource) == 16, "IR::SamplerResource changed: update ProgramCodec");
+static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
@@ -42,7 +42,7 @@ static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: upd
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
 static_assert(sizeof(CompiledShaderInfo) == 352, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 256, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource) == 272, "IR::DescriptorSource changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 112,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
@@ -440,6 +440,8 @@ void Write(CodecWriter& w, const SamplerResource& v) {
 	w.Bool(v.depth_compare);
 	w.Bool(v.integer_border);
 	w.Bool(v.gather_lod);
+	w.Bool(v.bindless);
+	w.U32(v.bindless_mapping_offset);
 }
 
 void Read(CodecReader& r, SamplerResource& v) {
@@ -450,6 +452,8 @@ void Read(CodecReader& r, SamplerResource& v) {
 	v.depth_compare         = r.Bool();
 	v.integer_border        = r.Bool();
 	v.gather_lod            = r.Bool();
+	v.bindless              = r.Bool();
+	v.bindless_mapping_offset = r.U32();
 }
 
 void Write(CodecWriter& w, const SampledResourcePair& v) {
@@ -776,10 +780,17 @@ public:
 				w.U32(image.nested_vsharp);
 				w.U32(image.nested_heap);
 				w.U32(image.nested_keys);
+				w.U32(image.workgroup_multiplier);
+				w.U32(image.workgroup_shift);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
 				}
+			}
+			w.Bool(source.bindless_sampler.has_value());
+			if (source.bindless_sampler) {
+				w.U32(source.bindless_sampler->table_offset);
+				w.U32(source.bindless_sampler->stride);
 			}
 		}
 		w.U32(static_cast<uint32_t>(p.control_flow.size()));
@@ -1015,10 +1026,17 @@ public:
 				image.nested_vsharp      = r.U32();
 				image.nested_heap        = r.U32();
 				image.nested_keys        = r.U32();
+				image.workgroup_multiplier = r.U32();
+				image.workgroup_shift      = static_cast<uint8_t>(r.U32());
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
 				}
+			}
+			if (r.Bool()) {
+				auto& sampler = source.bindless_sampler.emplace(DescriptorSource::BindlessSampler {});
+				sampler.table_offset = r.U32();
+				sampler.stride       = r.U32();
 			}
 			if (r.Failed()) return false;
 		}

@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 
@@ -30,8 +31,14 @@ public:
 	// Preparation phase (may submit the recording on ring wrap).
 	[[nodiscard]] Slot Reserve();
 	// Records the guard into `slot`; the caller dispatches from slot.buffer at slot.offset.
+	// local_size non-zero (KYTY_INDIRECT_THREADS_GPU): the record holds thread counts, converted to
+	// workgroup counts; the thread counts stay at SlotThreads(slot). guard false: no limits, no
+	// check (conversion only).
 	void Record(CommandBuffer& buffer, const Slot& slot, vk::Buffer args, uint64_t args_offset,
-	            uint64_t shader_hash);
+	            uint64_t shader_hash, const std::array<uint32_t, 3>& local_size = {0, 0, 0},
+	            bool guard = true);
+	// Device address of the slot's copy of the record's raw counts (dwords 4-6).
+	[[nodiscard]] vk::DeviceAddress SlotThreads(const Slot& slot) const;
 
 private:
 	void Initialize();

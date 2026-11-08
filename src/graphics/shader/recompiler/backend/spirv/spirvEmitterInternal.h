@@ -220,6 +220,10 @@ struct EmitterState {
 	uint32_t                                         bindless_translation_variable = 0;
 	uint32_t                                         bindless_feedback_variable    = 0;
 	uint32_t                                         bindless_slot                 = 0;
+	// KYTY_BINDLESS_SAMPLERS: the sampler array of set 1, and the slot of the current instruction's
+	// bindless sampler (0: its sampler is not bindless).
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
 	// KYTY_BINDLESS_3D_AS_ARRAY: the raw translation entry behind bindless_slot
 	// (BindlessSlotArrayFlag marks a 2D or 2D-array texture a 3D image instruction samples).
 	uint32_t                                         bindless_translation_raw      = 0;
@@ -280,6 +284,9 @@ struct EmitterState {
 	uint32_t                   helper_invocation_variable            = 0;
 	// KYTY_LOOP_GUARD: the invocation's loop-iteration count (a Function variable).
 	uint32_t                   loop_guard_variable                   = 0;
+	// KYTY_CALL_LOOP_CAP: rounds of the bracketed callee bodies' loops this invocation ran
+	// (CFG::Terminator::call_loop; a Function variable).
+	uint32_t                   call_loop_variable                    = 0;
 	// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS: BVH instruction executions of this invocation
 	// (Function u32; both halves of a two-lane invocation add to it).
 	uint32_t                   bvh_node_count_variable               = 0;
@@ -340,6 +347,9 @@ uint32_t FlattenedSrtElementPointerType(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);
+// KYTY_INDIRECT_THREADS_GPU: a thread-dimension compute dispatch whose counts the shader reads
+// from GPU memory (ShaderComputeInputInfo::dispatch_dimensions_indirect).
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
 uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
@@ -438,8 +448,6 @@ struct ValueEmitContext {
 	uint32_t                                                           half       = 0;
 };
 
-enum class VertexInputScalarKind { Float, Sint, Uint };
-
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 
 struct DppTargetLane {
@@ -470,14 +478,14 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
-VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location);
+Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
 uint32_t VertexParameterComponentCount(const InputBinding& input);
 
-uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
-
+uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -804,6 +812,7 @@ inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F3
 inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, uint32_t>;
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
+uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 

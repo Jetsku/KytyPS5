@@ -48,6 +48,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 			}
 		}
 	}
+	if (info.indirect_vertex_base) {
+		// KYTY_INDIRECT_VERTEX_BASE: only when set, so other keys stay as they were.
+		key.push_back(0x1B5E0000u | (static_cast<uint32_t>(info.base_vertex_sgpr) & 0xffffu));
+	}
 	if (info.clip_space.vte_format != 0) {
 		// KYTY_VTE_CNTL: only when set, so other keys stay as they were.
 		key.push_back(0x7E7E0000u | info.clip_space.vte_format);
@@ -139,6 +143,10 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 		// KYTY_FLOAT_STORE_CLAMP: only when set, so other keys stay as they were.
 		key.push_back(0x48460000u | info.target_half_float_mask);
 	}
+	if ((info.target_uint_mask | info.target_sint_mask) != 0) {
+		// KYTY_INT_MRT_OUTPUTS (upstream 26ca60923): integer-typed MRT outputs; only when set.
+		key.push_back(0x494e0000u | (uint32_t {info.target_sint_mask} << 8u) | info.target_uint_mask);
+	}
 	if (const auto mask = info.target_shader_mask; mask != UINT32_MAX) {
 		// KYTY_CB_SHADER_MASK_EXPORTS: which targets are written decides export locations.
 		key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
@@ -172,8 +180,10 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords | (info.lds_storage ? 0x80000000u : 0u));
 	key.push_back(info.scratch_size_dwords);
 	// Bit 1: an async compute queue (S_GETREG_B32 HW_ID2 answers only for graphics compute).
+	// Bit 2: thread counts read through a device address (KYTY_INDIRECT_THREADS_GPU).
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	              (static_cast<uint32_t>(info.async_compute) << 1u) |
+	              (static_cast<uint32_t>(info.dispatch_dimensions_indirect) << 2u));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

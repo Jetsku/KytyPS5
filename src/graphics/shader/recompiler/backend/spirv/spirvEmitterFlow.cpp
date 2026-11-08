@@ -89,7 +89,8 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
-	    kind == IR::StageInputKind::BaseInstance || kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
+	    kind == IR::StageInputKind::BaseInstance || kind == IR::StageInputKind::BaseVertex ||
+	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
@@ -166,7 +167,7 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	enable(flags.bank_mask, 2u);
 	enable(flags.row_mask, 4u);
 	// Only row shifts (0x101-0x10f, 0x111-0x11f) can vacate a lane; other controls always read one.
-	const bool row_shift = !flags.dpp8 && flags.control > 0x100u && flags.control < 0x120u &&
+	const bool row_shift = flags.control > 0x100u && flags.control < 0x120u &&
 	                       flags.control != 0x110u;
 	// DPP8 has no BOUND_CTRL; an inactive source reads zero there (handled by the read), not a skipped write.
 	if (flags.dpp8 || flags.bound_control || (flags.fetch_inactive && !row_shift)) {
@@ -378,9 +379,10 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 }
 
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      bool uint_output) {
-	auto& state = ctx.state;
-	if (exp.compr && !uint_output) {
+                      uint32_t vector_type) {
+	auto&      state          = ctx.state;
+	const bool integer_output = vector_type != TypeF32Vector(state, 4);
+	if (exp.compr && !integer_output) {
 		// SPI_SHADER_COL_FORMAT of a compressed export: 5 UNORM16_ABGR, 6 SNORM16_ABGR,
 		// 8 SINT16_ABGR (not modelled: it would need an integer output), otherwise FP16_ABGR.
 		const auto mode   = MrtOutputMode(state, exp);
@@ -424,9 +426,11 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
-		    ConstantU32(state, uint_output ? 1u : 0x3f800000u),
+		    ConstantU32(state, integer_output ? 1u : 0x3f800000u),
 		};
 		if (exp.compr) {
+			const auto extract = vector_type == TypeU32Vector(state, 4) ? spv::OpBitFieldUExtract
+			                                                            : spv::OpBitFieldSExtract;
 			for (uint32_t pair = 0; pair < 2u; pair++) {
 				if ((exp.en & (3u << (pair * 2u))) == 0u) {
 					continue;
@@ -438,8 +442,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 						continue;
 					}
 					raw[component] = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw[component],
-					                          packed, ConstantU32(state, lane * 16u),
+					state.builder.AddFunction(extract, TypeU32(state), raw[component], packed,
+					                          ConstantU32(state, lane * 16u),
 					                          ConstantU32(state, 16));
 				}
 			}
@@ -454,12 +458,10 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), data,
 		                          raw[0], raw[1], raw[2], raw[3]);
 	}
-	if (uint_output) {
+	if (vector_type == TypeU32Vector(state, 4)) {
 		return data;
 	}
-	const auto vector = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, TypeF32Vector(state, 4), vector, data);
-	return vector;
+	return Unary(state, spv::OpBitcast, vector_type, data);
 }
 
 uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
@@ -734,9 +736,17 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
-		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		// KYTY_INT_MRT_OUTPUTS=1 (upstream 26ca60923): exports to UINT and SINT targets are typed
+		// as integer vectors of the target's signedness. Off: only 32_ABGR exports (mode 7) are
+		// unsigned, every other export a float vector (the behaviour before).
+		const auto output_mode = MrtOutputMode(state, exp);
+		const auto vector_type = GetCodegenOptions().int_mrt_outputs
+		                             ? (output_mode != 0u ? MrtOutputType(state, exp.index)
+		                                                  : TypeF32Vector(state, 4))
+		                             : (output_mode == 7u ? TypeU32Vector(state, 4)
+		                                                  : TypeF32Vector(state, 4));
+		const bool uint_output = vector_type != TypeF32Vector(state, 4);
+		auto       value       = ExportVector(ctx, data, exp, vector_type);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    !uint_output && !exp.compr && exp.index < 8u &&
 		    (state.input_info.pixel->target_half_float_mask & (1u << exp.index)) != 0u) {
@@ -1005,7 +1015,26 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
 		ctx.Fail(inst, "invalid dispatch thread extent");
 	}
-	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+	if (!DispatchDimensionsIndirect(ctx.state)) {
+		return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
+	}
+	// KYTY_INDIRECT_THREADS_GPU (GT7 fork 633e00962): the counts stay in GPU memory, a copy the
+	// renderer made of the guest's indirect arguments; the shader data holds its device address.
+	auto&      state = ctx.state;
+	const auto u64   = TypeU64(state);
+	const auto low   = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, start));
+	const auto high  = Binary(state, spv::OpShiftLeftLogical, u64,
+	                          Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, start + 1u)),
+	                          state.builder.Constant(spv::OpConstant, u64, 32u, 0u));
+	const auto address =
+	    Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpBitwiseOr, u64, low, high),
+	           state.builder.Constant(spv::OpConstant, u64, inst.Arg(0).U32() * 4u, 0u));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
+	return value;
 }
 
 uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {

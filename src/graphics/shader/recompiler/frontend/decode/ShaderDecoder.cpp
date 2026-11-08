@@ -126,10 +126,9 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* sample_name =
-	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
+	const char*            sampled_name = MimgSampledOpcodeName(inst.opcode_id);
 	const std::string_view name =
-	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
+	    sampled_name != nullptr ? sampled_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
 	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
@@ -147,28 +146,15 @@ std::string FormatMimg(const Instruction& inst) {
 	if (inst.lwe) {
 		text += " lwe=1";
 	}
-	switch (inst.opcode) {
-		case Opcode::IMAGE_SAMPLE:
-		case Opcode::IMAGE_GATHER4_L:
-		case Opcode::IMAGE_GATHER4_LZ:
-		case Opcode::IMAGE_GATHER4_C:
-		case Opcode::IMAGE_GATHER4_C_L:
-		case Opcode::IMAGE_GATHER4_C_LZ:
-		case Opcode::IMAGE_GATHER4_LZ_O:
-		case Opcode::IMAGE_GATHER4_C_O:
-		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H:
-			text += fmt::format(" sample_flags={} addr_components={}",
-			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
-			                    inst.image_address_components);
-			break;
-		case Opcode::IMAGE_BVH_INTERSECT_RAY:
-		case Opcode::IMAGE_BVH64_INTERSECT_RAY:
-			text += fmt::format(" a16={} addr_dwords={}",
-			                    (inst.image_sample_flags & ImageSampleFlagA16) != 0u ? 1u : 0u,
-			                    inst.image_address_components);
-			break;
-		default: break;
+	if (sampled_name != nullptr) {
+		text += fmt::format(" sample_flags={} addr_components={}",
+		                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
+		                    inst.image_address_components);
+	} else if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	           inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) {
+		text += fmt::format(" a16={} addr_dwords={}",
+		                    (inst.image_sample_flags & ImageSampleFlagA16) != 0u ? 1u : 0u,
+		                    inst.image_address_components);
 	}
 	if (inst.image_nsa_dwords != 0) {
 		text += fmt::format(" nsa_dwords={} nsa_addr=", inst.image_nsa_dwords);
@@ -557,6 +543,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_NOT_B64:
 		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
+		case Opcode::S_QUADMASK_B32:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
 		case Opcode::S_ORN2_SAVEEXEC_B32:
@@ -661,15 +648,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
-		case Opcode::IMAGE_GATHER4_L:
-		case Opcode::IMAGE_GATHER4_LZ:
-		case Opcode::IMAGE_GATHER4_C:
-		case Opcode::IMAGE_GATHER4_C_L:
-		case Opcode::IMAGE_GATHER4_C_LZ:
-		case Opcode::IMAGE_GATHER4_LZ_O:
-		case Opcode::IMAGE_GATHER4_C_O:
-		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_GATHER4:
 		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Opcode::IMAGE_BVH64_INTERSECT_RAY: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:

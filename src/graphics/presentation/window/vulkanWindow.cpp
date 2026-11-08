@@ -45,6 +45,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -54,6 +55,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -75,6 +77,7 @@ struct VulkanExtensions {
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	vk::PhysicalDeviceVulkan11Features features {};
 	features.storageBuffer16BitAccess = VK_TRUE;
+	features.shaderDrawParameters     = VK_TRUE;
 	return features;
 }
 
@@ -298,6 +301,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.samplerMirrorClampToEdge);
 		check_feature(features11.storageBuffer16BitAccess, "storageBuffer16BitAccess",
 		              WindowContext::RequiredVulkan11Features().storageBuffer16BitAccess);
+		check_feature(features11.shaderDrawParameters, "shaderDrawParameters",
+		              WindowContext::RequiredVulkan11Features().shaderDrawParameters);
 		check_feature(features12.storageBuffer8BitAccess, "storageBuffer8BitAccess",
 		              required_features12.storageBuffer8BitAccess);
 		check_feature(features12.timelineSemaphore, "timelineSemaphore",
@@ -965,8 +970,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 	// Only used by the driver-cache probes of the library path and KYTY_PIPELINE_FAST_FIRST; the
 	// default device stays unchanged.
+	// KYTY_PIPELINE_SKIP_PROBE=1 needs it too: without the feature the probe was silently off (the
+	// GT7 preset turns fast-first off, so nothing else asked for it).
+	const bool skip_probe_requested = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_SKIP_PROBE");
+		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+	}();
 	graphics.pipeline_creation_cache_control_enabled =
-	    (graphics.pipeline_library_enabled ||
+	    (graphics.pipeline_library_enabled || skip_probe_requested ||
 	     Libs::Graphics::PipelineFastFirstRequested(graphics.GetPhysicalDeviceProperties().vendorID)) &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
@@ -1051,6 +1062,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		const uint32_t     usable        = limit > SetZeroMargin ? limit - SetZeroMargin : 0u;
 		graphics.bindless_enabled = requested && supported && usable / 4u > 3u;
 		graphics.bindless_max_sampled_images = graphics.bindless_enabled ? usable : 0u;
+		graphics.bindless_max_samplers =
+		    graphics.bindless_enabled
+		        ? std::min(properties12.maxDescriptorSetUpdateAfterBindSamplers,
+		                   properties12.maxPerStageDescriptorUpdateAfterBindSamplers)
+		        : 0u;
 		if (graphics.bindless_enabled) {
 			features12.runtimeDescriptorArray                       = VK_TRUE;
 			features12.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
@@ -1102,6 +1118,32 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		ShaderRecompiler::Spirv::SetHostBufferPairAtomics(pairs);
 		LOGF("Vulkan buffer pair atomics: %s (storage offset alignment %" PRIu64 ")\n",
 		     pairs ? "yes" : "no", static_cast<uint64_t>(alignment));
+	}
+	// KYTY_COHERENT_LOAD_ACQUIRE=auto (GT7 fork 171338e72): NVIDIA reloads coherent loads without a
+	// barrier, AMD's drivers need one (SpirvEmitter.h).
+	{
+		constexpr uint32_t NvidiaVendorId = 0x10deu;
+		ShaderRecompiler::Spirv::SetCoherentLoadVendorDefault(properties2.properties.vendorID !=
+		                                                      NvidiaVendorId);
+		const auto mode = ShaderRecompiler::Spirv::GetCoherentLoadMode();
+		if (mode != ShaderRecompiler::Spirv::CoherentLoadMode::Plain) {
+			LOGF("Vulkan coherent loads: made as %s (KYTY_COHERENT_LOAD_MODE / _ACQUIRE)\n",
+			     ShaderRecompiler::Spirv::CoherentLoadModeName(mode));
+		}
+	}
+	// KYTY_MESH_LAYER=drop|amd (default keep; GT7 fork 67d59fe29): mesh shaders without their Layer
+	// output, on any GPU or on an AMD GPU only, whose Windows driver crashed making those pipelines.
+	{
+		constexpr uint32_t AmdVendorId = 0x1002u;
+		const char*        value       = std::getenv("KYTY_MESH_LAYER");
+		const std::string_view setting(value != nullptr ? value : "");
+		const bool drop = setting == "drop" ||
+		                  (setting == "amd" && properties2.properties.vendorID == AmdVendorId);
+		ShaderRecompiler::Spirv::SetHostMeshLayerDrop(drop);
+		if (drop || !setting.empty()) {
+			LOGF("Mesh shaders: their Layer output is %s (KYTY_MESH_LAYER=%s)\n",
+			     drop ? "left out" : "kept", value);
+		}
 	}
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =
@@ -1573,6 +1615,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
+	}
+	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
+	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
+	// depth- or stencil-writing fragment shader needs an epilog (upstream 597137e8b).
+	vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state {};
+	extended_dynamic_state.extendedDynamicState = VK_TRUE;
+	if (HasExtension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
+		extended_dynamic_state.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &extended_dynamic_state;
 	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -2253,7 +2304,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
-		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
+		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

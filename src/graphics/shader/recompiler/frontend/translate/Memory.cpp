@@ -387,8 +387,8 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
                                        const Decoder::Operand&     base) {
 	std::array<IR::Value, 13> components {};
 	components.fill(IR::Value(0u));
-	const auto count =
-	    Decoder::ImageAddressDwordCount(inst.image_sample_flags, inst.image_address_components);
+	const auto count = Decoder::ImageAddressDwordCount(
+	    inst.image_sample_flags, inst.image_dimension, inst.image_address_components);
 	EXIT_IF(count > components.size());
 	const auto nsa_components =
 	    std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
@@ -1430,15 +1430,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
-		case Decoder::Opcode::IMAGE_GATHER4_L:
-		case Decoder::Opcode::IMAGE_GATHER4_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_C:
-		case Decoder::Opcode::IMAGE_GATHER4_C_L:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_GATHER4: return IMAGE_GATHER(inst);
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 

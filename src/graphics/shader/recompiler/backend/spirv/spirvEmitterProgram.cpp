@@ -262,6 +262,30 @@ bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
 	});
 }
 
+// KYTY_CALL_LOOP_CAP: the merge of a loop of a bracketed callee body (CFG::Terminator::call_loop).
+bool IsCallLoopMergeBlock(const IR::Program& program, uint32_t target) {
+	return std::ranges::any_of(program.block_info, [=](const IR::BlockInfo& info) {
+		return info.terminator.loop_header && info.terminator.call_loop && info.terminator.merge_block == target;
+	});
+}
+
+// True once the invocation has run more rounds of such loops than the cap.
+uint32_t CallLoopExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.call_loop_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, GetCodegenOptions().call_loop_cap));
+	return exhausted;
+}
+
+void SpendCallLoop(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.call_loop_variable);
+	state.builder.AddFunction(spv::OpStore, state.call_loop_variable,
+	                          EmitAddU32(state, count, ConstantU32(state, 1)));
+}
+
 // An exhausted invocation reports once, at return, by adding one to the last GDS dword.
 void EmitLoopGuardReport(EmitterState& state) {
 	if (state.loop_guard_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
@@ -319,6 +343,36 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 		return Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state), word,
 		              ConstantU32(ctx.state, zero ? ~0u : 0u));
 	}
+	// KYTY_NATIVE_WAVE64_BRANCH (Senaxx 49723097f): a wave64 workgroup shader on a 64-wide host
+	// subgroup (compute and mesh shaders on AMD) runs natively, one guest lane per invocation. Its
+	// VCC/EXEC/SCC branch decides for the wave, as the two emulated halves below do; a lane's own
+	// bit would split the wave. Lanes a partial workgroup lacks are not in the ballot, so a zero
+	// condition holds when no present lane fails it.
+	if (ctx.other_half == nullptr && !ctx.state.split_wave &&
+	    kind != CFG::BranchCondition::ScalarInstruction &&
+	    kind != CFG::BranchCondition::GotoVariable && GetCodegenOptions().native_wave64_branch &&
+	    ctx.state.program.wave_size == 64u) {
+		const auto* workgroup = ShaderWorkgroupInput(ctx.state.program.stage, ctx.state.input_info);
+		if (workgroup != nullptr && workgroup->host_subgroup_size == 64u) {
+			auto& state     = ctx.state;
+			auto  predicate = ctx.Def(info.condition);
+			if (zero) {
+				predicate = Unary(state, spv::OpLogicalNot, TypeBool(state), predicate);
+			}
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+			const auto ballot = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+			                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+			const auto low  = state.builder.AllocateId();
+			const auto high = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+			const auto any = Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+			return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), any,
+			              ConstantU32(state, 0));
+		}
+	}
 	// Scalar-instruction conditions already test the full wave's raw register values.
 	if ((ctx.other_half == nullptr && !ctx.state.split_wave) ||
 	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
@@ -360,6 +414,9 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 		if (term.loop_header) {
 			if (ctx.state.loop_guard_variable != 0) {
 				SpendLoopGuard(ctx.state);
+			}
+			if (ctx.state.call_loop_variable != 0 && term.call_loop) {
+				SpendCallLoop(ctx.state);
 			}
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
@@ -417,6 +474,25 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 						                              exhausted);
 						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced,
 						                              condition, alive);
+					}
+					condition = forced;
+				}
+			}
+			if (ctx.state.call_loop_variable != 0) {
+				// KYTY_CALL_LOOP_CAP: an exhausted invocation leaves the bracketed bodies' loops.
+				const bool true_exits  = IsCallLoopMergeBlock(program, term.true_block);
+				const bool false_exits = IsCallLoopMergeBlock(program, term.false_block);
+				if (true_exits != false_exits) {
+					const auto exhausted = CallLoopExhausted(ctx.state);
+					const auto forced    = ctx.state.builder.AllocateId();
+					if (true_exits) {
+						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced, condition,
+						                              exhausted);
+					} else {
+						const auto alive = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), alive, exhausted);
+						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced, condition,
+						                              alive);
 					}
 					condition = forced;
 				}
@@ -1589,6 +1665,12 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (GetCodegenOptions().call_loop_cap != 0u && !program.dispatcher_fallback &&
+	    std::ranges::any_of(program.block_info,
+	                        [](const IR::BlockInfo& info) { return info.terminator.call_loop; })) {
+		state.call_loop_variable = state.builder.AllocateId();
+		state.builder.AddName(state.call_loop_variable, "call_loop_rounds");
+	}
 	if (LoopGuardApplies(program.shader_hash) && !program.dispatcher_fallback) {
 		state.loop_guard_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_guard_variable, "loop_guard");
@@ -1732,6 +1814,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_guard_variable, spv::StorageClassFunction);
 	}
+	if (state.call_loop_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.call_loop_variable, spv::StorageClassFunction);
+	}
 	if (state.bvh_node_count_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
@@ -1772,6 +1859,9 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
+	}
+	if (state.call_loop_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.call_loop_variable, ConstantU32(state, 0));
 	}
 	EmitGeometryOutputDefaults(state);
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {

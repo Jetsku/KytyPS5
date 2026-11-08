@@ -103,6 +103,14 @@ public:
 		return m_published.load(std::memory_order_acquire) != m_issued;
 	}
 	[[nodiscard]] bool Active() const noexcept { return m_queries.Active(); }
+	// KYTY_SKIP_OCCLUSION_VISIBLE (renderDraw.cpp): a draw skipped while its shaders translate or its
+	// pipeline builds, while a dump pair counts, adds `samples` to the counter every later dump
+	// publishes (to its first DB's qword), so the guest sees the object as visible (CP thread).
+	void AddSkippedSamples(uint64_t samples) noexcept {
+		m_skip_bias += samples;
+		++m_skipped_draws;
+	}
+	[[nodiscard]] uint64_t SkippedDraws() const noexcept { return m_skipped_draws; }
 	// KYTY_OCCLUSION_LOG=<file> (diagnostics): while <file>.on exists, every dump ("D"), its
 	// publication ("P", the cumulative value) and every draw recorded while a dump pair is open
 	// ("d") are written to <file>. Pair results are P(end) - P(begin).
@@ -198,6 +206,8 @@ private:
 	ScopeInfo m_last_scope {}; // hang-trace diagnostics only
 	ScopeInfo m_instance_scope {};
 	bool      m_last_dump_kept = false;
+	uint64_t  m_skip_bias      = 0; // KYTY_SKIP_OCCLUSION_VISIBLE: samples of skipped draws so far
+	uint64_t  m_skipped_draws  = 0;
 };
 }
 #endif

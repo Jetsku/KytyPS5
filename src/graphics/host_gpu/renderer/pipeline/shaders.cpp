@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/aaMaskCoverage.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
@@ -194,7 +195,9 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 }
 
 static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless);
+	return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) ||
+	       std::ranges::any_of(program.info.samplers,
+	                           &ShaderRecompiler::IR::SamplerResource::bindless);
 }
 
 // Set 0 plus one push-constant range {push_stages, 0, NativePushConstantSize}; interned by
@@ -227,7 +230,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache,
-                            const GraphicsPipelineCreateHook*      create_hook) {
+                            const GraphicsPipelineCreateHook*      create_hook,
+                            vk::Result*                            result_out) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -710,8 +714,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 		result = (*create_hook)(pipeline_info, layout_signature, &pipeline.pipeline);
 	} else {
-		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-		                                                 &pipeline.pipeline);
+		result = PipelineFeedback::CreateGraphics(graphics.device, driver_cache, pipeline_info, &pipeline.pipeline,
+		                                          PipelineFeedback::Path::Sync);
 	}
 	Profiler::AddFrameWait(Profiler::FrameWait::GraphicsPipelineDriver, 1,
 	                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -721,16 +725,38 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
+	const auto destroy_tess_modules = [&] {
+		if (tess_control_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+		}
+		if (tess_eval_shader_module != nullptr) {
+			graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+		}
+	};
+	if (result_out != nullptr) {
+		// The caller can do without this pipeline (KYTY_PIPELINE_SKIP_PROBE's driver-cache lookup):
+		// the result is returned, and what was created for a failed one given back.
+		*result_out = result;
+		if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+			if (result == vk::Result::eSuccess) {
+				*result_out = vk::Result::eErrorUnknown;
+			}
+			if (pipeline.pipeline != nullptr) {
+				graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+				pipeline.pipeline = nullptr;
+			}
+			ReleasePipelineLayout(graphics, pipeline.pipeline_layout, pipeline.descriptor_set_layout);
+			pipeline.pipeline_layout       = nullptr;
+			pipeline.descriptor_set_layout = nullptr;
+			destroy_tess_modules();
+			return;
+		}
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
-	if (tess_control_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
-	}
-	if (tess_eval_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
-	}
+	destroy_tess_modules();
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

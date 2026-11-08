@@ -172,6 +172,10 @@ bool TextureBindingMemo::RefreshIsNoOp(const Image& image) {
 	if (image.IsCpuDirty() || image.IsBufferModified() || !image.IsTracked()) {
 		return false;
 	}
+	// KYTY_LIGHT_GRID_GUEST: the per-submission guest-byte check runs at every binding.
+	if (TextureCache::LightGridGuestApplies(image)) {
+		return false;
+	}
 	if (image.ChunkTracked()) {
 		return image.chunks.untracked_count == 0;
 	}

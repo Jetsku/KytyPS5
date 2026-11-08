@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
@@ -32,6 +33,8 @@ bool BindlessImagesEnabled() {
 
 namespace {
 
+// KYTY_TABLE_KEY_BOUNDS: matches MaxIndirectImageProbes (ResourceMaterialization.cpp).
+constexpr uint32_t MaxTableKeyProbes = 65536u;
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
@@ -212,6 +215,7 @@ public:
 				Collect(inst);
 			}
 		}
+		CollectDeferredSamplerReads();
 		if (!m_dead_stores.empty()) {
 			// Global legs of aperture-routed stores that can never run: erase them.
 			for (auto* block: m_program.blocks) {
@@ -251,6 +255,14 @@ public:
 				}
 			}
 		}
+		// KYTY_BINDLESS_SAMPLERS: the handle carries its key (which the shader reads) and the heap
+		// V#'s first three dwords (which keep the plan's values alive).
+		for (const auto& plan: m_bindless_samplers) {
+			plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 0; dword < 3u; dword++) {
+				plan.handle->SetArg(dword + 1u, plan.table_roots[dword]);
+			}
+		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
@@ -285,6 +297,14 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+	};
+
+	// KYTY_BINDLESS_SAMPLERS: a sampler handle whose S# is read from a sampler heap at a key.
+	struct BindlessSamplerPlan {
+		Inst*                handle = nullptr;
+		uint32_t             source = 0;
+		Value                key;
+		std::array<Value, 3> table_roots {};
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -439,7 +459,8 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value()) {
+			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value() ||
+			    current.bindless_sampler != descriptor.bindless_sampler) {
 				continue;
 			}
 			if (current.indirect_descriptor.has_value()) {
@@ -449,6 +470,8 @@ private:
 				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
 				    a.table_stride != b.table_stride || a.table_record_bytes != b.table_record_bytes ||
 				    a.table_scalar != b.table_scalar || a.workgroup_axis != b.workgroup_axis ||
+				    a.workgroup_multiplier != b.workgroup_multiplier ||
+				    a.workgroup_shift != b.workgroup_shift ||
 				    a.bindless != b.bindless || a.runtime != b.runtime ||
 				    a.record_pointer != b.record_pointer ||
 				    a.nested_vsharp != b.nested_vsharp || a.nested_heap != b.nested_heap ||
@@ -652,6 +675,52 @@ private:
 			return UINT32_MAX;
 		}
 		return axis;
+	}
+
+	// KYTY_WORKGROUP_IMAGES (upstream de3ed905c): key = (first + workgroup ID) * multiplier >> shift
+	// with shift >= 32 (a UMulHi and a shift), where first is a runtime value; first and the
+	// division are optional. Fills the indirect descriptor's workgroup fields on a match.
+	bool MatchWorkgroupKey(Value key, DescriptorSource::IndirectDescriptor* indirect) const {
+		uint32_t    bits = 0, multiplier = 0;
+		const auto* shift = key.Resolve().TryInstruction();
+		if (shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+			const auto* high = shift->Arg(0).Resolve().TryInstruction();
+			if (high != nullptr && high->GetOpcode() == ValueOpcode::UMulHi &&
+			    ImmediateU32(shift->Arg(1), bits) && bits < 32u &&
+			    ImmediateU32(high->Arg(1), multiplier)) {
+				key = high->Arg(0);
+				bits += 32u;
+			} else {
+				bits = 0;
+			}
+		} else if (shift != nullptr && shift->GetOpcode() == ValueOpcode::UMulHi &&
+		           ImmediateU32(shift->Arg(1), multiplier)) {
+			key  = shift->Arg(0);
+			bits = 32u;
+		}
+		Value    first;
+		uint32_t axis = WorkgroupAxis(key);
+		if (axis == UINT32_MAX) {
+			const auto* sum = key.Resolve().TryInstruction();
+			if (sum == nullptr || sum->GetOpcode() != ValueOpcode::IAdd32) return false;
+			for (uint32_t arm = 0; arm < 2u && axis == UINT32_MAX; ++arm) {
+				const auto base = sum->Arg(arm ^ 1u);
+				if (WorkgroupAxis(sum->Arg(arm)) == UINT32_MAX ||
+				    !ValidateRuntimeValue(m_program, base, RuntimeValueType::Integer)) {
+					continue;
+				}
+				axis  = WorkgroupAxis(sum->Arg(arm));
+				first = base;
+			}
+			if (axis == UINT32_MAX) return false;
+		}
+		if (indirect != nullptr) {
+			indirect->workgroup_axis       = axis;
+			indirect->selector_first       = first;
+			indirect->workgroup_multiplier = bits != 0u ? multiplier : 0u;
+			indirect->workgroup_shift      = static_cast<uint8_t>(bits);
+		}
+		return true;
 	}
 
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t* key_mask = nullptr,
@@ -1111,6 +1180,289 @@ private:
 		return {};
 	}
 
+	// KYTY_TABLE_KEY_BOUNDS (adapted from upstream dfcf1c0b0, 20bb268a4, a3ac6d0d3 and b2053c286):
+	// a constant maximum for an address-table image key that neither a bit scan nor a bounded loop
+	// covers, so the table enumerates keys 0..maximum instead of the program being skipped (or
+	// going bindless).
+
+	// Bounds of an F32 value; -inf / +inf when a side is unknown.
+	std::pair<float, float> KeyFloatRange(Value value, uint32_t depth = 0) const {
+		constexpr std::pair<float, float> unknown {-INFINITY, INFINITY};
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::F32) return {value.F32Value(), value.F32Value()};
+			return unknown;
+		}
+		const auto* inst = value.TryInstruction();
+		// A multiply-add evaluates three operands; keep the search shallow.
+		if (depth > 12u || inst == nullptr) return unknown;
+		const auto range  = [&](uint32_t arg) { return KeyFloatRange(inst->Arg(arg), depth + 1u); };
+		const auto finite = [](const std::pair<float, float>& r) {
+			return std::isfinite(r.first) && std::isfinite(r.second);
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::BitCastU32F32: return range(0);
+			// Clamping maps NaN to zero.
+			case ValueOpcode::FPSaturate32: return {0.0f, 1.0f};
+			case ValueOpcode::FPFloor32: {
+				const auto [low, high] = range(0);
+				return {std::floor(low), std::floor(high)};
+			}
+			case ValueOpcode::FPMin32: {
+				const auto a = range(0), b = range(1);
+				return {std::min(a.first, b.first), std::min(a.second, b.second)};
+			}
+			case ValueOpcode::FPMax32: {
+				const auto a = range(0), b = range(1);
+				return {std::max(a.first, b.first), std::max(a.second, b.second)};
+			}
+			case ValueOpcode::FPAdd32: {
+				const auto a = range(0), b = range(1);
+				return {a.first + b.first, a.second + b.second};
+			}
+			case ValueOpcode::FPMul32:
+			case ValueOpcode::FPMad32:
+			case ValueOpcode::FPFma32: {
+				// The rounded multiply and add are monotonic, so the bounds lie at the corners.
+				const auto a = range(0), b = range(1);
+				if (!finite(a) || !finite(b)) return unknown;
+				const auto c = inst->GetOpcode() == ValueOpcode::FPMul32
+				                   ? std::pair<float, float> {0.0f, 0.0f}
+				                   : range(2);
+				const auto [low, high] = std::minmax({a.first * b.first, a.first * b.second,
+				                                      a.second * b.first, a.second * b.second});
+				return {low + c.first, high + c.second};
+			}
+			default: return unknown;
+		}
+	}
+
+	// The largest value key can hold where guard (an EXEC or branch predicate, true on the lanes
+	// that use key) holds: key < C, key <= C (inclusive, a3ac6d0d3), key == C and mirrored forms.
+	uint32_t GuardKeyMaximum(Value guard, Value key, bool positive = true, uint32_t depth = 0) const {
+		if (guard.IsEmpty() || depth > 8u) return UINT32_MAX;
+		const auto* test = SimplifyGuard(guard).TryInstruction();
+		if (test == nullptr) return UINT32_MAX;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::LogicalNot) {
+			return GuardKeyMaximum(test->Arg(0), key, !positive, depth + 1u);
+		}
+		if ((op == ValueOpcode::LogicalAnd && positive) || (op == ValueOpcode::LogicalOr && !positive)) {
+			return std::min(GuardKeyMaximum(test->Arg(0), key, positive, depth + 1u),
+			                GuardKeyMaximum(test->Arg(1), key, positive, depth + 1u));
+		}
+		if (test->NumArgs() != 2u) return UINT32_MAX;
+		uint32_t   limit    = 0;
+		const bool key_left = EquivalentValue(m_program, test->Arg(0), key) &&
+		                      ImmediateU32(test->Arg(1), limit);
+		const bool key_right = !key_left && EquivalentValue(m_program, test->Arg(1), key) &&
+		                       ImmediateU32(test->Arg(0), limit);
+		if (!key_left && !key_right) return UINT32_MAX;
+		// Normalise to "key OP limit" on the lanes where the test holds.
+		auto opcode = op;
+		if (key_right) {
+			switch (op) {
+				case ValueOpcode::ULessThan32: opcode = ValueOpcode::UGreaterThan32; break;
+				case ValueOpcode::ULessThanEqual32: opcode = ValueOpcode::UGreaterThanEqual32; break;
+				case ValueOpcode::UGreaterThan32: opcode = ValueOpcode::ULessThan32; break;
+				case ValueOpcode::UGreaterThanEqual32: opcode = ValueOpcode::ULessThanEqual32; break;
+				default: break;
+			}
+		}
+		if (!positive) {
+			switch (opcode) {
+				case ValueOpcode::ULessThan32: opcode = ValueOpcode::UGreaterThanEqual32; break;
+				case ValueOpcode::ULessThanEqual32: opcode = ValueOpcode::UGreaterThan32; break;
+				case ValueOpcode::UGreaterThan32: opcode = ValueOpcode::ULessThanEqual32; break;
+				case ValueOpcode::UGreaterThanEqual32: opcode = ValueOpcode::ULessThan32; break;
+				case ValueOpcode::INotEqual32: opcode = ValueOpcode::IEqual32; break;
+				default: return UINT32_MAX;
+			}
+		}
+		switch (opcode) {
+			case ValueOpcode::ULessThan32: return limit == 0u ? 0u : limit - 1u;
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::IEqual32: return limit;
+			default: return UINT32_MAX;
+		}
+	}
+
+	// GuardKeyMaximum over every unique-predecessor edge that leads to block after key's definition.
+	uint32_t EntryKeyMaximum(Value key, const Block* block) const {
+		uint32_t    result     = UINT32_MAX;
+		const auto* definition = key.Resolve().TryInstruction();
+		for (size_t depth = 0; block != nullptr && depth < m_program.blocks.size(); ++depth) {
+			if (block->ImmPredecessors().size() != 1u ||
+			    (definition != nullptr && definition->Parent() == block)) {
+				break;
+			}
+			const auto* previous = block->ImmPredecessors()[0];
+			Value       condition;
+			bool        positive = false;
+			if (ConditionalEdge(previous, block, condition, positive)) {
+				result = std::min(result, GuardKeyMaximum(condition, key, positive));
+			}
+			block = previous;
+		}
+		return result;
+	}
+
+	uint32_t KeyMaximum(Value value, Value guard, uint32_t depth = 0) const {
+		value              = value.Resolve();
+		uint32_t immediate = 0;
+		if (ImmediateU32(value, immediate)) return immediate;
+		const auto* inst = value.TryInstruction();
+		if (depth > 24u || inst == nullptr) return UINT32_MAX;
+		uint32_t   result  = std::min(PossibleU32Bits(value), GuardKeyMaximum(guard, value));
+		const auto maximum = [&](uint32_t arg, Value context) {
+			return KeyMaximum(inst->Arg(arg), context, depth + 1u);
+		};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane: {
+				// The value is some lane's: a context-free bound on every lane applies, and a
+				// waterfall guard (local == key) bounds it by the executing lanes' local value.
+				result           = std::min(result, maximum(0, {}));
+				const auto local = EqualLocalKey(guard, value);
+				if (!local.IsEmpty()) result = std::min(result, KeyMaximum(local, guard, depth + 1u));
+				break;
+			}
+			case ValueOpcode::UMin32:
+			case ValueOpcode::BitwiseAnd32:
+				result = std::min(result, std::min(maximum(0, guard), maximum(1, guard)));
+				break;
+			case ValueOpcode::SMin32: {
+				const auto left = maximum(0, guard), right = maximum(1, guard);
+				// Signed and unsigned minimums agree on nonnegative operands.
+				if (std::max(left, right) <= static_cast<uint32_t>(INT32_MAX)) {
+					result = std::min(result, std::min(left, right));
+					break;
+				}
+				// A signed clamp to a constant (20bb268a4): a negative key finds no enumerated
+				// row and reads the first candidate.
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
+					uint32_t row = 0;
+					if (ImmediateU32(inst->Arg(arg), row) && row <= static_cast<uint32_t>(INT32_MAX)) {
+						result = std::min(result, row);
+					}
+				}
+				break;
+			}
+			case ValueOpcode::ShiftRightLogical32:
+				if (ImmediateU32(inst->Arg(1), immediate)) {
+					result = std::min(result, maximum(0, guard) >> (immediate & 31u));
+				}
+				break;
+			case ValueOpcode::BitFieldUExtract:
+				if (inst->NumArgs() == 3u && ImmediateU32(inst->Arg(2), immediate) && immediate < 32u) {
+					result = std::min(result, (1u << immediate) - 1u);
+				}
+				break;
+			case ValueOpcode::IAdd32: {
+				const uint64_t sum = uint64_t {maximum(0, guard)} + maximum(1, guard);
+				if (sum <= UINT32_MAX) result = std::min(result, static_cast<uint32_t>(sum));
+				break;
+			}
+			case ValueOpcode::SelectU32:
+				if (inst->NumArgs() == 3u) {
+					result = std::min(result, !guard.IsEmpty() && Implies(guard, inst->Arg(0))
+					                              ? maximum(1, guard)
+					                              : std::max(maximum(1, guard), maximum(2, guard)));
+				}
+				break;
+			case ValueOpcode::ConvertS32F32:
+			case ValueOpcode::ConvertU32F32: {
+				// The conversion truncates toward zero (dfcf1c0b0).
+				const auto [low, high] = KeyFloatRange(inst->Arg(0));
+				if (low > -1.0f && high < 0x1p31f) {
+					result = std::min(result, static_cast<uint32_t>(high));
+				}
+				break;
+			}
+			default: break;
+		}
+		return result;
+	}
+
+	// The EXEC predicate of an image access through use, else the branch predicate of its block.
+	Value KeyUseGuard(const Use& use) const {
+		const auto& access = *use.user;
+		if (use.operand == 0u && access.NumArgs() != 0u &&
+		    ImageOpcodeInfoOf(access.GetOpcode()).access != ImageAccess::None) {
+			const auto mask = access.Arg(access.NumArgs() - 1u);
+			if (mask.GetType() == Type::U1 && mask.Resolve() != Value(true)) return mask;
+		}
+		return PositiveUseGuard(access.Parent());
+	}
+
+	uint32_t TableKeyMaximum(Value key, const Inst& handle) const {
+		uint32_t result = 0;
+		bool     any    = false;
+		for (const auto& use: handle.Uses()) {
+			if (ImageOpcodeInfoOf(use.user->GetOpcode()).access == ImageAccess::None) {
+				return UINT32_MAX;
+			}
+			result = std::max(result, std::min(EntryKeyMaximum(key, use.user->Parent()),
+			                                   KeyMaximum(key, KeyUseGuard(use))));
+			any = true;
+		}
+		return any ? result : UINT32_MAX;
+	}
+
+	static bool ZeroBasedInduction(const Inst* phi) {
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->GetType() != Type::U32 ||
+		    phi->NumArgs() != 2u) {
+			return false;
+		}
+		const Value key(const_cast<Inst*>(phi));
+		for (uint32_t initial = 0; initial < 2u; ++initial) {
+			const auto  zero      = phi->Arg(initial).Resolve();
+			const auto* step      = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
+			uint32_t    increment = 0;
+			if (zero.IsImmediate() && zero.GetType() == Type::U32 && zero.U32() == 0u &&
+			    step != nullptr && step->GetOpcode() == ValueOpcode::IAdd32 &&
+			    ((step->Arg(0).Resolve() == key && ImmediateU32(step->Arg(1), increment) &&
+			      increment == 1u) ||
+			     (step->Arg(1).Resolve() == key && ImmediateU32(step->Arg(0), increment) &&
+			      increment == 1u))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// b2053c286: a zero-based loop key that only per-lane data bounds takes the runtime count that
+	// every uniformly bounded zero-based loop of the program shares, assuming each lane's count
+	// stays within it.
+	Value ProgramLoopCount(Value key) const {
+		key = key.Resolve();
+		if (m_shader_writes || !ZeroBasedInduction(key.TryInstruction())) return {};
+		Value count;
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if ((inst.GetOpcode() != ValueOpcode::SLessThan32 &&
+				     inst.GetOpcode() != ValueOpcode::ULessThan32) ||
+				    inst.NumArgs() != 2u) {
+					continue;
+				}
+				const auto induction = inst.Arg(0).Resolve();
+				if (induction == key || !ZeroBasedInduction(induction.TryInstruction()) ||
+				    !ValidateRuntimeValue(m_program, inst.Arg(1))) {
+					continue;
+				}
+				if (!count.IsEmpty() && !EquivalentValue(m_program, count, inst.Arg(1))) return {};
+				count = inst.Arg(1);
+			}
+		}
+		if (!count.IsEmpty()) {
+			std::printf("Warning: shader 0x%016" PRIx64 " bounds a per-lane table loop by its uniform "
+			            "loops' count (KYTY_TABLE_KEY_BOUNDS)\n",
+			            m_program.shader_hash);
+		}
+		return count;
+	}
+
 	// KYTY_HEAP_KEY_MASK (adapted from KytyPS5-Frank's ResolveDescriptorPhi): a descriptor word that
 	// is a Phi web where the register held the T# word on the sampling paths and a data value on
 	// others (PPSA03671's 0xbf3eac34fedbad2d restores a spilled heap T# with V_READLANE after loops
@@ -1268,7 +1620,7 @@ private:
 				return workgroup && !strided &&
 				       MatchTableOffset(read->Arg(1), current_key, offset, &current_mask,
 				                        &current_masked, &current_stride) &&
-				       current_masked == nullptr && WorkgroupAxis(current_key) != UINT32_MAX;
+				       current_masked == nullptr && MatchWorkgroupKey(current_key, nullptr);
 			};
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
@@ -1390,7 +1742,14 @@ private:
 				}
 				if (indirect.key_count.IsEmpty() &&
 				    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, pc)) {
-					return WhyNot(__LINE__);
+					if (!GetCodegenOptions().table_key_bounds) return WhyNot(__LINE__);
+					const auto maximum = TableKeyMaximum(key, handle);
+					if (maximum < MaxTableKeyProbes) {
+						indirect.key_count = Value(maximum + 1u);
+					} else {
+						indirect.key_count = ProgramLoopCount(key);
+						if (indirect.key_count.IsEmpty()) return WhyNot(__LINE__);
+					}
 				}
 				if ((table_offset & 3u) != 0u ||
 				    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return WhyNot(__LINE__);
@@ -1437,14 +1796,13 @@ private:
 		// the workgroup id enumerates that axis' workgroup count at each dispatch, reading key k's
 		// T# at table_offset + k * table_stride (MaterializeIndirectImage); any user, storage
 		// images too. Words the shader also uses as values stay real reads (above).
-		const uint32_t workgroup_axis =
-		    workgroup && masked == nullptr && !word0_shared ? WorkgroupAxis(key) : UINT32_MAX;
-		if (workgroup_axis != UINT32_MAX) {
+		// The key may also be a runtime base plus the workgroup id, divided by a constant
+		// (MatchWorkgroupKey, upstream de3ed905c).
+		if (workgroup && masked == nullptr && !word0_shared && MatchWorkgroupKey(key, &indirect)) {
 			if (table_stride == 0u || (table_stride & 3u) != 0u || (table_offset & 3u) != 0u) {
 				return WhyNot(__LINE__);
 			}
-			indirect.table_stride   = table_stride;
-			indirect.workgroup_axis = workgroup_axis;
+			indirect.table_stride = table_stride;
 		} else if (masked != nullptr || word0_shared || table_stride != 32u || !enumerable()) {
 			const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
 				return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
@@ -1913,6 +2271,96 @@ private:
 		       source->indirect_descriptor->bindless;
 	}
 
+	// With bindless images, the S# beside a bindless or runtime T# may be read from a sampler heap
+	// with S_BUFFER_LOAD (per key, like the T#). The sampler plan (TryMakeBindlessSampler or the
+	// stand-in, UseDefaultSamplerIfUnresolved) is made at the image operation, after the walk has
+	// passed those reads: collected first, they became a buffer resource whose V# words dead code
+	// elimination then removed with the stranded reads, and materialization failed. A scalar
+	// buffer read that feeds nothing but sampler handles (and the dead phis a waterfall loop
+	// leaves) is collected after the walk instead, and only if an ordinary sampler still uses it;
+	// otherwise it is planning-only, like an indirect image plan's T# reads (Senaxx 59cb8a83e
+	// marks a bindless sampler's exclusive reads the same way).
+	bool IsSamplerOnlyRead(const Inst& inst) const {
+		if (!GetCodegenOptions().sampler_reads_deferred || !BindlessImagesEnabled() ||
+		    inst.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+			return false;
+		}
+		uint32_t index = 0;
+		if (ScalarReadMemory(inst, index) == nullptr || inst.Uses().empty()) {
+			return false;
+		}
+		bool sampler = false;
+		if (!FeedsOnlySamplers(inst, sampler) || !sampler) {
+			return false;
+		}
+		return true;
+	}
+
+	// Whether every use of value (through phis) is a sampler handle; sampler: one was found.
+	static bool FeedsOnlySamplers(const Inst& value, bool& sampler) {
+		std::vector<const Inst*> pending {&value};
+		std::unordered_set<const Inst*> visited {&value};
+		while (!pending.empty()) {
+			const auto* current = pending.back();
+			pending.pop_back();
+			for (const auto& use: current->Uses()) {
+				const auto op = use.user->GetOpcode();
+				if (op == ValueOpcode::GetSamplerResource) {
+					sampler = true;
+				} else if (op == ValueOpcode::Phi) {
+					if (visited.insert(use.user).second) {
+						pending.push_back(use.user);
+					}
+				} else {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	void CollectDeferredSamplerReads() {
+		if (m_deferred_sampler_reads.empty()) {
+			return;
+		}
+		auto deferred = std::move(m_deferred_sampler_reads);
+		m_deferred_sampler_reads.clear();
+		std::vector<const Inst*> stranded;
+		m_collecting_deferred = true;
+		for (auto* read: deferred) {
+			// Still the S# of a sampler without a heap plan: an ordinary read.
+			bool live = false;
+			std::vector<const Inst*>        pending {read};
+			std::unordered_set<const Inst*> visited {read};
+			while (!pending.empty() && !live) {
+				const auto* current = pending.back();
+				pending.pop_back();
+				for (const auto& use: current->Uses()) {
+					if (use.user->GetOpcode() == ValueOpcode::Phi) {
+						if (visited.insert(use.user).second) {
+							pending.push_back(use.user);
+						}
+					} else if (FindBindlessSampler(use.user) == nullptr) {
+						live = true;
+						break;
+					}
+				}
+			}
+			if (live) {
+				Collect(*read);
+				continue;
+			}
+			m_program.memory_info[read->Flags<MemoryFlags>().index].planning_only = true;
+			stranded.push_back(read);
+		}
+		m_collecting_deferred = false;
+		if (!stranded.empty()) {
+			std::erase_if(m_program.dynamic_reads, [&](Value value) {
+				return std::ranges::find(stranded, value.Resolve().TryInstruction()) != stranded.end();
+			});
+		}
+	}
+
 	// Stopgap (Senaxx's default sampler): the S# beside a bindless T# that is read per key too
 	// (from the same material record) has no plan. Sample with one fixed sampler (trilinear,
 	// wrap, full LOD range) rather than skipping the program; only filtering and edge addressing
@@ -1937,6 +2385,99 @@ private:
 		for (uint32_t dword = 0; dword < 4u; dword++) {
 			handle->SetArg(dword, Value(DefaultSampler[dword]));
 		}
+	}
+
+	const BindlessSamplerPlan* FindBindlessSampler(const Inst* handle) const {
+		if (handle == nullptr) {
+			return nullptr;
+		}
+		const auto found = std::ranges::find(m_bindless_samplers, handle, &BindlessSamplerPlan::handle);
+		return found == m_bindless_samplers.end() ? nullptr : &*found;
+	}
+
+	// KYTY_BINDLESS_SAMPLERS (a minimal port of Senaxx's mirrored sampler heaps, 59cb8a83e): the S#
+	// beside a bindless or runtime image whose four dwords are scalar reads of one sampler heap at
+	// key * stride + offset (a key the shader computes, a stride of 16 or more, a heap V# the host
+	// can evaluate) is planned as a bindless sampler: the shader keeps the key and indexes the
+	// bindless sampler array, which the host mirrors from the heap. The reads stay ordinary loads.
+	// False: the caller falls back to the stand-in sampler (UseDefaultSamplerIfUnresolved).
+	bool TryMakeBindlessSampler(Value value, bool sample_adjust, uint32_t pc) {
+		auto* handle = value.Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetSamplerResource ||
+		    handle->NumArgs() != 4u) {
+			return false;
+		}
+		if (FindBindlessSampler(handle) != nullptr) {
+			return true;
+		}
+		DescriptorSource descriptor;
+		MakeSource(*handle, 4u, true, sample_adjust, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(descriptor, bad_dword)) {
+			return false; // an ordinary S#
+		}
+		Inst*    table_handle = nullptr;
+		Value    key;
+		uint32_t table_offset = 0;
+		uint32_t table_stride = 0;
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			const auto* read = ResolveInvariantPhi(m_program, handle->Arg(dword)).TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u) {
+				return false;
+			}
+			auto*    current_handle = read->Arg(0).Resolve().TryInstruction();
+			Value    current_key;
+			uint32_t offset = 0;
+			uint32_t stride = 0;
+			if (current_handle == nullptr ||
+			    current_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    (table_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, nullptr, nullptr, &stride) ||
+			    stride < 16u || (stride & 3u) != 0u || memory->offset > UINT32_MAX - offset) {
+				return false;
+			}
+			offset += memory->offset;
+			if (dword == 0u) {
+				key          = current_key;
+				table_offset = offset;
+				table_stride = stride;
+			} else if (stride != table_stride || !EquivalentValue(m_program, key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
+				return false;
+			}
+			table_handle = current_handle;
+		}
+		// A key the host can evaluate has an ordinary plan (the S# would be a valid value).
+		if (ValidateRuntimeValue(m_program, key)) {
+			return false;
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*table_handle, pc, table_source) ||
+		    table_source.dword_count != 4u) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = 4u;
+		source.dwords.fill(Value(0u));
+		BindlessSamplerPlan plan;
+		for (uint32_t dword = 0; dword < 3u; dword++) {
+			source.dwords[dword]    = table_source.dwords[dword];
+			plan.table_roots[dword] = table_source.dwords[dword];
+		}
+		source.bindless_sampler =
+		    DescriptorSource::BindlessSampler {.table_offset = table_offset, .stride = table_stride};
+		plan.handle = handle;
+		plan.key    = key;
+		plan.source = InternSource(source);
+		m_bindless_samplers.push_back(plan);
+		return true;
 	}
 
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
@@ -2159,7 +2700,10 @@ private:
 		if (m_info.samplers.size() >= ShaderInfo::MaxSamplers) {
 			return UINT32_MAX;
 		}
-		m_info.samplers.push_back({source, pc});
+		SamplerResource sampler {.source = source, .first_use_pc = pc};
+		const auto*     descriptor = Source(source);
+		sampler.bindless = descriptor != nullptr && descriptor->bindless_sampler.has_value();
+		m_info.samplers.push_back(sampler);
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
 	}
 
@@ -2223,6 +2767,10 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
+			return;
+		}
+		if (!m_collecting_deferred && IsSamplerOnlyRead(inst)) {
+			m_deferred_sampler_reads.push_back(&inst);
 			return;
 		}
 		Inst*    handle   = nullptr;
@@ -2387,11 +2935,17 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			if ((indirect != nullptr && IsBindlessPlan(*indirect)) || runtime) {
+			if (((indirect != nullptr && IsBindlessPlan(*indirect)) || runtime) &&
+			    !(GetCodegenOptions().bindless_samplers &&
+			      TryMakeBindlessSampler(inst.Arg(1), sample_adjust, flags.pc))) {
 				UseDefaultSamplerIfUnresolved(inst.Arg(1), sample_adjust, flags.pc);
 			}
-			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-			               sampler_handle, sampler_source, true, sample_adjust)) {
+			if (const auto* bindless = FindBindlessSampler(inst.Arg(1).Resolve().TryInstruction());
+			    bindless != nullptr) {
+				sampler_handle = bindless->handle;
+				sampler_source = bindless->source;
+			} else if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			                      sampler_handle, sampler_source, true, sample_adjust)) {
 				return; // unresolved (KYTY_SRT_VARIANT_READS): the shader is skipped
 			}
 			sampler = AddSampler(sampler_source, flags.pc);
@@ -2503,6 +3057,9 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::vector<BindlessSamplerPlan>           m_bindless_samplers;
+	std::vector<Inst*>                         m_deferred_sampler_reads; // IsSamplerOnlyRead
+	bool                                       m_collecting_deferred = false;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 	bool                                       m_logged_runtime_image = false;

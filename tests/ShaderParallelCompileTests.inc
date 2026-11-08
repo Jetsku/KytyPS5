@@ -170,7 +170,7 @@ std::vector<std::unique_ptr<Job>> CaseJobs() {
     auto user_data = MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
     const auto uses_image =
         std::any_of(test.opcodes.begin(), test.opcodes.end(), [](auto op) {
-          return op >= ShaderOpcode::IMAGE_GET_RESINFO && op <= ShaderOpcode::IMAGE_GATHER4H;
+          return op >= ShaderOpcode::IMAGE_GET_RESINFO && op <= ShaderOpcode::IMAGE_GATHER4;
         });
     if (uses_image && ((user_data[3] >> 28u) & 0xfu) == 0) {
       user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;

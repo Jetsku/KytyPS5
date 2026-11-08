@@ -242,7 +242,27 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// The guest bytes of a range, staged for an image upload whatever buffer covers them (the
+	// caller knows the GPU wrote none of them; ObtainBufferForImage copies from such a buffer).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageGuestBytesForImage(uint64_t vaddr, uint64_t size);
+	// KYTY_PENDING_FILLS=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 bdab60022): a
+	// GPU fill (FillBuffer's GPU path, or a compute shader's uniform fill, both recorded as known
+	// fills) that found no image still holds for its range, the bytes of it that were not mapped
+	// then among them: a render or depth target created later inside it starts as the fill
+	// (TextureCache::ClearFromKnownFill) instead of what its memory holds then.
+	[[nodiscard]] static bool PendingFillsEnabled();
+	// GPU thread, for a target made over [vaddr, vaddr + size): the dword of the known fill that
+	// holds all of it, when the mapped bytes of it are all still GPU-written. `take` forgets the
+	// range from the fill, which keeps the rest of it for other images.
+	[[nodiscard]] bool FillOfNewImage(uint64_t vaddr, uint64_t size, uint32_t& value, bool take);
+	// KYTY_PENDING_FILLS: a write over [vaddr, vaddr + size) the other paths do not see (an image's
+	// GPU write, a CPU-path fill or copy), newer than the fills there.
+	void ForgetFillsUnder(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// GPU thread, KYTY_SPARSE_FILLS: a GPU fill of the mapped `spans` of a range with holes in its
+	// mappings (a compute shader's fill of sparse memory), as the hardware's writes land there;
+	// the holes, where the hardware drops the writes, are left alone.
+	void FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans, uint32_t value);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
 	// at its position in the GPU timeline and returns true; false leaves it to the CPU write.
 	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);
@@ -339,6 +359,10 @@ public:
 	void               SynchronizeBdaBuffers(const RangeSet& mapped_ranges);
 	// Map/unmap callers may run outside the GPU thread, under the mapped-range lock.
 	void               InvalidateBdaSynchronization() noexcept;
+	// KYTY_BDA_REGISTER_LOG: a new registered buffer's range, logged for the next BDA pass
+	// (ChangeRegister<true>); every other structure change goes through
+	// InvalidateBdaSynchronization.
+	void               NoteBdaRegistered(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
 	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
@@ -476,7 +500,10 @@ private:
 	// KYTY_BDA_DIRTY_LOG pass (SynchronizeBdaBuffersNow): synchronizes the ranges the tracker
 	// logged since the last pass (m_bda_dirtied) and the recorded hot runs, instead of every
 	// mapped buffer. False (nothing done) when a recorded hot run's buffer is gone.
-	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
+	// `registered` (KYTY_BDA_REGISTER_LOG, may be null): the ranges of buffers registered since the
+	// last pass, synchronized as well.
+	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges,
+	                                         const RangeSet* registered = nullptr);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
 	// KYTY_BUFFER_LOOKUP_STATS: the kind of the last SynchronizeBdaBuffersNow (BufferLookupStats::Part).
@@ -765,8 +792,24 @@ private:
 		uint64_t size       = 0;
 		bool     downloaded = false;
 	};
-	// The drain path: GPU thread only.
-	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+	// KYTY_ASYNC_DRAIN (adapted from usa-ratt/KytyPS5-GT7's KYTY_ASYNC_READBACK): the download a
+	// guest thread's drain records is submitted and the GPU thread goes on; the guest thread waits
+	// for its publication, then FinishAsyncDrain releases the window on the GPU thread.
+	struct AsyncDrain {
+		uint64_t tick         = 0; // 0: nothing to wait for (done, or drained synchronously)
+		uint64_t window_begin = 0;
+		uint64_t window_end   = 0;
+	};
+	[[nodiscard]] static bool AsyncDrainEnabled();
+	// The drain path: GPU thread only. With `async` (guest-thread faults only) a recorded download
+	// is submitted without waiting and its tick returned in *async.
+	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace,
+	                     AsyncDrain* async = nullptr);
+	// GPU thread, after the guest thread waited for async.tick's publication: the window's pages
+	// lose their GPU-written protection when nothing was written to them since (else the drain is
+	// redone synchronously), and a write's bytes become CPU-dirty, as the synchronous drain does.
+	void FinishAsyncDrain(uint64_t vaddr, uint64_t size, bool is_write, const AsyncDrain& async,
+	                      ReadMemoryTrace& trace);
 	// KYTY_CLEAN_PAGE=1 (adapted from usa-ratt/KytyPS5-GT7 ba83f1a64, its round 135), GPU thread:
 	// the faulting pages [page_begin, page_end) are no longer GPU-written for the tracker and hold
 	// no GPU-written bytes, no bytes of a readback or publication still to land, and no GPU-written
@@ -782,6 +825,13 @@ private:
 	// without a download, and true is returned. Without it the fault copies the window's other
 	// GPU-written ranges and waits for their writer.
 	[[nodiscard]] bool TryLiftFaultPages(uint64_t page_begin, uint64_t page_end);
+	// KYTY_CLEAN_READ=1 (default off; adapted from usa-ratt/KytyPS5-GT7 19b6c5cfb), GPU thread: a
+	// guest load of [vaddr, vaddr + size) faulted on a page protected because the GPU wrote other
+	// bytes of it. When none of these bytes is GPU-written, on its way back from the GPU (pending
+	// publication, early release), in a GPU-written image, or within reach of a running address-
+	// writing shader, copies them from guest memory into `data` and returns true: the fault
+	// handler completes the load with them and the page stays protected.
+	[[nodiscard]] bool TryReadCleanBytes(uint64_t vaddr, uint64_t size, void* data);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
@@ -827,6 +877,27 @@ private:
 	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
 	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
 	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);
+
+public:
+	// Colour metadata watches (KYTY_DCC_GPU_WIDE, TextureCache::TryMaterializeGpuMetadataClear; after
+	// usa-ratt/KytyPS5-GT7's WatchMetadata): WatchMetadata starts watching [vaddr, vaddr + size) as
+	// written by nothing since; any GPU write noted for the buffer cache (NoteBufferContentWrite),
+	// an upload of CPU-dirty bytes, a CPU-side invalidation or an unbounded GPU write over it marks it
+	// written. MetadataUnwritten: the exact range is watched, unwritten and not CPU-modified now.
+	// Byte-exact, unlike a buffer's content revision (any write anywhere in the buffer).
+	void               WatchMetadata(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool MetadataUnwritten(uint64_t vaddr, uint64_t size);
+
+private:
+	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
+	struct MetadataWatch {
+		uint64_t end     = 0;
+		bool     written = false;
+	};
+	std::mutex                        m_metadata_watch_mutex;
+	std::map<uint64_t, MetadataWatch> m_metadata_watches; // by first byte
+	uint64_t                          m_metadata_watch_span = 0;
+	std::atomic<size_t>               m_metadata_watch_count {0};
 	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
 	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
 	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,
@@ -1023,6 +1094,21 @@ private:
 	bool                                              m_bda_log_baseline = false;
 	int                                               m_bda_log_verify   = 0;
 	RangeSet                                          m_bda_dirtied;
+	// KYTY_BDA_REGISTER_LOG=1 (default off; needs KYTY_BDA_DIRTY_LOG; adapted from the GT7 fork's
+	// b970ba6fe, whose BDA walk visits only the regions where pages turned CPU-dirty or a buffer
+	// was registered since the last walk). A new registered buffer moves the structure epoch, and
+	// the pass after it used to scan every mapped buffer. With the log, a pass whose structure
+	// changed only by new buffers (the layout epoch, moved by unregistrations and GPU mapping
+	// changes, held) synchronizes the logged CPU-dirty ranges plus the new buffers' ranges.
+	// m_bda_registered and the structure epoch move together under m_bda_registered_mutex, so a
+	// pass takes the log with the epoch it accounts for.
+	bool                                              m_bda_register_log = false;
+	std::mutex                                        m_bda_registered_mutex;
+	RangeSet                                          m_bda_registered;
+	bool                                              m_bda_registered_overflow = false;
+	std::atomic_uint64_t                              m_bda_layout_epoch {1};
+	uint64_t                                          m_bda_scanned_layout_epoch = 0;
+	uint64_t                                          m_bda_register_passes      = 0;
 	struct BdaLogTotals {
 		uint64_t passes                = 0;
 		uint64_t ranges                = 0;

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -149,6 +150,36 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		return 1;
 	});
 	FaultCost::RunStartupBenchmark();
+	// KYTY_WAIT_ATTRIB: the command processor's op recording a GPU write (CpGaps' innermost op
+	// scope, needs KYTY_CP_GAP_STATS), and the guest mapping of a region.
+	FaultCost::SetOpDescriber([]() -> const char* {
+		auto* state = CpGaps::t_state;
+		if (state == nullptr) {
+			return "?";
+		}
+		const auto depth = std::min(state->ledger.Depth(), CpGaps::Ledger::MaxDepth);
+		for (uint32_t level = depth; level-- > 0;) {
+			switch (const auto cat = state->ledger.At(level)) {
+				case CpGaps::Cat::GpuWaitDrain:
+				case CpGaps::Cat::GpuWaitOcclusion:
+				case CpGaps::Cat::GpuWaitOther:
+				case CpGaps::Cat::RecorderWait:
+				case CpGaps::Cat::SubmitWait:
+				case CpGaps::Cat::TextureUpload:
+				case CpGaps::Cat::Protect:
+				case CpGaps::Cat::Fault:
+				case CpGaps::Cat::ProgPrepare:
+				case CpGaps::Cat::ProgKey:
+				case CpGaps::Cat::ProgMaterialize:
+				case CpGaps::Cat::ProgPermutation: continue;
+				default: return CpGaps::CatName(cat);
+			}
+		}
+		return "none";
+	});
+	FaultCost::SetRangeDescriber([](uint64_t vaddr, uint64_t* start, uint64_t* size, char* name, uint64_t name_size) {
+		return LibKernel::Memory::DescribeVirtualRange(vaddr, start, size, name, name_size);
+	});
 }
 
 RenderContext::~RenderContext() {
@@ -208,10 +239,21 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
 	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
+	// KYTY_WAIT_ATTRIB: the command processor's faults by call site, page state and region.
+	FaultCost::AttribScope attrib(access == PageFaultAccess::Write ? FaultCost::AttribKind::FaultWrite
+	                                                               : FaultCost::AttribKind::FaultRead,
+	                              FaultCost::InRetriedFault());
+	if (attrib.Active()) {
+		const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+		attrib.SetAddress(fault_vaddr);
+		attrib.AddFlags((m_buffer_cache.IsRegionGpuModifiedRelaxed(page, TRACKER_PAGE_SIZE) ? FaultCost::AttribBufferGpu : 0u) |
+		                (m_texture_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ? FaultCost::AttribImageGpu : 0u));
+	}
 	// Live cost numbers (faultCost.h); the slow-PC simulation's wait comes first, outside every lock.
 	const auto start = FaultCost::NowNs();
 	FaultCost::SimulateFault();
-	const bool               map = FaultCost::MapEnabled();
+	const bool               map   = FaultCost::MapEnabled();
+	const bool               split = map || attrib.Active();
 	FaultCost::FaultRecord   record;
 	MemoryStats::Count(access == PageFaultAccess::Write ? MemoryStats::Counter::WriteFaults
 	                                                    : MemoryStats::Counter::ReadFaults);
@@ -219,7 +261,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		// Both caches' releases of the page reach the host once, when the scope ends and no
 		// tracking lock is held (KYTY_DEFER_UNPROTECT).
 		const bool nested = PageManager::InDeferUnprotectScope();
-		if (map) {
+		if (split) {
 			FaultCost::MapInFault(true);
 		}
 		uint64_t mark = map ? FaultCost::NowNs() : 0;
@@ -246,7 +288,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			                         TRACKER_PAGE_SIZE, nested);
 		}
 		lap(FaultCost::Part::Reconcile);
-		if (map) {
+		if (split) {
 			FaultCost::MapInFault(false);
 		}
 		if (nested) {
@@ -260,6 +302,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.NoteCpFault(fault_vaddr, handler_ns); // KYTY_CP_FAULT_WRITERS
 	}
 	const bool found_dirty = access == PageFaultAccess::Write && MemoryTracker::TakeFaultFoundDirty();
+	if (found_dirty) {
+		attrib.AddFlags(FaultCost::AttribFoundDirty);
+	}
 	FaultCost::NoteFault(handler_ns);
 	if (map) {
 		record.address     = fault_vaddr;

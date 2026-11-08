@@ -1704,12 +1704,33 @@ static int32_t GsUserSgprAt(uint32_t location) {
 	return hs < 32u ? static_cast<int32_t>(32u + hs) : -1;
 }
 
+// KYTY_INDIRECT_VERTEX_BASE=1 (default off; upstream a833e1b73): an indirect draw's vertex
+// shader gets index VGPRs without the record's base vertex, as the GPU's are, and the base vertex
+// only in the GS user SGPR at BASE_VTX_LOC (none for SH_NOP). Off: Vulkan's vertex index, which
+// includes the base vertex, as before.
+static bool IndirectVertexBaseEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_VERTEX_BASE");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static void SetIndirectVertexBase(CommandProcessor& cp, uint32_t base_vertex_location) {
+	if (!IndirectVertexBaseEnabled()) {
+		return;
+	}
+	const auto id = base_vertex_location - Pm4::SPI_SHADER_USER_DATA_GS_0;
+	cp.GetShCtx().SetIndirectVertexBase(true, id < 32u ? static_cast<int32_t>(id) : -1);
+}
+
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
 	// Ported from chenxiao07/KytyPS5 3b351932d: only an indirect draw has the CP write a start
 	// instance (START_INST_LOC); the vertex shader is translated for it.
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
+	cp.GetShCtx().SetIndirectVertexBase(false, -1);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
 
@@ -1761,6 +1782,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const bool indexed        = (cmd_id == 0xc0032500);
 	// START_INST_LOC: the SH register the CP writes the arguments' start instance into.
 	cp.GetShCtx().SetStartInstanceUserSgpr(GsUserSgprAt(buffer[2] & 0xffffu));
+	SetIndirectVertexBase(cp, buffer[1] & 0xffffu);
 	// The native indexed packet enables the high-half first-index destination in word 3.
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
@@ -1780,6 +1802,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 
 	const auto data_offset        = buffer[0];
 	cp.GetShCtx().SetStartInstanceUserSgpr(GsUserSgprAt(buffer[2] & 0xffffu));
+	SetIndirectVertexBase(cp, buffer[1] & 0xffffu);
 	const auto count_indirect     = (buffer[3] >> 30u) & 0x1u;
 	const auto max_count_or_count = buffer[4];
 	auto*      count_addr         = reinterpret_cast<const volatile uint32_t*>(
@@ -1813,6 +1836,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0033500);
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
+	cp.GetShCtx().SetIndirectVertexBase(false, -1);
 
 	uint32_t max_index_size = buffer[0];
 	uint32_t index_offset   = buffer[1];
@@ -1833,6 +1857,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012d00);
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
+	cp.GetShCtx().SetIndirectVertexBase(false, -1);
 
 	uint32_t index_count = buffer[0];
 	uint32_t flags       = buffer[1];
@@ -1983,6 +2008,18 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	cp.SetFlip(f);
 	cp.Flip();
 	return 5;
+}
+
+// Experimental Pro mode (upstream 651ef73a0): libPsml's linear PSSR request.
+KYTY_CP_OP_PARSER(CpOpPssr) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+
+	const auto packet_dw = KYTY_PM4_LEN(cmd_id) - 1;
+	EXIT_NOT_IMPLEMENTED(packet_dw < Pssr::RequestDwords || packet_dw > dw);
+	Pssr::Request request {};
+	std::memcpy(&request, buffer, sizeof(request));
+	cp.ProcessPssr(request);
+	return packet_dw;
 }
 
 KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
@@ -2517,11 +2554,36 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
+	// Agc emits RELEASE_MEM as a private NOP (R_RELEASE_MEM); a guest-built native packet
+	// (upstream bf5dd62ee) has the same body, with ADDRESS_LO's low two bits reserved.
+	if (cmd_id == 0xc0064900) {
+		uint32_t body[7];
+		std::memcpy(body, buffer, sizeof(body));
+		body[2] &= ~0x3u;
+		cp.ReleaseMem(body);
+		return 7;
+	}
+
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
 	cp.ReleaseMem(buffer);
 
 	return 7;
+}
+
+KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+
+	const auto control = buffer[2];
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
+	                     (control >> 29u) < 6u);
+
+	auto* counter = reinterpret_cast<uint64_t*>(
+	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
+	// A signal updates the counter before the next packet, so its mailbox stall never waits.
+	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
+
+	return 3;
 }
 
 KYTY_CP_OP_PARSER(CpOpSetContextReg) {

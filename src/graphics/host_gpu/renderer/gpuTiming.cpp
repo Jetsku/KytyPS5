@@ -239,6 +239,38 @@ void OnGuestFlip() {
 		return static_cast<double>(calibration.steady_ns) + from_calibration;
 	};
 
+	// KYTY_GPU_SPAN_LOG=<path> (diagnostic, default off): one line per guest command buffer with
+	// its GPU start/end and its host record/submit/dispatch/observe times, in microseconds on the
+	// hang trace's clock (cp.csv t_us), so GPU idle gaps can be matched with CP and guest events.
+	static FILE*   span_log    = nullptr;
+	static int64_t span_offset = 0;
+	static const bool span_log_on = [] {
+		const auto* path = std::getenv("KYTY_GPU_SPAN_LOG");
+		if (path == nullptr || path[0] == '\0') {
+			return false;
+		}
+		span_log = std::fopen(path, "w");
+		if (span_log == nullptr) {
+			return false;
+		}
+		span_offset = static_cast<int64_t>(NowNs()) - static_cast<int64_t>(HangTrace::NowNs());
+		std::fprintf(span_log, "gpu_start_us,gpu_end_us,record_us,submit_us,dispatch_us,observed_us\n");
+		return true;
+	}();
+	if (span_log_on && calibration.valid) {
+		const auto rel = [](double steady_ns) {
+			return static_cast<long long>((steady_ns - static_cast<double>(span_offset)) / 1000.0);
+		};
+		for (const auto& span: spans) {
+			const auto& s = *span.sample;
+			std::fprintf(span_log, "%lld,%lld,%lld,%lld,%lld,%lld\n", rel(to_steady(span.start)),
+			             rel(to_steady(span.end)), rel(static_cast<double>(s.record_ns)),
+			             rel(static_cast<double>(s.submit_ns)), rel(static_cast<double>(s.dispatch_ns)),
+			             rel(static_cast<double>(s.observed_ns)));
+		}
+		std::fflush(span_log);
+	}
+
 	// Union of [start, end] spans. The cursor starts at the previous flip's union end, so an
 	// overlap with already-counted work is not counted twice and the gap from the previous
 	// flip's last completed span is attributed to this flip.

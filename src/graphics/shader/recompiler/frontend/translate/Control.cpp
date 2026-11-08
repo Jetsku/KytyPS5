@@ -96,8 +96,28 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	if (negate_result) {
 		result = ir.LogicalNot(result);
 	}
+	// KYTY_PS_EXEC_WORDS: the EXEC words combine bitwise (as the hardware's), the per-lane EXEC
+	// combines the per-lane masks, so helper lanes stay enabled per lane.
+	std::array<IR::U32, 2> mask {};
+	if (ExecWordsExcludeHelpers()) {
+		const std::array old_words {ir.GetExecLo(), ir.GetExecHi()};
+		const auto       src_words = ReadU32Pair(inst.src0);
+		for (size_t half = 0; half < 2; half++) {
+			const auto lhs_word = negate_exec ? ir.BitwiseNot(old_words[half]) : old_words[half];
+			const auto rhs_word = negate_source ? ir.BitwiseNot(src_words[half]) : src_words[half];
+			auto word = operation == IR::ValueOpcode::LogicalAnd  ? ir.BitwiseAnd(lhs_word, rhs_word)
+			            : operation == IR::ValueOpcode::LogicalOr ? ir.BitwiseOr(lhs_word, rhs_word)
+			                                                      : ir.BitwiseXor(lhs_word, rhs_word);
+			if (negate_result) {
+				word = ir.BitwiseNot(word);
+			}
+			mask[half] = program.wave_size == 64u || half == 0 ? word : IR::U32(IR::Value(0u));
+		}
+	}
 	WriteMask(inst.dst, old, true);
-	const auto mask = BallotMask(result);
+	if (!ExecWordsExcludeHelpers()) {
+		mask = BallotMask(result);
+	}
 	ir.SetExec(result);
 	ir.SetExecLo(mask[0]);
 	ir.SetExecHi(mask[1]);

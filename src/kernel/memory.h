@@ -6,6 +6,8 @@
 #include "common/virtualMemory.h"
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -28,9 +30,10 @@ struct DebugStats {
 	uint64_t flexible_total      = 0;
 	uint64_t flexible_used       = 0;
 	uint64_t pool_committed      = 0;
-	uint64_t cpu_page_entries    = 0; // 2 MiB page-table entries in use.
-	uint64_t gpu_page_entries    = 0;
-	uint64_t page_entries_total  = 0; // Per side.
+	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries       = 0;
+	uint64_t cpu_page_entries_total = 0;
+	uint64_t gpu_page_entries_total = 0;
 };
 [[nodiscard]] DebugStats GetDebugStats();
 
@@ -194,6 +197,9 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 [[nodiscard]] bool     IsCommittedSpan(uint64_t vaddr, uint64_t size);
 // The unhandled-fault report: what the kernel and the GPU tracker know about an address.
 [[nodiscard]] std::string DescribeAddressForCrash(uint64_t vaddr);
+// The guest virtual range containing vaddr: start, size and the name the guest gave it (diagnostics).
+[[nodiscard]] bool     DescribeVirtualRange(uint64_t vaddr, uint64_t* start, uint64_t* size, char* name,
+                                            uint64_t name_size);
 // The committed, non-private, GPU-mapped allocation containing vaddr; false for anything else.
 [[nodiscard]] bool     GetGpuBufferMapping(uint64_t vaddr, uint64_t* start, uint64_t* size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
@@ -218,6 +224,13 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.
 [[nodiscard]] uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size);
+// The committed parts of [vaddr, vaddr + size), adjacent ones merged, in order, as (start, size):
+// where a GPU write over a range with holes in its mappings (sparse memory) lands. At most
+// max_spans; false (and none) when there are more. Any thread.
+[[nodiscard]] bool CommittedSpans(uint64_t vaddr, uint64_t size, size_t max_spans,
+                                  std::vector<std::pair<uint64_t, uint64_t>>* spans);
+// From vaddr to the end of the last committed byte of [vaddr, vaddr + size); 0 when none is.
+[[nodiscard]] uint64_t CommittedExtent(uint64_t vaddr, uint64_t size);
 // The guest virtual ranges' change generation (advanced before every change starts; 0 before
 // they exist). Unchanged since a read made before a ClampRangeSize call: the call's answer holds.
 [[nodiscard]] uint64_t VirtualRangesGeneration() noexcept;
@@ -290,6 +303,11 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
+// Loaded modules' segments use flexible memory without taking its backing.
+// Charged only with KYTY_UPSTREAM_MEMORY_DEFAULTS=1; returns the size charged (0 otherwise).
+uint64_t ChargeFlexibleMemory(uint64_t size);
+void ReleaseFlexibleMemory(uint64_t size);
+
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,

@@ -22,7 +22,7 @@ public:
 	explicit MainDialog(QWidget* parent = nullptr);
 	~MainDialog() override = default;
 
-	void RunInterpreter(QProcess* process, const Configuration& info);
+	void RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal);
 
 	// u59-preset.json was not applied: a warning line in the window, and a message box once the
 	// emulator was found.

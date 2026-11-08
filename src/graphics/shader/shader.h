@@ -211,6 +211,11 @@ struct ShaderVertexInputInfo {
 	// Last: journals and pipeline lists store the fields before them (ShaderStoredInputInfoSize).
 	uint32_t                param_alias_mask = 0;
 	std::array<uint32_t, 32> param_alias_source {};
+	// KYTY_INDIRECT_VERTEX_BASE (upstream a833e1b73): an indirect draw's vertex index excludes its
+	// record's base vertex, which goes only to this user SGPR (s8 + GS user data index; -1: none).
+	// Not stored in journals and lists (a later build recompiles such a program).
+	bool                    indirect_vertex_base = false;
+	int32_t                 base_vertex_sgpr     = -1;
 };
 
 // Bytes of an input info that shader journals and pipeline lists store. A vertex input info is
@@ -238,6 +243,10 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	// Last before the runtime field: the fields above keep the offsets older shader journals and
 	// pipeline lists stored.
 	bool               async_compute              = false;
+	// KYTY_INDIRECT_THREADS_GPU: a thread-dimension DISPATCH_INDIRECT whose thread counts the
+	// shader reads from GPU memory; the dispatch-thread shader data dwords hold their device
+	// address instead of the counts. In the padding before the runtime field (stored size kept).
+	bool               dispatch_dimensions_indirect = false;
 	ShaderStageRuntime stage;
 };
 
@@ -271,8 +280,16 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
-	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
-	uint32_t                                       lds_size_dwords              = 0;
+	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS); at most 255 * 128
+	// dwords, so 16 bits. The two bytes after it were its always-zero high half in stored journals
+	// and pipeline lists.
+	uint16_t                                       lds_size_dwords              = 0;
+	// KYTY_INT_MRT_OUTPUTS (upstream 26ca60923): exports to UINT and SINT targets, which take
+	// integer outputs of the same signedness. In the old high half of lds_size_dwords (the padding
+	// before `stage` holds the ObjPrimID fields); journals and pipeline lists read them as zero
+	// (ShaderSanitizeStoredInputInfo).
+	uint8_t                                        target_uint_mask             = 0;
+	uint8_t                                        target_sint_mask             = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
@@ -314,6 +331,11 @@ struct ShaderPixelInputInfo {
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 	bool HasObjprimOutput() const { return objprim_slot < 8u; }
 };
+// Journals and pipeline lists store the whole pixel input info: the masks above must stay in padding.
+static_assert(offsetof(ShaderPixelInputInfo, target_uint_mask) == offsetof(ShaderPixelInputInfo, lds_size_dwords) + 2,
+              "ShaderPixelInputInfo: the integer target masks must stay in lds_size_dwords' old high half");
+static_assert(offsetof(ShaderPixelInputInfo, stage) == 216,
+              "ShaderPixelInputInfo layout changed: stored journals and pipeline lists would break");
 
 // Journals and pipeline lists written before async_compute / parameter_mode existed hold padding
 // bytes where those fields now sit (sizeof did not change). Called after a stored input info is
@@ -329,6 +351,8 @@ inline void ShaderSanitizeStoredInputInfo(ShaderPixelInputInfo& info) {
 	info.objprim_slot           = 0xffu;
 	info.objprim_push_dword     = 0xffu;
 	info.objprim_add_prim_id    = false;
+	info.target_uint_mask       = 0;
+	info.target_sint_mask       = 0;
 }
 inline void ShaderSanitizeStoredInputInfo(ShaderVertexInputInfo& info) {
 	info.clip_space.vte_format = 0;

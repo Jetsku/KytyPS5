@@ -1186,6 +1186,129 @@ void CallExpanderRefreshes() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+// KYTY_CALL_LEARN (adapted from usa-ratt/KytyPS5-GT7 8b76a992a): a table call over the bound is
+// expanded with the targets its dispatches reported (at most learn_variants, in report order);
+// every other target reports itself (MissReport) and is skipped. A table within the bound, or
+// the mode off, leaves the program to Expand.
+void CallExpanderLearns() {
+  constexpr const char *name = "CallExpanderLearns";
+  constexpr uint64_t DataBase = 0x0000000150000000ull;
+  constexpr uint64_t CalleeBase = 0x0000000160000000ull;
+  static TestCallees callees;
+  static std::vector<u32> callee_words;
+  callee_words = callees.words;
+  static std::vector<u32> data;
+  data.assign(0x200 / 4, 0u);
+  const uint64_t table = DataBase + 0x100;
+  data[0] = static_cast<u32>(table);
+  data[1] = static_cast<u32>(table >> 32u);
+  data[2] = 3u * 16u;
+  for (u32 index = 0; index < 3u; ++index) {
+    const auto function = TestCallees::Address(CalleeBase, index);
+    data[0x100 / 4 + index * 4 + 0] = static_cast<u32>(function);
+    data[0x100 / 4 + index * 4 + 1] = static_cast<u32>(function >> 32u);
+  }
+  FakeGuestMemory memory;
+  memory.regions = {{DataBase, &data}, {CalleeBase, &callee_words}};
+  std::vector<u32> code;
+  code.push_back(EncodeSmem0(0x02, 72, 2)); // s_load_dwordx4 s[72:75], s[4:5], 0
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 36));
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu);
+  AppendEnd(&code);
+  std::array<u32, 8> user_data{};
+  user_data[4] = static_cast<u32>(DataBase);
+  user_data[5] = static_cast<u32>(DataBase >> 32u);
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.shader_hash = 0x5ca11ab1e0000003ull;
+  options.user_data = user_data;
+  const uint64_t base = 0x0000000180000000ull;
+  const u32 marker = ShaderRecompiler::Decoder::EncodeCallStateWord(
+      ShaderRecompiler::Decoder::CallStateOp::MissReport, 1u);
+  const auto reports = [&](const std::vector<u32> &words) {
+    for (size_t i = 0; i + 1u < words.size(); ++i) {
+      if (words[i] == marker && words[i + 1u] == 14u) return true;
+    }
+    return false;
+  };
+  const auto key = [](uint64_t target) { return static_cast<u32>(target) | 1u; };
+
+  ShaderRecompiler::ShaderCallExpander expander;
+  expander.learn = true;
+  expander.learn_over = 1;
+  expander.learn_variants = 2;
+  ShaderRecompiler::CallPartitionRun probe, first, again, capped;
+  Require(name, "probe",
+          expander.Partition(code, base, options, memory.Reader(), probe) && probe.parts.size() == 1u &&
+              probe.parts[0].target == 0 && probe.parts[0].code != nullptr &&
+              reports(*probe.parts[0].code) &&
+              !ShaderRecompiler::Decoder::MayCallFunctions(*probe.parts[0].code),
+          "a table over the bound did not run the reporting expansion first");
+  const std::array<u32, 1> a{key(TestCallees::Address(CalleeBase, 1))};
+  expander.ReportPartitionKeys(probe.program, a);
+  Require(name, "learned",
+          expander.Partition(code, base, options, memory.Reader(), first) && first.parts.size() == 1u &&
+              first.parts[0].target == TestCallees::Address(CalleeBase, 1) &&
+              first.parts[0].code->size() > probe.parts[0].code->size() && reports(*first.parts[0].code),
+          "a reported target was not placed in the next expansion");
+  Require(name, "kept",
+          expander.Partition(code, base, options, memory.Reader(), again) &&
+              again.parts[0].code == first.parts[0].code,
+          "an unchanged learned set expanded the program again");
+  // One report set at a time, so the report order is callee 1, 2, 0.
+  const std::array<u32, 1> second{key(TestCallees::Address(CalleeBase, 2))};
+  const std::array<u32, 1> third{key(TestCallees::Address(CalleeBase, 0))};
+  expander.ReportPartitionKeys(probe.program, second);
+  expander.ReportPartitionKeys(probe.program, third);
+  Require(name, "capped",
+          expander.Partition(code, base, options, memory.Reader(), capped) &&
+              capped.parts[0].digest != first.parts[0].digest &&
+              capped.parts[0].target == TestCallees::Address(CalleeBase, 1) &&
+              capped.parts[0].code->size() > first.parts[0].code->size(),
+          "the second reported target was not added, or the bound was ignored");
+  {
+    // learn_variants 2: the third reported target (callee 0) stays out. A run with all three placed
+    // is longer still.
+    ShaderRecompiler::ShaderCallExpander all;
+    all.learn = true;
+    all.learn_over = 1;
+    all.learn_variants = 3;
+    ShaderRecompiler::CallPartitionRun run;
+    (void)all.Partition(code, base, options, memory.Reader(), run);
+    const std::array<u32, 3> every{key(TestCallees::Address(CalleeBase, 1)),
+                                   key(TestCallees::Address(CalleeBase, 2)),
+                                   key(TestCallees::Address(CalleeBase, 0))};
+    all.ReportPartitionKeys(run.program, every); // one set: added in table order
+    Require(name, "bound",
+            all.Partition(code, base, options, memory.Reader(), run) &&
+                run.parts[0].code->size() > capped.parts[0].code->size(),
+            "KYTY_CALL_VARIANTS did not bound the learned targets");
+  }
+  {
+    ShaderRecompiler::ShaderCallExpander off;
+    off.learn = false;
+    ShaderRecompiler::CallPartitionRun run;
+    Require(name, "off",
+            ShaderRecompiler::CallPartitionsEnabled() ||
+                !off.Partition(code, base, options, memory.Reader(), run),
+            "the learned mode ran while off");
+    ShaderRecompiler::ShaderCallExpander within;
+    within.learn = true;
+    within.learn_over = 3;
+    Require(name, "within the bound",
+            ShaderRecompiler::CallPartitionsEnabled() ||
+                !within.Partition(code, base, options, memory.Reader(), run),
+            "a table within the bound took the learned mode");
+  }
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
@@ -1232,6 +1355,7 @@ void RunAll(VulkanHarness *vulkan) {
   options.shader_calls = true;
   ScopedCodegenOptions scope(options);
   CallExpanderRefreshes();
+  CallExpanderLearns();
   vulkan->CheckCallTableDispatch();
   RunCase(vulkan, CallTableExpanded());
 }

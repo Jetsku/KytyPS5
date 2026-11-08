@@ -543,6 +543,11 @@ struct CodegenOptions {
 	// load of a kDepth k16UInt T# reads the D16 surface's codes: the host binds it as UNorm and the
 	// shader converts back (ReadsDepthBits). Before, such loads failed the depth view check (null).
 	bool depth_bits_read = false;
+	// KYTY_SRT_IMAGE_REACH=1 (default off; upstream 9801fd862): an image that only unreached blocks
+	// use reads a zero descriptor even when its descriptor source is live through another resource,
+	// and an indirect image's table key is then not evaluated (an unreached image's key can be
+	// garbage, which refused the draw). Off: every image of a live source is materialized.
+	bool srt_image_reach = false;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
@@ -597,6 +602,23 @@ struct CodegenOptions {
 	// three more) were skipped because a V_CMP to s11 looked like a write of their SRT pointer s12.
 	// Only programs whose trace failed change; not in the fingerprint (as KYTY_SHADER_CALLS).
 	bool call_trace_wave32 = false;
+	// KYTY_CALL_LOOP_CAP=<n> (default 0: off; adapted from usa-ratt/KytyPS5-GT7 08197df0b,
+	// 7e695ec62 and 655faf07e): a placed callee body with a back edge and no barrier
+	// (Decoder::ExpandShaderCalls) is bracketed by two S_NOPs (Decoder::ShaderCallLoopBodyBegin /
+	// End), and the loops whose headers lie in such a body draw on one per-invocation budget of <n>
+	// rounds: once it is spent, the invocation takes each such loop's exit edge (the loops around
+	// the call are left alone, so every remaining target is still called). GT7's lit material
+	// functions walk a per-pixel light list whose length they read from an image; a length from data
+	// the emulator does not reproduce ran up to 65,535 rounds a pixel and lost the device.
+	uint32_t call_loop_cap = 0;
+	// KYTY_CALL_LOOPS=0 (default 1): callee bodies with a back edge are left out of the expansions
+	// (their calls take the skip path) instead of being placed.
+	bool call_loops = true;
+	// KYTY_CALL_WATERFALL_CLEAR=1 (default off): a call inside a waterfall that keeps its "lanes
+	// left" flag in a VGPR (cleared before the call, tested after the exec restore, the loop
+	// repeated: Decoder::ExpandShaderCalls) clears the flag again where the call returns, so a callee
+	// that leaves it set does not repeat its lanes forever (GT7's material pass lost the device).
+	bool call_waterfall_clear = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
@@ -673,6 +695,15 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_INT_MRT_OUTPUTS=1 (default off; upstream 26ca60923): pixel exports to UINT and SINT render
+	// targets are typed as integer vectors of the target's signedness (Vulkan requires the output
+	// type to match the attachment's numeric type); compressed 16-bit exports to SINT targets are
+	// sign-extended instead of unpacked as FP16. Off: only 32_ABGR exports are unsigned vectors.
+	bool int_mrt_outputs = false;
+	// KYTY_UFLOAT_STORE_RTZ=1 (default off; upstream 59d8256b3): formatted buffer stores to 11/10-bit
+	// unsigned floats truncate (round toward zero through f16) and store negatives and NaN as zero.
+	// Off: round to nearest even, KYTY_FLOAT_STORE_CLAMP overflow, NaN kept.
+	bool ufloat_store_rtz = false;
 	// KYTY_RT_STUB=1: translate IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (MIMG
 	// 0xe6/0xe7) as "no intersection" for every lane instead of skipping compute dispatches that
 	// contain them (and failing other stages). A box node returns four invalid child pointers
@@ -736,12 +767,26 @@ struct CodegenOptions {
 	// placeholder and is requested, and the host resolves it like a heap key. Off: such a program
 	// is skipped ("descriptor computed at runtime without a BDA path"), as before.
 	bool runtime_images = false;
+	// KYTY_RUNTIME_INT_IMAGES=1 (default 0; needs KYTY_RUNTIME_IMAGES; adapted from usa-ratt/
+	// KytyPS5-GT7 2fa6c6514): a load (IMAGE_LOAD*, not a sample) of a runtime image whose T# has an
+	// integer format reads the texture through an alias of its bindless array with that component
+	// type (uint or sint), and the host resolves such T#s into the runtime heap with integer views.
+	// Off: such a load reads the pending placeholder (zeros), as before.
+	bool runtime_int_images = false;
 	// KYTY_BINDLESS_STRIDE=1 (default 0; on in the GT7 title preset; adapted from
 	// usa-ratt/KytyPS5-GT7 a6cd035f0): a bindless heap T# selected as key * stride (an immediate
 	// multiply, or a shift other than 5) with a 4-byte-aligned stride of at least 32 bytes (GT7's
 	// 188-byte material records) is looked up like a plain heap; the host reads key k's T# at
 	// table_offset + k * stride. Off: only 32-byte T# arrays, as before.
 	bool bindless_strided = false;
+	// KYTY_BINDLESS_SAMPLERS=1 (default 0; on in the GT7 title preset; a minimal port of Senaxx's
+	// mirrored sampler heaps, 59cb8a83e and 269b12f77): the S# beside a bindless or runtime image
+	// that the shader reads from a sampler heap at a key it computes (four scalar reads of one V# at
+	// key * stride + offset, stride 16 or more) samples with the game's own sampler instead of the
+	// linear/wrap stand-in: the host mirrors the heap's S# records into a sampler array (set 1,
+	// binding 6) and the shader indexes it with the key. Keys outside the heap, and heaps the host
+	// cannot read, use the stand-in (slot 0). Off: the stand-in for every such sampler, as before.
+	bool bindless_samplers = false;
 	// KYTY_CALL_TRACE_REACH=1 (default 0; on in the GT7 title preset; adapted from
 	// usa-ratt/KytyPS5-GT7 a6cd035f0): when the S_SWAPPC_B64 table trace finds no unique definition
 	// of a register range across control flow, it asks the instruction-level control flow graph:
@@ -841,6 +886,25 @@ struct CodegenOptions {
 	// own group's image by the workgroup id. Off: such a program is skipped ("computes a descriptor
 	// at runtime that has no BDA path"), as before.
 	bool workgroup_images = false;
+	// KYTY_TABLE_KEY_BOUNDS=1 (default off; adapted from upstream KytyPS5 dfcf1c0b0, 20bb268a4,
+	// a3ac6d0d3 and b2053c286): an address-table image key that neither a bit scan nor a bounded
+	// loop covers is enumerated up to a constant maximum proven from its value (truncated clamped
+	// float arithmetic, signed/unsigned minimums, masks, shifts, waterfall ReadFirstLane of a
+	// bounded lane value) or from guards on the access (key < C, key <= C); failing that, a
+	// zero-based per-lane loop key takes the runtime count every uniform zero-based loop of the
+	// program shares (a heuristic, logged). Off: such programs are skipped or go bindless, as before.
+	bool table_key_bounds = false;
+	// KYTY_NATIVE_WAVE64_BRANCH=1 (default off; Senaxx 49723097f): a wave64 compute or mesh program
+	// on a 64-wide host subgroup (AMD) takes a ballot for its VCC/EXEC/SCC branches, so the wave
+	// branches as one, as the emulated two-half path does on 32-wide hosts. Off: each lane branches
+	// on its own bit there (no effect on NVIDIA, whose subgroups are 32 wide).
+	bool native_wave64_branch = false;
+	// KYTY_SAMPLER_READS_DEFER=1 (default off; the GT7 preset after testing): with bindless images, an
+	// S_BUFFER_LOAD S# read that feeds only sampler handles is collected after the walk (and only if an
+	// ordinary sampler still uses it), so a bindless or stand-in sampler plan no longer strands it as a
+	// buffer resource whose V# words dead code elimination removed (materialization failed). Off: the
+	// walk collects it in place, as before (other titles' binding layouts stay as they were).
+	bool sampler_reads_deferred = false;
 	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (default exact; strxno/KytyPS5-GT7 220abc01c,
 	// 39a4bc75b): on a device without DenormFlushToZero for f32 (the RTX 3090 and 4090 drivers),
 	// skip the shader-side denormal flushes in pixel, compute or geometry (vertex, local, mesh,
@@ -849,6 +913,14 @@ struct CodegenOptions {
 	// conversions. Off, a denormal there stays denormal instead of reading as a signed zero
 	// (rcp(denormal) is then a large finite value, not an infinity). Bits: DenormFlushSkip*.
 	uint8_t denorm_flush_skip = 0;
+	// KYTY_PS_EXEC_WORDS=1 (adapted from upstream 5429888d4): a pixel shader's EXEC and VCC words
+	// leave out the helper lanes the per-lane EXEC keeps for derivatives: the entry words are the
+	// live lanes, VALU masks are limited to the EXEC words, SAVEEXEC combines the words bitwise.
+	bool ps_exec_words = false;
+	// KYTY_FRACT_CLAMP=1 (default off; upstream e864cb20b): V_FRACT_F16/F32/F64 results are clamped
+	// below one (the largest value under 1.0 in the destination precision), as the hardware returns
+	// for a tiny negative source where x - floor(x) rounds to 1.0. One compare and select per fract.
+	bool fract_clamp = false;
 };
 inline constexpr uint8_t DenormFlushSkipPixel    = 1u;
 inline constexpr uint8_t DenormFlushSkipCompute  = 2u;

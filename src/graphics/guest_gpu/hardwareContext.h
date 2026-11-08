@@ -628,6 +628,10 @@ struct VertexShaderInfo {
 	// The GS user SGPR the CP writes the draw's start instance into: an indirect draw's
 	// START_INST_LOC (-1: none; 32 + n: HS user SGPR n, for a tessellated draw).
 	int32_t start_instance_user_sgpr = -1;
+	// KYTY_INDIRECT_VERTEX_BASE: an indirect draw's index VGPR excludes its record's base vertex,
+	// which the CP writes only to the GS user SGPR at BASE_VTX_LOC (-1: none, or the switch off).
+	bool    indirect_vertex_base   = false;
+	int32_t base_vertex_user_sgpr  = -1;
 };
 
 struct PixelShaderInfo {
@@ -1160,6 +1164,10 @@ public:
 	}
 
 	void SetStartInstanceUserSgpr(int32_t id) { m_vs.start_instance_user_sgpr = id; }
+	void SetIndirectVertexBase(bool indirect, int32_t base_vertex_sgpr) {
+		m_vs.indirect_vertex_base  = indirect;
+		m_vs.base_vertex_user_sgpr = indirect ? base_vertex_sgpr : -1;
+	}
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

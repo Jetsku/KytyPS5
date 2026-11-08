@@ -153,6 +153,11 @@ struct PreparedDraw {
 	ShaderPixelInputInfo                                pixel_info;
 	PipelineCache::StagePrep                            vertex_prep;
 	PipelineCache::StagePrep                            pixel_prep;
+	// KYTY_DRAW_PREP_TESS: 3 for a tessellated draw, whose LS stage is vertex_info/vertex_prep and
+	// whose HS and TES stages are tess_info/tess_prep; 1 otherwise.
+	uint32_t                                            vertex_stages = 1;
+	std::array<ShaderVertexInputInfo, 2>                tess_info;
+	std::array<PipelineCache::StagePrep, 2>             tess_prep;
 	ReadSet                                             reads;
 	uint64_t                                            coherence_generation  = 0;
 	uint64_t                                            shader_map_generation = 0;
@@ -366,6 +371,27 @@ public:
 	// Per-packet hook of the command processor (before the packet's handler runs). fence_kind
 	// only matters for a fence (counted as FrameEvent DrawPrepFence<kind>).
 	void OnPacket(PacketClass packet_class, FenceKind fence_kind = FenceKind::Other);
+
+	// KYTY_DRAW_PREP_FENCE_OVERLAP=1 (default off; parallel mode, KYTY_CP_SEQ=0): a single-record
+	// indirect draw (with KYTY_DRAW_PREP_INDIRECT, default on) and a direct dispatch (with
+	// KYTY_DRAW_PREP_DISPATCH=1) no longer commit the window before their handler. The handler
+	// publishes the packet's preparation (PublishIndirect / PublishDispatch, from the registers it
+	// executes with) behind the pending draws, commits those (DrainBefore), and then executes the
+	// packet with the head slot offered (ExecuteIndirect / ExecuteDispatch). A worker prepares the
+	// packet's programs while the command processor records the draws before it; the order of
+	// execution is unchanged, and the preparation is used only under the same certificate as with
+	// the sequencer (Validate / ValidateDispatch). Without pending draws the command processor
+	// prepares the head itself (ReadyHead), as for any unclaimed head.
+	// Open: with KYTY_DRAW_PREP_VERIFY=1 a GT7 race logged 7 committed preparations (indirect draws)
+	// whose vertex or pixel resources differed from the serial ones (programs equal); not explained
+	// yet. GT7 CP time did not drop either (serial work moved into head waits), so it stays off.
+	[[nodiscard]] static bool FenceOverlapEnabled();
+	// Fence-overlap: OnPacket for the deferred fence (counted, nothing committed).
+	void NoteDeferredFence(FenceKind fence_kind);
+	// Commits pending draws in order up to, not including, window position `position`.
+	void DrainBefore(uint64_t position);
+	// Commits the head draw (a full window while the command processor publishes in direct mode).
+	void CommitOne();
 
 	struct Slot;
 

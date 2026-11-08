@@ -13,6 +13,16 @@ inline constexpr uint32_t BindlessImagesCube    = 2;
 inline constexpr uint32_t BindlessImages3D      = 3;
 inline constexpr uint32_t BindlessTranslation   = 4;
 inline constexpr uint32_t BindlessFeedback      = 5;
+// KYTY_BINDLESS_SAMPLERS (Senaxx's mirrored sampler heaps): samplers mirrored from guest sampler
+// heaps (S# records); slot 0 is the stand-in sampler (BindlessDefaultSampler). The binding exists
+// only with the switch.
+inline constexpr uint32_t BindlessSamplers      = 6;
+// The S# of the stand-in sampler: wrap on every axis, trilinear, full LOD range.
+inline constexpr uint32_t BindlessDefaultSampler[4] = {
+    0x00000000u,                             // wrap on every axis
+    0xfffu << 12u,                           // max_lod 255.9
+    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
+    0x00000000u};
 // KYTY_RUNTIME_IMAGES (adapted from usa-ratt/KytyPS5-GT7 2fa6c6514): images whose T# the shader
 // loads at run time (ImageResource::runtime). The table maps a T# to its translation entry:
 // RuntimeImageEntries entries of RuntimeImageEntryWords words, the eight T# dwords, the

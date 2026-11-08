@@ -71,10 +71,17 @@ void CountCoherentProgram(const EmitterState& state, bool per_access) {
 	Log::WriteToConsoleAndLog(text);
 }
 
+bool DispatchDimensionsIndirect(const EmitterState& state) {
+	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
+	       state.input_info.compute->dispatch_dimensions_indirect &&
+	       state.program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+}
+
 bool UsesPhysicalAddresses(const EmitterState& state) {
 	// Guest address accesses (DMA), or a mesh program that may read its draw dwords from a native
-	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params).
-	return state.program.info.uses_dma ||
+	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params), or a compute program
+	// that reads its thread counts through a device address (KYTY_INDIRECT_THREADS_GPU).
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
 	       state.program.bindings.call_state_dword != IR::PushData::NoStart ||
 	       (state.program.stage == ShaderType::Mesh && GetCodegenOptions().mesh_indirect_params);
 }
@@ -314,6 +321,17 @@ void DefineBindlessImages(EmitterState& state) {
 			continue;
 		}
 		images.push_back(image);
+		// KYTY_RUNTIME_INT_IMAGES: a runtime T# may name an integer texture; its loads read the slot
+		// through an alias of the binding with the texture's component type (EmitImage).
+		if (image.runtime && GetCodegenOptions().runtime_int_images) {
+			for (const auto numeric_class:
+			     {Prospero::TextureNumericClass::Uint, Prospero::TextureNumericClass::Sint}) {
+				auto alias          = image;
+				alias.numeric_class = numeric_class;
+				alias.depth_compare = false;
+				images.push_back(alias);
+			}
+		}
 		// KYTY_BINDLESS_3D_AS_ARRAY: a 3D image instruction may get a 2D or 2D-array T#
 		// (BindlessSlotArrayFlag); it reads the 2D-array array too.
 		if (BindlessVolumeMayBeArray(image)) {
@@ -345,6 +363,25 @@ void DefineBindlessImages(EmitterState& state) {
 		                            IR::BindlessDescriptorSet);
 		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
 		state.bindless_image_variables[type] = variable;
+		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireVersion(0x00010500u);
+	}
+	// KYTY_BINDLESS_SAMPLERS: the samplers the host mirrors from guest sampler heaps.
+	if (state.bindless_sampler_variable == 0 &&
+	    std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless)) {
+		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray,
+		                                         state.builder.Type(spv::OpTypeSampler));
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassUniformConstant, array),
+		    spv::StorageClassUniformConstant);
+		state.builder.AddName(variable, "bindless_samplers");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
+		                            IR::BindlessSamplers);
+		state.bindless_sampler_variable = variable;
 		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
@@ -659,47 +696,23 @@ uint32_t GlslStd450(EmitterState& state) {
 	return state.builder.Import("GLSL.std.450");
 }
 
-VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
+Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
 	if ((state.program.stage != ShaderType::Vertex && state.program.stage != ShaderType::Local) ||
 	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
-		return VertexInputScalarKind::Float;
+		return Format::ComponentType::Float;
 	}
-
-	switch (state.input_info.vertex->resources[location].Format()) {
-		case Prospero::BufferFormat::k8UInt:
-		case Prospero::BufferFormat::k16UInt:
-		case Prospero::BufferFormat::k8_8UInt:
-		case Prospero::BufferFormat::k32UInt:
-		case Prospero::BufferFormat::k16_16UInt:
-		case Prospero::BufferFormat::k8_8_8_8UInt:
-		case Prospero::BufferFormat::k32_32UInt:
-		case Prospero::BufferFormat::k16_16_16_16UInt:
-		case Prospero::BufferFormat::k32_32_32UInt:
-		case Prospero::BufferFormat::k32_32_32_32UInt: return VertexInputScalarKind::Uint;
-		case Prospero::BufferFormat::k8SInt:
-		case Prospero::BufferFormat::k16SInt:
-		case Prospero::BufferFormat::k8_8SInt:
-		case Prospero::BufferFormat::k32SInt:
-		case Prospero::BufferFormat::k16_16SInt:
-		case Prospero::BufferFormat::k8_8_8_8SInt:
-		case Prospero::BufferFormat::k32_32SInt:
-		case Prospero::BufferFormat::k16_16_16_16SInt:
-		case Prospero::BufferFormat::k32_32_32SInt:
-		case Prospero::BufferFormat::k32_32_32_32SInt: return VertexInputScalarKind::Sint;
-		default: return VertexInputScalarKind::Float;
-	}
+	return Format::GetFormatComponentType(state.input_info.vertex->resources[location].Format());
 }
 
 uint32_t VertexParameterComponentCount(const InputBinding& input) {
 	return std::clamp(input.component_count, 1u, 4u);
 }
 
-uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind) {
+uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind) {
 	switch (kind) {
-		case VertexInputScalarKind::Sint: return TypeI32(state);
-		case VertexInputScalarKind::Uint: return TypeU32(state);
-		case VertexInputScalarKind::Float:
+		case Format::ComponentType::Sint: return TypeI32(state);
+		case Format::ComponentType::Uint: return TypeU32(state);
 		default: return TypeF32(state);
 	}
 }
@@ -723,6 +736,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::TessCoord: return spv::BuiltInTessCoord;
 		case IR::StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
 		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
+		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
 		case IR::StageInputKind::FragCoord: return spv::BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
 		case IR::StageInputKind::Layer: return spv::BuiltInLayer;
@@ -844,6 +858,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::BaseInstance:
+			case IR::StageInputKind::BaseVertex:
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
@@ -1046,12 +1061,19 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
+				auto type = TypeF32Vector(state, 4);
+				if (binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				    binding.index < std::size(state.input_info.pixel->target_output_mode)) {
+					// KYTY_INT_MRT_OUTPUTS=1 (upstream 26ca60923): UINT and SINT targets take integer
+					// outputs of their signedness (ExportVector's type, spirvEmitterFlow.cpp).
+					const auto mode = state.input_info.pixel->target_output_mode[binding.index];
+					if (GetCodegenOptions().int_mrt_outputs) {
+						type = mode != 0u ? MrtOutputType(state, binding.index) : type;
+					} else if (mode == 7u) {
+						type = TypeU32Vector(state, 4);
+					}
+				}
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -1166,7 +1188,8 @@ void DefineModule(EmitterState& state) {
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
 	}
-	if (InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
+	if (InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0 ||
+	    InputVariableForKind(state, IR::StageInputKind::BaseVertex) != 0) {
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.requirements.image_gather_extended) {

@@ -134,6 +134,24 @@ std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	        program.wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
 }
 
+bool Translator::ExecWordsExcludeHelpers() const {
+	return program.stage == ShaderType::Pixel && GetCodegenOptions().ps_exec_words;
+}
+
+std::array<IR::U32, 2> Translator::VectorMask(IR::U1 value) {
+	auto mask = BallotMask(value);
+	if (ExecWordsExcludeHelpers()) {
+		// A helper lane stays out unless the EXEC words have it (after S_WQM): a VALU mask is then
+		// limited to the EXEC words, and a SALU mask operation on EXEC/VCC keeps its live lanes.
+		const auto helper = BallotMask(IR::U1(ir.Emit(IR::ValueOpcode::IsHelperInvocation)));
+		mask = {ir.BitwiseAnd(mask[0], ir.BitwiseOr(ir.GetExecLo(), ir.BitwiseNot(helper[0]))),
+		        program.wave_size == 64u
+		            ? ir.BitwiseAnd(mask[1], ir.BitwiseOr(ir.GetExecHi(), ir.BitwiseNot(helper[1])))
+		            : mask[1]};
+	}
+	return mask;
+}
+
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::LiteralConstant:
@@ -181,6 +199,9 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 124u: return ir.GetM0();
 		case 126u:
 		case 127u: {
+			if (ExecWordsExcludeHelpers()) {
+				return code == 126u ? ir.GetExecLo() : ir.GetExecHi();
+			}
 			const auto mask = BallotMask(ir.GetExec());
 			return mask[code - 126u];
 		}
@@ -329,7 +350,10 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Vgpr: {
 			const auto reg = static_cast<IR::VectorReg>(operand.reg);
 			const auto old = ir.GetVectorReg(reg);
-			if (operand.dpp) {
+			// DPP skips EXEC lanes only through row/bank masks, or for invalid sources without
+			// BOUND_CTRL (dpp8 reads zero); otherwise it is a plain masked write.
+			if (operand.dpp && (operand.dpp_row_mask != 0xfu || operand.dpp_bank_mask != 0xfu ||
+			                    (!operand.dpp_bound_ctrl && !operand.dpp8))) {
 				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
 				                        DppFlags(operand)));
 			} else {
@@ -406,7 +430,7 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 			case Decoder::OperandKind::Scc: ir.SetScc(IR::U1(value)); return;
 			case Decoder::OperandKind::ExecLo:
 			case Decoder::OperandKind::ExecHi: {
-				const auto mask = BallotMask(IR::U1(value));
+				const auto mask = VectorMask(IR::U1(value));
 				ir.SetExec(IR::U1(value));
 				ir.SetExecLo(mask[0]);
 				ir.SetExecHi(mask[1]);
@@ -414,7 +438,7 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 			}
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: {
-				const auto mask = BallotMask(IR::U1(value));
+				const auto mask = VectorMask(IR::U1(value));
 				ir.SetVcc(IR::U1(value));
 				ir.SetVccLo(mask[0]);
 				ir.SetVccHi(mask[1]);
@@ -727,7 +751,8 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 
 std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value,
                                              bool write_64) {
-	const auto mask = BallotMask(value);
+	// KYTY_PS_EXEC_WORDS: helper lanes not in the EXEC words stay out (VectorMask).
+	const auto mask = VectorMask(value);
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg  = static_cast<IR::ScalarReg>(operand.reg);
@@ -1291,7 +1316,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		}
 		entry_ir.SetExec(initial_exec);
-		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
+		// KYTY_PS_EXEC_WORDS: the pixel shader's EXEC words start as its live (non-helper) lanes,
+		// while the per-lane EXEC keeps the helpers for derivatives.
+		const bool exec_words = options.stage == ShaderType::Pixel && GetCodegenOptions().ps_exec_words;
+		const auto initial_mask = entry_ir.Emit(
+		    IR::ValueOpcode::Ballot,
+		    {exec_words ? entry_ir.LogicalAnd(initial_exec,
+		                                      entry_ir.LogicalNot(IR::U1(entry_ir.Emit(
+		                                          IR::ValueOpcode::IsHelperInvocation))))
+		                : initial_exec});
 		const auto initial_lo = entry_ir.CompositeExtract(initial_mask, 0);
 		const auto initial_hi = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
 		                                               : IR::U32(IR::Value(0u));
@@ -1305,6 +1338,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      entry_ir.CompositeExtract(present, 1)};
 			use_present_lanes  = true;
 		}
+		const auto active_lane_count = [&] {
+			auto count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
+			if (options.wave_size == 64u) {
+				count = entry_ir.IAdd(count, IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::BitCount32, {initial_hi})));
+			}
+			return count;
+		};
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1452,7 +1493,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    static_cast<IR::ScalarReg>(options.input_info.vertex->start_instance_sgpr), draw(2));
 			}
 		} else if (options.stage == ShaderType::Local) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), active_lane_count());
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
@@ -1558,17 +1599,26 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
 			// ESVertCount describes input vertices, independently of lane ordinals.
-			auto vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
-			if (options.wave_size == 64u) {
-				vertex_count = entry_ir.IAdd(vertex_count, IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::BitCount32, {initial_hi})));
-			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::VertexIndex));
+			                      entry_ir.BitwiseOr(active_lane_count(), IR::U32(IR::Value(1u << 28u))));
+			const auto* vertex_input = options.input_info.vertex;
+			if (vertex_input != nullptr && vertex_input->indirect_vertex_base) {
+				// KYTY_INDIRECT_VERTEX_BASE: as the GPU's, an indirect draw's index VGPR excludes the
+				// record's base vertex, which reaches only the SGPR its packet names (none: SH_NOP).
+				const auto base_vertex = builtin(IR::StageInputKind::BaseVertex);
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(5),
+				    entry_ir.ISub(builtin(IR::StageInputKind::VertexIndex), base_vertex));
+				if (vertex_input->base_vertex_sgpr >= 0) {
+					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(vertex_input->base_vertex_sgpr),
+					                      base_vertex);
+				}
+			} else {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+				                      builtin(IR::StageInputKind::VertexIndex));
+			}
 			// The instance ID counts from 0; the start instance is Vulkan's base instance.
 			const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),

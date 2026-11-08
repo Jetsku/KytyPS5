@@ -98,7 +98,8 @@ void Translator::EmitCallStateRecipe(const void* recipe_pointer, std::vector<IR:
 void Translator::S_KYTY_CALL_STATE(const Decoder::Instruction& inst) {
 	if (const auto partition_op = static_cast<Decoder::CallStateOp>(inst.offset);
 	    partition_op == Decoder::CallStateOp::PartitionCompare ||
-	    partition_op == Decoder::CallStateOp::PartitionDrop) {
+	    partition_op == Decoder::CallStateOp::PartitionDrop ||
+	    partition_op == Decoder::CallStateOp::MissReport) {
 		EmitCallPartition(inst);
 		return;
 	}
@@ -364,6 +365,9 @@ void Translator::EmitCallPartition(const Decoder::Instruction& inst) {
 	const auto leader = ir.LogicalAnd(ir.LogicalAnd(exec, ir.IEqual(lane, first)), has_report);
 	const auto base   = ir.ConstructU64(report_lo, report_hi);
 	ir.Emit(IR::ValueOpcode::CallStateReport, {base, IR::U32(ir.BitwiseOr(lo, IR::U32(IR::Value(1u)))), leader});
+	if (static_cast<Decoder::CallStateOp>(inst.offset) == Decoder::CallStateOp::MissReport) {
+		return; // KYTY_CALL_LEARN: the lanes stay and take the skip path
+	}
 	// The active lanes leave the wave: IREmitter::SetExec keeps them out of every later EXEC.
 	ir.SetGotoVariable(IR::PartitionDropVariable,
 	                   ir.LogicalOr(ir.GetGotoVariable(IR::PartitionDropVariable), exec));

@@ -671,6 +671,34 @@ void TestPadScriptEntries() {
 	Check(!held.stick[0], "a stick hold outlived its time");
 	g_pad_script.clear();
 }
+
+void TestUnreadPressSurvivesStickBurst() {
+	// Our coalescing is behind KYTY_PAD_STATE_COALESCE=1 (default off; upstream 39faa62eb).
+	const char* coalesce = std::getenv("KYTY_PAD_STATE_COALESCE");
+	if (coalesce == nullptr || std::strcmp(coalesce, "1") != 0) {
+		return;
+	}
+
+	Controller              controller;
+	std::array<PadData, 64> data {};
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	for (int value = 0; value < 100; value++) {
+		SetAxis(1, Axis::LeftX, value);
+	}
+	SetButton(1, PAD_BUTTON_CROSS, false);
+	for (int value = 100; value < 200; value++) {
+		SetAxis(1, Axis::LeftX, value);
+	}
+	Check(PadRead(1, data.data(), 64) == 2 && data[0].buttons == PAD_BUTTON_CROSS &&
+	          data[0].left_stick_x == 99 && data[1].buttons == 0 && data[1].left_stick_x == 199,
+	      "a stick burst pushed an unread press out of the pad history");
+	SetAxis(1, Axis::LeftX, 50);
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	Check(PadRead(1, data.data(), 64) == 2 && data[0].buttons == 0 &&
+	          data[0].left_stick_x == 50 && data[1].buttons == PAD_BUTTON_CROSS,
+	      "a stick move after a read did not add a sample");
+}
+
 } // namespace
 
 int main() {
@@ -685,6 +713,7 @@ int main() {
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
 	TestTriggerEffectState();
+	TestUnreadPressSurvivesStickBurst();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();

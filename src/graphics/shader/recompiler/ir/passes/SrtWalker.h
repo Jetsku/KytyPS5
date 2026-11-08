@@ -70,6 +70,15 @@ inline void ObserveSrtRead(const SrtRuntime& runtime, uint64_t address,
 
 enum class RuntimeValueType { Any, Integer };
 
+// Activity slots of FindActiveSources: one per descriptor source, then one per image
+// (KYTY_SRT_IMAGE_REACH; always active when no block lists it).
+inline size_t ActiveSlotCount(const ResourcePlan& plan) {
+	return plan.descriptor_sources.size() + plan.info.images.size();
+}
+inline uint32_t ImageActiveSlot(size_t descriptor_sources, uint32_t image) {
+	return static_cast<uint32_t>(descriptor_sources) + image;
+}
+
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot. With variant_reads
 // (KYTY_SRT_VARIANT_READS), a read whose address is not a valid runtime value (a loop-carried

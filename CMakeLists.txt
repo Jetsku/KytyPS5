@@ -436,6 +436,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${bda_write_pages_shader_header}")
+# KYTY_NAN_SCRUB (NanScrubber): rewrites the float fields of image words that are not finite.
+set(nan_scrub_shader_source "${gpu_tiler_shader_dir}/nan_scrub.comp")
+set(nan_scrub_shader_spv "${gpu_tiler_generated_dir}/nan_scrub.spv")
+set(nan_scrub_shader_header "${gpu_tiler_generated_dir}/nan_scrub_spv.h")
+add_custom_command(
+	OUTPUT "${nan_scrub_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${nan_scrub_shader_spv}" "${nan_scrub_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${nan_scrub_shader_spv} -DOUTPUT=${nan_scrub_shader_header}
+	        -DSYMBOL=NAN_SCRUB_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${nan_scrub_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${nan_scrub_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -662,6 +677,9 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+# Offline batch translation of shaders extracted from game files (Senaxx 5250bc5d4); a tool, not a
+# test: EXCLUDE_FROM_ALL, no add_test, built only on request.
+add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
 add_kyty_full_emulator_test(null_texture_desc_tests "${KYTY_TESTS_DIR}/NullTextureDescTests.cpp")
 add_kyty_full_emulator_test(sparse_residency_stress_tests "${KYTY_TESTS_DIR}/SparseResidencyStressTests.cpp")
 
@@ -697,6 +715,10 @@ add_executable(lane_local_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(lane_local_tests common fmt::fmt)
 target_include_directories(lane_local_tests PRIVATE ${inc_headers})
+
+if(KYTY_X86_64_V3)
+	add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
+endif()
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
@@ -1020,6 +1042,13 @@ add_executable(unresolved_import_log_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(unresolved_import_log_tests PRIVATE ${inc_headers})
 
+add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmResampleTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
+target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
+
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
@@ -1286,6 +1315,20 @@ target_include_directories(rt_hardware_tests PRIVATE ${inc_headers}
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_kyty_full_emulator_test(repeat_trace_tests "${KYTY_TESTS_DIR}/RepeatTraceTests.cpp")
+
+add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
+	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
+target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
+target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
+target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
+
+add_executable(psml_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(psml_tests common kyty_test_gtest)
+target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -1371,6 +1414,9 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-keep-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	if(KYTY_X86_64_V3)
+		add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
+	endif()
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
@@ -1511,8 +1557,11 @@ if(BUILD_TESTING)
 	add_test(NAME ajm_defer COMMAND $<TARGET_FILE:ajm_defer_tests>)
 	add_test(NAME audio_propagation COMMAND $<TARGET_FILE:audio_propagation_tests>)
 	add_test(NAME unresolved_import_log COMMAND $<TARGET_FILE:unresolved_import_log_tests>)
+	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
+	add_test(NAME controller_settings_coalesce COMMAND $<TARGET_FILE:controller_settings_tests>)
+	set_tests_properties(controller_settings_coalesce PROPERTIES ENVIRONMENT "KYTY_PAD_STATE_COALESCE=1")
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
@@ -1524,6 +1573,16 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
+	add_test(NAME shader_recompiler_vop3_conversions
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_quadmask
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
+	add_test(NAME shader_recompiler_integer16_ternary
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
+	add_test(NAME shader_recompiler_mad_u16
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-u16-only)
+	add_test(NAME shader_recompiler_mul_hi24
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -1564,6 +1623,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	set_tests_properties(virtual_memory_allocation_clamp_memo_off PROPERTIES
 		ENVIRONMENT "KYTY_CLAMP_RANGE_MEMO=0")
+	add_test(NAME trinity_mode
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -1698,6 +1760,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
 	set_tests_properties(bda_sync_dirty_log_off PROPERTIES
 		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_DIRTY_LOG=0")
+	# KYTY_BDA_REGISTER_LOG: the pass after a new buffer synchronizes it from the log (verified).
+	add_test(NAME bda_sync_register_log_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_register_log_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_REGISTER_LOG=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit;KYTY_BDA_HOT_SYNC_VERIFY=exit")
 	# KYTY_BINDING_EPOCH_MEMO: default, verify mode, off, and off through KYTY_SYNC_EPOCH=0.
 	add_test(NAME binding_epoch_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
@@ -2661,6 +2728,7 @@ if(BUILD_TESTING)
 		ajm_defer_tests
 		audio_propagation_tests
 		unresolved_import_log_tests
+		ajm_resample_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests
@@ -2729,6 +2797,10 @@ add_custom_target(kyty_trophy_sound
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
+# Reference game patches (ETAHen/GoldHEN JSON, the --game-patch format): installed to patches/, not
+# applied. To use one, copy it to _Patches/<title id>.json next to the launcher (the plan the launcher
+# passes); the loader checks the title, version, process and each write's original bytes first.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/patches/" DESTINATION patches FILES_MATCHING PATTERN "*.json")
 
 add_custom_target(kyty_touch_cursors
 	COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -2737,6 +2809,19 @@ add_custom_target(kyty_touch_cursors
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
+
+set(KYTY_NOTO_SANS_FONTS
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-Italic.ttf"
+	"${KYTY_NOTO_SANS_DIR}/NotoSans-BoldItalic.ttf")
+add_custom_target(kyty_noto_sans_fonts
+	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${KYTY_NOTO_SANS_FONTS}
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_noto_sans_fonts)
+install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

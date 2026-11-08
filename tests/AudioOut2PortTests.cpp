@@ -34,6 +34,8 @@ int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
 float                             g_objects_gain = 1.0f;
 bool                              g_objects_on   = true;
+std::atomic_uint64_t              g_process_time {0};
+std::atomic_bool                  g_process_time_frozen {false};
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -712,8 +714,7 @@ bool AudioOutObjectsEnabled() {
 namespace Libs::LibKernel {
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
-	static std::atomic_uint64_t now {0};
-	return now.fetch_add(1000);
+	return g_process_time_frozen ? g_process_time.load() : g_process_time.fetch_add(1000);
 }
 
 } // namespace Libs::LibKernel
@@ -786,6 +787,72 @@ void TestLongRepeatEpisode() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+// KYTY_AUDIO2_CONSUME_PCM (upstream 64a554dea): a push consumes its ports' PCM, so a port the game
+// stops feeding falls silent instead of replaying its last block.
+void TestPushConsumesPcm() {
+	namespace AI = Libs::Audio::AudioInternal;
+	AI::AudioOut2SetSwitchesForTest({.consume_pcm = true});
+	const auto context = CreateContext(1);
+	const auto port    = CreatePort(context, MakeParam(0x200));
+	std::array<float, 512 * 2> pcm {};
+	pcm.fill(0.25f);
+	SetPcm(port, pcm.data());
+	auto output = PushPcm(context, sizeof(pcm));
+	Check(output.size() == 1, "fed port was not played");
+	CheckSamples(output[0], {0.25f, 0.25f}, "fed port played other PCM");
+	Check(PushPcm(context, sizeof(pcm)).empty(), "a port without new PCM replayed its last block");
+	pcm.fill(0.5f);
+	SetPcm(port, pcm.data());
+	output = PushPcm(context, sizeof(pcm));
+	Check(output.size() == 1, "re-fed port was not played");
+	CheckSamples(output[0], {0.5f, 0.5f}, "re-fed port played other PCM");
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+	AI::AudioOut2SetSwitchesForTest({});
+}
+
+// KYTY_AUDIO2_EXACT_GRAIN (upstream 7ff8aff5e): three 512-sample grains play in exactly 32000 us
+// (the microsecond grain of 10666 us drained them 2 us early).
+void TestQueueDrainsAtExactGrainRate() {
+	namespace AI = Libs::Audio::AudioInternal;
+	AI::AudioOut2SetSwitchesForTest({.exact_grain = true});
+	const auto context    = CreateContext();
+	g_process_time_frozen = true;
+	const auto start      = g_process_time.load();
+	for (int push = 0; push < 3; push++) {
+		Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "async push failed");
+	}
+	const auto queued_after = [&](uint64_t micros) {
+		g_process_time  = start + micros;
+		uint32_t queued = 0;
+		Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, nullptr) == OK,
+		      "queue-level query failed");
+		return queued;
+	};
+	Check(queued_after(31999) == 1, "the third grain drained before it finished playing");
+	Check(queued_after(32000) == 0, "three grains did not drain in their playing time");
+	g_process_time_frozen = false;
+	AudioOut2::AudioOut2ContextDestroy(context);
+	AI::AudioOut2SetSwitchesForTest({});
+}
+
+// KYTY_AUDIO2_SDK_DEFAULTS (upstream 2efd31443): the library's context defaults.
+void TestSdkContextDefaults() {
+	namespace AI = Libs::Audio::AudioInternal;
+	ContextParam param {};
+	Check(AudioOut2::AudioOut2ContextResetParam(
+	          reinterpret_cast<AudioOut2::AudioOut2ContextParam*>(&param)) == OK &&
+	          param.max_ports == 256 && param.num_grains == 512 && param.queue_depth == 4,
+	      "default reset changed with the switch off");
+	AI::AudioOut2SetSwitchesForTest({.sdk_defaults = true});
+	Check(AudioOut2::AudioOut2ContextResetParam(
+	          reinterpret_cast<AudioOut2::AudioOut2ContextParam*>(&param)) == OK &&
+	          param.max_ports == 8 && param.max_object_ports == 0 && param.queue_depth == 1 &&
+	          param.num_grains == 256 && param.flags == 0,
+	      "SDK reset defaults differ");
+	AI::AudioOut2SetSwitchesForTest({});
+}
+
 } // namespace
 
 int main() {
@@ -811,6 +878,9 @@ int main() {
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestObjectPortsMixIntoBed();
 	TestPortGainAndValidation();
+	TestPushConsumesPcm();
+	TestQueueDrainsAtExactGrainRate();
+	TestSdkContextDefaults();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

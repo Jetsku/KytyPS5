@@ -884,6 +884,14 @@ void VideoOutDriver::Impl::VblankEnd() {
 // refresh rate changes. Independent of KYTY_PRESENT_PORT_UNLOCKED, which only changes FlipQueue::Flip.
 static Live::Switch g_present_abs_vblank("KYTY_PRESENT_ABS_VBLANK", Live::ParseDefaultOff);
 
+// KYTY_PRESENT_READY_FLIPS=1 (live switch, default off; usa-ratt/KytyPS5-GT7's FlipQueue::Flip): guest flips are
+// presented as soon as their GPU work is done, between vblanks, whatever the host present mode (the
+// absolute vblank timeline of KYTY_PRESENT_ABS_VBLANK keeps the guest's vblank events on their clock).
+// A frame that needs 25 ms is then shown at 25 ms instead of at the second vblank (33.3 ms): GT7's title
+// screen and races run at the GPU/CP rate rather than at 60/n fps. Less exact than the console, where a
+// vsync flip waits for the vblank; for titles that pace by flip completion.
+static Live::Switch g_present_ready_flips("KYTY_PRESENT_READY_FLIPS", Live::ParseDefaultOff);
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
 	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
@@ -917,7 +925,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		if ((++placement_count & 7u) == 0u) {
 			Common::SamplePlacement(Common::ThreadRole::Host);
 		}
-		const bool absolute    = g_present_abs_vblank.On();
+		const bool ready_flips = g_present_ready_flips.On();
+		const bool absolute    = g_present_abs_vblank.On() || ready_flips;
 		bool       behind      = false; // a vblank deadline was missed: may present a blank frame
 		uint64_t   frame_begin = 0;
 		uint64_t   period      = 1;
@@ -944,7 +953,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 					deadline = deadline_for(++abs_index);
 				}
 			}
-			if (Config::GetPresentMode() == Config::PresentMode::Immediate &&
+			if ((ready_flips || Config::GetPresentMode() == Config::PresentMode::Immediate) &&
 			    !m_presenter.IsGuestPaused()) {
 				// Present each ready flip as it arrives; the guest's vblank events keep their clock.
 				while (!token.stop_requested() &&

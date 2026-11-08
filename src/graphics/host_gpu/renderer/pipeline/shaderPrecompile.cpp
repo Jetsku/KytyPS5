@@ -756,23 +756,52 @@ void LowerCurrentThreadPriority() {
 #endif
 }
 
+uint64_t CurrentThreadCpuNs() {
+#if defined(_WIN32)
+	FILETIME created {}, exited {}, kernel {}, user {};
+	if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) == 0) return 0;
+	const auto ticks = [](const FILETIME& t) {
+		return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+	};
+	return (ticks(kernel) + ticks(user)) * 100u;
+#else
+	return 0;
+#endif
+}
+
 ShaderPrecompiler::ShaderPrecompiler(const ShaderJournal& journal, Settings settings, CompileFn compile)
     : m_journal(journal), m_settings(std::move(settings)), m_compile(std::move(compile)) {
 	m_total = m_journal.Entries().size();
-	if (m_settings.priority_source && m_total != 0) {
+	if ((m_settings.priority_source || m_settings.used_entry) && m_total != 0) {
 		const auto& sources = m_journal.Sources();
 		const auto& entries = m_journal.Entries();
+		// Tier per entry: 0 priority source, 1 used, 2 the rest.
 		std::vector<char> priority(sources.size(), 0);
-		for (size_t i = 0; i < sources.size(); i++) priority[i] = m_settings.priority_source(sources[i]) ? 1 : 0;
+		if (m_settings.priority_source) {
+			for (size_t i = 0; i < sources.size(); i++) priority[i] = m_settings.priority_source(sources[i]) ? 1 : 0;
+		}
+		std::vector<uint8_t> tier(entries.size(), 2);
+		for (uint32_t i = 0; i < entries.size(); i++) {
+			const auto source = entries[i].source;
+			if (source < priority.size() && priority[source] != 0) {
+				tier[i] = 0;
+			} else if (m_settings.used_entry && source < sources.size() &&
+			           m_settings.used_entry(sources[source], entries[i])) {
+				tier[i] = 1;
+				m_used_entries++;
+			}
+		}
 		m_order.reserve(entries.size());
-		for (uint32_t i = 0; i < entries.size(); i++) {
-			if (entries[i].source < priority.size() && priority[entries[i].source] != 0) m_order.push_back(i);
+		for (uint8_t t = 0; t <= 2; t++) {
+			if (t == 2 && !m_settings.replay_unused) break;
+			for (uint32_t i = 0; i < entries.size(); i++) {
+				if (tier[i] == t) m_order.push_back(i);
+			}
 		}
-		const auto first = m_order.size();
-		for (uint32_t i = 0; i < entries.size(); i++) {
-			if (entries[i].source >= priority.size() || priority[entries[i].source] == 0) m_order.push_back(i);
-		}
-		if (first == 0) m_order.clear(); // nothing to move
+		bool natural = m_order.size() == entries.size();
+		for (uint32_t i = 0; natural && i < m_order.size(); i++) natural = m_order[i] == i;
+		m_total = m_order.size();
+		if (natural) m_order.clear(); // nothing moved or dropped
 	}
 	if (m_settings.max_entries != 0) m_total = std::min<uint64_t>(m_total, m_settings.max_entries);
 	m_begin_ns    = NowNs();
@@ -784,9 +813,14 @@ ShaderPrecompiler::ShaderPrecompiler(const ShaderJournal& journal, Settings sett
 	const auto threads = static_cast<uint32_t>(std::min<uint64_t>(m_settings.threads, m_total));
 	m_workers_running  = threads;
 	if (m_settings.log) {
+		std::string used;
+		if (m_settings.used_entry) {
+			used = "; " + std::to_string(m_used_entries) + " bound by earlier runs first" +
+			       (m_settings.replay_unused ? "" : ", the others not replayed");
+		}
 		m_settings.log("Shader precompile: replaying " + std::to_string(m_total) + " permutations of " +
 		               std::to_string(m_journal.Sources().size()) + " sources on " +
-		               std::to_string(threads) + " threads");
+		               std::to_string(threads) + " threads" + used);
 	}
 	for (uint32_t i = 0; i < threads; i++) {
 		m_threads.emplace_back([this, i] { Worker(i); });
@@ -817,6 +851,8 @@ ShaderPrecompiler::Progress ShaderPrecompiler::GetProgress() const {
 	p.present  = m_present.load(std::memory_order_relaxed);
 	p.skipped  = m_skipped.load(std::memory_order_relaxed);
 	p.failed   = m_failed.load(std::memory_order_relaxed);
+	p.reloaded = m_reloaded.load(std::memory_order_relaxed);
+	p.cpu_ns   = m_cpu_ns.load(std::memory_order_relaxed);
 	std::scoped_lock lock(m_mutex);
 	p.finished = m_finished;
 	return p;
@@ -828,6 +864,7 @@ void ShaderPrecompiler::NoteDone(Outcome outcome) {
 		case Outcome::Present: m_present.fetch_add(1, std::memory_order_relaxed); break;
 		case Outcome::Skipped: m_skipped.fetch_add(1, std::memory_order_relaxed); break;
 		case Outcome::Failed: m_failed.fetch_add(1, std::memory_order_relaxed); break;
+		case Outcome::Reloaded: m_reloaded.fetch_add(1, std::memory_order_relaxed); break;
 	}
 	const auto done = m_done.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (!m_settings.log) return;
@@ -838,19 +875,32 @@ void ShaderPrecompiler::NoteDone(Outcome outcome) {
 		if (done == m_total) return; // the final line follows
 		m_reported_done = done;
 		m_reported_ns   = now;
-		char text[256];
-		std::snprintf(text, sizeof(text),
-		              "Shader precompile: %llu/%llu (%llu%%): %llu compiled, %llu present, %llu "
-		              "skipped, %llu failed, %.1f s",
+		char text[96];
+		std::snprintf(text, sizeof(text), "Shader precompile: %llu/%llu (%llu%%): ",
 		              static_cast<unsigned long long>(done), static_cast<unsigned long long>(m_total),
-		              static_cast<unsigned long long>(done * 100 / m_total),
-		              static_cast<unsigned long long>(m_compiled.load()),
-		              static_cast<unsigned long long>(m_present.load()),
-		              static_cast<unsigned long long>(m_skipped.load()),
-		              static_cast<unsigned long long>(m_failed.load()),
-		              static_cast<double>(now - m_begin_ns) / 1.0e9);
-		m_settings.log(text);
+		              static_cast<unsigned long long>(done * 100 / m_total));
+		m_settings.log(text + Counts());
 	}
+}
+
+// "N compiled, N reloaded, N present, N skipped, N failed, T s[, cpu C s]".
+std::string ShaderPrecompiler::Counts() const {
+	char text[256];
+	std::snprintf(text, sizeof(text),
+	              "%llu compiled, %llu reloaded, %llu present, %llu skipped, %llu failed, %.1f s",
+	              static_cast<unsigned long long>(m_compiled.load()),
+	              static_cast<unsigned long long>(m_reloaded.load()),
+	              static_cast<unsigned long long>(m_present.load()),
+	              static_cast<unsigned long long>(m_skipped.load()),
+	              static_cast<unsigned long long>(m_failed.load()),
+	              static_cast<double>(NowNs() - m_begin_ns) / 1.0e9);
+	std::string result = text;
+	if (m_settings.measure_cpu) {
+		std::snprintf(text, sizeof(text), ", cpu %.1f s",
+		              static_cast<double>(m_cpu_ns.load(std::memory_order_relaxed)) / 1.0e9);
+		result += text;
+	}
+	return result;
 }
 
 void ShaderPrecompiler::Worker(uint32_t index) {
@@ -864,7 +914,8 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 		const auto next = m_next.fetch_add(1, std::memory_order_relaxed);
 		if (next >= m_total) break;
 		const auto& entry = entries[m_order.empty() ? next : m_order[next]];
-		Outcome     outcome = Outcome::Failed;
+		Outcome     outcome   = Outcome::Failed;
+		const auto  cpu_begin = m_settings.measure_cpu ? CurrentThreadCpuNs() : 0;
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 		try {
 			outcome = m_compile(sources[entry.source], entry);
@@ -875,23 +926,19 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 		// Builds without exceptions (the Linux build): a failing compile reports Failed itself.
 		outcome = m_compile(sources[entry.source], entry);
 #endif
+		if (m_settings.measure_cpu) {
+			m_cpu_ns.fetch_add(CurrentThreadCpuNs() - cpu_begin, std::memory_order_relaxed);
+		}
 		NoteDone(outcome);
 	}
 	if (m_workers_running.fetch_sub(1, std::memory_order_acq_rel) == 1) {
 		const auto done = m_done.load(std::memory_order_relaxed);
 		if (m_settings.log) {
-			char text[256];
-			std::snprintf(text, sizeof(text),
-			              "Shader precompile: %s %llu/%llu: %llu compiled, %llu present, %llu skipped, "
-			              "%llu failed, %.1f s",
+			char text[96];
+			std::snprintf(text, sizeof(text), "Shader precompile: %s %llu/%llu: ",
 			              done == m_total ? "done," : "stopped,", static_cast<unsigned long long>(done),
-			              static_cast<unsigned long long>(m_total),
-			              static_cast<unsigned long long>(m_compiled.load()),
-			              static_cast<unsigned long long>(m_present.load()),
-			              static_cast<unsigned long long>(m_skipped.load()),
-			              static_cast<unsigned long long>(m_failed.load()),
-			              static_cast<double>(NowNs() - m_begin_ns) / 1.0e9);
-			m_settings.log(text);
+			              static_cast<unsigned long long>(m_total));
+			m_settings.log(text + Counts());
 		}
 		if (m_settings.on_finished) m_settings.on_finished();
 		std::scoped_lock lock(m_mutex);

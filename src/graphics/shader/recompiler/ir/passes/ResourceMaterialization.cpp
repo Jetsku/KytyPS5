@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -121,6 +122,19 @@ bool NullBufferDescriptor(const ShaderBufferResource& descriptor, bool count = t
 std::atomic<int> g_ms_depth_sample0 {-1};
 // KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b): the EQAA FMASK map. -1 = not read yet.
 std::atomic<int> g_eqaa_fmask_map {-1};
+
+// KYTY_INDIRECT_LEADING_COORDS=1 (default off; upstream d3768c00e). -1 = not read yet.
+std::atomic<int> g_indirect_leading_coords {-1};
+
+bool IndirectLeadingCoordinates() {
+	auto value = g_indirect_leading_coords.load(std::memory_order_relaxed);
+	if (value < 0) [[unlikely]] {
+		const char* text = std::getenv("KYTY_INDIRECT_LEADING_COORDS");
+		value            = text != nullptr && text[0] == '1' ? 1 : 0;
+		g_indirect_leading_coords.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
 
 bool EqaaFmaskMap() {
 	auto value = g_eqaa_fmask_map.load(std::memory_order_relaxed);
@@ -636,14 +650,29 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			t_workgroup_counts_missing = true;
 			return false;
 		}
-		if (indirect.table_stride == 0u || key_count > MaxIndirectImageProbes ||
-		    uint64_t {indirect.table_offset} + uint64_t {key_count - 1u} * indirect.table_stride +
-		            32u > UINT32_MAX + 1ull) {
+		// Upstream de3ed905c: a runtime base added to the id, and a constant division after it.
+		uint32_t first = 0;
+		if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first)) {
+			return false;
+		}
+		if (indirect.table_stride == 0u || key_count > MaxIndirectImageProbes) {
 			return false;
 		}
 		key_stride = indirect.table_stride;
 		keys.resize(key_count);
-		std::iota(keys.begin(), keys.end(), 0u);
+		std::iota(keys.begin(), keys.end(), first);
+		if (indirect.workgroup_shift != 0u) {
+			for (auto& key: keys) {
+				key = static_cast<uint32_t>(uint64_t {key} * indirect.workgroup_multiplier >>
+				                            indirect.workgroup_shift);
+			}
+		}
+		std::ranges::sort(keys);
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		if (uint64_t {indirect.table_offset} + uint64_t {keys.back()} * indirect.table_stride +
+		        32u > UINT32_MAX + 1ull) {
+			return false;
+		}
 	} else if (!indirect.selector) {
 		uint32_t key_count = 0;
 		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
@@ -1203,6 +1232,32 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
 		};
+		// KYTY_INDIRECT_LEADING_COORDS (upstream d3768c00e): each candidate samples with the
+		// coordinate count of its own type, so a 2D or 3D candidate reads the leading coordinates
+		// of an equal or larger dimension, except an array with more than one slice, which reads
+		// the next coordinate as its slice. Derivative, LOD, clamp and offset operands keep the
+		// root's dimension, so roots that use them (or mips) stay strict.
+		const auto& base    = program.info.images[root_index];
+		const auto  leading = [&](Decoder::ImageDimension dimension, const DescriptorValue& value) {
+			const bool sliced =
+			    static_cast<Prospero::ImageType>((value.dwords[3] >> 28u) & 0xfu) ==
+			        Prospero::ImageType::kColor2DArray &&
+			    (value.dwords[4] & 0x1fffu) != ((value.dwords[4] >> 16u) & 0x1fffu);
+			return !sliced &&
+			       (dimension == Decoder::ImageDimension::Dim2D || dimension == base.dimension);
+		};
+		const bool leading_coordinates =
+		    IndirectLeadingCoordinates() &&
+		    (base.dimension == Decoder::ImageDimension::Dim2D ||
+		     base.dimension == Decoder::ImageDimension::Dim3D) &&
+		    !base.cube && !image_class.cube && leading(image_class.dimension, snapshot.images[exemplar]) &&
+		    std::ranges::none_of(program.memory_info, [&](const MemoryInfo& memory) {
+			    return memory.kind == ResourceKind::Image && memory.resource == root_index &&
+			           (memory.image_has_mip ||
+			            (memory.image_sample_flags &
+			             (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagDerivative |
+			              Decoder::ImageSampleFlagLodClamp | Decoder::ImageSampleFlagOffset)) != 0u);
+		    });
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -1271,8 +1326,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.shader_swizzle == image_class.shader_swizzle) {
 				continue;
 			}
+			const bool prefix_coordinates = leading_coordinates && !image.cube &&
+			                                leading(image.dimension, snapshot.images[candidate]);
 			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
+			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
+			     !prefix_coordinates) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
@@ -1353,6 +1411,8 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		}
 	}
 	std::vector<ResourceBlock> blocks(program.blocks.size());
+	// KYTY_SRT_IMAGE_REACH (upstream 9801fd862): images get activity slots of their own.
+	const bool image_reach = GetCodegenOptions().srt_image_reach;
 	for (uint32_t i = 0; i < blocks.size(); i++) {
 		auto&                 block      = blocks[i];
 		const auto&           info       = program.block_info[i];
@@ -1400,6 +1460,10 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 				block.sources.push_back(program.info.buffers.at(memory.resource).source);
 			} else {
 				block.sources.push_back(program.info.images.at(memory.resource).source);
+				if (image_reach) {
+					block.sources.push_back(
+					    ImageActiveSlot(program.descriptor_sources.size(), memory.resource));
+				}
 				if (image.needs_sampler) {
 					block.sources.push_back(program.info.samplers.at(memory.sampler).source);
 				}
@@ -1835,6 +1899,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
+		target.bindless_sampler    = source.bindless_sampler;
 		if (target.indirect_descriptor.has_value()) {
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
 			target.indirect_descriptor->selector_first =
@@ -1878,13 +1943,20 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		                   plan.clean_flat_slots, indirect.selector_mask);
 		MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
 	}
+	// KYTY_BINDLESS_SAMPLERS: the host reads the sampler heap itself; the plan needs its V#.
+	for (const auto& sampler: plan.info.samplers) {
+		const auto* source = Source(plan, sampler.source);
+		if (source != nullptr && source->bindless_sampler.has_value()) {
+			MarkCleanFlatSlots(plan, source, plan.clean_flat_slots);
+		}
+	}
 	BuildSrtReadRuns(plan);
 	BuildSrtEvaluationRecipes(plan);
 	BuildSrtArithmeticTapes(plan);
 	if (Common::RendererBatchEnabled() && !plan.control_flow.empty()) {
 		const auto count = plan.control_flow.size();
 		plan.flow_aliases.resize(count);
-		plan.flow_initial_sources.assign(plan.descriptor_sources.size(), 1u);
+		plan.flow_initial_sources.assign(ActiveSlotCount(plan), 1u);
 		std::vector<uint8_t> resolved(count, 0u);
 		std::vector<uint32_t> path;
 		for (const auto& block: plan.control_flow) {
@@ -1963,6 +2035,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	// reads every slot on the host).
 	snapshot.gpu_fills.clear();
 	snapshot.bindless_heaps.clear();
+	snapshot.bindless_sampler_heaps.clear();
 	observed.gpu_fills = nullptr;
 	const bool gpu_fill = runtime.gpu_written != nullptr && !capture_reads &&
 	                      !program.gpu_fill_slots.empty();
@@ -1994,6 +2067,15 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			snapshot.uniform_fill = fill.fill;
 			snapshot.uniform_fill.value = stored[0];
 		}
+	}
+	// KYTY_BINDLESS_SAMPLERS: two words per bindless sampler (region base, record count) right
+	// after the SRT slots, before any image's words (BindlessSamplerMappingOffset); zeros select
+	// the stand-in sampler.
+	if (const auto bindless_samplers = BindlessSamplerCount(program.info); bindless_samplers != 0u) {
+		if (snapshot.flattened_srt.size() != program.srt_reads.size()) {
+			return false;
+		}
+		snapshot.flattened_srt.resize(snapshot.flattened_srt.size() + 2u * bindless_samplers, 0u);
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
@@ -2074,9 +2156,12 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (source == nullptr) {
 				return false;
 			}
+			// KYTY_SRT_IMAGE_REACH: an image only unreached blocks use reads zero.
+			const bool image_reached =
+			    active.empty() || active[ImageActiveSlot(program.descriptor_sources.size(), i)];
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.images[i] = {.dword_count = 8u};
-				if (!active.empty() && !active[image.source]) {
+				if (!active.empty() && (!active[image.source] || !image_reached)) {
 					continue;
 				}
 				const auto& indirect = *source->indirect_descriptor;
@@ -2110,7 +2195,9 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				if (!evaluate(image.source, snapshot.images[i])) {
 					return false;
 				}
-				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+				if (!image_reached) {
+					snapshot.images[i].dwords.fill(0);
+				} else if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 					if (!NullImageDescriptor(snapshot.images[i])) {
 						ReportInvalidImageDescriptor(program.shader_hash, i, snapshot.images[i]);
 						NullTraceNote(NullTraceKind::NullImage, program.shader_hash);
@@ -2125,8 +2212,34 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Resources::Specialization");
 		snapshot.samplers.resize(program.info.samplers.size());
+		snapshot.bindless_sampler_heaps.clear();
+		uint32_t bindless_sampler = 0;
 		for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-			if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+			const auto  source_index = program.info.samplers[i].source;
+			const auto* source       = Source(program, source_index);
+			if (source != nullptr && source->bindless_sampler.has_value()) {
+				// KYTY_BINDLESS_SAMPLERS: the shader indexes the host's mirror of the heap; set 0
+				// binds the stand-in sampler for this resource.
+				snapshot.samplers[i].dword_count = 4u;
+				std::copy_n(BindlessDefaultSampler, 4u, snapshot.samplers[i].dwords.begin());
+				const auto mapping_offset =
+				    BindlessSamplerMappingOffset(program.srt_reads.size(), bindless_sampler++);
+				DescriptorValue      table;
+				ShaderBufferResource heap;
+				if ((active.empty() || active[source_index]) &&
+				    clean.EvaluateDescriptor(source_index, table) &&
+				    DecodeBufferDescriptor(table, heap) && heap.Base48() != 0) {
+					snapshot.bindless_sampler_heaps.push_back(
+					    {.base           = heap.Base48(),
+					     .size           = heap.GetSize(),
+					     .table_offset   = source->bindless_sampler->table_offset,
+					     .stride         = source->bindless_sampler->stride,
+					     .sampler        = i,
+					     .mapping_offset = mapping_offset});
+				}
+				continue;
+			}
+			if (!evaluate(source_index, snapshot.samplers[i])) {
 				return false;
 			}
 			if (program.info.samplers[i].gather_lod) {
@@ -2205,6 +2318,36 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	                            specialization);
 }
 
+const char* UnsupportedResourceSpecialization(const Program&                program,
+                                              const ResourceSpecialization& specialization) {
+	// ApplyResourceSpecialization's check, before it changes anything (adapted from
+	// usa-ratt/KytyPS5-GT7 c3d3e76e8 / b70de4ef9): enumerated candidates only sample, or are
+	// stored to (KYTY_WORKGROUP_IMAGES). A load or query through an enumerated material table
+	// ended the emulator in GT7's cafe; only that specialization is skipped instead.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (ImageOpcodeInfoOf(op).access == ImageAccess::None || op == ValueOpcode::ImageSampleRaw ||
+			    op == ValueOpcode::ImageWrite) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto resource = program.memory_info[index].resource;
+			if (resource >= specialization.images.size()) {
+				continue;
+			}
+			const auto& image = specialization.images[resource];
+			if (!image.fmask && !image.bindless && image.indirect_root == resource) {
+				return "an image of an enumerated material table is read other than by a sample";
+			}
+		}
+	}
+	return nullptr;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
@@ -2252,11 +2395,20 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
+	// KYTY_BINDLESS_SAMPLERS: where MaterializeResources put each bindless sampler's two words. A
+	// class copy below shares its source's words (and so its mirror of the heap).
+	for (uint32_t index = 0, bindless = 0; index < samplers.size(); index++) {
+		if (samplers[index].bindless) {
+			samplers[index].bindless_mapping_offset =
+			    BindlessSamplerMappingOffset(program.srt_reads.size(), bindless++);
+		}
+	}
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
 		if (index >= program.info.samplers.size()) {
-			samplers.push_back(program.info.samplers[binding.source]);
+			const auto copy = samplers[binding.source];
+			samplers.push_back(copy);
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;

@@ -135,9 +135,22 @@ CodegenOptions FromEnvironment() {
 	options.bindless_3d_as_array =
 	    EnvFlag("KYTY_BINDLESS_3D_AS_ARRAY", options.bindless_3d_as_array);
 	options.runtime_images   = EnvFlag("KYTY_RUNTIME_IMAGES", options.runtime_images);
+	options.runtime_int_images =
+	    options.runtime_images && EnvFlag("KYTY_RUNTIME_INT_IMAGES", options.runtime_int_images);
 	options.bindless_strided = EnvFlag("KYTY_BINDLESS_STRIDE", options.bindless_strided);
+	options.bindless_samplers = EnvFlag("KYTY_BINDLESS_SAMPLERS", options.bindless_samplers);
 	options.workgroup_images = EnvFlag("KYTY_WORKGROUP_IMAGES", options.workgroup_images);
+	options.table_key_bounds = EnvFlag("KYTY_TABLE_KEY_BOUNDS", options.table_key_bounds);
+	options.native_wave64_branch =
+	    EnvFlag("KYTY_NATIVE_WAVE64_BRANCH", options.native_wave64_branch);
+	options.sampler_reads_deferred =
+	    EnvFlag("KYTY_SAMPLER_READS_DEFER", options.sampler_reads_deferred);
 	options.call_trace_reach = EnvFlag("KYTY_CALL_TRACE_REACH", options.call_trace_reach);
+	if (const auto* cap = std::getenv("KYTY_CALL_LOOP_CAP"); cap != nullptr && cap[0] != '\0') {
+		options.call_loop_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
+	}
+	options.call_loops           = EnvFlag("KYTY_CALL_LOOPS", options.call_loops);
+	options.call_waterfall_clear = EnvFlag("KYTY_CALL_WATERFALL_CLEAR", options.call_waterfall_clear);
 	options.storage_length_zero =
 	    EnvFlag("KYTY_STORAGE_LENGTH_ZERO", options.storage_length_zero);
 	if (const auto* list = std::getenv("KYTY_BDA_FORCE_SHADERS"); list != nullptr) {
@@ -185,6 +198,7 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
+	options.srt_image_reach   = EnvFlag("KYTY_SRT_IMAGE_REACH", options.srt_image_reach);
 	options.shader_calls      = EnvFlag("KYTY_SHADER_CALLS", options.shader_calls);
 	options.call_trace_wave32 = EnvFlag("KYTY_CALL_TRACE_WAVE32", options.call_trace_wave32);
 	options.realtime_clock   = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
@@ -201,6 +215,8 @@ CodegenOptions FromEnvironment() {
 	options.lane_reductions   = EnvFlag("KYTY_LANE_REDUCTIONS", options.lane_reductions);
 	options.ir_linear_uses    = EnvFlag("KYTY_IR_LINEAR_USES", options.ir_linear_uses);
 	options.fold_lane_masks   = EnvFlag("KYTY_FOLD_LANE_MASKS", options.fold_lane_masks);
+	options.int_mrt_outputs   = EnvFlag("KYTY_INT_MRT_OUTPUTS", options.int_mrt_outputs);
+	options.ufloat_store_rtz = EnvFlag("KYTY_UFLOAT_STORE_RTZ", options.ufloat_store_rtz);
 	if (const auto* cap = std::getenv("KYTY_DISPATCHER_CAP"); cap != nullptr && cap[0] != '\0') {
 		options.dispatcher_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
 	}
@@ -215,6 +231,7 @@ CodegenOptions FromEnvironment() {
 		    std::strcmp(mode, "exit") == 0;
 	}
 	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
+	options.fract_clamp  = EnvFlag("KYTY_FRACT_CLAMP", options.fract_clamp);
 	if (const auto* mode = std::getenv("KYTY_RT_SOFTWARE");
 	    mode != nullptr && mode[0] != '\0' && std::strcmp(mode, "auto") != 0) {
 		options.rt_software      = std::strcmp(mode, "0") != 0;
@@ -260,6 +277,7 @@ CodegenOptions FromEnvironment() {
 	options.snapshot_written_guard =
 	    EnvFlag("KYTY_SNAPSHOT_WRITTEN_GUARD", options.snapshot_written_guard);
 	options.tess_indexed = EnvFlag("KYTY_TESS_INDEXED", options.tess_indexed);
+	options.ps_exec_words = EnvFlag("KYTY_PS_EXEC_WORDS", options.ps_exec_words);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.
 	const auto flush_off = [](const char* name) {

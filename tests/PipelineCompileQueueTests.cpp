@@ -3,6 +3,7 @@
 #include <atomic>
 #include <barrier>
 #include <cstdio>
+#include <deque>
 #include <future>
 #include <stdexcept>
 
@@ -63,6 +64,48 @@ int main() {
 	}
 	if (drained != 32) return 6;
 	try { result.get(); return 7; } catch (const std::runtime_error&) {}
-	std::puts("Pipeline compiler: parallelism, bounded admission, urgent work, drain, shutdown and error publication passed");
+
+	// KYTY_PIPELINE_SKIP_ORDER: worker 0 takes the oldest task, the others the most recently asked
+	// (the latest submitted among equal stamps); a task no draw asked for in stale_ms only goes to a
+	// background worker, or to any while the caller is stalled.
+	{
+		using Task = PipelineCompileQueue::Task;
+		PipelineCompileQueue::Ordering ordering;
+		ordering.recent_first       = true;
+		ordering.background_workers = 1;
+		ordering.stale_ms           = 2000;
+		std::deque<Task> tasks;
+		tasks.push_back({1, {}, 1000});
+		tasks.push_back({2, {}, 5000});
+		tasks.push_back({3, {}, 5000});
+		tasks.push_back({4, {}, 3000});
+		const auto pick = [&](size_t worker, uint64_t now, uint64_t stalled = 0) {
+			const auto index = PipelineCompileQueue::PickOrdered(tasks, worker, now, stalled, ordering);
+			return index.has_value() ? tasks[*index].ticket : 0u;
+		};
+		if (pick(0, 5100) != 1) return 29;  // worker 0: the oldest, a background worker
+		if (pick(1, 5100) != 3) return 30; // the most recently asked, the later of two
+		if (pick(1, 8000) != 0) return 31; // stale: not for a foreground worker
+		if (pick(1, 8000, 8400) != 3) return 32; // stalled: any worker helps
+		if (pick(0, 8000) != 1) return 33; // a background worker takes stale work
+		if (PipelineCompileQueue::PickOrdered({}, 1, 0, 0, ordering).has_value()) return 34;
+	}
+	// With the ordering, every accepted task still runs, and Stop drains the queue.
+	{
+		PipelineCompileQueue::Ordering ordering;
+		ordering.recent_first = true;
+		std::atomic<int> ran {0};
+		{
+			PipelineCompileQueue ordered(3, 64, {}, ordering);
+			for (uint64_t i = 1; i <= 32; ++i) {
+				if (!ordered.Submit([&] { ++ran; }, i)) return 35;
+			}
+			ordered.Promote(7);
+			ordered.NoteStall();
+		}
+		if (ran != 32) return 36;
+	}
+	std::puts("Pipeline compiler: parallelism, bounded admission, urgent work, drain, shutdown, error publication and "
+	          "ordering passed");
 	return 0;
 }

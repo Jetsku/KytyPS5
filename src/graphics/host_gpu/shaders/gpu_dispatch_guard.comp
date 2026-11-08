@@ -4,6 +4,10 @@
 // DispatchIndirect record (3 dwords) into the guard slot, replaced by 0,0,0 when a component or the
 // product exceeds the host limits: a record the emulation produced from stale or garbage data would
 // otherwise hang the device. Slot dwords: {x, y, z, flag(1 = replaced), raw x, raw y, raw z, 0}.
+// KYTY_INDIRECT_THREADS_GPU (GT7 fork 633e00962): with local sizes pushed, the record holds thread
+// counts (the thread-dimension initiator) and x, y, z become workgroup counts; the raw thread counts
+// in dwords 4-6 bound the dispatch's lanes (the shader reads them through the slot's address).
+// max_dim 0: no limit (conversion only).
 layout(local_size_x = 1) in;
 layout(set = 0, binding = 0, std430) readonly buffer Args { uint words[]; } args;
 layout(set = 0, binding = 1, std430) writeonly buffer Out { uint words[]; } slot;
@@ -12,21 +16,36 @@ layout(push_constant) uniform Push {
 	uint out_word;
 	uint max_dim;
 	uint max_total;
+	uint local_x; // 0: the record holds workgroup counts
+	uint local_y;
+	uint local_z;
 } push_data;
+
+uint Groups(uint threads, uint local_size) {
+	return threads == 0u ? 0u : (threads - 1u) / max(local_size, 1u) + 1u;
+}
 
 void main() {
 	uint x = args.words[push_data.args_word];
 	uint y = args.words[push_data.args_word + 1u];
 	uint z = args.words[push_data.args_word + 2u];
-	bool bad = x > push_data.max_dim || y > push_data.max_dim || z > push_data.max_dim ||
-	           (uint64_t(x) * uint64_t(y) * uint64_t(z)) > uint64_t(push_data.max_total);
+	uint raw_x = x;
+	uint raw_y = y;
+	uint raw_z = z;
+	if (push_data.local_x != 0u) {
+		x = Groups(x, push_data.local_x);
+		y = Groups(y, push_data.local_y);
+		z = Groups(z, push_data.local_z);
+	}
+	bool bad = push_data.max_dim != 0u && (x > push_data.max_dim || y > push_data.max_dim || z > push_data.max_dim ||
+	           (uint64_t(x) * uint64_t(y) * uint64_t(z)) > uint64_t(push_data.max_total));
 	uint o = push_data.out_word;
 	slot.words[o] = bad ? 0u : x;
 	slot.words[o + 1u] = bad ? 0u : y;
 	slot.words[o + 2u] = bad ? 0u : z;
 	slot.words[o + 3u] = bad ? 1u : 0u;
-	slot.words[o + 4u] = x;
-	slot.words[o + 5u] = y;
-	slot.words[o + 6u] = z;
+	slot.words[o + 4u] = raw_x;
+	slot.words[o + 5u] = raw_y;
+	slot.words[o + 6u] = raw_z;
 	slot.words[o + 7u] = 0u;
 }

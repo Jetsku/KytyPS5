@@ -2471,9 +2471,17 @@ uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& resource)
 // A heap entry the bindless array of this binding can hold: a float-sampled, single-sample
 // texture of a matching shape. Anything else stays the placeholder rather than reaching
 // ResolveTexture, which exits on descriptors a draw would never bind that way.
-bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
-	if (descriptor.IsNull() || Prospero::SampledTextureNumericClass(descriptor.Format()) !=
-	                               Prospero::TextureNumericClass::Float) {
+// allow_integer (KYTY_RUNTIME_INT_IMAGES, runtime heaps): uint and sint textures too, which the
+// shader's loads read through integer aliases of the binding.
+bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding,
+                        bool allow_integer = false) {
+	if (descriptor.IsNull()) {
+		return false;
+	}
+	const auto numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());
+	if (numeric_class != Prospero::TextureNumericClass::Float &&
+	    !(allow_integer && (numeric_class == Prospero::TextureNumericClass::Uint ||
+	                        numeric_class == Prospero::TextureNumericClass::Sint))) {
 		return false;
 	}
 	switch (descriptor.Type()) {
@@ -2811,7 +2819,8 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	const auto dimension    = heap.resource.dimension;
 	const bool one_d_heap   = dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
 	                          dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
-	if (one_d_heap || !BindlessCompatible(descriptor, heap.binding)) {
+	const bool integer_views = heap.runtime && ShaderRecompiler::GetCodegenOptions().runtime_int_images;
+	if (one_d_heap || !BindlessCompatible(descriptor, heap.binding, integer_views)) {
 		// KYTY_BINDLESS_INCOMPATIBLE_LOG=<n> (diagnostic): the first n keys left on the placeholder
 		// because their T# does not fit the binding's view type.
 		static const uint32_t log_limit = [] {
@@ -2842,6 +2851,14 @@ bool RenderExecutor::ResolveBindlessKey(BindlessHeap& heap, uint32_t key) {
 	auto resource = heap.resource;
 	if (as_array) {
 		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+	}
+	if (integer_views) {
+		// KYTY_RUNTIME_INT_IMAGES: an integer T#'s view has its own component type.
+		if (const auto numeric_class = Prospero::SampledTextureNumericClass(descriptor.Format());
+		    numeric_class != Prospero::TextureNumericClass::Float) {
+			resource.numeric_class = numeric_class;
+			resource.depth_compare = false;
+		}
 	}
 	auto& texture_cache = m_context.GetTextureCache();
 	// KYTY_BINDLESS_HOLD_EXTENT=1 (default 0; on in the PPSA03671 preset; adapted from upstream
@@ -3675,6 +3692,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 	m_bindless_snapshot_serial++;
 	table.DebugWatchReport(frame);
 	ReleaseIdleBindlessHeaps(frame);
+	const auto snapshot_frame = m_bindless_snapshot_frame;
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget    = 128;
 	uint32_t           resolved  = RevalidateBindlessKeys(Budget);
@@ -3773,6 +3791,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 		     resolved);
 	}
 	LogBindlessHeapStats(table, frame);
+	UpdateBindlessUsageProbe(frame, snapshot_frame);
 	table.RecordFeedbackSnapshot();
 	m_bindless_snapshot_frame = frame;
 }
@@ -3829,16 +3848,138 @@ static Live::Switch g_bindless_refresh("KYTY_BINDLESS_REFRESH", [](const char* v
 	return value != nullptr ? std::strtol(value, nullptr, 10) : 0;
 });
 
+// KYTY_BINDLESS_EVICT=1 (default off; adapted from Senaxx 8585096e6, on by default there):
+// bindless textures stay pinned in the texture cache while a heap key refers to them, and the
+// guest's heaps refer to every texture it has streamed in (2-5 GB on 4-8 GB cards in the fork's
+// title). Under memory pressure (TextureCache::BindlessUnderPressure) a probe marks every resident
+// key's feedback word; draws that sample a key overwrite the mark, and a snapshot recorded
+// ProbeFrames later lists the images whose keys all kept it. While the cache stays under
+// pressure, TextureCache::RunGarbageCollector frees those (clean, unbound ones only); their keys
+// go back to pending, and a draw that samples one again requests it anew. The fork's slot reuse
+// and placeholder-type fix are in this line already (FreeSlot, OnImageUnregistered).
+void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_EVICT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	constexpr uint64_t ProbeFrames   = 16; // frames a texture must go unsampled
+	constexpr uint64_t ProbeInterval = 32; // frames between the end of one probe and the next
+	auto&              table         = m_context.GetBindlessTable();
+	auto&              texture_cache = m_context.GetTextureCache();
+	if (m_bindless_probe_frame != 0) {
+		// The snapshot read here must have been recorded ProbeFrames after the marks.
+		if (snapshot_frame < m_bindless_probe_frame + ProbeFrames) {
+			return;
+		}
+		m_bindless_unused.clear();
+		table.CollectUnusedImages(m_bindless_unused);
+		const auto bytes       = texture_cache.SetBindlessEvictable(m_bindless_unused);
+		m_bindless_probe_frame = 0;
+		m_bindless_next_probe  = frame + ProbeInterval;
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1) < 32) {
+			LOGF("Bindless probe: frame=%" PRIu64 " unused=%zu (%" PRIu64
+			     " MB) may be evicted (KYTY_BINDLESS_EVICT)\n",
+			     frame, m_bindless_unused.size(), bytes >> 20u);
+		}
+		return;
+	}
+	if (frame < m_bindless_next_probe) {
+		return;
+	}
+	if (!texture_cache.BindlessUnderPressure()) {
+		// No pressure: an older list must not free textures sampled since.
+		m_bindless_unused.clear();
+		(void)texture_cache.SetBindlessEvictable(m_bindless_unused);
+		m_bindless_next_probe = frame + ProbeInterval;
+		return;
+	}
+	table.ArmUsageProbe();
+	m_bindless_probe_frame = std::max<uint64_t>(frame, 1u); // 0 = idle
+}
+
+// KYTY_BINDLESS_SAMPLERS (a minimal port of Senaxx's mirrored sampler heaps, 59cb8a83e): the S#
+// records of each sampler heap a stage indexes are mirrored into the sampler array of set 1, once
+// per frame per heap and kind of use, and the shader gets the region base and record count. Keys
+// outside it, heaps the GPU has written or that cannot be read, and a full array, use the stand-in
+// sampler in slot 0 (the words stay 0, or the heap keeps its previous mirror).
+void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
+                                             PreparedBindings&         prepared) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	auto&       table    = m_context.GetBindlessTable();
+	auto&       cache    = m_context.GetSamplerCache();
+	{
+		ShaderSamplerResource stand_in;
+		std::copy_n(ShaderRecompiler::IR::BindlessDefaultSampler, 4u, stand_in.fields);
+		table.WriteDefaultSampler(cache.GetSampler(stand_in, false));
+	}
+	const auto         frame      = BindlessFrame();
+	constexpr uint64_t MaxRecords = 1024;
+	constexpr uint64_t MaxBytes   = 256u * 1024u;
+	std::vector<std::array<uint32_t, 4>> records;
+	for (const auto& use: snapshot.bindless_sampler_heaps) {
+		if (use.sampler >= program.info.samplers.size() || use.stride < 16u) {
+			continue;
+		}
+		const auto&    sampler = program.info.samplers[use.sampler];
+		const bool     cube    = CubeEdgeClamp() && SamplesCubesOnly(program, use.sampler);
+		const uint32_t flags   = (sampler.depth_compare ? 1u : 0u) |
+		                       (sampler.force_point_filtering ? 2u : 0u) |
+		                       (sampler.integer_border ? 4u : 0u) | (cube ? 8u : 0u);
+		auto& heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, use.stride, flags);
+		if (heap.checked_frame != frame) {
+			heap.checked_frame       = frame;
+			const uint64_t available = use.size > use.table_offset
+			                               ? (use.size - use.table_offset + use.stride - 16u) / use.stride
+			                               : 0u;
+			records.resize(std::min({available, MaxRecords, MaxBytes / use.stride}));
+			const uint64_t address = use.base + use.table_offset;
+			const uint64_t bytes =
+			    records.empty() ? 0u : (records.size() - 1u) * use.stride + sizeof(records[0]);
+			bool read = !records.empty() &&
+			            !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes);
+			if (read && use.stride == sizeof(records[0])) {
+				read = LibKernel::Memory::TryReadBacking(address, records.data(), bytes);
+			} else {
+				for (size_t key = 0; read && key < records.size(); key++) {
+					read = LibKernel::Memory::TryReadBacking(address + key * use.stride,
+					                                         records[key].data(),
+					                                         sizeof(records[key]));
+				}
+			}
+			if (read) {
+				const auto make = [&](const std::array<uint32_t, 4>& record) {
+					ShaderRecompiler::IR::DescriptorValue value;
+					value.dword_count = 4u;
+					std::copy(record.begin(), record.end(), value.dwords.begin());
+					return cache.GetSampler(NativeSamplerDescriptor(program, use.sampler, value),
+					                        sampler.integer_border);
+				};
+				(void)table.MirrorSamplerHeap(heap, records, make);
+			}
+		}
+		const uint32_t entries = heap.region != 0u ? static_cast<uint32_t>(heap.records.size()) : 0u;
+		prepared.bindless_patches.push_back({use.mapping_offset, heap.region, entries});
+	}
+}
+
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings&         prepared) {
 	prepared.bindless_patches.clear();
 	prepared.bindless_heaps.clear();
 	const auto& snapshot = *runtime.resources;
-	if (snapshot.bindless_heaps.empty()) [[likely]] {
+	if (snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty()) [[likely]] {
 		return;
 	}
 	const auto& program = *runtime.program;
 	auto&       table   = m_context.GetBindlessTable();
+	if (!snapshot.bindless_sampler_heaps.empty() && table.EnsureCreated()) {
+		PrepareBindlessSamplers(runtime, prepared);
+	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.record_pointer == UINT32_MAX && !use.runtime &&
 		    m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
@@ -4294,6 +4435,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
+		if (program.stage == ShaderType::Pixel && TextureCache::LightGridProbeEnabled()) {
+			for (uint32_t i = 0; i < count; i++) {
+				const auto& resource = program.info.images[i];
+				const auto& binding  = prepared.images[i];
+				if (!resource.written && binding.image_id &&
+				    binding.desc.info.pixel_format == vk::Format::eR32G32Uint &&
+				    binding.desc.info.resources.layers > 1) {
+					TextureCache::ProbeLightGrid(binding.desc.info, program.shader_hash);
+				}
+			}
+		}
 		if (program.stage == ShaderType::Pixel && TextureCache::LightGridCapEnabled()) {
 			// KYTY_LIGHT_GRID_CAP (usa-ratt/KytyPS5-GT7 ecef51e59): a pixel shader's light grid
 			// has its later uploads checked (TextureCache::NoteLightGridShape).
@@ -4487,6 +4639,38 @@ static void BufferPeek(uint64_t shader_hash, uint32_t index, uint64_t address, u
 	     shader_hash, index, address, size, text.c_str());
 }
 
+// KYTY_SPARSE_WRITES=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 cb543d499): a
+// written buffer binding over memory with holes in its mappings (sparse memory: 64 KB pages mapped
+// only where needed) is bound from its base to the end of its last mapped byte, instead of up to
+// its first hole (or as empty when its first page is a hole). The guest GPU's stores land in every
+// mapped page; those to a hole stay in the cached buffer and are never written back. Up to 1 GB and
+// the device's storage-buffer range; `clamped` otherwise. GT7 clears a sparse depth map with a
+// compute fill over the whole range.
+static uint64_t SparseWriteSize(uint64_t shader, uint64_t address, uint64_t requested,
+                                uint64_t clamped, uint64_t limit) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_WRITES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || address == 0) {
+		return clamped;
+	}
+	const auto extent = Libs::LibKernel::Memory::CommittedExtent(address, requested);
+	if (extent <= clamped || extent > std::min(limit, uint64_t {1} << 30u)) {
+		return clamped;
+	}
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> logged;
+	std::lock_guard                                lock(mutex);
+	if (logged.size() < 32 && logged.insert({shader, address}).second) {
+		LOGF("RenderExecutor: shader %016" PRIx64 " writes 0x%016" PRIx64 "+0x%" PRIx64
+		     " over memory with holes: bound to its last mapped byte, 0x%" PRIx64
+		     " (up to the first hole it was 0x%" PRIx64 "; KYTY_SPARSE_WRITES)\n",
+		     shader, address, requested, extent, clamped);
+	}
+	return extent;
+}
+
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -4576,6 +4760,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 					NoteBufferRangeFix("finite range across sparse holes", serial_address, serial_size,
 					                   requested_size);
 					serial_size = requested_size;
+				}
+				if (serial_size != requested_size && program.info.buffers[i].written) {
+					serial_size = SparseWriteSize(program.shader_hash, serial_address, requested_size,
+					                              serial_size, unbounded_read_limit);
 				}
 				if (serial_size == 0) {
 					// An unmapped V# (typically left over from a skipped shader's output): bind
@@ -4955,6 +5143,65 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	CommitStats::StepMark(CommitStats::Step::RbTables);
 }
 
+// KYTY_SPARSE_HOLES=1 (TextureCache::ResetUnmappedDepth): after a stage's views are acquired (and
+// their images refreshed), each image it samples with a depth comparison has its unmapped blocks
+// reset to the depth that passes the comparison: 1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL. None
+// for other functions, bindless samplers, or samplers of one image that disagree.
+static void ResetSparseDepthHoles(TextureCache& texture_cache, const PreparedBindings& prepared) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPARSE_HOLES");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || prepared.runtime == nullptr || !*prepared.runtime) {
+		return;
+	}
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	const auto& images   = prepared.images;
+	for (uint32_t i = 0; i < program.info.images.size() && i < images.size(); i++) {
+		if (!program.info.images[i].depth_compare ||
+		    images[i].desc.type == TextureCache::BindingType::Storage) {
+			continue;
+		}
+		std::optional<float> depth;
+		bool                 usable = true;
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != i || pair.sampler >= program.info.samplers.size()) {
+				continue;
+			}
+			const auto& sampler = program.info.samplers[pair.sampler];
+			if (!sampler.depth_compare) {
+				continue;
+			}
+			if (sampler.bindless || sampler.snapshot_index >= snapshot.samplers.size()) {
+				usable = false;
+				break;
+			}
+			float passing = 0.0f;
+			switch (DecodeNativeDescriptor<ShaderSamplerResource>(snapshot.samplers[sampler.snapshot_index])
+			            .DepthCompareFunc()) {
+				case 1: // LESS
+				case 3: // LEQUAL
+					passing = 1.0f;
+					break;
+				case 4: // GREATER
+				case 6: // GEQUAL
+					passing = 0.0f;
+					break;
+				default: usable = false; break;
+			}
+			if (!usable || (depth.has_value() && *depth != passing)) {
+				usable = false;
+				break;
+			}
+			depth = passing;
+		}
+		if (usable && depth.has_value()) {
+			texture_cache.ResetUnmappedDepth(images[i].image_id, *depth);
+		}
+	}
+}
+
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -4963,6 +5210,13 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// KYTY_SPARSE_HOLES: once the views are acquired (and their images refreshed), on every exit,
+	// for draws and dispatches alike.
+	struct SparseDepthHolesOnExit {
+		TextureCache&           cache;
+		const PreparedBindings& bindings;
+		~SparseDepthHolesOnExit() { ResetSparseDepthHoles(cache, bindings); }
+	} sparse_depth_holes {texture_cache, prepared};
 	// KYTY_DRAW_SEQUENCE_FAST (textures): when every binding would get TryAcquireView's hit and
 	// nothing else (TextureBindingMemo::TryRepeatViews, one texture-cache lock for the stage).
 	bool verify_views = false;

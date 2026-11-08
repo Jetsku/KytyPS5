@@ -282,6 +282,11 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	// KYTY_BINDLESS_SAMPLERS: selected per lane by a key into a guest sampler heap
+	// (DescriptorSource::bindless_sampler). The shader indexes the bindless sampler array (set 1)
+	// with the region base and record count at this flattened-SRT offset, which the host patches.
+	bool     bindless                = false;
+	uint32_t bindless_mapping_offset = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -323,6 +328,7 @@ enum class StageInputKind {
 	TessCoord,
 	InstanceIndex,
 	BaseInstance,
+	BaseVertex,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,
@@ -731,6 +737,9 @@ struct DescriptorSource {
 		// KYTY_RUNTIME_IMAGES: no table either; the T# is a value the shader loads
 		// (ImageResource::runtime).
 		bool     runtime      = false;
+		// KYTY_WORKGROUP_IMAGES (upstream de3ed905c): nonzero, the workgroup keys are
+		// (selector_first + ID) * workgroup_multiplier >> workgroup_shift (shift 32..63).
+		uint8_t  workgroup_shift = 0;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		// Bindless through a record pointer: the key selects a table_stride-byte record of the
 		// table, whose 64-bit word at this byte offset points at the T# (table_offset bytes past
@@ -743,7 +752,9 @@ struct DescriptorSource {
 		uint32_t nested_vsharp   = UINT32_MAX;
 		uint32_t nested_heap     = 0;
 		uint32_t nested_keys     = 0;
+		uint32_t workgroup_multiplier = 0;
 		Value    key_count;
+		// With workgroup_axis: a runtime base the shader adds to the workgroup ID (empty: none).
 		Value                 selector_first;
 		Value    selector_mask;
 
@@ -753,6 +764,15 @@ struct DescriptorSource {
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectDescriptor> indirect_descriptor;
+	// KYTY_BINDLESS_SAMPLERS: an S# read from a sampler heap at a key the shader computes. Dwords
+	// 0-2 are the heap's V# (dword 3 is 0); key k's S# is at table_offset + k * stride bytes.
+	struct BindlessSampler {
+		uint32_t table_offset = 0;
+		uint32_t stride       = 16;
+
+		bool operator==(const BindlessSampler& other) const = default;
+	};
+	std::optional<BindlessSampler> bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -768,6 +788,8 @@ struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
 	std::vector<uint32_t> successors;
+	// Descriptor sources the block reads; with KYTY_SRT_IMAGE_REACH an entry
+	// descriptor_sources.size() + i also marks image i (ImageActiveSlot, SrtWalker.h).
 	std::vector<uint32_t> sources;
 };
 

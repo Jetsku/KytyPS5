@@ -550,7 +550,16 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	uint64_t effective_hash = declared_hash;
-	if (RegisteredShaderCodeEnabled() && DrawPrep::Speculative()) {
+	// KYTY_DRAW_PREP_DECLARED_CODE=1 (default off): a draw-prep preparation of a shader with a
+	// declared (AGC header) hash takes the program by that hash, as the serial path does, without
+	// re-reading and re-hashing its code for the certificate (GT7's shaders are hundreds of KiB each;
+	// with KYTY_DRAW_PREP_PRIVATE_READS their code in the program image is otherwise copied and hashed
+	// for every prepared stage).
+	static const bool declared_code = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_DECLARED_CODE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (RegisteredShaderCodeEnabled() && DrawPrep::Speculative() && !(declared_code && declared_hash != 0)) {
 		// Keep the worker's exact code certificate, including failed-read fallback at commit.
 		const auto certified_hash = HashShaderCodeCertified(code);
 		if (certified_hash != data.code_hash || DrawPrep::SpeculativeFailed()) {
@@ -1348,7 +1357,7 @@ static void ShaderGetStaticInputInfoPS(
 
 	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
-	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
+	ps_info.lds_size_dwords     = static_cast<uint16_t>(static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u);
 
 	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
 	ps_info.input_num            = sh.ps_in_control & 0x3fu;
@@ -1433,11 +1442,13 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool async_compute             = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
+	const bool dispatch_dimensions_indirect = info.dispatch_dimensions_indirect;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
 	info                                  = {};
 	info.async_compute                    = async_compute;
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
+	info.dispatch_dimensions_indirect     = dispatch_dimensions_indirect;
 	info.host_subgroup_size               = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
@@ -1510,6 +1521,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		}
 		info.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		info.start_instance_sgpr = start_instance_sgpr;
+		info.indirect_vertex_base = regs.indirect_vertex_base;
+		info.base_vertex_sgpr =
+		    regs.indirect_vertex_base && regs.base_vertex_user_sgpr >= 0 &&
+		            static_cast<uint32_t>(regs.base_vertex_user_sgpr) < regs.gs_regs.rsrc2.user_sgpr
+		        ? 8 + regs.base_vertex_user_sgpr
+		        : -1;
 		// Upstream fa8216c4d: per-invocation LDS emulation is sized by the GS stage's LDS_SIZE.
 		info.lds_size_dwords = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 		return params;
@@ -1828,6 +1845,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	if (unsupported != nullptr) *unsupported = false;
+	// KYTY_DRAW_PREP_TESS (pipelineCache.cpp, adapted from usa-ratt/KytyPS5-GT7 59bd41633): a
+	// draw-prep preparation describes the set from the draw's register snapshot and never ends the
+	// emulator; whatever it cannot describe is refused (unsupported) or left to the serial path
+	// (a failed read), which decides at commit as before.
+	const bool speculative = DrawPrep::Speculative();
+	EXIT_IF(speculative && unsupported == nullptr);
+	if (speculative && DrawPrep::SpeculativeFailed()) {
+		return {};
+	}
 	const bool unsupported_types = (merged == nullptr && local.type != Prospero::ShaderBinaryType::kHsFront) ||
 	                               control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                               evaluation.type != Prospero::ShaderBinaryType::kGs;
@@ -1837,6 +1863,10 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	// the tessellator, a wave32 hull or domain stage, other binary types) has its patch draws
 	// skipped with KYTY_SKIP_INVALID (default on) instead of ending the emulator. Logged once per
 	// set and stage mask.
+	if (speculative && (unsupported_types || unsupported_stages || regs.hs_regs.user_data_addr == 0)) {
+		*unsupported = true;
+		return {};
+	}
 	if ((unsupported_types || unsupported_stages) && unsupported != nullptr &&
 	    Common::SkipInvalidEnabled()) {
 		static std::mutex                   logged_mutex;
@@ -1886,10 +1916,28 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 		params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 	}
+	if (speculative && DrawPrep::SpeculativeFailed()) {
+		return {};
+	}
 
 	input_info = {};
-	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+	if (speculative) {
+		// The LS vertex tables as PrepareProgram's VS path reads them in a preparation: metadata
+		// copied from clean memory, every table word through the recorder.
+		PreparationMetadata metadata_copy;
+		ShaderMappedData    metadata = local;
+		if (!CopyMetadataForPreparation(local, metadata_copy, metadata)) {
+			return {};
+		}
+		if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+		                                    regs.hs_regs.rsrc2.user_sgpr, sh, metadata,
+		                                    input_info[0])) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return {};
+		}
+	} else if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+	                                           regs.hs_regs.rsrc2.user_sgpr, sh, local,
+	                                           input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;
@@ -1915,6 +1963,11 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .min_tess_level        = sh.m_vgtHosMinTessLevel,
 	    .max_tess_level        = sh.m_vgtHosMaxTessLevel,
 	};
+	if (speculative && (tess.input_control_points == 0 || tess.input_control_points > 32 ||
+	                    tess.output_control_points == 0 || tess.output_control_points > 32)) {
+		*unsupported = true;
+		return {};
+	}
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	// The analysis caches the LS/HS strides per program pair and control point counts itself

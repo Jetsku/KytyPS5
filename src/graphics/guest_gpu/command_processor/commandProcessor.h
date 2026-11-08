@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -199,6 +200,8 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// R_PSSR (experimental Pro mode): a linear PSSR upscale, recorded as an op.
+	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 	// KYTY_PM4_BARRIERS=guest: the full barrier at the start of a queue's slice (executor thread).
 	void SliceStartBarrier() { EmitGlobalBarrier(); }
@@ -228,6 +231,9 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	// MEM_SEMAPHORE (async compute, upstream 1b7093805): a signal bumps (or sets) the counter, a
+	// wait suspends the packet while it is zero and decrements it otherwise. Direct front only.
+	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -362,6 +368,7 @@ private:
 	void          ExecReferenceClock(const CpSeq::ReferenceClockOp& op);
 	void          ExecDmaData(const CpSeq::DmaDataOp& op);
 	void          ExecLodStats(const CpSeq::LodStatsOp& op);
+	void          ExecPssr(const CpSeq::PssrOp& op);
 	void          ExecFlip(const CpSeq::FlipOp& op);
 	CpSeq::Result ExecWaitRegMem(const CpSeq::WaitRegMemOp& op);
 	template <typename T>
@@ -438,6 +445,9 @@ private:
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
+	// KYTY_GPU_INSTANCE_COUNT: the guest address of the instance count NumInstances would read
+	// when the newest pending native indirect draw decides it alone (no count buffer), else 0.
+	[[nodiscard]] uint64_t GpuInstanceCountAddress() const;
 	// Draw-prep (drawPrep.h): the engine of the graphics processor, created on first use when
 	// KYTY_DRAW_PREP (or the S0 histogram) is enabled; null otherwise.
 	[[nodiscard]] DrawPrep::Engine* DrawPrepEngine();
@@ -598,6 +608,9 @@ private:
 	uint64_t       m_retry_op         = 0;
 	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
 	bool m_packet_hook = false;
+	// KYTY_DRAW_PREP_FENCE_OVERLAP (drawPrep.h): the packet hook left the window open for this
+	// packet; its handler (DrawIndirect / DispatchDirect) publishes, commits up to and executes it.
+	bool m_fence_overlap = false;
 };
 
 } // namespace Libs::Graphics

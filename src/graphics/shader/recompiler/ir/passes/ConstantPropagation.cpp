@@ -510,11 +510,10 @@ bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
 }
 
 // Whether one boolean is the LogicalNot of the other (KYTY_FOLD_LANE_MASKS: x && !x, x || !x).
-bool IsComplement(Value lhs, Value rhs) {
-	const auto negates = [](Value negation, Value value) {
-		const auto* inst = negation.TryInstruction();
-		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalNot &&
-		       Arg(*inst, 0) == value;
+bool IsComplement(Value lhs, Value rhs, ValueOpcode negation = ValueOpcode::LogicalNot) {
+	const auto negates = [negation](Value negated, Value value) {
+		const auto* inst = negated.TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == negation && Arg(*inst, 0) == value;
 	};
 	return negates(lhs, rhs) || negates(rhs, lhs);
 }
@@ -1024,8 +1023,12 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitwiseXor32:
 			if (!FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
-			    })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0u);
+			    }) && !ReplaceBinaryIdentity(inst, Type::U32, 0u) &&
+			    GetCodegenOptions().fold_lane_masks && IsComplement(Arg(inst, 0), Arg(inst, 1),
+			                                                        ValueOpcode::BitwiseNot32)) {
+				// KYTY_FOLD_LANE_MASKS (upstream ce5e57aa3): x | ~x and x ^ ~x are every bit, as the
+				// complementary EXEC words of s_orn2_saveexec.
+				Replace(inst, Value(UINT32_MAX));
 			}
 			return;
 		case ValueOpcode::BitwiseNot32: {

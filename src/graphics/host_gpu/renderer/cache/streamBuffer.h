@@ -35,6 +35,10 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// KYTY_HOST_BUFFER_MB in bytes (0: off): device-local buffers at least this large live in system
+// memory.
+[[nodiscard]] uint64_t HostBufferBytes();
+
 class Buffer {
 public:
 	// transfer_shared: concurrent sharing with the upload DMA transfer queue family
