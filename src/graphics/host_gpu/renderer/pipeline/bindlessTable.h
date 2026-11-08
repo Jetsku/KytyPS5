@@ -105,6 +105,9 @@ struct BindlessHeap {
 	// KYTY_BINDLESS_PREFILL: the heap's keys were settled at its first use (RenderExecutor::
 	// PrefillBindlessHeap).
 	bool                                 prefilled        = false;
+	// KYTY_BINDLESS_REFILL: the scheduler tick of the last table check and the table bytes' digest then.
+	uint64_t                             refill_tick      = UINT64_MAX;
+	uint64_t                             refill_digest    = 0;
 	// KYTY_BINDLESS_TOUCH: the last frame its resolved images were touched (TextureCache::TouchImage).
 	uint64_t                             touched_frame    = UINT64_MAX;
 	uint32_t                             runtime_next_key = 0;

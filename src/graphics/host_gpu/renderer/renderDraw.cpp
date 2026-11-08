@@ -4703,6 +4703,127 @@ static void DrawPeek(RenderContext& context, CommandBuffer& buffer, const DrawCa
 	    });
 }
 
+// KYTY_DRAW_VERIFY_VSB=<vs hash>:<buffer index>[,<buffer index>] (hexadecimal hash, diagnostic,
+// default off): after every draw with this vertex program, the GPU's bytes of those VS buffers
+// (stride x records, at most 256 KiB each) are copied to a host-visible ring and, once the tick
+// completed, compared with the guest's bytes of the same range read when the draw was recorded
+// (the guest backing, as the CPU wrote it). "VsbVerify" logs per draw the records that differ, so
+// an instance buffer the GPU read stale (or that the guest rewrote while the draw was pending)
+// shows. Ends the rendering instance after each such draw.
+struct VerifyVsbRequest {
+	uint64_t              hash = 0;
+	std::vector<uint32_t> buffers;
+};
+static const VerifyVsbRequest& VerifyVsb() {
+	static const VerifyVsbRequest request = [] {
+		VerifyVsbRequest parsed;
+		if (const auto* value = std::getenv("KYTY_DRAW_VERIFY_VSB"); value != nullptr) {
+			char* end   = nullptr;
+			parsed.hash = std::strtoull(value, &end, 16);
+			while (end != nullptr && (*end == ':' || *end == ',')) {
+				parsed.buffers.push_back(static_cast<uint32_t>(std::strtoul(end + 1, &end, 10)));
+			}
+			if (parsed.buffers.empty()) parsed.buffers.push_back(0);
+		}
+		return parsed;
+	}();
+	return request;
+}
+
+static void VerifyVsbDraw(RenderContext& context, CommandBuffer& buffer, const DrawCallInfo& draw,
+                          const DrawRenderState& state) {
+	constexpr uint64_t MaxBytes = 256 * 1024;
+	constexpr uint32_t Slots    = 64;
+	static std::mutex              mutex;
+	static std::unique_ptr<Buffer> download;
+	static uint32_t                next_slot  = 0;
+	static int64_t                 last_frame = -1;
+	static uint32_t                ordinal    = 0;
+	const auto* program   = state.vertex_info[0].stage.program;
+	const auto* resources = state.vertex_info[0].stage.resources;
+	if (program == nullptr || resources == nullptr) return;
+	std::scoped_lock lock(mutex);
+	const auto       frame = static_cast<int64_t>(context.GetGpu().GetFrameNum());
+	if (frame != last_frame) {
+		last_frame = frame;
+		ordinal    = 0;
+	}
+	const auto draw_index = ordinal++;
+	if (download == nullptr) {
+		download = std::make_unique<Buffer>(context.GetGraphics(), context.GetCommandScheduler(),
+		                                    MemoryUsage::Download, 0, AllFlags, MaxBytes * Slots);
+	}
+	auto& cache = context.GetBufferCache();
+	for (const auto index: VerifyVsb().buffers) {
+		if (index >= program->info.buffers.size() || index >= resources->buffers.size()) continue;
+		const auto     r      = DecodeNativeDescriptor<ShaderBufferResource>(resources->buffers[index]);
+		const uint64_t base   = r.Base48();
+		const uint32_t stride = r.Stride();
+		const uint64_t bytes  = std::min<uint64_t>(stride != 0 ? uint64_t {stride} * r.NumRecords() : r.NumRecords(),
+		                                          MaxBytes) & ~uint64_t {3};
+		if (base == 0 || bytes == 0) continue;
+		auto       guest = std::make_shared<std::vector<uint8_t>>(bytes);
+		const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(base, guest->data(), bytes);
+		if (!clean) {
+			const auto* alias = LibKernel::Memory::GuestBackingAlias(base, bytes);
+			if (alias == nullptr) continue;
+			std::memcpy(guest->data(), alias, bytes);
+		}
+		const auto [source, offset] = cache.ObtainBuffer(base, bytes, false);
+		if (source == nullptr) continue;
+		const auto slot = next_slot++ % Slots;
+		download->CopyFrom(buffer, *source, offset, uint64_t {slot} * MaxBytes, bytes,
+		                   vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+		                   vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                   vk::AccessFlagBits::eHostRead);
+		const auto inst = draw.instance_count;
+		context.GetCommandScheduler().DeferOperation([slot, guest, base, bytes, stride, clean, frame, draw_index,
+		                                              index, inst] {
+			download->Invalidate(uint64_t {slot} * MaxBytes, bytes);
+			const auto*    gpu    = download->Mapped().data() + uint64_t {slot} * MaxBytes;
+			const uint32_t record = stride != 0 ? stride : 16u;
+			uint32_t       diff = 0, first = UINT32_MAX;
+			const uint64_t records = bytes / record;
+			for (uint64_t k = 0; k < records; k++) {
+				if (std::memcmp(gpu + k * record, guest->data() + k * record, record) != 0) {
+					if (first == UINT32_MAX) first = static_cast<uint32_t>(k);
+					diff++;
+				}
+			}
+			// Guest bytes now (at completion): whether the guest rewrote the range meanwhile.
+			uint32_t    now_diff = 0;
+			const auto* alias    = LibKernel::Memory::GuestBackingAlias(base, bytes);
+			if (alias != nullptr) {
+				for (uint64_t k = 0; k < records; k++) {
+					if (std::memcmp(static_cast<const uint8_t*>(alias) + k * record, guest->data() + k * record,
+					                record) != 0) {
+						now_diff++;
+					}
+				}
+			}
+			std::string text = fmt::format(
+			    "VsbVerify: frame={} #{} vsb{} base=0x{:x} stride={} records={} inst={} clean={} diff={} "
+			    "guest_changed_by_completion={}",
+			    frame, draw_index, index, base, stride, records, inst, clean ? 1 : 0, diff, now_diff);
+			if (diff != 0) {
+				text += fmt::format(" first={} gpu:", first);
+				for (uint32_t w = 0; w < std::min<uint32_t>(record, 32u) / 4u; w++) {
+					uint32_t value = 0;
+					std::memcpy(&value, gpu + uint64_t {first} * record + w * 4u, 4);
+					text += fmt::format(" {:08x}", value);
+				}
+				text += " guest:";
+				for (uint32_t w = 0; w < std::min<uint32_t>(record, 32u) / 4u; w++) {
+					uint32_t value = 0;
+					std::memcpy(&value, guest->data() + uint64_t {first} * record + w * 4u, 4);
+					text += fmt::format(" {:08x}", value);
+				}
+			}
+			LOGF("%s\n", text.c_str());
+		});
+	}
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -5782,6 +5903,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		buffer.EndRendering();
 		m_run_active = false;
 		DrawPeek(m_context, buffer, draw, state, indirect);
+	}
+	// KYTY_DRAW_VERIFY_VSB (above): the draw's VS buffers on the GPU vs the guest's bytes.
+	if (const auto verify_hash = VerifyVsb().hash;
+	    verify_hash != 0 && state.vertex_info[0].stage.program != nullptr &&
+	    state.vertex_info[0].stage.program->shader_hash == verify_hash) [[unlikely]] {
+		buffer.EndRendering();
+		m_run_active = false;
+		VerifyVsbDraw(m_context, buffer, draw, state);
 	}
 	// KYTY_PASS_DUMP (renderCompute.cpp): the draw and the targets it wrote.
 	if (PassDump::Capturing()) {

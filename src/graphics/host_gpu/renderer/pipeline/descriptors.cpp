@@ -2998,6 +2998,57 @@ static uint32_t BindlessPrefillMax() {
 	return max;
 }
 
+// KYTY_BINDLESS_REFILL (default on with KYTY_BINDLESS_PREFILL; =0 off, the old behaviour; adapted
+// from Erlou93/KytyPS5-Yotei's table path, which translates a texture table as a whole when a draw
+// that reads it is prepared and again whenever its bytes changed): when a draw or dispatch that
+// reads a heap is prepared, the heap's key table (at most KYTY_BINDLESS_REFILL_MAX keys, default
+// 4096) is hashed once per command-buffer tick, and when its bytes changed, its unresolved keys are
+// settled now (PrefillBindlessHeap), instead of being sampled as the pending placeholder until a
+// later frame's feedback asks for them. Ghost of Yotei rewrites the T#s of its terrain material
+// tables (2664 keys of 96 bytes, two tables in alternate frames) while virtual-texture tiles
+// stream; the keys new in a frame read transparent black and the terrain showed white snow
+// patches on the mountain and white sparkles on the water for a few frames (41-80 times per 300 s
+// standing at the flower field; KYTY_BINDLESS_DEBUG_COLORS=1 hid them, Erlou93/KytyPS5-Yotei has
+// none). Settling at the draw, not when the guest's write is noticed: the guest may still be
+// writing a table for a later frame then (that variant, resolving half-written T#s, made it worse).
+static std::atomic<uint64_t> g_bindless_refills {0}; // tables whose bytes changed, re-prefilled
+
+static bool BindlessRefillEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_REFILL");
+		return BindlessPrefillMode() != 0u && (value == nullptr || std::strcmp(value, "0") != 0);
+	}();
+	return enabled;
+}
+
+static uint32_t BindlessRefillMax() {
+	static const uint32_t max = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_REFILL_MAX");
+		return value != nullptr && value[0] != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 4096u;
+	}();
+	return max;
+}
+
+void RenderExecutor::RefillBindlessHeap(BindlessHeap& heap, uint32_t entries) {
+	const auto tick = m_context.GetCommandScheduler().CurrentTick();
+	if (heap.refill_tick == tick || entries == 0 || heap.stride == 0) {
+		return;
+	}
+	heap.refill_tick  = tick;
+	const auto bytes  = uint64_t {entries - 1u} * heap.stride + 32u;
+	m_bindless_refill_bytes.resize(bytes);
+	if (!LibKernel::Memory::TryReadBacking(heap.base + heap.table_offset, m_bindless_refill_bytes.data(), bytes)) {
+		return;
+	}
+	const auto digest = XXH3_64bits(m_bindless_refill_bytes.data(), bytes);
+	if (digest == heap.refill_digest) {
+		return;
+	}
+	heap.refill_digest = digest;
+	g_bindless_refills.fetch_add(1, std::memory_order_relaxed);
+	PrefillBindlessHeap(heap, entries);
+}
+
 void RenderExecutor::PrefillBindlessHeap(BindlessHeap& heap, uint32_t entries) {
 	auto&          table   = m_context.GetBindlessTable();
 	auto&          cache   = m_context.GetTextureCache();
@@ -3320,9 +3371,10 @@ void RenderExecutor::SyncWrittenBindlessEntries() {
 		if (const auto now = std::chrono::steady_clock::now(); now - last_line >= std::chrono::seconds(10)) {
 			last_line = now;
 			LOGF("BindlessSync 10s: syncs=%" PRIu64 " heaps=%zu compared_per_sync=%.0f retired_skips=%" PRIu64
-			     " stale_rechecks=%" PRIu64 "\n",
+			     " stale_rechecks=%" PRIu64 " refills=%" PRIu64 "\n",
 			     syncs, heaps.size(), syncs != 0 ? static_cast<double>(candidate_sum) / static_cast<double>(syncs) : 0.0,
-			     g_bindless_retired_skips.exchange(0), g_bindless_retired_rechecks.exchange(0));
+			     g_bindless_retired_skips.exchange(0), g_bindless_retired_rechecks.exchange(0),
+			     g_bindless_refills.exchange(0));
 			syncs = candidate_sum = 0;
 		}
 	}
@@ -3473,6 +3525,26 @@ uint32_t RenderExecutor::ResolveFlaggedKeys(BindlessHeap& heap, uint32_t budget,
 	m_bindless_requests.clear();
 	table.TakeRequests(heap, m_bindless_requests);
 	*requested += static_cast<uint32_t>(m_bindless_requests.size());
+	// KYTY_BINDLESS_REQ_LOG=<n> (diagnostic, default off): the first n lines "Bindless requests": per
+	// heap and frame, how many unresolved keys shaders sampled (feedback), with the heap's identity.
+	static const uint32_t req_log = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_REQ_LOG");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (req_log != 0 && !m_bindless_requests.empty()) {
+		static std::atomic<uint32_t> lines {0};
+		if (lines.fetch_add(1, std::memory_order_relaxed) < req_log) {
+			uint32_t unsettled = 0;
+			for (const auto key: m_bindless_requests) {
+				unsettled += key < heap.settled.size() && heap.settled[key] == 0 ? 1u : 0u;
+			}
+			LOGF("Bindless requests: frame=%" PRIu64 " heap 0x%" PRIx64 "+%u stride %u binding %u entries %u record %d "
+			     "runtime %d requested %zu unsettled %u first_key %u\n",
+			     BindlessFrame(), heap.base, heap.table_offset, heap.stride, heap.binding, heap.entries,
+			     heap.record_pointer != UINT32_MAX ? 1 : 0, heap.runtime ? 1 : 0, m_bindless_requests.size(),
+			     unsettled, m_bindless_requests.front());
+		}
+	}
 	for (const auto key: m_bindless_requests) {
 		if (heap.settled[key] != 0) {
 			continue;
@@ -3874,6 +3946,12 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		    heap->nested_vsharp == UINT32_MAX && entries <= BindlessPrefillMax()) {
 			heap->prefilled = true;
 			PrefillBindlessHeap(*heap, std::min(entries, heap->entries));
+		}
+		// KYTY_BINDLESS_REFILL: a heap's table whose bytes changed has its new keys settled before
+		// this draw or dispatch reads them.
+		if (BindlessRefillEnabled() && !pointers && !heap->runtime && heap->nested_vsharp == UINT32_MAX &&
+		    entries <= BindlessRefillMax()) {
+			RefillBindlessHeap(*heap, std::min(entries, heap->entries));
 		}
 		// KYTY_BINDLESS_REFRESH: the heap's resolved keys follow the texture cache (CPU writes, aliases).
 		if (g_bindless_refresh.Get() != 0 && !heap->runtime) {
