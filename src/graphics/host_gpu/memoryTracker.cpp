@@ -153,7 +153,7 @@ bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
 }
 
 std::pair<uint64_t, uint64_t> MemoryTracker::FaultWindow(uint64_t offset, uint64_t bytes,
-                                                         uint64_t ahead) noexcept {
+                                                         uint64_t ahead, bool sequential) noexcept {
 	// Page indices as RegionManager::MarkWriteFault computes its window.
 	const uint64_t start = offset / TRACKER_PAGE_SIZE;
 	const uint64_t end   = (offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
@@ -161,8 +161,12 @@ std::pair<uint64_t, uint64_t> MemoryTracker::FaultWindow(uint64_t offset, uint64
 		return {start * TRACKER_PAGE_SIZE, end * TRACKER_PAGE_SIZE};
 	}
 	const uint64_t window_begin = start / ahead * ahead;
-	const uint64_t window_end =
+	uint64_t window_end =
 	    std::min<uint64_t>((end + ahead - 1) / ahead * ahead, TRACKER_REGION_PAGES);
+	if (sequential) {
+		// The forward window [start, start + ahead) of a sequential fill (a superset either way).
+		window_end = std::max(window_end, std::min<uint64_t>(start + ahead, TRACKER_REGION_PAGES));
+	}
 	return {window_begin * TRACKER_PAGE_SIZE, std::max(end, window_end) * TRACKER_PAGE_SIZE};
 }
 

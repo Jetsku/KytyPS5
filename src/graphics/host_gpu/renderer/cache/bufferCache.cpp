@@ -172,6 +172,13 @@ Live::Switch g_hot_frames_live("KYTY_HOT_PAGE_FRAMES_LIVE", [](const char* value
 	return value == nullptr ? 0 : static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 255));
 });
 
+// KYTY_FAULT_AHEAD_SEQUENTIAL=1 (default off; live): the fault-ahead window (KYTY_FAULT_AHEAD_KB /
+// KYTY_FAULT_AHEAD_ADAPT size) opens only when the page below the faulting page is CPU-dirty already
+// (a sequential fill), forward from the faulting page; any other write fault makes only its own
+// pages CPU-dirty (FaultPolicy::sequential_ahead). Fewer pages uploaded that the guest did not
+// write, possibly more faults. Adapted from TheCruZ/KytyPS5-GTA InvalidateFaultedPage.
+Live::Switch g_fault_ahead_sequential("KYTY_FAULT_AHEAD_SEQUENTIAL", Live::ParseDefaultOff);
+
 uint32_t FaultAheadOverridePages() {
 	const auto value = g_fault_ahead_adapt.Get();
 	if (value == 0) {
@@ -1674,6 +1681,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
 	}
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	MemoryTracker::SetSequentialAhead(g_fault_ahead_sequential.Get() != 0);
 	if (ParseEnvU64("KYTY_INDIRECT_FORMAT_COUNT", 0) == 1) {
 		m_format_counts = std::make_unique<Buffer>(
 		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
@@ -1821,6 +1829,7 @@ void BufferCache::AdvanceFrame() noexcept {
 	FaultCost::AdvanceFrame();
 	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	MemoryTracker::SetSequentialAhead(g_fault_ahead_sequential.Get() != 0);
 	MemoryTracker::SetHotOverride(static_cast<uint32_t>(g_hot_frames_live.Get()),
 	                              static_cast<uint32_t>(g_hot_max_live.Get()));
 	if (m_format_counts != nullptr && ++m_format_count_frames % 600 == 0) {
@@ -1885,6 +1894,35 @@ void BufferCache::MaintainHotPages() {
 	std::erase_if(m_hot_shadows, [this, frame](const auto& entry) {
 		return frame - entry.second.last_use > m_hot_quiet_frames;
 	});
+}
+
+// KYTY_HOT_PAGE_SPANS=1 (default off): a changed hot page uploads only the span from its first to
+// its last 64-byte line that differs from the page's shadow (what the buffer holds), not the whole
+// 4 KiB page. Idea from TheCruZ/KytyPS5-GTA (uploads only what the guest wrote).
+static bool HotPageSpansEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOT_PAGE_SPANS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// [first, last) byte offsets of the 64-byte lines of a 4 KiB page that differ; the whole page when
+// none differ (the caller found a difference, so that only happens with a racing write).
+static std::pair<uint64_t, uint64_t> DifferingLines(const uint8_t* shadow, const uint8_t* page) {
+	constexpr uint64_t Line  = 64;
+	uint64_t           first = 0;
+	while (first < TRACKER_PAGE_SIZE && std::memcmp(shadow + first, page + first, Line) == 0) {
+		first += Line;
+	}
+	if (first == TRACKER_PAGE_SIZE) {
+		return {0, TRACKER_PAGE_SIZE};
+	}
+	uint64_t last = TRACKER_PAGE_SIZE;
+	while (last > first + Line && std::memcmp(shadow + last - Line, page + last - Line, Line) == 0) {
+		last -= Line;
+	}
+	return {first, last};
 }
 
 void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
@@ -1959,14 +1997,25 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				staged += TRACKER_PAGE_SIZE;
 				continue;
 			}
+			bool fresh = false;
 			if (shadow == m_hot_shadows.end()) {
 				if (m_hot_shadows.size() < max_pages) {
 					shadow = m_hot_shadows.emplace(page, HotShadow {}).first;
+					fresh  = true;
 					shadow->second.data = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
 				} else {
 					// No shadow to compare against: back to faulting on writes.
 					demote.push_back(page);
 				}
+			}
+			// KYTY_HOT_PAGE_SPANS: with a shadow of the buffer's contents, only the span of 64-byte
+			// lines that differ from it is uploaded (moved to the start of the snapshot slot).
+			uint64_t span_begin = 0;
+			uint64_t span_bytes = TRACKER_PAGE_SIZE;
+			if (shadow != m_hot_shadows.end() && !fresh && HotPageSpansEnabled()) {
+				const auto [first, last] = DifferingLines(shadow->second.data.get(), snapshot);
+				span_begin               = first;
+				span_bytes               = last - first;
 			}
 			if (shadow != m_hot_shadows.end()) {
 				std::memcpy(shadow->second.data.get(), snapshot, TRACKER_PAGE_SIZE);
@@ -1974,9 +2023,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				shadow->second.last_use         = frame;
 				shadow->second.unchanged_checks = 0;
 			}
-			copies.emplace_back(total_size, buffer.Offset(page), TRACKER_PAGE_SIZE);
-			total_size += TRACKER_PAGE_SIZE;
-			staged += TRACKER_PAGE_SIZE;
+			if (span_begin != 0) {
+				std::memmove(snapshot, snapshot + span_begin, span_bytes);
+			}
+			copies.emplace_back(total_size, buffer.Offset(page) + span_begin, span_bytes);
+			total_size += span_bytes;
+			staged += span_bytes;
 		}
 	}
 	MemoryStats::Count(MemoryStats::Counter::HotUploadPages, visited);
@@ -4194,6 +4246,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			stats->upload_copies += copies.size() + late_copies.size();
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size + late_size);
+		// The overlay's "Buffer transfers": every path, the staged reservation included.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size + late_size);
 		if (HangTrace::Enabled()) {
 			const char* reason = upload_reason;
 			if (reason == nullptr) {
@@ -4388,7 +4442,6 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		}
 		return host_data + (copy.srcOffset - host_base);
 	};
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
