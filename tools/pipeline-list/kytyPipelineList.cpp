@@ -1,6 +1,6 @@
 // kyty_pipeline_list: makes and checks KYPLST1 pipeline lists (pipelineList.h, KYTY_PIPELINE_LIST).
 //
-//   export --out <list> --game <app0 dir> (--shaders <shader journal> --pipelines <pipeline journal>)...
+//   export --out <list> --game <app0 dir or .zar> (--shaders <shader journal> --pipelines <pipeline journal>)...
 //          [--exe <executable>] [--producer <text>] [--data <file relative to app0>]... [--scan]
 //       Merges recorded journals (_PipelineCache/<title>.shaders.journal and .pipelines.journal of one
 //       or more recording runs) into a list. Shaders are located in the game executable, else in the
@@ -14,7 +14,7 @@
 //       still need --exe/--data).
 //   merge --out <list> <list>...        Union of lists of the same title, version and input layout.
 //   info <list>                         Header, counts, levels, section sizes.
-//   check <list> --game <app0 dir> [--exe <executable>]
+//   check <list> --game <app0 dir or .zar> [--exe <executable>]
 //       Resolves the list against a game copy, as the emulator does at start-up.
 //   retarget --list <list> --exe <executable> --title <id> --app-ver <version> --out <list>
 //       Re-stamps a list for another copy of the game (another version or SKU): each shader is looked up in
@@ -24,17 +24,23 @@
 //       Rewrites the vertex stage input infos of a list recorded before the mesh pass and
 //       tessellation clamp fields (stored size 16 bytes smaller: int21 and older builds) into this
 //       build's layout, with those fields at their defaults; other input infos must already match.
-//   verify <list> --game <app0 dir> [--exe <executable>] [--shaders <shader journal>]...
+//   verify <list> --game <app0 dir or .zar> [--exe <executable>] [--shaders <shader journal>]...
 //       The no-code proof: no 64-byte window of the listed shaders' code (read from the executable)
 //       or of any journaled shader's code occurs in the file or in any decompressed section.
 //       Exit code 1 when one does.
+// --game is the game folder (the one with eboot.bin and sce_sys) or a .zar archive of it (the
+// launcher's "Compress game"); every command reads the same files from either, and an export of a
+// folder and of its archive writes the same list. SOURCE_DATE_EPOCH (seconds), when set, is the
+// creation time written into lists instead of the current time.
 #include "common/stringUtils.h"
+#include "gameFiles.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -79,20 +85,20 @@ uint64_t FooterHash(std::span<const uint8_t> code) {
 	return XXH3_64bits(footer, FooterBytes) | 1u;
 }
 
+using PipelineListTool::GameFiles;
+
 // Calls fn(file offset of the byte after the footer, bytes ending there (at most max_before + footer))
 // for every footer in the file, reading it in 64 MiB chunks. False when the file cannot be read.
 template <typename Fn>
-bool ForEachFooter(const std::filesystem::path& path, size_t max_before, Fn&& fn) {
-	std::ifstream in(path, std::ios::binary);
-	if (!in) return false;
+bool ForEachFooter(const GameFiles::Stream& read, size_t max_before, Fn&& fn) {
+	if (!read) return false;
 	constexpr size_t     Chunk = size_t {64} << 20u;
 	std::vector<uint8_t> buffer;
 	std::vector<uint8_t> chunk(Chunk);
 	uint64_t             buffer_start = 0; // file offset of buffer[0]
 	size_t               searched     = 0; // buffer positions below this were searched already
 	for (;;) {
-		in.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
-		const auto got = static_cast<size_t>(in.gcount());
+		const auto got = read(chunk.data(), chunk.size());
 		if (got == 0) break;
 		buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
 		size_t pos = searched;
@@ -140,20 +146,20 @@ bool WriteFile(const std::filesystem::path& path, const std::vector<uint8_t>& by
 	return static_cast<bool>(out);
 }
 
-// Title and version as the emulator reads them (loader/systemContent.cpp: titleId, contentVersion).
-bool ReadParam(const std::filesystem::path& game, std::string& title, std::string& version) {
-	std::vector<uint8_t> bytes;
-	if (!ReadFile(game / "sce_sys" / "param.json", bytes)) return false;
-	const auto json = nlohmann::json::parse(bytes.begin(), bytes.end(), nullptr, false);
-	if (json.is_discarded() || !json.is_object()) return false;
-	if (json.contains("titleId") && json["titleId"].is_string()) title = json["titleId"].get<std::string>();
-	if (json.contains("contentVersion") && json["contentVersion"].is_string()) version = json["contentVersion"].get<std::string>();
-	if (json.contains("appVersion") && json["appVersion"].is_string()) version = json["appVersion"].get<std::string>();
-	return !title.empty() && !version.empty();
+// The game folder or archive of --game; null (with a message) when an archive cannot be opened.
+std::unique_ptr<GameFiles> OpenGame(const Arguments& args) {
+	auto game = GameFiles::Open(U8(args.game));
+	if (game == nullptr) std::fprintf(stderr, "cannot open the archive %s\n", args.game.c_str());
+	return game;
 }
 
-std::filesystem::path Executable(const Arguments& args) {
-	return args.exe.empty() ? U8(args.game) / "eboot.bin" : U8(args.exe);
+// --exe, else the game's eboot.bin.
+std::string ExecutableName(const Arguments& args) {
+	return args.exe.empty() ? args.game + "/eboot.bin" : args.exe;
+}
+
+bool ReadExecutable(const Arguments& args, GameFiles& game, std::vector<uint8_t>& image) {
+	return args.exe.empty() ? game.Read("eboot.bin", image) : ReadFile(U8(args.exe), image);
 }
 
 // "kyty shader journal; device ...; input infos A B C" -> {A, B, C}.
@@ -172,6 +178,12 @@ bool InputSizes(const std::vector<uint8_t>& identity, std::array<uint32_t, 3>& s
 }
 
 uint64_t NowUnix() {
+	// Reproducible lists (the same bytes from a folder and its archive): SOURCE_DATE_EPOCH.
+	if (const char* fixed = std::getenv("SOURCE_DATE_EPOCH"); fixed != nullptr && *fixed != '\0') {
+		char*      end   = nullptr;
+		const auto value = std::strtoull(fixed, &end, 10);
+		if (end != fixed && *end == '\0') return static_cast<uint64_t>(value);
+	}
 	return static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
@@ -205,8 +217,10 @@ int Export(const Arguments& args) {
 		std::fprintf(stderr, "export needs --out, --game and pairs of --shaders/--pipelines\n");
 		return 2;
 	}
+	const auto game = OpenGame(args);
+	if (game == nullptr) return 2;
 	PipelineList::Info info;
-	if (!ReadParam(U8(args.game), info.title_id, info.app_version)) {
+	if (!PipelineListTool::ReadParam(*game, info.title_id, info.app_version)) {
 		std::fprintf(stderr, "cannot read the title and version from %s/sce_sys/param.json\n", args.game.c_str());
 		return 2;
 	}
@@ -214,8 +228,8 @@ int Export(const Arguments& args) {
 	info.created_unix = NowUnix();
 	info.state_format = PipelineList::StateFormat;
 	std::vector<uint8_t> image;
-	if (!ReadFile(Executable(args), image)) {
-		std::fprintf(stderr, "cannot read %s\n", Common::PathToString(Executable(args)).c_str());
+	if (!ReadExecutable(args, *game, image)) {
+		std::fprintf(stderr, "cannot read %s\n", ExecutableName(args).c_str());
 		return 2;
 	}
 	std::printf("%s %s, executable %zu bytes\n", info.title_id.c_str(), info.app_version.c_str(), image.size());
@@ -304,7 +318,7 @@ int Export(const Arguments& args) {
 		}
 		if (rest.empty()) break;
 		std::vector<uint8_t> data_image;
-		if (!ReadFile(U8(args.game) / U8(data), data_image)) {
+		if (!game->Read(U8(data), data_image)) {
 			std::fprintf(stderr, "cannot read %s in %s\n", data.c_str(), args.game.c_str());
 			return 2;
 		}
@@ -347,23 +361,16 @@ int Export(const Arguments& args) {
 		}
 		std::printf("scan: %zu codes not found yet have a footer, %zu have none\n", rest, no_footer);
 		// eboot.bin was searched; the other files, smaller first, until every code is found.
-		std::vector<std::pair<uint64_t, std::filesystem::path>> files;
-		std::error_code                                         ec;
-		const std::filesystem::path                             root = U8(args.game);
-		for (auto it = std::filesystem::recursive_directory_iterator(root, ec); !ec && it != std::filesystem::recursive_directory_iterator();
-		     it.increment(ec)) {
-			if (!it->is_regular_file(ec) || it->path().filename() == "eboot.bin") continue;
-			files.emplace_back(it->file_size(ec), it->path());
-		}
-		std::sort(files.begin(), files.end());
+		auto files = game->Files();
+		std::erase_if(files, [](const GameFiles::Entry& file) { return file.relative.filename() == "eboot.bin"; });
 		size_t   found_total = 0;
 		uint64_t read_bytes  = 0;
 		for (const auto& [size, path]: files) {
 			if (found_total == rest) break;
-			const auto relative = Common::PathToGenericString(std::filesystem::relative(path, root, ec));
+			const auto relative = Common::PathToGenericString(path);
 			size_t     in_file  = 0;
 			read_bytes += size;
-			ForEachFooter(path, max_before, [&](uint64_t end, std::span<const uint8_t> before) {
+			ForEachFooter(game->OpenStream(path), max_before, [&](uint64_t end, std::span<const uint8_t> before) {
 				const auto footer = XXH3_64bits(before.data() + before.size() - FooterBytes, FooterBytes) | 1u;
 				const auto [first, last] = wanted.equal_range(footer);
 				for (auto it = first; it != last; ++it) {
@@ -533,10 +540,10 @@ int Info(const Arguments& args) {
 	return 0;
 }
 
-PipelineList::Resolved ResolveAgainst(const Arguments& args, const PipelineList::File& file, std::vector<uint8_t>& image,
-                                      PipelineList::ResolveStats& stats) {
-	if (!ReadFile(Executable(args), image)) {
-		std::fprintf(stderr, "cannot read %s\n", Common::PathToString(Executable(args)).c_str());
+PipelineList::Resolved ResolveAgainst(const Arguments& args, GameFiles& game, const PipelineList::File& file,
+                                      std::vector<uint8_t>& image, PipelineList::ResolveStats& stats) {
+	if (!ReadExecutable(args, game, image)) {
+		std::fprintf(stderr, "cannot read %s\n", ExecutableName(args).c_str());
 		image.clear();
 	}
 	// Data files: read once when first named.
@@ -548,7 +555,7 @@ PipelineList::Resolved ResolveAgainst(const Arguments& args, const PipelineList:
 		if (index != 0) {
 			auto [it, added] = data_images->try_emplace(index);
 			if (added && (index > file.files.size() ||
-			              !ReadFile(U8(args.game) / U8(file.files[index - 1]), it->second))) {
+			              !game.Read(U8(file.files[index - 1]), it->second))) {
 				it->second.clear();
 			}
 			source = &it->second;
@@ -564,8 +571,10 @@ int Check(const Arguments& args) {
 	if (args.inputs.size() != 1 || args.game.empty()) return 2;
 	PipelineList::File file;
 	if (!Load(args.inputs[0], file)) return 2;
+	const auto game = OpenGame(args);
+	if (game == nullptr) return 2;
 	std::string title, version;
-	if (!ReadParam(U8(args.game), title, version)) return 2;
+	if (!PipelineListTool::ReadParam(*game, title, version)) return 2;
 	std::printf("list for %s %s; game %s %s%s\n", file.info.title_id.c_str(), file.info.app_version.c_str(), title.c_str(),
 	            version.c_str(), title == file.info.title_id && version == file.info.app_version ? "" : ": MISMATCH (ignored at run time)");
 	if (title != file.info.title_id || version != file.info.app_version) {
@@ -573,7 +582,7 @@ int Check(const Arguments& args) {
 	}
 	std::vector<uint8_t>       image;
 	PipelineList::ResolveStats stats;
-	const auto                 resolved = ResolveAgainst(args, file, image, stats);
+	const auto                 resolved = ResolveAgainst(args, *game, file, image, stats);
 	(void)resolved;
 	std::printf("shaders %llu: %llu match (%llu at another offset), %llu differ, %llu unreadable; permutations %llu of %llu; "
 	            "pipelines %llu of %llu usable\n",
@@ -592,9 +601,11 @@ int Retarget(const Arguments& args) {
 	}
 	PipelineList::File file;
 	if (!Load(args.list, file)) return 2;
+	const auto game = OpenGame(args); // the list's data files (--game, if given)
+	if (game == nullptr) return 2;
 	std::vector<uint8_t>       image;
 	PipelineList::ResolveStats resolve_stats;
-	const auto                 resolved = ResolveAgainst(args, file, image, resolve_stats);
+	const auto                 resolved = ResolveAgainst(args, *game, file, image, resolve_stats);
 	PipelineList::RetargetStats stats;
 	auto                        out = PipelineList::Retarget(file, resolved, stats);
 	const auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
@@ -643,9 +654,11 @@ int Verify(const Arguments& args) {
 	std::vector<uint8_t> bytes;
 	PipelineList::File   file;
 	if (!ReadFile(U8(args.inputs[0]), bytes) || !Load(args.inputs[0], file)) return 2;
+	const auto game = OpenGame(args);
+	if (game == nullptr) return 2;
 	std::vector<uint8_t>       image;
 	PipelineList::ResolveStats stats;
-	const auto                 resolved = ResolveAgainst(args, file, image, stats);
+	const auto                 resolved = ResolveAgainst(args, *game, file, image, stats);
 	PipelineList::CodeWindows  windows;
 	uint64_t                   code_bytes = 0;
 	for (size_t i = 0; i < resolved.sources.size(); i++) {

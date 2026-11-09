@@ -2,12 +2,15 @@
 // shareable shader list, for players who do not use a command line. It runs kyty_pipeline_list (next
 // to this executable) export, verify and info, and keeps the list only when verify finds no shader
 // code in it. The list holds where each shader sits in the game files and its hashes, never code.
+// The game is a folder or a .zar archive of one (the launcher's "Compress game").
 #ifndef UNICODE
 #define UNICODE
 #endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "gameFiles.h"
+
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -32,7 +35,7 @@ namespace fs = std::filesystem;
 constexpr UINT WM_APP_TEXT = WM_APP + 1; // lParam: std::wstring* to append (the window frees it)
 constexpr UINT WM_APP_DONE = WM_APP + 2; // wParam: 1 when the list was written
 
-enum Control : int { KytyEdit = 101, KytyBrowse, GameEdit, GameBrowse, ExportButton, OpenButton, Log };
+enum Control : int { KytyEdit = 101, KytyBrowse, GameEdit, GameBrowse, GameZarBrowse, ExportButton, OpenButton, Log };
 
 HWND     g_window = nullptr;
 HFONT    g_font   = nullptr;
@@ -115,15 +118,10 @@ int Run(const std::wstring& arguments) {
 	return static_cast<int>(code);
 }
 
-bool ReadParam(const fs::path& game, std::string& title, std::string& version) {
-	std::ifstream in(game / L"sce_sys" / L"param.json", std::ios::binary);
-	if (!in) return false;
-	const auto json = nlohmann::json::parse(in, nullptr, false);
-	if (json.is_discarded() || !json.is_object()) return false;
-	if (json.contains("titleId") && json["titleId"].is_string()) title = json["titleId"].get<std::string>();
-	if (json.contains("contentVersion") && json["contentVersion"].is_string()) version = json["contentVersion"].get<std::string>();
-	if (json.contains("appVersion") && json["appVersion"].is_string()) version = json["appVersion"].get<std::string>();
-	return !title.empty() && !version.empty();
+// A game folder or .zar archive with eboot.bin and a readable sce_sys/param.json.
+bool ReadGame(const fs::path& game, std::string& title, std::string& version) {
+	const auto files = PipelineListTool::GameFiles::Open(game);
+	return files != nullptr && files->HasFile(L"eboot.bin") && PipelineListTool::ReadParam(*files, title, version);
 }
 
 // A Kyty folder: holds kyty_emulator.exe or _PipelineCache.
@@ -204,7 +202,8 @@ struct FoundGame {
 	std::string title, version;
 };
 
-// Game folders (or their direct subfolders) of the launcher's list whose title has journals.
+// Game folders and .zar archives of the launcher's list (also in its folders and their direct
+// subfolders) whose title has journals.
 std::vector<FoundGame> DetectGames(const fs::path& kyty) {
 	const auto             titles = RecordedTitles(kyty);
 	std::vector<FoundGame> found;
@@ -215,16 +214,29 @@ std::vector<FoundGame> DetectGames(const fs::path& kyty) {
 		const auto      canonical = fs::weakly_canonical(folder, error);
 		if (error || !seen.insert(canonical).second) return;
 		FoundGame game {canonical, {}, {}};
-		if (fs::exists(canonical / L"eboot.bin", error) && ReadParam(canonical, game.title, game.version) &&
-		    titles.contains(game.title)) {
+		if (ReadGame(canonical, game.title, game.version) && titles.contains(game.title)) {
 			found.push_back(std::move(game));
 		}
 	};
+	const auto is_zar = [](const fs::directory_entry& entry) {
+		std::error_code error;
+		return PipelineListTool::IsZarPath(entry.path()) && entry.is_regular_file(error);
+	};
 	for (const auto& folder: LauncherFolders(kyty)) {
-		consider(folder);
+		consider(folder); // a game folder or a .zar
 		std::error_code error;
 		for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
-			if (it->is_directory(error)) consider(it->path());
+			if (is_zar(*it)) {
+				consider(it->path());
+			} else if (it->is_directory(error)) {
+				consider(it->path());
+				// The launcher also lists the archives inside its game folders' subfolders.
+				std::error_code inner_error;
+				for (fs::directory_iterator inner(it->path(), inner_error); !inner_error && inner != end;
+				     inner.increment(inner_error)) {
+					if (is_zar(*inner)) consider(inner->path());
+				}
+			}
 		}
 	}
 	return found;
@@ -257,7 +269,8 @@ void Detect() {
 	} else {
 		std::wstring names;
 		for (const auto& title: titles) names += (names.empty() ? L"" : L", ") + Widen(title);
-		Post(L"Recorded: " + names + L". Its game folder was not found in the launcher's list: use Browse.\r\n");
+		Post(L"Recorded: " + names + L". Its game folder or .zar file was not found in the launcher's list: use Folder... or "
+		     L".zar file....\r\n");
 	}
 }
 
@@ -270,8 +283,9 @@ void Export(fs::path kyty, fs::path game) {
 	const auto cache = kyty / L"_PipelineCache";
 	if (!fs::is_directory(cache)) return fail(L"There is no _PipelineCache folder in the Kyty folder. Pick the folder you ran the game from.");
 	std::string title, version;
-	if (!fs::exists(game / L"eboot.bin") || !ReadParam(game, title, version)) {
-		return fail(L"The game folder has no eboot.bin or sce_sys\\param.json.");
+	if (!ReadGame(game, title, version)) {
+		return fail(PipelineListTool::IsZarPath(game) ? L"The .zar file cannot be read or has no eboot.bin or sce_sys/param.json."
+		                                              : L"The game folder has no eboot.bin or sce_sys\\param.json.");
 	}
 	const auto shaders   = cache / (Widen(title) + L".shaders.journal");
 	const auto pipelines = cache / (Widen(title) + L".pipelines.journal");
@@ -311,12 +325,17 @@ std::wstring Text(int id) {
 	return text;
 }
 
-void PickFolder(int edit, const wchar_t* title) {
+// A folder, or with zar a .zar file.
+void PickFolder(int edit, const wchar_t* title, bool zar = false) {
 	IFileOpenDialog* dialog = nullptr;
 	if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
 	DWORD options = 0;
 	dialog->GetOptions(&options);
-	dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+	dialog->SetOptions(options | (zar ? FOS_FILEMUSTEXIST : FOS_PICKFOLDERS) | FOS_FORCEFILESYSTEM);
+	if (zar) {
+		const COMDLG_FILTERSPEC types[] = {{L"Compressed game (*.zar)", L"*.zar"}};
+		dialog->SetFileTypes(1, types);
+	}
 	dialog->SetTitle(title);
 	if (SUCCEEDED(dialog->Show(g_window))) {
 		IShellItem* item = nullptr;
@@ -352,8 +371,9 @@ void Layout(int width, int height) {
 	const int edit_w = width - 3 * margin - button;
 	MoveWindow(GetDlgItem(g_window, KytyEdit), margin, 34, edit_w, row, TRUE);
 	MoveWindow(GetDlgItem(g_window, KytyBrowse), width - margin - button, 34, button, row, TRUE);
-	MoveWindow(GetDlgItem(g_window, GameEdit), margin, 90, edit_w, 200, TRUE); // with its drop-down list
-	MoveWindow(GetDlgItem(g_window, GameBrowse), width - margin - button, 90, button, row, TRUE);
+	MoveWindow(GetDlgItem(g_window, GameEdit), margin, 90, edit_w - margin - button, 200, TRUE); // with its drop-down list
+	MoveWindow(GetDlgItem(g_window, GameBrowse), width - 2 * margin - 2 * button, 90, button, row, TRUE);
+	MoveWindow(GetDlgItem(g_window, GameZarBrowse), width - margin - button, 90, button, row, TRUE);
 	MoveWindow(GetDlgItem(g_window, ExportButton), margin, 128, 160, 30, TRUE);
 	MoveWindow(GetDlgItem(g_window, OpenButton), margin + 172, 128, 160, 30, TRUE);
 	MoveWindow(GetDlgItem(g_window, Log), margin, 170, width - 2 * margin, height - 170 - margin, TRUE);
@@ -369,9 +389,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 			Add(L"STATIC", L"Kyty folder (the one with kyty_emulator.exe and _PipelineCache):", 0, 12, 12, 600, 20, 0);
 			Add(L"EDIT", L"", ES_AUTOHSCROLL, 0, 0, 0, 0, KytyEdit);
 			Add(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 0, 0, 0, 0, KytyBrowse);
-			Add(L"STATIC", L"Game folder (the one with eboot.bin and sce_sys):", 0, 12, 68, 600, 20, 0);
+			Add(L"STATIC", L"Game folder or .zar file (the folder is the one with eboot.bin and sce_sys):", 0, 12, 68, 600, 20, 0);
 			Add(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, GameEdit);
-			Add(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 0, 0, 0, 0, GameBrowse);
+			Add(L"BUTTON", L"Folder...", BS_PUSHBUTTON, 0, 0, 0, 0, GameBrowse);
+			Add(L"BUTTON", L".zar file...", BS_PUSHBUTTON, 0, 0, 0, 0, GameZarBrowse);
 			Add(L"BUTTON", L"Make shader list", BS_DEFPUSHBUTTON, 0, 0, 0, 0, ExportButton);
 			Add(L"BUTTON", L"Show the file", BS_PUSHBUTTON | WS_DISABLED, 0, 0, 0, 0, OpenButton);
 			Add(L"EDIT",
@@ -404,6 +425,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 					if (HIWORD(wparam) == EN_KILLFOCUS) Detect();
 					return 0;
 				case GameBrowse: PickFolder(GameEdit, L"Game folder"); return 0;
+				case GameZarBrowse: PickFolder(GameEdit, L"Game .zar file", true); return 0;
 				case OpenButton: {
 					if (g_written.empty()) return 0;
 					const std::wstring arguments = L"/select,\"" + g_written.wstring() + L"\"";
@@ -414,7 +436,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 					if (g_busy) return 0;
 					const auto kyty = Text(KytyEdit), game = Text(GameEdit);
 					if (kyty.empty() || game.empty()) {
-						MessageBoxW(window, L"Pick the Kyty folder and the game folder first.", L"Shader list", MB_ICONINFORMATION);
+						MessageBoxW(window, L"Pick the Kyty folder and the game folder or .zar file first.", L"Shader list", MB_ICONINFORMATION);
 						return 0;
 					}
 					g_busy = true;
