@@ -17,6 +17,8 @@ std::array<int, 2>    guest_stick {128, 128};
 uint32_t             guest_buttons = 0;
 bool                 guest_touch   = false;
 bool                 host_shake    = false;
+std::array<int, 2>    host_stick {128, 128};
+uint32_t             host_buttons = 0;
 } // namespace
 
 namespace Fake {
@@ -60,11 +62,17 @@ namespace Libs::Controller {
 void SetButton(int id, uint32_t button, bool down) {
 	if (id == 1) {
 		guest_buttons = down ? guest_buttons | button : guest_buttons & ~button;
+	} else if (id == HOST_INPUT_CONTROLLER_ID) {
+		host_buttons = down ? host_buttons | button : host_buttons & ~button;
 	}
 }
 void SetAxis(int id, Axis axis, int value) {
-	if (id == 1 && (axis == Axis::LeftX || axis == Axis::LeftY)) {
-		guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
+	if (axis == Axis::LeftX || axis == Axis::LeftY) {
+		if (id == 1) {
+			guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
+		} else if (id == HOST_INPUT_CONTROLLER_ID) {
+			host_stick[axis == Axis::LeftY ? 1 : 0] = value;
+		}
 	}
 }
 void SetTouchPad(int id, int finger, bool down, float, float) {
@@ -93,6 +101,8 @@ struct Inputs {
 		guest_buttons  = 0;
 		guest_touch    = false;
 		host_shake     = false;
+		host_stick     = {128, 128};
+		host_buttons   = 0;
 		HostInputInit(nullptr);
 	}
 	~Inputs() { HostInputShutdown(); }
@@ -123,13 +133,13 @@ void TestKeyboardSwitchesFromGamepadTouchPad() {
 	physical_stick = {SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX};
 	HostInputToggleGamepadTouchPad(1);
 	Check(HostInputGamepadDrawButton(1, true) && guest_touch, "gamepad drawing did not start");
-	HostInputKey(SDLK_F6, true);
+	HostInputKey(SDLK_F6, SDL_SCANCODE_F6, true);
 	Check(GetHostInputTouchPadVisualState().enabled && !HostInputGamepadAxis(1, true, 127),
 	      "F6 failed to switch from gamepad to mouse touchpad mode");
 	Check(!guest_touch && guest_stick == std::array {0, 255},
 	      "switching to mouse touchpad mode retained gamepad input capture");
-	HostInputKey(SDLK_F6, false);
-	HostInputKey(SDLK_F6, true);
+	HostInputKey(SDLK_F6, SDL_SCANCODE_F6, false);
+	HostInputKey(SDLK_F6, SDL_SCANCODE_F6, true);
 	Check(!GetHostInputTouchPadVisualState().enabled, "F6 failed to disable mouse touchpad mode");
 }
 
@@ -200,10 +210,22 @@ void TestDisabledMappingTabs() {
 // Astro Bot's first scene asks for a shake; the keyboard's X holds one.
 void TestKeyboardShake() {
 	Inputs inputs;
-	HostInputKey(SDLK_X, true);
+	HostInputKey(SDLK_X, SDL_SCANCODE_X, true);
 	Check(host_shake, "holding X did not shake the keyboard pad");
-	HostInputKey(SDLK_X, false);
+	HostInputKey(SDLK_X, SDL_SCANCODE_X, false);
 	Check(!host_shake, "releasing X did not stop the shake");
+}
+
+// The default keys are positions: on AZERTY the key in W's place types Z and still moves the stick up.
+void TestKeyboardPositions() {
+	Inputs inputs;
+	HostInputKey(SDLK_Z, SDL_SCANCODE_W, true);
+	Check(host_stick[1] == 0 && host_buttons == 0, "AZERTY Z (W position) did not move the stick up");
+	HostInputKey(SDLK_Z, SDL_SCANCODE_W, false);
+	Check(host_stick[1] == 128, "releasing AZERTY Z did not center the stick");
+	HostInputKey(SDLK_Q, SDL_SCANCODE_A, true);
+	Check(host_stick[0] == 0 && host_buttons == 0, "AZERTY Q (A position) did not move the stick left");
+	HostInputKey(SDLK_Q, SDL_SCANCODE_A, false);
 }
 
 int main() {
@@ -217,6 +239,7 @@ int main() {
 	TestTriggerLifecycleReset();
 	TestDisabledMappingTabs();
 	TestKeyboardShake();
+	TestKeyboardPositions();
 	Config::Shutdown();
 	return 0;
 }

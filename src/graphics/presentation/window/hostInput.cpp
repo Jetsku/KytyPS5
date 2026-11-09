@@ -805,7 +805,18 @@ void HostInputShutdown() {
 	}
 }
 
-void HostInputKey(int key_code, bool down) {
+void HostInputKey(int key_code, int scan_code, bool down) {
+	// The default bindings are key positions (WASD, IJKL), so letters and digits come from the physical
+	// key: on AZERTY, ZQSD moves the stick. Custom bindings name the key the player sees, so keep it.
+	if (!GetInputMap().Custom()) {
+		if (scan_code >= SDL_SCANCODE_A && scan_code <= SDL_SCANCODE_Z) {
+			key_code = static_cast<int>(SDLK_A) + (scan_code - SDL_SCANCODE_A);
+		} else if (scan_code >= SDL_SCANCODE_1 && scan_code <= SDL_SCANCODE_9) {
+			key_code = static_cast<int>(SDLK_1) + (scan_code - SDL_SCANCODE_1);
+		} else if (scan_code == SDL_SCANCODE_0) {
+			key_code = SDLK_0;
+		}
+	}
 	Common::HostInputTrace("host-key", key_code, down);
 	g_input_pulse.Key(key_code, down, SDL_GetTicks(), ApplyHostKey);
 }

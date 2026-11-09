@@ -212,7 +212,7 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 		fullscreen_key = SDLK_UNKNOWN;
 	}
 	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event) {
-		HostInputKey(key.key_code, key.down);
+		HostInputKey(key.key_code, key.scan_code, key.down);
 	}
 }
 
