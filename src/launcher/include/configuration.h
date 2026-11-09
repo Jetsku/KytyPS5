@@ -119,6 +119,7 @@ public:
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
+	static ShaderOptimizationType ShaderOptimizationTypeFromText(const QString& text);
 
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
@@ -147,22 +148,11 @@ public:
 	ControllerSettings controller;
 	// So do the audio mix levels.
 	AudioMixSettings audio_mix;
-	// And the occlusion mode: false = the bundled preset's (performance: always visible),
-	// true = accurate GPU occlusion queries (--gpu-occlusion on).
-	bool gpu_occlusion_accurate = false;
-
-	void WriteGlobalOnlySettings(QSettings* s) const {
-		audio_mix.WriteSettings(s);
-		s->setValue("gpu_occlusion_accurate", gpu_occlusion_accurate);
-	}
-	void ReadGlobalOnlySettings(QSettings* s) {
-		audio_mix.ReadSettings(s);
-		gpu_occlusion_accurate = s->value("gpu_occlusion_accurate", false).toBool();
-	}
+	void WriteGlobalOnlySettings(QSettings* s) const { audio_mix.WriteSettings(s); }
+	void ReadGlobalOnlySettings(QSettings* s) { audio_mix.ReadSettings(s); }
 	void CopyGlobalOnlySettingsFrom(const Configuration& other) {
-		controller             = other.controller;
-		audio_mix              = other.audio_mix;
-		gpu_occlusion_accurate = other.gpu_occlusion_accurate;
+		controller = other.controller;
+		audio_mix  = other.audio_mix;
 	}
 
 	QString                screen_resolution           = QStringLiteral("1280x720");
@@ -181,6 +171,10 @@ public:
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
+	// Occlusion mode, saved per game (key gpu_occlusion_accurate): false = the bundled preset's
+	// (performance: always visible), true = accurate GPU occlusion queries (--gpu-occlusion on).
+	// A game config saved before it was per game inherits the global value when read.
+	bool                   gpu_occlusion_accurate      = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
@@ -227,6 +221,7 @@ public:
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
+		gpu_occlusion_accurate      = other.gpu_occlusion_accurate;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;

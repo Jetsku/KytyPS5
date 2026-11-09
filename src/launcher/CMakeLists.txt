@@ -47,6 +47,21 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+add_executable(launcher_configuration_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherConfigurationTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+)
+target_link_libraries(launcher_configuration_tests Qt6::Gui common)
+target_include_directories(launcher_configuration_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_configuration_tests PROPERTIES AUTOMOC ON)
+add_test(NAME launcher_configuration COMMAND $<TARGET_FILE:launcher_configuration_tests>)
+if(WIN32)
+	# Qt's DLLs are deployed beside the launcher only.
+	set_tests_properties(launcher_configuration PROPERTIES ENVIRONMENT_MODIFICATION
+		"PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+endif()
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

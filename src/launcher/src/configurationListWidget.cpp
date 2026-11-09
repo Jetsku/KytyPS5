@@ -433,6 +433,9 @@ void ConfigurationListWidget::ReadSettings() {
 	for (int i = 0; i < size; i++) {
 		s->setArrayIndex(i);
 		auto* info = new Configuration;
+		// Game configs saved while the occlusion mode was global have no key: they keep the
+		// global value.
+		info->gpu_occlusion_accurate = m_global_info.gpu_occlusion_accurate;
 		info->ReadSettings(s.get());
 		info->custom_settings = true;
 		if (!info->game_path.isEmpty()) {
