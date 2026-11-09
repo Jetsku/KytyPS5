@@ -2457,11 +2457,15 @@ const char* UnsupportedResourceSpecialization(const Program&                prog
 	// usa-ratt/KytyPS5-GT7 c3d3e76e8 / b70de4ef9): enumerated candidates only sample, or are
 	// stored to (KYTY_WORKGROUP_IMAGES). A load or query through an enumerated material table
 	// ended the emulator in GT7's cafe; only that specialization is skipped instead.
+	// The exemptions are the ones ApplyResourceSpecialization accepts: storage reads, and with
+	// KYTY_SAMPLED_TABLE_READS loads of the candidate the key selects (Ghost of Yotei's Update Oct
+	// Maps CS e8e383355f93ab53: skipping it left its partner 0b0ec2ba writing alone, magenta light).
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
 			if (ImageOpcodeInfoOf(op).access == ImageAccess::None || op == ValueOpcode::ImageSampleRaw ||
-			    op == ValueOpcode::ImageWrite) {
+			    op == ValueOpcode::ImageWrite || op == ValueOpcode::ImageReadStorage ||
+			    (op == ValueOpcode::ImageRead && GetCodegenOptions().sampled_table_reads)) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;

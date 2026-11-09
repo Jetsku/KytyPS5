@@ -357,6 +357,19 @@ void TestSampledTableReads() {
             on.specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
             on.specialization.images[1].dimension == Decoder::ImageDimension::Dim3D,
         "a load table with 2D and 3D candidates did not keep each candidate's dimension");
+  // The compile path's precheck accepts what ApplyResourceSpecialization accepts: int22 skipped
+  // e8e3's permutation here ("read other than by a sample") although the switch was on.
+  Check(RC::IR::UnsupportedResourceSpecialization(on.fixture->program, on.specialization) == nullptr,
+        "the precheck rejects a table load KYTY_SAMPLED_TABLE_READS supports");
+  {
+    auto options = saved;
+    options.sampled_table_reads = false;
+    RC::SetCodegenOptions(options);
+    Check(RC::IR::UnsupportedResourceSpecialization(on.fixture->program, on.specialization) != nullptr,
+          "the precheck accepts a table load without KYTY_SAMPLED_TABLE_READS");
+    options.sampled_table_reads = true;
+    RC::SetCodegenOptions(options);
+  }
   ApplyResourceSpecialization(on.fixture->program, on.specialization);
   const auto &images = on.fixture->program.info.images;
   Check(images.size() == 2 && images[0].indirect_root == 0 &&
