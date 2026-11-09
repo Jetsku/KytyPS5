@@ -16,14 +16,16 @@
 #include <QStyledItemDelegate>
 #include <QTreeWidget>
 
+// The list's columns, in the order of configuration_list_widget.ui.
 inline constexpr int GAME_NAME_COLUMN             = 0;
-inline constexpr int GAME_SERIAL_COLUMN           = 1;
-inline constexpr int GAME_VERSION_COLUMN          = 2;
-inline constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
-inline constexpr int GAME_SIZE_COLUMN             = 4;
-inline constexpr int GAME_PATH_COLUMN             = 5;
-inline constexpr int GAME_STATUS_COLUMN           = 6;
-inline constexpr int GAME_COMMENT_COLUMN          = 7;
+inline constexpr int GAME_PRECOMPILE_COLUMN       = 1;
+inline constexpr int GAME_SERIAL_COLUMN           = 2;
+inline constexpr int GAME_VERSION_COLUMN          = 3;
+inline constexpr int GAME_FIRMWARE_VERSION_COLUMN = 4;
+inline constexpr int GAME_SIZE_COLUMN             = 5;
+inline constexpr int GAME_PATH_COLUMN             = 6;
+inline constexpr int GAME_STATUS_COLUMN           = 7;
+inline constexpr int GAME_COMMENT_COLUMN          = 8;
 
 // Holds the transparent list and grid views and paints the selected game's pic0 behind both.
 class GameViews: public QStackedWidget {

@@ -6,6 +6,8 @@
 #include "configurationListWidget.h"
 #include "controllerPreview.h"
 #include "gameContent.h"
+#include "precompile.h"
+#include "precompileDialog.h"
 #include "titleSound.h"
 #include "updateChecker.h"
 
@@ -35,6 +37,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 #include "ui_main_dialog.h"
@@ -77,6 +80,7 @@ public:
 	void Update();
 	void FindInterpreter();
 	void Run();
+	void PrecompileShaders();
 	void SetPresetWarning(const QString& text);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
@@ -109,7 +113,12 @@ private:
 	QString         m_preset_warning;
 	QLabel*         m_preset_label   = nullptr;
 	bool            m_started        = false;
+	// The window of the last precompile, until it is closed.
+	QPointer<PrecompileDialog> m_precompile;
+	bool                       m_precompiling = false;
+	QString                    m_precompile_title; // its game: no row of it runs meanwhile
 
+	// Running games and a running precompile.
 	int m_running_games = 0;
 };
 
@@ -161,6 +170,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
+	connect(m_ui->widget, &ConfigurationListWidget::PrecompileShaders, this,
+	        &MainDialogPrivate::PrecompileShaders);
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
@@ -244,6 +255,22 @@ void MainDialogPrivate::FindInterpreter() {
 	Update();
 	if (m_ui->check_updates_on_startup->isChecked()) {
 		m_update_checker->Check(false);
+	}
+
+	// --precompile <game folder or archive> (scripts, tests): the launcher starts as if that game's
+	// Precompile button had been clicked. Item widgets of the list are not reachable through UI
+	// Automation, so nothing else can press the button without the mouse.
+	const auto arguments = QCoreApplication::arguments();
+	if (const auto at = arguments.indexOf(QStringLiteral("--precompile"));
+	    at >= 0 && at + 1 < arguments.size()) {
+		QMetaObject::invokeMethod(
+		    this,
+		    [this, game = arguments.at(at + 1)]() {
+			    if (!m_ui->widget->PressPrecompile(game)) {
+				    qWarning().noquote() << "--precompile: no game in the list at" << game;
+			    }
+		    },
+		    Qt::QueuedConnection);
 	}
 }
 
@@ -501,11 +528,35 @@ static void ApplyTitlePreset(QProcess* process, const QString& title_id) {
 	process->setProcessEnvironment(environment);
 }
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
-	const auto& interpreter = m_p->GetInterpreter();
+// What a normal run and a prepare run share: the game's arguments, and on the process its
+// environment (title preset, frametime fix) and working directory. Empty arguments: the configuration
+// is not valid.
+static QStringList SetupEmulatorProcess(QProcess* process, const QString& interpreter,
+                                        const Configuration& info) {
 	ApplyTitlePreset(process, info.title_id);
 
 	auto args = CreateEmulatorArgs(info);
+	if (args.isEmpty()) {
+		return args;
+	}
+
+	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
+	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
+	// or the user's environment still applies (the emulator default is off). It goes over the
+	// environment ApplyTitlePreset set, so a title preset stays applied.
+	if (info.present_mode == Configuration::PresentMode::Immediate && info.smooth_frametime_fix) {
+		auto environment = process->processEnvironment();
+		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"), QStringLiteral("1"));
+		process->setProcessEnvironment(environment);
+	}
+	return args;
+}
+
+void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
+	const auto& interpreter = m_p->GetInterpreter();
+
+	const auto args = SetupEmulatorProcess(process, interpreter, info);
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
 		QApplication::quit();
@@ -529,16 +580,6 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	process->setNativeArguments(
 	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
-	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
-	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
-	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
-	// or the user's environment still applies (the emulator default is off). It goes over the
-	// environment ApplyTitlePreset set, so a title preset stays applied.
-	if (info.present_mode == Configuration::PresentMode::Immediate && info.smooth_frametime_fix) {
-		auto environment = process->processEnvironment();
-		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"), QStringLiteral("1"));
-		process->setProcessEnvironment(environment);
-	}
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
@@ -637,6 +678,81 @@ void MainDialogPrivate::Run() {
 	Update();
 }
 
+// The game list's Precompile button: the emulator's prepare run (precompile.h) on the selected
+// game, with the arguments and environment of a normal run, started without a console; a window
+// shows its progress. A game without a shader list gets one chosen first.
+void MainDialogPrivate::PrecompileShaders() {
+	if (m_update_checker->IsInstalling() || m_precompiling) {
+		return;
+	}
+	QPointer<ConfigurationItem> item = m_ui->widget->GetSelectedItem();
+	if (item == nullptr || item->IsRunning()) {
+		return;
+	}
+	const auto info         = m_ui->widget->CreateConfiguration(*item);
+	const auto emulator_dir = QFileInfo(m_interpreter).absolutePath();
+	// The run ends before the game shows a picture: its window need not cover the screen.
+	info->fullscreen_enabled = false;
+
+	auto       process = std::make_unique<QProcess>();
+	const auto args    = SetupEmulatorProcess(process.get(), m_interpreter, *info);
+	if (args.isEmpty()) {
+		QMessageBox::critical(m_main_dialog, tr("Error"), tr("Invalid emulator configuration"));
+		return;
+	}
+
+	// A preset that names a list file of its own: the emulator loads that one, and says so when it
+	// cannot.
+	auto       environment = process->processEnvironment();
+	const bool custom =
+	    Precompile::IsCustomList(environment.value(QLatin1String(Precompile::ENV_LIST)));
+	auto list = custom ? QString()
+	                   : Precompile::FindList(emulator_dir, info->title_id, info->gameVersion);
+	bool installed_now = false;
+	if (!custom && list.isEmpty()) {
+		list = PrecompileDialog::ChooseList(m_main_dialog, emulator_dir, *info, true);
+		// The dialogs ran an event loop: the row may be gone or busy by now.
+		if (list.isEmpty() || item == nullptr || item->IsRunning() || m_precompiling) {
+			return;
+		}
+		installed_now = true;
+	}
+
+	environment.insert(QLatin1String(Precompile::ENV_PREPARE), QStringLiteral("1"));
+	process->setProcessEnvironment(environment);
+	process->setProgram(m_interpreter);
+	process->setArguments(args);
+
+	if (m_precompile != nullptr) {
+		m_precompile->close(); // the result of an earlier run
+	}
+	item->SetRunning(true);
+	m_running_games++;
+	m_precompiling     = true;
+	m_precompile_title = info->title_id;
+	m_ui->widget->SetPrecompileRunning(true);
+
+	const QPointer<MainDialogPrivate> self(this);
+	m_precompile = new PrecompileDialog(
+	    info->name, list, installed_now, process.release(),
+	    [self, item]() {
+		    if (self == nullptr) {
+			    return; // the launcher is closing
+		    }
+		    if (item != nullptr) {
+			    item->SetRunning(false);
+		    }
+		    self->m_running_games--;
+		    self->m_precompiling = false;
+		    self->m_ui->widget->SetPrecompileRunning(false);
+		    self->Update();
+	    },
+	    m_main_dialog);
+	m_precompile->show();
+
+	Update();
+}
+
 void MainDialogPrivate::Update() {
 	const auto* item = m_ui->widget->GetSelectedItem();
 
@@ -646,9 +762,15 @@ void MainDialogPrivate::Update() {
 		const auto& info = item->GetInfo();
 		auto        dir  = info.basedir;
 		run_enabled      = !dir.isEmpty() && (QDir(dir).exists() || GameContent::IsArchive(dir));
+		// The game's other row (its folder and its archive) while its shaders are precompiled: the
+		// game and the prepare run would write the same caches.
+		if (m_precompiling && info.title_id == m_precompile_title) {
+			run_enabled = false;
+		}
 	}
 
 	m_ui->widget->SetRunEnabled(run_enabled);
+	m_ui->widget->UpdatePrecompileButtons();
 	m_update_checker->SetGameRunning(m_running_games > 0);
 	if (m_running_games > 0) {
 		m_controller_preview.SetSuspended(true);

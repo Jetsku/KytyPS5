@@ -176,6 +176,10 @@ double Seconds() {
 	return static_cast<double>(ClockMs()) / 1000.0;
 }
 
+std::string FormatEvent(const char* name, const std::string& extra) {
+	return EventLine(name, Frames(), ClockMs(), extra);
+}
+
 int64_t LoadingEndNs(uint32_t n) {
 	if (n == 0 || n > g_load_end_ns.size()) return 0;
 	return g_load_end_ns[n - 1].load(std::memory_order_acquire);

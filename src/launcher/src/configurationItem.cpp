@@ -2,6 +2,8 @@
 
 #include "configuration.h"
 #include "gameContent.h"
+#include "gameViews.h"
+#include "precompile.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -16,6 +18,7 @@
 #include <QLineEdit>
 #include <QLocale>
 #include <QPixmap>
+#include <QPushButton>
 #include <QSize>
 #include <QStringList>
 #include <QStyle>
@@ -28,14 +31,15 @@
 namespace {
 
 enum Column {
-	NameColumn,
-	SerialColumn,
-	GameVersionColumn,
-	FirmwareVersionColumn,
-	SizeColumn,
-	PathColumn,
-	StatusColumn,
-	CommentsColumn,
+	NameColumn            = GAME_NAME_COLUMN,
+	PrecompileColumn      = GAME_PRECOMPILE_COLUMN,
+	SerialColumn          = GAME_SERIAL_COLUMN,
+	GameVersionColumn     = GAME_VERSION_COLUMN,
+	FirmwareVersionColumn = GAME_FIRMWARE_VERSION_COLUMN,
+	SizeColumn            = GAME_SIZE_COLUMN,
+	PathColumn            = GAME_PATH_COLUMN,
+	StatusColumn          = GAME_STATUS_COLUMN,
+	CommentsColumn        = GAME_COMMENT_COLUMN,
 };
 
 class NoWheelComboBox: public QComboBox {
@@ -123,6 +127,17 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
     : QTreeWidgetItem(parent), m_info(std::move(info)) {
 	setSizeHint(NameColumn, QSize(0, 72));
 
+	// A button of its natural height in the middle of the row.
+	m_precompile_widget = new QWidget(parent);
+	MakeTransparent(m_precompile_widget);
+	auto* precompile_layout = new QHBoxLayout(m_precompile_widget);
+	precompile_layout->setContentsMargins(6, 0, 6, 0);
+	m_precompile_button = new QPushButton(QStringLiteral("Precompile"), m_precompile_widget);
+	m_precompile_button->setObjectName(QStringLiteral("game_precompile_button"));
+	m_precompile_button->setFocusPolicy(Qt::NoFocus);
+	precompile_layout->addWidget(m_precompile_button, 0, Qt::AlignVCenter);
+	parent->setItemWidget(this, PrecompileColumn, m_precompile_widget);
+
 	m_status_widget = new QWidget(parent);
 	MakeTransparent(m_status_widget);
 	auto* layout = new QHBoxLayout(m_status_widget);
@@ -208,6 +223,7 @@ void ConfigurationItem::Update(bool reload_icon) {
 	setText(FirmwareVersionColumn,
 	        m_info->firmwareVer.isEmpty() ? QStringLiteral("\u2014") : m_info->firmwareVer);
 	setText(PathColumn, path);
+	setText(PrecompileColumn, {});
 	setText(StatusColumn, {});
 	setText(CommentsColumn, {});
 	for (int column = NameColumn; column <= CommentsColumn; column++) {
@@ -236,7 +252,9 @@ bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
 
 	const int column = treeWidget() != nullptr ? treeWidget()->sortColumn() : NameColumn;
 	switch (column) {
-		case NameColumn: return GetSortText(*m_info) < GetSortText(*other_item->m_info);
+		case NameColumn:
+		case PrecompileColumn: // every row holds the same button
+			return GetSortText(*m_info) < GetSortText(*other_item->m_info);
 		case SizeColumn:
 			return data(SizeColumn, Qt::UserRole).toLongLong() <
 			       other.data(SizeColumn, Qt::UserRole).toLongLong();
@@ -273,6 +291,41 @@ void ConfigurationItem::SetRunning(bool state) {
 	}
 
 	UpdateIcon();
+	UpdatePrecompileButton();
+}
+
+void ConfigurationItem::SetPrecompileState(const QString& emulator_dir, bool blocked) {
+	m_emulator_dir       = emulator_dir;
+	m_precompile_blocked = blocked;
+	UpdatePrecompileButton();
+}
+
+// Off while this game or a precompile runs; the tooltip names the shader list the emulator will
+// load for the game, or says that none is installed.
+void ConfigurationItem::UpdatePrecompileButton() {
+	const auto& title   = m_info->title_id;
+	const auto& version = m_info->gameVersion;
+	const bool  game    = !m_info->basedir.isEmpty() && QFileInfo::exists(m_info->basedir);
+	const bool  valid   = !m_emulator_dir.isEmpty() && Precompile::IsValidGame(title, version);
+	m_precompile_button->setEnabled(game && valid && !m_running && !m_precompile_blocked);
+
+	QString tip;
+	if (m_emulator_dir.isEmpty()) {
+		// The emulator has not been looked for yet.
+	} else if (!Precompile::IsValidGame(title, version)) {
+		tip = QStringLiteral("This game has no title ID, so it cannot have a shader list.");
+	} else if (const auto list = Precompile::FindList(m_emulator_dir, title, version);
+	           !list.isEmpty()) {
+		tip = QStringLiteral("Builds this game's shaders and pipelines before you play.\n"
+		                     "Shader list: %1")
+		          .arg(QDir::toNativeSeparators(list));
+	} else {
+		tip = QStringLiteral("No shader list is installed for this game (%1).\n"
+		                     "Click to choose a .kyplst file.")
+		          .arg(QDir::toNativeSeparators(
+		              Precompile::InstallPath(m_emulator_dir, title, version)));
+	}
+	m_precompile_button->setToolTip(tip);
 }
 
 void ConfigurationItem::SetCompatibilityEditable(bool editable) {

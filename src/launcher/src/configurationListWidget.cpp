@@ -12,6 +12,7 @@
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
+#include "precompileDialog.h"
 #include "trophyViewerDialog.h"
 #include "wheelMappingDialog.h"
 
@@ -216,6 +217,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setUniformRowHeights(true);
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
+	m_ui->cfgs_list->setColumnWidth(GAME_PRECOMPILE_COLUMN, 110);
 	m_ui->cfgs_list->setColumnWidth(GAME_SERIAL_COLUMN, 110);
 	m_ui->cfgs_list->setColumnWidth(GAME_VERSION_COLUMN, 120);
 	m_ui->cfgs_list->setColumnWidth(GAME_FIRMWARE_VERSION_COLUMN, 150);
@@ -302,6 +304,47 @@ void ConfigurationListWidget::changeEvent(QEvent* event) {
 	if (event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::PaletteChange) {
 		UpdateToolbarIcons();
 	}
+}
+
+void ConfigurationListWidget::SetRuntimeDirectory(const QString& directory) {
+	m_runtime_directory = directory;
+	UpdatePrecompileButtons();
+}
+
+void ConfigurationListWidget::SetPrecompileRunning(bool running) {
+	m_precompile_running = running;
+	UpdatePrecompileButtons();
+}
+
+// Each button's tooltip names the game's shader list as it is on disk now. A game that runs from
+// another row (its folder and its archive are two rows) blocks the button like a running precompile:
+// both write the title's caches.
+void ConfigurationListWidget::UpdatePrecompileButtons() {
+	QSet<QString> running_titles;
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		const auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item->IsRunning()) {
+			running_titles.insert(item->GetInfo().title_id);
+		}
+	}
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		item->SetPrecompileState(m_runtime_directory,
+		                         m_precompile_running ||
+		                             running_titles.contains(item->GetInfo().title_id));
+	}
+}
+
+bool ConfigurationListWidget::PressPrecompile(const QString& game) {
+	const auto key = PathKey(game);
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (!key.isEmpty() && PathKey(item->GetInfo().game_path) == key) {
+			item->GetPrecompileButton()->click();
+			return true;
+		}
+	}
+	return false;
 }
 
 void ConfigurationListWidget::UpdateToolbarIcons() {
@@ -723,6 +766,11 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		auto* item = new ConfigurationItem(std::move(info), m_ui->cfgs_list);
 		item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
 		                               !item->GetInfo().title_id.trimmed().isEmpty());
+		connect(item->GetPrecompileButton(), &QPushButton::clicked, item, [this, item]() {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			emit PrecompileShaders();
+		});
 		connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
 		        [this, item](int /*index*/) {
 			        if (!m_compatibility->IsLocal()) {
@@ -807,6 +855,7 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		m_ui->cfgs_list->sortItems(sort_column, sort_order);
 	}
 	filter_configurations(m_ui->search_line_edit->text());
+	UpdatePrecompileButtons();
 
 	ConfigurationItem* selected_item = nullptr;
 	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
@@ -1217,6 +1266,20 @@ void ConfigurationListWidget::compress_game() {
 	    }));
 }
 
+// Installs (or replaces) the selected game's shader list without running it.
+void ConfigurationListWidget::choose_shader_list() {
+	auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->currentItem());
+	if (item == nullptr || m_precompile_running) {
+		return;
+	}
+
+	// A copy: the row may be rebuilt while the dialogs are open.
+	const auto info = CreateConfiguration(*item);
+	if (!PrecompileDialog::ChooseList(this, m_runtime_directory, *info, false).isEmpty()) {
+		UpdatePrecompileButtons();
+	}
+}
+
 void ConfigurationListWidget::filter_configurations(const QString& text) {
 	const auto query              = text.trimmed();
 	const bool has_query          = !query.isEmpty();
@@ -1287,6 +1350,10 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
 	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	QAction* action_precompile =
+	    menu.addAction(tr("Precompile shaders"), this, SIGNAL(PrecompileShaders()));
+	QAction* action_shader_list =
+	    menu.addAction(tr("Choose shader list..."), this, SLOT(choose_shader_list()));
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));
@@ -1347,6 +1414,9 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 
 	if (item != nullptr) {
 		action_run->setDisabled(item->IsRunning());
+		// As the row's button: not while the game or a precompile runs.
+		action_precompile->setEnabled(item->GetPrecompileButton()->isEnabled());
+		action_shader_list->setEnabled(item->GetPrecompileButton()->isEnabled());
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
@@ -1356,6 +1426,8 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		action_delete->setDisabled(item->IsRunning() || !item->GetInfo().custom_settings);
 	} else {
 		action_run->setDisabled(true);
+		action_precompile->setDisabled(true);
+		action_shader_list->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
 		action_compress->setDisabled(true);

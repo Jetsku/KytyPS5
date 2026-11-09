@@ -14,6 +14,7 @@
 #include "common/file.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
+#include "common/kytyEvents.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -37,6 +38,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineListGameFile.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineListInt21.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/rtSession.h"
@@ -6840,6 +6843,13 @@ struct PipelineCache::ComputePrewarm {
 		LogTotals();
 	}
 
+	// Builds finished (built, dropped or failed) and builds requested, for the prepare run's progress
+	// events.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> Progress() const {
+		const auto get = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+		return {get(g_compile_totals.prewarm_built) + get(dropped) + get(failed), get(requested)};
+	}
+
 	void LogTotals() const {
 		if (requested.load() != 0) {
 			PipelineCacheLog("Compute prewarm: {} requested, {} built and published ({:.1f} ms), {} dropped (a "
@@ -6929,8 +6939,9 @@ struct PipelineCache::ComputePrewarm {
 // matched join the pipeline replay (JournalReplay; boot level first, then the pipelines recorded in the
 // most levels). Compute pipelines follow from the compute prewarm, on by default with the list.
 // KYTY_PIPELINE_LIST_PREPARE=1 ("Prepare shaders"): builds everything at start-up with more threads
-// (KYTY_SHADER_PRECOMPILE_THREADS and KYTY_PIPELINE_JOURNAL_THREADS default 8), prints progress, saves
-// the caches and exits (exit code 0; 2 when there is no usable list) before the game starts.
+// (KYTY_SHADER_PRECOMPILE_THREADS and KYTY_PIPELINE_JOURNAL_THREADS default 8), prints progress (also
+// as "KYTY_EVENT: prepare-progress" lines about once a second, common/kytyEvents.h), saves the caches
+// and exits (exit code 0; 2 when there is no usable list) before the game starts.
 struct PipelineCache::ListState {
 	std::vector<std::string>             levels;
 	std::vector<PipelineList::Pipeline>  pipelines;  // moved into the pipeline replay
@@ -6983,6 +6994,7 @@ struct PipelineCache::JournalReplay {
 	void Start(uint32_t thread_count, bool force_known) {
 		force    = force_known;
 		begin_ns = CompileClockNs();
+		queued.store(items.size(), std::memory_order_release);
 		running  = std::max<uint32_t>(1, thread_count);
 		for (uint32_t i = 0; i < running; i++) threads.emplace_back([this] { Worker(); });
 	}
@@ -7174,6 +7186,13 @@ struct PipelineCache::JournalReplay {
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 		}
+	}
+
+	// Records finished and records in all for the prepare run's progress events: the queued count until
+	// the workers have ordered the records (they wait for the shader replay first).
+	[[nodiscard]] std::pair<uint64_t, uint64_t> Progress() const {
+		const auto ordered = total.load(std::memory_order_acquire);
+		return {done.load(std::memory_order_relaxed), ordered != 0 ? ordered : queued.load(std::memory_order_acquire)};
 	}
 
 	// A progress line every report_ns (any worker; the one that wins the exchange prints it).
@@ -7413,7 +7432,7 @@ struct PipelineCache::JournalReplay {
 	std::vector<Item>            items;       // filled before Start
 	std::vector<std::string>     list_level_names;
 	std::vector<uint32_t>        order;
-	std::atomic<uint64_t>        next {0}, done {0}, total {0}, last_report_ns {0}, full_checks {0};
+	std::atomic<uint64_t>        next {0}, done {0}, total {0}, queued {0}, last_report_ns {0}, full_checks {0};
 	std::atomic<uint32_t>        running {0};
 	std::atomic<bool>            stop {false}, logged_exit {false}, stopped_once {false}, cache_full {false};
 	std::atomic<uint64_t> built {0}, built_list {0}, skipped_known {0}, missing {0}, failed {0}, mismatched {0},
@@ -7634,33 +7653,6 @@ void PipelineCache::StopBackgroundPipelines() {
 
 namespace {
 
-// The vertex input info that int21 (744705ee1) journals and lists stored: this build added the mesh
-// fast launch flag and passes, and the tessellation clamp levels and carried VGPRs. Tessellation
-// stages are left out (their clamp levels come from guest registers the list does not keep).
-PipelineList::VertexLayoutUpgrade Int21VertexLayout() {
-	static_assert(sizeof(ShaderMeshInputInfo) == 64 && sizeof(ShaderTessellationInputInfo) == 76 &&
-	                  ShaderStoredInputInfoSize<ShaderVertexInputInfo>() == 10216,
-	              "the vertex input info changed again: describe the int21 layout from the new one");
-	const ShaderVertexInputInfo info;
-	const auto offset = [&](const void* field) {
-		return static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(field) - reinterpret_cast<const uint8_t*>(&info));
-	};
-	// Defaults of the added fields as a draw of an ordinary vertex shader sets them.
-	const auto mesh_at    = offset(&info.mesh.fast_launch);
-	const auto mesh_added = offset(&info.tess) - mesh_at;
-	const auto tess_at    = offset(&info.tess.min_tess_level);
-	const auto tess_added = offset(&info.fetch_external) - tess_at;
-	std::vector<uint8_t> mesh_bytes(mesh_added, 0);
-	const uint32_t       passes = info.mesh.passes;
-	std::memcpy(mesh_bytes.data() + (offset(&info.mesh.passes) - mesh_at), &passes, sizeof(passes));
-	PipelineList::VertexLayoutUpgrade upgrade;
-	upgrade.from_size = ShaderStoredInputInfoSize<ShaderVertexInputInfo>() - mesh_added - tess_added;
-	upgrade.inserts.push_back({mesh_at, std::move(mesh_bytes)});
-	upgrade.inserts.push_back({tess_at - mesh_added, std::vector<uint8_t>(tess_added, 0)});
-	upgrade.skip_if_nonzero_at = offset(&info.tess.input_control_points) - mesh_added;
-	return upgrade;
-}
-
 // A pipeline list source's device-dependent stage input fields for this device (the host subgroup
 // size of compute and mesh stages, mesh group splitting and passes; as GetComputeProgram and FinishMeshStage
 // set them), and its static key derived again from the input info, as BuildKey does. False when the
@@ -7776,40 +7768,36 @@ void PipelineCache::InitializePipelineList() {
 		                 Common::PathToString(path), file.info.title_id, file.info.app_version, title_id, version);
 		return;
 	}
+	// A game folder's file, or a member of a game archive (a .zar game: "<game>.zar!/eboot.bin").
 	const auto executable = PipelineListExecutable();
-	std::ifstream code_file(executable, std::ios::binary);
-	if (executable.empty() || !code_file) {
+	PipelineListGameFile code_file(executable);
+	if (executable.empty() || !code_file.Ok()) {
 		PipelineCacheLog("Pipeline list: the game executable ({}) cannot be read: ignored",
 		                 Common::PathToString(executable));
 		return;
 	}
 	// Data files (list format with a files section): opened once each, next to the executable (/app0).
-	std::map<uint32_t, std::unique_ptr<std::ifstream>> data_files;
+	std::map<uint32_t, std::unique_ptr<PipelineListGameFile>> data_files;
 	const PipelineList::ReadCodeFn read = [&](PipelineList::CodeFile which, uint64_t offset, std::span<uint8_t> out) {
-		std::ifstream* in    = &code_file;
-		const auto     index = static_cast<uint32_t>(which);
+		PipelineListGameFile* in    = &code_file;
+		const auto            index = static_cast<uint32_t>(which);
 		if (index != 0) {
 			auto& opened = data_files[index];
 			if (opened == nullptr && index <= file.files.size()) {
-				opened = std::make_unique<std::ifstream>(executable.parent_path() / Common::PathFromUtf8(file.files[index - 1]),
-				                                          std::ios::binary);
+				opened = std::make_unique<PipelineListGameFile>(executable.parent_path() /
+				                                                Common::PathFromUtf8(file.files[index - 1]));
 			}
-			if (opened == nullptr || !*opened) return false;
+			if (opened == nullptr || !opened->Ok()) return false;
 			in = opened.get();
 		}
-		in->clear();
-		in->seekg(static_cast<std::streamoff>(offset));
-		return static_cast<bool>(in->read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size())));
+		return in->Read(offset, out);
 	};
 	const PipelineList::ReadImageFn read_image = [&](PipelineList::CodeFile) {
 		std::vector<uint8_t> image;
-		std::error_code      size_error;
-		const auto           size = std::filesystem::file_size(executable, size_error);
-		if (size_error || size > 4ull * 1024 * 1024 * 1024) return image;
+		uint64_t             size = 0;
+		if (!code_file.Size(size) || size > 4ull * 1024 * 1024 * 1024) return image;
 		image.resize(static_cast<size_t>(size));
-		code_file.clear();
-		code_file.seekg(0);
-		if (!code_file.read(reinterpret_cast<char*>(image.data()), static_cast<std::streamsize>(image.size()))) image.clear();
+		if (!code_file.Read(0, image)) image.clear();
 		return image;
 	};
 	const std::array<uint32_t, 3> sizes {ShaderStoredInputInfoSize<ShaderVertexInputInfo>(),
@@ -7902,11 +7890,41 @@ void PipelineCache::RunListPrepare() {
 		std::_Exit(2);
 	}
 	PipelineCacheLog("Prepare shaders: building the pipeline list's shaders and pipelines");
+	// About once a second, how far the replays are, as an event line (common/kytyEvents.h) for the
+	// program that started the run (the launcher's Precompile window shows it as a progress bar).
+	std::atomic<const char*> phase {"shaders"};
+	const auto progress = [&] {
+		ShaderPrecompiler::Progress   shaders;
+		std::pair<uint64_t, uint64_t> pipelines, compute;
+		if (m_shader_precompiler != nullptr) shaders = m_shader_precompiler->GetProgress();
+		if (m_journal_replay != nullptr) pipelines = m_journal_replay->Progress();
+		if (m_compute_prewarm != nullptr) compute = m_compute_prewarm->Progress();
+		const auto counts = fmt::format("phase={} shaders={}/{} pipelines={}/{} compute={}/{}", phase.load(),
+		                                shaders.done, shaders.total, pipelines.first, pipelines.second, compute.first,
+		                                compute.second);
+		PipelineCacheLog("{}", KytyEvents::FormatEvent("prepare-progress", counts));
+	};
+	std::mutex                  progress_mutex;
+	std::condition_variable_any progress_cv;
+	std::jthread reporter([&](const std::stop_token& stop) {
+		std::unique_lock lock(progress_mutex);
+		while (!progress_cv.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; }) &&
+		       !stop.stop_requested()) {
+			progress();
+		}
+	});
 	if (m_shader_precompiler != nullptr) m_shader_precompiler->Wait();
 	const auto shaders_ns = CompileClockNs() - begin;
+	phase.store("pipelines");
 	if (m_journal_replay != nullptr) m_journal_replay->Wait();
+	phase.store("compute");
 	if (m_compute_prewarm != nullptr) m_compute_prewarm->Drain();
 	if (m_rt != nullptr) m_rt->WaitAll();
+	// Saving ends the replays and frees what the counts are read from: the last line goes out first.
+	reporter.request_stop();
+	reporter.join();
+	phase.store("saving");
+	progress();
 	size_t     size     = 0;
 	if (m_driver_cache != nullptr) (void)m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
 	Save();
@@ -7918,6 +7936,12 @@ void PipelineCache::RunListPrepare() {
 	                 static_cast<double>(CompileClockNs() - begin - shaders_ns) / 1e9, t.replayed.load(),
 	                 t.journal_built.load(), t.prewarm_built.load(), size,
 	                 size > DriverCacheFileCap() ? " (over the file cap, KYTY_DRIVER_CACHE_MAX_MB: the next start discards it)" : "");
+	// The same counts as an event line (known: pipelines the driver cache already held).
+	const auto counts =
+	    fmt::format("seconds={:.1f} shaders={} pipelines={} known={} compute={}",
+	                static_cast<double>(CompileClockNs() - begin) / 1e9, t.replayed.load(), t.journal_built.load(),
+	                t.journal_skipped.load(), t.prewarm_built.load());
+	PipelineCacheLog("{}", KytyEvents::FormatEvent("prepare-done", counts));
 	std::fflush(nullptr);
 	std::_Exit(0);
 }
