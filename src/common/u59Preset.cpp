@@ -97,6 +97,29 @@ LoadResult LoadTitle(const std::vector<std::filesystem::path>& dirs, std::string
 	return LoadNamed(dirs, TitleFileName(title_id));
 }
 
+std::string TitleIdFromParamJson(std::string_view text) {
+	const auto document = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
+	if (document.is_discarded() || !document.is_object()) {
+		return {};
+	}
+	if (const auto it = document.find("titleId"); it != document.end() && it->is_string()) {
+		if (auto id = it->get<std::string>(); !id.empty()) {
+			return id;
+		}
+	}
+	if (const auto it = document.find("contentId"); it != document.end() && it->is_string()) {
+		const auto& content_id = it->get_ref<const std::string&>();
+		if (content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
+			return content_id.substr(7, 9);
+		}
+	}
+	return {};
+}
+
+bool EmulatorTitleFallbackWanted(const char* title_preset_env) {
+	return title_preset_env == nullptr || title_preset_env[0] == '\0';
+}
+
 std::string Describe(const LoadResult& result) {
 	static constexpr std::string_view consequence =
 	    "Games start with the emulator's built-in defaults, which are slower and use more video memory "

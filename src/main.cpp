@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/u59Preset.h"
 #include "common/virtualMemory.h"
 #include "common/wheelConfig.h"
 #include "emulator.h"
@@ -915,6 +916,94 @@ static void ReportUncaughtException() {
 	std::abort();
 }
 
+// The directory of kyty_emulator itself (empty when unknown).
+static std::filesystem::path EmulatorDirectory() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::vector<wchar_t> path(32768);
+	const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+	if (length == 0 || length >= path.size()) {
+		return {};
+	}
+	return std::filesystem::path(std::wstring(path.data(), length)).parent_path();
+#else
+	std::error_code ec;
+	auto            exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+	return ec ? std::filesystem::path {} : exe.parent_path();
+#endif
+}
+
+// u59-preset.<TITLE_ID>.json when no launcher applied it. Per-title presets are applied by the
+// launcher (KYTY_TITLE_PRESET names the file), but a launcher older than them (int21 and before)
+// starting a newer emulator, or a direct start, ran the game without its title's switches: Ratchet &
+// Clank then ran without KYTY_INDIRECT_COHERENT and the rest of its preset and lost the device at
+// its first gameplay load. The emulator then loads the file itself, from its own folder or the one
+// above (where the launcher looks), with the launcher's precedence: over the bundled preset and the
+// environment, under the command line (it runs before the arguments are parsed, so
+// --gpu-occlusion still wins). KYTY_TITLE_PRESET set to anything (e.g. "none") skips it.
+static void ApplyTitlePresetFallback(int argc, char* argv[]) {
+	if (!U59Preset::EmulatorTitleFallbackWanted(std::getenv("KYTY_TITLE_PRESET"))) {
+		return;
+	}
+	std::string game;
+	for (int i = 1; i + 1 < argc; i++) {
+		if (std::string_view(argv[i]) == "--game") {
+			game = argv[i + 1];
+			break;
+		}
+	}
+	if (game.empty()) {
+		return;
+	}
+	const auto      path = PathFromUtf8(FixFilenameSlash(game));
+	std::error_code ec;
+	std::filesystem::path app0;
+	if (std::filesystem::is_directory(path, ec)) {
+		app0 = path;
+	} else if (IsSupportedArchive(path) && File::IsFileExisting(path)) {
+		app0 = MakeArchivePath(path);
+	} else if (std::filesystem::is_regular_file(path, ec)) {
+		app0 = path.parent_path();
+	} else {
+		return;
+	}
+	File param;
+	param.Open(app0 / "sce_sys" / "param.json", File::Mode::Read);
+	if (param.IsInvalid()) {
+		return;
+	}
+	const auto buffer = param.ReadWholeBuffer();
+	param.Close();
+	const auto title_id = U59Preset::TitleIdFromParamJson(
+	    std::string_view(reinterpret_cast<const char*>(buffer.data()), buffer.size()));
+	const auto dir = EmulatorDirectory();
+	if (title_id.empty() || dir.empty()) {
+		return;
+	}
+	const auto result = U59Preset::LoadTitle({dir, dir.parent_path()}, title_id);
+	if (result.status == U59Preset::Status::Missing) {
+		return;
+	}
+	if (result.status != U59Preset::Status::Loaded) {
+		std::printf("%s was not applied: %s\n", U59Preset::TitleFileName(title_id).c_str(),
+		            result.error.c_str());
+		return;
+	}
+	const auto set = [](const std::string& key, const std::string& value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		_putenv_s(key.c_str(), value.c_str());
+#else
+		setenv(key.c_str(), value.c_str(), 1);
+#endif
+	};
+	for (const auto& entry: result.entries) {
+		set(entry.key, entry.value);
+	}
+	// Emulator::Run prints "Per-title preset applied: <file>" into the log.
+	set("KYTY_TITLE_PRESET", PathToString(result.path));
+	std::printf("The launcher did not apply %s: the emulator applied its %zu variable(s).\n",
+	            U59Preset::TitleFileName(title_id).c_str(), result.entries.size());
+}
+
 static int Main(int argc, char* argv[]) {
 	std::set_terminate(ReportUncaughtException);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -945,6 +1034,8 @@ static int Main(int argc, char* argv[]) {
 		PrintUsage();
 		return 0;
 	}
+
+	ApplyTitlePresetFallback(argc, argv);
 
 	if (!ParseArgs(argc, argv, options, show_help)) {
 		PrintUsage();

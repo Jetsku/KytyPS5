@@ -160,6 +160,23 @@ void TestLoadTitle() {
 	std::filesystem::remove_all(root, ec);
 }
 
+// The emulator's own load of the title preset when the launcher did not apply it.
+void TestEmulatorTitleFallback() {
+	Check(TitleIdFromParamJson(R"({"titleId": "PPSA01474", "contentId": "UP9000-PPSA01474_00-RATCHETPS5000000"})") ==
+	          "PPSA01474",
+	      "param.json titleId is the title id");
+	Check(TitleIdFromParamJson(R"({"contentId": "UP9000-PPSA01417_00-0000000000000000"})") == "PPSA01417",
+	      "without titleId, the contentId's nine characters are the title id");
+	Check(TitleIdFromParamJson(R"({"contentId": "short"})").empty(), "a malformed contentId gives nothing");
+	Check(TitleIdFromParamJson("not json").empty(), "text that is not JSON gives nothing");
+	Check(TitleIdFromParamJson("[]").empty(), "a JSON array gives nothing");
+	Check(EmulatorTitleFallbackWanted(nullptr) && EmulatorTitleFallbackWanted(""),
+	      "no KYTY_TITLE_PRESET (an int21 launcher, a direct start): the emulator loads the file");
+	Check(!EmulatorTitleFallbackWanted("C:/Kyty/u59-preset.PPSA01474.json"),
+	      "a launcher that applied the file is not overridden");
+	Check(!EmulatorTitleFallbackWanted("none"), "KYTY_TITLE_PRESET=none turns the emulator's load off");
+}
+
 // The preset this repository ships parses, covers every marker and sets what the defaults need.
 void TestShippedPreset() {
 	const auto shipped = Load({std::filesystem::path(KYTY_U59_PRESET_DIR)});
@@ -282,6 +299,7 @@ int main() {
 	TestParse();
 	TestLoad();
 	TestLoadTitle();
+	TestEmulatorTitleFallback();
 	TestShippedPreset();
 	TestTextureSparseResidency();
 	TestStartupWarnings();
