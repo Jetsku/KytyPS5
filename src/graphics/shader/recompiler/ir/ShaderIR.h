@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1118,6 +1119,12 @@ void  ResolveControlFlowIdentities(Program& program);
 // returns how many it cleared; Count only counts them. Neither dereferences such a reference.
 size_t CountDeadPlanReferences(const Program& program);
 size_t DropDeadPlanReferences(Program& program);
+// The instructions the resource-plan tables name, except dynamic_reads (a list of the walk's
+// reads, not values the plan evaluates). Dead-code elimination after resource tracking keeps them:
+// tracking can take a value's last IR use (a stand-in or bindless sampler plan rewires the S#
+// handle, stranding the heap reads and with them the V# words of the heap's buffer source), and
+// ExtractResourcePlan reads every such value and its arguments.
+std::unordered_set<const Inst*> PlanTableInstructions(const Program& program);
 // Points plan-table references to Identity instructions at what the identities resolve to.
 // RemoveIdentities rewires only IR uses and erases the identities, so such a reference would be
 // dead (DropDeadPlanReferences clears it) although its value is still live: Astro Bot's Sky Garden

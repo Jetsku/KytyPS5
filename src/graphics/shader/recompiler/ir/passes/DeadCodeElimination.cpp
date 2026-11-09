@@ -46,7 +46,7 @@ void RemoveIdentities(const BlockList& blocks) {
 	}
 }
 
-static bool RemoveDeadPhiWebs(const BlockList& blocks) {
+static bool RemoveDeadPhiWebs(const BlockList& blocks, const std::unordered_set<const Inst*>* keep) {
 	std::vector<Inst*> dead;
 	std::vector<Inst*> web;
 	std::vector<Inst*> stack;
@@ -67,6 +67,10 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
 					continue;
 				}
 				web.push_back(current);
+				if (keep != nullptr && keep->contains(current)) {
+					external = true;
+					break;
+				}
 				for (const auto& use: current->Uses()) {
 					if (use.user->GetOpcode() != ValueOpcode::Phi) {
 						external = true;
@@ -100,7 +104,7 @@ static bool RemoveDeadPhiWebs(const BlockList& blocks) {
 	return true;
 }
 
-void EliminateDeadCode(const BlockList& blocks) {
+static void EliminateDeadCodeImpl(const BlockList& blocks, const std::unordered_set<const Inst*>* keep) {
 	do {
 		bool changed;
 		do {
@@ -110,7 +114,8 @@ void EliminateDeadCode(const BlockList& blocks) {
 				auto  inst         = instructions.end();
 				while (inst != instructions.begin()) {
 					--inst;
-					if (inst->HasUses() || inst->MayHaveSideEffects()) {
+					if (inst->HasUses() || inst->MayHaveSideEffects() ||
+					    (keep != nullptr && keep->contains(&*inst))) {
 						continue;
 					}
 					inst->Invalidate();
@@ -119,7 +124,15 @@ void EliminateDeadCode(const BlockList& blocks) {
 				}
 			}
 		} while (changed);
-	} while (RemoveDeadPhiWebs(blocks));
+	} while (RemoveDeadPhiWebs(blocks, keep));
+}
+
+void EliminateDeadCode(const BlockList& blocks) {
+	EliminateDeadCodeImpl(blocks, nullptr);
+}
+
+void EliminateDeadCode(const BlockList& blocks, const std::unordered_set<const Inst*>& keep) {
+	EliminateDeadCodeImpl(blocks, keep.empty() ? nullptr : &keep);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -1276,8 +1276,33 @@ void CheckSamplerHeap() {
   };
   auto codegen = GetCodegenOptions();
   codegen.srt_variant_reads = true;
-  codegen.sampler_reads_deferred = true; // KYTY_SAMPLER_READS_DEFER
   ShaderRecompiler::IR::SetBindlessImagesEnabled(true);
+  {
+    // Both switches off (the default): the walk collects the S# reads as a heap buffer resource,
+    // and the stand-in sampler strands them. The plan must still own every value it names (the
+    // heap V# words): extracting it read erased instructions, a draw-prep thread crash.
+    codegen.sampler_reads_deferred = false;
+    codegen.bindless_samplers = false;
+    ScopedCodegenOptions scope(codegen);
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "stranded reads", !translated.skip_dispatch,
+            "the bindless image was skipped without KYTY_SAMPLER_READS_DEFER");
+    Require(name, "stranded reads",
+            ShaderRecompiler::IR::CountDeadPlanReferences(translated.program) == 0u,
+            "the plan tables name erased instructions");
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    Require(name, "stranded reads",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization) &&
+                resources.samplers.size() == 1u &&
+                resources.samplers[0].dwords[2] == ShaderRecompiler::IR::BindlessDefaultSampler[2],
+            "the stand-in sampler did not materialize beside the stranded heap buffer");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+    ValidateSpirv(name, result.spirv);
+    std::printf("[bindless] %-32s stranded reads ok (%zu buffers)\n", name, resources.buffers.size());
+  }
+  codegen.sampler_reads_deferred = true; // KYTY_SAMPLER_READS_DEFER
   {
     // Switch off: the stand-in sampler, no sampler array, no sampler heap in the snapshot.
     codegen.bindless_samplers = false;

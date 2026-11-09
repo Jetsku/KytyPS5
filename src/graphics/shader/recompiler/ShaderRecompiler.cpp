@@ -1643,7 +1643,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		skipped.skip_reason   = "descriptor computed at runtime without a BDA path";
 		return skipped;
 	}
-	IR::EliminateDeadCode(ir.blocks);
+	// Resource tracking can take a plan-table value's last IR use: a stand-in or bindless sampler
+	// plan rewires the S# handle, so the scalar reads of the sampler heap are stranded, and the
+	// heap's buffer source (collected in the walk) names V# words nothing else uses. Erasing them
+	// left the plan naming freed instructions, which ExtractResourcePlan then read (and the
+	// draw-prep thread crashed once another compile had reused that memory), so the elimination
+	// keeps every value the plan tables name. The walk's list of dynamic reads is no plan value:
+	// entries for stranded reads are cleared instead.
+	IR::EliminateDeadCode(ir.blocks, IR::PlanTableInstructions(ir));
+	(void)IR::DropDeadPlanReferences(ir);
 	// A subgroup larger than a host mesh workgroup runs in passes, cut at its barriers.
 	if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr &&
 	    options.input_info.vertex->mesh.passes > 1u) {
