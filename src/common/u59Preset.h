@@ -56,6 +56,16 @@ struct LoadResult {
 [[nodiscard]] LoadResult LoadTitle(const std::vector<std::filesystem::path>& dirs,
                                    std::string_view                           title_id);
 
+// The title id of a game's sce_sys/param.json text: "titleId", else the nine characters of a
+// "contentId" (XX0000-PPSA01474_00-...); empty when neither is there or the text is not JSON.
+[[nodiscard]] std::string TitleIdFromParamJson(std::string_view text);
+
+// Whether the emulator applies u59-preset.<TITLE_ID>.json itself: only when no launcher named a
+// title preset (KYTY_TITLE_PRESET unset or empty). A launcher older than the per-title presets
+// (int21 and before) starts int22 and later emulators without them; any other value, such as
+// "none", turns the emulator's own load off.
+[[nodiscard]] bool EmulatorTitleFallbackWanted(const char* title_preset_env);
+
 // One paragraph for the launcher (window and log) about a preset that was not applied, naming the
 // file or the directories searched. Empty for Loaded.
 [[nodiscard]] std::string Describe(const LoadResult& result);
