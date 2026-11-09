@@ -18,6 +18,15 @@ QString Configuration::NormalizeResolution(const QString& text) {
 	return QStringLiteral("%1x%2").arg(width).arg(height);
 }
 
+Configuration::ShaderOptimizationType
+Configuration::ShaderOptimizationTypeFromText(const QString& text) {
+	// Unknown or empty text (a hand-edited or damaged config) means the default, Performance.
+	bool       ok    = false;
+	const auto value = QMetaEnum::fromType<ShaderOptimizationType>().keyToValue(
+	    text.trimmed().toUtf8().constData(), &ok);
+	return ok ? static_cast<ShaderOptimizationType>(value) : ShaderOptimizationType::Performance;
+}
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -37,6 +46,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(sync_raw_image_buffers);
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(occlusion_queries_enabled);
+	KYTY_CFG_SET(gpu_occlusion_accurate);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -94,6 +104,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
+	// Missing in configs saved while the setting was global: keep the value set before reading.
+	gpu_occlusion_accurate = s.value("gpu_occlusion_accurate", gpu_occlusion_accurate).toBool();
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
@@ -108,7 +120,8 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	}
 	KYTY_CFG_GET(vulkan_validation_enabled);
 	KYTY_CFG_GET(shader_validation_enabled);
-	KYTY_CFG_GET(shader_optimization_type);
+	shader_optimization_type = ShaderOptimizationTypeFromText(
+	    s.value("shader_optimization_type").toString());
 	KYTY_CFG_GET(shader_log_direction);
 	KYTY_CFG_GET(shader_log_folder);
 	KYTY_CFG_GET(command_buffer_dump_enabled);

@@ -144,8 +144,6 @@ static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
 	for (int row = 1; row <= 6; row++) {
 		ui.audioLayout->setRowVisible(row, visible);
 	}
-	// The occlusion mode is global too (graphics row 9).
-	ui.graphicsLayout->setRowVisible(ui.checkBox_gpu_occlusion, visible);
 }
 
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
@@ -379,7 +377,10 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
-	// ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
+	// Upstream hid this row and stopped filling the combo; the row is visible in this form, so
+	// fill it (an unknown value shows as Performance).
+	ListInit(m_ui->comboBox_shader_optimization_type,
+	         Configuration::ShaderOptimizationTypeFromText(EnumToText(info.shader_optimization_type)));
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
@@ -578,7 +579,6 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 			info.audio_mix.*mix.field = mix.slider->value();
 		}
 		info.audio_mix.objects_enabled = ui.checkBox_audio_objects->isChecked();
-		info.gpu_occlusion_accurate = ui.checkBox_gpu_occlusion->isChecked();
 		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
 	}
 	info.screen_resolution =
@@ -595,6 +595,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.gpu_occlusion_accurate    = ui.checkBox_gpu_occlusion->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();
@@ -614,8 +615,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
-	// info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
-	//     ui.comboBox_shader_optimization_type->currentText());
+	info.shader_optimization_type = Configuration::ShaderOptimizationTypeFromText(
+	    ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
