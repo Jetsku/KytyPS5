@@ -140,14 +140,21 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
-static void Execute(const std::filesystem::path& game_patch) {
-	auto           patch_path = game_patch;
+static void Execute(const std::filesystem::path& elf, const std::filesystem::path& game_patch) {
+	struct Paths {
+		std::filesystem::path elf;
+		std::filesystem::path game_patch;
+	} paths {elf, game_patch};
+	// The window is already open: load the ELF (seconds for a large game) on the guest thread, so
+	// the main thread answers the compositor's pings instead of being reported as not responding.
 	Common::Thread guest_thread(
 	    [](void* param) {
+		    const auto* p = static_cast<const Paths*>(param);
+		    LoadElf(p->elf);
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
+		    rt->Execute(p->game_patch);
 	    },
-	    &patch_path);
+	    &paths);
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);
 }
@@ -202,9 +209,7 @@ void Run(const RunOptions& options) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 
-	LoadElf(options.elf);
-
-	Execute(options.game_patch);
+	Execute(options.elf, options.game_patch);
 }
 
 } // namespace Emulator
