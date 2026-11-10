@@ -139,6 +139,8 @@ PrecompileDialog::~PrecompileDialog() {
 	}
 }
 
+QString PrecompileDialog::s_test_list;
+
 QString PrecompileDialog::ChooseList(QWidget* parent, const QString& emulator_dir,
                                      const Configuration& game, bool explain_missing) {
 	const auto title  = tr("Precompile shaders");
@@ -154,26 +156,29 @@ QString PrecompileDialog::ChooseList(QWidget* parent, const QString& emulator_di
 	                               ? QStringLiteral("%1, %2").arg(game.name, game.title_id)
 	                               : tr("%1, %2 version %3")
 	                                     .arg(game.name, game.title_id, game.gameVersion);
-	const auto text =
-	    (explain_missing ? tr("No shader list is installed for %1.") : tr("Shader list for %1."))
-	        .arg(game_text) +
-	    QStringLiteral("\n\n") +
-	    tr("A shader list (.kyplst) names the shaders and pipelines a game uses, so the emulator "
-	       "can build them all before you play instead of one by one while you play.") +
-	    QStringLiteral("\n\n") + tr("The file you choose is copied to %1.").arg(native_target);
-	QMessageBox question(QMessageBox::Information, title, text, QMessageBox::Cancel, parent);
-	question.setTextFormat(Qt::PlainText);
-	auto* choose = question.addButton(tr("Choose a .kyplst file..."), QMessageBox::AcceptRole);
-	question.setDefaultButton(choose);
-	question.exec();
-	if (question.clickedButton() != choose) {
-		return {};
-	}
-
-	const auto source = QFileDialog::getOpenFileName(parent, tr("Choose a shader list"), {},
-	                                                 tr("Shader lists (*.kyplst);;All files (*)"));
+	QString source = s_test_list;
 	if (source.isEmpty()) {
-		return {};
+		const auto text =
+		    (explain_missing ? tr("No shader list is installed for %1.") : tr("Shader list for %1."))
+		        .arg(game_text) +
+		    QStringLiteral("\n\n") +
+		    tr("A shader list (.kyplst) names the shaders and pipelines a game uses, so the emulator "
+		       "can build them all before you play instead of one by one while you play.") +
+		    QStringLiteral("\n\n") + tr("The file you choose is copied to %1.").arg(native_target);
+		QMessageBox question(QMessageBox::Information, title, text, QMessageBox::Cancel, parent);
+		question.setTextFormat(Qt::PlainText);
+		auto* choose = question.addButton(tr("Choose a .kyplst file..."), QMessageBox::AcceptRole);
+		question.setDefaultButton(choose);
+		question.exec();
+		if (question.clickedButton() != choose) {
+			return {};
+		}
+
+		source = QFileDialog::getOpenFileName(parent, tr("Choose a shader list"), {},
+		                                      tr("Shader lists (*.kyplst);;All files (*)"));
+		if (source.isEmpty()) {
+			return {};
+		}
 	}
 	QString error;
 	if (!Precompile::IsListFile(source, &error)) {

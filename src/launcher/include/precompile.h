@@ -51,8 +51,8 @@ struct Progress {
 	quint64 compute_total   = 0;
 };
 [[nodiscard]] bool ParseProgress(const QString& line, Progress* progress);
-// 0..1000 of everything counted so far, a pipeline weighing more than a shader (0 while nothing is
-// counted).
+// 0..1000 of the whole run: shaders fill 0..150, graphics pipelines 150..900, compute pipelines
+// 900..990 (each by the count ProgressText shows), 1000 while saving.
 [[nodiscard]] int     ProgressPermille(const Progress& progress);
 [[nodiscard]] QString ProgressText(const Progress& progress);
 

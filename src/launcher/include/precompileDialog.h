@@ -37,6 +37,9 @@ public:
 	// installed. With `explain_missing` the question starts from "no list is installed".
 	static QString ChooseList(QWidget* parent, const QString& emulator_dir, const Configuration& game,
 	                          bool explain_missing);
+	// Test seam (the launcher's --precompile-list argument): this file is taken as the user's
+	// choice, without the question and the file dialog; the checks and the copy are the same.
+	static void SetTestList(const QString& path) { s_test_list = path; }
 
 	void reject() override;
 
@@ -44,6 +47,7 @@ protected:
 	void closeEvent(QCloseEvent* event) override;
 
 private:
+	static QString s_test_list;
 	void ReadOutput();
 	void TakeLine(const QString& line);
 	void ShowLines();

@@ -165,37 +165,66 @@ bool ParseProgress(const QString& line, Progress* progress) {
 	return true;
 }
 
-int ProgressPermille(const Progress& progress) {
-	// A graphics pipeline took about five times as long as a shader permutation in a cold run
-	// (2680 pipelines in 56 s, 1069 permutations in 4.6 s on 8 threads each): weighted so, the bar
-	// moves about with the time.
-	constexpr quint64 pipeline_weight = 5;
-	const auto        total = progress.shaders_total + pipeline_weight * progress.pipelines_total +
-	                          progress.compute_total;
-	if (total == 0) {
-		return 0;
+namespace {
+
+enum class Step { Shaders, Pipelines, Compute, Saving };
+
+// The step the run is in: the emulator's phase, else the first one whose counts are not complete.
+Step CurrentStep(const Progress& progress) {
+	if (progress.phase == QLatin1String("saving")) {
+		return Step::Saving;
 	}
-	const auto done = std::min(progress.shaders_done, progress.shaders_total) +
-	                  pipeline_weight * std::min(progress.pipelines_done, progress.pipelines_total) +
-	                  std::min(progress.compute_done, progress.compute_total);
-	return static_cast<int>(done * 1000 / total);
+	if (progress.phase == QLatin1String("compute")) {
+		return Step::Compute;
+	}
+	if (progress.phase == QLatin1String("pipelines") ||
+	    (progress.phase.isEmpty() && progress.shaders_total != 0 && progress.shaders_done >= progress.shaders_total)) {
+		return Step::Pipelines;
+	}
+	return Step::Shaders;
+}
+
+} // namespace
+
+int ProgressPermille(const Progress& progress) {
+	// The bar covers the whole run and the text names the step: each step fills its own part of the
+	// bar with the count the text shows. The parts follow where a run spends its time when the
+	// driver has no cached pipelines (shaders about 10%, graphics pipelines most of the rest); with a
+	// warm driver cache the later steps just go by quicker.
+	constexpr int shaders_end   = 150;
+	constexpr int pipelines_end = 900;
+	constexpr int compute_end   = 990;
+	const auto    part = [](quint64 done, quint64 total, int from, int to) {
+		if (total == 0) {
+			return from;
+		}
+		return from + static_cast<int>(std::min(done, total) * static_cast<quint64>(to - from) / total);
+	};
+	switch (CurrentStep(progress)) {
+		case Step::Shaders: return part(progress.shaders_done, progress.shaders_total, 0, shaders_end);
+		case Step::Pipelines:
+			return part(progress.pipelines_done, progress.pipelines_total, shaders_end, pipelines_end);
+		case Step::Compute: return part(progress.compute_done, progress.compute_total, pipelines_end, compute_end);
+		case Step::Saving: break;
+	}
+	return 1000;
 }
 
 QString ProgressText(const Progress& progress) {
-	const auto counts = [](const char* what, quint64 done, quint64 total) {
-		return QStringLiteral("Building %1: %2 of %3").arg(QLatin1String(what)).arg(done).arg(total);
+	const auto counts = [](int step, const char* what, quint64 done, quint64 total) {
+		return QStringLiteral("Step %1 of 3, building %2: %3 of %4")
+		    .arg(step)
+		    .arg(QLatin1String(what))
+		    .arg(done)
+		    .arg(total);
 	};
-	if (progress.phase == QLatin1String("saving")) {
-		return QStringLiteral("Saving the caches...");
+	switch (CurrentStep(progress)) {
+		case Step::Saving: return QStringLiteral("Saving the caches...");
+		case Step::Compute: return counts(3, "compute pipelines", progress.compute_done, progress.compute_total);
+		case Step::Pipelines: return counts(2, "pipelines", progress.pipelines_done, progress.pipelines_total);
+		case Step::Shaders: break;
 	}
-	if (progress.phase == QLatin1String("compute")) {
-		return counts("compute pipelines", progress.compute_done, progress.compute_total);
-	}
-	if (progress.phase == QLatin1String("pipelines") ||
-	    (progress.phase.isEmpty() && progress.shaders_done >= progress.shaders_total)) {
-		return counts("pipelines", progress.pipelines_done, progress.pipelines_total);
-	}
-	return counts("shaders", progress.shaders_done, progress.shaders_total);
+	return counts(1, "shaders", progress.shaders_done, progress.shaders_total);
 }
 
 bool ParseDone(const QString& line, Result* result) {

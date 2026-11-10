@@ -128,9 +128,10 @@ void ProgressLines() {
 	Check(p.phase == QStringLiteral("shaders") && p.shaders_done == 120 && p.shaders_total == 1069 &&
 	          p.pipelines_done == 0 && p.pipelines_total == 2680 && p.compute_done == 3 && p.compute_total == 7,
 	      "the progress counts");
-	Check(Precompile::ProgressPermille(p) == 123 * 1000 / (1069 + 5 * 2680 + 7),
-	      "the bar is the share of everything counted, a pipeline as five shaders");
-	Check(Precompile::ProgressText(p) == QStringLiteral("Building shaders: 120 of 1069"), "the shader phase text");
+	Check(Precompile::ProgressPermille(p) == 120 * 150 / 1069,
+	      "the shader step fills the first part of the bar by the count the text shows");
+	Check(Precompile::ProgressText(p) == QStringLiteral("Step 1 of 3, building shaders: 120 of 1069"),
+	      "the shader phase text");
 
 	// A log prefix before the event, "\r" after it, the fields in another order, no compute field.
 	Check(Precompile::ParseProgress(QStringLiteral("[12:00:01] KYTY_EVENT: prepare-progress pipelines=2680/2680 "
@@ -143,22 +144,39 @@ void ProgressLines() {
 	Check(Precompile::ParseProgress(QStringLiteral("KYTY_EVENT: prepare-progress phase=pipelines shaders=10/10 "
 	                                               "pipelines=5/20 compute=0/0"),
 	                                &p) &&
-	          Precompile::ProgressText(p) == QStringLiteral("Building pipelines: 5 of 20") &&
-	          Precompile::ProgressPermille(p) == 35 * 1000 / 110,
+	          Precompile::ProgressText(p) == QStringLiteral("Step 2 of 3, building pipelines: 5 of 20") &&
+	          Precompile::ProgressPermille(p) == 150 + 5 * 750 / 20,
 	      "the pipeline phase");
 	Check(Precompile::ParseProgress(QStringLiteral("KYTY_EVENT: prepare-progress phase=compute shaders=10/10 "
 	                                               "pipelines=20/20 compute=1/4"),
 	                                &p) &&
-	          Precompile::ProgressText(p) == QStringLiteral("Building compute pipelines: 1 of 4"),
+	          Precompile::ProgressText(p) == QStringLiteral("Step 3 of 3, building compute pipelines: 1 of 4") &&
+	          Precompile::ProgressPermille(p) == 900 + 1 * 90 / 4,
 	      "the compute phase");
 	// A count beyond its total (a total read a moment earlier) never overfills the bar.
 	Check(Precompile::ParseProgress(QStringLiteral("KYTY_EVENT: prepare-progress shaders=12/10 pipelines=0/10"), &p) &&
-	          Precompile::ProgressPermille(p) == 10 * 1000 / 60 &&
-	          Precompile::ProgressText(p) == QStringLiteral("Building pipelines: 0 of 10"),
+	          Precompile::ProgressPermille(p) == 150 &&
+	          Precompile::ProgressText(p) == QStringLiteral("Step 2 of 3, building pipelines: 0 of 10"),
 	      "counts are clamped and the phase follows from them");
 	Check(Precompile::ParseProgress(QStringLiteral("KYTY_EVENT: prepare-progress shaders=0/0 pipelines=0/0"), &p) &&
 	          Precompile::ProgressPermille(p) == 0,
 	      "nothing counted yet");
+
+	// The bar never steps back across the steps of a run and ends full.
+	int last = 0;
+	for (const char* line : {"phase=shaders shaders=0/10 pipelines=0/20 compute=0/0",
+	                         "phase=shaders shaders=10/10 pipelines=0/20 compute=0/0",
+	                         "phase=pipelines shaders=10/10 pipelines=10/20 compute=2/4",
+	                         "phase=pipelines shaders=10/10 pipelines=20/20 compute=4/4",
+	                         "phase=compute shaders=10/10 pipelines=20/20 compute=2/4",
+	                         "phase=compute shaders=10/10 pipelines=20/20 compute=4/4",
+	                         "phase=saving shaders=10/10 pipelines=20/20 compute=4/4"}) {
+		Check(Precompile::ParseProgress(QStringLiteral("KYTY_EVENT: prepare-progress ") + QLatin1String(line), &p) &&
+		          Precompile::ProgressPermille(p) >= last,
+		      "the bar does not step back between the steps");
+		last = Precompile::ProgressPermille(p);
+	}
+	Check(last == 1000, "the bar ends full");
 
 	const Precompile::Progress before = p;
 	Check(!Precompile::ParseProgress(QStringLiteral("KYTY_EVENT: loading-start frame=0 t=1.000"), &p) &&

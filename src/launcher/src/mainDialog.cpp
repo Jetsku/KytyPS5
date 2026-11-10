@@ -259,8 +259,13 @@ void MainDialogPrivate::FindInterpreter() {
 
 	// --precompile <game folder or archive> (scripts, tests): the launcher starts as if that game's
 	// Precompile button had been clicked. Item widgets of the list are not reachable through UI
-	// Automation, so nothing else can press the button without the mouse.
+	// Automation, so nothing else can press the button without the mouse. With --precompile-list <file>
+	// the list that game asks for is that file, as if it had been chosen in the file dialog.
 	const auto arguments = QCoreApplication::arguments();
+	if (const auto at = arguments.indexOf(QStringLiteral("--precompile-list"));
+	    at >= 0 && at + 1 < arguments.size()) {
+		PrecompileDialog::SetTestList(arguments.at(at + 1));
+	}
 	if (const auto at = arguments.indexOf(QStringLiteral("--precompile"));
 	    at >= 0 && at + 1 < arguments.size()) {
 		QMetaObject::invokeMethod(
