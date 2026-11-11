@@ -56,10 +56,34 @@ target_link_libraries(launcher_configuration_tests Qt6::Gui common)
 target_include_directories(launcher_configuration_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_configuration_tests PROPERTIES AUTOMOC ON)
 add_test(NAME launcher_configuration COMMAND $<TARGET_FILE:launcher_configuration_tests>)
+# The Precompile button without its windows: shader list paths and the prepare run's lines.
+add_executable(launcher_precompile_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherPrecompileTests.cpp"
+	include/precompile.h
+	src/precompile.cpp
+)
+target_link_libraries(launcher_precompile_tests Qt6::Core)
+target_include_directories(launcher_precompile_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME launcher_precompile COMMAND $<TARGET_FILE:launcher_precompile_tests>)
+
+# The Precompile column of the game list and its row button (offscreen, no emulator).
+add_executable(launcher_precompile_item_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherPrecompileItemTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+	src/configurationItem.cpp
+	src/gameContent.cpp
+	src/precompile.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_precompile_item_tests Qt6::Concurrent Qt6::Widgets common)
+target_include_directories(launcher_precompile_item_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_precompile_item_tests PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
+add_test(NAME launcher_precompile_item COMMAND $<TARGET_FILE:launcher_precompile_item_tests>)
 if(WIN32)
 	# Qt's DLLs are deployed beside the launcher only.
-	set_tests_properties(launcher_configuration PROPERTIES ENVIRONMENT_MODIFICATION
-		"PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+	set_tests_properties(launcher_configuration launcher_precompile launcher_precompile_item
+		PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
 endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)

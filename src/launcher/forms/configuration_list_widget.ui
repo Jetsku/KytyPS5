@@ -344,6 +344,11 @@
           </column>
           <column>
            <property name="text">
+            <string>Precompile</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
             <string>Serial</string>
            </property>
           </column>

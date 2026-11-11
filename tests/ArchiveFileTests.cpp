@@ -1,6 +1,7 @@
 #include "common/file.h"
 #include "common/archive.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineListGameFile.h"
 #include "ArchiveTestFixture.h"
 
 #include <algorithm>
@@ -208,6 +209,41 @@ void CheckPackArchive(const std::filesystem::path &root, const std::vector<uint8
   WriteHostFile(source / "EBOOT.BIN", nullptr, 0);
   Check(rejected(source, true), "reject names that differ only in case");
 #endif
+}
+
+// The pipeline list's reader (KYTY_PIPELINE_LIST): a game file in a folder and the same file as
+// an archive member answer alike.
+void CheckPipelineListGameFile(const std::filesystem::path &root,
+                               const std::filesystem::path &archive_root,
+                               const std::vector<uint8_t> &payload) {
+  const auto host_path = root / "list-data.bin";
+  WriteHostFile(host_path, payload.data(), payload.size());
+  for (const auto &path : {host_path, archive_root / "assets/subdir/data.bin"}) {
+    Libs::Graphics::PipelineListGameFile file(path);
+    uint64_t size = 0;
+    Check(file.Ok() && file.Size(size) && size == payload.size(), "open a game file and report its size");
+    std::vector<uint8_t> slice(4099);
+    const uint64_t offset = 2 * 64 * 1024 - 7;
+    Check(file.Read(offset, slice) &&
+              std::equal(slice.begin(), slice.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset)),
+          "read shader code at an offset");
+    Check(!file.Read(payload.size() - 9, slice), "a read past the end fails");
+    // The executable is read again after a failed read (a shader recorded past the end of this copy).
+    Check(file.Read(0, std::span(slice).first(16)) && std::equal(slice.begin(), slice.begin() + 16, payload.begin()),
+          "read again after a failed read");
+    std::vector<uint8_t> image(payload.size());
+    Check(file.Read(0, image) && image == payload, "read the whole file");
+  }
+  Libs::Graphics::PipelineListGameFile executable(archive_root / "eboot.bin");
+  std::vector<uint8_t> eboot(ArchiveTests::Eboot.size());
+  Check(executable.Ok() && executable.Read(0, eboot) &&
+            std::equal(eboot.begin(), eboot.end(), ArchiveTests::Eboot.begin()),
+        "read the executable of an archived game");
+  Check(!Libs::Graphics::PipelineListGameFile(archive_root / "missing.bin").Ok() &&
+            !Libs::Graphics::PipelineListGameFile(archive_root / "assets").Ok() &&
+            !Libs::Graphics::PipelineListGameFile(root / "missing.bin").Ok() &&
+            !Libs::Graphics::PipelineListGameFile({}).Ok(),
+        "report files that cannot be opened");
 }
 
 #if !defined(_WIN32) || defined(_GLIBCXX_GCC_GTHR_POSIX_H)
@@ -444,6 +480,7 @@ int main() {
             !Common::File::RenameFile(copied, data_path),
         "reject unsupported copy and rename operations involving archives");
 
+  CheckPipelineListGameFile(temporary.Path(), root, payload);
   CheckMalformedArchives(archive_path, payload);
 
   file.Close();

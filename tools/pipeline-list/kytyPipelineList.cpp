@@ -22,8 +22,9 @@
 //       their pipelines, the title and version are replaced. Prints the match counts.
 //   upgrade <list> --out <list>
 //       Rewrites the vertex stage input infos of a list recorded before the mesh pass and
-//       tessellation clamp fields (stored size 16 bytes smaller: int21 and older builds) into this
-//       build's layout, with those fields at their defaults; other input infos must already match.
+//       tessellation clamp fields (stored size 16 bytes smaller) into this build's layout, with those
+//       fields at their defaults; other input infos must already match. A list of the int21 release
+//       (its layout is older still) is refused with a note: the emulator upgrades it when it loads it.
 //   verify <list> --game <app0 dir or .zar> [--exe <executable>] [--shaders <shader journal>]...
 //       The no-code proof: no 64-byte window of the listed shaders' code (read from the executable)
 //       or of any journaled shader's code occurs in the file or in any decompressed section.
@@ -35,6 +36,7 @@
 #include "common/stringUtils.h"
 #include "gameFiles.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineListInt21.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -488,6 +490,11 @@ int Upgrade(const Arguments& args) {
 		std::fprintf(stderr, "%s: input infos %u %u %u cannot be upgraded to %u %u %u\n", args.inputs[0].c_str(),
 		             file.info.input_info_sizes[0], file.info.input_info_sizes[1], file.info.input_info_sizes[2], now[0],
 		             now[1], now[2]);
+		// Not this tool's work: the stored specializations change with that layout too.
+		if (file.info.input_info_sizes[0] == Libs::Graphics::Int21VertexLayout().from_size) {
+			std::fprintf(stderr, "this is the int21 layout, which the emulator upgrades itself when it loads the list (its log "
+			                     "says \"Pipeline list: int21 layout: ...\"): the list can be used as it is\n");
+		}
 		return 2;
 	}
 	size_t upgraded = 0;

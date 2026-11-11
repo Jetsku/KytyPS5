@@ -74,11 +74,22 @@ void LoadingAndIdle() {
 	const auto after = Join(all);
 	Check(after.find("loading-end") != after.rfind("loading-end"), "4 fps closes the second load", after);
 }
+
+// The lines of the prepare run (KYTY_PIPELINE_LIST_PREPARE): the same head as the monitor's events.
+void CallerEvents() {
+	const auto line = KytyEvents::FormatEvent("prepare-progress", "phase=shaders shaders=3/10 pipelines=0/20 compute=0/0");
+	Check(line.starts_with("KYTY_EVENT: prepare-progress frame=0 t="), "event head", line);
+	Check(line.ends_with(" phase=shaders shaders=3/10 pipelines=0/20 compute=0/0"), "event keys", line);
+	Check(line.find('\n') == std::string::npos, "one line, no newline", line);
+	const auto bare = KytyEvents::FormatEvent("prepare-done", "");
+	Check(bare.starts_with("KYTY_EVENT: prepare-done frame=0 t=") && bare.back() != ' ', "no trailing space", bare);
+}
 } // namespace
 
 int main() {
 	GuestLines();
 	LoadingAndIdle();
+	CallerEvents();
 	std::printf("KytyEventsTests: ok\n");
 	return 0;
 }

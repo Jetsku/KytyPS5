@@ -25,6 +25,16 @@
 //                         shader/pipeline builds started since the last idle period and none has
 //                         been in flight for KYTY_EVENTS_IDLE_MS (default 3000); smaller trickles
 //                         are not reported.
+// The "Prepare shaders" run (KYTY_PIPELINE_LIST_PREPARE=1, pipelineCache.cpp) prints two more in the
+// same form, whatever KYTY_EVENTS says (the launcher's Precompile window reads them):
+//   prepare-progress      about once a second: phase=<shaders|pipelines|compute|saving>
+//                         shaders=<done>/<total> pipelines=<done>/<total> compute=<done>/<total>
+//                         (replayed shader permutations, graphics pipelines, prewarmed compute
+//                         pipelines; a total grows while earlier work adds to it), and once more
+//                         with phase=saving before the caches are written;
+//   prepare-done          once, before the process ends: seconds=<s> shaders=<n> pipelines=<n>
+//                         known=<n> compute=<n> (what was built; known: pipelines the driver cache
+//                         held already).
 // KYTY_EVENTS_TRACE=1 adds one "KYTY_EVENT_TRACE:" line per second with the raw rates.
 namespace KytyEvents {
 
@@ -41,6 +51,8 @@ void NoteBuildEnd();
 
 [[nodiscard]] uint64_t Frames();
 [[nodiscard]] double   Seconds();
+// "KYTY_EVENT: <name> frame=<n> t=<s> <extra>" for an event its caller prints (no newline).
+[[nodiscard]] std::string FormatEvent(const char* name, const std::string& extra);
 // Steady-clock nanoseconds (std::chrono::steady_clock epoch) at which the n-th (1-based, n <= 4)
 // loading-end event was printed; 0 until then (or with KYTY_EVENTS=0).
 [[nodiscard]] int64_t LoadingEndNs(uint32_t n);
