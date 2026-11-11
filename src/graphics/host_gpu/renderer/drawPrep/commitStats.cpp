@@ -243,7 +243,7 @@ const char* const kStepNames[StepCount] = {
     "latecheck",    "pipelinesel",   "acquire",      "barriersafe",   "drawscope",     "vertexcommit",
     "cbhead",       "cbtransitions", "cbbuild",      "cbpushconst",   "cbdescriptors", "cbtail",
     "indexcommit",  "dynamicstate",  "begin",        "bindpipeline",  "drawcmd",       "occlusion",
-    "runrecord",    "resetbindings", "committail",   "calib"};
+    "runrecord",    "resetbindings", "committail",   "kentry",        "calib"};
 
 void PrintSteps(State& s, double seconds, double ns_per_tick) {
 	const double frames = static_cast<double>(std::max<uint64_t>(1, s.frames));

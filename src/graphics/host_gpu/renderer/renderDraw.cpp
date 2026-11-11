@@ -7038,10 +7038,12 @@ bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffe
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
 	m_kernel = true;
+	CommitStats::StepMark(CommitStats::Step::Restart);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, m_kernel_record.topology, emit, index_source,
 	                    m_kernel_record.primitive_restart);
 	m_kernel = false;
 	ResetBindings();
+	CommitStats::StepMark(CommitStats::Step::ResetBindings);
 	return true;
 }
 
@@ -7091,6 +7093,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_CONT_KERNEL (above ExecutePreparedDraw).
 	if (const auto kernel_mode = g_cont_kernel.Get(); kernel_mode != 0 && ContinuationKernelEntry(args)) {
 		if (kernel_mode == 1) {
+			CommitStats::StepMark(CommitStats::Step::KernelEntry);
 			if (ContinuationKernel(submit_id, buffer, args)) {
 				return;
 			}
