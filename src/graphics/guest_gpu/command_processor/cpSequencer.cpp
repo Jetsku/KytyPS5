@@ -4,6 +4,7 @@
 #include "common/cpuPlacement.h"
 #include "common/handoffLean.h"
 #include "common/hangWatchdog.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/spinGate.h"
@@ -27,6 +28,10 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+
+// KYTY_HANDOFF_LEAN (live, default 0; common/handoffLean.h): registered here, in the emulator, as the
+// header's users include tests without the live-switch registry. The parser publishes the mode.
+static Live::Switch g_handoff_lean("KYTY_HANDOFF_LEAN", Common::HandoffLean::Parse);
 
 namespace Libs::Graphics::CpSeq {
 

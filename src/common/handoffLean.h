@@ -1,8 +1,6 @@
 #ifndef EMULATOR_SRC_COMMON_HANDOFFLEAN_H_
 #define EMULATOR_SRC_COMMON_HANDOFFLEAN_H_
 
-#include "common/liveSwitch.h"
-
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -42,16 +40,21 @@ inline constexpr bool kAvailable = false;
 inline std::atomic<uint32_t> g_active {0};
 inline std::atomic<uint64_t> g_flushes {0};
 
-inline int64_t Parse(const char* value) {
-	return kAvailable && value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
-}
+// The mode, written by the parser of the live switch KYTY_HANDOFF_LEAN registered in cpSequencer.cpp
+// (emulator only: this header is also used by tests that do not link the live-switch registry). The
+// parser runs at startup and for every live change; a publishing thread reads the mode per call.
+inline std::atomic<int64_t> g_mode {0};
 
-inline Live::Switch g_switch("KYTY_HANDOFF_LEAN", Parse);
+inline int64_t Parse(const char* value) {
+	const int64_t mode = kAvailable && value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+	g_mode.store(mode, std::memory_order_relaxed);
+	return mode;
+}
 
 // The publishing side: whether this publication may be lean.
 [[nodiscard]] inline bool On() noexcept {
 	static thread_local bool lean = false;
-	const bool on = g_switch.Get() != 0;
+	const bool on = g_mode.load(std::memory_order_relaxed) != 0;
 	if (on != lean) [[unlikely]] {
 		if (on) {
 			g_active.fetch_add(1, std::memory_order_seq_cst);
