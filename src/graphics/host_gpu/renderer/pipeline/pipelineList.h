@@ -173,6 +173,25 @@ struct File {
 // when the words are not a snapshot.
 [[nodiscard]] bool RewriteSnapshotModules(std::span<uint32_t> words, const std::function<uint64_t(uint32_t)>& hash_for);
 
+// The values of a stored snapshot that come from the recording device, not from the draw: the
+// dynamic state VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT (present when the device enabled
+// attachment feedback loops, shaders.cpp) and each stage's required subgroup size
+// (GraphicContext::GraphicsSubgroupSize). The run-time pipeline key holds the running device's own
+// values, so a pipeline recorded on another device would be built and never found.
+//
+// Canonical stored form (what the exporter and the merge write): the feedback-loop state absent, every
+// stage's required subgroup size 0. The loader applies this device's values to a list pipeline
+// before it builds it. `subgroup_for` gets the stage's VkShaderStageFlags word and its index in the
+// snapshot; null means 0 for every stage. `words` are a pipeline's words (snapshot words, then the
+// layout signature length and the signature), `snapshot_words` the snapshot's part, which grows or
+// shrinks by one word with the state. False (nothing changed) when the words are not a snapshot.
+inline constexpr uint32_t DynamicStateAttachmentFeedbackLoop = 1000524000u; // VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT
+using SubgroupSizeFn = std::function<uint32_t(uint32_t stage_flags, uint32_t stage_index)>;
+[[nodiscard]] bool ApplySnapshotDeviceState(std::vector<uint32_t>& words, uint32_t& snapshot_words, bool feedback_loop,
+                                            const SubgroupSizeFn& subgroup_for);
+// The canonical form (above) of `pipeline`.
+[[nodiscard]] bool NormalizePipelineDeviceState(Pipeline& pipeline);
+
 struct Hash128 {
 	uint64_t low = 0, high = 0;
 	bool     operator==(const Hash128&) const = default;

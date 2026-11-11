@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineList.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -46,12 +47,16 @@ struct Example {
 	vk::PipelineMultisampleStateCreateInfo   multisample {};
 	vk::PipelineColorBlendAttachmentState    blend {};
 	vk::PipelineColorBlendStateCreateInfo    color_blend {};
-	vk::DynamicState                         dynamic_states[2] = {vk::DynamicState::eViewportWithCount,
-	                                                              vk::DynamicState::eScissorWithCount};
+	vk::DynamicState                         dynamic_states[3] = {vk::DynamicState::eViewportWithCount,
+	                                                              vk::DynamicState::eScissorWithCount,
+	                                                              vk::DynamicState::eAttachmentFeedbackLoopEnableEXT};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_info {};
 	vk::PipelineDynamicStateCreateInfo       dynamic {};
 	vk::GraphicsPipelineCreateInfo           info {};
 
-	explicit Example(vk::PrimitiveTopology topology) {
+	// `feedback`: the device enabled attachment feedback loops (the dynamic state is listed last);
+	// `mesh_subgroup` >= 0: a mesh pipeline whose mesh stage requires that subgroup size (0: none).
+	explicit Example(vk::PrimitiveTopology topology, bool feedback = false, int mesh_subgroup = -1) {
 		rendering.colorAttachmentCount    = 1;
 		rendering.pColorAttachmentFormats = colors;
 		stages[0].stage                   = vk::ShaderStageFlagBits::eVertex;
@@ -72,7 +77,7 @@ struct Example {
 		blend.colorWriteMask                         = vk::ColorComponentFlagBits::eR;
 		color_blend.attachmentCount                  = 1;
 		color_blend.pAttachments                     = &blend;
-		dynamic.dynamicStateCount                    = 2;
+		dynamic.dynamicStateCount                    = feedback ? 3 : 2;
 		dynamic.pDynamicStates                       = dynamic_states;
 		info.pNext               = &rendering;
 		info.stageCount          = 2;
@@ -85,13 +90,21 @@ struct Example {
 		info.pColorBlendState    = &color_blend;
 		info.pDynamicState       = &dynamic;
 		info.layout              = FakeHandle<vk::PipelineLayout>(0x77);
+		if (mesh_subgroup >= 0) {
+			stages[0].stage                    = vk::ShaderStageFlagBits::eMeshEXT;
+			subgroup_info.requiredSubgroupSize = static_cast<uint32_t>(mesh_subgroup);
+			stages[0].pNext                    = mesh_subgroup != 0 ? &subgroup_info : nullptr;
+			info.pVertexInputState             = nullptr;
+			info.pInputAssemblyState           = nullptr;
+		}
 	}
 };
 
 // Snapshot words with SPIR-V-like module hashes, then a layout signature (pipeline/shaders.cpp layout).
-std::vector<uint32_t> PipelineWords(vk::PrimitiveTopology topology, uint32_t& snapshot_words) {
-	const Example example(topology);
-	const auto    snapshot = GraphicsPipelineSnapshot::Capture(example.info);
+std::vector<uint32_t> PipelineWords(vk::PrimitiveTopology topology, uint32_t& snapshot_words, bool feedback = false,
+                                    int mesh_subgroup = -1) {
+	const Example example(topology, feedback, mesh_subgroup);
+	const auto    snapshot = GraphicsPipelineSnapshot::Capture(example.info, mesh_subgroup >= 0);
 	std::vector<uint32_t> words;
 	if (snapshot == nullptr ||
 	    !snapshot->Serialize(words, [](vk::ShaderModule module) {
@@ -163,7 +176,8 @@ struct Recording {
 };
 
 // Two shaders (VS, PS), two VS permutations, one PS permutation, and pipelines over them.
-Recording MakeRecording(const std::string& level, vk::PrimitiveTopology topology, uint32_t pixel_seed = 2) {
+Recording MakeRecording(const std::string& level, vk::PrimitiveTopology topology, uint32_t pixel_seed = 2,
+                        bool feedback = false, int mesh_subgroup = -1) {
 	Recording r;
 	r.sources.push_back(SourceOf(Code(1, 300), ShaderJournal::Kind::Vertex, 1, InputSizes[0]));
 	r.sources.push_back(SourceOf(Code(pixel_seed, 200), ShaderJournal::Kind::Pixel, 2, InputSizes[1]));
@@ -171,7 +185,7 @@ Recording MakeRecording(const std::string& level, vk::PrimitiveTopology topology
 	r.entries.push_back({0, 8, {1, 2, 3}});
 	r.entries.push_back({1, 0, {9}});
 	uint32_t   snapshot_words = 0;
-	const auto words          = PipelineWords(topology, snapshot_words);
+	const auto words          = PipelineWords(topology, snapshot_words, feedback, mesh_subgroup);
 	for (const auto vs: {0, 1}) {
 		const std::vector<std::pair<uint64_t, uint64_t>> identities = {
 		    {PermutationIdentity(r.sources[0], r.entries[vs]), 0x51},
@@ -469,6 +483,147 @@ void TestMerge() {
 	CHECK(PipelineList::Decode(PipelineList::Encode(out), decoded) && decoded.pipelines.size() == 4);
 }
 
+// The two values the recording device decides (pipelineList.h): the feedback-loop dynamic state and the
+// stages' required subgroup sizes.
+void TestDeviceState() {
+	uint32_t   sw_feedback = 0, sw_plain = 0, sw_subgroup = 0;
+	const auto feedback = PipelineWords(vk::PrimitiveTopology::eTriangleList, sw_feedback, true);
+	const auto plain    = PipelineWords(vk::PrimitiveTopology::eTriangleList, sw_plain, false);
+	CHECK(!feedback.empty() && !plain.empty() && sw_feedback == sw_plain + 1);
+
+	// Canonical form: the state absent. The words after the snapshot (layout signature) follow it.
+	auto     a   = feedback;
+	uint32_t a_w = sw_feedback;
+	CHECK(PipelineList::ApplySnapshotDeviceState(a, a_w, false, nullptr));
+	CHECK(a == plain && a_w == sw_plain);
+	// Already canonical: unchanged.
+	auto     b   = plain;
+	uint32_t b_w = sw_plain;
+	CHECK(PipelineList::ApplySnapshotDeviceState(b, b_w, false, nullptr) && b == plain && b_w == sw_plain);
+	// A device that has the feature: the state comes back after every other dynamic state, and the
+	// words are the ones a device with it records.
+	CHECK(PipelineList::ApplySnapshotDeviceState(b, b_w, true, nullptr));
+	CHECK(b == feedback && b_w == sw_feedback);
+	CHECK(PipelineList::ApplySnapshotDeviceState(b, b_w, true, nullptr) && b == feedback); // idempotent
+
+	// The loader's words describe the create info a device with the feature makes.
+	{
+		uint32_t   lookup   = 0;
+		const auto snapshot = GraphicsPipelineSnapshot::Deserialize(
+		    std::span<const uint32_t>(b).first(b_w),
+		    [&](uint64_t) { return FakeHandle<vk::ShaderModule>(0x1000 + 0x1000 * lookup++); },
+		    FakeHandle<vk::PipelineLayout>(0x77));
+		CHECK(snapshot != nullptr);
+		if (snapshot != nullptr) {
+			const auto& dynamic = *snapshot->Info().pDynamicState;
+			CHECK(dynamic.dynamicStateCount == 3 &&
+			      dynamic.pDynamicStates[2] == vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+		}
+	}
+
+	// Subgroup sizes: 32 on a device that requires it, none in the canonical form.
+	const auto mesh_none = PipelineWords(vk::PrimitiveTopology::eTriangleList, sw_plain, false, 0);
+	const auto mesh_32   = PipelineWords(vk::PrimitiveTopology::eTriangleList, sw_subgroup, false, 32);
+	CHECK(!mesh_none.empty() && !mesh_32.empty() && mesh_none.size() == mesh_32.size() && mesh_none != mesh_32);
+	auto     c   = mesh_32;
+	uint32_t c_w = sw_subgroup;
+	CHECK(PipelineList::ApplySnapshotDeviceState(c, c_w, false, nullptr) && c == mesh_none);
+	std::vector<std::pair<uint32_t, uint32_t>> asked;
+	CHECK(PipelineList::ApplySnapshotDeviceState(c, c_w, false, [&](uint32_t stage, uint32_t index) {
+		asked.emplace_back(stage, index);
+		return stage == static_cast<uint32_t>(vk::ShaderStageFlagBits::eMeshEXT) ? 32u : 0u;
+	}));
+	CHECK(c == mesh_32);
+	CHECK(asked.size() == 2 && asked[0].first == static_cast<uint32_t>(vk::ShaderStageFlagBits::eMeshEXT) &&
+	      asked[0].second == 0 && asked[1].first == static_cast<uint32_t>(vk::ShaderStageFlagBits::eFragment) &&
+	      asked[1].second == 1);
+	// Both at once (a recording from a device with the feature whose mesh stage requires 32).
+	uint32_t   sw_both = 0;
+	const auto both    = PipelineWords(vk::PrimitiveTopology::eTriangleList, sw_both, true, 32);
+	auto       d       = both;
+	uint32_t   d_w     = sw_both;
+	CHECK(PipelineList::ApplySnapshotDeviceState(d, d_w, false, nullptr) && d == mesh_none && d_w == sw_plain);
+
+	// Words that are no snapshot, or cut short, are refused and left alone.
+	std::vector<uint32_t> junk(40, 0x12345678u);
+	uint32_t              junk_w = 30;
+	CHECK(!PipelineList::ApplySnapshotDeviceState(junk, junk_w, false, nullptr) && junk_w == 30 &&
+	      junk == std::vector<uint32_t>(40, 0x12345678u));
+	for (const size_t cut: {size_t {6}, size_t {12}, size_t {sw_feedback - 30}, size_t {sw_feedback - 3}}) {
+		auto     truncated = feedback;
+		uint32_t cut_w     = static_cast<uint32_t>(cut);
+		truncated.resize(cut);
+		const auto before = truncated;
+		CHECK(!PipelineList::ApplySnapshotDeviceState(truncated, cut_w, false, nullptr) && truncated == before);
+	}
+}
+
+// The same pipeline recorded on two devices is one entry in an export and in a merge.
+void TestMergeAcrossDevices() {
+	auto a = MakeRecording("level_a", vk::PrimitiveTopology::eTriangleList, 2, true, 0);   // feedback loops, no subgroup
+	auto b = MakeRecording("level_b", vk::PrimitiveTopology::eTriangleList, 2, false, 32); // none, subgroup 32
+	auto c = MakeRecording("level_c", vk::PrimitiveTopology::eTriangleList, 2, false);     // not a mesh pipeline
+	std::vector<uint64_t> offsets;
+	const auto            image = Image(a.sources, offsets);
+
+	// One export of both recordings.
+	PipelineList::Builder     both(TestInfo());
+	PipelineList::ExportStats stats;
+	both.AddJournals(a.sources, a.entries, a.pipelines, LocatorFor(image), stats);
+	both.AddJournals(b.sources, b.entries, b.pipelines, LocatorFor(image), stats);
+	const auto exported = both.Finish();
+	CHECK(exported.pipelines.size() == 2 && stats.pipelines_merged == 2 && exported.levels.size() == 2);
+	CHECK(exported.pipelines[0].levels == std::vector<uint16_t>({0, 1}));
+
+	// Lists made on two devices merge into one entry per pipeline, in either order.
+	std::vector<PipelineList::File> lists;
+	for (auto* recording: {&a, &b}) {
+		PipelineList::Builder     one(TestInfo());
+		PipelineList::ExportStats one_stats;
+		one.AddJournals(recording->sources, recording->entries, recording->pipelines, LocatorFor(image), one_stats);
+		lists.push_back(one.Finish());
+	}
+	// A list written before the normalisation holds the recording device's words as they were.
+	PipelineList::File raw = lists[0];
+	{
+		uint32_t   snapshot_words = 0;
+		auto       words          = PipelineWords(vk::PrimitiveTopology::eTriangleList, snapshot_words, true, 0);
+		CHECK(PipelineList::RewriteSnapshotModules(std::span(words).first(snapshot_words), [](uint32_t) { return uint64_t {0}; })); // lists hold no module hashes
+		for (auto& pipeline: raw.pipelines) {
+			pipeline.words          = words;
+			pipeline.snapshot_words = snapshot_words;
+		}
+	}
+	for (const bool reversed: {false, true}) {
+		PipelineList::Builder     merged(TestInfo());
+		PipelineList::ExportStats merge_stats;
+		if (reversed) {
+			merged.AddList(lists[1], merge_stats);
+			merged.AddList(raw, merge_stats);
+		} else {
+			merged.AddList(raw, merge_stats);
+			merged.AddList(lists[1], merge_stats);
+		}
+		const auto out = merged.Finish();
+		CHECK(out.pipelines.size() == 2 && merge_stats.pipelines_merged == 2);
+		for (const auto& pipeline: out.pipelines) {
+			CHECK(pipeline.words.size() == pipeline.snapshot_words + 1 + 8);
+			CHECK(pipeline.words[pipeline.snapshot_words] == 8); // the signature length stayed in place
+			const auto snapshot_end = pipeline.words.begin() + pipeline.snapshot_words;
+			CHECK(std::find(pipeline.words.begin(), snapshot_end, PipelineList::DynamicStateAttachmentFeedbackLoop) == snapshot_end);
+		}
+		PipelineList::File decoded;
+		CHECK(PipelineList::Decode(PipelineList::Encode(out), decoded) && decoded.pipelines.size() == 2);
+	}
+
+	// Pipelines that really differ stay apart (a mesh pipeline against a vertex one).
+	PipelineList::Builder     apart(TestInfo());
+	PipelineList::ExportStats apart_stats;
+	apart.AddJournals(a.sources, a.entries, a.pipelines, LocatorFor(image), apart_stats);
+	apart.AddJournals(c.sources, c.entries, c.pipelines, LocatorFor(image), apart_stats);
+	CHECK(apart.Finish().pipelines.size() == 4);
+}
+
 void TestReplayInput() {
 	// List content joins the replay input after a journal's, without duplicates.
 	ShaderJournal::Settings settings;
@@ -640,6 +795,8 @@ int main() {
 	TestResolve();
 	TestMergedStage();
 	TestMerge();
+	TestDeviceState();
+	TestMergeAcrossDevices();
 	TestReplayInput();
 	TestRewrite();
 	TestRetarget();

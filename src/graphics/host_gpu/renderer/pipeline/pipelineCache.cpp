@@ -6948,7 +6948,8 @@ struct PipelineCache::ListState {
 	std::vector<ShaderJournal::Source>   sources;    // index-aligned with the list's shaders; code empty: unusable
 	std::vector<ShaderJournal::Entry>    entries;    // the usable permutations (source: index into `sources`)
 	std::vector<uint64_t>                identities; // per list permutation: this run's identity (0: unusable)
-	bool                                 prepare = false;
+	std::vector<uint32_t>                wave_sizes; // per list permutation: the stage's guest wave size
+	bool                                prepare = false;
 };
 
 // KYTY_PIPELINE_JOURNAL=1 (default off): every graphics pipeline the game creates is journaled by its
@@ -6983,6 +6984,7 @@ struct PipelineCache::JournalReplay {
 		uint32_t                rank = 0;    // after the boot level's records: higher first
 		std::vector<uint16_t>   list_levels; // list records: indices into list_level_names
 		bool                    from_list = false;
+		std::vector<uint32_t>   stage_waves; // list records: per stage, the guest wave size (0: none)
 	};
 
 	// The boot level, read once the game's file system is mounted (after the cache is created).
@@ -7241,10 +7243,36 @@ struct PipelineCache::JournalReplay {
 			NoteReplayKey(record.key);
 			return true;
 		}
-		const std::span<const uint32_t> words(payload.words);
-		const auto                      snapshot_words = words.first(payload.snapshot_words);
-		const auto                      signature      = words.subspan(payload.snapshot_words + 1);
-		auto&                           device         = cache.m_graphics.device;
+		std::span<const uint32_t> words(payload.words);
+		uint32_t                  words_snapshot = payload.snapshot_words;
+		// A list pipeline carries the recording device's feedback-loop dynamic state and required subgroup
+		// sizes (the list stores the canonical form, PipelineList::ApplySnapshotDeviceState): this device's
+		// values go in before the pipeline is described and built, so its key is the one the game makes.
+		std::vector<uint32_t> device_words;
+		if (item.from_list) {
+			const auto& graphics = cache.m_graphics;
+			device_words         = payload.words;
+			const auto subgroup  = [&](uint32_t stage_flags, uint32_t index) -> uint32_t {
+				const auto wave = index < item.stage_waves.size() ? item.stage_waves[index] : 0u;
+				if (wave == 0) return 0;
+				if (stage_flags == static_cast<uint32_t>(vk::ShaderStageFlagBits::eMeshEXT)) {
+					return graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, wave);
+				}
+				if (stage_flags == static_cast<uint32_t>(vk::ShaderStageFlagBits::eFragment)) {
+					return graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eFragment, wave);
+				}
+				return 0;
+			};
+			if (PipelineList::ApplySnapshotDeviceState(device_words, words_snapshot, graphics.attachment_feedback_loop_enabled,
+			                                           subgroup)) {
+				words = device_words;
+			} else {
+				words_snapshot = payload.snapshot_words;
+			}
+		}
+		const auto snapshot_words = words.first(words_snapshot);
+		const auto signature      = words.subspan(words_snapshot + 1);
+		auto&      device         = cache.m_graphics.device;
 		// Pin the modules (a program cache teardown waits for the build).
 		// A module of the recorded code, or else (KYTY_PIPELINE_JOURNAL_RETARGET, default on; always for
 		// list records, which carry no module hashes) the module another translator revision made from
@@ -7318,7 +7346,11 @@ struct PipelineCache::JournalReplay {
 		bool         ok       = false;
 		if (snapshot != nullptr) {
 			// The rebuilt create info must describe the journaled pipeline exactly.
-			const auto check = DescribeGraphicsPipeline(snapshot->Info(), signature.subspan(0));
+			// The layout signature's push-descriptor word is the device's choice (maxPushDescriptors), the
+			// one the layout above was made with.
+			std::vector<uint32_t> device_signature(signature.begin(), signature.end());
+			if (item.from_list && device_signature.size() >= 2) device_signature[1] = layouts.uses_push_descriptors ? 1u : 0u;
+			const auto check = DescribeGraphicsPipeline(snapshot->Info(), device_signature);
 			if (check.key != 0) NoteReplayKey(check.key);
 			if (retargeted && check.key != 0 && !force && !cache.m_adopt && cache.IsKnownPipeline(check.key)) {
 				skipped_known.fetch_add(1, std::memory_order_relaxed);
@@ -7606,10 +7638,12 @@ void PipelineCache::InitializePipelineJournal() {
 		uint64_t usable = 0;
 		for (auto& pipeline: m_list->pipelines) {
 			std::vector<std::pair<uint64_t, uint64_t>> identities;
+			std::vector<uint32_t>                      waves;
 			for (const auto& stage: pipeline.stages) {
 				const auto identity = m_list->identities[stage.permutation];
 				if (identity == 0) break;
 				identities.emplace_back(stage.plain ? identity ^ PlainModuleIdentitySalt : identity, stage.bindings);
+				waves.push_back(m_list->wave_sizes[stage.permutation]);
 			}
 			if (identities.size() != pipeline.stages.size()) continue;
 			JournalReplay::Item item;
@@ -7618,6 +7652,7 @@ void PipelineCache::InitializePipelineJournal() {
 			item.rank           = static_cast<uint32_t>(pipeline.levels.size());
 			item.list_levels    = std::move(pipeline.levels);
 			item.from_list      = true;
+			item.stage_waves    = std::move(waves);
 			replay.items.push_back(std::move(item));
 			usable++;
 		}
@@ -7657,7 +7692,8 @@ namespace {
 // size of compute and mesh stages, mesh group splitting and passes; as GetComputeProgram and FinishMeshStage
 // set them), and its static key derived again from the input info, as BuildKey does. False when the
 // source cannot be used on this device.
-bool NormalizeListSource(const GraphicContext& graphics, ShaderJournal::Source& source) {
+bool NormalizeListSource(const GraphicContext& graphics, ShaderJournal::Source& source, uint32_t* stage_wave = nullptr) {
+	if (stage_wave != nullptr) *stage_wave = source.wave_size;
 	const auto load = [&](auto& info) {
 		constexpr auto stored = ShaderStoredInputInfoSize<std::remove_cvref_t<decltype(info)>>();
 		if (source.input_info.size() != stored) return false;
@@ -7680,6 +7716,7 @@ bool NormalizeListSource(const GraphicContext& graphics, ShaderJournal::Source& 
 			if (info->logical_stage == ShaderType::Mesh) {
 				if (!graphics.mesh_shader_enabled) return false;
 				auto&      mesh     = info->mesh;
+				if (stage_wave != nullptr) *stage_wave = mesh.wave_size;
 				const auto required = graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, mesh.wave_size);
 				mesh.host_subgroup_size = required != 0 ? required : graphics.subgroup_size;
 				const auto& limits      = graphics.mesh_shader_properties;
@@ -7839,9 +7876,10 @@ void PipelineCache::InitializePipelineList() {
 		file.pipelines.clear();
 	}
 	// This device's inputs and static keys; the permutations' identities follow from them.
-	uint64_t not_here = 0;
+	uint64_t              not_here = 0;
+	std::vector<uint32_t> source_waves(resolved.sources.size(), 0);
 	for (size_t i = 0; i < resolved.sources.size(); i++) {
-		if (resolved.usable[i] && !NormalizeListSource(m_graphics, resolved.sources[i])) {
+		if (resolved.usable[i] && !NormalizeListSource(m_graphics, resolved.sources[i], &source_waves[i])) {
 			resolved.usable[i] = false;
 			resolved.sources[i].code.clear();
 			not_here++;
@@ -7849,9 +7887,11 @@ void PipelineCache::InitializePipelineList() {
 	}
 	auto state = std::make_unique<ListState>();
 	state->identities.assign(file.permutations.size(), 0);
+	state->wave_sizes.assign(file.permutations.size(), 0);
 	for (size_t k = 0; k < resolved.entries.size(); k++) {
 		const auto& entry = resolved.entries[k];
 		if (!resolved.usable[entry.source]) continue;
+		state->wave_sizes[resolved.entry_permutation[k]] = source_waves[entry.source];
 		state->identities[resolved.entry_permutation[k]] = PermutationIdentity(resolved.sources[entry.source], entry);
 		state->entries.push_back(entry);
 	}

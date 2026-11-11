@@ -593,6 +593,96 @@ bool RewriteSnapshotModules(std::span<uint32_t> words, const std::function<uint6
 	return true;
 }
 
+namespace {
+
+// Where the device-derived words sit in a snapshot (pipelineSnapshot.cpp, Serialize).
+struct SnapshotDeviceWords {
+	std::vector<size_t> stage_flags;    // per stage: the VkShaderStageFlags word
+	std::vector<size_t> stage_subgroup; // per stage: the required subgroup size word
+	size_t              dynamic_count = 0; // the dynamic state count word; the states follow
+};
+
+bool LocateSnapshotDeviceWords(std::span<const uint32_t> words, SnapshotDeviceWords& out) {
+	constexpr uint32_t SnapshotMagic     = 0x324e5350u; // "PSN2"
+	constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3"
+	const size_t       size              = words.size();
+	if (size < 7 || (words[0] != SnapshotMagic && words[0] != SnapshotMagicTess)) return false;
+	const bool tess     = words[0] == SnapshotMagicTess;
+	size_t     position = 5; // magic, mesh flag, view mask, depth format, stencil format
+	// `count` words must follow `position`.
+	const auto room = [&](uint64_t count) { return count <= size - position; };
+	const auto colors = words[position++];
+	if (colors > 8 || !room(uint64_t {colors} + 1)) return false;
+	position += colors;
+	const auto stages = words[position++];
+	if (stages > (tess ? 5u : 2u)) return false;
+	for (uint32_t i = 0; i < stages; i++) {
+		if (!room(4)) return false; // flags, hash (two words), entry point length
+		out.stage_flags.push_back(position);
+		position += 3;
+		const auto name = words[position++];
+		const auto text = (uint64_t {name} + 3) / 4;
+		if (name > 256 || !room(text + 1)) return false;
+		position += text;
+		out.stage_subgroup.push_back(position++);
+	}
+	if (tess) {
+		if (!room(1)) return false;
+		position++; // patch control points
+	}
+	if (!room(1)) return false;
+	const auto bindings = words[position++];
+	if (bindings > 64 || !room(uint64_t {bindings} * 3 + 1)) return false;
+	position += uint64_t {bindings} * 3;
+	const auto attributes = words[position++];
+	// Input assembly, viewport, depth clip control, rasterization, provoking vertex, depth clip,
+	// multisample, depth/stencil, color blend flags, logic op and blend constants up to the blend
+	// attachment count: 56 words.
+	constexpr size_t FixedWords = 56;
+	if (attributes > 64 || !room(uint64_t {attributes} * 4 + FixedWords + 1)) return false;
+	position += uint64_t {attributes} * 4 + FixedWords;
+	const auto blends = words[position++];
+	// Blend attachments (8 words each), the color write flag, its count.
+	if (blends > 8 || !room(uint64_t {blends} * 8 + 2)) return false;
+	position += uint64_t {blends} * 8 + 1;
+	const auto writes = words[position++];
+	if (writes > 8 || !room(uint64_t {writes} + 1)) return false;
+	position += writes;
+	out.dynamic_count = position;
+	return words[position] <= 64 && room(uint64_t {words[position]} + 1);
+}
+
+} // namespace
+
+bool ApplySnapshotDeviceState(std::vector<uint32_t>& words, uint32_t& snapshot_words, bool feedback_loop,
+                              const SubgroupSizeFn& subgroup_for) {
+	if (snapshot_words > words.size()) return false;
+	SnapshotDeviceWords at;
+	if (!LocateSnapshotDeviceWords(std::span<const uint32_t>(words).first(snapshot_words), at)) return false;
+	for (size_t i = 0; i < at.stage_subgroup.size(); i++) {
+		words[at.stage_subgroup[i]] = subgroup_for ? subgroup_for(words[at.stage_flags[i]], static_cast<uint32_t>(i)) : 0u;
+	}
+	const auto first = words.begin() + static_cast<std::ptrdiff_t>(at.dynamic_count + 1);
+	const auto last  = first + words[at.dynamic_count];
+	const auto found = std::find(first, last, DynamicStateAttachmentFeedbackLoop);
+	if (!feedback_loop && found != last) {
+		const auto removed = static_cast<uint32_t>(std::count(first, last, DynamicStateAttachmentFeedbackLoop));
+		words[at.dynamic_count] -= removed;
+		words.erase(std::remove(first, last, DynamicStateAttachmentFeedbackLoop), last);
+		snapshot_words -= removed;
+	} else if (feedback_loop && found == last) {
+		// The renderer appends it after every other dynamic state (shaders.cpp).
+		words[at.dynamic_count]++;
+		words.insert(last, DynamicStateAttachmentFeedbackLoop);
+		snapshot_words++;
+	}
+	return true;
+}
+
+bool NormalizePipelineDeviceState(Pipeline& pipeline) {
+	return ApplySnapshotDeviceState(pipeline.words, pipeline.snapshot_words, false, nullptr);
+}
+
 Hash128 CodeHash(std::span<const uint8_t> code) {
 	const auto hash = XXH3_128bits(code.data(), code.size());
 	return {hash.low64, hash.high64};
@@ -719,6 +809,9 @@ uint16_t Builder::AddLevel(const std::string& level) {
 }
 
 void Builder::AddPipeline(Pipeline pipeline, ExportStats& stats) {
+	// The same pipeline recorded on two devices differs only in values the device decides: stored in
+	// the canonical form (pipelineList.h) it is one entry. Words that are not a snapshot stay as they are.
+	(void)NormalizePipelineDeviceState(pipeline);
 	std::sort(pipeline.levels.begin(), pipeline.levels.end());
 	pipeline.levels.erase(std::unique(pipeline.levels.begin(), pipeline.levels.end()), pipeline.levels.end());
 	const auto digest = PipelineDigest(pipeline);
