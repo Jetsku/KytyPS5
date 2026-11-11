@@ -1661,6 +1661,67 @@ static bool SameVertexRanges(const DrawPrep::VertexRangePlan& a, const DrawPrep:
 	return true;
 }
 
+// KYTY_KEEP_DRAW_BUFFERS (live, default 0; 1 on, 2 verify): a draw's vertex buffer range or index
+// buffer whose guest range equals the one kept at its position (merged vertex range i, the index
+// buffer) takes the kept cache buffer and offset while BufferCache::KeepValid holds - the binding
+// memo would hit the same entry (the KYTY_KEEP_BINDINGS rule for these read-only obtains). Not with
+// KYTY_RAW_READ_IMAGE_SYNC (its obtains synchronize images first). 2 = verify: the normal obtain
+// runs and its result is compared ("KeepDrawBuffers verify"). GPU thread.
+static Live::Switch g_keep_draw_buffers("KYTY_KEEP_DRAW_BUFFERS", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+});
+namespace KeepDrawBuffers {
+struct State {
+	std::array<BufferCache::KeptRead, ShaderVertexInputInfo::RES_MAX> vertex {};
+	BufferCache::KeptRead                                            index {};
+	uint64_t obtains = 0, kept = 0, checks = 0, mismatches = 0;
+};
+State& Get() {
+	static thread_local State state;
+	return state;
+}
+int Mode() {
+	const auto mode = static_cast<int>(g_keep_draw_buffers.Get());
+	if (mode == 0 || BufferCache::RawReadImageSyncEnabled()) {
+		return 0;
+	}
+	if (!RegionManager::AnySerialEnabled()) {
+		RegionManager::EnableAnySerial();
+	}
+	return mode;
+}
+// ObtainBuffer(vaddr, size, false) through the kept result.
+std::pair<Buffer*, uint64_t> Obtain(BufferCache& cache, int mode, BufferCache::KeptRead& kept, uint64_t vaddr,
+                                    uint64_t size) {
+	if (mode == 0) {
+		return cache.ObtainBuffer(vaddr, size, false);
+	}
+	auto&      state = Get();
+	const bool valid = cache.KeepValid(kept, vaddr, size, BufferId {});
+	if ((++state.obtains & 0x3fffffu) == 0) {
+		std::printf("KeepDrawBuffers: obtains %" PRIu64 " kept %" PRIu64 " verify checks %" PRIu64
+		            " mismatches %" PRIu64 "\n",
+		            state.obtains, state.kept, state.checks, state.mismatches);
+		std::fflush(stdout);
+	}
+	if (valid && mode == 1) {
+		state.kept++;
+		return {kept.buffer, kept.offset};
+	}
+	const auto stamp  = cache.KeepBegin();
+	const auto result = cache.ObtainBuffer(vaddr, size, false);
+	if (valid) {
+		state.checks++;
+		if ((result.first != kept.buffer || result.second != kept.offset) && state.mismatches++ < 8) {
+			std::printf("KeepDrawBuffers verify: mismatch guest=0x%016" PRIx64 " size=0x%" PRIx64 "\n", vaddr,
+			            size);
+		}
+	}
+	(void)cache.KeepCapture(kept, stamp, vaddr, size, BufferId {}, result);
+	return result;
+}
+} // namespace KeepDrawBuffers
+
 // planned: the draw's guest ranges from its binding plan (KYTY_DRAW_PREP_BINDINGS, clamped by the
 // preparing thread while the guest virtual ranges were as they are now), or null.
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&                   buffer,
@@ -1707,10 +1768,12 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&                
 		cache.PrepareReadRange(ranges->merged[i].base_address,
 		                       ranges->merged[i].acquired_end - ranges->merged[i].base_address);
 	}
+	const int keep_mode = KeepDrawBuffers::Mode();
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range = ranges->merged[i];
 		const auto  size  = range.acquired_end - range.base_address;
-		acquired[i]       = cache.ObtainBuffer(range.base_address, size, false);
+		acquired[i]       = KeepDrawBuffers::Obtain(cache, keep_mode, KeepDrawBuffers::Get().vertex[i],
+		                                            range.base_address, size);
 		SetVulkanObjectNameF(
 		    buffer.GetContext().GetGraphics().device, acquired[i].first->Handle(),
 		    "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]", range.base_address, size);
@@ -1802,10 +1865,12 @@ static void AcquireVertexBuffersInto(CommandBuffer&                   buffer,
 		cache.PrepareReadRange(ranges->merged[i].base_address,
 		                       ranges->merged[i].acquired_end - ranges->merged[i].base_address);
 	}
+	const int keep_mode = KeepDrawBuffers::Mode();
 	for (uint32_t i = 0; i < ranges->merged_count; i++) {
 		const auto& range           = ranges->merged[i];
 		const auto  size            = range.acquired_end - range.base_address;
-		const auto [handle, offset] = cache.ObtainBuffer(range.base_address, size, false);
+		const auto [handle, offset] = KeepDrawBuffers::Obtain(cache, keep_mode, KeepDrawBuffers::Get().vertex[i],
+		                                                      range.base_address, size);
 		acquired[i]                 = {handle, offset};
 		SetVulkanObjectNameF(
 		    buffer.GetContext().GetGraphics().device, handle->Handle(),
@@ -4266,8 +4331,9 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	} else {
 		// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS (BufferCache::PrepareReadRange).
 		buffer.GetContext().GetBufferCache().PrepareReadRange(source.address, source.size);
-		auto [buffer_ptr, offset] =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
+		auto [buffer_ptr, offset] = KeepDrawBuffers::Obtain(buffer.GetContext().GetBufferCache(),
+		                                                    KeepDrawBuffers::Mode(), KeepDrawBuffers::Get().index,
+		                                                    source.address, source.size);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
