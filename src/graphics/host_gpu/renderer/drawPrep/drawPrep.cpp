@@ -1896,7 +1896,10 @@ Engine::Slot& Engine::ReadyHead() {
 	auto& slot = window.HeadPayload();
 	CommitStats::StepMark(CommitStats::Step::GapDrawOp);
 	const auto stats_start = CommitStats::Now();
-	if (window.TryClaimHead()) {
+	// KYTY_HANDOFF_LEAN: a head a worker has finished is seen with a plain acquire load, without
+	// the locked compare-exchange that would fail on it anyway.
+	const bool head_done = Common::HandoffLean::On() && window.HeadDone();
+	if (!head_done && window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
 		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
 		PrepareSlot(m_renderer.GetPipelineCache(), slot, true);
@@ -1905,7 +1908,7 @@ Engine::Slot& Engine::ReadyHead() {
 		if (stats_start != 0) {
 			CommitStats::NoteHead(CommitStats::Now() - stats_start, 0);
 		}
-	} else if (window.HeadDone()) {
+	} else if (head_done || window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);

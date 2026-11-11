@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
+#include "common/handoffLean.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -127,6 +128,17 @@ void Sequencer::NoteExecuted(uint64_t next_op) {
 	// Only a parked sequencer needs the bump (a spinning one reads the words directly). The
 	// seq_cst store keeps the load of m_parked after it: either the sequencer's re-check after
 	// announcing itself sees the new value, or this thread sees the announcement.
+	// KYTY_HANDOFF_LEAN (common/handoffLean.h): a release store, a compiler barrier and an acquire
+	// load; the parking side's process-wide store-buffer flush keeps the wake.
+	if (Common::HandoffLean::On()) {
+		m_executed.store(next_op, std::memory_order_release);
+		Common::HandoffLean::CompilerBarrier();
+		if (m_parked.load(std::memory_order_acquire) != 0 &&
+		    next_op >= m_wake_at.load(std::memory_order_relaxed)) {
+			Bump();
+		}
+		return;
+	}
 	m_executed.store(next_op, std::memory_order_seq_cst);
 	if (m_parked.load(std::memory_order_seq_cst) != 0 &&
 	    next_op >= m_wake_at.load(std::memory_order_seq_cst)) {
@@ -160,6 +172,7 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 		m_wake_at.store(wake_at, std::memory_order_seq_cst);
 		const auto observed = m_progress.load(std::memory_order_seq_cst);
 		m_parked.fetch_add(1, std::memory_order_seq_cst);
+		Common::HandoffLean::ParkFence(); // KYTY_HANDOFF_LEAN: before the re-check
 		if (!ready() && !Stopping()) {
 			HangWatchdog::Scope wait("sequencer-progress", reinterpret_cast<uint64_t>(this),
 			                         wake_at, observed, 0, rewake_at);
