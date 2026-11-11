@@ -4275,11 +4275,20 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source || late_source) {
 		if (InplaceStats::Enabled()) {
 			InplaceStats::NoteUploadBytes(total_size + late_size, copies.size() + late_copies.size());
-			for (const auto& copy: copies) {
+			const auto path = stats != nullptr ? InplaceStats::UploadPath::BdaSync
+			                  : is_written     ? InplaceStats::UploadPath::Written
+			                  : is_texel_buffer ? InplaceStats::UploadPath::Texel
+			                                    : InplaceStats::UploadPath::Read;
+			for (size_t i = 0; i < copies.size(); i++) {
+				const auto& copy = copies[i];
 				InplaceStats::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+				// Copies past guest_copies were added by CollectHotPages (changed hot pages).
+				InplaceStats::NoteUploadDetail(path, i >= guest_copies, buffer.CpuAddress() + copy.dstOffset,
+				                               copy.size);
 			}
 			for (const auto& copy: late_copies) {
 				InplaceStats::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+				InplaceStats::NoteUploadDetail(path, false, buffer.CpuAddress() + copy.dstOffset, copy.size);
 			}
 		}
 		if (stats != nullptr) {

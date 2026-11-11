@@ -24,6 +24,12 @@ enum class CpKind : uint8_t { WriteData, DmaFill, DmaCopy, ConstRam, LabelOther,
 
 void NoteFault(uint64_t vaddr) noexcept;
 void NoteUpload(uint64_t vaddr, uint64_t size) noexcept;
+// Full mode: one upload copy by path, hot (a changed hot page's copy) or not. Each 4 KiB page's
+// contents are hashed and compared with its previous upload: bytes of unchanged pages are counted,
+// and so are bytes of pages that took no write fault of their own this or the previous frame
+// (opened by fault-ahead, or hot).
+enum class UploadPath : uint8_t { BdaSync, Written, Texel, Read, Count };
+void NoteUploadDetail(UploadPath path, bool hot, uint64_t vaddr, uint64_t size) noexcept;
 void NoteUploadBytes(uint64_t bytes, uint64_t copies) noexcept;
 void NoteStream(uint64_t vaddr, uint64_t size) noexcept;
 void NoteCpWrite(CpKind kind, uint64_t vaddr, uint64_t size) noexcept;

@@ -10,6 +10,10 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <xxhash.h>
+
+#include "kernel/memory.h"
+
 namespace Libs::Graphics::InplaceStats {
 
 namespace {
@@ -21,6 +25,11 @@ struct Entry {
 	uint32_t upload_frame = 0;
 	uint32_t stream_frame = 0;
 	uint8_t  streak       = 0; // consecutive frames with a write fault, saturating
+	uint64_t hash         = 0; // XXH3 of the page at its last upload (0: none)
+};
+
+struct PathTotals {
+	uint64_t bytes = 0, unchanged = 0, no_fault = 0, hot = 0, hot_unchanged = 0;
 };
 
 struct KindTotals {
@@ -44,6 +53,7 @@ struct Totals {
 	uint64_t stream_bytes  = 0;
 	uint64_t stream_copies = 0;
 	KindTotals cp[static_cast<int>(CpKind::Count)];
+	PathTotals path[static_cast<int>(UploadPath::Count)];
 };
 
 // Plain counts are lock-free (lite mode runs in timing boots: a mutex in the fault handler
@@ -155,6 +165,33 @@ void NoteUpload(uint64_t vaddr, uint64_t size) noexcept {
 	});
 }
 
+void NoteUploadDetail(UploadPath path, bool hot, uint64_t vaddr, uint64_t size) noexcept {
+	if (!Full() || size == 0) {
+		return;
+	}
+	const uint32_t frame = g_frame.load(std::memory_order_relaxed);
+	std::scoped_lock lock {g_mutex};
+	auto& totals = g_totals.path[static_cast<int>(path)];
+	const uint64_t end = vaddr + size;
+	ForEachPage(vaddr, size, [&](uint64_t page) {
+		const uint64_t lo    = std::max(vaddr, page << kPageBits);
+		const uint64_t hi    = std::min(end, (page + 1) << kPageBits);
+		const uint64_t bytes = hi - lo;
+		auto&          entry = g_pages[page];
+		const auto*    host  = Libs::LibKernel::Memory::GuestBackingAlias(page << kPageBits, uint64_t {1} << kPageBits);
+		const uint64_t hash  = host != nullptr ? (XXH3_64bits(host, uint64_t {1} << kPageBits) | 1u) : 0;
+		const bool     same  = hash != 0 && entry.hash == hash;
+		entry.hash           = hash;
+		totals.bytes += bytes;
+		totals.unchanged += same ? bytes : 0;
+		totals.no_fault += Recent(entry.fault_frame, frame) ? 0 : bytes;
+		if (hot) {
+			totals.hot += bytes;
+			totals.hot_unchanged += same ? bytes : 0;
+		}
+	});
+}
+
 void NoteUploadBytes(uint64_t bytes, uint64_t copies) noexcept {
 	if (!Enabled()) {
 		return;
@@ -254,7 +291,7 @@ void AdvanceFrame() noexcept {
 	}
 	const double f = g_period_frames;
 	const auto&  t = g_totals;
-	char line[2048];
+	char line[4096];
 	int  n = std::snprintf(
         line, sizeof(line),
         "InplaceStats %.0fs: %.0f frames | faults/f %.1f: streak1 %.1f streak2 %.1f streak3+ %.1f | uploaded "
@@ -268,6 +305,16 @@ void AdvanceFrame() noexcept {
 		n += std::snprintf(line + n, sizeof(line) - n,
 		                   " cp %s %.1f/f %.0f B/f: on faulted %.1f uploaded %.1f streamed %.1f any %.1f;", KindName(k),
 		                   c.count / f, c.bytes / f, c.in_fault / f, c.in_upload / f, c.in_stream / f, c.in_any / f);
+	}
+	if (Full()) {
+		static const char* names[] = {"bda-sync", "written", "texel", "read"};
+		for (int k = 0; k < static_cast<int>(UploadPath::Count) && n > 0 && n < static_cast<int>(sizeof(line)); k++) {
+			const auto& u = t.path[k];
+			n += std::snprintf(line + n, sizeof(line) - n,
+			                   " up %s %.2f MB/f: unchanged %.2f, pages without own fault %.2f, hot %.2f (unchanged %.2f);",
+			                   names[k], u.bytes / f / 1e6, u.unchanged / f / 1e6, u.no_fault / f / 1e6, u.hot / f / 1e6,
+			                   u.hot_unchanged / f / 1e6);
+		}
 	}
 	std::printf("%s\n", line);
 	std::fflush(stdout);
