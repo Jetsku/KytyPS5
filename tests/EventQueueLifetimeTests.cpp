@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "common/liveSwitch.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -102,8 +103,9 @@ void TestPeriodicTimerEvents() {
 	      "timer update preserves accumulated occurrences and updates userdata");
 	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
 	      "timer update replaces the repeating interval");
-	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
-	      "delete periodic timer");
+	Live::Testing::StageText("KYTY_DELETE_TIMER_EVENT=1\n");
+	Live::OnCpFlip();
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "delete periodic timer");
 
 	Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
 	      "add immediate periodic timer");
@@ -116,8 +118,21 @@ void TestPeriodicTimerEvents() {
 		          events[0].data == 1,
 		      "zero interval remains immediately ready after delivery");
 	}
-	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
-	      "delete immediate timer");
+	Live::Testing::StageText("KYTY_DELETE_TIMER_EVENT=0\n");
+	Live::OnCpFlip();
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "switch off: delete returns OK");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK && out == 1,
+	      "switch off: the timer stays in the queue");
+	Live::Testing::StageText("KYTY_DELETE_TIMER_EVENT=1\n");
+	Live::OnCpFlip();
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "delete immediate timer");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "deleted timer is not delivered again");
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+	      "deleting a missing timer reports ENOENT");
+	Check(EventQueue::KernelDeleteTimerEvent(EventQueue::KERNEL_EQUEUE_INVALID, 10) ==
+	          Libs::LibKernel::KERNEL_ERROR_EBADF,
+	      "deleting from an invalid queue reports EBADF");
 
 	const Libs::LibKernel::KernelTimespec delay {0, 1000000};
 	Check(EventQueue::KernelAddHRTimerEvent(queue, 10, &delay, user_data) == OK,
@@ -552,6 +567,7 @@ void TestConcurrentDelete() {
 } // namespace
 
 int main() {
+	Live::Testing::SetLogSink([](const std::string& /*line*/) {});
 	TestLevelUserEventDelivery();
 	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState(true);

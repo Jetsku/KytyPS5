@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/paceLog.h"
@@ -763,6 +764,19 @@ static int AddTimerEvent(KernelEqueue eq, int id, uint64_t delay_ns, bool period
 
 int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec, void* udata) {
 	return AddTimerEvent(eq, id, static_cast<uint64_t>(usec) * 1000, true, udata);
+}
+
+// KYTY_DELETE_TIMER_EVENT=1 (live switch, default off; based on upstream a7e14aa71):
+// sceKernelDeleteTimerEvent deletes the EVFILT_TIMER event (EBADF for an unknown queue, ENOENT for
+// an unknown timer). Off: it returns OK and leaves the timer in the queue, as the unresolved-import
+// stub did (Gran Turismo 7's "PGL EventQ" thread deletes its timer after every delivery).
+static Live::Switch g_delete_timer_event("KYTY_DELETE_TIMER_EVENT", Live::ParseDefaultOff);
+
+int KYTY_SYSV_ABI KernelDeleteTimerEvent(KernelEqueue eq, int id) {
+	if (!g_delete_timer_event.On()) {
+		return OK;
+	}
+	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_TIMER);
 }
 
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
