@@ -4,6 +4,7 @@
 #include "common/hangWatchdog.h"
 #include "common/spinGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
 
 #include <algorithm>
 #include <chrono>
@@ -797,8 +798,12 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 	const auto start = NowNs();
 	stats.spins++;
 	// KYTY_SPIN_GATE: the consumer's idle spin only while the PC keeps CPUs idle.
+	const auto spin_tsc = DrawPrep::PrepStats::Tsc();
 	const bool spun = Spin(Common::SpinGate::SpinAllowed() ? policy.spin_ns : 0,
 	                       [&] { return available() || stop.load(std::memory_order_acquire); });
+	// PrepStats: the recorder's spin time (one consumer thread; relaxed adds read by the reporter).
+	DrawPrep::PrepStats::g_spin.recorder.fetch_add(DrawPrep::PrepStats::Tsc() - spin_tsc,
+	                                                std::memory_order_relaxed);
 	if (!spun) {
 		stats.blocks++;
 		for (;;) {

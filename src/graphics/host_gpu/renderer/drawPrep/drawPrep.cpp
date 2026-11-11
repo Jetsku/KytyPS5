@@ -1432,6 +1432,8 @@ struct Engine::Slot {
 	// KYTY_DRAW_RUN_KEY_DIAG: the key's part hashes (only while the switch is on).
 	DrawRun::KeyParts run_parts {};
 	bool              run_parts_valid = false;
+	// PrepStats: the TSC when the preparing thread completed the slot.
+	uint64_t done_tsc = 0;
 };
 
 namespace {
@@ -1597,6 +1599,7 @@ struct Engine::Workers {
 		PlanBindings(slot, plan_context);
 		Phases::Mark(Phases::Phase::Plan);
 		slot.worker_prepared = true;
+		slot.done_tsc        = PrepStats::Tsc();
 		window.Complete(seq);
 		Phases::End(Phases::Phase::Complete);
 	}
@@ -1896,6 +1899,10 @@ Engine::Slot& Engine::ReadyHead() {
 	auto& slot = window.HeadPayload();
 	CommitStats::StepMark(CommitStats::Step::GapDrawOp);
 	const auto stats_start = CommitStats::Now();
+	auto&      prep_stats  = PrepStats::g_commit;
+	const auto head_tsc    = PrepStats::Tsc();
+	prep_stats.heads++;
+	prep_stats.occupancy += window.Occupancy();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
 		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
@@ -1905,9 +1912,22 @@ Engine::Slot& Engine::ReadyHead() {
 		if (stats_start != 0) {
 			CommitStats::NoteHead(CommitStats::Now() - stats_start, 0);
 		}
+		prep_stats.self++;
+		prep_stats.self_tsc += PrepStats::Tsc() - head_tsc;
 	} else if (window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
+		prep_stats.ready++;
+		const auto lead = head_tsc > slot.done_tsc ? head_tsc - slot.done_tsc : 0;
+		prep_stats.lead_tsc += lead;
+		// Buckets in TSC ticks at ~4 GHz: <2, <10, <50, <200, <1000 us.
+		const uint64_t bounds[5] = {8'000, 40'000, 200'000, 800'000, 4'000'000};
+		size_t         bucket    = 0;
+		while (bucket < 5 && lead >= bounds[bucket]) {
+			bucket++;
+		}
+		prep_stats.lead_hist[bucket]++;
 	} else {
+		prep_stats.waited++;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
 		const CpGaps::Scope gap(CpGaps::Cat::HeadWait);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
@@ -1979,6 +1999,7 @@ Engine::Slot& Engine::ReadyHead() {
 		if (stats_start != 0) {
 			CommitStats::NoteHead(0, CommitStats::Now() - stats_start);
 		}
+		prep_stats.wait_tsc += PrepStats::Tsc() - head_tsc;
 	}
 	CommitStats::StepMark(CommitStats::Step::GapHead);
 	if (const auto mode = g_cert_prefetch.Get(); mode != 0) {
@@ -2172,6 +2193,91 @@ void Engine::Drain() {
 // preparation against draws that fell back to the serial path, and why. Fallbacks run the whole
 // program preparation on the command processor, so the ratio says how much of it is avoidable.
 namespace {
+// PrepStats (prepStats.h): one line per 10 s, the deltas since the previous line. TSC ticks are
+// converted with the TSC rate measured between two lines.
+void PrintPrepStats(uint64_t now_ns) {
+	static uint64_t last_ns  = 0;
+	static uint64_t last_tsc = 0;
+	struct W {
+		uint64_t slots = 0, busy = 0, spin = 0, park = 0, parks = 0;
+	};
+	static W                                         last_w[PrepStats::MaxWorkers] {};
+	static PrepStats::Commit                         last_c {};
+	const auto                                       tsc = PrepStats::Tsc();
+	if (last_ns == 0) {
+		last_ns  = now_ns;
+		last_tsc = tsc;
+		last_c   = PrepStats::g_commit;
+		std::printf("PrepStats sizes: slot %zu registers %zu prepared %zu plan %zu reads %zu\n",
+		            sizeof(Engine::Slot), sizeof(RegisterSnapshot), sizeof(PreparedDraw),
+		            sizeof(BindingPlan), sizeof(ReadSet));
+		return;
+	}
+	const double ticks_per_us = static_cast<double>(tsc - last_tsc) / (static_cast<double>(now_ns - last_ns) * 1e-3);
+	const double secs         = static_cast<double>(now_ns - last_ns) * 1e-9;
+	const auto   ms           = [&](uint64_t t) { return static_cast<double>(t) / ticks_per_us * 1e-3 / secs; };
+	const auto&  c            = PrepStats::g_commit;
+	const auto   heads        = c.heads - last_c.heads;
+	const auto   ready        = c.ready - last_c.ready;
+	std::string  workers;
+	W            sum;
+	for (uint32_t i = 0; i < PrepStats::MaxWorkers; i++) {
+		const auto& g = PrepStats::g_workers[i];
+		W           v {g.slots.load(std::memory_order_relaxed), g.busy.load(std::memory_order_relaxed),
+                       g.spin.load(std::memory_order_relaxed), g.park.load(std::memory_order_relaxed),
+                       g.parks.load(std::memory_order_relaxed)};
+		W           d {v.slots - last_w[i].slots, v.busy - last_w[i].busy, v.spin - last_w[i].spin,
+                       v.park - last_w[i].park, v.parks - last_w[i].parks};
+		last_w[i] = v;
+		if (d.slots == 0 && d.spin == 0 && d.park == 0) {
+			continue;
+		}
+		sum.slots += d.slots; sum.busy += d.busy; sum.spin += d.spin; sum.park += d.park; sum.parks += d.parks;
+		char text[160];
+		std::snprintf(text, sizeof(text), " w%u:%.0f/s,%.2fus,b%.0f,s%.0f,p%.0f,n%.0f", i,
+		              static_cast<double>(d.slots) / secs,
+		              d.slots != 0 ? static_cast<double>(d.busy) / ticks_per_us / static_cast<double>(d.slots) : 0.0,
+		              ms(d.busy), ms(d.spin), ms(d.park), static_cast<double>(d.parks) / secs);
+		workers += text;
+	}
+	std::printf("PrepStats %.0fs: tsc %.0f MHz | heads %.0f/s ready %.1f%% waited %.1f%% (%.2f ms/s) self %.1f%% "
+	            "(%.2f ms/s) | lead avg %.1f us hist %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+	            "/%" PRIu64 " | occupancy %.1f | workers %.0f slots/s %.2f us/slot busy %.0f spin %.0f park %.0f "
+	            "ms/s parks %.0f/s |%s\n",
+	            secs, ticks_per_us, static_cast<double>(heads) / secs,
+	            heads != 0 ? 100.0 * static_cast<double>(ready) / static_cast<double>(heads) : 0.0,
+	            heads != 0 ? 100.0 * static_cast<double>(c.waited - last_c.waited) / static_cast<double>(heads) : 0.0,
+	            ms(c.wait_tsc - last_c.wait_tsc),
+	            heads != 0 ? 100.0 * static_cast<double>(c.self - last_c.self) / static_cast<double>(heads) : 0.0,
+	            ms(c.self_tsc - last_c.self_tsc),
+	            ready != 0 ? static_cast<double>(c.lead_tsc - last_c.lead_tsc) / ticks_per_us / static_cast<double>(ready) : 0.0,
+	            c.lead_hist[0] - last_c.lead_hist[0], c.lead_hist[1] - last_c.lead_hist[1],
+	            c.lead_hist[2] - last_c.lead_hist[2], c.lead_hist[3] - last_c.lead_hist[3],
+	            c.lead_hist[4] - last_c.lead_hist[4], c.lead_hist[5] - last_c.lead_hist[5],
+	            heads != 0 ? static_cast<double>(c.occupancy - last_c.occupancy) / static_cast<double>(heads) : 0.0,
+	            static_cast<double>(sum.slots) / secs,
+	            sum.slots != 0 ? static_cast<double>(sum.busy) / ticks_per_us / static_cast<double>(sum.slots) : 0.0,
+	            ms(sum.busy), ms(sum.spin), ms(sum.park), static_cast<double>(sum.parks) / secs, workers.c_str());
+	static PrepStats::CpIdle last_i {};
+	const auto&              i = PrepStats::g_cp_idle;
+	std::printf("PrepStats cp idle %.0fs: starved %.2f ms/s (%.0f/s) | outside slices: empty %.2f blocked %.2f "
+	            "fence %.2f ms/s\n",
+	            secs, ms(i.starved - last_i.starved), static_cast<double>(i.starved_n - last_i.starved_n) / secs,
+	            ms(i.empty - last_i.empty), ms(i.blocked - last_i.blocked), ms(i.fence - last_i.fence));
+	last_i = i;
+	static uint64_t last_seq = 0, last_rec = 0;
+	const auto      seq_spin = PrepStats::g_spin.sequencer.load(std::memory_order_relaxed);
+	const auto      rec_spin = PrepStats::g_spin.recorder.load(std::memory_order_relaxed);
+	std::printf("PrepStats spin %.0fs: workers %.0f sequencer %.0f recorder %.0f ms/s\n", secs, ms(sum.spin),
+	            ms(seq_spin - last_seq), ms(rec_spin - last_rec));
+	last_seq = seq_spin;
+	last_rec = rec_spin;
+	std::fflush(stdout);
+	last_ns  = now_ns;
+	last_tsc = tsc;
+	last_c   = c;
+}
+
 void PrintDrawPrepSummary() {
 	static uint64_t last_ns        = 0;
 	static uint64_t last_committed = 0;
@@ -2281,6 +2387,7 @@ void PrintDrawPrepSummary() {
 		std::printf("DrawPrep plan abstains %.0fs:%s\n", static_cast<double>(now - last_ns) * 1e-9,
 		            reasons.c_str());
 	}
+	PrintPrepStats(now);
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;

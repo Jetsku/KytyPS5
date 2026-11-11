@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
@@ -2122,6 +2123,18 @@ void GuestGpu::ThreadRun(void* data) {
 					HangWatchdog::Scope suspended("cp-all-queues-suspended",
 					                              reinterpret_cast<uint64_t>(gpu),
 					                              gpu->m_submission_count);
+					// PrepStats (prepStats.h): what this idle stretch waits for.
+					bool any_queued = false;
+					for (const auto& queue: gpu->m_queues) {
+						any_queued = any_queued || !queue.empty();
+					}
+					auto& idle = DrawPrep::PrepStats::g_cp_idle;
+					struct IdleNote {
+						uint64_t& bucket;
+						uint64_t  start;
+						~IdleNote() { bucket += DrawPrep::PrepStats::Tsc() - start; }
+					} idle_note {!any_queued ? idle.empty : fence_held ? idle.fence : idle.blocked,
+					             DrawPrep::PrepStats::Tsc()};
 					gpu->m_processing = false;
 					const CpGaps::Scope gap(CpGaps::Cat::Blocked);
 					if (!wakeups) {
@@ -6901,6 +6914,14 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
 			const CpGaps::Scope       starved_gap(CpGaps::Cat::Starved);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
+			struct StarvedNote {
+				uint64_t start = DrawPrep::PrepStats::Tsc();
+				~StarvedNote() {
+					auto& idle = DrawPrep::PrepStats::g_cp_idle;
+					idle.starved += DrawPrep::PrepStats::Tsc() - start;
+					idle.starved_n++;
+				}
+			} starved_note;
 			const auto start    = CpNowNs();
 			bool       produced = false;
 			for (uint32_t spins = 0;; spins++) {

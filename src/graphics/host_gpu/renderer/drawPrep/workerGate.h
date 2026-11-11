@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WORKERGATE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WORKERGATE_H_
 
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -213,13 +215,24 @@ void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uin
 	const auto spin_limit = hot ? hot_spin_ns : cold_spin_ns;
 	auto       idle_start = WorkerNowNs();
 	uint32_t   spins      = 0;
+	// PrepStats (prepStats.h): TSC split of this worker's time into preparing, spinning, parked.
+	auto& stats    = PrepStats::t_local;
+	stats.index    = index + 1u;
+	auto  idle_tsc = PrepStats::Tsc();
 	while (!stop.load(std::memory_order_acquire)) {
 		uint64_t seq = 0;
 		if (auto* slot = window.TryClaim(seq); slot != nullptr) {
+			const auto claimed_tsc = PrepStats::Tsc();
+			stats.spin += claimed_tsc - idle_tsc;
 			if (gate.HasCold() && gate.MaybeWakeCold(window.Unclaimed())) {
 				on_cold_wake();
 			}
 			prepare(*slot, seq);
+			idle_tsc = PrepStats::Tsc();
+			stats.busy += idle_tsc - claimed_tsc;
+			if ((++stats.slots & 31u) == 0u) {
+				PrepStats::Flush(stats);
+			}
 			idle_start = WorkerNowNs();
 			spins      = 0;
 			continue;
@@ -228,14 +241,21 @@ void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uin
 		if ((++spins & 255u) != 0u || WorkerNowNs() - idle_start < spin_limit) {
 			continue;
 		}
+		const auto park_tsc = PrepStats::Tsc();
+		stats.spin += park_tsc - idle_tsc;
 		if (hot) {
 			gate.ParkHot([&window] { return window.HasClaimable(); }, stop);
 		} else {
 			gate.ParkCold([&window, &gate] { return window.Unclaimed() >= gate.WakeBacklog(); },
 			              stop);
 		}
+		idle_tsc = PrepStats::Tsc();
+		stats.park += idle_tsc - park_tsc;
+		stats.parks++;
+		PrepStats::Flush(stats);
 		idle_start = WorkerNowNs();
 	}
+	PrepStats::Flush(stats);
 }
 
 // When the producer steals (KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US). A stolen
