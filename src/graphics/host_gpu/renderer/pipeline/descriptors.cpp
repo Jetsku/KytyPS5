@@ -4807,7 +4807,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	PrepareBindlessHeaps(runtime, prepared);
 }
 
-// KYTY_CONT_KERNEL_CEILING (renderDraw.cpp): PrepareBindings(keep_images) of a continuation, whose
+// KYTY_CONT_KERNEL (renderDraw.cpp): PrepareBindings(keep_images) of a continuation, whose
 // record excluded GDS and bindless heaps (the same programs), without the verify paths.
 void RenderExecutor::PrepareBindingsContinuation(const ShaderStageRuntime& runtime,
                                                  PreparedBindings& prepared, DrawPrep::StagePlan* plan) {
