@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gthreadStats.h"
 #include "common/guestProbe.h"
 #include "common/hangTrace.h"
 #include "common/hostException.h"
@@ -1647,6 +1648,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
+	GThreadStats::MarkGuestThread();
+	GThreadStats::Start();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

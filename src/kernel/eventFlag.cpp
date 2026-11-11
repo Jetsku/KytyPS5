@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -290,6 +291,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
 	PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
