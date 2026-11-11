@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/kytyEvents.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -2351,20 +2352,31 @@ struct FiberOptParam {
 	uint32_t magic;
 };
 
+// fp_env (KYTY_GUEST_FP_ENV, upstream f399d4818): the fiber's MXCSR and x87 control word, saved
+// with the registers; a restore loads them (MXCSR's exception flags stay the thread's). A zero
+// MXCSR (the switch off) restores none.
 struct FiberCpuContext {
-	uint64_t rbx;
-	uint64_t rbp;
-	uint64_t rdi;
-	uint64_t rsi;
-	uint64_t r12;
-	uint64_t r13;
-	uint64_t r14;
-	uint64_t r15;
-	uint64_t rsp;
-	uint64_t rip;
+	uint64_t      rbx;
+	uint64_t      rbp;
+	uint64_t      rdi;
+	uint64_t      rsi;
+	uint64_t      r12;
+	uint64_t      r13;
+	uint64_t      r14;
+	uint64_t      r15;
+	uint64_t      rsp;
+	uint64_t      rip;
+	Common::FpEnv fp_env;
 };
 
-static_assert(sizeof(FiberCpuContext) == 80);
+static_assert(sizeof(FiberCpuContext) == 88);
+
+// After a FiberSaveContext: without KYTY_GUEST_FP_ENV the context carries no FP environment.
+static void FiberKeepFpEnv(FiberCpuContext* ctx) {
+	if (!Common::GuestFpEnvEnabled()) {
+		ctx->fp_env = {};
+	}
+}
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2494,6 +2506,8 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	             "movq %r11, 64(%r10)\n\t"
 	             "movq (%rsp), %r11\n\t"
 	             "movq %r11, 72(%r10)\n\t"
+	             "stmxcsr 80(%r10)\n\t"
+	             "fnstcw 84(%r10)\n\t"
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
 }
@@ -2511,6 +2525,19 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             "cmpl $0, 80(%r10)\n\t"
+	             "je 1f\n\t"
+	             "subq $8, %rsp\n\t"
+	             "stmxcsr (%rsp)\n\t"
+	             "movl (%rsp), %ecx\n\t"
+	             "andl $0x3f, %ecx\n\t"
+	             "movl 80(%r10), %edx\n\t"
+	             "andl $0xffffffc0, %edx\n\t"
+	             "orl %ecx, %edx\n\t"
+	             "movl %edx, (%rsp)\n\t"
+	             "ldmxcsr (%rsp)\n\t"
+	             "fldcw 84(%r10)\n\t"
+	             "1:\n\t"
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
@@ -2539,6 +2566,12 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rsp = rsp;
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
+	if (Common::GuestFpEnvEnabled()) {
+		if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
+			Common::WriteFpEnv(Common::GuestFpEnv);
+		}
+		ctx.fp_env = Common::ReadFpEnv();
+	}
 
 	FiberRestoreContext(&ctx, 1);
 }
@@ -2743,6 +2776,7 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	FiberSetThreadContext(&context);
 
 	if (FiberSaveContext(&context.cpu_context) == 0) {
+		FiberKeepFpEnv(&context.cpu_context);
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
@@ -2786,6 +2820,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	fiber->arg_on_return = 0;
 
 	if (FiberSaveContext(&caller->saved_context) == 0) {
+		FiberKeepFpEnv(&caller->saved_context);
 		FiberSetContextValid(caller, true);
 		context->pending_idle_fiber = caller;
 		if (fiber->context_valid) {
@@ -2828,6 +2863,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 	fiber->arg_on_return = arg_on_return;
 
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
+		FiberKeepFpEnv(&fiber->saved_context);
 		FiberSetContextValid(fiber, true);
 		context->returned_fiber = fiber;
 		context->pending_idle_fiber = fiber;

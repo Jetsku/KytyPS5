@@ -1645,6 +1645,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-exit-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	# KYTY_GUEST_FP_ENV=1: fibers start with the console's MXCSR and carry their own across switches.
+	add_test(NAME guest_fp_env_fibers
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --fiber-fp-env-only)
+	set_tests_properties(guest_fp_env_fibers PROPERTIES ENVIRONMENT "KYTY_GUEST_FP_ENV=1")
 	if(WIN32)
 		add_test(NAME virtual_memory_allocation_lazy_backing
 			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)

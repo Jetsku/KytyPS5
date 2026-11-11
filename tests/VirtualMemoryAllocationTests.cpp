@@ -5140,6 +5140,86 @@ struct FiberRoundTrip {
 	}
 }
 
+// KYTY_GUEST_FP_ENV: a new fiber (FIBER_FLAG_SET_FPU_REGS) starts with the console's MXCSR, a
+// fiber switch carries each fiber's MXCSR, and the thread gets its own back when the fiber
+// returns. Off: fibers keep whatever MXCSR the thread has, as before.
+struct FiberFpEnvData {
+	Libs::Fiber::FiberObject* first;
+	Libs::Fiber::FiberObject* second;
+	uint32_t first_start = 0;
+	uint32_t second_start = 0;
+	uint32_t first_resumed = 0;
+};
+
+constexpr uint32_t MxcsrControl(uint32_t value) {
+	return value & ~0x3fu;
+}
+
+[[noreturn]] void KYTY_SYSV_ABI FpFirstFiberEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data = *reinterpret_cast<FiberFpEnvData*>(initial);
+	data.first_start = MxcsrControl(_mm_getcsr());
+	_mm_setcsr(0x7f80); // round toward zero, no FTZ/DAZ
+	uint64_t arg = 0;
+	(void)Libs::Fiber::FiberSwitch(data.second, 1, &arg);
+	data.first_resumed = MxcsrControl(_mm_getcsr());
+	for (;;) {
+		(void)Libs::Fiber::FiberReturnToThread(2, &arg);
+	}
+}
+
+[[noreturn]] void KYTY_SYSV_ABI FpSecondFiberEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data = *reinterpret_cast<FiberFpEnvData*>(initial);
+	data.second_start = MxcsrControl(_mm_getcsr());
+	_mm_setcsr(0x3f80); // round down
+	uint64_t arg = 0;
+	for (;;) {
+		(void)Libs::Fiber::FiberSwitch(data.first, 3, &arg);
+	}
+}
+
+void TestFiberFpEnv() {
+	const char* test = "FiberFpEnv";
+	const char* value = std::getenv("KYTY_GUEST_FP_ENV");
+	const bool on = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	alignas(8) std::array<uint8_t, 256> first_object {};
+	alignas(8) std::array<uint8_t, 256> second_object {};
+	alignas(16) static std::array<uint8_t, 64 * 1024> first_stack {};
+	alignas(16) static std::array<uint8_t, 64 * 1024> second_stack {};
+	FiberFpEnvData data {reinterpret_cast<Libs::Fiber::FiberObject*>(first_object.data()),
+	                     reinterpret_cast<Libs::Fiber::FiberObject*>(second_object.data())};
+	CheckOk(test, Libs::Fiber::FiberInitialize(data.first, "fp-first", FpFirstFiberEntry,
+	    reinterpret_cast<uint64_t>(&data), first_stack.data(), first_stack.size(), nullptr,
+	    0x0a000000), "initialize first fiber");
+	CheckOk(test, Libs::Fiber::FiberInitialize(data.second, "fp-second", FpSecondFiberEntry,
+	    reinterpret_cast<uint64_t>(&data), second_stack.data(), second_stack.size(), nullptr,
+	    0x0a000000), "initialize second fiber");
+	const uint32_t saved = _mm_getcsr();
+	_mm_setcsr(0x1f80);
+	uint64_t returned = 0;
+	const int run = Libs::Fiber::FiberRun(data.first, 0, &returned);
+	const uint32_t thread_after = MxcsrControl(_mm_getcsr());
+	_mm_setcsr(saved);
+	CheckOk(test, run, "run first fiber");
+	Check(test, returned == 2, "first fiber returned to the thread");
+	char text[160];
+	std::snprintf(text, sizeof(text), "on=%d first_start=%#x second_start=%#x first_resumed=%#x thread=%#x",
+	              on ? 1 : 0, data.first_start, data.second_start, data.first_resumed, thread_after);
+	if (on) {
+		Check(test, data.first_start == 0x9fc0 && data.second_start == 0x9fc0,
+		      std::string("new fibers start with MXCSR 0x9fc0: ") + text);
+		Check(test, data.first_resumed == 0x7f80,
+		      std::string("a resumed fiber gets its own MXCSR back: ") + text);
+		Check(test, thread_after == 0x1f80,
+		      std::string("the thread gets its MXCSR back: ") + text);
+	} else {
+		Check(test, data.first_start == 0x1f80 && data.second_start == 0x7f80 &&
+		                data.first_resumed == 0x3f80 && thread_after == 0x3f80,
+		      std::string("off: fibers keep the thread's running MXCSR: ") + text);
+	}
+	(void)Libs::Fiber::FiberFinalize(data.first);
+	(void)Libs::Fiber::FiberFinalize(data.second);
+}
+
 void TestSmallFiberStacksAndMigration() {
 	const char* test = "SmallFiberStacksAndMigration";
 	// 256-byte objects, 8-byte object alignment, 16-byte context
@@ -5430,6 +5510,10 @@ int main(int argc, char** argv) {
 		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--fiber-fp-env-only") == 0) {
+		RunTest(TestFiberFpEnv);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
@@ -5465,6 +5549,7 @@ int main(int argc, char** argv) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
+	RunTest(TestFiberFpEnv);
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);

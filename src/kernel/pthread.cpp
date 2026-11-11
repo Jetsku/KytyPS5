@@ -6,6 +6,7 @@
 #include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/fpEnv.h"
 #include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
 #include "common/hostException.h"
@@ -3573,6 +3574,7 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	Common::EnterGuestFpEnv();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
