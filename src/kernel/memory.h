@@ -161,6 +161,10 @@ bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t
 // the process lifetime: reading it never faults, whatever the guest view's protection, and after
 // the guest unmaps the range it shows whatever that backing then holds. Any thread.
 [[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
+// The always-RW backing alias as one host range (KYTY_INPLACE imports windows of it): its base
+// address and size, 0 before the address space exists.
+[[nodiscard]] uint64_t GuestBackingBase();
+[[nodiscard]] uint64_t GuestBackingSize();
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
 // draw-prep preparation the read is certified by that digest instead of its bytes

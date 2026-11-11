@@ -35,6 +35,7 @@ class TextureCache;
 class UploadDma;
 struct UploadHostCopy;
 class CommandRecorder;
+class InplaceHeap;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -123,6 +124,9 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
 	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
 	void                   AdvanceFrame() noexcept;
+	// KYTY_INPLACE (inplaceHeap.h): a command-processor CPU write of guest memory (DMA_DATA) is
+	// about to happen. Any thread.
+	void                   InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size);
 	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
 	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
 	// records them all behind one barrier. Every command recorded meanwhile through
@@ -1184,6 +1188,11 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	// After the staging ring: destroyed first, waiting for its copies that read the ring.
 	std::unique_ptr<UploadDma>                        m_upload_dma;
+	// KYTY_INPLACE (inplaceHeap.h), null when off.
+	std::unique_ptr<InplaceHeap>                      m_inplace;
+	// GPU thread: [vaddr, +size) bound to an imported window when every page is a candidate and
+	// guest memory holds its current bytes.
+	[[nodiscard]] bool TryInplaceBinding(uint64_t vaddr, uint64_t size, std::pair<Buffer*, uint64_t>& result);
 	StreamBuffer                                      m_stream_buffer;
 	// KYTY_STREAM_COPY_DEFER: copies encoded for the recorder that it may not have executed yet
 	// (ring position after each), in encoding order from m_deferred_head; [lo, hi) bounds them.

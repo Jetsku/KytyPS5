@@ -980,6 +980,12 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(inplace_candidates_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/InplaceCandidatesTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/inplaceCandidates.cpp"
+)
+target_include_directories(inplace_candidates_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -1442,6 +1448,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_gpu_keep_device
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-keep-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	add_test(NAME inplace_candidates COMMAND $<TARGET_FILE:inplace_candidates_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	if(KYTY_X86_64_V3)
 		add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)

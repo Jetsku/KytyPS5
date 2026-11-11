@@ -23,6 +23,8 @@
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/readFaultDiag.h"
 #include "graphics/host_gpu/renderer/cache/bufferLookupStats.h"
+#include "graphics/host_gpu/renderer/cache/inplaceHeap.h"
+#include "graphics/host_gpu/renderer/cache/inplaceStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -688,8 +690,14 @@ MemoryTracker::FaultPolicy BufferFaultPolicy() {
 	if (ParseEnvU64("KYTY_HOT_PAGES", 1) != 0) {
 		policy.hot_frames = static_cast<uint32_t>(
 		    std::clamp<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_FRAMES", 3), 1, 255));
+		// KYTY_INPLACE: pages bound in place must stay writable (hot) without faulting, so the hot
+		// set defaults to the in-place cap (KYTY_INPLACE_MAX_MB in 4 KiB pages) unless set.
+		const uint64_t hot_default =
+		    InplaceHeap::ConfiguredMode() != InplaceHeap::Mode::Off
+		        ? (ParseEnvU64("KYTY_INPLACE_MAX_MB", 512) << 20u) / TRACKER_PAGE_SIZE
+		        : 1024;
 		policy.hot_max =
-		    static_cast<uint32_t>(std::min<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_MAX", 1024), 65536));
+		    static_cast<uint32_t>(std::min<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_MAX", hot_default), 65536));
 		if (policy.hot_max == 0) {
 			policy.hot_frames = 0;
 		}
@@ -724,6 +732,7 @@ bool DirtyQueryCombinedEnabled() {
 // the stream buffer reads the guest bytes through the guest mapping instead of the backing store
 // (TryReadBacking). Its pages are CPU-dirty and not GPU-dirty, so no protection stops the read.
 BufferCache* g_defer_cache = nullptr; // the BufferCache whose stream copies are deferred
+InplaceHeap* g_inplace_heap = nullptr; // KYTY_INPLACE: CP writes check its candidate pages
 UploadDma*   g_write_drain_dma = nullptr; // KYTY_UPLOAD_DMA_WRITE_DRAIN: the cache's upload DMA
 
 bool StreamCopyProbe() {
@@ -1660,6 +1669,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (m_upload_dma != nullptr) {
 		g_write_drain_dma = m_upload_dma.get(); // KYTY_UPLOAD_DMA_WRITE_DRAIN
 	}
+	if (const auto mode = InplaceHeap::ConfiguredMode(); mode != InplaceHeap::Mode::Off) {
+		if (graphics.external_memory_host_enabled && Libs::LibKernel::Memory::GuestBackingBase() != 0) {
+			m_inplace       = std::make_unique<InplaceHeap>(graphics, scheduler, mode);
+			g_inplace_heap  = m_inplace.get();
+		} else {
+			std::printf("Kyty in-place reads: off (no VK_EXT_external_memory_host or no backing alias)\n");
+		}
+	}
 	m_relaxed_queries = RelaxedQueriesEnabled();
 	m_bda_dirty_log   = m_bda_hot_sync && BdaDirtyLogEnabled();
 	if (m_bda_dirty_log) {
@@ -1753,6 +1770,9 @@ BufferCache::~BufferCache() {
 	if (g_defer_cache == this) {
 		g_defer_cache = nullptr;
 	}
+	if (m_inplace != nullptr && g_inplace_heap == m_inplace.get()) {
+		g_inplace_heap = nullptr;
+	}
 	if (m_upload_dma != nullptr && g_write_drain_dma == m_upload_dma.get()) {
 		g_write_drain_dma = nullptr;
 	}
@@ -1784,6 +1804,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 	if (!write_fault) {
 		m_memory_tracker.InvalidateRegion(vaddr, size, flush);
 		return;
+	}
+	InplaceStats::NoteFault(vaddr);
+	if (m_inplace != nullptr) {
+		m_inplace->NoteFault(vaddr);
 	}
 	// KYTY_READBACK_SIDE_WRITES: only a fault taken by the exception handler is retried.
 	const auto fault_flush = [this, vaddr, size] {
@@ -1826,6 +1850,10 @@ BufferCache::UploadBatch::~UploadBatch() {
 
 void BufferCache::AdvanceFrame() noexcept {
 	m_memory_tracker.AdvanceFrame();
+	InplaceStats::AdvanceFrame();
+	if (m_inplace != nullptr) {
+		m_inplace->AdvanceFrame();
+	}
 	FaultCost::AdvanceFrame();
 	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
@@ -1890,7 +1918,11 @@ void BufferCache::MaintainHotPages() {
 		return;
 	}
 	m_hot_sweep_frame = frame;
-	m_memory_tracker.SweepHotPages(m_hot_quiet_frames);
+	// KYTY_INPLACE: pages bound in place get no uploads, so the idle sweep would demote them
+	// (write-protect them, and they would fault again) although the GPU reads them every frame.
+	if (m_inplace == nullptr) {
+		m_memory_tracker.SweepHotPages(m_hot_quiet_frames);
+	}
 	std::erase_if(m_hot_shadows, [this, frame](const auto& entry) {
 		return frame - entry.second.last_use > m_hot_quiet_frames;
 	});
@@ -4241,6 +4273,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
 	}
 	if (source || late_source) {
+		if (InplaceStats::Enabled()) {
+			InplaceStats::NoteUploadBytes(total_size + late_size, copies.size() + late_copies.size());
+			for (const auto& copy: copies) {
+				InplaceStats::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+			}
+			for (const auto& copy: late_copies) {
+				InplaceStats::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+			}
+		}
 		if (stats != nullptr) {
 			stats->upload_bytes += total_size + late_size;
 			stats->upload_copies += copies.size() + late_copies.size();
@@ -4623,6 +4664,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	if (m_inplace != nullptr) {
+		if (is_written) {
+			m_inplace->Demote(vaddr, size);
+		} else if (!is_texel_buffer) {
+			std::pair<Buffer*, uint64_t> result;
+			if (TryInplaceBinding(vaddr, size, result)) {
+				return result;
+			}
+		}
+	}
 	if (!is_written && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
 	    GuestGpu::IsGpuThread()) {
 		if (!is_texel_buffer) {
@@ -4639,6 +4690,38 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
+}
+
+bool BufferCache::TryInplaceBinding(uint64_t vaddr, uint64_t size, std::pair<Buffer*, uint64_t>& result) {
+	if (!m_inplace->AllCandidates(vaddr, size) || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// Guest memory must hold the current bytes: no GPU-written bytes the cache still owns, no
+	// readback or backing publication about to land, no image that wrote the range.
+	MemoryTracker::DirtyState state;
+	if (!m_memory_tracker.QueryDirtyRelaxed(vaddr, size, state)) {
+		state = m_memory_tracker.QueryDirty(vaddr, size);
+	}
+	const uint64_t page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const uint64_t page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (state.gpu || HasPendingBackingPublication(vaddr, size) || OverlapsPendingSideReadback(page_begin, page_end) ||
+	    (!m_early_released.empty() && OverlapsUnpublished(vaddr, size)) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	Buffer*  buffer = nullptr;
+	uint64_t offset = 0;
+	if (!m_inplace->Bind(vaddr, size, buffer, offset)) {
+		return false;
+	}
+	result = {buffer, offset};
+	return true;
+}
+
+void BufferCache::InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size) {
+	if (m_inplace != nullptr) {
+		m_inplace->BeforeCpWrite(vaddr, size);
+	}
 }
 
 void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find) const noexcept {
@@ -5151,6 +5234,9 @@ bool BufferCache::TryDeferStreamCopy(uint8_t* mapped, uint64_t vaddr, uint64_t s
 }
 
 void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
+	if (auto* inplace = g_inplace_heap; inplace != nullptr && size != 0) {
+		inplace->BeforeCpWrite(address, size);
+	}
 	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {
 		(void)dma->DrainHostCopies(address, size, false);
@@ -5175,6 +5261,9 @@ void StreamCopyDefer::NoteGuestWrite(uint64_t address, uint64_t size) {
 	// KYTY_UPLOAD_DMA_WRITE_DRAIN (uploadDma.h): the guest may observe this write (a label) and
 	// then rewrite memory an earlier upload still has to read, so every queued host copy is made
 	// first.
+	if (auto* inplace = g_inplace_heap; inplace != nullptr && size != 0) {
+		inplace->BeforeCpWrite(address, size);
+	}
 	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {
 		(void)dma->DrainHostCopies(address, size, true);
@@ -5305,6 +5394,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 				}
 			}
 			if (read) {
+				InplaceStats::NoteStream(vaddr, size);
 				m_stream_buffer.Commit();
 				return {&m_stream_buffer, offset};
 			}

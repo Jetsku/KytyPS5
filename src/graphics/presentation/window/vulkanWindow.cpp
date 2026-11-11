@@ -2361,6 +2361,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// KYTY_INPLACE (renderer/cache/inplaceHeap.h): guest memory imported as Vulkan memory.
+		if (const auto* inplace = std::getenv("KYTY_INPLACE");
+		    inplace != nullptr && (std::strcmp(inplace, "1") == 0 || std::strcmp(inplace, "verify") == 0)) {
+			if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+				graphic_ctx.external_memory_host_enabled = true;
+			} else {
+				std::printf("Kyty in-place reads: VK_EXT_external_memory_host is not offered by this device\n");
+			}
+		}
 #if defined(_WIN32)
 		// KYTY_FULLSCREEN_EXCLUSIVE: the swapchain then tells the driver whether exclusive
 		// fullscreen may be used (Swapchain::Create). The instance extension it needs was enabled

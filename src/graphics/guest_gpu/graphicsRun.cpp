@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/inplaceStats.h"
 
 #include "common/assert.h"
 #include "common/prepPhases.h"
@@ -1524,6 +1525,7 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 }
 
 void CommandProcessor::ExecDumpConstRam(const CpSeq::DumpConstRamOp& op, const uint32_t* src) {
+	InplaceStats::ScopedCpKind inplace_kind(InplaceStats::CpKind::ConstRam);
 	StreamCopyDefer::NoteGpuOnlyWrite(op.dst, uint64_t {op.dw_num} * 4u);
 	memcpy(reinterpret_cast<uint32_t*>(op.dst), src, static_cast<size_t>(op.dw_num) * 4);
 	NoteCpWrite(op.dst, uint64_t {op.dw_num} * 4u);
@@ -1756,6 +1758,7 @@ static bool SplitWriteDataDeferred() {
 }
 
 void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_t* src) {
+	InplaceStats::ScopedCpKind inplace_kind(InplaceStats::CpKind::WriteData);
 	auto*          dst           = reinterpret_cast<uint32_t*>(op.dst);
 	const uint32_t dw_num        = op.dw_num;
 	const uint32_t write_control = op.write_control;
@@ -1962,6 +1965,10 @@ void CommandProcessor::ExecDmaData(const CpSeq::DmaDataOp& op) {
 		if (dst_gds) {
 			trace_gds(dst_address_or_offset, src_address_or_offset_or_immediate & 0xffffffffu, 0);
 		}
+		if (!dst_gds) {
+			InplaceStats::NoteCpWrite(InplaceStats::CpKind::DmaFill, dst_address_or_offset, num_bytes);
+			buffer_cache.InplaceBeforeCpWrite(dst_address_or_offset, num_bytes);
+		}
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
@@ -1978,6 +1985,10 @@ void CommandProcessor::ExecDmaData(const CpSeq::DmaDataOp& op) {
 		trace_gds(dst_address_or_offset, src_address_or_offset_or_immediate, 1);
 	} else if (src_gds) {
 		trace_gds(src_address_or_offset_or_immediate, dst_address_or_offset, 2);
+	}
+	if (!dst_gds) {
+		InplaceStats::NoteCpWrite(InplaceStats::CpKind::DmaCopy, dst_address_or_offset, num_bytes);
+		buffer_cache.InplaceBeforeCpWrite(dst_address_or_offset, num_bytes);
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
@@ -5667,6 +5678,7 @@ void CommandProcessor::CopyFrontState(const CommandProcessor& from) {
 // draw preparations then span the packets between ordering points, and a preparation that read
 // the written bytes must fail its certificate at commit (drawPrep.h, P3-SEQUENCER.md 2.6).
 void NoteCpWrite(uint64_t address, uint64_t size) {
+	InplaceStats::NoteCpWriteDefault(address, size);
 	if (CpSeq::ConfiguredMode() == CpSeq::Mode::Thread && address != 0 && size != 0) {
 		Coherence::NoteContentWrite(address, size, Coherence::Source::CpWrite);
 	}
