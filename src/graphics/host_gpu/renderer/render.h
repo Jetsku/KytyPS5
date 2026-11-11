@@ -1330,6 +1330,13 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// KYTY_CONT_KERNEL_CEILING (renderDraw.cpp; unsafe measurement switch): the shortened path of a
+	// DrawIndex continuation. False, with the draw's preparation handed back, when it does not apply.
+	[[nodiscard]] bool ContinuationCeiling(uint64_t submit_id, CommandBuffer& buffer,
+	                                       const DrawIndexArgs& args);
+	// PrepareBindings for a continuation stage (keep_images): no GDS, no bindless heaps, no verify.
+	void PrepareBindingsContinuation(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                                 DrawPrep::StagePlan* plan);
 	// written: DrawScissorUnion of the draw (nullptr: the whole colour targets may be written).
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
@@ -1707,6 +1714,16 @@ private:
 	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)
 	uint64_t      m_run_swap_key       = 0;     // and the key without the vertex program (PIPESWAP)
 	bool          m_run_pipeswap       = false; // KYTY_DRAW_RUN_PIPESWAP: the continuation swaps
+	// KYTY_CONT_KERNEL_CEILING: what the draw that last recorded m_run resolved (its pipeline,
+	// barrier safety, shader write stages), for the record of this key and rendering instance.
+	struct ContCeilingRecord {
+		const PipelineCache::Pipeline* pipeline     = nullptr;
+		uint64_t                       generation   = 0;
+		uint64_t                       key          = 0;
+		uint64_t                       serial       = 0;
+		vk::PipelineStageFlags         write_stages = {};
+		bool                           barrier_safe = false;
+	} m_cont_ceiling;
 	// KYTY_DRAW_RUN_PIPESWAP: the kept vertex-stage bindings and claims fit the new vertex program.
 	[[nodiscard]] static bool DrawRunPipeSwapCompatible(
 	    const ShaderRecompiler::IR::CompiledShaderInfo& recorded,
