@@ -262,6 +262,17 @@ void MainDialogPrivate::FindInterpreter() {
 	// Automation, so nothing else can press the button without the mouse. With --precompile-list <file>
 	// the list that game asks for is that file, as if it had been chosen in the file dialog.
 	const auto arguments = QCoreApplication::arguments();
+	if (const auto at = arguments.indexOf(QStringLiteral("--context-menu"));
+	    at >= 0 && at + 1 < arguments.size()) {
+		QMetaObject::invokeMethod(
+		    this,
+		    [this, game = arguments.at(at + 1)]() {
+			    if (!m_ui->widget->OpenContextMenu(game)) {
+				    qWarning().noquote() << "--context-menu: no game in the list at" << game;
+			    }
+		    },
+		    Qt::QueuedConnection);
+	}
 	if (const auto at = arguments.indexOf(QStringLiteral("--precompile-list"));
 	    at >= 0 && at + 1 < arguments.size()) {
 		PrecompileDialog::SetTestList(arguments.at(at + 1));

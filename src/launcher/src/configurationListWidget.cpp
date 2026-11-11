@@ -347,6 +347,19 @@ bool ConfigurationListWidget::PressPrecompile(const QString& game) {
 	return false;
 }
 
+bool ConfigurationListWidget::OpenContextMenu(const QString& game) {
+	const auto key = PathKey(game);
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = m_ui->cfgs_list->topLevelItem(index);
+		if (!key.isEmpty() && PathKey(static_cast<ConfigurationItem*>(item)->GetInfo().game_path) == key) {
+			m_ui->cfgs_list->setCurrentItem(item);
+			ShowContextMenu(item); // returns when the menu closes
+			return true;
+		}
+	}
+	return false;
+}
+
 void ConfigurationListWidget::UpdateToolbarIcons() {
 	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
 	                                                                      : QColor(Qt::black);

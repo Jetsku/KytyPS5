@@ -37,6 +37,9 @@ public:
 	// As a click on the Precompile button of the game in this folder or archive (the launcher's
 	// --precompile argument); false when the list has no such game.
 	bool PressPrecompile(const QString& game);
+	// As a right click on the row of the game in this folder or archive (the launcher's
+	// --context-menu argument, for tests); false when the list has no such game.
+	bool OpenContextMenu(const QString& game);
 	void SetControllerPreview(ControllerPreview* preview) { m_controller_preview = preview; }
 
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
