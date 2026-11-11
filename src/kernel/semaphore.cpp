@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -26,6 +27,12 @@ LIB_NAME("libkernel", "libkernel");
 
 constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
 
+// KYTY_SEMA_TARGETED_WAKE=1 (live switch, default off; based on upstream a0268f1de): each waiter
+// sleeps on a condition variable of its own and a signal wakes only the waiters it hands counts
+// to. Off: a signal wakes every waiter, and those still short of counts go back to sleep (the old
+// shared condition variable's broadcast). Cancel and delete wake every waiter either way.
+static Live::Switch g_targeted_wake("KYTY_SEMA_TARGETED_WAKE", Live::ParseDefaultOff);
+
 class KernelSemaPrivate {
 public:
 	enum class Result { Ok, TimedOut, Canceled, Deleted, InvalCount };
@@ -48,25 +55,33 @@ public:
 
 	[[nodiscard]] const std::string& GetName() const { return m_name; }
 
+	// Waiters not yet made runnable (tests).
+	[[nodiscard]] int Waiting() {
+		Common::LockGuard lock(m_mutex);
+		return static_cast<int>(std::count_if(m_waiting_threads.begin(), m_waiting_threads.end(),
+		                                      [](const WaitingThread* waiter) { return !waiter->ready; }));
+	}
+
 private:
 	enum class Status { Set, Deleted };
 
 	struct WaitingThread {
-		int    id         = 0;
-		int    priority   = 700;
-		int    need_count = 0;
-		Result result     = Result::TimedOut;
-		bool   ready      = false;
+		int             priority   = 700;
+		int             need_count = 0;
+		Result          result     = Result::TimedOut;
+		bool            ready      = false;
+		Common::CondVar cond_var;
 	};
 
 	void AddWaiter(WaitingThread* waiter);
 	void RemoveWaiter(WaitingThread* waiter);
-	void WakeWaiters();
+	// Hands counts to waiters in queue order; 	argeted: wakes those it made runnable.
+	void WakeWaiters(bool targeted);
 	// WakeWaiters with the KYTY_GTHREAD_STATS signal counters.
-	void CountSignal();
+	void CountSignal(bool targeted);
+	void WakeAll();
 
-	Common::Mutex              m_mutex;
-	Common::CondVar             m_cond_var;
+	Common::Mutex               m_mutex;
 	std::string                 m_name;
 	Status                      m_status = Status::Set;
 	std::vector<WaitingThread*> m_waiting_threads;
@@ -94,7 +109,7 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 		}
 	}
 
-	m_cond_var.SignalAll();
+	WakeAll();
 
 	while (!m_waiting_threads.empty()) {
 		m_mutex.Unlock();
@@ -129,7 +144,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 		}
 	}
 
-	m_cond_var.SignalAll();
+	WakeAll();
 
 	return Result::Ok;
 }
@@ -147,14 +162,17 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 
 	m_count += signal_count;
 
+	const bool targeted = g_targeted_wake.On();
 	if (GThreadStats::Enabled()) {
 		GThreadStats::FpProbe();
-		CountSignal();
+		CountSignal(targeted);
 	} else {
-		WakeWaiters();
+		WakeWaiters(targeted);
 	}
 
-	m_cond_var.SignalAll();
+	if (!targeted) {
+		WakeAll();
+	}
 
 	return Result::Ok;
 }
@@ -179,23 +197,32 @@ void KernelSemaPrivate::RemoveWaiter(WaitingThread* waiter) {
 	}
 }
 
-void KernelSemaPrivate::WakeWaiters() {
+void KernelSemaPrivate::WakeWaiters(bool targeted) {
 	for (auto* waiter: m_waiting_threads) {
 		if (!waiter->ready && waiter->need_count <= m_count) {
 			m_count -= waiter->need_count;
 			waiter->result = Result::Ok;
 			waiter->ready  = true;
+			if (targeted) {
+				waiter->cond_var.Signal();
+			}
 		}
 	}
 }
 
-void KernelSemaPrivate::CountSignal() {
+void KernelSemaPrivate::WakeAll() {
+	for (auto* waiter: m_waiting_threads) {
+		waiter->cond_var.Signal();
+	}
+}
+
+void KernelSemaPrivate::CountSignal(bool targeted) {
 	const auto not_ready = [this] {
 		return std::count_if(m_waiting_threads.begin(), m_waiting_threads.end(),
 		                     [](const WaitingThread* waiter) { return !waiter->ready; });
 	};
 	const auto before = not_ready();
-	WakeWaiters();
+	WakeWaiters(targeted);
 	auto& counters = GThreadStats::Local();
 	GThreadStats::Add(counters.sema_signal);
 	if (before >= 2) {
@@ -241,12 +268,9 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	Common::Timer t;
 	t.Start();
 
-	int id = Common::Thread::GetThreadIdUnique();
-
 	HangWatchdog::Scope wait("guest-semaphore", reinterpret_cast<uint64_t>(this), need_count,
 	                         m_count, 0, micros);
 	WaitingThread waiter {};
-	waiter.id         = id;
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
@@ -262,12 +286,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 			return Result::TimedOut;
 		}
 
-		bool woke = false;
-		if (infinitely) {
-			woke = m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
-		} else {
-			woke = m_cond_var.WaitFor(&m_mutex, micros - elapsed);
-		}
+		const bool woke =
+		    waiter.cond_var.WaitFor(&m_mutex, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
 		if (stats && woke) {
 			auto& counters = GThreadStats::Local();
 			GThreadStats::Add(counters.sema_wake);
@@ -409,6 +429,10 @@ int KYTY_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads) {
 	}
 
 	return ret;
+}
+
+int Testing::Waiting(KernelSema sem) {
+	return sem != nullptr ? sem->Waiting() : 0;
 }
 
 } // namespace Libs::LibKernel::Semaphore

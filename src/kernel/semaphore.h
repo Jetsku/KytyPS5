@@ -26,6 +26,11 @@ int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec);
 int KYTY_SYSV_ABI PthreadSemPost(void* sem);
 int KYTY_SYSV_ABI PthreadSemGetvalue(void* sem, int* value);
 
+namespace Testing {
+// Waiters of the semaphore that no signal, cancel or delete has made runnable yet.
+int Waiting(KernelSema sem);
+} // namespace Testing
+
 } // namespace Libs::LibKernel::Semaphore
 
 namespace Libs::Posix {
