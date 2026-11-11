@@ -2374,10 +2374,33 @@ static void SwapPreparedStage(PipelineCache::StagePrep& state, PipelineCache::St
 // stage preps are swapped (the preparation keeps the old vectors' capacity) and the stage
 // runtimes re-pointed at the draw state's copies. Like GetGraphicsPrograms, a draw without an
 // active pixel shader leaves the pixel prep untouched.
+// KYTY_CONT_KERNEL_INPLACE (renderDraw.cpp, ContinuationKernel): 1 while a kernel continuation is
+// applied - its programs and pixel input are functions of the run key (programs, registers), so the
+// draw state already holds them from the previous draw of the run and they are not copied again;
+// 2 verify: copied, and compared with what the state held. GPU thread only.
+static int g_apply_keyed_skip = 0;
+static std::atomic<uint64_t> g_inplace_checks {0};
+static std::atomic<uint64_t> g_inplace_mismatches {0};
+
 static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState& state) {
-	state.programs = prepared.programs;
+	if (g_apply_keyed_skip == 2) {
+		auto pixel            = prepared.pixel_info;
+		pixel.stage.resources = state.ps_input_info.stage.resources;
+		const bool same =
+		    std::memcmp(&state.programs, &prepared.programs, sizeof(state.programs)) == 0 &&
+		    (!prepared.pixel_active || std::memcmp(&state.ps_input_info, &pixel, sizeof(pixel)) == 0);
+		const auto n = g_inplace_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto m = same ? g_inplace_mismatches.load(std::memory_order_relaxed)
+		                    : g_inplace_mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((!same && m <= 8) || (n & 0x7fffffu) == 0) {
+			std::printf("ContKernel inplace verify: checks %" PRIu64 " mismatches %" PRIu64 "\n", n, m);
+		}
+	}
+	if (g_apply_keyed_skip != 1) {
+		state.programs      = prepared.programs;
+		state.ps_input_info = prepared.pixel_info;
+	}
 	CopyPreparedVertexInfo(state.vertex_info[0], prepared.vertex_info);
-	state.ps_input_info = prepared.pixel_info;
 	SwapPreparedStage(state.stage_preps.vertex[0], prepared.vertex_prep);
 	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
 	// KYTY_DRAW_PREP_TESS: a tessellated draw's HS and TES stages.
@@ -3323,6 +3346,7 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_targets_kept   = false;
 	m_run_pipeswap       = false;
 	m_prepared_validated = false;
+	m_kernel_verify      = false;
 	if (!m_in_engine_commit && DrawRun::Enabled()) {
 		DrawRun::NoteForeignActivity("draw outside an engine commit");
 	}
@@ -5267,6 +5291,113 @@ static void VerifyVsbDraw(RenderContext& context, CommandBuffer& buffer, const D
 	}
 }
 
+// KYTY_CONT_KERNEL (live, default 0): the continuation kernel. A DrawIndex whose run structure key is
+// the current record's (DrawRun::StructureKey: every context register, the user-config registers but
+// the index offset and object id, both programs and their T#/S# words), in the record's command
+// buffer, tick, rendering instance and activity epoch, with the record's index element size, takes a
+// short path (RenderExecutor::ContinuationKernel): the decisions that are functions of that key are
+// the record's instead of being computed again (target operations, vertex-shader and hardware checks,
+// topology, primitive restart, the pixel shader's activity - which the preparation's Validate also
+// proves -, the pipeline while no pipeline was replaced and the plain-pixel choice is the record's,
+// barrier safety), the copy-to-colour / EQAA / prefetch steps of a first draw are left out, and the run
+// record keeps only what a continuation changes. What depends on more than the key is still done every
+// draw: the preparation's certificate, the run candidate check, the binding marks, the buffer work, the
+// late image / command check (its fallback leaves the kernel), the rebind after a join, the dynamic-state
+// shadow check and the packet encode. 2 = verify: the normal path runs, and every key-derived decision a
+// kernel draw would have reused is compared with the computed one ("ContKernel verify" lines).
+static Live::Switch g_cont_kernel("KYTY_CONT_KERNEL", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0; // 0, 1 or 2
+});
+// KYTY_CONT_KERNEL_INPLACE (live, default 0; 2 = verify): ApplyPreparedDraw (above) of a kernel
+// continuation keeps the programs and pixel input the draw state holds.
+static Live::Switch g_cont_kernel_inplace("KYTY_CONT_KERNEL_INPLACE", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+});
+
+namespace ContKernel {
+enum Item : uint32_t { TargetOps, VsCheck, Topology, Restart, Pipeline, BarrierSafe, Stage, Eligible, ItemCount };
+constexpr const char* kItemNames[ItemCount] = {"targetops", "vscheck", "topology", "restart",
+                                               "pipeline",  "barrier", "stage",    "eligible"};
+struct Counters {
+	std::atomic<uint64_t>                          draws {0};
+	std::atomic<uint64_t>                          checks {0};
+	std::array<std::atomic<uint64_t>, ItemCount>   mismatches {};
+	std::atomic<uint64_t>                          taken {0};
+	std::atomic<uint64_t>                          declined {0};
+	std::atomic<uint64_t>                          left {0}; // left the kernel after the buffer work
+};
+Counters g_counters;
+
+void Print(const char* why) {
+	auto& c = g_counters;
+	std::string line = fmt::format("ContKernel {}: taken {} declined {} left {} | verify draws {} checks {} mismatches",
+	                               why, c.taken.load(), c.declined.load(), c.left.load(), c.draws.load(),
+	                               c.checks.load());
+	uint64_t total = 0;
+	for (uint32_t i = 0; i < ItemCount; i++) {
+		total += c.mismatches[i].load();
+		line += fmt::format(" {}={}", kItemNames[i], c.mismatches[i].load());
+	}
+	line += fmt::format(" total={}", total);
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+}
+
+void Check(Item item, bool same) {
+	auto& c = g_counters;
+	const auto n = c.checks.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (!same) {
+		const auto m = c.mismatches[item].fetch_add(1, std::memory_order_relaxed);
+		if (m < 8) {
+			std::printf("ContKernel verify: %s mismatch\n", kItemNames[item]);
+		}
+	}
+	if ((n & 0x7fffffu) == 0) {
+		Print("verify");
+	}
+}
+
+// The candidate's precondition (PrepareDrawRenderState): no stage with bindless heaps.
+bool Bindless(const DrawRenderState& state) {
+	const auto bindless_stage = [](const ShaderStageRuntime& stage) {
+		return stage.resources != nullptr && !stage.resources->bindless_heaps.empty();
+	};
+	return (state.ps_active && bindless_stage(state.ps_input_info.stage)) ||
+	       std::ranges::any_of(state.vertex_info, [&](const auto& info) { return bindless_stage(info.stage); });
+}
+
+void NoteTaken() {
+	if (const auto n = g_counters.taken.fetch_add(1, std::memory_order_relaxed) + 1; (n & 0x1fffffu) == 0) {
+		Print("kernel");
+	}
+}
+} // namespace ContKernel
+
+// The register test of DepthStencilCopy (depthRenderTarget.cpp): whether it would copy.
+static bool DepthStencilCopyApplies(const HW::Context& hw) {
+	if (hw.GetColorControl().mode != 0) {
+		return false;
+	}
+	const auto& z        = hw.GetDepthRenderTarget();
+	const auto& override = hw.GetDepthRenderOverride();
+	const bool depth_copy = override.force_z_dirty && override.force_z_valid &&
+	                        z.z_info.format != Prospero::DepthFormat::kInvalid && z.z_read_base_addr != 0 &&
+	                        z.z_write_base_addr != 0 && z.z_read_base_addr != z.z_write_base_addr;
+	const bool stencil_copy = override.force_stencil_dirty && override.force_stencil_valid &&
+	                          z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	                          z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	                          z.stencil_read_base_addr != z.stencil_write_base_addr;
+	return depth_copy || stencil_copy;
+}
+
+static bool ListResetEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LIST_RESET");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -5583,14 +5714,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		LOGF("%s\n", text.c_str());
 	}
-	if (CopyDepthToColor(buffer, draw, emit, state)) {
+	// KYTY_CONT_KERNEL: both tests below are functions of the run key (registers and programs) and
+	// passed for the record.
+	if (!m_kernel && CopyDepthToColor(buffer, draw, emit, state)) {
 		m_run_active = false; // the copy is not a draw of the run
 		return;
 	}
 	// KYTY_EQAA_MIXED through NV mixed samples (colour samples below depth samples): no per-sample
 	// shading. A pixel shader that shades per sample runs its per-pixel copy (shaders.cpp); one
 	// without such a copy (the rewrite gave up) is skipped instead of losing the device.
-	if (state.ps_active && state.color_count != 0 && state.depth_info.image_id &&
+	if (!m_kernel && state.ps_active && state.color_count != 0 && state.depth_info.image_id &&
 	    state.color_info[0].desc.info.samples < state.depth_info.desc.info.samples &&
 	    buffer.GetGraphics().mixed_attachment_samples ==
 	        GraphicContext::MixedAttachmentSamples::Nv &&
@@ -5613,7 +5746,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	// CommitStats: image transitions recorded while this draw is committed.
 	const auto stats_transitions = CommitStats::Enabled() ? Image::RecordedTransitions() : uint64_t {0};
-	if (m_context.GetPipelineCache().PipelinePrefetchEnabled() && !CpPipelinePrefetchSkipped() &&
+	if (!m_kernel && m_context.GetPipelineCache().PipelinePrefetchEnabled() && !CpPipelinePrefetchSkipped() &&
 	    (m_binding_plan == nullptr || m_binding_plan->pipeline == nullptr)) {
 		const CommitStats::SubScope prefetch_scope(CommitStats::Sub::Prefetch);
 		m_context.GetPipelineCache().PrefetchGraphicsPipeline(
@@ -5741,19 +5874,40 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareBindings");
 		// KYTY_DRAW_RUN continuation: the stages keep the previous draw's textures and samplers.
-		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+		// KYTY_CONT_KERNEL: the same programs as the record's, which had no GDS (run eligibility) and
+		// no bindless heaps (the candidate's precondition): the lean preparation.
+		for (uint32_t i = 0; m_kernel && i < 1; i++) {
+			PrepareBindingsContinuation(state.vertex_info[0].stage, bindings.vertex[0],
+			                            plan_stages ? &plan->vertex : nullptr);
+			descriptor_stages[stage_count++] = &bindings.vertex[0];
+			if (state.ps_active) {
+				PrepareBindingsContinuation(state.ps_input_info.stage, *bindings.pixel,
+				                            plan_stages && plan->pixel_active ? &plan->pixel : nullptr);
+				descriptor_stages[stage_count++] = &*bindings.pixel;
+			}
+		}
+		for (uint32_t i = 0; !m_kernel && i < vertex_stages.size(); i++) {
 			// KYTY_UNNORMALIZED_FIX: a hull shader's normalized-LOD copy binds normalized samplers.
 			bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i],
 			                plan_stages ? &plan->vertex : nullptr, m_run_active);
 			descriptor_stages[stage_count++] = &bindings.vertex[i];
 		}
-		if (state.ps_active) {
+		if (!m_kernel && state.ps_active) {
 			if (!bindings.pixel) bindings.pixel.emplace();
 			PrepareBindings(state.ps_input_info.stage, *bindings.pixel,
 			                plan_stages && plan->pixel_active ? &plan->pixel : nullptr,
 			                m_run_active);
 			descriptor_stages[stage_count++] = &*bindings.pixel;
+		}
+		if (m_kernel_verify && m_run_active && !m_run_pipeswap) {
+			// What the lean preparation leaves out must be absent.
+			bool lean = vertex_stages.size() == 1;
+			for (uint32_t i = 0; i < stage_count; i++) {
+				lean = lean && descriptor_stages[i]->gds.buffer == nullptr &&
+				       descriptor_stages[i]->bindless_heaps.empty();
+			}
+			ContKernel::Check(ContKernel::Stage, lean);
 		}
 	}
 	CommitStats::StepMark(CommitStats::Step::PrepStages);
@@ -5848,6 +6002,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			DrawRun::CountMiss(DrawRun::Miss::Images);
 		}
 		m_run_active = false;
+		if (std::exchange(m_kernel, false)) {
+			ContKernel::g_counters.left.fetch_add(1, std::memory_order_relaxed);
+		}
 		DrawRunRecallFallback();
 		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
 		// No plan: its shader data was taken by the first preparation above.
@@ -5954,6 +6111,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (SkipRecurrentTargetsOnly()) NoteSkipTargets(m_context, state);
 	}
 	const auto* ps_input       = state.ps_active ? &state.ps_input_info : nullptr;
+	// KYTY_CONT_KERNEL: the pipeline is selected as for any draw. The record's is NOT reused: the
+	// pipeline's vertex input comes from the vertex buffers' V# words (per-draw data, outside the run
+	// key); verify mode counts how often the record's would have been wrong ("pipeline").
+	const bool kernel_valid = m_kernel_record.plain_pixel == plain_pixel &&
+	                          m_kernel_record.generation == pipeline_cache.PipelineGeneration();
+	if (m_kernel && !kernel_valid) {
+		m_kernel = false; // barrier safety depends on the plain-pixel choice
+		ContKernel::g_counters.left.fetch_add(1, std::memory_order_relaxed);
+	}
 	const auto* planned_pipeline =
 	    plan_stages && plan->pipeline != nullptr
 	        ? DrawPrep::PlannedPipeline(pipeline_cache, *plan, colors_span, state.depth_info,
@@ -6007,6 +6173,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	const auto& pipeline = *pipeline_object;
+	const bool  kernel_verify = m_kernel_verify && m_run_active && !m_run_pipeswap;
+	if (kernel_verify) {
+		ContKernel::Check(ContKernel::Topology, topology == m_kernel_record.topology);
+		ContKernel::Check(ContKernel::Restart, primitive_restart_enable == m_kernel_record.primitive_restart);
+		if (kernel_valid) {
+			ContKernel::Check(ContKernel::Pipeline, pipeline_object == m_kernel_record.pipeline);
+		}
+	}
 	CommitStats::StepMark(CommitStats::Step::PipelineSel);
 	CommitStats::Mark(CommitStats::Phase::Pipeline);
 	if (mesh_indirect) {
@@ -6105,10 +6279,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool* programs_safe = plan_statics && plan->plain_pixel == plain_pixel
 	                                ? &plan->programs_barrier_safe
 	                                : nullptr;
+	// KYTY_CONT_KERNEL: a function of the programs, plain-pixel choice, images and targets (the
+	// record's) and the sink switch.
+	const bool kernel_barrier = m_kernel && m_kernel_record.barrier_sink == BarrierSinkEnabled();
 	const bool barrier_safe =
-	    DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
-	                      feedback_aspects, indirect != nullptr, plain_pixel,
-	                      plan_verify ? nullptr : programs_safe);
+	    kernel_barrier ? m_kernel_record.barrier_safe
+	                   : DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
+	                                       feedback_aspects, indirect != nullptr, plain_pixel,
+	                                       plan_verify ? nullptr : programs_safe);
+	if (kernel_verify && kernel_valid && m_kernel_record.barrier_sink == BarrierSinkEnabled()) {
+		ContKernel::Check(ContKernel::BarrierSafe, barrier_safe == m_kernel_record.barrier_safe);
+	}
 	if (plan_verify && programs_safe != nullptr) {
 		DrawPrep::CountBindingVerifyCheck();
 		if (DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
@@ -6565,7 +6746,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitStats::StepMark(CommitStats::Step::Occlusion);
 	// KYTY_DRAW_RUN: whether the next draw may continue this one (drawPrep/drawRun.h), and in verify
 	// mode what this draw's normal path computed against what a continuation would have reused.
-	if (DrawRun::Enabled()) {
+	// KYTY_CONT_KERNEL: a kernel continuation's eligibility is its record's but for the terms that
+	// can change after the key matched (ContinuationKernelEntry checks the switches' terms).
+	const bool kernel_eligible = (m_kernel || kernel_verify) && buffer.ActiveRenderingSerial() != 0 &&
+	                             RenderStateFastEnabled(RenderStatePart::Reset) &&
+	                             !graphics_debug_dump_enabled();
+	if (m_kernel && DrawRun::Enabled()) {
+		const CommitStats::SubScope record_scope(CommitStats::Sub::RunRecord);
+		if (kernel_eligible) {
+			DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages,
+			                  bounded ? &written : nullptr, pipeline);
+		}
+	} else if (DrawRun::Enabled()) {
 		const CommitStats::SubScope record_scope(CommitStats::Sub::RunRecord);
 		if (m_run_verify) {
 			DrawRunVerify(state, rendering, feedback_aspects, stages);
@@ -6700,6 +6892,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (!continued) {
 				m_run.record_writes_ok = writes_ok;
 			}
+			if (m_run.valid) {
+				// KYTY_CONT_KERNEL_CEILING: what a continuation of this record reuses.
+				m_cont_ceiling = {&pipeline, pipeline_cache.PipelineGeneration(), m_run.key,
+				                  m_run.rendering_serial, shader_write_stages, barrier_safe};
+			}
+		}
+		if (kernel_verify) {
+			// A kernel continuation would have recorded exactly when this one did.
+			ContKernel::Check(ContKernel::Eligible, kernel_eligible == (eligible && m_run.valid));
+		}
+		if (m_run.valid && g_cont_kernel.Get() != 0) {
+			// KYTY_CONT_KERNEL: what a kernel continuation of this record reuses.
+			const auto& hw        = buffer.GetRegisters();
+			const auto  mode      = hw.GetColorControl().mode;
+			auto&       record    = m_kernel_record;
+			record.pipeline          = &pipeline;
+			record.generation        = pipeline_cache.PipelineGeneration();
+			record.key               = m_run.key;
+			record.serial            = m_run.rendering_serial;
+			record.topology          = topology;
+			record.element_size      = draw.IsIndexed() && index_source.host_data == nullptr &&
+			                                   (index_source.guest_element_size == 2 ||
+			                                    index_source.guest_element_size == 4)
+			                               ? index_source.guest_element_size
+			                               : 0u;
+			record.primitive_restart = primitive_restart_enable;
+			record.plain_pixel       = plain_pixel;
+			record.barrier_safe      = barrier_safe;
+			record.barrier_sink      = BarrierSinkEnabled();
+			record.target_ops_quiet  = (mode == 0 || mode == 1) && !DepthStencilCopyApplies(hw);
+		} else {
+			m_kernel_record.pipeline = nullptr; // switched off: no record from before switching on
 		}
 		if (DrawRun::KeyDiagEnabled()) [[unlikely]] {
 			DrawRunKeyDiagResolved(buffer, stages, pipeline, rendering, eligible && m_run.valid);
@@ -6748,6 +6972,285 @@ static bool GpuInstanceCountApplies(CommandBuffer& buffer, const HW::UserConfig&
 	       !buffer.GetRegisters().GetRenderControl().copy_depth_to_color;
 }
 
+// KYTY_CONT_KERNEL_CEILING=1 (live, default off; a phase-1 MEASUREMENT switch, unsafe, never to be
+// shipped): a DrawIndex whose structure key is the current run record's (same command buffer,
+// tick, rendering instance and activity epoch) and whose preparation validates takes a shortened
+// path: the preparation is taken and applied, the run candidate check runs, then only the per-draw
+// buffer work (stage shader data, FindBuffers/RebindBuffers, vertex and index buffers) and the packet
+// encode (vertex binds, CommitBindings, index bind, BeginRendering, pipeline bind, draw, the shader
+// write barrier). Skipped without proof: the target operations, vertex-shader / hw / draw checks, the
+// topology and pixel-shader-active decisions (the record's), the binding marks, the prefetch, the
+// late image check, the rebind-after-join check, pipeline selection (the record's pipeline), the
+// acquisition (the record's rendering state), barrier safety (the record's), the dynamic state, the
+// diagnostics hooks and the run record (only its push epoch). It measures what those cost.
+static Live::Switch g_cont_kernel_ceiling("KYTY_CONT_KERNEL_CEILING", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0; // the level (ParseDefaultOff gave 1 for any)
+});
+
+// Whether a stage of the draw has bindless heaps (such draws never continue a run).
+static bool DrawStateBindless(const DrawRenderState& state) {
+	const auto bindless_stage = [](const ShaderStageRuntime& stage) {
+		return stage.resources != nullptr && !stage.resources->bindless_heaps.empty();
+	};
+	return (state.ps_active && bindless_stage(state.ps_input_info.stage)) ||
+	       std::ranges::any_of(state.vertex_info, [&](const auto& info) { return bindless_stage(info.stage); });
+}
+
+bool RenderExecutor::ContinuationCeiling(uint64_t submit_id, CommandBuffer& buffer,
+                                         const DrawIndexArgs& args) {
+	(void)submit_id;
+	auto&       ucfg  = buffer.GetUserConfig();
+	auto&       state = *m_draw_state;
+	auto* const saved_prepared = m_prepared_draw;
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance};
+	static std::atomic<uint64_t> taken {0};
+	static std::atomic<uint64_t> declined {0};
+	if (saved_prepared == nullptr || !saved_prepared->ok) {
+		declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	state.ps_active = m_run.ps_active;
+	RefreshShaders(buffer, draw, state);
+	// KYTY_CONT_KERNEL_CEILING=2: also the late check's image and command test, before the buffer work
+	// (a texture refreshed or an attachment changed since the record declines the shortened path).
+	// The candidate's own precondition (PrepareDrawRenderState): no bindless heaps (a record can be
+	// a bindless draw; its continuations never are). Missing in 08782ad5d.
+	if (!m_prepared_validated || state.programs.translation_pending || DrawStateBindless(state) ||
+	    !DrawRunCandidate(buffer, state, args.render_target_slice_offset) || m_run_pipeswap ||
+	    (g_cont_kernel_ceiling.Get() >= 2 &&
+	     (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true)))) {
+		// The normal path from the start: the preparation back, as it was before RefreshShaders
+		// (ApplyPreparedDraw swapped the stage preps: swapping again restores both sides).
+		if (m_prepared_validated && saved_prepared != nullptr) {
+			SwapPreparedStage(state.stage_preps.vertex[0], saved_prepared->vertex_prep);
+			for (uint32_t i = 1; i < saved_prepared->vertex_stages; i++) {
+				SwapPreparedStage(state.stage_preps.vertex[i], saved_prepared->tess_prep[i - 1]);
+			}
+			if (saved_prepared->pixel_active) {
+				SwapPreparedStage(state.stage_preps.pixel, saved_prepared->pixel_prep);
+			}
+		}
+		m_prepared_draw        = saved_prepared;
+		m_binding_plan_active  = false;
+		m_prepared_validated   = false;
+		m_run_pipeswap         = false;
+		declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	if (const auto n = taken.fetch_add(1, std::memory_order_relaxed) + 1; (n & 0x3ffffu) == 0) {
+		std::printf("ContKernelCeiling: %" PRIu64 " continuations taken, %" PRIu64 " declined\n", n,
+		            declined.load(std::memory_order_relaxed));
+	}
+	m_run_active         = true;
+	m_run_slice_offset   = args.render_target_slice_offset;
+	state.color_count         = m_run.color_count;
+	state.color_slots_written = m_run.color_slots;
+
+	DrawIndexBufferSource index_source {};
+	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
+	if (static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex16) {
+		index_source.type               = vk::IndexType::eUint16;
+		index_source.guest_element_size = 2;
+	} else {
+		index_source.type               = vk::IndexType::eUint32;
+		index_source.guest_element_size = 4;
+	}
+	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	const auto [vertex_offset, instance_offset] =
+	    ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+	DrawEmitInfo emit {};
+	emit.vertex_offset  = vertex_offset + args.base_vertex;
+	emit.first_instance = instance_offset;
+
+	// The per-draw buffer work.
+	auto* const plan     = m_binding_plan_active ? m_binding_plan : nullptr;
+	auto&       bindings = m_graphics_bindings;
+	std::array<PreparedBindings*, 2> descriptor_stages {};
+	uint32_t                         stage_count = 0;
+	PrepareBindingsContinuation(state.vertex_info[0].stage, bindings.vertex[0],
+	                            plan != nullptr ? &plan->vertex : nullptr);
+	descriptor_stages[stage_count++] = &bindings.vertex[0];
+	if (state.ps_active) {
+		PrepareBindingsContinuation(state.ps_input_info.stage, *bindings.pixel,
+		                            plan != nullptr && plan->pixel_active ? &plan->pixel : nullptr);
+		descriptor_stages[stage_count++] = &*bindings.pixel;
+	}
+	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count}, true);
+	PreparedVertexBuffers vertex_bindings;
+	{
+		const DrawPrep::VertexRangePlan* vertex_ranges = nullptr;
+		if (plan != nullptr && plan->vertex_ranges.valid &&
+		    plan->vertex_ranges.buffer_count == static_cast<uint32_t>(state.vertex_info[0].buffers_num) &&
+		    plan->vm_generation == LibKernel::Memory::VirtualRangesGeneration()) {
+			vertex_ranges = &plan->vertex_ranges;
+		}
+		if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+			AcquireVertexBuffersInto(buffer, state.vertex_info[0], vertex_ranges, vertex_bindings);
+		} else {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_ranges);
+		}
+	}
+	auto index_binding = PrepareIndexBuffer(buffer, index_source);
+	// KYTY_CONT_KERNEL_CEILING=3: also KYTY_REBIND_AFTER_JOIN (as ExecutePreparedDraw).
+	if (g_cont_kernel_ceiling.Get() >= 3 && RebindAfterJoinEnabled()) {
+		auto& cache = m_context.GetBufferCache();
+		for (uint32_t pass = 0; pass < 4 && cache.UnregisterEpoch() != m_rebind_epoch; pass++) {
+			m_rebind_epoch = cache.UnregisterEpoch();
+			{
+				const BufferCache::UploadBatch upload_batch(cache);
+				for (auto* stage: stages) {
+					RebindBuffers(*stage);
+				}
+			}
+			vertex_bindings = PreparedVertexBuffers {};
+			if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+				AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+			} else {
+				vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
+			}
+			index_binding = PrepareIndexBuffer(buffer, index_source);
+		}
+	}
+
+	// The packet encode, with the record's pipeline, rendering state and barrier safety.
+	const auto& pipeline   = *m_cont_ceiling.pipeline;
+	const auto  rendering  = m_run.rendering;
+	m_depth_feedback.valid = false;
+	const CommandBuffer::DrawScope draw_scope(buffer, m_cont_ceiling.barrier_safe);
+	const auto                     vk_buffer = buffer.EmissionSink();
+	CommitVertexBuffers(vk_buffer, vertex_bindings);
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, true);
+	CommitIndexBuffer(vk_buffer, index_binding);
+	m_context.GetCommandScheduler().BeginRendering(rendering);
+	buffer.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	m_dynamic_state.command  = vk_buffer.Identity();
+	m_dynamic_state.pipeline = pipeline.pipeline;
+	if (state.color_count == 0) {
+		m_dynamic_state.color_write_valid = false;
+	}
+	if (const auto planes = state.vertex_info[0].user_clip_planes; planes != 0) {
+		uint32_t count = 0;
+		for (uint32_t mask = planes; mask != 0; mask >>= 1u) {
+			count++;
+		}
+		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		                        vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
+		                        ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
+		                        count * 4u * sizeof(uint32_t),
+		                        buffer.GetRegisters().GetUserClipPlanes().data());
+	}
+	if (state.ps_active && state.ps_input_info.HasObjprimOutput()) {
+		const vk::ShaderStageFlags objprim_stages =
+		    vk::ShaderStageFlagBits::eFragment | NativeShaderStage(state.vertex_info[0].logical_stage);
+		const uint32_t object_id = ucfg.GetObjectId();
+		vk_buffer.pushConstants(pipeline.pipeline_layout, objprim_stages,
+		                        uint32_t {state.ps_input_info.objprim_push_dword} * 4u,
+		                        sizeof(object_id), &object_id);
+		buffer.InvalidatePushConstants();
+	}
+	EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	if (const auto write_stages = m_cont_ceiling.write_stages; write_stages) {
+		if (GuestSyncBarriersEnabled()) {
+			m_indirect_barrier_rendering = 0;
+		} else if (DrawWriteSinkEnabled()) {
+			ShaderWriteBarrier(buffer, write_stages);
+			m_indirect_barrier_rendering = 0;
+		} else {
+			m_context.GetCommandScheduler().EndRendering();
+			ShaderWriteBarrier(buffer, write_stages);
+		}
+	}
+	// The run record: only what a continuation changes. A command buffer, tick or rendering
+	// instance that changed during the buffer work ends the run (the late check's inputs).
+	m_run.push_epoch = buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics);
+	m_run.valid      = buffer.Identity() == m_run.command &&
+	              m_context.GetCommandScheduler().CurrentTick() == m_run.tick &&
+	              buffer.ActiveRenderingSerial() != 0 &&
+	              buffer.ActiveRenderingSerial() == m_run.rendering_serial;
+	ResetBindings();
+	return true;
+}
+
+// KYTY_CONT_KERNEL (above ExecutePreparedDraw): whether the committed DrawIndex may take the kernel.
+bool RenderExecutor::ContinuationKernelEntry(const DrawIndexArgs& args) const {
+	const auto& record = m_kernel_record;
+	const auto  type   = static_cast<Prospero::IndexType>(args.index_type_and_size);
+	const uint32_t element_size = type == Prospero::IndexType::kIndex16   ? 2u
+	                              : type == Prospero::IndexType::kIndex32 ? 4u
+	                                                                       : 0u;
+	return m_in_engine_commit && m_run_prev_valid && m_run_key != 0 && m_run_key == m_run.key &&
+	       record.pipeline != nullptr && record.key == m_run.key && record.serial == m_run.rendering_serial &&
+	       record.target_ops_quiet && element_size != 0 && record.element_size == element_size &&
+	       args.offset_source == DrawOffsetSource::DrawState && args.gpu_instance_address == 0 &&
+	       DrawRun::Enabled() && DrawRun::GetMode() == DrawRun::Mode::On && DrawRun::ContEligibleMode() == 1 &&
+	       !DrawRun::KeyDiagEnabled() && DrawRun::WritesEnabled() == m_run.record_writes_ok &&
+	       g_cube_every.Get() <= 1 && !graphics_debug_dump_enabled() && !ListResetEnabled();
+}
+
+// KYTY_CONT_KERNEL=1: the continuation kernel's front. The preparation is taken, validated (with the
+// record's pixel-shader activity: Validate compares it with the preparation's own) and applied; the
+// run candidate check decides. A draw that is not a continuation gets its preparation back and runs
+// the normal path from the start. False then.
+bool RenderExecutor::ContinuationKernel(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args) {
+	auto&       ucfg           = buffer.GetUserConfig();
+	auto&       state          = *m_draw_state;
+	auto* const saved_prepared = m_prepared_draw;
+	auto&       counters       = ContKernel::g_counters;
+	if (saved_prepared == nullptr || !saved_prepared->ok) {
+		counters.declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance};
+	state.ps_active = m_run.ps_active;
+	g_apply_keyed_skip = static_cast<int>(g_cont_kernel_inplace.Get());
+	RefreshShaders(buffer, draw, state);
+	g_apply_keyed_skip = 0;
+	if (!m_prepared_validated || state.programs.translation_pending || ContKernel::Bindless(state) ||
+	    !DrawRunCandidate(buffer, state, args.render_target_slice_offset) || m_run_pipeswap) {
+		// ApplyPreparedDraw swapped the stage preps: swapping again restores both sides.
+		if (m_prepared_validated) {
+			SwapPreparedStage(state.stage_preps.vertex[0], saved_prepared->vertex_prep);
+			for (uint32_t i = 1; i < saved_prepared->vertex_stages; i++) {
+				SwapPreparedStage(state.stage_preps.vertex[i], saved_prepared->tess_prep[i - 1]);
+			}
+			if (saved_prepared->pixel_active) {
+				SwapPreparedStage(state.stage_preps.pixel, saved_prepared->pixel_prep);
+			}
+		}
+		m_prepared_draw       = saved_prepared;
+		m_binding_plan_active = false;
+		m_prepared_validated  = false;
+		m_run_pipeswap        = false;
+		counters.declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	ContKernel::NoteTaken();
+	m_run_slice_offset        = args.render_target_slice_offset;
+	state.color_count         = m_run.color_count;
+	state.color_slots_written = m_run.color_slots;
+	m_run_active              = true;
+	DrawRunMarkBindings();
+
+	DrawIndexBufferSource index_source {};
+	index_source.address            = reinterpret_cast<uint64_t>(args.index_addr);
+	index_source.guest_element_size = m_kernel_record.element_size;
+	index_source.type = m_kernel_record.element_size == 2 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+	DrawEmitInfo emit {};
+	emit.vertex_offset  = vertex_offset + args.base_vertex;
+	emit.first_instance = instance_offset;
+	m_kernel = true;
+	ExecutePreparedDraw(submit_id, buffer, draw, state, m_kernel_record.topology, emit, index_source,
+	                    m_kernel_record.primitive_restart);
+	m_kernel = false;
+	ResetBindings();
+	return true;
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_GPU_OP_SITE("draw.index");
@@ -6791,22 +7294,47 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		PassCensus::Drop('d', 0, "skipped: zero indices or instances");
 		return;
 	}
+	// KYTY_CONT_KERNEL_CEILING (above): the record's key, instance and pipeline generation.
+	if (g_cont_kernel_ceiling.On() && m_in_engine_commit && m_run_prev_valid && m_run_key != 0 &&
+	    m_run_key == m_run.key && m_cont_ceiling.pipeline != nullptr && m_cont_ceiling.key == m_run.key &&
+	    m_cont_ceiling.serial == m_run.rendering_serial &&
+	    m_cont_ceiling.generation == m_context.GetPipelineCache().PipelineGeneration() &&
+	    DrawRun::Enabled() && DrawRun::GetMode() == DrawRun::Mode::On &&
+	    args.offset_source == DrawOffsetSource::DrawState && args.gpu_instance_address == 0 &&
+	    (static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex16 ||
+	     static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex32) &&
+	    !graphics_debug_dump_enabled() && ContinuationCeiling(submit_id, buffer, args)) {
+		return;
+	}
+	// KYTY_CONT_KERNEL (above ExecutePreparedDraw).
+	if (const auto kernel_mode = g_cont_kernel.Get(); kernel_mode != 0 && ContinuationKernelEntry(args)) {
+		if (kernel_mode == 1) {
+			if (ContinuationKernel(submit_id, buffer, args)) {
+				return;
+			}
+		} else {
+			m_kernel_verify = true;
+			ContKernel::g_counters.draws.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		PassCensus::Drop('d', 0, "consumed: metadata colour op / depth-stencil copy / colour resolve");
+		if (m_kernel_verify) {
+			ContKernel::Check(ContKernel::TargetOps, false); // an upper bound: the kernel skips these
+		}
 		ResetBindings();
 		return;
 	}
 	CommitStats::StepMark(CommitStats::Step::TargetOps);
 
-	if (!DrawHasValidVertexShader(sh_ctx)) {
-		PassCensus::Drop('d', 0, "skipped: no valid vertex shader");
-		return;
-	}
-	if (SkipCubeDraw(buffer)) {
-		PassCensus::Drop('d', 0, "skipped: SkipCubeDraw");
+	if (!DrawHasValidVertexShader(sh_ctx) || SkipCubeDraw(buffer)) {
+		PassCensus::Drop('d', 0, "skipped: no valid vertex shader / SkipCubeDraw");
+		if (m_kernel_verify) {
+			ContKernel::Check(ContKernel::VsCheck, false); // an upper bound, as above
+		}
 		return;
 	}
 

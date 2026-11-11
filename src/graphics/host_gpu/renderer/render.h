@@ -1330,6 +1330,13 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// KYTY_CONT_KERNEL_CEILING (renderDraw.cpp; unsafe measurement switch): the shortened path of a
+	// DrawIndex continuation. False, with the draw's preparation handed back, when it does not apply.
+	[[nodiscard]] bool ContinuationCeiling(uint64_t submit_id, CommandBuffer& buffer,
+	                                       const DrawIndexArgs& args);
+	// PrepareBindings for a continuation stage (keep_images): no GDS, no bindless heaps, no verify.
+	void PrepareBindingsContinuation(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                                 DrawPrep::StagePlan* plan);
 	// written: DrawScissorUnion of the draw (nullptr: the whole colour targets may be written).
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
@@ -1707,6 +1714,36 @@ private:
 	uint64_t      m_run_targets_key    = 0;     // and its registers' part (KYTY_DRAW_RUN_TARGETS)
 	uint64_t      m_run_swap_key       = 0;     // and the key without the vertex program (PIPESWAP)
 	bool          m_run_pipeswap       = false; // KYTY_DRAW_RUN_PIPESWAP: the continuation swaps
+	// KYTY_CONT_KERNEL_CEILING: what the draw that last recorded m_run resolved (its pipeline,
+	// barrier safety, shader write stages), for the record of this key and rendering instance.
+	struct ContCeilingRecord {
+		const PipelineCache::Pipeline* pipeline     = nullptr;
+		uint64_t                       generation   = 0;
+		uint64_t                       key          = 0;
+		uint64_t                       serial       = 0;
+		vk::PipelineStageFlags         write_stages = {};
+		bool                           barrier_safe = false;
+	} m_cont_ceiling;
+	// KYTY_CONT_KERNEL (renderDraw.cpp): what the draw that last recorded m_run (not through the
+	// kernel) resolved, which a kernel continuation of the same key and rendering instance reuses.
+	struct ContKernelRecord {
+		const PipelineCache::Pipeline* pipeline          = nullptr;
+		uint64_t                       generation        = 0;
+		uint64_t                       key               = 0;
+		uint64_t                       serial            = 0;
+		vk::PrimitiveTopology          topology          = vk::PrimitiveTopology::ePointList;
+		uint32_t                       element_size      = 0; // 2 or 4: an indexed draw without host indices
+		bool                           primitive_restart = false;
+		bool                           plain_pixel       = false;
+		bool                           barrier_safe      = false;
+		bool                           barrier_sink      = false;
+		bool                           target_ops_quiet  = false; // colour mode 0/1, no depth-stencil copy
+	} m_kernel_record;
+	bool m_kernel        = false; // KYTY_CONT_KERNEL=1: the committed draw takes the kernel
+	bool m_kernel_verify = false; // KYTY_CONT_KERNEL=2: the committed draw would have
+	[[nodiscard]] bool ContinuationKernelEntry(const DrawIndexArgs& args) const;
+	[[nodiscard]] bool ContinuationKernel(uint64_t submit_id, CommandBuffer& buffer,
+	                                      const DrawIndexArgs& args);
 	// KYTY_DRAW_RUN_PIPESWAP: the kept vertex-stage bindings and claims fit the new vertex program.
 	[[nodiscard]] static bool DrawRunPipeSwapCompatible(
 	    const ShaderRecompiler::IR::CompiledShaderInfo& recorded,

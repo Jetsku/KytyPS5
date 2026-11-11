@@ -4807,6 +4807,32 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	PrepareBindlessHeaps(runtime, prepared);
 }
 
+// KYTY_CONT_KERNEL_CEILING (renderDraw.cpp): PrepareBindings(keep_images) of a continuation, whose
+// record excluded GDS and bindless heaps (the same programs), without the verify paths.
+void RenderExecutor::PrepareBindingsContinuation(const ShaderStageRuntime& runtime,
+                                                 PreparedBindings& prepared, DrawPrep::StagePlan* plan) {
+	const auto& program      = *runtime.program;
+	prepared.runtime             = &runtime;
+	prepared.xframe_verify_views = false;
+	prepared.plan                = plan;
+	prepared.plan_shader_data    = false;
+	prepared.flattened_srt      = {};
+	prepared.shader_data_buffer = {};
+	prepared.shared_memory      = {};
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
+	const auto dwords = program.bindings.ShaderDataDwords();
+	if (plan != nullptr && plan->shader_data_valid && plan->shader_data.size() == dwords) {
+		prepared.shader_data.swap(plan->shader_data);
+		prepared.plan_shader_data = true;
+	} else {
+		prepared.shader_data.clear();
+		prepared.shader_data.reserve(dwords);
+		AppendUserShaderData(program, *runtime.resources, prepared.shader_data);
+		prepared.shader_data.resize(dwords);
+	}
+}
+
 // The binding range is stride * NUM_RECORDS (NUM_RECORDS bytes without a stride) whatever the
 // V# OOB_SELECT (RDNA2 ISA 8.1.5, Table 35: 0 also checks offset < stride, 1 checks the index
 // only, 2 disables the check, 3 counts NUM_RECORDS in bytes). Log each OOB_SELECT / stride /
