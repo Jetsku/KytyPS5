@@ -196,6 +196,34 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// KYTY_KEEP_BINDINGS (descriptors.cpp, RebindBuffers; GPU thread): a read binding (not written,
+	// not a texel read) whose ObtainBuffer was a cache-buffer result the binding memo now holds keeps
+	// that result for the next identical binding while nothing it depends on moved: no region serial
+	// anywhere (RegionManager::AnySerial, so every RangeSignature is unchanged), the same sync epoch
+	// and buffer structure epoch (the memo's guard). A normal lookup then hits the same memo entry
+	// (same key, signature, guard and epoch) and returns the same buffer and offset; the keep only
+	// repeats the hit's touch. KeepBegin is read before the lookup, KeepCapture after it.
+	struct KeepStamp {
+		uint64_t token     = 0; // 0: no capture
+		uint64_t epoch     = 0;
+		uint64_t structure = 0;
+	};
+	struct KeptRead {
+		KeepStamp stamp {};
+		uint64_t  vaddr   = 0;
+		uint64_t  size    = 0;
+		BufferId  id {};
+		Buffer*   buffer  = nullptr;
+		uint64_t  offset  = 0;
+		uint64_t  touched = UINT64_MAX;
+	};
+	[[nodiscard]] KeepStamp KeepBegin() const noexcept;
+	// True when `kept` now holds a result a later KeepValid may return.
+	bool KeepCapture(KeptRead& kept, const KeepStamp& stamp, uint64_t vaddr, uint64_t size, BufferId id,
+	                 const std::pair<Buffer*, uint64_t>& result);
+	// Whether ObtainBuffer(vaddr, size, false, false, id) would return kept's buffer and offset now
+	// (then touched as a hit is).
+	[[nodiscard]] bool KeepValid(KeptRead& kept, uint64_t vaddr, uint64_t size, BufferId id);
 	// KYTY_RAW_READ_IMAGE_SYNC=1 (default off; Ghost of Yotei preset): a shader's raw (unformatted)
 	// read-only binding whose range starts at a GPU-modified image takes the image's contents
 	// first, as a texel read does (SynchronizeBufferFromImage); the caller passes the buffer its
