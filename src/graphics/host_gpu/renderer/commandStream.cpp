@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandStream.h"
 #include "common/ramStats.h"
 
+#include "common/handoffLean.h"
 #include "common/hangWatchdog.h"
 #include "common/spinGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
@@ -736,8 +737,18 @@ uint8_t* Ring::Reserve(uint32_t bytes, const WaitPolicy& policy, WaitStats& stat
 
 void Ring::Kick(WaitStats& stats) noexcept {
 	m_last_published = m_write;
-	m_published.store(m_write, std::memory_order_seq_cst);
-	if (m_consumer_parked.load(std::memory_order_seq_cst) != 0) {
+	// KYTY_HANDOFF_LEAN (common/handoffLean.h): a release store and a relaxed load of the parked
+	// word; WaitPublished's process-wide store-buffer flush keeps the wake.
+	bool parked = false;
+	if (Common::HandoffLean::On()) {
+		m_published.store(m_write, std::memory_order_release);
+		Common::HandoffLean::CompilerBarrier();
+		parked = m_consumer_parked.load(std::memory_order_relaxed) != 0;
+	} else {
+		m_published.store(m_write, std::memory_order_seq_cst);
+		parked = m_consumer_parked.load(std::memory_order_seq_cst) != 0;
+	}
+	if (parked) {
 		m_consumer_bell.fetch_add(1, std::memory_order_release);
 		m_consumer_bell.notify_one();
 		stats.wakes++;
@@ -804,6 +815,7 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 		for (;;) {
 			const auto bell = m_consumer_bell.load(std::memory_order_acquire);
 			m_consumer_parked.store(1, std::memory_order_seq_cst);
+			Common::HandoffLean::ParkFence(); // KYTY_HANDOFF_LEAN: before the re-check
 			m_published_cache = m_published.load(std::memory_order_seq_cst);
 			if (m_published_cache != m_read || stop.load(std::memory_order_seq_cst)) {
 				break;

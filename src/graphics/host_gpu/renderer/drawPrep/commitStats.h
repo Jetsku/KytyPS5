@@ -171,6 +171,7 @@ enum class Step : uint8_t {
 	RunRecord,      // the run eligibility and record
 	ResetBindings,  // DrawIndex: ResetBindings
 	CommitTail,     // Engine::Commit: plan count, repeat trace, register restore, after-commit
+	KernelEntry,    // KYTY_CONT_KERNEL: the kernel's entry test (ContinuationKernelEntry)
 	Calib,          // an empty step (the boundary's own cost)
 	Count
 };

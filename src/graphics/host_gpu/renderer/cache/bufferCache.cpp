@@ -4865,6 +4865,79 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBindingMemo(uint64_t vaddr, 
 	return result;
 }
 
+BufferCache::KeepStamp BufferCache::KeepBegin() const noexcept {
+	if (!RegionManager::AnySerialEnabled() || m_binding_memo == nullptr) {
+		return {};
+	}
+	// The token first: a serial advance after it is seen by KeepValid.
+	KeepStamp stamp;
+	stamp.token     = RegionManager::AnySerial();
+	stamp.epoch     = SyncEpoch::Current();
+	stamp.structure = m_bda_structure_epoch.load(std::memory_order_acquire);
+	return stamp;
+}
+
+bool BufferCache::KeepCapture(KeptRead& kept, const KeepStamp& stamp, uint64_t vaddr, uint64_t size,
+                              BufferId id, const std::pair<Buffer*, uint64_t>& result) {
+	kept.stamp.token = 0;
+	if (stamp.token == 0 || result.first == nullptr || result.first == &m_stream_buffer ||
+	    size >= BindingMemoMaxSize || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// The entry the lookup used (ObtainReadBindingMemo's choice of the hot or the full slot): a
+	// cache-buffer result taken or recorded under the stamp's epoch and buffer structure.
+	const auto& full    = BindingMemoSlot(vaddr, size);
+	const auto& hot     = BindingHotMemoSlot(vaddr, size);
+	const bool  hot_key = m_binding_hot_enabled && hot.kind != BindingMemoKind::Empty && hot.vaddr == vaddr &&
+	                     hot.size == size;
+	const auto& memo    = hot_key ? hot : full;
+	if (memo.kind != BindingMemoKind::Cached || memo.vaddr != vaddr || memo.size != size ||
+	    memo.epoch != stamp.epoch || memo.guard != stamp.structure || memo.buffer != result.first ||
+	    memo.offset != result.second) {
+		return false;
+	}
+	kept.stamp   = stamp;
+	kept.vaddr   = vaddr;
+	kept.size    = size;
+	kept.id      = id;
+	kept.buffer  = result.first;
+	kept.offset  = result.second;
+	kept.touched = m_gc_tick; // the lookup touched it (or recorded it after obtaining it)
+	return true;
+}
+
+bool BufferCache::KeepValid(KeptRead& kept, uint64_t vaddr, uint64_t size, BufferId id) {
+	if (kept.stamp.token == 0 || kept.vaddr != vaddr || kept.size != size || kept.id != id ||
+	    RegionManager::AnySerial() != kept.stamp.token || SyncEpoch::Current() != kept.stamp.epoch ||
+	    m_bda_structure_epoch.load(std::memory_order_acquire) != kept.stamp.structure ||
+	    m_scheduler.Current().IsInvalid()) {
+		return false;
+	}
+	// The normal lookup must still find the entry: another range's record may have replaced it, and
+	// a lookup that misses decides again (over hot pages written since, too). The slot it would
+	// read (ObtainReadBindingMemo's hot or full choice, including the hot table's reset on a new
+	// generation) holds the key, the kept result, the epoch and the guard; its signature is the one
+	// the kept lookup checked or recorded, as no region serial moved.
+	const auto  generation = g_binding_hot_generation.load(std::memory_order_relaxed);
+	const auto& full       = BindingMemoSlot(vaddr, size);
+	const auto& hot        = BindingHotMemoSlot(vaddr, size);
+	const bool  hot_key    = g_binding_hot_memo.On() && generation != UINT64_MAX &&
+	                     m_binding_hot_generation == generation && hot.kind != BindingMemoKind::Empty &&
+	                     hot.vaddr == vaddr && hot.size == size;
+	const auto& memo       = hot_key ? hot : full;
+	if (memo.kind != BindingMemoKind::Cached || memo.vaddr != vaddr || memo.size != size ||
+	    memo.epoch != kept.stamp.epoch || memo.guard != kept.stamp.structure || memo.buffer != kept.buffer ||
+	    memo.offset != kept.offset) {
+		return false;
+	}
+	// A hit's touch: within one GC tick a repeated touch changes nothing (KYTY_BINDING_MEMO_TOUCH).
+	if (kept.touched != m_gc_tick) {
+		TouchBuffer(*kept.buffer);
+		kept.touched = m_gc_tick;
+	}
+	return true;
+}
+
 bool BufferCache::TryLeanReadMiss(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
                                   BufferId id, std::pair<Buffer*, uint64_t>& result) {
 	if (before == 0 || !m_relaxed_queries || IsBufferInvalid(id) ||

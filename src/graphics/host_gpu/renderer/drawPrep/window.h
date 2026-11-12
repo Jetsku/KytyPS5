@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WINDOW_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WINDOW_H_
 
+#include "common/handoffLean.h"
 #include "common/ramStats.h"
 
 #include <atomic>
@@ -92,9 +93,16 @@ public:
 
 	// Retires the head after its commit.
 	void Retire() noexcept {
-		const auto head = Head();
+		const auto head = m_head.load(std::memory_order_relaxed); // only this thread writes it
 		m_slots[head & m_mask].state.store(Encode(head, State::Free), std::memory_order_relaxed);
-		m_head.store(head + 1u, std::memory_order_seq_cst);
+		// KYTY_HANDOFF_LEAN (common/handoffLean.h): a release store. The sequencer parks on the
+		// executed-op word, not on the head: CpSeq::Sequencer::NoteExecuted follows every retire
+		// and its lean handshake (or seq_cst one) covers this store too.
+		if (Common::HandoffLean::On()) {
+			m_head.store(head + 1u, std::memory_order_release);
+		} else {
+			m_head.store(head + 1u, std::memory_order_seq_cst);
+		}
 	}
 
 	// Workers.

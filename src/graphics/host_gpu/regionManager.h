@@ -514,7 +514,28 @@ public:
 
 private:
 	// Callers hold `lock`: the serial advances before the bits it describes change.
-	void Bump() noexcept { m_serial.fetch_add(1, std::memory_order_release); }
+	void Bump() noexcept {
+		m_serial.fetch_add(1, std::memory_order_release);
+		if (s_any_serial_on.load(std::memory_order_seq_cst)) {
+			s_any_serial.fetch_add(1, std::memory_order_seq_cst);
+		}
+	}
+
+public:
+	// KYTY_KEEP_BINDINGS (descriptors.cpp, BufferCache::KeepReadBinding): once enabled (sticky),
+	// every serial advance of any region also advances this process-wide token, so a token read
+	// before a RangeSignature and unchanged later proves that no region serial moved in between.
+	// A Bump that read the flag as unset completed its serial advance (a locked RMW) before the
+	// flag store became visible, so a signature read after enabling includes it.
+	static void EnableAnySerial() noexcept { s_any_serial_on.store(true, std::memory_order_seq_cst); }
+	[[nodiscard]] static bool AnySerialEnabled() noexcept {
+		return s_any_serial_on.load(std::memory_order_acquire);
+	}
+	[[nodiscard]] static uint64_t AnySerial() noexcept { return s_any_serial.load(std::memory_order_acquire); }
+
+private:
+	static inline std::atomic<bool>     s_any_serial_on {false};
+	static inline std::atomic<uint64_t> s_any_serial {1};
 	// Callers hold `lock`, before pages become CPU-dirty (Dirtied).
 	void BumpDirtied() noexcept { m_dirtied.fetch_add(1, std::memory_order_release); }
 

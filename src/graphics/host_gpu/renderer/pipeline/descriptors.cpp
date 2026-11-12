@@ -54,6 +54,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -355,7 +356,8 @@ static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
                     uint32_t slot, uint32_t& buffer_offset,
-                    const std::vector<GuestRange>* written_ranges, bool uniform_view) {
+                    const std::vector<GuestRange>* written_ranges, bool uniform_view,
+                    std::pair<Buffer*, uint64_t>* obtained = nullptr) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -392,6 +394,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
 	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                     sync_images, id);
+	if (obtained != nullptr) {
+		*obtained = {buffer, offset}; // KYTY_KEEP_BINDINGS (RebindBuffers)
+	}
 	if (!resource.written && !sync_images && BufferCache::RawReadImageSyncEnabled()) {
 		// KYTY_RAW_READ_IMAGE_SYNC (BufferCache::SyncRawReadFromWrittenImage).
 		(void)context.GetBufferCache().SyncRawReadFromWrittenImage(*buffer, address, size);
@@ -5347,6 +5352,96 @@ static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&       
 	return narrowed ? &scratch.ranges : nullptr;
 }
 
+// KYTY_BINDING_SAME_STATS=1 (diagnostic, KYTY_CP_DIAGNOSTICS builds only): per binding class, how
+// often a buffer binding's source (address, size, cache id) equals the previous RebindBuffers' of the
+// same program at the same slot, how often KYTY_KEEP_BINDINGS could keep it (keepable: its check
+// passes; the normal path runs and verify compares), and the TSC time of NativeStorageBuffer for
+// same / different ones. One console line every 2^20 bindings. GPU thread only.
+namespace BindingSame {
+enum Class : uint32_t { VsRead, VsTexel, PsRead, PsTexel, Written, ClassCount };
+constexpr const char* kNames[ClassCount] = {"vs-read", "vs-texel", "ps-read", "ps-texel", "written"};
+constexpr uint32_t    kSlots             = 64;
+struct Stage {
+	const void*                                        program = nullptr;
+	std::array<PreparedBindings::BufferSource, kSlots> sources {};
+};
+struct Totals {
+	std::array<uint64_t, ClassCount> total {}, same {}, keepable {}, same_ticks {}, diff_ticks {};
+	uint64_t                         bindings = 0;
+	std::array<Stage, 2>             stages {};
+};
+bool Enabled() {
+#if !KYTY_CP_DIAGNOSTICS
+	return false;
+#else
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDING_SAME_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+#endif
+}
+Totals& Get() {
+	static Totals totals;
+	return totals;
+}
+void Print(Totals& t) {
+	std::string line = "BindingSame:";
+	for (uint32_t c = 0; c < ClassCount; c++) {
+		const double total = static_cast<double>(std::max<uint64_t>(1, t.total[c]));
+		line += fmt::format(" {} {} same {:.1f}% keepable {:.1f}% ticks same {} diff {} |", kNames[c], t.total[c],
+		                    100.0 * static_cast<double>(t.same[c]) / total,
+		                    100.0 * static_cast<double>(t.keepable[c]) / total, t.same_ticks[c], t.diff_ticks[c]);
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+	t.total      = {};
+	t.same       = {};
+	t.keepable   = {};
+	t.same_ticks = {};
+	t.diff_ticks = {};
+}
+} // namespace BindingSame
+
+// KYTY_KEEP_BINDINGS (live, default 0; 1 on, 2 verify): a vertex or pixel stage's read buffer binding
+// (not written, not a texel read, not synchronized with images) whose source (address, size, cache
+// id) and uniform view equal the binding kept at its slot, while BufferCache::KeepValid holds (no
+// region serial anywhere, sync epoch or buffer structure moved since the kept lookup began), takes the
+// kept descriptor and offset: the binding memo would hit the same entry, so the lookup, the range
+// signature and the descriptor arithmetic are skipped (the hit's touch is repeated). Idea from
+// chenxiao07's KYTY_TABLE_GATHER_MEMO (a V# unchanged at its index keeps its resolved entry, his
+// fe9f2e4ff / 7de6fd9e7), here with an exact validity check instead of word equality alone.
+// 2 = verify: the normal path runs and its descriptor and offset are compared ("KeepBindings verify").
+// Per thread (GPU thread): the kept state is valid for any executor, as its checks are the cache's.
+static Live::Switch g_keep_bindings("KYTY_KEEP_BINDINGS", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+});
+namespace KeepBindings {
+constexpr uint32_t kSlots = 64;
+struct Stage {
+	std::array<BufferCache::KeptRead, kSlots>     reads {};
+	std::array<vk::DescriptorBufferInfo, kSlots> infos {};
+	std::array<uint32_t, kSlots>                  offsets {};
+	std::array<bool, kSlots>                      uniform {};
+};
+struct State {
+	std::array<Stage, 2> stages {};
+	uint64_t             lookups = 0, kept = 0, captures = 0, checks = 0, mismatches = 0;
+};
+State& Get() {
+	static thread_local State state;
+	return state;
+}
+void Note(State& s) {
+	if ((++s.lookups & 0x3fffffu) == 0) {
+		std::printf("KeepBindings: lookups %" PRIu64 " kept %" PRIu64 " captured %" PRIu64 " verify checks %" PRIu64
+		            " mismatches %" PRIu64 "\n",
+		            s.lookups, s.kept, s.captures, s.checks, s.mismatches);
+		std::fflush(stdout);
+	}
+}
+} // namespace KeepBindings
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	prepared.write_preparation_tick = BufferCache::ShaderWriteRetickEnabled()
@@ -5392,6 +5487,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	CommitStats::StepMark(CommitStats::Step::RbHead);
 	const auto* uniform_binding = ShaderRecompiler::IR::FindBinding(
 	    program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UniformBuffers);
+	// KYTY_KEEP_BINDINGS (above): which read bindings may keep the previous identical one.
+	const int  keep_mode  = static_cast<int>(g_keep_bindings.Get());
+	const bool keep_probe = BindingSame::Enabled(); // diagnostics: how often a keep would apply
+	const bool keep_stage = (keep_mode != 0 || keep_probe) &&
+	                        (program.stage == ShaderType::Vertex || program.stage == ShaderType::Pixel) &&
+	                        !BufferCache::RawReadImageSyncEnabled();
+	const bool keep_sync_reads = keep_stage && Config::SyncRawImageBuffersEnabled();
+	if (keep_stage && !RegionManager::AnySerialEnabled()) {
+		RegionManager::EnableAnySerial();
+	}
+	auto& keep_state = KeepBindings::Get();
+	auto& keep_slots = keep_state.stages[program.stage == ShaderType::Pixel ? 1 : 0];
+	auto& cache      = m_context.GetBufferCache();
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t   buffer_offset = 0;
 		const auto ranges_start  = program.info.buffers[i].written ? BufferLookupStats::Now() : 0;
@@ -5403,10 +5511,76 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		}
 		const bool uniform_view = uniform_binding != nullptr &&
 		                          std::ranges::binary_search(uniform_binding->resources, i);
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset, written, uniform_view));
+		const auto& source      = prepared.buffer_sources[i];
+		const auto& res         = program.info.buffers[i];
+		const bool  same_stats  = BindingSame::Enabled() && i < BindingSame::kSlots &&
+		                          (program.stage == ShaderType::Vertex || program.stage == ShaderType::Pixel);
+		const auto  same_start  = same_stats ? CommitStats::Now() : 0;
+		const bool  keep_slot   = keep_stage && i < KeepBindings::kSlots && !res.written && !res.formatted &&
+		                          !(res.read && keep_sync_reads) && source.address != 0 && source.size != 0;
+		bool        keep_valid  = false;
+		if (keep_slot) {
+			keep_valid = keep_slots.uniform[i] == uniform_view &&
+			             cache.KeepValid(keep_slots.reads[i], source.address, source.size, source.id);
+		}
+		if (keep_valid && keep_mode == 1) {
+			// The previous identical binding's descriptor and offset.
+			prepared.buffers.push_back(keep_slots.infos[i]);
+			buffer_offset = keep_slots.offsets[i];
+			keep_state.kept++;
+		} else {
+			const auto stamp = keep_slot ? cache.KeepBegin() : BufferCache::KeepStamp {};
+			std::pair<Buffer*, uint64_t> obtained {nullptr, 0};
+			const auto info = NativeStorageBuffer(m_context, source, res, program.stage, i, buffer_offset, written,
+			                                      uniform_view, keep_slot ? &obtained : nullptr);
+			if (keep_valid) {
+				// Verify (2) or the diagnostics' probe: what the keep would have bound.
+				keep_state.checks++;
+				if (info != keep_slots.infos[i] || buffer_offset != keep_slots.offsets[i]) {
+					if (keep_state.mismatches++ < 8) {
+						std::printf("KeepBindings verify: mismatch stage=%s slot=%u guest=0x%016" PRIx64
+						            " size=0x%" PRIx64 "\n",
+						            ShaderStageResourceName(program.stage), i, source.address, source.size);
+					}
+				}
+			}
+			if (keep_slot && cache.KeepCapture(keep_slots.reads[i], stamp, source.address, source.size,
+			                                   source.id, obtained)) {
+				keep_slots.infos[i]   = info;
+				keep_slots.offsets[i] = buffer_offset;
+				keep_slots.uniform[i] = uniform_view;
+				keep_state.captures++;
+			}
+			prepared.buffers.push_back(info);
+		}
+		if (keep_slot) {
+			KeepBindings::Note(keep_state);
+		}
+		if (same_stats) {
+			const auto ticks    = CommitStats::Now() - same_start;
+			auto&      totals   = BindingSame::Get();
+			const bool pixel    = program.stage == ShaderType::Pixel;
+			auto&      stage    = totals.stages[pixel ? 1 : 0];
+			const auto& kept    = stage.sources[i];
+			const auto  cls     = res.written     ? BindingSame::Written
+			                      : res.formatted ? (pixel ? BindingSame::PsTexel : BindingSame::VsTexel)
+			                                      : (pixel ? BindingSame::PsRead : BindingSame::VsRead);
+			const bool  same    = stage.program == &program && kept.address == source.address &&
+			                      kept.size == source.size && kept.id == source.id;
+			totals.total[cls]++;
+			totals.same[cls] += same ? 1 : 0;
+			totals.keepable[cls] += keep_valid ? 1 : 0;
+			(same ? totals.same_ticks[cls] : totals.diff_ticks[cls]) += ticks;
+			stage.sources[i] = source;
+			if (++totals.bindings % (1u << 20u) == 0) {
+				BindingSame::Print(totals);
+			}
+		}
 		pack_memory_offset(i, buffer_offset);
+	}
+	if (BindingSame::Enabled() &&
+	    (program.stage == ShaderType::Vertex || program.stage == ShaderType::Pixel)) {
+		BindingSame::Get().stages[program.stage == ShaderType::Pixel ? 1 : 0].program = &program;
 	}
 	CommitStats::StepMark(CommitStats::Step::RbBindings);
 	prepared.mip_stats_canary = false;
