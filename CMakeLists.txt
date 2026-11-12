@@ -906,8 +906,9 @@ target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})
 add_executable(pipeline_snapshot_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineSnapshotTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineSnapshot.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineFeedback.cpp"
 )
-target_link_libraries(pipeline_snapshot_tests Vulkan::Headers)
+target_link_libraries(pipeline_snapshot_tests Vulkan::Headers fmt::fmt)
 target_include_directories(pipeline_snapshot_tests PRIVATE ${inc_headers})
 
 # KYTY_PIPELINE_LIST: the KYPLST1 pipeline list (pipeline/pipelineList.h): format, export, merge,

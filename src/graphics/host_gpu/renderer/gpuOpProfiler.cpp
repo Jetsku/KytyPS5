@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 
 #include <algorithm>
 #include <array>
@@ -1838,7 +1839,10 @@ PipelineClass ClassOf(const VkGraphicsPipelineCreateInfo& info) {
 	}
 	for (uint32_t i = 0; i < info.stageCount; ++i) {
 		if (info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
-			return PipelineClass::GuestFragment;
+			const auto empty = EmptyFragment::Module(); // KYTY_EMPTY_FS
+			return empty != nullptr && info.pStages[i].module == static_cast<VkShaderModule>(empty)
+			           ? PipelineClass::EmptyFragment
+			           : PipelineClass::GuestFragment;
 		}
 	}
 	return PipelineClass::NoFragment;

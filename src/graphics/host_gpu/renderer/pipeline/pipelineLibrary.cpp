@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 
 #include <array>
 #include <bit>
@@ -158,8 +159,9 @@ GraphicsPipelineLibrary::Create(const vk::GraphicsPipelineCreateInfo& info,
 	const auto monolithic = [&](const char* reason) {
 		result.path     = Path::Monolithic;
 		result.fallback = reason;
-		result.result   = m_graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr,
-		                                                            &result.pipeline);
+		EmptyFragment::Storage storage; // KYTY_EMPTY_FS: the driver's copy only
+		result.result = m_graphics.device.createGraphicsPipelines(driver_cache, 1, &EmptyFragment::Apply(info, storage),
+		                                                          nullptr, &result.pipeline);
 		result.optimize.reset();
 		return std::move(result);
 	};
@@ -173,9 +175,10 @@ GraphicsPipelineLibrary::Create(const vk::GraphicsPipelineCreateInfo& info,
 	if (m_graphics.pipeline_creation_cache_control_enabled && ProbeEnabled()) {
 		auto probe            = s.Info();
 		probe.flags           = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-		vk::Pipeline pipeline = nullptr;
-		const auto   probed =
-		    m_graphics.device.createGraphicsPipelines(driver_cache, 1, &probe, nullptr, &pipeline);
+		vk::Pipeline           pipeline = nullptr;
+		EmptyFragment::Storage storage; // KYTY_EMPTY_FS: as the monolithic build would make it
+		const auto             probed   = m_graphics.device.createGraphicsPipelines(
+		                driver_cache, 1, &EmptyFragment::Apply(probe, storage), nullptr, &pipeline);
 		if (probed == vk::Result::eSuccess && pipeline != nullptr) {
 			result.path     = Path::CacheHit;
 			result.pipeline = pipeline;
@@ -349,6 +352,10 @@ GraphicsPipelineLibrary::Create(const vk::GraphicsPipelineCreateInfo& info,
 	const vk::PipelineShaderStageCreateInfo* fragment_stage = nullptr;
 	for (const auto& stage: s.m_stages) {
 		if (stage.stage == vk::ShaderStageFlagBits::eFragment) fragment_stage = &stage;
+	}
+	if (fragment_stage == nullptr) {
+		// KYTY_EMPTY_FS: the empty stage (null when off); the fs key stays the pipeline's own.
+		fragment_stage = EmptyFragment::LibraryStage();
 	}
 	// Fragment shader state takes a depth/stencil state even without a depth attachment; the
 	// default one tests nothing, and the pipeline's own (all tests are dynamic state) otherwise.
