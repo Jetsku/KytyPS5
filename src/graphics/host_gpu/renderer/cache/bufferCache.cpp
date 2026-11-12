@@ -1371,6 +1371,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
+	NoteBdaReachRegister(pages.first, pages.last_exclusive, insert); // KYTY_BDA_REACH=verify
 }
 
 // KYTY_BUFFER_LRU_SKIP=1 (default off): draws touch the same buffers many times per GC tick. The
@@ -4275,7 +4276,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source || late_source) {
 		if (InplaceStats::Enabled()) {
 			InplaceStats::NoteUploadBytes(total_size + late_size, copies.size() + late_copies.size());
-			const auto path = stats != nullptr ? InplaceStats::UploadPath::BdaSync
+			const auto path = stats != nullptr ? (stats->reach ? InplaceStats::UploadPath::BdaReach : InplaceStats::UploadPath::BdaSync)
 			                  : is_written     ? InplaceStats::UploadPath::Written
 			                  : is_texel_buffer ? InplaceStats::UploadPath::Texel
 			                                    : InplaceStats::UploadPath::Read;

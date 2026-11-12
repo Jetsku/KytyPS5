@@ -40,8 +40,9 @@ static_assert(sizeof(BindingLayout) == 72, "IR::BindingLayout changed: update Pr
 static_assert(sizeof(WriteRangeNode) == 24, "IR::WriteRangeNode changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: update ProgramCodec");
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
-static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
-static_assert(sizeof(CompiledShaderInfo) == 376, "IR::CompiledShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(DmaReadAccess) == 60, "IR::DmaReadAccess changed: update ProgramCodec");
+static_assert(sizeof(WriteRangeProgram) == 80, "IR::WriteRangeProgram changed: update ProgramCodec");
+static_assert(sizeof(CompiledShaderInfo) == 408, "IR::CompiledShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource) == 304, "IR::DescriptorSource changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 144,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
@@ -625,6 +626,8 @@ void Read(CodecReader& r, uint8_t& value) {
 // Element types defined after the vector helpers (template lookup needs them declared first).
 void Write(CodecWriter& w, const BufferWriteRange& v);
 void Read(CodecReader& r, BufferWriteRange& v);
+void Write(CodecWriter& w, const DmaReadAccess& v);
+void Read(CodecReader& r, DmaReadAccess& v);
 
 template <typename T>
 void WriteVector(CodecWriter& w, const std::vector<T>& values) {
@@ -732,14 +735,58 @@ void Read(CodecReader& r, BindingLayout& v) {
 	ReadVector(r, v.descriptors);
 }
 
+void Write(CodecWriter& w, const DmaReadAccess& v) {
+	w.U8(static_cast<uint8_t>(v.kind));
+	w.Bool(v.scalar);
+	w.U8(v.table_words);
+	w.U32(v.base_low);
+	w.U32(v.base_high);
+	w.U32(v.offset);
+	w.I32(v.immediate);
+	w.U32(v.extent);
+	w.U32(v.table_offset);
+	w.U32(v.table_bits);
+	w.I32(v.table_immediate);
+	for (const auto word: v.words) {
+		w.U32(word);
+	}
+	w.U32(v.index);
+	w.U32(v.soffset);
+}
+
+void Read(CodecReader& r, DmaReadAccess& v) {
+	v.kind            = static_cast<DmaReadAccess::Kind>(r.U8());
+	v.scalar          = r.Bool();
+	v.table_words     = r.U8();
+	v.base_low        = r.U32();
+	v.base_high       = r.U32();
+	v.offset          = r.U32();
+	v.immediate       = r.I32();
+	v.extent          = r.U32();
+	v.table_offset    = r.U32();
+	v.table_bits      = r.U32();
+	v.table_immediate = r.I32();
+	for (auto& word: v.words) {
+		word = r.U32();
+	}
+	v.index   = r.U32();
+	v.soffset = r.U32();
+}
+
 void Write(CodecWriter& w, const WriteRangeProgram& v) {
 	WriteVector(w, v.nodes);
 	WriteVector(w, v.buffers);
+	w.Bool(v.dma.bounded);
+	w.U32(v.dma.reason);
+	WriteVector(w, v.dma.accesses);
 }
 
 void Read(CodecReader& r, WriteRangeProgram& v) {
 	ReadVector(r, v.nodes);
 	ReadVector(r, v.buffers);
+	v.dma.bounded = r.Bool();
+	v.dma.reason  = r.U32();
+	ReadVector(r, v.dma.accesses);
 }
 
 // ---------------------------------------------------------------------------------------------

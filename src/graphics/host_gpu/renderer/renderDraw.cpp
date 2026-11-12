@@ -5274,6 +5274,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	KYTY_GPU_OP_SITE("draw.execute");
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	m_bda_mesh_index = {}; // KYTY_BDA_REACH: set below for this draw only
+	m_bda_mesh_known = false;
 	auto& ucfg = buffer.GetUserConfig();
 	LearnCubeTarget(buffer, state);
 	if (m_context.GetOcclusionCounter().DebugLogActive()) {
@@ -5686,6 +5688,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	// KYTY_BDA_REACH: the index bytes the mesh prologue reads (a native indirect draw's count is GPU data).
+	m_bda_mesh_index = {};
+	m_bda_mesh_known = false;
+	if (mesh_active && !mesh_indirect) {
+		// A non-indexed draw pushes index size 0: the prologue reads no index (empty reach).
+		m_bda_mesh_known = true;
+		if (draw.IsIndexed()) {
+			m_bda_mesh_index = {index_source.address,
+			                    index_source.address + static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size};
+		}
+	}
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed. A native

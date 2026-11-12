@@ -307,7 +307,7 @@ void AdvanceFrame() noexcept {
 		                   c.count / f, c.bytes / f, c.in_fault / f, c.in_upload / f, c.in_stream / f, c.in_any / f);
 	}
 	if (Full()) {
-		static const char* names[] = {"bda-sync", "written", "texel", "read"};
+		static const char* names[] = {"bda-sync", "written", "texel", "read", "bda-reach"};
 		for (int k = 0; k < static_cast<int>(UploadPath::Count) && n > 0 && n < static_cast<int>(sizeof(line)); k++) {
 			const auto& u = t.path[k];
 			n += std::snprintf(line + n, sizeof(line) - n,

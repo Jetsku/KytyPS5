@@ -120,6 +120,17 @@ void MemoryTracker::AdvanceCpuMutationEpoch() noexcept {
 }
 
 void MemoryTracker::NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept {
+	if (m_reach_log_on.load(std::memory_order_acquire) && size != 0) {
+		std::scoped_lock lock(m_dirtied_mutex);
+		if (!m_reach_log_overflow) {
+			if (m_reach_log.Size() >= DirtiedLogMaxRanges) {
+				m_reach_log_overflow = true;
+				m_reach_log.Clear();
+			} else {
+				m_reach_log.Add(vaddr, size);
+			}
+		}
+	}
 	if (!m_track_cpu_mutations) {
 		return;
 	}
@@ -149,6 +160,15 @@ bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
 	epoch                 = m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	const bool complete   = !m_dirtied_overflow;
 	m_dirtied_overflow    = false;
+	return complete;
+}
+
+bool MemoryTracker::TakeReachLog(RangeSet& ranges) {
+	std::scoped_lock lock(m_dirtied_mutex);
+	ranges.Clear();
+	std::swap(ranges, m_reach_log);
+	const bool complete  = !m_reach_log_overflow;
+	m_reach_log_overflow = false;
 	return complete;
 }
 

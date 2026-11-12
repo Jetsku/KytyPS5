@@ -167,6 +167,7 @@ void FaultManager::ProcessFaultBuffer() {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 			m_buffer_cache.NoteBdaFault(start, end - start);
+			m_buffer_cache.NoteBdaReachFault(start, end - start); // KYTY_BDA_REACH=verify
 		});
 		m_fault_areas[area] = 0;
 	});

@@ -122,6 +122,11 @@ public:
 	// one. False when ranges were dropped since the last take (overflow): the caller must
 	// re-examine everything.
 	[[nodiscard]] bool TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch);
+	// KYTY_BDA_REACH=verify (bufferCacheReach.cpp): a second log of the same transitions, with or
+	// without CPU-mutation tracking, taken by the reach verification only. False from the take
+	// when ranges were dropped (overflow).
+	void EnableReachLog(bool enable) noexcept { m_reach_log_on.store(enable, std::memory_order_release); }
+	[[nodiscard]] bool TakeReachLog(RangeSet& ranges);
 	// The sum of the mutation serials (RegionManager::Serial) of the regions [vaddr, vaddr + size)
 	// spans, or 0 when one of them does not exist yet (or the range is invalid). Serials only grow,
 	// so while this sum is unchanged no CPU-dirty, GPU-dirty, hot or readback-pending bit of any
@@ -530,6 +535,10 @@ private:
 	std::mutex              m_dirtied_mutex;
 	RangeSet                m_dirtied;
 	bool                    m_dirtied_overflow = false;
+	// Reach log (EnableReachLog), under m_dirtied_mutex.
+	std::atomic_bool        m_reach_log_on {false};
+	RangeSet                m_reach_log;
+	bool                    m_reach_log_overflow = false;
 };
 
 } // namespace Libs::Graphics

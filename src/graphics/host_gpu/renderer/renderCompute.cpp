@@ -2038,7 +2038,12 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		// KYTY_BDA_REACH: the dispatch's reach (workgroup ids bounded by a direct dispatch's size).
+		const RenderContext::BdaReachStage reach {.runtime          = &input_info.stage,
+		                                          .bindless_patches = bindings.bindless_patches,
+		                                          .groups           = bindings.dispatch_groups,
+		                                          .has_groups       = bindings.has_dispatch_groups};
+		m_context.PrepareBda(std::span<const RenderContext::BdaReachStage>(&reach, 1));
 	}
 	// KYTY_RT_HW: the host acceleration structures of the program's guest TLAS.
 	if (program.info.ray_query_sites != 0) {
@@ -2506,7 +2511,12 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	WatchRange::SetCurrentOp("CS", program.shader_hash);
 	WatchRange::NoteDispatch(program.shader_hash, async_compute, 0, 0, 0, true);
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		// KYTY_BDA_REACH: the dispatch's reach (workgroup ids bounded by a direct dispatch's size).
+		const RenderContext::BdaReachStage reach {.runtime          = &input_info.stage,
+		                                          .bindless_patches = bindings.bindless_patches,
+		                                          .groups           = bindings.dispatch_groups,
+		                                          .has_groups       = bindings.has_dispatch_groups};
+		m_context.PrepareBda(std::span<const RenderContext::BdaReachStage>(&reach, 1));
 	}
 	// KYTY_RT_HW: the host acceleration structures of the program's guest TLAS.
 	if (program.info.ray_query_sites != 0) {

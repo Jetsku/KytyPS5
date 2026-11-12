@@ -5755,7 +5755,26 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	CommitStats::StepMark(CommitStats::Step::FindBuffers);
 	if (uses_dma) {
 		const BufferLookupStats::PartScope stats_scope(BufferLookupStats::Part::PrepareBda);
-		m_context.PrepareBda();
+		// KYTY_BDA_REACH: the stages' reach (a draw has at most a handful of stages).
+		std::array<RenderContext::BdaReachStage, 8> reach {};
+		size_t                                      count = 0;
+		for (auto* stage: stages) {
+			if (count < reach.size()) {
+				reach[count] = {.runtime = stage->runtime, .bindless_patches = stage->bindless_patches};
+				if (stage->runtime != nullptr && stage->runtime->program != nullptr &&
+				    stage->runtime->program->stage == ShaderType::Mesh) {
+					reach[count].mesh_index_known = m_bda_mesh_known;
+					reach[count].mesh_index_begin = m_bda_mesh_index.first;
+					reach[count].mesh_index_end   = m_bda_mesh_index.second;
+				}
+				count++;
+			}
+		}
+		if (count == stages.size()) {
+			m_context.PrepareBda(std::span<const RenderContext::BdaReachStage>(reach.data(), count));
+		} else {
+			m_context.PrepareBda();
+		}
 	}
 	// KYTY_GRAPHICS_BDA_WRITES: a stage that writes through BDA; settled right after the draw
 	// (ExecutePreparedDraw). As for a dispatch, PrepareBda above uploaded every CPU-dirty page.

@@ -1315,6 +1315,11 @@ private:
 	// skipped (the previous draw's bindings are kept).
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors, bool keep_images = false);
+	// KYTY_BDA_REACH: the guest index bytes [first, second) the mesh prologue of the next
+	// PrepareGraphicsBindings may read (set by ExecutePreparedDraw for direct indexed mesh draws,
+	// consumed there); {0, 0}: unknown.
+	std::pair<uint64_t, uint64_t> m_bda_mesh_index {};
+	bool                          m_bda_mesh_known = false; // the range above is the draw's (may be empty)
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -36,10 +37,49 @@ struct WriteRangeSpan {
 	bool operator==(const WriteRangeSpan& other) const = default;
 };
 
+// DmaSpans: guest memory of V# tables. read(user, address, words) fills `words` with the dwords at
+// the 4-byte aligned `address` as the GPU will read them (false: not readable so, e.g. unmapped or
+// GPU-written); the spans then fail.
+struct DmaReachInputs {
+	bool (*read)(void* user, uint64_t address, std::span<uint32_t> words) = nullptr;
+	void*    user              = nullptr;
+	uint32_t max_table_entries = 4096;
+	uint64_t max_span_bytes    = uint64_t {256} << 20u;
+	// A mesh draw's guest index bytes [begin, end) (DmaReadAccess::Kind::MeshIndex); unknown: fails.
+	bool     mesh_index_known  = false;
+	uint64_t mesh_index_begin  = 0;
+	uint64_t mesh_index_end    = 0;
+};
+
+enum class DmaReachFailure : uint8_t {
+	None,
+	NotBounded,   // the program's reach is unknown (DmaReadReach::bounded)
+	Base,         // a base or V# word is not one value for this draw
+	Offset,       // an offset or index is unbounded
+	TableEntries, // too many V# table entries
+	TableRead,    // a V# table entry is not readable as the GPU reads it
+	Swizzle,      // a swizzled V# without its index stride
+	Size,         // a span past max_span_bytes
+	Count,
+};
+
+// DmaSpans' spans as the host synchronizes them: widened to whole `page` bytes (a power of two),
+// sorted, overlapping and touching spans merged.
+void NormalizeDmaSpans(std::vector<std::pair<uint64_t, uint64_t>>& spans, uint64_t page);
+
 // Evaluates a sealed WriteRangeProgram. Reusable; not thread-safe (one per recording thread).
 class WriteRangeEvaluator {
 public:
 	static constexpr size_t MaxSpans = 8;
+
+	// The absolute guest byte spans [first, second) the program's device-address reads can reach
+	// with the inputs of the last Evaluate() (appended to `spans`, unsorted). False (and `why`)
+	// when the reach is not known for these inputs: the caller must assume any memory.
+	[[nodiscard]] bool DmaSpans(const WriteRangeProgram& program, const DmaReachInputs& inputs,
+	                            std::vector<std::pair<uint64_t, uint64_t>>& spans,
+	                            DmaReachFailure& why) const;
+	// Diagnostics after a failed DmaSpans: the failing access, its nodes' sources and intervals.
+	[[nodiscard]] std::string DescribeDmaFailure(const WriteRangeProgram& program) const;
 
 	// Evaluates every node once for these inputs.
 	void Evaluate(const WriteRangeProgram& program, const WriteRangeInputs& inputs);
@@ -62,6 +102,7 @@ private:
 	                              WriteRangeSpan& span) const;
 
 	std::vector<Interval> m_values;
+	mutable size_t        m_dma_failed = 0; // DmaSpans: the access that failed
 	const WriteRangeProgram* m_program = nullptr;
 };
 

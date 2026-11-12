@@ -980,6 +980,26 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+# KYTY_BDA_REACH: the reach of device-address reads and the spans the renderer synchronizes.
+add_executable(bda_reach_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BdaReachTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
+)
+target_link_libraries(bda_reach_tests common fmt::fmt xbyak::xbyak)
+target_include_directories(bda_reach_tests PRIVATE ${inc_headers})
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(bda_reach_tests PRIVATE -fexceptions)
+endif()
 add_executable(inplace_candidates_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/InplaceCandidatesTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/inplaceCandidates.cpp"
@@ -1449,6 +1469,7 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-keep-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME inplace_candidates COMMAND $<TARGET_FILE:inplace_candidates_tests>)
+	add_test(NAME bda_reach COMMAND $<TARGET_FILE:bda_reach_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	if(KYTY_X86_64_V3)
 		add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
