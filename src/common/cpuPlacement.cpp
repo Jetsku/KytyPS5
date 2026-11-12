@@ -1502,6 +1502,23 @@ std::vector<CpuSetInfo> ReadProcessCpuSets(uint64_t* affinity) {
 	return sets;
 }
 
+void VisitPlacedThreads(void (*visit)(void* context, uint32_t tid, void* handle, bool guest),
+                        void* context) {
+#if defined(_WIN32)
+	auto&           state = GetState();
+	std::lock_guard lock(state.mutex);
+	for (const auto& thread: state.guest) {
+		visit(context, static_cast<uint32_t>(thread.tid), thread.handle, true);
+	}
+	for (const auto& thread: state.cold) {
+		visit(context, static_cast<uint32_t>(thread.tid), thread.handle, false);
+	}
+#else
+	(void)visit;
+	(void)context;
+#endif
+}
+
 uint32_t ProcessAffinityProcessorCount() {
 	if (CoreBudgetEnabled()) {
 		if (const auto logical = CoreBudgetLogical(); logical != 0) {

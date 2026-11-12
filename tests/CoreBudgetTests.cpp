@@ -224,6 +224,73 @@ void TestGate() {
 		      "spin above the cycles is clamped to them");
 		Check(ClassifyThreads(&s, 1, 0, 0.25).busy == 0, "empty interval");
 	}
+	{
+		// Threads the scan does not measure: the process total minus the measured ones.
+		Demand d;
+		d.busy = 3;
+		AddUnmeasured(d, 5 * I, 2 * I + I / 4, I); // 2.75 cores unexplained
+		Check(d.busy == 6 && d.busy_cores > 2.74 && d.busy_cores < 2.76, "unmeasured: 2.75 cores = 3 busy threads");
+		AddUnmeasured(d, I, 2 * I, I);
+		Check(d.busy == 6, "unmeasured: measured above the total adds nothing");
+	}
+	{
+		// Hysteresis. The 6-core trace that flapped: 250 ms intervals, demand above the budget in
+		// one interval of three (busy 10 + spinning 4 against 12), below it otherwise (busy 6, 3
+		// idle spinners). One decision per interval flips the gate twice every 750 ms.
+		GateInput high;
+		high.budget_logical = 12;
+		high.busy           = 10;
+		high.spinning       = 4;
+		high.idle_spinners  = 4;
+		GateInput low;
+		low.budget_logical = 12;
+		low.busy           = 6;
+		low.spinning       = 1;
+		low.idle_spinners  = 3;
+		uint32_t raw_changes = 0;
+		bool     raw         = true;
+		for (int i = 0; i < 240; i++) {
+			const bool next = NextBudgetGateOpen(raw, i % 3 == 0 ? high : low);
+			raw_changes += next != raw ? 1u : 0u;
+			raw = next;
+		}
+		Check(raw_changes >= 100, "the raw decision flaps on the trace");
+		GateFilter filter(GateConfig {});
+		bool       open      = true;
+		uint64_t   last_flip = 0;
+		uint32_t   changes   = 0;
+		bool       holds_ok  = true;
+		for (int i = 1; i <= 240; i++) { // 60 s
+			const uint64_t now  = static_cast<uint64_t>(i) * 250u;
+			const bool     next = filter.Step(now, i % 3 == 0 ? high : low);
+			if (next != open) {
+				holds_ok &= now - last_flip >= (open ? 1000u : 2000u) || last_flip == 0;
+				last_flip = now;
+				changes++;
+				open = next;
+			}
+		}
+		Check(holds_ok, "filter: every state is held its minimum time");
+		Check(changes <= 1, "filter: the flapping trace changes the state at most once (mean demand)");
+		// Sustained demand above the budget closes it within the window, and a sustained fall reopens
+		// it only after the closed hold.
+		GateFilter sustained(GateConfig {});
+		uint64_t   closed_at = 0;
+		uint64_t   opened_at = 0;
+		for (int i = 1; i <= 80; i++) {
+			const uint64_t now = 1000u + static_cast<uint64_t>(i) * 250u;
+			const bool     o   = sustained.Step(now, i <= 20 ? high : low);
+			if (!o && closed_at == 0) {
+				closed_at = now;
+			}
+			if (o && closed_at != 0 && opened_at == 0) {
+				opened_at = now;
+			}
+		}
+		Check(closed_at != 0 && closed_at <= 1000u + 250u * 4u, "filter: sustained high closes within the window");
+		Check(opened_at != 0 && opened_at - closed_at >= 2000u, "filter: reopens after the closed hold");
+		Check(sustained.Closes() == 1, "filter: one close");
+	}
 	// The runtime gate with the switch unset and no profile: spins as wanted, counts.
 	Check(!BudgetEnabled() && !BudgetClosed(), "KYTY_SPIN_BUDGET unset: off");
 	Check(SpinNs(Site::Sequencer, 200'000) == 200'000, "off: the wanted spin");

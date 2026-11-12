@@ -271,6 +271,12 @@ void               SamplePlacement(ThreadRole role);
 // (never this module's own). `affinity` receives the process mask. Empty off Windows.
 // KYTY_CORE_BUDGET's source (common/coreBudget.h).
 [[nodiscard]] std::vector<CpuSetInfo> ReadProcessCpuSets(uint64_t* affinity = nullptr);
+// The threads this module keeps handles of (PlaceCurrentThreadGuest: guest threads;
+// PlaceCurrentThreadCold: compile, I/O, audio and monitor threads): `visit(context, tid, handle,
+// guest)` for each, under the placement lock (keep it short). KYTY_SPIN_BUDGET's scan reads their
+// cycle counts. Nothing off Windows.
+void VisitPlacedThreads(void (*visit)(void* context, uint32_t tid, void* handle, bool guest),
+                        void* context);
 // group * 64 + number of the processor the calling thread runs on now.
 [[nodiscard]] uint32_t CurrentLogicalProcessor();
 // The physical core (group * 256 + CoreIndex) of a logical processor, UINT32_MAX if unknown.
