@@ -824,6 +824,18 @@ if(LINUX)
 	target_link_libraries(cpu_placement_tests Threads::Threads)
 endif()
 
+# KYTY_CORE_BUDGET / KYTY_SPIN_BUDGET / KYTY_CPU_RESERVE_SCALE (common/coreBudget.h, spinGate.h,
+# cpuPlacement.h): the core budget, the budget spin gate's decision and the small-CPU placement rules on
+# synthetic CPU set tables.
+add_executable(core_budget_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CoreBudgetTests.cpp"
+)
+target_link_libraries(core_budget_tests common)
+target_include_directories(core_budget_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(core_budget_tests Threads::Threads)
+endif()
+
 # Live switches (common/liveSwitch.h, KYTY_LIVE_FILE): parsing, application at the flip, the
 # synthetic CP spin and the live-control thread.
 add_executable(live_switch_tests EXCLUDE_FROM_ALL
@@ -1458,6 +1470,7 @@ if(BUILD_TESTING)
 	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
 	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
+	add_test(NAME core_budget COMMAND $<TARGET_FILE:core_budget_tests>)
 	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
 	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
 	add_test(NAME cpu_placement_vcache_sets COMMAND $<TARGET_FILE:cpu_placement_tests> --vcache sets)

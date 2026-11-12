@@ -1,5 +1,6 @@
 #include "common/cpuPlacement.h"
 
+#include "common/coreBudget.h"
 #include "common/hangTrace.h"
 #include "common/profiler.h"
 
@@ -549,6 +550,7 @@ std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity, const std::vector<ULONG>
 			set.core             = cpu.CoreIndex;
 			set.cache            = cpu.LastLevelCacheIndex;
 			set.scheduling_class = cpu.SchedulingClass;
+			set.efficiency_class = cpu.EfficiencyClass;
 			const bool ours      = cpu.Allocated == 0 || cpu.AllocatedToTargetProcess != 0;
 			const bool in_constraint =
 			    restriction != 0
@@ -1327,7 +1329,30 @@ uint32_t CoreOfLogicalProcessor(uint32_t logical) {
 	                                  : UINT32_MAX;
 }
 
+std::vector<CpuSetInfo> ReadProcessCpuSets(uint64_t* affinity) {
+	uint64_t mask = 0;
+	std::vector<CpuSetInfo> sets;
+#if defined(_WIN32)
+	auto& state = GetState();
+	{
+		std::lock_guard lock(state.mutex);
+		// Before the placement started: the default CPU sets now are another process's.
+		const auto external = state.initialized ? state.external : ProcessDefaultCpuSets();
+		sets                = ReadCpuSets(mask, external);
+	}
+#endif
+	if (affinity != nullptr) {
+		*affinity = mask;
+	}
+	return sets;
+}
+
 uint32_t ProcessAffinityProcessorCount() {
+	if (CoreBudgetEnabled()) {
+		if (const auto logical = CoreBudgetLogical(); logical != 0) {
+			return logical;
+		}
+	}
 #if defined(_WIN32)
 	DWORD_PTR process_mask = 0;
 	DWORD_PTR system_mask  = 0;

@@ -99,6 +99,7 @@ struct CpuSetInfo {
 	uint8_t  core             = 0; // CoreIndex: shared by SMT siblings
 	uint8_t  cache            = 0; // LastLevelCacheIndex
 	uint8_t  scheduling_class = 0; // higher = preferred (CPPC)
+	uint8_t  efficiency_class = 0; // higher = faster core class (hybrid CPUs: P above E); else 0
 	bool     allowed          = false;
 };
 
@@ -233,8 +234,14 @@ AffinityScan       ScanThreadAffinities(bool repin);
 [[nodiscard]] bool PlacementSamplingEnabled();
 void               SamplePlacement(ThreadRole role);
 // The logical processors the process may run on now (popcount of its affinity mask; the machine's
-// count where that is unavailable). KYTY_DRAW_PREP_ADAPT's worker bound.
+// count where that is unavailable). KYTY_DRAW_PREP_ADAPT's worker bound. With KYTY_CORE_BUDGET
+// (common/coreBudget.h) the budget's logical processors instead (affinity and CPU sets).
 [[nodiscard]] uint32_t ProcessAffinityProcessorCount();
+// The CPU set table as the placement reads it: `allowed` = in the process affinity mask, not
+// allocated to another process, and inside KYTY_CPU_SETS or another process's default CPU sets
+// (never this module's own). `affinity` receives the process mask. Empty off Windows.
+// KYTY_CORE_BUDGET's source (common/coreBudget.h).
+[[nodiscard]] std::vector<CpuSetInfo> ReadProcessCpuSets(uint64_t* affinity = nullptr);
 // group * 64 + number of the processor the calling thread runs on now.
 [[nodiscard]] uint32_t CurrentLogicalProcessor();
 // The physical core (group * 256 + CoreIndex) of a logical processor, UINT32_MAX if unknown.
