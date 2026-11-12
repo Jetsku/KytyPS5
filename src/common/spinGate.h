@@ -10,7 +10,7 @@
 // closes below an average of three idle CPUs and opens again from five. Closed, those waits block
 // at once. Windows only (always open elsewhere). Adapted from chenxiao07/KytyPS5 de192903c.
 //
-// KYTY_SPIN_BUDGET=1 (live, default off): the
+// KYTY_SPIN_BUDGET=1 (live, default off; KYTY_CORE_BUDGET_PROFILE turns it on when unset): the
 // gate decides from the core budget (common/coreBudget.h: the processors this process may use),
 // not from the machine's idle time, which never closes under an affinity mask (a process held to
 // 6 of 32 cores still sees ~20 idle CPUs) and misjudges small CPUs. Every spinning site asks it:

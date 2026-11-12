@@ -147,6 +147,9 @@ void TestBudget() {
 	          Common::ParseTriState("0") == 0 && Common::ParseTriState("1") == 1 &&
 	          Common::ParseTriState("on") == 1,
 	      "tri-state parse");
+	Check(!Common::EffectiveSwitch(-1, false) && Common::EffectiveSwitch(-1, true) &&
+	          !Common::EffectiveSwitch(0, true) && Common::EffectiveSwitch(1, false),
+	      "explicit values win over the profile, unset follows it");
 	std::puts("CoreBudgetTests: budget ok");
 }
 

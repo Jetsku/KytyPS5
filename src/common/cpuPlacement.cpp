@@ -540,11 +540,15 @@ CpuReserveMode GetCpuReserveMode() {
 }
 
 namespace {
-// KYTY_CPU_RESERVE_SCALE (live): a change makes the monitor
+// KYTY_CPU_RESERVE_SCALE (live): a change (or a profile change while it is unset) makes the monitor
 // apply the layout again within a second.
 std::atomic<bool> g_rules_changed {false};
 Live::Switch      g_reserve_scale("KYTY_CPU_RESERVE_SCALE", ParseTriState,
                                   [](int64_t, int64_t) { g_rules_changed.store(true); });
+[[maybe_unused]] const bool g_scale_listener = [] {
+	OnCoreBudgetProfileChange([](bool) { g_rules_changed.store(true); });
+	return true;
+}();
 
 uint32_t EnvRule(const char* name, uint32_t fallback) {
 	const auto* value = EnvValue(name);

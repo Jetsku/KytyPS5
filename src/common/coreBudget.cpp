@@ -3,6 +3,7 @@
 #include "common/liveSwitch.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -111,6 +112,21 @@ int64_t ParseTriState(const char* value) {
 
 namespace {
 
+std::array<std::atomic<void (*)(bool)>, 8> g_listeners {};
+
+void NotifyProfile(int64_t /*previous*/, int64_t value) {
+	for (auto& slot: g_listeners) {
+		if (auto* listener = slot.load(std::memory_order_acquire); listener != nullptr) {
+			listener(value != 0);
+		}
+	}
+}
+
+Live::Switch& ProfileSwitch() {
+	static Live::Switch profile("KYTY_CORE_BUDGET_PROFILE", Live::ParseDefaultOff, NotifyProfile);
+	return profile;
+}
+
 Live::Switch& BudgetSwitch() {
 	static Live::Switch budget("KYTY_CORE_BUDGET", ParseTriState);
 	return budget;
@@ -119,6 +135,7 @@ Live::Switch& BudgetSwitch() {
 // Registered before main as the header asks (the function-local statics above make the order safe
 // for callers during static initialisation).
 [[maybe_unused]] const bool g_registered = [] {
+	(void)ProfileSwitch();
 	(void)BudgetSwitch();
 	return true;
 }();
@@ -154,11 +171,20 @@ bool EffectiveSwitch(int64_t value) {
 }
 
 bool CoreBudgetProfileOn() {
-	return false;
+	return ProfileSwitch().On();
 }
 
 bool CoreBudgetEnabled() {
 	return EffectiveSwitch(BudgetSwitch().Get());
+}
+
+void OnCoreBudgetProfileChange(void (*listener)(bool on)) {
+	for (auto& slot: g_listeners) {
+		void (*none)(bool) = nullptr;
+		if (slot.compare_exchange_strong(none, listener, std::memory_order_acq_rel)) {
+			return;
+		}
+	}
 }
 
 CoreBudget CurrentCoreBudget(bool force) {

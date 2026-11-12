@@ -151,7 +151,7 @@ struct VCacheDecision {
 
 inline constexpr uint32_t kMinGeneralProcessors = 6;
 
-// KYTY_CPU_RESERVE_SCALE=1 (live, default off):
+// KYTY_CPU_RESERVE_SCALE=1 (live, default off; KYTY_CORE_BUDGET_PROFILE turns it on when unset):
 // KYTY_CPU_RESERVE's rules scaled to the CPU, from the core budget (common/coreBudget.h: the
 // physical cores and logical processors the process may use; with the V-cache placement the whole
 // process's, both CCDs).

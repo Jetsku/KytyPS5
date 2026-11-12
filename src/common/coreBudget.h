@@ -23,6 +23,11 @@
 // and a "Kyty core budget" line logs the budget whenever it changes. The spin gate and the
 // placement rules use the budget whenever their own switches are on.
 //
+// KYTY_CORE_BUDGET_PROFILE=1 (live, default off): the "budget profile". Every core-budget switch
+// left unset takes the profile's value: KYTY_CORE_BUDGET, KYTY_SPIN_BUDGET, KYTY_CPU_RESERVE_SCALE
+// and KYTY_DRAW_PREP_ADAPT. A switch set explicitly (also to 0) keeps its own value. Meant to become
+// the default later.
+//
 // Hybrid CPUs (Intel P/E cores): the efficiency class of each processor (higher = faster class).
 // The budget counts the processors of the top class separately; the CP is never placed on a lower
 // class with KYTY_CPU_RESERVE_SCALE.
@@ -49,18 +54,21 @@ struct CoreBudget {
 // Pure (tested): the budget of a CPU set table (group 0, `allowed` processors).
 [[nodiscard]] CoreBudget ComputeCoreBudget(const std::vector<CpuSetInfo>& sets);
 
-// Tri-state switch text: unset (nullptr or empty) -1, "0" 0, anything else 1 (the core-budget
-// switches: unset is off).
+// Tri-state switch text: unset (nullptr or empty) -1, "0" 0, anything else 1. The core-budget
+// switches use it so that unset follows KYTY_CORE_BUDGET_PROFILE.
 [[nodiscard]] int64_t ParseTriState(const char* value);
-// A tri-state value: explicit 0/1, unset (-1) is off.
+// A tri-state value with the profile applied: explicit 0/1 win, unset (-1) is the profile.
 [[nodiscard]] bool EffectiveSwitch(int64_t value);
 // Pure (tested): the same with the profile given.
 [[nodiscard]] constexpr bool EffectiveSwitch(int64_t value, bool profile) {
 	return value < 0 ? profile : value != 0;
 }
 
-[[nodiscard]] bool CoreBudgetProfileOn(); // always false (no profile switch yet)
-[[nodiscard]] bool CoreBudgetEnabled();   // KYTY_CORE_BUDGET (live)
+[[nodiscard]] bool CoreBudgetProfileOn(); // KYTY_CORE_BUDGET_PROFILE (live)
+[[nodiscard]] bool CoreBudgetEnabled();   // KYTY_CORE_BUDGET, profile applied (live)
+// Called on the command processor's thread after a live change of KYTY_CORE_BUDGET_PROFILE (at most
+// 8 listeners; registration before the change).
+void OnCoreBudgetProfileChange(void (*listener)(bool on));
 
 // The budget now. Re-read from the system at most once a second (whoever calls first after that
 // does it; cheap otherwise). `force`: read now.

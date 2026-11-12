@@ -4,6 +4,7 @@
 
 #include "common/assert.h"
 #include "common/prepPhases.h"
+#include "common/coreBudget.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
@@ -1653,9 +1654,24 @@ void ApplyAdaptMode(int64_t previous, int64_t value);
 // loop's leave flag is set and its sleepers woken, so a worker leaving one loop finds the other.
 // Publishes in between may wake the side the workers just left; the commit thread then prepares
 // such a head itself, as any unclaimed head.
-static Live::Switch g_adapt_mode("KYTY_DRAW_PREP_ADAPT", Live::ParseDefaultOff,
+// Unset follows KYTY_CORE_BUDGET_PROFILE (common/coreBudget.h); a profile change moves the workers
+// the same way while the switch is unset.
+static Live::Switch g_adapt_mode("KYTY_DRAW_PREP_ADAPT", Common::ParseTriState,
                                  [](int64_t previous, int64_t value) { ApplyAdaptMode(previous, value); });
 
+namespace {
+bool AdaptOn() {
+	return Common::EffectiveSwitch(g_adapt_mode.Get());
+}
+[[maybe_unused]] const bool g_adapt_profile_listener = [] {
+	Common::OnCoreBudgetProfileChange([](bool /*on*/) {
+		if (g_adapt_mode.Get() < 0) {
+			ApplyAdaptMode(-1, -1);
+		}
+	});
+	return true;
+}();
+} // namespace
 
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
@@ -1675,7 +1691,7 @@ struct Engine::Workers {
 		adapt          = std::make_unique<AdaptivePool>(count, cap);
 		g_adapt_cap.store(cap, std::memory_order_relaxed);
 		g_adapt_lps.store(lps, std::memory_order_relaxed);
-		const bool on = g_adapt_mode.On();
+		const bool on = AdaptOn();
 		adapt_on.store(on, std::memory_order_seq_cst);
 		leave_adapt.store(!on, std::memory_order_seq_cst);
 		leave_gate.store(on, std::memory_order_seq_cst);
@@ -1838,8 +1854,10 @@ struct Engine::Workers {
 
 namespace {
 void ApplyAdaptMode(int64_t /*previous*/, int64_t value) {
+	// Command processor thread only. Unset (-1) follows KYTY_CORE_BUDGET_PROFILE.
+	const bool on = Common::EffectiveSwitch(value);
 	if (auto* workers = g_live_workers.load(std::memory_order_seq_cst); workers != nullptr) {
-		g_live_set_adapt(workers, value != 0);
+		g_live_set_adapt(workers, on);
 	}
 	g_stats_due.store(true, std::memory_order_relaxed); // closes the A/B slot's PrepStats period
 }
@@ -1892,7 +1910,7 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		     "adapt_spin=%" PRIu64 "us adapt_min=%u adapt_max=%u cap=%u lps=%u\n",
 		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
 		     wake_backlog, cold_spin_us, cold_token ? 1 : 0, steal.min_unclaimed, steal_us,
-		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode(), g_adapt_mode.On() ? 1 : 0,
+		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode(), AdaptOn() ? 1 : 0,
 		     adapt.spin_ns / 1000u, adapt.min_cap, adapt.max_cap,
 		     g_adapt_cap.load(std::memory_order_relaxed), g_adapt_lps.load(std::memory_order_relaxed));
 	}
