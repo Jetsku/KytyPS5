@@ -656,8 +656,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
 	EXIT_IF(m_command.IsInvalid());
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
 		// Work its owner deferred to the end of this command buffer (SetPreSubmitHook).
 		m_in_pre_submit = true;
@@ -856,7 +854,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	if (m_gpu_timing) {
 		if (auto* dispatch_ns = m_gpu_timing->Submitted(tick, submit_ns); dispatch_ns != nullptr) {
 			*dispatch_ns = GpuTiming::NowNs();

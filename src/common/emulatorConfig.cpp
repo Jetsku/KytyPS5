@@ -147,12 +147,24 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
+const std::filesystem::path& GetDlssFolder() {
+	return g_config->dlss_folder;
+}
+
+uint32_t GetDlssPreset() {
+	return g_config->dlss_preset;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
 
 const std::string& GetAmdCpuDecision() {
 	return g_config->amd_cpu_decision;
+}
+
+bool GuestTscEnabled() {
+	return g_config->guest_tsc_enabled;
 }
 
 uint32_t GetVblankFrequency() {
@@ -235,12 +247,28 @@ bool ReadbackTiledImagesEnabled() {
 	return g_config->readback_tiled_images;
 }
 
+bool ReadbackStorageImagesEnabled() {
+	return g_config->readback_storage_images;
+}
+
+uint32_t GetFlushDraws() {
+	return g_config->flush_draws;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
 bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
+}
+
+bool RelaxedShaderFloatEnabled() {
+	return g_config->relaxed_shader_float;
+}
+
+bool LodStatsEnabled() {
+	return g_config->lod_stats_enabled;
 }
 
 bool TrophyEnabled() {

@@ -361,7 +361,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.stretch_enabled, "--stretch");
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--readback-tiled-images" << BoolArg(info.readback_tiled_images);
+	args << "--readback-storage-images" << BoolArg(info.readback_storage_images);
 	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
+	args << "--flush-draws" << QString::number(info.flush_draws);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
@@ -369,6 +371,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--network-connected" << BoolArg(info.network_connected);
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
+	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
@@ -390,12 +393,16 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--spirv-debug-printf" << "false";
 	AddFlag(args, info.pro_enabled, "--trinity");
+	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
+		args << "--dlss" << info.dlss_folder;
+	}
 	// Neither flag: the emulator decides from the CPU vendor.
 	if (info.amd_cpu_mode == QStringLiteral("on")) {
 		args << "--amd-cpu";
 	} else if (info.amd_cpu_mode == QStringLiteral("off")) {
 		args << "--no-amd-cpu";
 	}
+	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)
 	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif

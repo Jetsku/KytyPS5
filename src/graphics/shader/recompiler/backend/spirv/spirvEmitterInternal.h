@@ -41,6 +41,7 @@ struct OutputBinding : IR::StageOutput {
 
 using ImageDimension = Decoder::ImageDimension;
 
+// Component counts are the guest's; 1D images are host 2D images one texel high.
 struct ImageDimensionInfo {
 	ImageDimension dimension;
 	uint32_t       spirv_dimension;
@@ -48,16 +49,17 @@ struct ImageDimensionInfo {
 	uint32_t       spatial_components;
 	uint32_t       arrayed;
 	uint32_t       multisampled;
+	bool           one_dimensional;
 };
 
 constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
-    {ImageDimension::Dim1D, spv::Dim1D, 1, 1, 0, 0},
-    {ImageDimension::Dim1DArray, spv::Dim1D, 2, 1, 1, 0},
-    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0},
-    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0},
-    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0},
-    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1},
-    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1},
+    {ImageDimension::Dim1D, spv::Dim2D, 1, 1, 0, 0, true},
+    {ImageDimension::Dim1DArray, spv::Dim2D, 2, 1, 1, 0, true},
+    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0, false},
+    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0, false},
+    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0, false},
+    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1, false},
+    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1, false},
 }};
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
@@ -543,8 +545,6 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
-uint32_t ConstantU32(EmitterState& state, uint32_t value);
-
 uint32_t ConstantI32(EmitterState& state, int32_t value);
 
 uint32_t ConstantF32(EmitterState& state, uint32_t bits);
@@ -570,16 +570,6 @@ void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
 uint32_t MeshLaneSlot(EmitterState& state);
-
-DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
-                                    uint32_t lane_bits);
-
-DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
-                                        bool left);
-
-DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subid, uint32_t amount);
-
-DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row);
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 
@@ -715,6 +705,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+// EmitMemoryElementInBounds, or true for storage buffers the device bounds-checks
+// (KYTY_ROBUST_BUFFER_STORES); only plain stores use it (loads: DeviceChecksDwordLoad).
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -722,14 +716,10 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
 
-uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
-
 inline constexpr auto EmitTBufferSelectF32 =
     EmitNative<spv::OpSelect, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 
 bool IsSignedFormatComponent(Format::ComponentType type);
-
-uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
@@ -792,9 +782,6 @@ bool NoContraction(EmitterState& state, const IR::Inst& inst);
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
-
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match);
 
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);

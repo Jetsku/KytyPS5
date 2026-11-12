@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -17,14 +18,19 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <optional>
+#include <vector>
 
 // Experimental Pro mode (--trinity): the host pass of libPsml's PSSR request (R_PSSR), ported from
 // upstream 651ef73a0 (renderPssr.cpp, gpu_pssr_linear.comp). Upstream's PSSR is a bilinear upscale
 // of the request's active input rectangle into the output image, not Sony's network; so is this.
+// With a DLSS model folder (--dlss, NVIDIA only) a request with depth and motion vectors is
+// upscaled by DLSS instead (upstream 782a85c62, dlss.cpp); the linear pass stays the fallback.
 // Differences from upstream: it records through our CommandBuffer (batched transitions, the
-// recorder-aware bind/push/dispatch calls) and holds its pipeline in PssrState; a request the pass
-// cannot run (formats, tiling, sizes, overlap) is logged and skipped instead of stopping the
-// emulator. Only reachable in Pro mode: the packet is never produced otherwise.
+// recorder-aware bind/push/dispatch calls; DLSS records into the native handle) and holds its
+// pipeline and DLSS contexts in PssrState; a request the pass cannot run (formats, tiling, sizes,
+// overlap) is logged and skipped instead of stopping the emulator. Only reachable in Pro mode: the
+// packet is never produced otherwise.
 
 namespace Libs::Graphics {
 namespace {
@@ -35,10 +41,15 @@ struct PssrParameters {
 	uint32_t output_channels[4];
 };
 
-bool IsInputFormat(Prospero::BufferFormat format) {
-	return format == Prospero::BufferFormat::k11_11_10Float ||
-	       format == Prospero::BufferFormat::k10_11_11Float ||
-	       format == Prospero::BufferFormat::k16_16_16_16Float;
+// DLSS reads and writes with stages and accesses of its own.
+void DlssMemoryBarrier(vk::CommandBuffer command) {
+	const vk::MemoryBarrier2 barrier {.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands,
+	                                  .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+	                                  .dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands,
+	                                  .dstAccessMask = vk::AccessFlagBits2::eMemoryRead |
+	                                                   vk::AccessFlagBits2::eMemoryWrite};
+	command.pipelineBarrier2(
+	    vk::DependencyInfo {.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
 }
 
 bool Is2dColor(const ShaderTextureResource& descriptor) {
@@ -85,17 +96,15 @@ struct RenderExecutor::PssrState {
 		layout_info.pPushConstantRanges    = &push;
 		RequireVulkanSuccess(device.createPipelineLayout(&layout_info, nullptr, &pipeline_layout),
 		                     "create PSSR pipeline layout");
-		const auto shader = CompileSPV(GPU_PSSR_LINEAR_SPV, device);
-		vk::ComputePipelineCreateInfo create {};
-		create.stage.stage  = vk::ShaderStageFlagBits::eCompute;
-		create.stage.module = shader;
-		create.stage.pName  = "main";
-		create.layout       = pipeline_layout;
-		const auto result   = device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
-		device.destroyShaderModule(shader, nullptr);
-		RequireVulkanSuccess(result, "create PSSR pipeline");
+		pipeline = CreateComputePipeline(device, GPU_PSSR_LINEAR_SPV, pipeline_layout,
+		                                 "create PSSR pipeline");
 	}
 	~PssrState() {
+		for (const auto& context: dlss_contexts) {
+			if (context.feature != nullptr) {
+				Dlss::ReleaseFeature(context.feature);
+			}
+		}
 		device.destroyPipeline(pipeline, nullptr);
 		device.destroyPipelineLayout(pipeline_layout, nullptr);
 		device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
@@ -107,6 +116,57 @@ struct RenderExecutor::PssrState {
 	vk::DescriptorSetLayout descriptor_layout = nullptr;
 	vk::PipelineLayout      pipeline_layout   = nullptr;
 	vk::Pipeline            pipeline          = nullptr;
+
+	// One DLSS feature per PSSR context (the owner of the history); a library has at most four.
+	struct DlssContext {
+		uint64_t       context;
+		Dlss::Creation creation;
+		Dlss::Feature* feature;
+	};
+	std::vector<DlssContext> dlss_contexts;
+
+	// Upstream RenderExecutor::Upscale (782a85c62): records DLSS for the request into command;
+	// false when DLSS cannot take it (the linear pass runs instead).
+	bool Upscale(CommandScheduler& scheduler, vk::CommandBuffer command,
+	             const Pssr::Request& request, Dlss::Inputs& inputs) {
+		const auto release = [&](Dlss::Feature* feature) {
+			if (feature != nullptr) {
+				scheduler.DeferOperation([feature] { Dlss::ReleaseFeature(feature); });
+			}
+		};
+		auto context = std::ranges::find(dlss_contexts, request.context, &DlssContext::context);
+		bool reset   = (request.flags & Pssr::kReset) != 0;
+		if (context == dlss_contexts.end() || !Dlss::Takes(context->creation, request, inputs)) {
+			// A render size no quality mode takes scales linearly.
+			const auto creation = Dlss::Choose(*Dlss::Capabilities(), request, inputs);
+			if (!creation) {
+				return false;
+			}
+			if (context != dlss_contexts.end()) {
+				release(context->feature);
+			} else {
+				if (dlss_contexts.size() == 4) {
+					release(dlss_contexts.front().feature);
+					dlss_contexts.erase(dlss_contexts.begin());
+				}
+				context = dlss_contexts.insert(dlss_contexts.end(), {request.context, {}, nullptr});
+			}
+			context->creation = *creation;
+			context->feature  = Dlss::CreateFeature(command, *creation);
+			reset             = true;
+		}
+		if (context->feature == nullptr) {
+			return false;
+		}
+		DlssMemoryBarrier(command);
+		if (!Dlss::Evaluate(command, context->feature, request, inputs, reset)) {
+			release(context->feature);
+			context->feature = nullptr;
+			return false;
+		}
+		DlssMemoryBarrier(command);
+		return true;
+	}
 };
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
@@ -120,7 +180,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	std::copy_n(request.input, 8, input_descriptor.fields);
 	std::copy_n(request.output, 8, output_descriptor.fields);
 	if (!Is2dColor(input_descriptor) || !Is2dColor(output_descriptor) ||
-	    !IsInputFormat(input_descriptor.Format()) ||
+	    !Pssr::IsColorFormat(input_descriptor.Format()) ||
 	    output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
 	    output_descriptor.TileMode() != Prospero::TileMode::kStandard256B ||
 	    output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||
@@ -177,6 +237,22 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		SkipRequest("input and output memory overlap", request);
 		return;
 	}
+	// Depth, motion vectors and exposure for DLSS, which writes the output unswizzled.
+	const std::array<const uint32_t*, 3>         dlss_words {request.depth, request.motion,
+	                                                         request.exposure};
+	std::array<std::optional<TextureBinding>, 3> dlss_bindings;
+	if (Dlss::Capabilities() != nullptr && Dlss::Accepts(request) &&
+	    parameters.output_channels[0] == 0 && parameters.output_channels[1] == 1 &&
+	    parameters.output_channels[2] == 2) {
+		for (size_t i = 0; i < dlss_words.size(); ++i) {
+			ShaderTextureResource descriptor {};
+			std::copy_n(dlss_words[i], 8, descriptor.fields);
+			if (!descriptor.IsNull()) {
+				dlss_bindings[i] = resolve(dlss_words[i], false);
+				BindImage(dlss_bindings[i]->image_id, false);
+			}
+		}
+	}
 	// Resolving the output may have dropped or rebuilt the input's image (and the reverse for a
 	// rediscovered binding): such a binding is resolved again before its view is acquired.
 	const auto acquire = [&](TextureBinding& binding, const uint32_t* words, bool storage) {
@@ -188,6 +264,11 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		}
 		binding.image_view = cache.FindTexture(binding.image_id, binding.desc);
 	};
+	for (size_t i = 0; i < dlss_words.size(); ++i) {
+		if (dlss_bindings[i]) {
+			acquire(*dlss_bindings[i], dlss_words[i], false);
+		}
+	}
 	acquire(input, request.input, false);
 	acquire(output, request.output, true);
 	auto&       source           = cache.GetImage(input.image_id);
@@ -217,6 +298,51 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	                    ImageSubresourceRange {destination_view.base_level, 1,
 	                                           destination_view.base_layer, 1},
 	                    identity, true);
+	if (dlss_bindings[0] && dlss_bindings[1]) {
+		const auto range = [](const ImageViewInfo& view) {
+			return ImageSubresourceRange {view.base_level, 1, view.base_layer, 1};
+		};
+		for (const auto& binding: dlss_bindings) {
+			if (binding) {
+				cache.GetImage(binding->image_id)
+				    .Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+				             range(binding->desc.view_info), identity, true);
+			}
+		}
+		const auto resource = [&](const TextureBinding& binding, bool write) {
+			const auto& image  = cache.GetImage(binding.image_id);
+			const auto& view   = binding.desc.view_info;
+			const auto  width  = std::max(binding.desc.info.extent.width >> view.base_level, 1u);
+			const auto  height = std::max(binding.desc.info.extent.height >> view.base_level, 1u);
+			// DLSS takes a depth image in its backing format and depth aspect.
+			const bool depth  = image.info.IsDepth();
+			const auto aspect = depth ? vk::ImageAspectFlagBits::eDepth : view.aspect;
+			return Dlss::Resource {
+			    .view       = static_cast<VkImageView>(binding.image_view),
+			    .image      = static_cast<VkImage>(image.backing.image),
+			    .range      = {static_cast<VkImageAspectFlags>(aspect), view.base_level, 1,
+			                   view.base_layer, 1},
+			    .format     = static_cast<VkFormat>(depth ? image.backing.format : view.format),
+			    .width      = width,
+			    .height     = height,
+			    .type       = 0,
+			    .read_write = static_cast<uint8_t>(write ? 1 : 0)};
+		};
+		auto exposure = dlss_bindings[2] ? resource(*dlss_bindings[2], false) : Dlss::Resource {};
+		Dlss::Inputs inputs {resource(input, false), resource(*dlss_bindings[0], false),
+		                     resource(*dlss_bindings[1], false),
+		                     dlss_bindings[2] ? &exposure : nullptr, resource(output, true)};
+		// The native handle records the batched transitions first (Handle()).
+		if (pass.Upscale(m_context.GetCommandScheduler(), buffer.Handle(), request, inputs)) {
+			ResetBindings();
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 4u) {
+				LOGF("PSSR: DLSS upscale %ux%u -> %ux%u\n", request.width, request.height,
+				     parameters.output_size[0], parameters.output_size[1]);
+			}
+			return;
+		}
+	}
 	buffer.BeginEmission();
 	const std::array images {
 	    vk::DescriptorImageInfo {nullptr, input.image_view, vk::ImageLayout::eGeneral},

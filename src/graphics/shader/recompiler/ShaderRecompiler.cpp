@@ -1354,13 +1354,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (DiagCodePatch(options.shader_hash, code, diag_patched)) {
 		code = diag_patched;
 	}
-	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u\n",
-		     static_cast<unsigned>(options.stage));
-	}
 
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {

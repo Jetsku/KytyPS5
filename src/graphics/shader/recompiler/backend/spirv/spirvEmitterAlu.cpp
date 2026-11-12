@@ -9,6 +9,15 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
+                 std::initializer_list<uint32_t> args) {
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> words {spv::OpExtInst, type, result, GlslStd450(state), opcode};
+	words.insert(words.end(), args.begin(), args.end());
+	state.builder.AddFunction(words);
+	return result;
+}
+
 struct Pair {
 	uint32_t low  = 0;
 	uint32_t high = 0;
@@ -22,6 +31,11 @@ Pair ExtractPair(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	// KYTY_RELAXED_FLOAT (upstream 8dbee8635): native f64 min/max.
+	if (GetCodegenOptions().relaxed_float) {
+		return EmitExt(state, TypeF64(state), max_value ? GLSLstd450NMax : GLSLstd450NMin,
+		               {lhs, rhs});
+	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -102,8 +116,8 @@ bool IsPlainConstant(const F32Operand& operand) {
 // non-zero constant never forms two zeros.
 F32Operand EmitFastMinMaxF32(EmitterState& state, F32Operand lhs, F32Operand rhs,
                              bool max_value) {
-	if (GetCodegenOptions().native_float_min_max) {
-		// KYTY_NATIVE_FMINMAX: NMin/NMax return the other operand for one NaN, as the guest does;
+	if (GetCodegenOptions().native_float_min_max || GetCodegenOptions().relaxed_float) {
+		// KYTY_NATIVE_FMINMAX / KYTY_RELAXED_FLOAT: NMin/NMax return the other operand for one NaN, as the guest does;
 		// which zero min/max(-0, +0) returns is left to the host.
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
@@ -168,15 +182,6 @@ bool FastFloatMinMax() {
 	return GetCodegenOptions().fast_float_min_max;
 }
 
-uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
-                 std::initializer_list<uint32_t> args) {
-	const auto            result = state.builder.AllocateId();
-	std::vector<uint32_t> words {spv::OpExtInst, type, result, GlslStd450(state), opcode};
-	words.insert(words.end(), args.begin(), args.end());
-	state.builder.AddFunction(words);
-	return result;
-}
-
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	const auto trunc         = EmitTruncF32Value(state, src);
 	const auto converted_raw = state.builder.AllocateId();
@@ -212,6 +217,20 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 } // namespace
 uint32_t EmitFPMedTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, IR::Value arg2) {
 	auto& state = ctx.state;
+	if (GetCodegenOptions().relaxed_float) {
+		// KYTY_RELAXED_FLOAT (upstream 8dbee8635): the smallest pairwise maximum from native
+		// min/max; a NaN source gives the minimum of the other two.
+		const auto a       = ctx.Def(arg0);
+		const auto b       = ctx.Def(arg1);
+		const auto c       = ctx.Def(arg2);
+		const auto min_max = [&](uint32_t x, uint32_t y, bool max_value) {
+			return EmitExt(state, TypeF32(state), max_value ? GLSLstd450NMax : GLSLstd450NMin, {x, y});
+		};
+		const auto ab = min_max(a, b, true);
+		const auto bc = min_max(b, c, true);
+		const auto ac = min_max(a, c, true);
+		return min_max(min_max(ab, bc, false), ac, false);
+	}
 	if (FastFloatMinMax()) {
 		return EmitFastMedTri32(state, OperandF32(ctx, arg0), OperandF32(ctx, arg1),
 		                          OperandF32(ctx, arg2));
@@ -696,7 +715,7 @@ uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 }
 
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, true);
+	auto source = EmitTrigCycleF32(state, arg0, !GetCodegenOptions().relaxed_float);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }

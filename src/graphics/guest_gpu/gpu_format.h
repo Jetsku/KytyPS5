@@ -48,6 +48,7 @@ bool                       IsFmaskTextureFormat(BufferFormat format);
 /// and 156 for instance, so a value well inside the enum's range can still be no format, and that
 /// is what separates a descriptor from eight dwords that merely sit where one was expected.
 bool                       IsDefinedBufferFormat(BufferFormat format);
+bool                       IsSrgbFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 // KYTY_FMT30_UFLOAT=1 (Erlou93/KytyPS5-Yotei FIX_RT_11_11_10_FLOAT, default on there): format 30

@@ -17,12 +17,7 @@
 #include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
@@ -88,12 +83,7 @@ class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
-		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
-			EXIT("invalid region tracking manager construction\n");
-		}
 		m_cpu_dirty.Fill();
-		m_writable.Fill();
-		m_readable.Fill();
 		PublishCpuMirror();
 	}
 
@@ -182,17 +172,14 @@ public:
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
-		if constexpr (source == DirtySource::Gpu && enable) {
-			if (m_cpu_dirty.AnyInRange(start, end)) {
-				EXIT("GPU dirty state conflicts with CPU dirty state\n");
-			}
-		}
 		auto& bits = GetBits<source>();
+		// The pages whose bit flips (upstream 79a04b9a1: protection follows the changed pages
+		// instead of a shadow copy of the last applied protection).
+		RegionBits changed = enable ? RegionBits(~bits, start, end) : RegionBits(bits, start, end);
 		{
-			const RegionBits current(bits, start, end);
-			const bool       changes = enable ? current.Count() != end - start : current.Any();
+			const bool changes = !changed.None();
 			if (changes ||
-			    (source == DirtySource::Gpu && RegionBits(m_readback_pending, start, end).Any())) {
+			    (source == DirtySource::Gpu && m_readback_pending.AnyInRange(start, end))) {
 				Bump();
 			}
 			if (source == DirtySource::Cpu && enable && changes) {
@@ -214,9 +201,9 @@ public:
 			PublishGpuMirror(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			UpdateProtection<!enable, false>();
+			UpdateProtection<!enable, false>(changed);
 		} else {
-			UpdateProtection<enable, true>();
+			UpdateProtection<enable, true>(changed);
 		}
 	}
 
@@ -239,11 +226,11 @@ public:
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				PublishCpuMirror(start, end);
-				UpdateProtection<true, false>();
+				UpdateProtection<true, false>(mask);
 			} else {
 				m_readback_pending.UnsetRange(start, end);
 				PublishGpuMirror(start, end);
-				UpdateProtection<false, true>();
+				UpdateProtection<false, true>(mask);
 			}
 		}
 		for (const auto [first, last]: mask) {
@@ -292,6 +279,8 @@ public:
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
 		result.already_dirty = already_dirty.Any();
+		// The pages that become CPU-dirty here, for the protection update (79a04b9a1).
+		RegionBits changed(~m_cpu_dirty, start, end);
 		m_cpu_dirty.SetRange(start, end);
 		// The pages whose CPU-dirty bits may change: the faulting ones and the fault-ahead window.
 		size_t changed_begin = start;
@@ -309,6 +298,7 @@ public:
 			    RegionBits(all, window_begin, window_end) & ~m_gpu_dirty & ~m_cpu_dirty;
 			result.ahead_pages = window.Count();
 			m_cpu_dirty |= window;
+			changed |= window;
 			for (const auto [first, last]: window) {
 				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE,
 				         (last - first) * TRACKER_PAGE_SIZE);
@@ -316,7 +306,7 @@ public:
 		}
 		// Published before the pages become writable: a guest write can only land after it.
 		PublishCpuMirror(changed_begin, changed_end);
-		UpdateProtection<false, false>();
+		UpdateProtection<false, false>(changed);
 		if (policy.hot_frames == 0) {
 			return result;
 		}
@@ -381,11 +371,11 @@ public:
 			}
 		}
 		// Hot pages are always CPU-dirty, so `normal` holds exactly the pages to clear.
-		const RegionBits normal = RegionBits(m_cpu_dirty, start, end) & ~hot;
+		RegionBits normal = RegionBits(m_cpu_dirty, start, end) & ~hot;
 		if (normal.Any()) {
 			m_cpu_dirty ^= normal;
 			PublishCpuMirror(start, end);
-			UpdateProtection<true, false>();
+			UpdateProtection<true, false>(normal);
 		}
 		for (const auto [first, last]: normal) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE, false);
@@ -418,8 +408,8 @@ public:
 	uint32_t SettleHot(uint64_t vaddr, uint64_t size, std::atomic_uint32_t& hot_count,
 	                   Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		const RegionBits hot(m_hot, start, end);
-		const auto       settled = static_cast<uint32_t>(hot.Count());
+		RegionBits hot(m_hot, start, end);
+		const auto settled = static_cast<uint32_t>(hot.Count());
 		if (settled == 0) {
 			return 0;
 		}
@@ -428,7 +418,7 @@ public:
 		hot_count.fetch_sub(settled, std::memory_order_relaxed);
 		m_cpu_dirty ^= hot;
 		PublishCpuMirror(start, end);
-		UpdateProtection<true, false>();
+		UpdateProtection<true, false>(hot);
 		for (const auto [first, last]: hot) {
 			for (auto page = first; page < last; page++) {
 				func(m_cpu_addr + page * TRACKER_PAGE_SIZE);
@@ -499,6 +489,8 @@ public:
 		if (pending.Any()) {
 			Bump();
 		}
+		// The GPU-dirty pages that become clean here, for the protection update (79a04b9a1).
+		RegionBits changed = pending & m_gpu_dirty;
 		for (const auto [first, last]: pending) {
 			m_gpu_dirty.UnsetRange(first, last);
 			m_readback_pending.UnsetRange(first, last);
@@ -513,7 +505,7 @@ public:
 			retained += last - first;
 		}
 		if (cleared != 0) {
-			UpdateProtection<false, true>();
+			UpdateProtection<false, true>(changed);
 		}
 		return {cleared, retained};
 	}
@@ -550,16 +542,13 @@ private:
 		m_cpu_dirty_words.store(dirty_words, std::memory_order_release);
 	}
 
+	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched. `changed` holds the
+	// pages whose bit just flipped (upstream 79a04b9a1 dropped the shadow protection bitsets).
 	template <bool track, bool is_read>
-	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
-		auto&      previous   = is_read ? m_readable : m_writable;
-		auto       mask       = protection ^ previous;
-		if (mask.None()) {
-			return;
+	void UpdateProtection(RegionBits& changed) {
+		if (!changed.None()) {
+			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
 		}
-		previous = protection;
-		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
 	template <DirtySource source>
@@ -580,11 +569,8 @@ private:
 		}
 	}
 
+	// Callers pass a range inside this region (upstream 25fb20e53 dropped the range check).
 	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
-		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
-		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
-			EXIT("range lies outside its tracking region\n");
-		}
 		const auto offset = vaddr - m_cpu_addr;
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
@@ -602,8 +588,6 @@ private:
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_readback_pending;
-	RegionBits   m_writable;
-	RegionBits   m_readable;
 	// Hot pages: always a subset of m_cpu_dirty (never GPU-dirty).
 	RegionBits                    m_hot;
 	std::unique_ptr<FaultHistory> m_history;

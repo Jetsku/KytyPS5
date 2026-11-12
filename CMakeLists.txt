@@ -80,17 +80,8 @@ endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
-include(TestBigEndian)
-
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 	message(FATAL_ERROR "only 64-bit builds are supported")
-endif()
-
-test_big_endian(BIG_ENDIAN)
-if(BIG_ENDIAN)
-	set(KYTY_ENDIAN KYTY_ENDIAN_BIG)
-else()
-	set(KYTY_ENDIAN KYTY_ENDIAN_LITTLE)
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)
@@ -466,7 +457,7 @@ function(add_gpu_blit_shader shader_name shader_file)
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-		DEPENDS "${shader_source}"
+		DEPENDS "${shader_source}" "${gpu_tiler_shader_dir}/gpu_video_out_hdr10_to_sdr.inc"
 		VERBATIM
 	)
 	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
@@ -481,6 +472,8 @@ add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_video_out_downscale gpu_video_out_downscale.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
+# At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
+add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
@@ -582,7 +575,6 @@ file(GLOB_RECURSE kyty_codegen_sources CONFIGURE_DEPENDS
 list(APPEND kyty_codegen_sources
 	"${KYTY_SOURCE_DIR}/graphics/shader/shader.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.h"
-	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderCompiler.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
@@ -675,7 +667,7 @@ function(add_kyty_full_emulator_test target source)
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
-		target_link_libraries(${target} iphlpapi)
+		target_link_libraries(${target} iphlpapi dxgi)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
@@ -711,7 +703,6 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
@@ -757,7 +748,7 @@ target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/TrophySystemTests.cpp"
 )
-target_link_libraries(trophy_system_tests common)
+target_link_libraries(trophy_system_tests common Vulkan::Headers)
 target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
 
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
@@ -959,6 +950,9 @@ add_executable(device_compat_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceCom
 target_link_libraries(device_compat_tests Vulkan::Headers)
 target_include_directories(device_compat_tests PRIVATE ${inc_headers})
 
+add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp")
+target_link_libraries(common_tests common kyty_test_gtest)
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -982,7 +976,6 @@ target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
@@ -990,7 +983,6 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/NullTrace.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
@@ -1007,7 +999,6 @@ target_include_directories(resource_materialization_tests PRIVATE ${inc_headers}
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
@@ -1122,6 +1113,14 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
+
+add_executable(rtc_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RtcTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(rtc_tests common kyty_test_gtest)
+target_include_directories(rtc_tests PRIVATE ${inc_headers})
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -1348,6 +1347,15 @@ target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/t
 target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
 target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
+target_link_libraries(net_resolver_tests kyty_test_gtest)
+
+add_executable(dlss_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DlssTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/dlss.cpp")
+target_link_libraries(dlss_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
+target_include_directories(dlss_tests PRIVATE ${inc_headers})
+
 add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
@@ -1359,6 +1367,12 @@ target_include_directories(psml_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(rt_patch_tests "${KYTY_TESTS_DIR}/RtPatchTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
+
+add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
+	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
+target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
+target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
@@ -1572,6 +1586,11 @@ if(BUILD_TESTING)
 		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME device_compat COMMAND $<TARGET_FILE:device_compat_tests>)
+	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
+	# Upstream's gtest targets (not registered upstream; built by name here).
+	add_test(NAME dlss COMMAND $<TARGET_FILE:dlss_tests>)
+	add_test(NAME net_resolver COMMAND $<TARGET_FILE:net_resolver_tests>)
+	add_test(NAME gpu_blit_shader COMMAND $<TARGET_FILE:gpu_blit_shader_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -1601,9 +1620,14 @@ if(BUILD_TESTING)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
+	add_test(NAME shader_recompiler_relaxed_float
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --relaxed-float-only)
+	add_test(NAME shader_recompiler_cmp_u_f16
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cmp-u-f16-only)
 	add_test(NAME shader_recompiler_vop3_conversions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
 	add_test(NAME shader_recompiler_quadmask
@@ -2747,6 +2771,7 @@ if(BUILD_TESTING)
 		vram_budget_tests
 		device_compat_tests
 		shader_precompile_tests
+		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -2777,6 +2802,7 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		rtc_tests
 	)
 endif()
 
@@ -2867,6 +2893,7 @@ if (WIN32)
 	target_link_libraries(kyty_emulator iphlpapi)
 	target_link_libraries(kyty_emulator setupapi)
 	target_link_libraries(kyty_emulator ws2_32)
+	target_link_libraries(kyty_emulator dxgi)
 endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)
@@ -2926,6 +2953,7 @@ if(KYTY_BUILD_LAUNCHER)
 
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+		target_link_options(kyty_updater PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
 	endif()
 endif()
 if(KYTY_CLANG_CL)

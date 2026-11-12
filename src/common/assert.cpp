@@ -1,7 +1,6 @@
 #include "common/assert.h"
 
 #include "common/hangWatchdog.h"
-#include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
@@ -9,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
-#include <string>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -55,35 +53,13 @@ static std::string FatalStack() {
 #endif
 }
 
-static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
+// Upstream 0631e343f: the handlers no longer return. The report goes to the console and the log
+// (the former Log::WriteFatal), then the process ends with status 321 (the former EXIT_HALT).
+[[noreturn]] static void DbgReport(const char* title, std::string_view text, const char* file,
+                                   int line, bool with_stack) {
 	HangWatchdog::NoteFatal(text, file, line);
-	Log::WriteFatal(BuildFatalReport(title, text, file, line) + FatalStack());
-	Subsystems::EmergencyShutdownActive();
-	return 1;
-}
-
-int DbgExitIfHandler(const char* expr, const char* file, int line) {
-	return DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr),
-	                 file, line);
-}
-
-int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
-	return DbgReport("--- Fatal Error ---", fmt::format("Not implemented ({})", expr), file, line);
-}
-
-int DbgExitHandler(const char* file, int line, std::string_view text) {
-	HangWatchdog::NoteFatal(text, file, line);
-	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
-	return 1;
-}
-
-int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
-	HangWatchdog::NoteFatal(text, file, line);
-	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
-	return 1;
-}
-
-void DbgExit(int status) {
+	Log::WriteToConsoleAndLog(BuildFatalReport(title, text, file, line) +
+	                          (with_stack ? FatalStack() : std::string {}));
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 #if defined(_WIN32)
@@ -96,10 +72,23 @@ void DbgExit(int status) {
 		return value != nullptr && value[0] == '1';
 	}();
 	if (!exit_process) {
-		TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
+		TerminateProcess(GetCurrentProcess(), 321);
 	}
 #endif
-	std::_Exit(status);
+	std::_Exit(321);
+}
+
+void DbgExitIfHandler(const char* expr, const char* file, int line) {
+	DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr), file,
+	          line, true);
+}
+
+void DbgNotImplementedHandler(const char* expr, const char* file, int line) {
+	DbgReport("--- Fatal Error ---", fmt::format("Not implemented ({})", expr), file, line, true);
+}
+
+void DbgExitHandler(const char* file, int line, std::string_view text) {
+	DbgReport("--- Error ---", text, file, line, false);
 }
 
 } // namespace Common

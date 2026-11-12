@@ -9,7 +9,6 @@
 #include "common/stringUtils.h"
 #include "common/textureSparseResidency.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
@@ -23,6 +22,7 @@
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
@@ -990,7 +990,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.pipeline_creation_cache_control_enabled ? "true" : "false");
 	LOGF("Vulkan shader object support: %s (renderer uses pipelines)\n",
 	     supported_shader_object.shaderObject ? "true" : "false");
-	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Indirect mesh draws launch their records' groups from a task shader (upstream abc509d33).
+	graphics.mesh_shader_enabled =
+	    mesh_extension && supported_mesh.meshShader && supported_mesh.taskShader;
 	if (!graphics.mesh_shader_enabled) {
 		// Not a reason to reject the device: games without mesh (NGG) shaders still run.
 		Log::WriteToConsoleAndLog(fmt::format(
@@ -1089,6 +1091,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		robustness.storage_dword_loads_return_zero =
 		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE &&
 		    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+		// Upstream ee034be4b: the same condition lets the recompiler drop store and subword-load
+		// bounds checks (Profile::robust_buffer_access).
+		graphics.robust_buffer_access_enabled = robustness.storage_dword_loads_return_zero;
 		// KYTY_UNIFORM_BUFFERS: uniform ranges are bound in whole dwords. The device checks bounds
 		// in units of this alignment (16 on NVIDIA): a constant read in the last partial unit past
 		// a V#'s end may return the buffer's bytes instead of 0; reads beyond it return 0. The
@@ -1188,6 +1193,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    physical_device.getFormatProperties(vk::Format::eR8Srgb).optimalTilingFeatures &
 	    vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
 	Prospero::SetSrgb8ViewSupported(r8_srgb_filter);
+	// Upstream e914ec6db: 8 and 8_8 sRGB textures decode through sRGB views when they filter.
+	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
+	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
 	LOGF("Vulkan fragment shader pixel interlock (POPS): %s; compute derivative group linear: %s; "
 	     "R8_SRGB filtering: %s\n",
 	     fragment_interlock.fragmentShaderPixelInterlock == VK_TRUE ? "yes" : "no",
@@ -1512,6 +1520,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = graphics.mesh_shader_enabled;
+	mesh_features.taskShader            = graphics.mesh_shader_enabled;
 	feedback_dynamic.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
@@ -1662,6 +1671,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		ShaderRecompiler::SetCodegenOptions(options);
 	}
 	LOGF("Vulkan native ray tracing (KYTY_RT_HW): %s\n", graphics.native_ray_tracing_enabled ? "enabled" : "off");
+	// --relaxed-shader-float (upstream 8dbee8635) = KYTY_RELAXED_FLOAT=1 (CodegenOptions::relaxed_float).
+	if (Config::RelaxedShaderFloatEnabled() && !ShaderRecompiler::GetCodegenOptions().relaxed_float) {
+		auto options          = ShaderRecompiler::GetCodegenOptions();
+		options.relaxed_float = true;
+		ShaderRecompiler::SetCodegenOptions(options);
+	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -2117,8 +2132,8 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
+		     callback_data->pMessage);
 	}
 
 	if (!skip) {
@@ -2182,10 +2197,12 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	Vr::OpenXrInit();
+	Dlss::Load();
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
 	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
+	Dlss::AppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -2585,6 +2602,7 @@ void WindowContext::CreateVulkan() {
 			GpuTiming::NoteCalibrationExtensionEnabled(calibration);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -2600,6 +2618,8 @@ void WindowContext::CreateVulkan() {
 	CommandRecorder::InstallGuardHooks(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	if (graphic_ctx.side_queue_index != 0) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.side_queue_index,
 		                            &graphic_ctx.side_queue);
@@ -2662,6 +2682,7 @@ WindowContext::~WindowContext() {
 	ShaderRecompiler::IR::SetUnmappedBufferProbe(nullptr);
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
+	Dlss::Shutdown();
 	graphic_ctx.submission_queue.Shutdown();
 
 	if (graphic_ctx.device != nullptr) {

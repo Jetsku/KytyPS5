@@ -1,7 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
-#include "common/assert.h"
-#include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "gpu_tiler_shaders/bda_write_pages_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -11,10 +9,9 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include <algorithm>
 #include <bit>
-#include <cinttypes>
 #include <cstring>
-#include <limits>
 
 namespace Libs::Graphics {
 
@@ -60,8 +57,6 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                                &m_fault_process_desc_layout),
 	    "create fault-buffer descriptor layout");
 
-	const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_graphics.device);
-
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount = 1;
 	pipeline_layout_info.pSetLayouts    = &m_fault_process_desc_layout;
@@ -70,17 +65,9 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                           &m_fault_process_pipeline_layout),
 	    "create fault-buffer pipeline layout");
 
-	vk::PipelineShaderStageCreateInfo stage {};
-	stage.stage  = vk::ShaderStageFlagBits::eCompute;
-	stage.module = module;
-	stage.pName  = "main";
-	vk::ComputePipelineCreateInfo pipeline_info {};
-	pipeline_info.stage  = stage;
-	pipeline_info.layout = m_fault_process_pipeline_layout;
-	const auto result = m_graphics.device.createComputePipelines(
-	    nullptr, 1, &pipeline_info, nullptr, &m_fault_process_pipeline);
-	m_graphics.device.destroyShaderModule(module, nullptr);
-	RequireVulkanSuccess(result, "create fault-buffer pipeline");
+	m_fault_process_pipeline =
+	    CreateComputePipeline(m_graphics.device, FAULT_BUFFER_PROCESS_SPV,
+		                      m_fault_process_pipeline_layout, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
 }
 
@@ -142,7 +129,7 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128; // Four words per invocation (fd04c3fa9).
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
@@ -156,7 +143,7 @@ void FaultManager::ProcessFaultBuffer() {
 		// The parser counts every faulting page but stores at most MaxPageFaults - 1 records
 		// (entries 1..MaxPageFaults - 1): a larger count would read past this area into another
 		// batch's records or past the download buffer (chenxiao07/KytyPS5 d645c916b). Pages left
-		// out fault again at their next read.
+		// out stay set in the bitmap for the next scan (fd04c3fa9).
 		const auto count = static_cast<uint32_t>(
 		    std::min<uint64_t>(static_cast<uint32_t>(faults[0]), MaxPageFaults - 1));
 		for (uint32_t index = 1; index <= count; ++index) {

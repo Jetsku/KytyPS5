@@ -16,24 +16,17 @@
 
 namespace Common {
 
-int DbgExitIfHandler(const char*, const char*, int) {
-	return 1;
-}
-
-int DbgNotImplementedHandler(const char*, const char*, int) {
-	return 1;
-}
-
-int DbgExitHandler(const char*, int, std::string_view text) {
-	throw std::runtime_error(std::string(text));
-}
-
-int DbgExitHandler(const char*, int, fmt::text_style, std::string_view text) {
-	throw std::runtime_error(std::string(text));
-}
-
-void DbgExit(int) {
+// Upstream 0631e343f: the handlers do not return (before, they returned 1 and DbgExit aborted).
+[[noreturn]] void DbgExitIfHandler(const char*, const char*, int) {
 	std::abort();
+}
+
+[[noreturn]] void DbgNotImplementedHandler(const char*, const char*, int) {
+	std::abort();
+}
+
+[[noreturn]] void DbgExitHandler(const char*, int, std::string_view text) {
+	throw std::runtime_error(std::string(text));
 }
 
 } // namespace Common

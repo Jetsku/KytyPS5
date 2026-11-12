@@ -309,6 +309,10 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Every byte of the range is exact GPU-dirty data (upstream 9678c59b7, storage readback).
+	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) const {
+		return m_gpu_modified_ranges.Contains(vaddr, size);
+	}
 	// Diagnostics (KYTY_CS_VERIFY): the registered cache buffer holding [vaddr, vaddr + size) and the
 	// offset there, without any synchronization (nullptr: none). GPU thread.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> DebugPeekBuffer(uint64_t vaddr, uint64_t size);

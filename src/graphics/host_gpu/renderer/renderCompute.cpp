@@ -1561,6 +1561,37 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// KYTY_BACK_ADDRESS_BASES=1 (default off; upstream c174ade18 for another title): global loads
+// read pages without a buffer as zero, so the 32 KiB after each base a compute shader loads from
+// scalar data (ShaderInfo::address_bases, flattened SRT slots) get a buffer before the dispatch.
+static bool BackAddressBasesEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BACK_ADDRESS_BASES");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
+	if (!BackAddressBasesEnabled() || !stage) {
+		return;
+	}
+	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+	const auto&        flat = stage.resources->flattened_srt;
+	for (const auto [low, high]: stage.program->info.address_bases) {
+		if (low >= flat.size() || high >= flat.size()) {
+			continue;
+		}
+		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
+		for (uint64_t index = 0; index <= 2; ++index) {
+			const auto page = base + index * Page;
+			if (context.IsMapped(page, 1)) {
+				(void)context.GetBufferCache().FindBuffer(page, 1);
+			}
+		}
+	}
+}
+
 // KYTY_LDS_DEVICE_BUFFER_MB (default 1024): the most memory the compute LDS device buffer may
 // take; a direct dispatch with more workgroups than it holds runs its excess workgroups without
 // LDS (their accesses read zero and drop writes), and says so once per shader.
@@ -1960,22 +1991,9 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	}
 
 	if (use_thread_dimensions) {
-		const uint32_t old_x = thread_group_x;
-		const uint32_t old_y = thread_group_y;
-		const uint32_t old_z = thread_group_z;
-		thread_group_x       = input_info.workgroup_counts[0];
-		thread_group_y       = input_info.workgroup_counts[1];
-		thread_group_z       = input_info.workgroup_counts[2];
-
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: use-thread-dimensions %ux%ux%u / %ux%ux%u -> "
-			     "groups %ux%ux%u\n",
-			     old_x, old_y, old_z, std::max(cs_regs.cs_regs.num_thread_x, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_y, 1u),
-			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
-			     thread_group_z);
-		}
+		thread_group_x = input_info.workgroup_counts[0];
+		thread_group_y = input_info.workgroup_counts[1];
+		thread_group_z = input_info.workgroup_counts[2];
 	}
 
 	buffer.EndRendering();
@@ -2035,6 +2053,7 @@ void RenderExecutor::DispatchDirectOne(uint64_t submit_id, CommandBuffer& buffer
 	if (program.info.bda_writes) {
 		m_context.GetBufferCache().SnapshotBdaMergePages(program.shader_hash); // KYTY_BDA_CPU_MERGE
 	}
+	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	if (program.info.uses_dma) {
@@ -2499,6 +2518,7 @@ void RenderExecutor::DispatchIndirectOne(uint64_t submit_id, CommandBuffer& buff
 	                               input_info.stage.resources->user_data.data(),
 	                               static_cast<uint32_t>(input_info.stage.resources->user_data.size()), 0xffffffffu,
 	                               0xffffffffu, 0xffffffffu);
+	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchBda);
 	const auto& program = *input_info.stage.program;

@@ -100,8 +100,7 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k32_32_32_32UInt, vk::Format::eR32G32B32A32Uint},
     {Prospero::BufferFormat::k32_32_32_32SInt, vk::Format::eR32G32B32A32Sint},
     {Prospero::BufferFormat::k32_32_32_32Float, vk::Format::eR32G32B32A32Sfloat},
-    // Narrow-channel sRGB formats are optional in Vulkan. Keep a same-width fallback until
-    // sampler-aware sRGB emulation is available.
+    // 8 and 8_8 sRGB views are optional in Vulkan, so these images store UNorm.
     {Prospero::BufferFormat::k8Srgb, vk::Format::eR8Unorm},
     {Prospero::BufferFormat::k8_8Srgb, vk::Format::eR8G8Unorm},
     {Prospero::BufferFormat::k8_8_8_8Srgb, vk::Format::eR8G8B8A8Srgb},
@@ -475,6 +474,21 @@ uint64_t UseShrinkVerdictFile(const std::string& path) {
 		return 0;
 	}
 	return ShrinkVerdicts::Instance().Open(path);
+}
+
+vk::Pipeline CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
+                                   vk::PipelineLayout layout, const char* operation) {
+	const auto                    shader = CompileSPV(code, device);
+	vk::ComputePipelineCreateInfo create {};
+	create.stage.stage    = vk::ShaderStageFlagBits::eCompute;
+	create.stage.module   = shader;
+	create.stage.pName    = "main";
+	create.layout         = layout;
+	vk::Pipeline pipeline = nullptr;
+	const auto   result   = device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+	device.destroyShaderModule(shader, nullptr);
+	RequireVulkanSuccess(result, operation);
+	return pipeline;
 }
 
 } // namespace Libs::Graphics

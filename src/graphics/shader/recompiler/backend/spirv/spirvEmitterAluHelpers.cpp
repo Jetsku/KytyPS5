@@ -145,8 +145,8 @@ F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
 	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match) {
+static uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
+                                      uint32_t class_match) {
 	const auto selected =
 	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, mask, 1u << bit), 0);
 	return EmitLogicalAndBool(state, selected, class_match);
@@ -217,6 +217,13 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	// KYTY_RELAXED_FLOAT (upstream 8dbee8635): native NMin/NMax.
+	if (GetCodegenOptions().relaxed_float) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+		return result;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
@@ -308,8 +315,9 @@ uint32_t EmitHalfPk(EmitterState& state, HalfPkOp op, uint32_t a, uint32_t b, ui
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
-	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (CodegenOptions::denorm_flush_skip).
-	if (DenormFlushSkipped(state)) {
+	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (CodegenOptions::denorm_flush_skip), or
+	// KYTY_RELAXED_FLOAT (upstream 8dbee8635: no input denormal flushes).
+	if (DenormFlushSkipped(state) || GetCodegenOptions().relaxed_float) {
 		return value;
 	}
 	g_denorm_flushes[DenormFlushStage(state)].fetch_add(1, std::memory_order_relaxed);

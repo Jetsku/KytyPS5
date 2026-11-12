@@ -91,7 +91,6 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 }
 
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
-	EXIT_IF(!runtime);
 	const auto& program   = *runtime.program;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
@@ -137,7 +136,6 @@ static void RecordShaderBarrier(const CommandBuffer& buffer, vk::PipelineStageFl
 
 void ShaderAccessBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages) {
 	KYTY_GPU_OP_SITE("shader.access_barrier");
-	EXIT_IF(buffer.IsInvalid() || !source_stages);
 	RecordShaderBarrier(buffer, source_stages, vk::PipelineStageFlagBits::eAllCommands,
 	                    MakeShaderAccessDependency(), BarrierOrigin::ShaderAccess);
 }
@@ -145,14 +143,12 @@ void ShaderAccessBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags sou
 void ShaderWriteHazardBarrier(const CommandBuffer&   buffer,
                               vk::PipelineStageFlags destination_stages) {
 	KYTY_GPU_OP_SITE("shader.write_hazard_barrier");
-	EXIT_IF(buffer.IsInvalid() || !destination_stages);
 	RecordShaderBarrier(buffer, vk::PipelineStageFlagBits::eAllCommands, destination_stages,
 	                    MakeShaderWriteHazardDependency(), BarrierOrigin::ShaderWriteHazard);
 }
 
 void ShaderWriteBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages) {
 	KYTY_GPU_OP_SITE("shader.write_barrier");
-	EXIT_IF(buffer.IsInvalid() || !source_stages);
 	RecordShaderBarrier(buffer, source_stages,
 	                    vk::PipelineStageFlagBits::eComputeShader |
 	                        vk::PipelineStageFlagBits::eAllGraphics |

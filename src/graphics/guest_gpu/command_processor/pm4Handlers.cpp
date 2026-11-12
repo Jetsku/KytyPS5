@@ -1140,25 +1140,13 @@ KYTY_HW_SH_PARSER(HwShSetCsRegisters) {
 	return reg_num;
 }
 
-static uint32_t UserSgprWriteNum(uint32_t slot, uint32_t reg_num, uint32_t capacity,
-                                 const char* stage) {
-	EXIT_IF(stage == nullptr);
-	EXIT_NOT_IMPLEMENTED(capacity > HW::UserSgprInfo::SGPRS_MAX || slot >= capacity ||
-	                     reg_num > capacity - slot);
-
-	return reg_num;
-}
-
 KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(
-	    !(cmd_offset >= Pm4::COMPUTE_USER_DATA_0 && cmd_offset <= Pm4::COMPUTE_USER_DATA_15));
+	uint32_t slot = cmd_offset - Pm4::COMPUTE_USER_DATA_0;
 
-	uint32_t slot = (cmd_offset - Pm4::COMPUTE_USER_DATA_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 16u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
@@ -1167,15 +1155,12 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 }
 
 KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_DATA_PS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_DATA_PS_31));
+	uint32_t slot = cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
 
-	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 32u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
@@ -1184,15 +1169,12 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 }
 
 KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_DATA_GS_31));
+	uint32_t slot = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
 
-	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 32u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
@@ -1201,15 +1183,12 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 }
 
 KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_DATA_HS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_DATA_HS_31));
+	uint32_t slot = cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
 
-	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0) / 1;
+	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num > 32u - slot);
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
+	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
@@ -1386,7 +1365,6 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	if (PassCensus::Tracking()) PassCensus::Packet(&cp, true); // KYTY_TRACE_PASS_CENSUS
 	CountFrameWork(cp, Profiler::FrameWork::DispatchDirectCommands);
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	uint32_t thread_group_x = buffer[0];
@@ -1475,8 +1453,6 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_PREDICATION);
-
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 
 	EXIT_NOT_IMPLEMENTED(payload_dw < 2);
@@ -1507,8 +1483,6 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 KYTY_CP_OP_PARSER(CpOpCondExec) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_COND_EXEC);
-
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 
 	EXIT_NOT_IMPLEMENTED(payload_dw < 4);
@@ -1532,11 +1506,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 KYTY_CP_OP_PARSER(CpOpBranch) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
-
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
-
-	EXIT_NOT_IMPLEMENTED(payload_dw != 13);
 
 	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
 	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
@@ -1556,16 +1526,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then =
-	    cp.Branch(reinterpret_cast<uint64_t>(compare_addr), mask, reference, function);
-	if (!cp.IsReferenceFront()) {
-		LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64
-		     "/%" PRIu32 "\n",
-		     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
-		     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
-	}
-
-	if (take_then) {
+	if (cp.Branch(reinterpret_cast<uint64_t>(compare_addr), mask, reference, function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
@@ -1716,6 +1677,17 @@ static bool IndirectVertexBaseEnabled() {
 	return enabled;
 }
 
+// KYTY_INDIRECT_RUNS (default on, upstream b30f2d6c9; read once; "0" emits one draw per packet as
+// before): runs of DRAW_INDIRECT / DRAW_INDEX_INDIRECT packets with identical words on consecutive
+// records are one indirect draw of several records (CpOpDrawIndirect, CommandProcessor::DrawIndirect).
+static bool IndirectRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_RUNS");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static void SetIndirectVertexBase(CommandProcessor& cp, uint32_t base_vertex_location) {
 	if (!IndirectVertexBaseEnabled()) {
 		return;
@@ -1732,42 +1704,51 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
 	cp.GetShCtx().SetIndirectVertexBase(false, -1);
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0042700);
 
-	if (cmd_id == 0xc0073a00) {
-		uint32_t index_count = buffer[0];
-		auto*    index_addr =
-		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-		uint32_t max_instance_count = buffer[3];
-		uint32_t instance_count     = buffer[6];
-		uint32_t flags              = buffer[7];
+	uint32_t max_index_count = buffer[0];
+	auto*    index_addr =
+	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+	uint32_t index_count = buffer[3];
+	uint32_t flags       = buffer[4];
 
-		EXIT_NOT_IMPLEMENTED(instance_count > max_instance_count);
-		EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
+	EXIT_NOT_IMPLEMENTED(index_count > max_index_count);
+	EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
 
+	cp.DrawIndex({.index_count = index_count, .index_addr = index_addr});
+
+	return 5;
+}
+
+// DRAW_INDEX_MULTI_INST (upstream bf2af5285, fields in packet order): the instance count, the
+// object-ID table (one ID per instance, not modelled), the index buffer size, the index buffer, the
+// index count and the draw initiator.
+KYTY_CP_OP_PARSER(CpOpDrawIndexMultiInst) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+	cp.GetShCtx().SetStartInstanceUserSgpr(-1);
+	cp.GetShCtx().SetIndirectVertexBase(false, -1);
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00);
+
+	uint32_t instance_count  = buffer[0];
+	uint32_t max_index_count = buffer[3];
+	auto*    index_addr =
+	    reinterpret_cast<void*>(buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u));
+	uint32_t index_count = buffer[6];
+	uint32_t flags       = buffer[7];
+
+	EXIT_NOT_IMPLEMENTED(index_count > max_index_count);
+	EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
+
+	// DrawIndex replaces a zero instance count with NUM_INSTANCES; this packet draws none then.
+	if (instance_count != 0) {
 		cp.DrawIndex({.index_count    = index_count,
 		              .index_addr     = index_addr,
 		              .instance_count = instance_count});
-
-		return 8;
 	}
 
-	if (cmd_id == 0xc0042700) {
-		uint32_t max_index_count = buffer[0];
-		auto*    index_addr =
-		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-		uint32_t index_count = buffer[3];
-		uint32_t flags       = buffer[4];
-
-		EXIT_NOT_IMPLEMENTED(index_count > max_index_count);
-		EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
-
-		cp.DrawIndex({.index_count = index_count, .index_addr = index_addr});
-
-		return 5;
-	}
-
-	return 1;
+	return 8;
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
@@ -1788,9 +1769,31 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
-	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
+	// KYTY_INDIRECT_RUNS (upstream b30f2d6c9): following packets with the same other words (the
+	// header without a predicate bit, registers, initiator), each drawing the record right after the
+	// previous one, join this draw as records of one multi-draw (DrawIndirect's `records`). Nothing
+	// runs between them on the GPU either, the front state is the same for all of them, and the
+	// bytes were checked with the rest of the command buffer (CheckCommandBytes) before this parse.
+	constexpr uint32_t packet_dw   = 5;
+	const uint32_t     record_size = indexed ? 20u : 16u; // DrawIndexedIndirectArgs, DrawIndirectArgs
+	uint32_t           records     = 1;
+	if (IndirectRunsEnabled()) {
+		for (uint32_t at = 4; at + packet_dw < dw; at += packet_dw, records++) {
+			const auto* next = buffer + at;
+			if (next[0] != cmd_id || next[1] != uint64_t {next[-4]} + record_size ||
+			    next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) {
+				break;
+			}
+		}
+	}
+	// The per-packet counters count every packet of the run.
+	for (uint32_t i = 1; i < records; i++) {
+		if (PassCensus::Tracking()) PassCensus::Packet(&cp, false); // KYTY_TRACE_PASS_CENSUS
+		CountFrameWork(cp, Profiler::FrameWork::DrawIndirectCommands);
+	}
+	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed, records);
 
-	return 4;
+	return 4 + packet_dw * (records - 1);
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
@@ -1930,8 +1933,6 @@ KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
 
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
 	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
 	uint32_t   event_index    = (buffer[0] >> 8u) & 0x7u;
@@ -2079,7 +2080,6 @@ KYTY_CP_OP_PARSER(CpOpIndexBase) {
 KYTY_CP_OP_PARSER(CpOpSetBase) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_BASE);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	auto base_index = buffer[0] & 0xfu;
@@ -2102,8 +2102,6 @@ KYTY_CP_OP_PARSER(CpOpSetBase) {
 KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
-
 	if (KYTY_PM4_LEN(cmd_id) == 14u) {
 		return CpOpBranch(cp, cmd_id, buffer, dw, num_dw);
 	}
@@ -2111,12 +2109,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	const uint32_t control = buffer[2];
-
-	const uint32_t control_flags = control & 0x0fe00000u;
-	if (control_flags != 0x0f200000u) {
-		LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
-		     control_flags);
-	}
 
 	auto* indirect_buffer =
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
@@ -2192,7 +2184,6 @@ static bool IndirectRegisterListIsStale(const uint32_t* list, uint32_t count, ui
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
@@ -2277,7 +2268,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
@@ -2364,7 +2354,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
@@ -2526,11 +2515,7 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
-	static std::atomic<uint32_t> pop_marker_log_count {0};
 	if (PassCensus::Tracking()) PassCensus::Marker(&cp, nullptr); // KYTY_TRACE_PASS_CENSUS
-	if (pop_marker_log_count.fetch_add(1) < 64) {
-		LOGF("Pop marker\n");
-	}
 
 	return dw_num + 1;
 }
@@ -2542,11 +2527,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 
 	const char* str = reinterpret_cast<const char*>(buffer);
 
-	static std::atomic<uint32_t> push_marker_log_count {0};
 	if (PassCensus::Tracking()) PassCensus::Marker(&cp, str); // KYTY_TRACE_PASS_CENSUS
-	if (push_marker_log_count.fetch_add(1) < 128) {
-		LOGF("Push marker: %s\n", str);
-	}
 
 	return dw_num + 1;
 }
@@ -4107,6 +4088,11 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[0x0ca] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
+	// The HS-front allocation word (RSRC1_LS, upstream a7491cc66): the fused HS resource registers
+	// carry that allocation.
+	g_hw_sh_indirect_func[0x14a] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
@@ -4372,14 +4358,8 @@ void GraphicsInitJmpTablesUcIndirect() {
 		HwUcSetGdsOaRegister(cp, cmd_offset, value);
 	};
 
-	g_hw_uc_indirect_func[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("warning: ignoring indirect uc reg GE_STEREO_CNTL at 0x%" PRIx32
-			     ", value = 0x%08" PRIx32 "\n",
-			     cmd_offset, value);
-		}
-	};
+	// Ignored (upstream 5b9749d95 dropped the warning).
+	g_hw_uc_indirect_func[Pm4::GE_STEREO_CNTL] = [](CommandProcessor&, uint32_t, uint32_t) {};
 }
 
 } // namespace Libs::Graphics

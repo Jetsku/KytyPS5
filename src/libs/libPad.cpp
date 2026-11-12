@@ -541,16 +541,8 @@ static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const 
 		// Logged by the wheel at a throttled rate: GT7 probes about 9 times a second.
 		return PadWheel::OpenExt(user_id, type, index, static_cast<const uint16_t*>(param));
 	}
-
-	PRINT_NAME();
-
-	LOGF("\t user_id = %d\n"
-	     "\t type    = %d\n"
-	     "\t index   = %d\n"
-	     "\t param   = 0x%016" PRIx64 "\n",
-	     user_id, type, index, reinterpret_cast<uint64_t>(param));
-
-	return OK;
+	// Upstream 6a75ca42f: without an extended device, report "not connected" instead of handle 0.
+	return Controller::PadOpenExt(user_id, type, index, param);
 }
 
 static int KYTY_SYSV_ABI PadReadWheelAware(int handle, Controller::PadData* data, int num) {

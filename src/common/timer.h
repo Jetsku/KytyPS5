@@ -1,39 +1,31 @@
 #ifndef KYTY_COMMON_TIMER_H_
 #define KYTY_COMMON_TIMER_H_
 
-#include "common/common.h"
+#include <chrono>
+#include <cstdint>
 
 namespace Common {
 
+inline uint64_t SteadyNs() {
+	return static_cast<uint64_t>(
+	    std::chrono::nanoseconds(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Measures from its construction.
 class Timer final {
 public:
-	Timer() noexcept;
-	~Timer() = default;
+	[[nodiscard]] double GetTimeS() const {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count();
+	}
 
-	void Start();
-
-	void Pause();
-
-	void Resume();
-
-	[[nodiscard]] bool IsPaused() const;
-
-	// return time in milliseconds
-	[[nodiscard]] double GetTimeMs() const;
-
-	// return time in seconds
-	[[nodiscard]] double GetTimeS() const;
-
-	KYTY_CLASS_NO_COPY(Timer);
-
+	// The host performance counter (Windows QueryPerformanceCounter; elsewhere steady_clock
+	// nanoseconds). Kept for our callers that map it to Vulkan's calibrated QPC time domain
+	// (eopTimestamps, videoOut pacing) after upstream 159149c50 dropped it. timer.cpp.
 	[[nodiscard]] static uint64_t QueryPerformanceFrequency();
 	[[nodiscard]] static uint64_t QueryPerformanceCounter();
 
 private:
-	bool     m_is_paused = true;
-	uint64_t m_Frequency = 0;
-	uint64_t m_StartTime = 0;
-	uint64_t m_PauseTime = 0;
+	std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
 };
 
 } // namespace Common

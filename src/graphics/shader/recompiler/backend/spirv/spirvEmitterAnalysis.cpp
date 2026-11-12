@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <unordered_map>
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
@@ -158,12 +160,8 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
-	switch (ImageDimensionInfoFor(dimension).coordinate_components) {
-		case 1u: return TypeU32(state);
-		case 2u: return TypeU32Vector(state, 2);
-		case 3u: return TypeU32Vector(state, 3);
-		default: return 0;
-	}
+	const auto& info = ImageDimensionInfoFor(dimension);
+	return TypeU32Vector(state, info.coordinate_components + (info.one_dimensional ? 1u : 0u));
 }
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,

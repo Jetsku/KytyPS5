@@ -4,16 +4,21 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+// Per VGPR, the pcs of its first V_WRITELANE_B32 and its last V_READLANE_B32 (ca2fd3141).
+using LaneSpills = std::array<std::pair<uint32_t, uint32_t>, IR::NumVectorRegs>;
+inline constexpr LaneSpills NoLaneSpills {};
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs, bool graphics_compute,
+	           const LaneSpills& lane_spills, bool flush_f32_inputs, bool graphics_compute,
 	           const std::array<IR::U32, 2>* present_lanes = nullptr)
-	    : program(program), ir(block), current_vector_limit(vector_limit),
+	    : program(program), ir(block), current_vector_limit(vector_limit), lane_spills(lane_spills),
 	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {
 		if (present_lanes != nullptr) {
 			present_mask      = *present_lanes;
@@ -165,7 +170,7 @@ private:
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
 	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
-	                             bool is64 = false);
+	                             IR::Type type = IR::Type::F32);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half = false);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
@@ -315,6 +320,7 @@ private:
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
+	const LaneSpills& lane_spills;
 	bool            lds_write_pending    = false;
 	bool            flush_f32_inputs;
 	bool            graphics_compute;

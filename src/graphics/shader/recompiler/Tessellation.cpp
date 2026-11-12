@@ -5,6 +5,7 @@
 #include "common/skipInvalid.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -114,8 +115,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	TessellationRegisters registers {};
 	TessellationScalars   scalars {};
-	const auto            scalar_slot = [&](const Operand& operand) -> std::optional<uint32_t> {
-		if (!indexed) return std::nullopt;
+	// Scalar constants are tracked in every mode (upstream 65cfffe88: SDWA takes no literal, so
+	// S_MOVK_I32 stages factors in SGPRs); KYTY_TESS_INDEXED adds the folds that use them further.
+	const auto scalar_slot = [&](const Operand& operand) -> std::optional<uint32_t> {
 		if (operand.kind == OperandKind::Sgpr && operand.reg < 106u) return operand.reg;
 		if (operand.kind == OperandKind::VccLo) return 106u;
 		if (operand.kind == OperandKind::VccHi) return 107u;
@@ -125,7 +127,15 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 	const auto is_constant = [](const Address& value) {
 		return value.kind == Kind::Affine && value.coefficient == 0u;
 	};
-	const auto read = [&](const Operand& operand) -> Address {
+	// The packed HS ID holds the patch ordinal in bits 7:0 and the control point ID in bits
+	// 12:8. Addresses vary with the control point ID at patch 0, as the frontend initializes v1,
+	// or (KYTY_TESS_SINGLE_CP, upstream 3b3e2475d) with the patch ordinal when one output control
+	// point makes each HS lane one patch.
+	const bool single_cp = GetCodegenOptions().tess_single_cp;
+	const bool single    = single_cp && !local && control_points == 1u;
+	const auto patch     = single ? Address {Kind::Affine, 1u, 0u} : constant(0u);
+	const auto point     = single ? constant(0u) : Address {Kind::Affine, 1u, 0u};
+	const auto read      = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
 			return {};
@@ -138,9 +148,7 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		} else if (const auto slot = scalar_slot(operand); slot && is_constant(scalars[*slot])) {
 			value = scalars[*slot];
 		}
-		// The native packed HS ID's low byte is the patch ordinal. The logical
-		// interface addresses one patch, as in the frontend's v1 initialization.
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
+		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return patch;
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -198,9 +206,10 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			return constant(value.constant & 0xffffffu);
 		// A loaded index is a control point number, far below 2^24.
 		if (indexed && (value.kind == Kind::Unknown || value.kind == Kind::Indexed)) return value;
+		// The largest index: the last control point, or the last patch ordinal of a one-point HS.
+		const uint64_t maximum = single ? 0xffu : control_points - 1u;
 		return value.kind == Kind::Affine &&
-		               uint64_t {value.coefficient} * (control_points - 1u) + value.constant <=
-		                   0xffffffu
+		               uint64_t {value.coefficient} * maximum + value.constant <= 0xffffffu
 		           ? value
 		           : Address {};
 	};
@@ -211,8 +220,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		if (!is_constant(bits)) return {};
 		if (is_constant(value)) return constant(value.constant & bits.constant);
 		if (value.kind == Kind::PackedControlPoint) {
-			if ((bits.constant & ~0xffu) == 0u) return constant(0u);
-			if (bits.constant == 0x1f00u) return {Kind::Affine, 0x100u, 0u};
+			if ((bits.constant & ~0xffu) == 0u)
+				return !single ? constant(0u) : bits.constant == 0xffu ? patch : Address {};
+			if (bits.constant == 0x1f00u) return multiply(point, constant(0x100u));
 		}
 		return {};
 	};
@@ -281,7 +291,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					                 stage_name, inst.pc, hash));
 					return false;
 				}
-				if (address.coefficient != 0u) {
+				// A coefficient below zero (KYTY_TESS_SINGLE_CP: later patches sit lower in the ring)
+				// marks a patch constant, as a zero one does (upstream 3b3e2475d).
+				if (static_cast<int32_t>(address.coefficient) > 0) {
 					const auto expected = control_read ? input_stride : stride;
 					if ((address.coefficient & 3u) != 0u ||
 					    (expected != 0u && expected != address.coefficient)) {
@@ -303,17 +315,17 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					}
 				}
 			}
-			// KYTY_TESS_INDEXED: scalar constants (s_mov / s_movk); any other scalar write forgets
-			// what it may cover (a load's dwords, a 64-bit pair, a carry-out).
+			// Scalar constants (s_mov / s_movk); any other scalar write forgets what it may cover (a
+			// load's dwords, a 64-bit pair, a carry-out).
 			if (const auto slot = scalar_slot(inst.dst2); slot) {
 				for (uint32_t index = 0; index < 2u && *slot + index < scalars.size(); index++)
 					scalars[*slot + index] = {};
 			}
 			if (const auto slot = scalar_slot(inst.dst); slot) {
-				const bool single =
+				const bool move =
 				    inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOVK_I32;
-				const auto     value   = single ? read(inst.src0) : Address {};
-				const uint32_t covered = single ? 1u : std::max(inst.data_dwords, 2u);
+				const auto     value   = move ? read(inst.src0) : Address {};
+				const uint32_t covered = move ? 1u : std::max(inst.data_dwords, 2u);
 				for (uint32_t index = 0; index < covered && *slot + index < scalars.size(); index++)
 					scalars[*slot + index] = {};
 				if (is_constant(value)) scalars[*slot] = value;
@@ -335,9 +347,8 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
 					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
 					    third.coefficient == 0u) {
-						if (rhs.constant == 8u && third.constant == 5u)
-							value = {Kind::Affine, 1u, 0u};
-						if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+						if (rhs.constant == 8u && third.constant == 5u) value = point;
+						if (rhs.constant == 0u && third.constant == 8u) value = patch;
 					}
 					break;
 				case Opcode::V_AND_B32:
@@ -351,13 +362,13 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					     rhs.kind == Kind::PackedControlPoint) ||
 					    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0xffu &&
 					     lhs.kind == Kind::PackedControlPoint))
-						value = constant(0u);
+						value = patch;
 					// Bits 8..12 hold the control point (upstream 77458260f): & 0x1f00 is 256 * cp.
 					if ((lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant == 0x1f00u &&
 					     rhs.kind == Kind::PackedControlPoint) ||
 					    (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant == 0x1f00u &&
 					     lhs.kind == Kind::PackedControlPoint))
-						value = {Kind::Affine, 256u, 0u};
+						value = multiply(point, constant(256u));
 					break;
 				case Opcode::V_MOV_B32: value = lhs; break;
 				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
@@ -380,10 +391,12 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 						value = multiply(rhs, constant(1u << lhs.constant));
 					break;
 				case Opcode::V_SUB_NC_U32:
+					// KYTY_TESS_SINGLE_CP (upstream 3b3e2475d): the coefficient may fall below zero.
 					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-					    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
-						value =
-						    affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
+					    lhs.constant >= rhs.constant &&
+					    (single_cp || lhs.coefficient >= rhs.coefficient))
+						value = {Kind::Affine, lhs.coefficient - rhs.coefficient,
+						         lhs.constant - rhs.constant};
 					break;
 				default: break;
 			}

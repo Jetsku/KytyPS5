@@ -317,6 +317,12 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// With storage readback (Config::ReadbackStorageImagesEnabled, upstream 9678c59b7), a GL2
+	// writeback makes GPU-written images visible to the CPU; returns whether a download was
+	// recorded.
+	[[nodiscard]] bool WriteBackImages();
+	// The tick of the latest storage-readback write-back pending over the range's pages, or 0.
+	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	// Called once per completed guest flip. Alias lifetimes are measured in presented frames:
 	// a frame spans hundreds of scheduler ticks, so tick age alone treats every alias used
 	// earlier in the same frame as stale.
@@ -493,6 +499,8 @@ private:
 		uint32_t layers     = 0;
 		// KYTY_HTILE_SIZE_RULE: the largest HTILE size a depth target bound with it (0 = not known).
 		uint64_t size       = 0;
+		// The depth image that last acquired this HTile range (upstream 2d84e36b4).
+		ImageId owner;
 	};
 
 	struct OverlapResult {
@@ -761,6 +769,8 @@ private:
 	// Returns true when the destination's copied subresources now hold exactly the source's
 	// native bits for every subresource of both images (same shape, lossless path).
 	bool CopyImage(ImageId destination, ImageId source, const char* context = "other");
+	// The depth image's stencil plane record covering exactly range, or none (upstream 84419aef7).
+	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
@@ -771,6 +781,14 @@ private:
 	// KYTY_IMAGE_WRITEBACK_GUARD: a recorded image download not yet written into guest memory. It
 	// watches the pages it has not given up (`watched`); a CPU write to them before the write-back
 	// releases them and marks them CPU-written, and the write-back leaves those to the CPU.
+	// A storage-readback image download whose guest pages stay inaccessible until it lands
+	// (upstream 9678c59b7).
+	struct StorageWriteBack {
+		GuestRange range;
+		uint64_t   tick;
+	};
+	[[nodiscard]] bool DownloadQueuedImages();
+
 	struct PendingWriteback {
 		KeptRanges::List watched;
 		KeptRanges::List cpu_written;
@@ -939,6 +957,8 @@ private:
 	void ReleaseUnregisteredImage(ImageId id);
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::mutex                                        m_storage_write_back_mutex;
+	std::vector<StorageWriteBack>                     m_storage_write_backs;
 	std::atomic<uint64_t>                             m_frame {0};
 	// KYTY_DISCARDED_TARGET_SKIP (textureCache.cpp): ranges of GPU-written render/depth targets freed
 	// without their pixels reaching guest memory, with the frame of the free.
@@ -1011,6 +1031,7 @@ private:
 	uint64_t         m_dcc_decision_effects = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	bool             m_readback_storage_images = false;
 	// Texture streaming (see TextureCache constructor for the environment switches).
 	bool             m_partial_upload      = true;
 	bool             m_partial_bands       = true;

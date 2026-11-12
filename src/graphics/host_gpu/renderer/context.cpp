@@ -1048,8 +1048,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::RenderSplits);
 		barrier_split = true;
 	}
-	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
-	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	if (m_rendering) {
 		// Attribution of the end (GpuOps.EndRendering.<site>): a pending barrier that could not
 		// be sunk, or different targets/state/occlusion control.

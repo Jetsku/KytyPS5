@@ -41,12 +41,7 @@
 #include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #endif
 
 namespace Libs::Graphics {
@@ -1093,7 +1088,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
-			// AGC vertex formats encode the buffer format above the two channel-count bits.
+			// Vertex attribute formats encode the buffer format above the two channel-count bits.
 			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
 			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
 			              (buffer_format << 12u) |
@@ -1295,14 +1290,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	info.scratch_size_dwords = data.scratch_size_dwords;
 
 	if (data.user_data == nullptr) {
-		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
+		LOGF("ShaderGetVertexInputInfo(): no user data for shader=0x%016" PRIx64
 		     " user_sgpr_num=%u\n",
 		     shader_addr, user_sgpr_num);
 	}
 	ShaderVertexMetadata metadata;
 	std::string          metadata_error;
 	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
-		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+		LOGF("ShaderGetVertexInputInfo(): invalid vertex metadata shader=0x%016" PRIx64 ": %s\n",
 		     shader_addr, metadata_error.c_str());
 		return false;
 	}
@@ -1681,6 +1676,14 @@ static bool TessMergedHullEnabled() {
 	return enabled;
 }
 
+static bool TessWave32Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TESS_WAVE32");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 // KYTY_TESS_MERGED_CARRY (default off; only with KYTY_TESS_MERGED_HULL; based on
 // Erlou93/KytyPS5-Yotei): the split merged program's HS part starts with the VGPRs it reads before
 // writing them, as its LS part left them in the lane (ShaderTessellationInputInfo::carried_vgprs).
@@ -1858,11 +1861,14 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	                               control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                               evaluation.type != Prospero::ShaderBinaryType::kGs;
 	const uint32_t stages             = context.GetShaderStages();
-	const bool     unsupported_stages = (stages & 0x4u) == 0 || (stages & 0x00600020u) != 0;
+	// KYTY_TESS_WAVE32 (upstream 27f290e95, default off): wave32 hull (HS_W32_EN, bit 21) and domain
+	// (GS_W32_EN, bit 22) stages compile with their wave size instead of counting as unsupported.
+	const uint32_t wave32_mask        = TessWave32Enabled() ? 0x00000020u : 0x00600020u;
+	const bool     unsupported_stages = (stages & 0x4u) == 0 || (stages & wave32_mask) != 0;
 	// GT7 (usa-ratt/KytyPS5-GT7 round 138): a set this path cannot run (no hull stage, a GS after
-	// the tessellator, a wave32 hull or domain stage, other binary types) has its patch draws
-	// skipped with KYTY_SKIP_INVALID (default on) instead of ending the emulator. Logged once per
-	// set and stage mask.
+	// the tessellator, a wave32 hull or domain stage without KYTY_TESS_WAVE32, other binary types)
+	// has its patch draws skipped with KYTY_SKIP_INVALID (default on) instead of ending the
+	// emulator. Logged once per set and stage mask.
 	if (speculative && (unsupported_types || unsupported_stages || regs.hs_regs.user_data_addr == 0)) {
 		*unsupported = true;
 		return {};
@@ -1940,6 +1946,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	                                           input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
+	// LS and HS share the HS wave; the TES runs in the GS wave.
 	input_info[0].logical_stage       = ShaderType::Local;
 	// An indirect draw's START_INST_LOC names the first stage's user SGPR: for tessellation
 	// the LS, whose user SGPRs start at s0 here. The LS then gets the instance ID from 0 and
@@ -1948,9 +1955,12 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.hs_regs.rsrc2.user_sgpr) {
 		input_info[0].start_instance_sgpr = start_instance;
 	}
+	input_info[0].wave_size           = (stages & 0x00200000u) != 0 ? 32u : 64u;
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
+	input_info[1].wave_size           = input_info[0].wave_size;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
+	input_info[2].wave_size           = (stages & 0x00400000u) != 0 ? 32u : 64u;
 	input_info[2].scratch_size_dwords = evaluation.scratch_size_dwords;
 	input_info[2].pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 

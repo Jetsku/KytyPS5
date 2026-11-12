@@ -1,6 +1,5 @@
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/dateTime.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
@@ -223,48 +222,6 @@ static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	return true;
 }
 
-static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
-	if (st == nullptr) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
-	}
-
-	const bool is_dir  = Common::File::IsDirectoryExisting(host_path);
-	const bool is_file = Common::File::IsFileExisting(host_path);
-	if (!is_dir && !is_file) {
-		return LibKernel::KERNEL_ERROR_ENOENT;
-	}
-
-	LibKernel::FileSystem::FileStat stat {};
-	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-
-	auto at = Common::DateTime::FromSystemUTC();
-	auto wt = at;
-
-	if (is_dir) {
-		stat.st_size    = 0;
-		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
-	} else {
-		stat.st_size    = static_cast<int64_t>(Common::File::Size(host_path));
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
-
-		Common::File::GetLastAccessAndWriteTimeUTC(host_path, &at, &wt);
-	}
-
-	stat.st_atim.tv_sec  = static_cast<int64_t>(at.ToUnix());
-	stat.st_atim.tv_nsec = static_cast<int64_t>(
-	    (at.ToUnix() - static_cast<double>(stat.st_atim.tv_sec)) * 1000000000.0);
-	stat.st_mtim.tv_sec  = static_cast<int64_t>(wt.ToUnix());
-	stat.st_mtim.tv_nsec = static_cast<int64_t>(
-	    (wt.ToUnix() - static_cast<double>(stat.st_mtim.tv_sec)) * 1000000000.0);
-	stat.st_ctim     = stat.st_atim;
-	stat.st_birthtim = stat.st_mtim;
-	*st              = stat;
-
-	return OK;
-}
-
 // Mounts can appear after a failed lookup (e.g. additional content), so forget negative results.
 void InvalidateFailedResolves() {
 	std::scoped_lock lock(g_mutex);
@@ -308,6 +265,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		if (AprOneQueryEnabled()) {
 			// One attribute query per path: games resolve every file of their package this way
 			// (Demon's Souls ~224,000 at boot, a query each for directory, file and size before).
+			// Upstream b0c6b0b0b/1a24e34e8 made the one query the only path; ours keeps the switch.
 			if (const auto host = Common::File::GetInfo(real_path); host && host->is_file) {
 				info.file_size = host->size;
 			} else if (host || Common::File::IsDirectoryExisting(real_path)) {
@@ -607,7 +565,7 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	return KernelSyscallResult(AprShared::GetHostPathStat(host_path, st));
+	return KernelSyscallResult(LibKernel::FileSystem::StatHostPath(host_path, st));
 }
 
 static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {

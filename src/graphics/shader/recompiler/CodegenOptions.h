@@ -112,6 +112,13 @@ struct CodegenOptions {
 	// zero min/max(-0, +0) returns unspecified and may treat denormals differently from the
 	// guest's compare (see EmitFastMinMaxF32), so this stays opt-in.
 	bool native_float_min_max = false;
+	// KYTY_RELAXED_FLOAT=1 or --relaxed-shader-float (default off; upstream 8dbee8635): native float
+	// ops whose NaN, signed-zero and denormal results may differ from the guest: f32/f64 min/max as
+	// NMin/NMax (as KYTY_NATIVE_FMINMAX, also on the slow path), V_MED3_F32 from native min/max,
+	// sin/cos without the signed-zero-preserving range cycle, and no shader-side f32 denormal input
+	// flushes (EmitFlushF32DenormToSignedZero). The command-line option is applied at device
+	// creation (vulkanWindow.cpp).
+	bool relaxed_float = false;
 	// KYTY_DCACHE_INV=1 (default off; upstream 22ef16a04): BUFFER_GL0_INV/GL1_INV emit a device
 	// acquire barrier and make the program's storage buffers coherent (slower memory access).
 	bool dcache_invalidate = false;
@@ -146,6 +153,11 @@ struct CodegenOptions {
 	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
 	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
 	bool robust_buffer_loads = true;
+	// KYTY_ROBUST_BUFFER_STORES=0 (upstream ee034be4b relies on robustBufferAccess2 for stores): keep the
+	// explicit bounds check on plain dword stores and 8/16-bit-view subword stores to storage buffers
+	// even when the device drops writes past the descriptor range (HostBufferRobustness, the same
+	// device condition as robust_buffer_loads). Atomics and 32-bit-view subword stores always keep it.
+	bool robust_buffer_stores = true;
 	// KYTY_BRANCHLESS_LOADS=1 (default off; YOTEI 434138316 / 01714a120 / 76a51a908, bruno 6ddeb3388):
 	// a raw dword or subword load of a storage buffer that the device bounds-checks (robust_buffer_loads
 	// on a robustBufferAccess2 device, DeviceChecksDwordLoad) runs in every lane and selects zero where
@@ -886,6 +898,11 @@ struct CodegenOptions {
 	// folds the shifted patch ordinal; HS and TES share the patch-constant range the analysis
 	// found. Factor or patch-constant addresses that still do not fold skip the stage's draws.
 	bool tess_indexed = false;
+	// KYTY_TESS_SINGLE_CP=1 (default off; upstream 3b3e2475d): the LS/HS stride analysis of a hull
+	// shader with one output control point takes the packed HS ID's low byte (the patch ordinal) as
+	// the varying index, as each HS lane is then one patch, and treats stores whose address falls with
+	// the patch as patch constants. Off: the patch ordinal reads as patch 0 (the behaviour before).
+	bool tess_single_cp = false;
 	// KYTY_WORKGROUP_IMAGES=1 (default off; the GT7 preset; adapted from upstream KytyPS5 0ee880090
 	// and c23de6218, nmzik): a compute image whose T# is read from a table at
 	// workgroup_id[axis] * stride + offset (GT7's CS 0xe042c5de1f18d724: two storage T#s per Z group

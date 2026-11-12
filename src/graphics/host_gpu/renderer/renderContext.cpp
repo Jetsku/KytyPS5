@@ -269,6 +269,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			            fault_vaddr);
 		}
 	}
+	// The access retries once the image write-backs over its page land (upstream 9678c59b7;
+	// only with --readback-storage-images, TextureCache::WriteBackTick is 0 otherwise).
+	if (WaitWriteBacks(fault_vaddr, fault_size)) {
+		return true;
+	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
 	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
 	// KYTY_WAIT_ATTRIB: the command processor's faults by call site, page state and region.
@@ -472,7 +477,25 @@ bool RenderContext::TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t 
 	return true;
 }
 
+bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
+	const auto tick = m_texture_cache.WriteBackTick(vaddr, size);
+	if (tick == 0) {
+		return false;
+	}
+	// The GPU thread can fault inside a draw, so it submits without running deferred operations.
+	if (GuestGpu::IsGpuThread()) {
+		m_command_scheduler.Wait(tick);
+	} else if (m_gpu != nullptr && tick == m_command_scheduler.CurrentTick()) {
+		m_gpu->SendCommandSync([this, tick] { m_command_scheduler.Wait(tick); });
+	}
+	m_command_scheduler.WaitPriorityOperations(tick);
+	return true;
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	// Host I/O into the range, even one running past its mapping, would fail on its inaccessible
+	// pages, and a later write-back would overwrite it.
+	(void)WaitWriteBacks(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
@@ -669,10 +692,6 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
-	if (!m_bda_logged) {
-		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		m_bda_logged = true;
-	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
 	m_fault_process_pending = true;

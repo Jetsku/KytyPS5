@@ -167,6 +167,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
+	memory.image_cube    = decoded.image_cube;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
 	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.
@@ -1212,7 +1213,10 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16:
@@ -1226,6 +1230,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:

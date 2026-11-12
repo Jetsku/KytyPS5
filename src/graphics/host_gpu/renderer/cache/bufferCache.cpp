@@ -1642,8 +1642,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize(),
                        graphics.transfer_queue != nullptr),
       m_upload_dma(UploadDma::Create(graphics, scheduler)),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, false, {},
-                      StreamRingHostEnabled()),
+      // Device address: the indirect mesh task shader reads its parameters from this ring
+      // (upstream abc509d33).
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, false,
+                      vk::BufferUsageFlagBits::eShaderDeviceAddress, StreamRingHostEnabled()),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {

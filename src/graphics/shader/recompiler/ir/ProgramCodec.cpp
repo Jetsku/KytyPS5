@@ -18,9 +18,9 @@ namespace {
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
-// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
+// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 26; BufferResource 16;
 // ImageResource 22; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
-// ShaderInfo 10; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
+// ShaderInfo 11; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (BindlessSampler 2, IndirectDescriptor
 // 18, SelectorRead 6 (MaskRanks 3));SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
@@ -34,14 +34,14 @@ static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: updat
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
-static_assert(sizeof(ShaderInfo) == 216, "IR::ShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(ShaderInfo) == 240, "IR::ShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorBinding) == 32, "IR::DescriptorBinding changed: update ProgramCodec");
 static_assert(sizeof(BindingLayout) == 72, "IR::BindingLayout changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeNode) == 24, "IR::WriteRangeNode changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: update ProgramCodec");
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
-static_assert(sizeof(CompiledShaderInfo) == 376, "IR::CompiledShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(CompiledShaderInfo) == 400, "IR::CompiledShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource) == 304, "IR::DescriptorSource changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 144,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
@@ -59,7 +59,7 @@ static_assert(sizeof(ResourcePlan::ArithmeticTape) == 8,
               "IR::ResourcePlan::ArithmeticTape changed: update ProgramCodec");
 static_assert(sizeof(UniformFill) == 28, "IR::UniformFill changed: update ProgramCodec");
 static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: update ProgramCodec");
-static_assert(sizeof(ResourcePlan) == 760, "IR::ResourcePlan changed: update ProgramCodec");
+static_assert(sizeof(ResourcePlan) == 784, "IR::ResourcePlan changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
@@ -306,6 +306,7 @@ void Write(CodecWriter& w, const MemoryInfo& v) {
 	w.Bool(v.formatted);
 	w.Bool(v.image_has_mip);
 	w.Bool(v.image_r128);
+	w.Bool(v.image_cube);
 	w.Bool(v.idxen);
 	w.Bool(v.offen);
 	w.Bool(v.coherent);
@@ -334,6 +335,7 @@ void Read(CodecReader& r, MemoryInfo& v) {
 	v.formatted                = r.Bool();
 	v.image_has_mip            = r.Bool();
 	v.image_r128               = r.Bool();
+	v.image_cube               = r.Bool();
 	v.idxen                    = r.Bool();
 	v.offen                    = r.Bool();
 	v.coherent                 = r.Bool();
@@ -623,6 +625,8 @@ void Read(CodecReader& r, uint8_t& value) {
 }
 
 // Element types defined after the vector helpers (template lookup needs them declared first).
+void Write(CodecWriter& w, const std::array<uint32_t, 2>& v);
+void Read(CodecReader& r, std::array<uint32_t, 2>& v);
 void Write(CodecWriter& w, const BufferWriteRange& v);
 void Read(CodecReader& r, BufferWriteRange& v);
 
@@ -663,11 +667,22 @@ void Read(CodecReader& r, BufferWriteRange& v) {
 	ReadVector(r, v.accesses);
 }
 
+void Write(CodecWriter& w, const std::array<uint32_t, 2>& v) {
+	w.U32(v[0]);
+	w.U32(v[1]);
+}
+
+void Read(CodecReader& r, std::array<uint32_t, 2>& v) {
+	v[0] = r.U32();
+	v[1] = r.U32();
+}
+
 void Write(CodecWriter& w, const ShaderInfo& v) {
 	WriteVector(w, v.buffers);
 	WriteVector(w, v.images);
 	WriteVector(w, v.samplers);
 	WriteVector(w, v.sampled_pairs);
+	WriteVector(w, v.address_bases);
 	WriteVector(w, v.inputs);
 	WriteVector(w, v.outputs);
 	w.Raw(v.vertex_fetch_components.data(), v.vertex_fetch_components.size());
@@ -690,6 +705,7 @@ void Read(CodecReader& r, ShaderInfo& v) {
 	ReadVector(r, v.images);
 	ReadVector(r, v.samplers);
 	ReadVector(r, v.sampled_pairs);
+	ReadVector(r, v.address_bases);
 	ReadVector(r, v.inputs);
 	ReadVector(r, v.outputs);
 	const auto fetch = r.Take(v.vertex_fetch_components.size());

@@ -554,7 +554,14 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto m0       = GetCodegenOptions().movrel_full_m0
 	                          ? m0_value
 	                          : ir.BitwiseAnd(m0_value, IR::U32(IR::Value(0xffu)));
+	// Between its first lane write and last lane read a VGPR holds spilled SGPRs, which no
+	// indexed register tuple overlaps, so the first such VGPR above the base ends the tuple
+	// (upstream ca2fd3141).
 	for (uint32_t index = base; index < current_vector_limit; index++) {
+		const auto [first_write, last_read] = lane_spills[index];
+		if (index != base && first_write < current_pc && current_pc < last_read) {
+			break;
+		}
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);

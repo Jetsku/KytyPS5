@@ -1,68 +1,37 @@
 #include "common/timer.h"
 
-#include "common/assert.h"
-#include "common/platform/sysTimer.h"
+#include "common/common.h"
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Common {
 
-Timer::Timer() noexcept {
-	SysQueryPerformanceFrequency(&m_Frequency);
-}
-
-void Timer::Start() {
-	SysQueryPerformanceCounter(&m_StartTime);
-	m_is_paused = false;
-}
-
-void Timer::Pause() {
-	EXIT_IF(m_is_paused);
-
-	SysQueryPerformanceCounter(&m_PauseTime);
-	m_is_paused = true;
-}
-
-void Timer::Resume() {
-	EXIT_IF(!m_is_paused);
-
-	uint64_t current_time = 0;
-	SysQueryPerformanceCounter(&current_time);
-
-	m_StartTime += current_time - m_PauseTime;
-
-	m_is_paused = false;
-}
-
-bool Timer::IsPaused() const {
-	return m_is_paused;
-}
-
-// return time in milliseconds
-double Timer::GetTimeMs() const {
-	return GetTimeS() * 1000.0;
-}
-
-// return time in seconds
-double Timer::GetTimeS() const {
-	if (m_is_paused) {
-		return (static_cast<double>(m_PauseTime - m_StartTime)) / static_cast<double>(m_Frequency);
-	}
-
-	uint64_t current_time = 0;
-	SysQueryPerformanceCounter(&current_time);
-
-	return (static_cast<double>(current_time - m_StartTime)) / static_cast<double>(m_Frequency);
-}
-
 uint64_t Timer::QueryPerformanceFrequency() {
-	uint64_t ret = 0;
-	SysQueryPerformanceFrequency(&ret);
-	return ret;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	LARGE_INTEGER f {};
+	::QueryPerformanceFrequency(&f);
+	return static_cast<uint64_t>(f.QuadPart);
+#else
+	return 1000000000;
+#endif
 }
 
 uint64_t Timer::QueryPerformanceCounter() {
-	uint64_t ret = 0;
-	SysQueryPerformanceCounter(&ret);
-	return ret;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	LARGE_INTEGER c {};
+	::QueryPerformanceCounter(&c);
+	return static_cast<uint64_t>(c.QuadPart);
+#else
+	return SteadyNs();
+#endif
 }
 
 } // namespace Common

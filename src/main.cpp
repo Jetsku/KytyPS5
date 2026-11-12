@@ -1,12 +1,9 @@
 #include "common/archive.h"
 #include "common/common.h"
-#include "common/dateTime.h"
-#include "common/debug.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/u59Preset.h"
-#include "common/virtualMemory.h"
 #include "common/wheelConfig.h"
 #include "emulator.h"
 #include "kernel/memory.h"
@@ -99,28 +96,10 @@ static void StartPgoDumps() {
 }
 #endif
 
-static std::string GetBuildString() {
-	Date date = Date::FromMacros(std::string(__DATE__));
-
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	std::string type = "Debug";
-#elif KYTY_BUILD == KYTY_BUILD_RELEASE
-	std::string type = "Release";
-#else
-	std::string type = "????";
-#endif
-
-	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
-
-	std::string str =
-	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
-	                KYTY_VERSION, KYTY_GIT_VERSION, date.ToString().c_str());
-
-	return str;
-}
-
 static void PrintUsage() {
-	::printf("%s\n", GetBuildString().c_str());
+	::printf("%s, %s, ver = %s, git = %s, date = %s\n",
+	         KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release", KYTY_TOOLCHAIN, KYTY_VERSION,
+	         KYTY_GIT_VERSION, __DATE__);
 	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
@@ -162,7 +141,10 @@ static void PrintUsage() {
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
-	         "                                       (PSSR uses linear scaling). Default: off.\n");
+	         "                                       (PSSR uses linear scaling unless --dlss is set). Default: off.\n");
+	::printf("  --dlss <folder>                      With --trinity, upscale PSSR with the DLSS\n"
+	         "                                       model in <folder> instead of linearly.\n");
+	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --wheel <true|false>                 Show the game a racing wheel fed by host\n"
 	         "                                       devices (see --wheel-config).\n");
 	::printf("  --wheel-config <json>                Wheel mapping file. Default: wheel.json in\n"
@@ -172,6 +154,7 @@ static void PrintUsage() {
 	         "                                       Default: on unless the CPU is an AMD (KYTY_AMD_CPU=\n"
 	         "                                       1|0|auto overrides).\n");
 	::printf("  --no-amd-cpu                         Turn Intel CPU compatibility off on a non-AMD CPU.\n");
+	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -184,6 +167,8 @@ static void PrintUsage() {
 	::printf("  --gpu-occlusion <on|off>             Accurate GPU occlusion queries (on) or always visible\n"
 	         "                                       (off, faster). Overrides KYTY_GPU_OCCLUSION (the\n"
 	         "                                       bundled preset: off).\n");
+	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
+	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -199,7 +184,11 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-tiled-images <true|false>  Read back small writable tiled images on submit.\n");
 	::printf(
+	    "  --readback-storage-images <true|false> Read back storage images on GL2 writeback.\n");
+	::printf(
 	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
+	::printf(
+	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
 	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
@@ -432,6 +421,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		// Upstream flags (2f885e25b, 8dbee8635, 84b1dfbb3), value-less as there.
+		if (arg == "--guest-tsc") {
+			options.config.guest_tsc_enabled = true;
+			continue;
+		}
+
+		if (arg == "--relaxed-shader-float") {
+			options.config.relaxed_shader_float = true;
+			continue;
+		}
+
+		if (arg == "--lod-stats") {
+			options.config.lod_stats_enabled = true;
+			continue;
+		}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
 			options.config.red_zone_protection_enabled = true;
@@ -589,6 +594,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--dlss") {
+			options.config.dlss_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--dlss-preset") {
+			if (value.size() != 1 || value[0] < 'A' || value[0] > 'O') {
+				::printf("invalid DLSS preset: %s\n", value.c_str());
+				return false;
+			}
+			options.config.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -597,6 +610,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--flush-draws") {
+			if (!ParseUint32(value, options.config.flush_draws)) {
+				::printf("invalid draw count: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {
@@ -693,6 +711,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--readback-tiled-images") {
 			if (!ParseBool(value, options.config.readback_tiled_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--readback-storage-images") {
+			if (!ParseBool(value, options.config.readback_storage_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
@@ -1020,7 +1043,6 @@ static int Main(int argc, char* argv[]) {
 		setenv("RADV_PERFTEST", "transfer_queue", 0);
 	}
 #endif
-	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
 	// After the address-space reservations: the thread's stack must not land in the guest range.

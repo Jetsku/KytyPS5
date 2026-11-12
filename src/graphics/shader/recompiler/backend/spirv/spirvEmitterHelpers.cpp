@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+namespace {
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits) {
@@ -60,6 +61,8 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	               ConstantU32(state, half_row ? 7u : 15u)),
 	        ConstantBool(state, true)};
 }
+
+} // namespace
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);

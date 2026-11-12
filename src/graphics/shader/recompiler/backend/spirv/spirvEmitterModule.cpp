@@ -628,13 +628,8 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, alias, spv::DecorationCoherent);
 					state.image_coherent_variables[IR::ImageBindingIndex(binding.kind)] = alias;
 				}
-				if (image.dimension == ImageDimension::Dim1D ||
-				    image.dimension == ImageDimension::Dim1DArray) {
-					state.builder.RequireCapability(image.resource_class ==
-					                                        IR::ImageResourceClass::Sampled
-					                                    ? spv::CapabilitySampled1D
-					                                    : spv::CapabilityImage1D);
-				}
+				// 1D images are host 2D images one texel high (upstream e6cc1ce30): no Sampled1D /
+				// Image1D capability.
 				break;
 			}
 		}

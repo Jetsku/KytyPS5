@@ -164,9 +164,7 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics, bool track_dispatch)
 }
 
 MasterSemaphore::~MasterSemaphore() {
-	if (m_semaphore != nullptr) {
-		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
-	}
+	m_graphics.device.destroySemaphore(m_semaphore, nullptr);
 }
 
 void MasterSemaphore::Refresh() {

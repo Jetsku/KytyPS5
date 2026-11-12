@@ -35,6 +35,7 @@ CodegenOptions FromEnvironment() {
 	options.vs_lane_wrap32     = EnvFlag("KYTY_VS_LANE_WRAP32", options.vs_lane_wrap32);
 	options.fast_float_min_max = EnvFlag("KYTY_FAST_FMINMAX", options.fast_float_min_max);
 	options.native_float_min_max = EnvFlag("KYTY_NATIVE_FMINMAX", options.native_float_min_max);
+	options.relaxed_float        = EnvFlag("KYTY_RELAXED_FLOAT", options.relaxed_float);
 	options.dcache_invalidate = EnvFlag("KYTY_DCACHE_INV", options.dcache_invalidate);
 	options.readfirstlane_exec_zero =
 	    EnvFlag("KYTY_READFIRSTLANE_EXEC0", options.readfirstlane_exec_zero);
@@ -46,6 +47,7 @@ CodegenOptions FromEnvironment() {
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	options.layer_clamp    = EnvFlag("KYTY_LAYER_CLAMP", options.layer_clamp);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
+	options.robust_buffer_stores = EnvFlag("KYTY_ROBUST_BUFFER_STORES", options.robust_buffer_stores);
 	options.branchless_loads    = EnvFlag("KYTY_BRANCHLESS_LOADS", options.branchless_loads);
 	options.branchless_lds      = EnvFlag("KYTY_BRANCHLESS_LDS", options.branchless_lds);
 	options.flat_aperture_bvh   = EnvFlag("KYTY_FLAT_APERTURE_BVH", options.flat_aperture_bvh);
@@ -293,6 +295,7 @@ CodegenOptions FromEnvironment() {
 	options.snapshot_written_guard =
 	    EnvFlag("KYTY_SNAPSHOT_WRITTEN_GUARD", options.snapshot_written_guard);
 	options.tess_indexed = EnvFlag("KYTY_TESS_INDEXED", options.tess_indexed);
+	options.tess_single_cp = EnvFlag("KYTY_TESS_SINGLE_CP", options.tess_single_cp);
 	options.ps_exec_words = EnvFlag("KYTY_PS_EXEC_WORDS", options.ps_exec_words);
 	// "off" (or "0") skips that stage's shader-side denormal flushes; unset, "exact" or anything
 	// else keeps them.

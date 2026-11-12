@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -236,7 +237,7 @@ private:
 	uint32_t                                  m_warned_upload       = 0;
 	bool                                      m_warned_no_haptic    = false;
 
-	std::unique_ptr<Common::Thread> m_thread;
+	std::unique_ptr<std::thread> m_thread;
 };
 
 WheelHost* g_host = nullptr;
@@ -980,15 +981,14 @@ void WheelHost::CloseAll() {
 void WheelHost::Start(const std::filesystem::path& config_path) {
 	m_config_path = config_path;
 	ReloadConfig(true);
-	m_thread = std::make_unique<Common::Thread>(
-	    [](void* arg) { static_cast<WheelHost*>(arg)->Loop(); }, this);
+	m_thread = std::make_unique<std::thread>([this] { Loop(); });
 }
 
 void WheelHost::Stop() {
 	m_quit = true;
 	m_cond.Signal();
 	if (m_thread) {
-		m_thread->Join();
+		m_thread->join();
 		m_thread.reset();
 	}
 }

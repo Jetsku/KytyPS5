@@ -21,12 +21,7 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #else
 #include <map>
 #include <sys/mman.h>
@@ -180,7 +175,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
 void TestWatchAndUnwatch() {
   g_protection_calls = 0;
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -196,7 +191,7 @@ void TestWatchAndUnwatch() {
 
 void TestSharedWatcherCounts() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -244,7 +239,7 @@ void TestResyncHostProtection() {
 
 void TestCrossRegionRange() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   auto *memory = Allocate(region_size * 2);
   const auto base = reinterpret_cast<uint64_t>(memory);
@@ -282,7 +277,7 @@ void TestCrossRegionRange() {
 
 void TestBatchedWatcherRanges() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   constexpr uint64_t allocation_size = region_size * 3;
   auto *memory = Allocate(allocation_size);
@@ -578,7 +573,7 @@ void SetDeferMode(DeferMode mode) { PageManager::SetDeferModeForTests(mode); }
 void TestDeferredReleaseWaitsForScope(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -620,7 +615,7 @@ void TestDeferredReleaseWaitsForScope(DeferMode mode) {
 void TestDeferredReleaseRacingWatch(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -678,7 +673,7 @@ void TestDeferredReleaseRacingWatch(DeferMode mode) {
 void TestDeferredBatchOverflow() {
   SetDeferMode(DeferMode::On);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 40 * 80; // 40 spans, 80 pages apart (beyond the merge gap)
   auto *memory = Allocate(page_size * pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -711,7 +706,7 @@ void TestDeferredBatchOverflow() {
 void TestDeferredReleaseStress(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 16;
   auto *memory = Allocate(page_size * pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -827,7 +822,7 @@ void TestParkingLock() {
 
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   if (std::strcmp(name, "invalid-range") == 0) {
     manager.UpdatePageWatchers<true>((1ull << 40u) - 1, 2);
   } else if (std::strcmp(name, "unknown-untrack") == 0) {
@@ -851,12 +846,13 @@ void TestParkingLock() {
     const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
     const auto page = static_cast<size_t>((address - region_base) / page_size);
     mask.Set(page);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    for (uint32_t count = 0; count < 256; count++) {
+      manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    }
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count < 256; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
@@ -919,7 +915,7 @@ void TestDeferredProtects(const char *mode) {
   Live::OnCpFlip();
   Check(PageManager::DeferProtectsMode() != 0, "KYTY_DEFER_PROTECTS did not switch on");
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto before = PageManager::GetDeferProtectsStats();
@@ -983,7 +979,7 @@ void TestDeferredProtectRacingRelease() {
   Live::Testing::StageText("KYTY_DEFER_PROTECTS=1\n");
   Live::OnCpFlip();
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto before = PageManager::GetDeferProtectsStats();
@@ -1033,7 +1029,7 @@ void TestDeferredProtectCoWatch(bool fix) {
                            (fix ? "1" : "0") + "\n");
   Live::OnCpFlip();
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto before = PageManager::GetDeferProtectsStats();

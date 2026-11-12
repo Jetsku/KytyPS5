@@ -6,6 +6,7 @@
 #include "common/prepPhases.h"
 #include "common/paceLog.h"
 #include "common/cpuPlacement.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
@@ -1283,9 +1284,21 @@ static Live::Switch g_dispatch_flush_interval("KYTY_DISPATCH_FLUSH_INTERVAL",
 	                                              return static_cast<int64_t>(std::min(parsed, 65536ul));
                                               });
 
+// Upstream 7d4e0d9b3's --flush-draws <n> (launcher "Performance tweaks", default 0 = off): the draw
+// interval when KYTY_DRAW_FLUSH_INTERVAL is unset or 0, with this function's rules (4x inside a
+// rendering instance, OptionalSubmitAllowed) instead of upstream's plain every-n count. The config
+// is loaded before the command processor runs.
+static uint32_t ConfigFlushDraws() {
+	static const uint32_t draws = std::min(Config::GetFlushDraws(), 65536u);
+	return draws;
+}
+
 bool CommandProcessor::MaybeFlushPeriodic(bool dispatch) {
-	const auto interval =
+	auto interval =
 	    static_cast<uint32_t>(dispatch ? g_dispatch_flush_interval.Get() : g_draw_flush_interval.Get());
+	if (interval == 0 && !dispatch) {
+		interval = ConfigFlushDraws();
+	}
 	if (interval == 0) {
 		return false;
 	}
@@ -2175,7 +2188,11 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			HangWatchdog::Scope service("cp-service-execute", reinterpret_cast<uint64_t>(gpu));
 			const CpGaps::Scope gap(CpGaps::Cat::Service);
-			command();
+			{
+				const Common::DebugCounters::ScopedTimer busy(
+				    Common::DebugCounters::Counter::GpuThreadBusyNs);
+				command();
+			}
 			SyncEpoch::Advance();
 			// KYTY_DRAW_RUN: a service command is other command-processor work.
 			if (DrawRun::Enabled()) {
@@ -2208,6 +2225,9 @@ void GuestGpu::ThreadRun(void* data) {
 		bool complete = false;
 		{
 			const CpGaps::Scope gap(CpGaps::Cat::Slice);
+			// The overlay's GPU-thread busy time (upstream 94094c692).
+			const Common::DebugCounters::ScopedTimer busy(
+			    Common::DebugCounters::Counter::GpuThreadBusyNs);
 			complete = gpu->Process(submission);
 		}
 		HangWatchdog::NoteQueue(
@@ -2344,14 +2364,6 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::Compute: {
 			const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
 			const auto*     buffer = submission.commands.data();
-			static uint32_t compute_batch_log_count = 0;
-			if (first_slice && num_dw <= 128 && compute_batch_log_count++ < 32) {
-				LOGF("compute direct batch: data=0x%016" PRIx64 ", num_dw=%" PRIu32 "\n",
-				     reinterpret_cast<uint64_t>(buffer), num_dw);
-				for (uint32_t i = 0; i < std::min<uint32_t>(num_dw, 16); i++) {
-					LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIx32 "\n", i, buffer[i]);
-				}
-			}
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
@@ -2694,13 +2706,6 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 		EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 		if (!reference && !prefetch) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPacketsSkipped);
-			static std::atomic<uint32_t> skip_log_count {0};
-			if (skip_log_count.fetch_add(1) < 2048) {
-				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
-				     ", packet=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32 "\n",
-				     opcode, KYTY_PM4_R(packet_header), packet_dw,
-				     reinterpret_cast<uint64_t>(packet), packet_header);
-			}
 			if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM &&
 			    packet_dw >= 7) {
 				static std::atomic<uint32_t> log_count {0};
@@ -3000,15 +3005,6 @@ CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payl
 		event.condition = condition;
 		event.skip      = skip;
 		HangTrace::RecordOcclusion(event);
-	}
-	if (op == 0x03) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 128) {
-			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
-			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(address), value, condition, skip ? 1u : 0u,
-			     wait_op);
-		}
 	}
 	return {false, skip ? 1u : 0u};
 }
@@ -3416,7 +3412,7 @@ static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t ind
 // (KYTY_START_INSTANCE_SGPR, recorded by the PM4 handler).
 void CommandProcessor::DrawIndirect(uint32_t data_offset,
                                     [[maybe_unused]] IndirectDrawRegisters registers,
-                                    uint32_t draw_initiator, bool indexed) {
+                                    uint32_t draw_initiator, bool indexed, uint32_t records) {
 	// KYTY_DRAW_PREP_INDIRECT (drawPrep.h): the draw's programs are prepared in a window slot.
 	auto*      engine  = m_draw_prep.get();
 	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
@@ -3426,6 +3422,12 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset,
 		DropSpeculativeSlots();
 	}
 	auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	if (records > 1) {
+		// KYTY_INDIRECT_RUNS: the run's records (a single draw keeps 0 here, as before).
+		op.max_count_or_count = records;
+		op.stride             = static_cast<uint32_t>(indexed ? sizeof(DrawIndexedIndirectArgs)
+		                                                      : sizeof(DrawIndirectArgs));
+	}
 	if (m_fence_overlap) {
 		// KYTY_DRAW_PREP_FENCE_OVERLAP (direct front): prepared behind the pending draws, which are
 		// committed first; the window position is the head when the op executes below.
@@ -3455,12 +3457,84 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset,
 // KYTY_CP_OP_STATS: an Exec* body may name its outcome for the op being timed (ExecuteOp).
 static const char* g_cp_op_outcome = nullptr;
 
+// The indirect-run counter site (KYTY_INDIRECT_RUNS): one call per executed run of `records` (at
+// least 2) DRAW_INDIRECT / DRAW_INDEX_INDIRECT packets, on the resolver (the CP thread), whichever
+// way the run is drawn (one native multi-draw or record by record).
+static void NoteIndirectRun([[maybe_unused]] uint32_t records) {}
+
 void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
+	// KYTY_INDIRECT_RUNS (CpOpDrawIndirect): `records` packets drawing consecutive records.
+	const uint32_t records = std::max(op.max_count_or_count, 1u);
+	// A run as one host multi-draw (the records' bytes, records * stride, are what the native path
+	// checks for GPU ownership, binds and reads). False: the native path declined (CPU-clean records,
+	// a mesh draw it converts one record at a time, no multi-draw support, ...).
+	const auto run_native = [this, records](const CpSeq::DrawIndirectOp& run) {
+		if ((run.flags & CpSeq::IndirectFlagSetInstances) != 0) {
+			m_num_instances = run.num_instances;
+			m_pending_num_instances.clear();
+		}
+		const bool indexed = (run.flags & CpSeq::IndirectFlagIndexed) != 0;
+		if (!TryDrawIndirectNative({.args_addr           = run.args_base + run.data_offset,
+		                            .stride              = run.stride,
+		                            .max_count           = records,
+		                            .count_addr          = 0,
+		                            .indexed             = indexed,
+		                            .index_base_addr     = run.index_base_addr,
+		                            .index_buffer_size   = run.index_buffer_size,
+		                            .index_type_and_size = run.index_type_and_size})) {
+			return false;
+		}
+		g_cp_op_outcome = "DrawIndirect run native";
+		// Per packet, as separate packets would have counted: the census line and the idle-flush /
+		// periodic-flush draw count (TryDrawIndirectNative counted the first).
+		for (uint32_t i = 0; i < records; i++) {
+			Libs::Graphics::PassCensus::Drop('i', 0, "info: indirect draw, native GPU path");
+			if (i != 0) {
+				MaybeFlushIdleGpu();
+			}
+		}
+		return true;
+	};
+	// The records one by one, each as its own packet would have drawn (instances already applied).
+	const auto run_records = [this](CpSeq::DrawIndirectOp run, uint32_t first, uint32_t end) {
+		run.flags &= ~(CpSeq::IndirectFlagSetInstances | CpSeq::IndirectFlagPrepared);
+		run.max_count_or_count = 0;
+		for (uint32_t i = first; i < end; i++) {
+			auto one        = run;
+			one.data_offset = run.data_offset + i * run.stride;
+			ExecDrawIndirect(one);
+		}
+	};
 	if ((op.flags & CpSeq::IndirectFlagPrepared) != 0) {
 		// KYTY_DRAW_PREP_INDIRECT: the same execution, with the slot's preparation offered.
 		auto plain = op;
 		plain.flags &= ~CpSeq::IndirectFlagPrepared;
+		if (records > 1) {
+			NoteIndirectRun(records);
+			// The run's multi-draw is the slot's commit. If the native path declines it, the first
+			// record is the commit (offered what is left of the preparation) and the others draw
+			// after the slot retired, as unprepared single packets: never several draws inside one
+			// engine commit.
+			bool drawn = false;
+			m_draw_prep->ExecuteIndirect(op.window, [&run_native, &run_records, &plain, &drawn] {
+				drawn = run_native(plain);
+				if (!drawn) {
+					run_records(plain, 0, 1);
+				}
+			});
+			if (!drawn) {
+				run_records(plain, 1, records);
+			}
+			return;
+		}
 		m_draw_prep->ExecuteIndirect(op.window, [this, &plain] { ExecDrawIndirect(plain); });
+		return;
+	}
+	if (records > 1) {
+		NoteIndirectRun(records);
+		if (!run_native(op)) {
+			run_records(op, 0, records);
+		}
 		return;
 	}
 	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {

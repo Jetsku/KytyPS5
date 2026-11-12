@@ -37,20 +37,11 @@ struct CheckPredict {
 };
 
 struct CheckLogState {
-	std::atomic<bool>     rt_slices {false};
-	std::atomic<bool>     rt_mip_level {false};
-	std::atomic<bool>     rt_fmask {false};
 	std::atomic<bool>     rt_metadata {false};
-	std::atomic<bool>     rt_blend_bypass {false};
-	std::atomic<bool>     rt_round_mode {false};
 	std::atomic<bool>     rt_dest_alpha {false};
-	std::atomic<bool>     rt_msaa {false};
-	std::atomic<bool>     rt_extent {false};
-	std::atomic<bool>     rt_mip_count {false};
 	std::atomic<bool>     rt_pipe_aligned {false};
 	std::atomic<bool>     rt_metadata_addresses {false};
 	std::atomic<bool>     mc_window_offset {false};
-	std::atomic<bool>     bc_constants {false};
 	std::atomic<bool>     bc_mode {false};
 	std::atomic<bool>     bc_raster_op {false};
 	std::atomic<uint32_t> vp_msaa {0};
@@ -58,8 +49,6 @@ struct CheckLogState {
 	std::atomic<uint32_t> vp_guard_band {0};
 	std::atomic<uint32_t> eqaa {0};
 	std::atomic<uint32_t> aa {0};
-	std::atomic<uint32_t> phases {0};
-	std::atomic<uint32_t> depth_clear {0};
 };
 CheckLogState g_check_log;
 
@@ -142,27 +131,6 @@ uint32_t DrawColorOutputFilter(const HW::Context& ctx) {
 		}
 	}
 	return output_mask;
-}
-
-static bool RenderTargetMaskHasMrt(uint32_t mask) {
-	return (mask & ~0x0fu) != 0;
-}
-
-static bool RenderTargetMaskHasBoundMrt(const HW::Context& hw) {
-	const auto mask = hw.GetRenderTargetMask();
-
-	if (!RenderTargetMaskHasMrt(mask)) {
-		return false;
-	}
-
-	uint32_t bound_targets = 0;
-	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && render_target_bound(hw.GetRenderTarget(i))) {
-			bound_targets++;
-		}
-	}
-
-	return bound_targets > 1;
 }
 
 static uint32_t RenderTargetFirstBoundSlot(const HW::Context& hw) {
@@ -326,26 +294,11 @@ static void RtCheck(P& p, const HW::RenderTarget& rt) {
 		return;
 	}
 	auto& log = g_check_log;
-	//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
 
 	KYTY_CHECK_EXIT(p, rt.view.base_array_slice_index > rt.view.last_array_slice_index);
-	KYTY_CHECK_LOG_ONCE(p, log.rt_slices,
-	                    rt.view.base_array_slice_index != 0x00000000 ||
-	                        rt.view.last_array_slice_index != 0x00000000,
-	                    "RenderTarget: using color target array slice range %" PRIu32 "..%" PRIu32
-	                    "\n",
-	                    rt.view.base_array_slice_index, rt.view.last_array_slice_index);
-	KYTY_CHECK_LOG_ONCE(p, log.rt_mip_level, rt.view.current_mip_level != 0x00000000,
-	                    "RenderTarget: using PS5 color target mip level %" PRIu32 "\n",
-	                    rt.view.current_mip_level);
-	if (rt.info.fmask_compression_enable) {
-		KYTY_CHECK_EXIT(p, rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
-		// Native MSAA stores expanded samples, independent of FMASK metadata compression.
-		KYTY_CHECK_LOG_ONCE(p, log.rt_fmask, true,
-		                    "RenderTarget: using expanded native Vulkan MSAA samples, "
-		                    "fmask=0x%016" PRIx64 "\n",
-		                    rt.fmask.addr);
-	}
+	// Native MSAA stores expanded samples, independent of FMASK metadata compression.
+	KYTY_CHECK_EXIT(p, rt.info.fmask_compression_enable && rt.attrib.num_samples == 0 &&
+	                       rt.attrib.num_fragments == 0);
 
 	KYTY_CHECK_LOG_ONCE(p, log.rt_metadata,
 	                    rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable,
@@ -354,31 +307,8 @@ static void RtCheck(P& p, const HW::RenderTarget& rt) {
 	                    rt.info.cmask_fast_clear_enable ? "true" : "false",
 	                    rt.info.dcc_compression_enable ? "true" : "false", rt.cmask.addr,
 	                    rt.dcc_addr.addr);
-	KYTY_CHECK_LOG_ONCE(p, log.rt_blend_bypass, rt.info.blend_bypass,
-	                    "RenderTarget: temporary: using PS5 blend bypass as disabled Vulkan "
-	                    "blending\n");
-	// EXIT_NOT_IMPLEMENTED(rt.info.blend_clamp != false);
-	KYTY_CHECK_LOG_ONCE(p, log.rt_round_mode, rt.info.round_mode,
-	                    "RenderTarget: temporary: ignoring PS5 color round mode\n");
-	//		 EXIT_NOT_IMPLEMENTED(rt.format != 0x0000000a);
-	// EXIT_NOT_IMPLEMENTED(rt.channel_type != 0x00000006);
-	// EXIT_NOT_IMPLEMENTED(rt.channel_order != 0x00000001);
 	KYTY_CHECK_LOG_ONCE(p, log.rt_dest_alpha, rt.attrib.force_dest_alpha_to_one,
 	                    "RenderTarget: temporary: accepting PS5 force destination alpha-to-one\n");
-	KYTY_CHECK_LOG_ONCE(p, log.rt_msaa,
-	                    rt.attrib.num_samples != 0x00000000 || rt.attrib.num_fragments != 0x00000000,
-	                    "RenderTarget: using native PS5 MSAA color target, "
-	                    "samples=0x%08" PRIx32 " fragments=0x%08" PRIx32 "\n",
-	                    rt.attrib.num_samples, rt.attrib.num_fragments);
-
-	KYTY_CHECK_LOG_ONCE(p, log.rt_extent,
-	                    rt.attrib2.width == 0x00000000 || rt.attrib2.height == 0x00000000,
-	                    "RenderTarget: temporary: accepting PS5 raw 1-pixel color target extent "
-	                    "fields width_minus1=0x%08" PRIx32 " height_minus1=0x%08" PRIx32 "\n",
-	                    rt.attrib2.width, rt.attrib2.height);
-	KYTY_CHECK_LOG_ONCE(p, log.rt_mip_count, rt.attrib2.num_mip_levels != 0x00000000,
-	                    "RenderTarget: using PS5 color target mip count field 0x%08" PRIx32 "\n",
-	                    rt.attrib2.num_mip_levels);
 	KYTY_CHECK_FAIL(p, !RenderIsColorTileMode(rt.attrib3.tile_mode),
 	                "unknown PS5 render-target tile mode: 0x%08" PRIx32 "\n",
 	                static_cast<uint32_t>(rt.attrib3.tile_mode));
@@ -388,11 +318,7 @@ static void RtCheck(P& p, const HW::RenderTarget& rt) {
 	                    "RenderTarget: temporary: accepting unaligned PS5 metadata pipe flag\n");
 	KYTY_CHECK_EXIT(p, rt.attrib3.write_vrs_rate_hint_to_cmask);
 
-	// EXIT_NOT_IMPLEMENTED(rt.dcc_max_uncompressed_block_size != 0x00000002);
-	// EXIT_NOT_IMPLEMENTED(rt.dcc.max_compressed_block_size != 0x00000000);
-	// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
 	KYTY_CHECK_EXIT(p, rt.dcc.overwrite_combiner_disable != false);
-	// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 	KYTY_CHECK_EXIT(p, rt.dcc.dcc_clear_key_enable != false);
 	KYTY_CHECK_LOG_ONCE(p, log.rt_metadata_addresses,
 	                    rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
@@ -562,13 +488,8 @@ static void BcPrint(const char* func, const HW::BlendControl& c, const HW::Blend
 }
 
 template <typename P>
-static void BcCheck(P& p, const HW::BlendColor& color, const HW::ColorControl& cc) {
+static void BcCheck(P& p, const HW::ColorControl& cc) {
 	auto& log = g_check_log;
-	KYTY_CHECK_LOG_ONCE(p, log.bc_constants,
-	                    color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f ||
-	                        color.alpha != 0.0f,
-	                    "BlendControl: temporary: accepting nonzero blend constants (%f, %f, %f, %f)\n",
-	                    color.red, color.green, color.blue, color.alpha);
 	KYTY_CHECK_LOG_ONCE(p, log.bc_mode,
 	                    cc.mode != 1 && cc.mode != 0 && cc.mode != 2 && cc.mode != 3 &&
 	                        cc.mode != 5 && cc.mode != 6,
@@ -765,35 +686,17 @@ static void VpCheck(P& p, const HW::ScreenViewport& vp, const HW::ScanModeContro
 	KYTY_CHECK_LOG_COUNTED(p, log.vp_msaa, 16u, smc.msaa_enable,
 	                       "\t warning: unsupported PS5 MSAA raster controls use native Vulkan "
 	                       "defaults\n");
-	// EXIT_NOT_IMPLEMENTED(smc.vport_scissor_enable);
 	KYTY_CHECK_EXIT(p, smc.line_stipple_enable);
 
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xscale != 960.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xoffset != 960.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yscale != -540.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yoffset != 540.000000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zscale != 0.500000);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zoffset != 0.500000);
 	KYTY_CHECK_LOG_COUNTED(p, log.vp_transform, 16u, vp.transform_control != 1087,
 	                       "\t warning: non-default viewport transform control = 0x%08" PRIx32
 	                       ", applying enabled scale/offset bits\n",
 	                       vp.transform_control);
-	// EXIT_NOT_IMPLEMENTED(vp.hw_offset_x != 60);
-	// EXIT_NOT_IMPLEMENTED(vp.hw_offset_y != 32);
-	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_horz_clip - 33.133327f) > 0.001f);
-	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_vert_clip - 59.629623f) > 0.001f);
 
 	KYTY_CHECK_LOG_COUNTED(p, log.vp_guard_band, 16u,
 	                       vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f,
 	                       "\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
 	                       vp.guard_band_horz_discard, vp.guard_band_vert_discard);
-
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_left != 0);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_top != 0);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_right != 0);
-	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_bottom != 0);
-	// EXIT_NOT_IMPLEMENTED(viewport_scissor &&
-	// vp.viewports[0].viewport_scissor_window_offset_enable != true);
 }
 
 static bool ScissorRectValid(const ScissorRect& r) {
@@ -843,8 +746,6 @@ static constexpr std::array<uint16_t, 16> MakeScissorIntersectionRules() {
 }
 
 static bool ScissorClipRuleToIntersectionMask(uint16_t rule, uint8_t* mask) {
-	EXIT_IF(mask == nullptr);
-
 	static constexpr auto rules = MakeScissorIntersectionRules();
 	for (uint32_t candidate = 0; candidate < rules.size(); candidate++) {
 		if (rules[candidate] == rule) {
@@ -858,7 +759,6 @@ static bool ScissorClipRuleToIntersectionMask(uint16_t rule, uint8_t* mask) {
 
 bool calc_scissor_unclamped(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
                             uint32_t viewport_index, ScissorRect& scissor) {
-	EXIT_IF(viewport_index >= std::size(vp.viewports));
 	ScissorRect final {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
 	                   vp.screen_scissor_bottom};
 	const auto intersect = [&](ScissorRect rect, bool window_offset) {
@@ -924,60 +824,22 @@ template <typename P>
 static void HwCheck(P& p, const HW::Context& hw) {
 	const auto  rt_slot = RenderTargetFirstBoundSlot(hw);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
 	const auto& c       = hw.GetClipControl();
-	const auto& rc      = hw.GetRenderControl();
 	const auto& mc      = hw.GetModeControl();
 	const auto& eqaa    = hw.GetEqaaControl();
 	const auto& cc      = hw.GetColorControl();
 	const auto& smc     = hw.GetScanModeControl();
 	const auto& aa      = hw.GetAaSampleControl();
 	const auto& ac      = hw.GetAaConfig();
-	auto&       log     = g_check_log;
 
-	const bool debug_dump = graphics_debug_dump_enabled();
-	auto       log_phase  = [&](const char* phase) {
-        KYTY_CHECK_LOG_COUNTED(p, log.phases, 512u, debug_dump, "HwCheckPhase: %s\n", phase);
-	};
-
-	log_phase("rt");
 	RtCheck(p, rt);
-	log_phase("vp");
 	VpCheck(p, vp, smc);
-	log_phase("clip");
 	ClipCheck(p, c);
-	log_phase("mode");
 	McCheck(p, mc);
-	log_phase("blend");
-	BcCheck(p, bclr, cc);
-	log_phase("eqaa");
+	BcCheck(p, cc);
 	EqaaCheck(p, eqaa, ac);
-	log_phase("aa");
 	AaCheck(p, aa, ac);
-	log_phase("done");
-
-	if (debug_dump && RenderTargetMaskHasBoundMrt(hw)) {
-		if constexpr (P::Predict) {
-			p.loud = true;
-		} else {
-			LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
-			for (uint32_t i = 0; i < 8; i++) {
-				const auto& mrt = hw.GetRenderTarget(i);
-				LOGF("\t RT%u addr=0x%010" PRIx64 " mask=0x%x fmt=0x%08" PRIx32
-				     " width=%u height=%u tile=%u\n",
-				     i, mrt.base.addr, (hw.GetRenderTargetMask() >> (i * 4u)) & 0x0fu,
-				     static_cast<uint32_t>(mrt.info.format), mrt.attrib2.width + 1,
-				     mrt.attrib2.height + 1, static_cast<uint32_t>(mrt.attrib3.tile_mode));
-			}
-		}
-	}
-	KYTY_CHECK_LOG_COUNTED(p, log.depth_clear, 16u,
-	                       rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&
-	                           hw.GetDepthClearValue() != 1.0f,
-	                       "\t temporary: accepting non-default depth clear value %f\n",
-	                       hw.GetDepthClearValue());
-	// EXIT_NOT_IMPLEMENTED(hw.GetStencilClearValue() != 0);
 }
 
 void hw_check(const CommandBuffer& buffer) {

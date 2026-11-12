@@ -209,6 +209,9 @@ private:
 		int                                 event_id = 0;
 	};
 
+	// Waits for the image write-backs over the range's pages; returns whether any overlapped.
+	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
+
 	GraphicContext&           m_graphics;
 	RenderMutex               m_mutex;
 	RenderExecutor            m_render_executor;
@@ -232,7 +235,6 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	std::unique_ptr<NativeRayTracing> m_native_ray_tracing;
 	bool                      m_fault_process_pending = false;
-	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -864,12 +864,6 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records) {
 	using namespace Emitter;
 
-	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
-	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Mesh &&
-	    program.stage != ShaderType::Local && program.stage != ShaderType::TessellationControl &&
-	    program.stage != ShaderType::TessellationEvaluation) {
-		Fail(program, "binary SPIR-V emitter received an unsupported shader stage");
-	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
 	    !program.shader_info_complete || !program.binding_layout_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");

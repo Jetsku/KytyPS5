@@ -71,13 +71,7 @@ public:
 	KYTY_CLASS_NO_COPY(FramePool);
 
 	void Initialize(uint32_t count, vk::Format format) {
-		if (count == 0 || format == vk::Format::eUndefined) {
-			EXIT("prepared-frame pool requires at least one frame\n");
-		}
 		Common::LockGuard lock(m_mutex);
-		if (!m_frames.empty()) {
-			EXIT("prepared-frame pool was initialized twice\n");
-		}
 		m_format = format;
 		m_frames.reserve(count);
 		m_free.reserve(count);
@@ -89,26 +83,17 @@ public:
 	}
 
 	void SetFormat(vk::Format format) {
-		if (format == vk::Format::eUndefined) {
-			EXIT("prepared-frame pool requires a presentation format\n");
-		}
 		Common::LockGuard lock(m_mutex);
 		m_format = format;
 	}
 
 	vk::Format GetFormat() {
 		Common::LockGuard lock(m_mutex);
-		if (m_format == vk::Format::eUndefined) {
-			EXIT("prepared-frame pool has no presentation format\n");
-		}
 		return m_format;
 	}
 
 	Presenter::Frame* Acquire(vk::Extent2D extent, vk::Format format) {
 		m_mutex.Lock();
-		if (m_frames.empty()) {
-			EXIT("prepared-frame pool was used before swapchain initialization\n");
-		}
 		// A synchronized flip may need more frames than the swapchain has images.
 		// Queue capacity bounds growth; waiting here can prevent its master from recording.
 		if (m_free.empty()) {
@@ -125,9 +110,6 @@ public:
 			*compatible = m_free.back();
 		}
 		m_free.pop_back();
-		if (frame->busy) {
-			EXIT("prepared-frame pool returned an invalid frame\n");
-		}
 		frame->busy = true;
 		m_mutex.Unlock();
 
@@ -135,17 +117,7 @@ public:
 		return frame;
 	}
 
-	void ValidateForPresent(Presenter::Frame* frame) {
-		Common::LockGuard lock(m_mutex);
-		if (frame == nullptr || !frame->busy) {
-			EXIT("prepared frame has invalid presentation ownership\n");
-		}
-	}
-
 	void Release(Presenter::Frame* frame) {
-		if (frame == nullptr) {
-			EXIT("cannot release a null prepared frame\n");
-		}
 		Common::LockGuard lock(m_mutex);
 		if (!frame->busy) {
 			EXIT("prepared frame was released twice\n");
@@ -242,7 +214,6 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 	dependency.pImageMemoryBarriers    = &barrier;
 	command.pipelineBarrier2(dependency);
 	image.state = {stage, access, layout};
-	image.subresource_states.clear();
 }
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
@@ -306,8 +277,8 @@ private:
 	vk::SurfaceFormatKHR SelectFormat();
 	/// Destroys the swapchain Vulkan objects and resets all members.
 	void Destroy();
-	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
-	                 const vk::Rect2D& rect);
+	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
+	               const vk::Rect2D& rect);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -335,7 +306,7 @@ private:
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	PresentFilter                  m_filter; // KYTY_PRESENT_BOX_DOWNSCALE
-	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
+	uint32_t                       m_image_index         = 0;
 	uint32_t                       m_frame_index         = 0;
 };
 
@@ -344,7 +315,6 @@ struct Presenter::Impl {
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx, CommandScheduler::Role::Presenter),
 	      frames(owner, present_scheduler) {
-		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		const uint32_t image_count = swapchain.ImageCount() > 0 ? swapchain.ImageCount() : 3;
 		frames.Initialize(image_count, swapchain.Format());
@@ -591,8 +561,6 @@ void Swapchain::Create() {
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
 	}
-	m_image_index = static_cast<uint32_t>(-1);
-	m_frame_index = 0;
 }
 
 Swapchain::~Swapchain() {
@@ -651,7 +619,6 @@ void Swapchain::Destroy() {
 	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
 	m_window_extent = {};
-	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
 	m_images.clear();
 	m_image_views.clear();
@@ -724,12 +691,10 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	if (m_minimized || m_handle == nullptr) {
 		return Status::Minimized;
 	}
-	EXIT_IF(m_frame_index >= m_image_acquired.size());
 	if (m_frame_index < m_frame_ticks.size() && m_frame_ticks[m_frame_index] != 0) {
 		scheduler.Wait(m_frame_ticks[m_frame_index]);
 		m_frame_ticks[m_frame_index] = 0;
 	}
-	m_image_index = static_cast<uint32_t>(-1);
 	vk::Result result;
 	{
 		// Hang reports (issue #62, Linux): shows a present thread blocked in the driver's acquire.
@@ -757,7 +722,6 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 			return Status::SurfaceLost;
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
-	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
 }
 
@@ -993,8 +957,8 @@ static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& targ
 	        {w, h}};
 }
 
-void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
-                            const vk::Rect2D& rect) {
+void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
+                          const vk::Rect2D& rect) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -1096,9 +1060,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
-	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
-	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
-	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
+	// The main bus ignores alpha.
+	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
+	                       (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
+	                       (layer.bus == 0 ? 16u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -1127,7 +1093,6 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
-	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
@@ -1252,23 +1217,27 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 	                           &to_present);
 	if (draw_attachment) {
+		// Each pass blends over the color writes of the previous one.
+		to_present.srcAccessMask      = vk::AccessFlagBits::eColorAttachmentWrite;
+		to_present.oldLayout          = vk::ImageLayout::eColorAttachmentOptimal;
+		const auto attachment_barrier = [&] {
+			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+			                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
+			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
+			                           &to_present);
+		};
+		// Upstream 026189166 also draws an HDR10 main frame through DrawLayer here; ours converts it
+		// in the filter pass above (KYTY_HDR_TO_SDR).
 		if (draw_overlay) {
-			DrawOverlay(vk_command, overlay, game_rect);
+			DrawLayer(vk_command, overlay, game_rect);
 			if (draw_system_overlay) {
-				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
-				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
-				vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-				                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
-				                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0,
-				                           nullptr, 1, &to_present);
+				attachment_barrier();
 			}
 		}
 		if (draw_system_overlay) {
 			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		}
-		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
-		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,
@@ -1278,7 +1247,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
-	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
@@ -1293,7 +1261,6 @@ Swapchain::Status Swapchain::Present() {
 	if (m_minimized || m_handle == nullptr) {
 		return Status::Minimized;
 	}
-	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;
@@ -1532,10 +1499,6 @@ bool Presenter::PresentLastFrame() {
 	return true;
 }
 
-bool Presenter::IsGuestPaused() const noexcept {
-	return m_impl->window.loop.paused.load(std::memory_order_acquire);
-}
-
 bool Presenter::IsHdrSupported() const noexcept {
 	return m_impl->swapchain.IsHdrSupported();
 }
@@ -1559,7 +1522,6 @@ void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
-		m_impl->frames.ValidateForPresent(layer.frame);
 		auto& previous = m_impl->layers[layer.bus];
 		if (layer.hold && previous.frame != nullptr && previous.frame != layer.frame) {
 			// KYTY_HOLD_SKIPPED_DRAWS: the frame shown before stays; this one goes back to the pool.
@@ -1588,6 +1550,9 @@ void Presenter::ClearLayer(int bus) {
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+	using Common::DebugCounters::Counter;
+	using Common::DebugCounters::ScopedTimer;
+	ScopedTimer present_time(Counter::PresentNs);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
@@ -1602,7 +1567,10 @@ void Presenter::Impl::Present() {
 		return;
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage(present_scheduler);
+		auto status = [&] {
+			ScopedTimer acquire_time(Counter::PresentAcquireNs);
+			return swapchain.AcquireNextImage(present_scheduler);
+		}();
 		if (status == Swapchain::Status::Minimized) {
 			return;
 		}
@@ -1618,9 +1586,12 @@ void Presenter::Impl::Present() {
 			if (!PresentUnlocked()) {
 				render_lock.emplace(renderer.GetMutex());
 			}
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    (overlay_visual.active || PerformanceOverlayEnabled()) && swapchain.PrepareSystemOverlay();
+			auto&      command             = present_scheduler.BeginCommand();
+			const bool draw_system_overlay = [&] {
+				ScopedTimer overlay_time(Counter::OverlayNs);
+				return (overlay_visual.active || PerformanceOverlayEnabled()) &&
+				       swapchain.PrepareSystemOverlay();
+			}();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
 			const auto tick = swapchain.Submit(present_scheduler);

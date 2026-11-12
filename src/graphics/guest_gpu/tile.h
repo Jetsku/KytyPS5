@@ -116,6 +116,14 @@ bool     TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch,
                           Prospero::DepthFormat z_format, Prospero::StencilFormat stencil_format,
                           bool htile, TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
                           TileSizeAlign& depth_size, uint32_t num_fragments_log2 = 0);
+// Upstream's signature (17df86f46 dropped the pitch, which every caller passed as 0).
+inline bool TileGetDepthSize(uint32_t width, uint32_t height, Prospero::DepthFormat z_format,
+                             Prospero::StencilFormat stencil_format, bool htile,
+                             TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
+                             TileSizeAlign& depth_size, uint32_t num_fragments_log2 = 0) {
+	return TileGetDepthSize(width, height, 0, z_format, stencil_format, htile, stencil_size,
+	                        htile_size, depth_size, num_fragments_log2);
+}
 uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
                                   uint32_t num_fragments_log2 = 0);
 uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,

@@ -244,6 +244,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -805,6 +807,8 @@ uint32_t ArithmeticArity(const ResourcePlan::EvaluationRecipe& recipe) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -1909,6 +1913,20 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				return true;
 			}
 			return false;
+		// Runtime descriptor values may take a maximum (upstream 2c63453c6: SMax32).
+		case ValueOpcode::UMax32:
+			if (binary()) {
+				result = std::max(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMax32:
+			if (binary()) {
+				result = static_cast<uint32_t>(std::max(static_cast<int32_t>(static_cast<uint32_t>(a)),
+				                                        static_cast<int32_t>(static_cast<uint32_t>(b))));
+				return true;
+			}
+			return false;
 		case ValueOpcode::ConvertF32U32:
 			if (arg(0, a)) {
 				result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
@@ -2541,6 +2559,8 @@ bool IsTracePure(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::ConvertU32F32:
 		case ValueOpcode::ConvertS32F32:

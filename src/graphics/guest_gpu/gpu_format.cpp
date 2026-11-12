@@ -296,6 +296,12 @@ bool IsDefinedBufferFormat(BufferFormat format) {
 	       (format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kBc7Srgb);
 }
 
+bool IsSrgbFormat(BufferFormat format) {
+	return (format >= BufferFormat::k8Srgb && format <= BufferFormat::k8_8_8_8Srgb) ||
+	       format == BufferFormat::kBc1Srgb || format == BufferFormat::kBc2Srgb ||
+	       format == BufferFormat::kBc3Srgb || format == BufferFormat::kBc7Srgb;
+}
+
 TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 	const auto* info = FindFormatInfo(format);
 	if (info == nullptr || !info->sampled_texture) {

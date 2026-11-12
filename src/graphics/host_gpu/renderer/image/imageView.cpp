@@ -32,11 +32,6 @@ namespace {
 
 [[nodiscard]] bool IsValidViewType(const VulkanImage& image, const ImageViewInfo& info) {
 	switch (image.image_type) {
-		case vk::ImageType::e1D:
-			if (info.type != vk::ImageViewType::e1D && info.type != vk::ImageViewType::e1DArray) {
-				return false;
-			}
-			return info.type != vk::ImageViewType::e1D || info.layer_count == 1;
 		case vk::ImageType::e2D:
 			switch (info.type) {
 				case vk::ImageViewType::e2D: return info.layer_count == 1;
@@ -382,6 +377,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+	// 8 and 8_8 sRGB views of UNorm images only sample (upstream e914ec6db).
+	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
+		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +

@@ -140,7 +140,6 @@ struct GraphicContext {
 	}
 	bool                               precise_occlusion_enabled             = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
-	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	// VK_EXT_color_write_enable: draws turn attachments without an image off through dynamic
@@ -150,6 +149,11 @@ struct GraphicContext {
 	// VK_EXT_depth_clip_enable: depth clipping set apart from the always-on depth clamp (the DB's
 	// behaviour). Without it, pipelines clamp only where the guest turns Z clipping off.
 	bool                               depth_clip_enable_enabled             = false;
+	// robustBufferAccess2 (ee034be4b): out-of-range storage accesses read zero / drop writes.
+	bool                               robust_buffer_access_enabled          = false;
+	// R8/R8G8 sRGB formats sample with linear filtering (e914ec6db): 8 and 8_8 sRGB textures.
+	bool                               r8_srgb_views                         = false;
+	bool                               r8g8_srgb_views                       = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	// shaderStorageImageReadWithoutFormat (TileManager::TileFromImage).
@@ -228,6 +232,14 @@ struct GraphicContext {
 			physical_device.getFormatProperties(format, &it->second);
 		}
 		return it->second;
+	}
+
+	// Sampled views of format filter linearly, as guest samplers may.
+	[[nodiscard]] bool SamplesFiltered(vk::Format format) const {
+		constexpr vk::FormatFeatureFlags features =
+		    vk::FormatFeatureFlagBits::eSampledImage |
+		    vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+		return (GetFormatProperties(format).optimalTilingFeatures & features) == features;
 	}
 
 	[[nodiscard]] vk::Result GetImageFormatProperties(vk::Format format, vk::ImageType type,

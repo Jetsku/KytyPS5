@@ -154,48 +154,49 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 	return result;
 }
 
+// `row` is the host y of a 1D image, inserted after x.
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  uint32_t first, uint32_t components, bool cube = false) {
-	auto x = AddressF32(ctx, mem, address, first);
-	if (components == 1u) return x;
-	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
-	                                                   : ZeroF32(ctx.state);
+                  uint32_t first, uint32_t components, bool cube = false, uint32_t row = 0) {
+	auto&    state = ctx.state;
+	uint32_t values[3] {AddressF32(ctx, mem, address, first)};
+	uint32_t count = 1;
+	if (row != 0u) values[count++] = row;
+	for (uint32_t index = 1; index < components; index++) {
+		values[count++] = mem.image_address_components > first + index
+		                      ? AddressF32(ctx, mem, address, first + index)
+		                      : ZeroF32(state);
+	}
 	if (cube) {
-		x = CubeAxis(ctx.state, x);
-		y = CubeAxis(ctx.state, y);
+		values[0] = CubeAxis(state, values[0]);
+		values[1] = CubeAxis(state, values[1]);
+		if (count == 3u) values[2] = CubeLayer(state, values[2]);
 	}
-	const auto result = ctx.state.builder.AllocateId();
-	if (components == 3u) {
-		auto z = mem.image_address_components > first + 2u
-		             ? AddressF32(ctx, mem, address, first + 2u)
-		             : ZeroF32(ctx.state);
-		if (cube) z = CubeLayer(ctx.state, z);
-		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 3),
-		                              result, x, y, z);
-	} else {
-		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 2),
-		                              result, x, y);
-	}
+	if (count == 1u) return values[0];
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, count), result,
+	                          std::span(values).first(count));
 	return result;
+}
+
+// Texel center of a 1D image's single host row.
+uint32_t RowCenter(EmitterState& state, ImageDimension dimension) {
+	return ImageDimensionInfoFor(dimension).one_dimensional ? ConstantF32Value(state, 0.5f) : 0u;
 }
 
 uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                   ImageDimension dimension) {
-	const auto components = ImageDimensionInfoFor(dimension).coordinate_components;
-	const auto x          = AddressU32(ctx, mem, address, 0);
-	if (components == 1u) return x;
-	const auto y      = mem.image_address_components > 1u ? AddressU32(ctx, mem, address, 1)
-	                                                      : ConstantU32(ctx.state, 0);
-	const auto result = ctx.state.builder.AllocateId();
-	if (components == 3u) {
-		const auto z = mem.image_address_components > 2u ? AddressU32(ctx, mem, address, 2)
-		                                                 : ConstantU32(ctx.state, 0);
-		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 3),
-		                              result, x, y, z);
-	} else {
-		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 2),
-		                              result, x, y);
+	const auto& info = ImageDimensionInfoFor(dimension);
+	uint32_t    values[3] {AddressU32(ctx, mem, address, 0)};
+	uint32_t    count = 1;
+	if (info.one_dimensional) values[count++] = ConstantU32(ctx.state, 0);
+	for (uint32_t index = 1; index < info.coordinate_components; index++) {
+		values[count++] = mem.image_address_components > index
+		                      ? AddressU32(ctx, mem, address, index)
+		                      : ConstantU32(ctx.state, 0);
 	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, count),
+	                              result, std::span(values).first(count));
 	return result;
 }
 
@@ -313,17 +314,14 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		                              ImageViewSizeType(ctx.state, dimension), size, image,
 		                              AddressU32(ctx, mem, address, 0));
 	}
-	const auto components = info.coordinate_components;
-	uint32_t   result[4]  = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
-	                         ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
-	if (components == 1u) {
-		result[0] = size;
-	} else {
-		for (uint32_t index = 0; index < components; index++) {
-			result[index] = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state),
-			                              result[index], size, index);
-		}
+	uint32_t result[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
+	                      ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
+	for (uint32_t index = 0; index < info.coordinate_components; index++) {
+		// Skip a 1D image's host height.
+		const auto component = info.one_dimensional && index != 0u ? index + 1u : index;
+		result[index]        = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), result[index],
+		                              size, component);
 	}
 	if (info.multisampled == 0u) {
 		result[3] = ctx.state.builder.AllocateId();
@@ -338,10 +336,12 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 
 uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                       const ImageSampleLayout& layout, ImageDimension dimension) {
-	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
+	const auto& info    = ImageDimensionInfoFor(dimension);
+	const auto  spatial = info.spatial_components;
+	// A 1D image is a host 2D image one texel high (upstream e6cc1ce30); its row takes no offset.
+	const auto components = info.one_dimensional ? 2u : spatial;
 	const auto zero       = ConstantI32(ctx.state, 0);
 	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
-		if (components == 1u) return zero;
 		const auto result = ctx.state.builder.AllocateId();
 		if (components == 3u) {
 			ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 3),
@@ -355,13 +355,12 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	const auto packed    = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state),
 	                             AddressU32(ctx, mem, address, layout.offset));
 	uint32_t   values[3] = {zero, zero, zero};
-	for (uint32_t index = 0; index < components; index++) {
+	for (uint32_t index = 0; index < spatial; index++) {
 		values[index] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(ctx.state), values[index],
 		                              packed, ConstantU32(ctx.state, index * 8u),
 		                              ConstantU32(ctx.state, 6));
 	}
-	if (components == 1u) return values[0];
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 3),
@@ -476,7 +475,12 @@ SampleOffset SampleOffsetFor(ValueEmitContext& ctx, const IR::Inst& inst, const 
 				ids[index] = ConstantI32(state, offsets[index]);
 			}
 			if (components == 1u) {
-				result.const_offset = ids[0];
+				// A 1D image's host row (upstream e6cc1ce30) takes offset 0.
+				result.const_offset = ImageDimensionInfoFor(dimension).one_dimensional
+				                          ? state.builder.Constant(spv::OpConstantComposite,
+				                                                   TypeI32Vector(state, 2), ids[0],
+				                                                   ConstantI32(state, 0))
+				                          : ids[0];
 			} else if (components == 2u) {
 				result.const_offset = state.builder.Constant(
 				    spv::OpConstantComposite, TypeI32Vector(state, 2), ids[0], ids[1]);
@@ -526,37 +530,41 @@ uint32_t ApplyDynamicSampleOffset(EmitterState& state, uint32_t resource, uint32
 	                          image, level);
 	const auto packed_i32 = Unary(state, spv::OpBitcast, TypeI32(state), packed);
 	uint32_t   moved[4]   = {};
-	for (uint32_t index = 0; index < info.coordinate_components; index++) {
-		auto component = coord;
-		if (info.coordinate_components > 1u) {
+	// A 1D image's coordinate and size carry the host row as component 1 (upstream e6cc1ce30).
+	const uint32_t host_count = info.coordinate_components + (info.one_dimensional ? 1u : 0u);
+	for (uint32_t host = 0; host < host_count; host++) {
+		const bool     row   = info.one_dimensional && host == 1u;
+		const uint32_t index = info.one_dimensional && host > 1u ? host - 1u : host;
+		auto           component = coord;
+		if (host_count > 1u) {
 			component = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, coord,
-			                          index);
+			                          host);
 		}
-		if (index < components) {
+		if (!row && index < components) {
 			const auto offset = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), offset, packed_i32,
 			                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
 			const auto offset_f32 = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpConvertSToF, TypeF32(state), offset_f32, offset);
 			auto extent = size;
-			if (info.coordinate_components > 1u) {
+			if (host_count > 1u) {
 				extent = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size,
-				                          index);
+				                          host);
 			}
 			const auto extent_f32 = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), extent_f32, extent);
 			component = Binary(state, spv::OpFAdd, TypeF32(state), component,
 			                   Binary(state, spv::OpFDiv, TypeF32(state), offset_f32, extent_f32));
 		}
-		moved[index] = component;
+		moved[host] = component;
 	}
-	if (info.coordinate_components == 1u) {
+	if (host_count == 1u) {
 		return moved[0];
 	}
 	const auto result = state.builder.AllocateId();
-	if (info.coordinate_components == 2u) {
+	if (host_count == 2u) {
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
 		                          moved[0], moved[1]);
 	} else {
@@ -566,20 +574,14 @@ uint32_t ApplyDynamicSampleOffset(EmitterState& state, uint32_t resource, uint32
 	return result;
 }
 
-uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
-	const auto components   = ImageDimensionInfoFor(dimension).spatial_components;
-	const auto count        = ConstantU32(state, 4);
-	const auto element_type = components == 1u ? TypeI32(state) : TypeI32Vector(state, 2);
-	const auto array_type   = state.builder.Type(spv::OpTypeArray, element_type, count);
+uint32_t HorizontalOffsets(EmitterState& state) {
+	const auto count      = ConstantU32(state, 4);
+	const auto array_type = state.builder.Type(spv::OpTypeArray, TypeI32Vector(state, 2), count);
 	uint32_t   offsets[4] {};
 	for (uint32_t index = 0; index < 4u; index++) {
-		const auto x = ConstantI32(state, static_cast<int32_t>(index) - 1);
-		if (components == 1u) {
-			offsets[index] = x;
-		} else {
-			offsets[index] = state.builder.Constant(
-			    spv::OpConstantComposite, TypeI32Vector(state, 2), x, ConstantI32(state, 0));
-		}
+		offsets[index] = state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 2),
+		                                        ConstantI32(state, static_cast<int32_t>(index) - 1),
+		                                        ConstantI32(state, 0));
 	}
 	return state.builder.Constant(spv::OpConstantComposite, array_type, offsets[0], offsets[1],
 	                              offsets[2], offsets[3]);
@@ -857,48 +859,6 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
 	                              values[0], values[1], values[2], values[3]);
-	return result;
-}
-
-uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                    uint32_t coord, Prospero::TextureNumericClass numeric_class) {
-	auto& state = ctx.state;
-	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto image = LoadImageDescriptor(state, mem.resource);
-	const auto width = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32(state), width, image,
-	                          ConstantU32(state, 0));
-	const auto width_f32 = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), width_f32, width);
-	const auto left = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), left, GlslStd450(state),
-	                          GLSLstd450Floor,
-	                          Binary(state, spv::OpFSub, TypeF32(state),
-	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
-	                                 ConstantF32(state, 0x3f000000u)));
-
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
-	const auto vector_type = ImageVectorType(state, numeric_class, 4);
-	const auto scalar_type = ImageScalarType(state, numeric_class);
-	const auto component = ImageGatherSource(state, mem);
-	uint32_t values[2] {};
-	for (uint32_t index = 0; index < 2u; index++) {
-		const auto sample_coord =
-		    Binary(state, spv::OpFDiv, TypeF32(state),
-		           Binary(state, spv::OpFAdd, TypeF32(state), left,
-		                  ConstantF32(state, index == 0u ? 0x3f000000u : 0x3fc00000u)),
-		           width_f32);
-		const auto texel = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpImageSampleExplicitLod, vector_type, texel, sampled,
-		                          sample_coord, spv::ImageOperandsLodMask, ZeroF32(state));
-		values[index] = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, values[index], texel,
-		                          component);
-	}
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, values[0], values[1],
-	                          values[1], values[0]);
 	return result;
 }
 
@@ -1734,7 +1694,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(
 		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
 		    CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components,
-		             image.cube));
+		             image.cube, RowCenter(state, dimension)));
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
 		                      ConstantU32(state, 0)};
 		for (uint32_t index = 0; index < 2u; index++) {
@@ -1972,24 +1932,11 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			// Upstream 23ed47ec6: 1D and 1D-array images (host 2D one texel high, e6cc1ce30) gather
+			// natively from the centre of their host row 0.
 			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-			                            dimension_info.coordinate_components, image.cube);
-			if (dimension == ImageDimension::Dim1D) {
-				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-					ctx.Fail(inst, "has an unsupported 1D gather variant");
-					return;
-				}
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-				                              numeric_class, false, mem, true));
-				return;
-			}
-			if (dimension == ImageDimension::Dim1DArray) {
-				ctx.Fail(inst, "has an unsupported 1D-array gather");
-				return;
-			}
+			                            dimension_info.coordinate_components, image.cube,
+			                            RowCenter(state, dimension));
 			const auto result_numeric_class = dref ? Prospero::TextureNumericClass::Float
 			                                       : numeric_class;
 			const auto result_type = ImageVectorType(state, result_numeric_class, 4);
@@ -2005,7 +1952,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			uint32_t offset = 0;
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				operand_mask = spv::ImageOperandsConstOffsetsMask;
-				offset = HorizontalOffsets(state, dimension);
+				offset = HorizontalOffsets(state);
 			} else if (layout.offset != NoImageComponent) {
 				operand_mask = spv::ImageOperandsOffsetMask;
 				offset = PackedOffset(ctx, mem, *address, layout, dimension);
@@ -2022,7 +1969,16 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 					words.push_back(offset);
 				}
 				state.builder.AddFunction(words);
-				return sample;
+				// Host row 0 holds a 1D image's texels in w and z; x and y read row 1, which is out
+				// of range. Horizontal gathers read row 0 in every component.
+				if (!dimension_info.one_dimensional ||
+				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					return sample;
+				}
+				const auto shuffled = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVectorShuffle, result_type, shuffled, sample, sample,
+				                          3u, 2u, 2u, 3u);
+				return shuffled;
 			};
 			const auto sample = image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
 			                        ? EmitIndexSwitch(
@@ -2074,10 +2030,12 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 		std::vector<uint32_t> operands;
 		if (gradient) {
 			operand_mask |= spv::ImageOperandsGradMask;
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components));
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components));
+			// A 1D image's host row does not vary (upstream e6cc1ce30).
+			const auto row = dimension_info.one_dimensional ? ZeroF32(state) : 0u;
+			operands.push_back(CoordF32(ctx, mem, *address, layout.grad_x,
+			                            dimension_info.spatial_components, false, row));
+			operands.push_back(CoordF32(ctx, mem, *address, layout.grad_y,
+			                            dimension_info.spatial_components, false, row));
 		} else if (explicit_lod) {
 			operand_mask |= spv::ImageOperandsLodMask;
 			auto lod = ZeroF32(state);
@@ -2124,7 +2082,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto        coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			             candidate.cube, RowCenter(state, candidate.dimension));
 			if (sample_offset.dynamic) {
 				uint32_t level = ZeroF32(state);
 				if (explicit_lod_value != 0u) {
@@ -2138,7 +2096,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 					    MakeSampledImage(state, resource, sampler_id),
 					    CoordF32(ctx, mem, *address, layout.coord,
 					             ImageDimensionInfoFor(candidate.dimension).spatial_components,
-					             candidate.cube));
+					             candidate.cube, RowCenter(state, candidate.dimension)));
 					level = state.builder.AllocateId();
 					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), level, query,
 					                          0u);
@@ -2174,7 +2132,7 @@ static void EmitImageOperation(ValueEmitContext& ctx, const IR::Inst& inst) {
 						    spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled_image,
 						    CoordF32(ctx, mem, *address, layout.coord,
 						             ImageDimensionInfoFor(candidate.dimension).spatial_components,
-						             candidate.cube));
+						             candidate.cube, RowCenter(state, candidate.dimension)));
 						lod = state.builder.AllocateId();
 						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod,
 						                          query, 1u);

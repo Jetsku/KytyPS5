@@ -257,14 +257,7 @@ struct ImageViewInfo {
 	vk::ComponentMapping mapping     = {};
 	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
 
-	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
-		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
-		       base_level == rhs.base_level && level_count == rhs.level_count &&
-		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
-		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
-		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
-		       mapping.a == rhs.mapping.a && usage == rhs.usage;
-	}
+	[[nodiscard]] bool operator==(const ImageViewInfo&) const noexcept = default;
 };
 
 // KYTY_IMAGE_LEVEL_CLAMP (default on; =0 off). A T# may give more mip levels than its extent has
@@ -332,19 +325,6 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 	return has_stencil ? policy.stencil_attachment_formats.front() : policy.depth_attachment_format;
 }
 
-[[nodiscard]] inline constexpr vk::Format
-DepthAttachmentFormat(Prospero::DepthFormat   depth_format,
-                      Prospero::StencilFormat stencil_format) noexcept {
-	bool has_stencil = false;
-	switch (stencil_format) {
-		case Prospero::StencilFormat::kInvalid: break;
-		case Prospero::StencilFormat::k8UInt: has_stencil = true; break;
-		default: return vk::Format::eUndefined;
-	}
-	const auto* policy = FindDepthFormatPolicy(depth_format);
-	return policy == nullptr ? vk::Format::eUndefined : DepthAttachmentFormat(*policy, has_stencil);
-}
-
 [[nodiscard]] inline constexpr vk::ImageUsageFlags DepthTargetImageUsage() noexcept {
 	return vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled |
 	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -372,14 +352,6 @@ inline bool ImageInfo::IsDepth() const noexcept {
 		case vk::Format::eD32Sfloat: return 4;
 		default: return 0;
 	}
-}
-
-[[nodiscard]] inline constexpr uint32_t EncodeD16AsD24(uint16_t value) noexcept {
-	return static_cast<uint32_t>((static_cast<uint64_t>(value) * 0x00ffffffu + 0x7fffu) / 0xffffu);
-}
-
-[[nodiscard]] inline uint32_t EncodeD16AsD32(uint16_t value) noexcept {
-	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
 }
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
@@ -438,16 +410,22 @@ struct VideoOutFormatPolicy {
 
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ = 0x8100070400000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ =
+    0xc001070722000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ =
+    0xc001070700000000ull;
 
 [[nodiscard]] constexpr bool IsHdrVideoOutPixelFormat(uint64_t format) {
 	switch (format) {
 		case VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ:
-		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ: return true;
+		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return true;
 		default: return false;
 	}
 }
 
-inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -456,6 +434,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {0x8100000622000000ull,
+     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {0x8100000600000000ull,
+     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ,
@@ -463,6 +445,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
+    {VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ,
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
 }};
 

@@ -320,9 +320,10 @@ struct LodStatsOp {
 	uint32_t body[4] {};
 };
 
-// R_PSSR: the packet's Pssr::Request (output and input T#s, size), 18 dwords.
+// R_PSSR: the packet's Pssr::Request (output and input T#s, size and, since upstream e1292528f,
+// the temporal upscaler inputs), 52 dwords; ProcessPssr checks the size against Pssr::Request.
 struct PssrOp {
-	uint32_t request[18] {};
+	uint32_t request[52] {};
 };
 
 enum class FlipVariant : uint32_t { Plain = 0, Label = 1, LabelInterrupt = 2 };

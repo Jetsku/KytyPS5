@@ -36,7 +36,6 @@ public:
 	                       int64_t flip_arg, uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
-	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	// `before` (KYTY_FLIP_WATERMARK): only flip requests with an id below it count (UINT64_MAX: all).
 	void WaitFlipDone(int handle, int index, uint64_t before = UINT64_MAX);

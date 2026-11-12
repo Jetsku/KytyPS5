@@ -29,6 +29,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -162,7 +163,6 @@ void InitSubsystems() {
 	}
 
 	static Common::Subsystems subsystems;
-	Common::VirtualMemory::Init();
 	Common::InitializeThreads();
 	subsystems.Initialize<Config::Lifecycle>();
 
@@ -578,6 +578,22 @@ void ExpectUnmapped(const char* test, uint64_t addr) {
 	}
 }
 
+void ExpectHostReadOnly(const char* test, uint64_t address) {
+#if defined(__linux__)
+	uint64_t value = 0;
+	iovec    local {&value, sizeof(value)};
+	iovec    remote {reinterpret_cast<void*>(address), sizeof(value)};
+	Check(test, process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == -1,
+	      "host protection is not read-only");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
+	          info.Protect == PAGE_READONLY,
+	      "host protection is not read-only");
+#endif
+}
+
 void TestProsperoArgumentAndInfoSizeContracts() {
 	const char* test = "ProsperoArgumentAndInfoSizeContracts";
 	void*       addr = nullptr;
@@ -872,15 +888,6 @@ void TestSparseReadDuringDirectCommit() {
 	      "sparse read rejected a partly committed direct mapping");
 	Check(test, bytes.front() == 0x3c && bytes[chunk_size] == 0 && bytes.back() == 0xa7,
 	      "sparse read lost resident bytes or sparse zeros");
-	Libs::LibKernel::Memory::TestFailNextVirtualRangeReplacement();
-	CheckFailed(test, map_chunk(1), "KernelMapNamedDirectMemory(injected replacement failure)");
-	ExpectRange(test, Query(test, base + chunk_size), base + chunk_size,
-	            base + (chunks - 1) * chunk_size, 0, 0, 0, 0, 0, "anon");
-	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base + chunk_size, bytes.data(),
-	                                                    chunk_size) &&
-	                Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size) &&
-	                bytes[chunk_size] == 0,
-	      "failed direct publication did not restore sparse reservation and backing");
 
 	std::atomic<bool>     started {false};
 	std::atomic<bool>     stop {false};
@@ -1424,46 +1431,6 @@ void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFragmentedBackingUnmapRollback() {
-	const char* test     = "FragmentedBackingUnmapRollback";
-	const auto  baseline = AvailableFlexibleMemory(test);
-	const auto  left =
-	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_hole_left");
-	const auto blocker =
-	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_blocker");
-	const auto right =
-	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_hole_right");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(left, SceKernelPageSize),
-	        "KernelMunmap(left hole)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(right, SceKernelPageSize),
-	        "KernelMunmap(right hole)");
-
-	const auto fragmented =
-	    MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw, "fragmented_backing");
-	auto* first_word = reinterpret_cast<uint64_t*>(fragmented);
-	auto* last_word =
-	    reinterpret_cast<uint64_t*>(fragmented + SceKernelPageSize * 2 - sizeof(uint64_t));
-	*first_word = 0x465241474c454654ull; // "FRAGLEFT"
-	*last_word  = 0x4652414752474854ull; // "FRAGRGHT"
-
-	Libs::LibKernel::Memory::TestFailGuestBackingStoreUnmapAfter(1);
-	CheckFailed(test, Libs::LibKernel::Memory::KernelMunmap(fragmented, SceKernelPageSize * 2),
-	            "KernelMunmap(injected second-view failure)");
-	ExpectRange(test, Query(test, fragmented), fragmented, fragmented + SceKernelPageSize * 2,
-	            SceKernelProtCpuRw, 1, 0, 0, 1, "fragmented_backing");
-	Check(test, *first_word == 0x465241474c454654ull && *last_word == 0x4652414752474854ull,
-	      "transactional backing-unmap rollback lost mapped contents");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(fragmented, SceKernelPageSize * 2),
-	        "KernelMunmap(retry)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(blocker, SceKernelPageSize),
-	        "KernelMunmap(blocker)");
-	Check(test, AvailableFlexibleMemory(test) == baseline,
-	      "fragmented backing rollback test leaked flexible capacity");
-
-	std::printf("[host]    %-48s ok\n", test);
-}
-
 void TestRuntimeMemoryOwnerLifecycle() {
 	const char* test = "RuntimeMemoryOwnerLifecycle";
 	Check(test,
@@ -1558,6 +1525,12 @@ void TestCopySparseMemoryMappings() {
 	                !CopySparseMemory(base, &canary, 0) &&
 	                !CopySparseMemory(base, nullptr, sizeof(canary)) && canary == UINT64_MAX,
 	      "invalid sparse copy accepted its range or changed its destination");
+	Check(test, !TryReadBacking(UINT64_MAX - 3, &canary, sizeof(canary)) &&
+	                !TryReadBacking(base, &canary, 0) && canary == UINT64_MAX,
+	      "invalid backing read accepted its range or changed its destination");
+	Check(test, !TryWriteBacking(UINT64_MAX - 3, &canary, sizeof(canary)) &&
+	                !TryWriteBacking(base, &canary, 0),
+	      "invalid backing write accepted its range");
 	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "unmap shared first page");
 	for (const auto page : {1u, 3u}) {
 		Check(test, FreeGuestMemory(base + page * SceKernelPageSize, SceKernelPageSize),
@@ -1861,7 +1834,6 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-#if defined(__linux__)
 void TestPartialUnmapPreservesHostPermissions() {
 	const char* test = "PartialUnmapPreservesHostPermissions";
 	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
@@ -1877,6 +1849,15 @@ void TestPartialUnmapPreservesHostPermissions() {
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(middle)");
 
+	ExpectHostReadOnly(test, base);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION right {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<void*>(base + SceKernelPageSize * 2), &right,
+	                   sizeof(right)) != 0 &&
+	          right.Protect == PAGE_NOACCESS,
+	      "partial unmap removed the right survivor's read protection");
+#else
 	// Probe actual host access without taking a signal or changing the page protections.
 	uint64_t value = 0;
 	iovec local {&value, sizeof(value)};
@@ -1884,10 +1865,9 @@ void TestPartialUnmapPreservesHostPermissions() {
 	iovec right {reinterpret_cast<void*>(base + SceKernelPageSize * 2), sizeof(value)};
 	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value),
 	      "partial unmap removed read access to the left survivor");
-	Check(test, process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1,
-	      "partial unmap removed the left survivor's write protection");
 	Check(test, process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
 	      "partial unmap removed the right survivor's read protection");
+#endif
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
 	        "KernelMunmap(left cleanup)");
@@ -1896,7 +1876,6 @@ void TestPartialUnmapPreservesHostPermissions() {
 	        "KernelMunmap(right cleanup)");
 	std::printf("[host]    %-48s ok\n", test);
 }
-#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void TestWindowsBackingViewPermissions() {
@@ -2075,40 +2054,6 @@ void TestDirectMapValidationBeforeOwnerMutation() {
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize * 2),
 	        "KernelReleaseDirectMemory");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestDirectReleaseRollbackRestoresOwnerMapping() {
-	const char* test      = "DirectReleaseRollbackRestoresOwnerMapping";
-	int64_t     phys_addr = 0;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
-	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
-	        "KernelAllocateDirectMemory");
-	void* address = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &address, SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
-	            "release_rollback"),
-	        "KernelMapNamedDirectMemory");
-	const auto base                    = reinterpret_cast<uint64_t>(address);
-	*reinterpret_cast<uint64_t*>(base) = 0x52454c524f4c4c42ull; // "RELROLLB"
-
-	Libs::LibKernel::Memory::TestFailNextPhysicalMemoryUnmap();
-	CheckFailed(
-	    test,
-	    Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
-	    "KernelCheckedReleaseDirectMemory(injected failure)");
-	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 0, 1,
-	            0, 1, "release_rollback", static_cast<uint64_t>(phys_addr));
-	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x52454c524f4c4c42ull,
-	      "release rollback lost the shared-backing contents");
-
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
-	        "KernelCheckedReleaseDirectMemory(retry)");
-	ExpectUnmapped(test, base);
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -2919,30 +2864,8 @@ void TestFixedDirectReplacementPreservesAccess() {
 	      "middle replacement changed a neighboring page's bytes or host protection");
 	Check(test, ProtectGuestHostMemory(base, page * 3, Mode::ReadWrite),
 	      "could not restore neighboring permissions");
-	const auto check_preserved = [&] {
-		Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&
-		                *reinterpret_cast<uint64_t*>(base + page) == 0x45 &&
-		                *reinterpret_cast<uint64_t*>(base + page * 2) == 0x33,
-		      "failed replacement changed bytes");
-		for (uint64_t i = 0; i < 3; ++i) {
-			Check(test, !TestPlaceholderRangeIsFree(base + i * page, page),
-			      "failed replacement released part of the owned mapping");
-		}
-		ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw,
-		            0, 1, 0, 1, "replacement_original", physical);
-		ExpectRange(test, Query(test, base + page), base + page, base + page * 2,
-		            SceKernelProtCpuRw, 0, 1, 0, 1, "replacement_changed", physical + page * 3);
-		ExpectRange(test, Query(test, base + page * 2), base + page * 2, base + page * 3,
-		            SceKernelProtCpuRw, 0, 1, 0, 1, "replacement_original", physical + page * 2);
-	};
-	TestFailPhysicalMemoryUnmapAfter(1);
-	CheckFailed(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
-	            "KernelMapNamedDirectMemory(second-view removal failure)");
-	check_preserved();
-	TestFailNextVirtualRangeReplacement();
-	CheckFailed(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
-	            "KernelMapNamedDirectMemory(publication failure)");
-	check_preserved();
+	// Upstream dcdef60bd: a failed replacement after validation exits, so the injected
+	// removal and publication failures this test made are gone.
 	CheckOk(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
 	        "KernelMapNamedDirectMemory(multiple backing views)");
 	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x11 &&
@@ -3041,158 +2964,273 @@ void TestFixedReserveReplacesPartialDirectMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFixedReserveRollbackSkipsUntouchedChunks() {
-	const char*        test       = "FixedReserveRollbackSkipsUntouchedChunks";
-	constexpr uint64_t part_size  = SceKernelPageSize * 2;
-	constexpr uint64_t total_size = part_size * 2;
-	int64_t            left_phys  = 0;
-	int64_t            right_phys = 0;
-
+void TestFragmentedBackingPublication() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "FragmentedBackingPublication";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto left    = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "backing_hole_left");
+	const auto blocker = MapNamedFlexible(test, page, SceKernelProtCpuRw, "backing_blocker");
+	const auto right   = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "backing_hole_right");
+	std::memset(reinterpret_cast<void*>(left), 0xa5, 2 * page);
+	std::memset(reinterpret_cast<void*>(right), 0x5a, 2 * page);
+	*reinterpret_cast<uint64_t*>(blocker) = 0x424c4f434b455231ull;
+	CheckOk(test, KernelMunmap(left, 2 * page), "KernelMunmap(left hole)");
+	CheckOk(test, KernelMunmap(right, 2 * page), "KernelMunmap(right hole)");
+	void* target = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&target, 4 * page, 0, page),
+	        "reserve fragmented publication target");
+	const auto fragmented = reinterpret_cast<uint64_t>(target);
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            part_size, SceKernelPageSize, SceKernelMtypeC, &left_phys),
-	        "KernelAllocateDirectMemory(left)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            part_size, SceKernelPageSize, SceKernelMtypeC, &right_phys),
-	        "KernelAllocateDirectMemory(right)");
-
-	void* reserve = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
-	                                                           SceKernelPageSize),
-	        "KernelReserveVirtualRange");
-	const auto base  = reinterpret_cast<uint64_t>(reserve);
-	void*      left  = reserve;
-	void*      right = reinterpret_cast<void*>(base + part_size);
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &left, part_size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            left_phys, SceKernelPageSize, "rollback_left"),
-	        "KernelMapNamedDirectMemory(left)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &right, part_size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            right_phys, SceKernelPageSize, "rollback_right"),
-	        "KernelMapNamedDirectMemory(right)");
-	*reinterpret_cast<uint64_t*>(left)  = 0x4b5954594c454654ull; // "KYTYLEFT"
-	*reinterpret_cast<uint64_t*>(right) = 0x4b59545952474854ull; // "KYTYRGHT"
-
-	Libs::LibKernel::Memory::TestFailPhysicalMemoryUnmapAfter(1);
-	void* replacement = reserve;
-	CheckFailed(test,
-	            Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	                &replacement, total_size, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	                SceKernelPageSize),
-	            "KernelReserveVirtualRange(second-chunk rollback)");
-	Check(test, *reinterpret_cast<uint64_t*>(left) == 0x4b5954594c454654ull,
-	      "rollback did not restore the mutated first chunk");
-	Check(test, *reinterpret_cast<uint64_t*>(right) == 0x4b59545952474854ull,
-	      "rollback damaged the failing second chunk");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, part_size),
-	      "first restored mapping remained recorded as a free placeholder");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base + part_size, part_size),
-	      "second restored mapping remained recorded as a free placeholder");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, part_size), "KernelMunmap(left)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + part_size, part_size),
-	        "KernelMunmap(right)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(left_phys, part_size),
-	        "KernelReleaseDirectMemory(left)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(right_phys, part_size),
-	        "KernelReleaseDirectMemory(right)");
-
+	        KernelMapNamedFlexibleMemory(&target, 4 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                     "fragmented_backing"),
+	        "publish fragmented flexible mapping");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(fragmented);
+	Check(test,
+	      std::all_of(bytes, bytes + 4 * page, [](uint8_t byte) { return byte == 0; }) &&
+	          *reinterpret_cast<uint64_t*>(blocker) == 0x424c4f434b455231ull,
+	      "fragmented publication exposed stale bytes or changed the live gap");
+	CheckOk(test, KernelMunmap(fragmented, 4 * page), "KernelMunmap(fragmented backing)");
+	CheckOk(test, KernelMunmap(blocker, page), "KernelMunmap(blocker)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "fragmented publication test leaked flexible capacity");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFixedReserveRollbackConsumesRestoredPlaceholder() {
-	const char*        test       = "FixedReserveRollbackConsumesRestoredPlaceholder";
-	constexpr uint64_t total_size = SceKernelPageSize * 4;
-
-	int64_t phys_addr = 0;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            total_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
-	        "KernelAllocateDirectMemory");
-
-	void* reserve = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
-	                                                           SceKernelPageSize),
+void TestMunmapGpuRuns() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "MunmapGpuRuns";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	void*              reserve  = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
 	        "KernelReserveVirtualRange");
 	const auto base = reinterpret_cast<uint64_t>(reserve);
-
-	void* mapped = reserve;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &mapped, total_size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            phys_addr, SceKernelPageSize, "rollback_direct"),
-	        "KernelMapNamedDirectMemory");
-	*reinterpret_cast<uint64_t*>(base) = 0x4b595459524f4c4cull; // "KYTYROLL"
-
-	Libs::LibKernel::Memory::TestFailNextPhysicalMemoryUnmap();
-	void* replacement = reserve;
-	CheckFailed(test,
-	            Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	                &replacement, total_size, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	                SceKernelPageSize),
-	            "KernelReserveVirtualRange(injected rollback)");
-	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x4b595459524f4c4cull,
-	      "rollback did not restore direct-memory contents");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, total_size),
-	      "rollback left a mapped direct range recorded as a free placeholder");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, total_size), "KernelMunmap");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, total_size),
-	        "KernelReleaseDirectMemory");
-
+	for (const auto [offset, prot, name]:
+	     {std::tuple {0 * page, SceKernelProtCpuRw, "run_a"},
+	      {2 * page, SceKernelProtCpuRw, "run_b"}, {3 * page, SceKernelProtCpuRead, "run_c"}}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test, KernelMapNamedFlexibleMemory(&address, page, prot, SceKernelMapFixed, name),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap(reserved gap)");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {false, base + 2 * page, 2 * page}},
+	      "munmap did not unmap each run of committed ranges from the GPU once");
+	for (uint64_t i = 0; i < 4; ++i)
+		ExpectUnmapped(test, base + i * page);
+	Check(test, AvailableFlexibleMemory(test) == baseline, "munmap leaked flexible-memory budget");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
-	const char*        test      = "FixedReserveRangeAddRollbackKeepsPlaceholder";
-	constexpr uint64_t size      = SceKernelPageSize * 4;
-	int64_t            phys_addr = 0;
-
+void TestMprotectSkipsUncommittedRanges() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test    = "MprotectSkipsUncommittedRanges";
+	constexpr uint64_t page    = SceKernelPageSize;
+	void*              reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 2 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "protect"),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	CheckOk(test, KernelMunmap(base + 3 * page, page), "leave a hole after the mappings");
+	CheckOk(test, KernelMprotect(reserve, 4 * page, SceKernelProtCpuRead),
+	        "protect across a reservation and a hole");
+	for (const auto offset: {0 * page, 2 * page}) {
+		ExpectRange(test, Query(test, base + offset), base + offset, base + offset + page,
+		            SceKernelProtCpuRead, 1, 0, 0, 1, "protect");
+		ExpectHostReadOnly(test, base + offset);
+	}
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, 0, 0, 0, 0, 0);
+	Check(test,
+	      KernelMprotect(reinterpret_cast<void*>(page), page, SceKernelProtCpuRead) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "mprotect accepted a range outside the address space");
+	Check(test,
+	      KernelMprotect(reserve, UINT64_MAX, SceKernelProtCpuRead) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "mprotect accepted an overflowing length");
+	CheckOk(test, KernelMunmap(base, 3 * page), "KernelMunmap");
+#if defined(__linux__)
+	void* straddle = reinterpret_cast<void*>(0x1000000000ull - page);
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        KernelMapNamedFlexibleMemory(&straddle, 2 * page, SceKernelProtCpuRw,
+	                                     SceKernelMapFixed | SceKernelMapNoOverwrite, "straddle"),
+	        "map across the host user-space boundary");
+	CheckOk(test, KernelMprotect(straddle, 2 * page, SceKernelProtCpuRead),
+	        "protect across the host user-space boundary");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(straddle), 2 * page),
+	        "unmap across the host user-space boundary");
+#endif
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedReplacementGpuUnmaps() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test    = "FixedReplacementGpuUnmaps";
+	constexpr uint64_t page    = SceKernelPageSize;
+	void*              reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 2 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, offset == 0 ? page : 2 * page,
+		                                     SceKernelProtCpuRw, SceKernelMapFixed, "replaced"),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, SceKernelMapFixed, page),
+	        "reserve over mappings and a reserved gap");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {false, base + 2 * page, 2 * page}},
+	      "reserve-fixed did not unmap each run of committed ranges from the GPU once");
+	ExpectRange(test, Query(test, base), base, base + 4 * page, 0, 0, 0, 0, 0);
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	for (const auto size: {page, 2 * page}) {
+		void* address = reserve;
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, size, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "fixed_map"),
+		        "map into a reservation, then over a mapping and a reservation");
+	}
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
+	                                                        {true, base, page},
+	                                                        {false, base, page},
+	                                                        {false, base, 2 * page},
+	                                                        {true, base, 2 * page}},
+	      "fixed flexible maps did not unmap their whole target from the GPU");
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedReserveValidatesBeforeUnmapping() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "FixedReserveValidatesBeforeUnmapping";
+	constexpr uint64_t page = SceKernelPageSize;
+	constexpr uint64_t top  = 0xfc00000000ull - page;
+	Check(test,
+	      AllocateRuntimeMemory(top, page, Common::VirtualMemory::Mode::ReadWrite, "top_runtime",
+	                            true) == top,
+	      "fixed runtime allocation at the top of the user area failed");
+	*reinterpret_cast<uint64_t*>(top) = 0x544f5052554e5449ull;
+	void* past_end                    = reinterpret_cast<void*>(top);
+	Check(test,
+	      KernelReserveVirtualRange(&past_end, 2 * page, SceKernelMapFixed, page) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "reserve-fixed accepted a span past the user area");
+	Check(test, *reinterpret_cast<const uint64_t*>(top) == 0x544f5052554e5449ull,
+	      "rejected reserve-fixed changed runtime memory");
+	Check(test, FreeGuestMemory(top, page), "free top runtime memory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestMunmapRoundsToPages() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "MunmapRoundsToPages";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto         base     = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "round");
+	Check(test, KernelMunmap(base + page / 4, page) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "munmap accepted an unaligned address");
+	CheckOk(test, KernelMunmap(base, 0x100), "unmap part of the first page");
+	ExpectUnmapped(test, base + 0x100);
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, SceKernelProtCpuRw, 1,
+	            0, 0, 1, "round");
+	CheckOk(test, KernelMunmap(base + page, 1), "unmap one byte of the second page");
+	ExpectUnmapped(test, base + page);
+	Check(test, AvailableFlexibleMemory(test) == baseline, "munmap leaked flexible budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestRangeNamesCoverWholePages() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "RangeNamesCoverWholePages";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto         base     = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "names");
+	CheckOk(test,
+	        KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page + 0x100), 0x200, "inner"),
+	        "name part of the middle page");
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, SceKernelProtCpuRw, 1,
+	            0, 0, 1, "inner");
+	CheckOk(test, KernelClearVirtualRangeName(reinterpret_cast<void*>(base + page - 1), 2),
+	        "clear names across a page boundary");
+	ExpectRange(test, Query(test, base), base, base + 2 * page, SceKernelProtCpuRw, 1, 0, 0, 1, "");
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 3 * page,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "names");
+	CheckOk(test, KernelMunmap(base, 3 * page), "unmap the renamed pages");
+	Check(test, AvailableFlexibleMemory(test) == baseline, "renamed pages leaked flexible budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectReleaseUnmapsGpuRuns() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "DirectReleaseUnmapsGpuRuns";
+	constexpr uint64_t page     = SceKernelPageSize;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 4 * page, page,
+	                                   SceKernelMtypeC, &physical),
 	        "KernelAllocateDirectMemory");
 	void* reserve = nullptr;
-	CheckOk(
-	    test,
-	    Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, size, 0, SceKernelPageSize),
-	    "KernelReserveVirtualRange");
-	const auto base   = reinterpret_cast<uint64_t>(reserve);
-	void*      mapped = reserve;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 2 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapDirectMemory(&address, 2 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                              physical + offset, page),
+		        "KernelMapDirectMemory");
+	}
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, 4 * page),
+	        "release memory behind two adjacent views");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, 4 * page}},
+	      "release did not unmap adjacent views from the GPU once");
+	for (uint64_t i = 0; i < 4; ++i)
+		ExpectUnmapped(test, base + i * page);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestMemoryPoolReserveInsideReservation() {
+	const char*        test  = "MemoryPoolReserveInsideReservation";
+	constexpr uint64_t len   = SceKernelMemoryPoolReserveLen;
+	void*              outer = nullptr;
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&outer, 5 * len, 0, len),
+	        "KernelReserveVirtualRange(outer)");
+	// Free gaps on both sides keep the outer reservation from merging with other ranges.
+	const auto base = reinterpret_cast<uint64_t>(outer) + len;
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base - len, len), "KernelMunmap(front)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 3 * len, len), "KernelMunmap(back)");
+	void* pool = reinterpret_cast<void*>(base + len);
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &mapped, size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            phys_addr, SceKernelPageSize, "range_add_rollback"),
-	        "KernelMapNamedDirectMemory");
-	*reinterpret_cast<uint64_t*>(mapped) = 0x4b59545952414e47ull; // "KTYRANG"
-
-	Libs::LibKernel::Memory::TestFailNextFixedReserveRangeRegistration();
-	void* replacement = mapped;
-	CheckFailed(
-	    test,
-	    Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	        &replacement, size, SceKernelMapFixed | SceKernelMapNoCoalesce, SceKernelPageSize),
-	    "KernelReserveVirtualRange(range-add rollback)");
-	Check(test, *reinterpret_cast<uint64_t*>(mapped) == 0x4b59545952414e47ull,
-	      "range-add rollback did not restore direct-memory contents");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, size),
-	      "range-add rollback left the restored mapping recorded as free");
-	ExpectRange(test, Query(test, base), base, base + size, SceKernelProtCpuRw, 0, 1, 0, 1,
-	            "range_add_rollback");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
-	        "KernelReleaseDirectMemory");
+	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(pool, len, 0, SceKernelMapFixed, &pool),
+	        "KernelMemoryPoolReserve(inside a reservation)");
+	ExpectRange(test, Query(test, base), base, base + len, 0, 0, 0, 0, 0, "anon");
+	ExpectRange(test, Query(test, base + len), base + len, base + 2 * len, 0, 0, 0, 1, 0, "anon");
+	ExpectRange(test, Query(test, base + 2 * len), base + 2 * len, base + 3 * len, 0, 0, 0, 0, 0,
+	            "anon");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, 3 * len), "KernelMunmap(outer)");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -3254,14 +3292,14 @@ void TestLargeHintedReserveHostsSmallDirectMap() {
 }
 
 // Upstream 259a40abf, adapted: this line has no automatic AMM backing (MapAutomaticMemory), so
-// the AMM unmap is checked on an ordinary direct mapping: holes are accepted, and an owner failure
-// restores exactly the GPU range it had unmapped.
+// the AMM unmap is checked on an ordinary direct mapping: holes are accepted, and the mapped run
+// between them is unmapped from the GPU with one call (upstream d384084e3; an owner failure exits
+// since e2777436f).
 void TestAmmUnmapAcceptsHolesAndRestoresGpuRange() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test     = "AmmUnmapAcceptsHolesAndRestoresGpuRange";
-	constexpr uint64_t page     = SceKernelPageSize;
-	constexpr uint64_t sentinel = 0x0123456789abcdefull;
-	int64_t            phys     = 0;
+	const char*        test = "AmmUnmapAcceptsHolesAndRestoresGpuRange";
+	constexpr uint64_t page = SceKernelPageSize;
+	int64_t            phys = 0;
 	CheckOk(test,
 	        KernelAllocateDirectMemory(SceKernelDirectMemoryStart, KernelGetDirectMemorySize(),
 	                                   page * 4, page, SceKernelMtypeC, &phys),
@@ -3280,24 +3318,14 @@ void TestAmmUnmapAcceptsHolesAndRestoresGpuRange() {
 		Check(test, UnmapAmmMemory(address, size) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
 		      "AMM unmap accepted an unaligned or empty range");
 	}
-	*reinterpret_cast<uint64_t*>(base + page) = sentinel;
 
-	TestFailPhysicalMemoryUnmapAfter(0);
 	g_gpu_range_events.clear();
 	TestSetGpuRangeCallback(ObserveGpuRange);
 	const int unmap_result = UnmapAmmMemory(base, page * 4);
 	TestSetGpuRangeCallback(nullptr);
-	TestFailPhysicalMemoryUnmapAfter(UINT32_MAX);
-	CheckFailed(test, unmap_result, "AMM unmap owner failure");
-	Check(test,
-	      g_gpu_range_events ==
-	          std::vector<GpuRangeEvent> {{false, base + page, page * 2},
-	                                      {true, base + page, page * 2}},
-	      "failed AMM unmap did not restore exactly the surviving GPU range");
-	Check(test, *reinterpret_cast<const uint64_t*>(base + page) == sentinel,
-	      "failed AMM unmap did not restore the original backing");
-
-	CheckOk(test, UnmapAmmMemory(base, page * 4), "AMM unmap with leading and trailing holes");
+	CheckOk(test, unmap_result, "AMM unmap with leading and trailing holes");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base + page, page * 2}},
+	      "AMM unmap did not unmap the mapped run from the GPU once");
 	ExpectUnmapped(test, base + page);
 	ExpectUnmapped(test, base + page * 2);
 	CheckOk(test, UnmapAmmMemory(base, page * 4), "AMM unmap of a completely unmapped range");
@@ -3634,6 +3662,23 @@ void TestMemoryPoolMultiRangeDecommit() {
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(read-only)");
+	void* fixed = arena;
+	Check(test,
+	      Libs::LibKernel::Memory::KernelReserveVirtualRange(&fixed, SceKernelMemoryPoolCommitLen,
+	                                                         SceKernelMapFixed, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "reserve-fixed replaced committed pool memory");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolDecommit(
+	          reinterpret_cast<void*>(base + SceKernelPageSize), SceKernelMemoryPoolCommitLen, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "decommit accepted an address not aligned to 64 KiB");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	          reinterpret_cast<void*>(base + 2 * SceKernelMemoryPoolCommitLen + SceKernelPageSize),
+	          SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRw, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "commit accepted an address not aligned to 64 KiB");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, expand_len, 0),
 	        "KernelMemoryPoolDecommit(different protections)");
 	const auto decommitted = Query(test, base);
@@ -3642,13 +3687,54 @@ void TestMemoryPoolMultiRangeDecommit() {
 	          decommitted.is_pooled == 1 && decommitted.is_committed == 0,
 	      "multi-range decommit did not restore the reserved pool span");
 
+	const auto split_span = base + 2 * SceKernelMemoryPoolCommitLen;
+	const auto renamed    = split_span + SceKernelMemoryPoolCommitLen;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelSetVirtualRangeName(
+	            reinterpret_cast<void*>(renamed), SceKernelMemoryPoolCommitLen, "pool_renamed"),
+	        "KernelSetVirtualRangeName(pool tail)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(reinterpret_cast<void*>(split_span),
+	                                                        expand_len, SceKernelMtypeC,
+	                                                        SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit(renamed span)");
+	ExpectRange(test, Query(test, split_span), split_span, renamed, SceKernelProtCpuRw, 0, 0, 1, 1);
+	ExpectRange(test, Query(test, renamed), renamed, split_span + expand_len, SceKernelProtCpuRw,
+	            0, 0, 1, 1, "pool_renamed");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolDecommit(reinterpret_cast<void*>(split_span),
+	                                                          expand_len, 0),
+	        "KernelMemoryPoolDecommit(renamed span)");
+	ExpectRange(test, Query(test, renamed), renamed, split_span + expand_len, 0, 0, 0, 1, 0,
+	            "pool_renamed");
+
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(mixed span)");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(arena, expand_len, SceKernelMtypeC,
+	                                                      SceKernelProtCpuRw, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EBUSY,
+	      "commit accepted a span with committed pool memory");
+	ExpectRange(test, Query(test, base), base, base + SceKernelMemoryPoolCommitLen, 0, 0, 0, 1, 0);
+	const auto pool_end = base + SceKernelMemoryPoolReserveLen;
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	          reinterpret_cast<void*>(pool_end - SceKernelMemoryPoolCommitLen), expand_len,
+	          SceKernelMtypeC, SceKernelProtCpuRw, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "commit accepted a span past the pool reserve");
+	g_gpu_range_events.clear();
+	Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, expand_len, 0),
 	        "KernelMemoryPoolDecommit(reserved and committed span)");
+	Libs::LibKernel::Memory::TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {
+	              {false, base + SceKernelMemoryPoolCommitLen, SceKernelMemoryPoolCommitLen}},
+	      "decommit did not unmap exactly its committed pool block from the GPU");
 	const auto mixed_decommitted = Query(test, base);
 	Check(test,
 	      mixed_decommitted.start <= base && mixed_decommitted.end >= base + expand_len &&
@@ -5077,6 +5163,96 @@ void TestCpuExtensionPatches() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestTimeStampCounterPatches() {
+	const char*           test = "TimeStampCounterPatches";
+	Config::ConfigOptions options;
+	options.printf_direction  = Config::LogDirection::Silent;
+	options.guest_tsc_enabled = true;
+	Config::Load(options);
+	constexpr uint64_t code_size = 0x1000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x908000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "tsc_test");
+	Check(test, mapping != 0, "failed to allocate TSC fixture");
+	InstructionTestScope           restore {mapping, code_size * 2};
+	const std::array<uintptr_t, 1> starts {mapping};
+	const auto                     multiplier = Libs::LibKernel::KernelGuestTscMultiplier();
+	const auto                     patch      = [&](uint64_t capacity, uint64_t tsc_multiplier) {
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                            reinterpret_cast<void*>(mapping + code_size),
+		                                            capacity);
+		return Loader::PatchGuestInstructions(mapping, code_size, starts, false, false, {},
+		                                      tsc_multiplier)
+		    .rdtsc;
+	};
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	code.mov(code.r11, 0x0123456789abcdefull);
+	code.mov(code.qword[code.rsp - 8], code.r11);
+	code.mov(code.rax, UINT64_MAX);
+	code.mov(code.rdx, UINT64_MAX);
+	code.add(code.rax, 1); // Sets CF, PF, AF and ZF; clears SF and OF.
+	code.rdtsc();
+	code.mov(code.qword[code.rdi], code.rax);
+	code.mov(code.qword[code.rdi + 8], code.rdx);
+	code.rdtscp();
+	code.mov(code.qword[code.rdi + 16], code.rax);
+	code.mov(code.qword[code.rdi + 24], code.rdx);
+	code.mov(code.qword[code.rdi + 32], code.rcx);
+	code.mov(code.rax, code.qword[code.rsp - 8]);
+	code.mov(code.qword[code.rdi + 40], code.rax);
+	code.mov(code.qword[code.rdi + 48], code.r11);
+	code.pushfq();
+	code.pop(code.qword[code.rdi + 56]);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate TSC fixture");
+	const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+	const auto                 unchanged = [&] {
+		return std::equal(original.begin(), original.end(), code.getCode());
+	};
+
+	const auto disabled = patch(code_size, 0);
+	Check(test, disabled.found == 0 && unchanged(), "TSC scaling without a multiplier changed code");
+	const auto patched = patch(code_size, multiplier);
+	Check(test, patched.found == 2 && patched.native == 2, "RDTSC/RDTSCP were not rewritten");
+
+	using GuestFunction = void(KYTY_SYSV_ABI*)(uint64_t*);
+	std::array<uint64_t, 8> output {};
+	uint32_t                aux_before = 0;
+	uint32_t                aux_after  = 0;
+	const auto              before     = Libs::LibKernel::KernelReadTsc();
+	__rdtscp(&aux_before);
+	reinterpret_cast<GuestFunction>(mapping)(output.data());
+	__rdtscp(&aux_after);
+	const auto after = Libs::LibKernel::KernelReadTsc();
+	Check(test, ((output[0] | output[1] | output[2] | output[3] | output[4]) >> 32u) == 0,
+	      "RDTSC/RDTSCP left the upper register halves set");
+	const auto rdtsc  = output[0] | (output[1] << 32u);
+	const auto rdtscp = output[2] | (output[3] << 32u);
+	Check(test, before <= rdtsc && rdtsc <= rdtscp && rdtscp <= after,
+	      "guest RDTSC/RDTSCP differ from sceKernelReadTsc()");
+	Check(test, aux_before != aux_after || output[4] == aux_before, "RDTSCP lost TSC_AUX");
+	Check(test, output[5] == 0x0123456789abcdefull && output[6] == 0x0123456789abcdefull,
+	      "TSC rewrite changed the red zone or another register");
+	Check(test, (output[7] & 0x8d5u) == 0x55u, "TSC rewrite changed RFLAGS");
+
+	const auto start_tsc  = Libs::LibKernel::KernelReadTsc();
+	const auto start_time = std::chrono::steady_clock::now();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const auto ticks   = static_cast<double>(Libs::LibKernel::KernelReadTsc() - start_tsc);
+	const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time);
+	const auto frequency = static_cast<double>(Libs::LibKernel::KernelGetTscFrequency());
+	Check(test, frequency == 1600000000 && std::abs(ticks / seconds.count() / frequency - 1) < 0.1,
+	      "guest counter does not run at the reported rate");
+
+	// The trap fallback would fit here, but it would read the counter at the host rate.
+	std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+	const auto exhausted = patch(16, multiplier);
+	Check(test, exhausted.found == 2 && exhausted.Skipped() == 2 && unchanged(),
+	      "RDTSC without trampoline space was not left unpatched");
+	options.guest_tsc_enabled = false;
+	Config::Load(options);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -5436,6 +5612,7 @@ int main(int argc, char** argv) {
 		RunTest(TestCpuExtensionContexts);
 		RunTest(TestPackedBitFieldInsert);
 		RunTest(TestCpuExtensionPatches);
+		RunTest(TestTimeStampCounterPatches);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
@@ -5473,6 +5650,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionContexts);
 	RunTest(TestPackedBitFieldInsert);
 	RunTest(TestCpuExtensionPatches);
+	RunTest(TestTimeStampCounterPatches);
 #endif
 	RunTest(TestWindowsMisalignedSysvHostEntry);
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
@@ -5496,7 +5674,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestStackExitLifecycle);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
-	RunTest(TestFragmentedBackingUnmapRollback);
+	RunTest(TestFragmentedBackingPublication);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
@@ -5504,22 +5682,26 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestMunmapGpuRuns);
+	RunTest(TestMunmapRoundsToPages);
+	RunTest(TestRangeNamesCoverWholePages);
+	RunTest(TestMprotectSkipsUncommittedRanges);
+	RunTest(TestFixedReplacementGpuUnmaps);
+	RunTest(TestFixedReserveValidatesBeforeUnmapping);
 	RunTest(TestClampRangeMemoFollowsMappings);
 	RunTest(TestClampRangeBitmapFollowsMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestAmmUnmapAcceptsHolesAndRestoresGpuRange);
 	RunTest(TestOrdinaryMappingsAvoidAmmWindow);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-#if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
-#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestWindowsBackingViewPermissions);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
-	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
+	RunTest(TestDirectReleaseUnmapsGpuRuns);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
@@ -5535,14 +5717,12 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
-	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
-	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
-	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);
 	RunTest(TestMemoryPoolMultiRangeDecommit);
+	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);

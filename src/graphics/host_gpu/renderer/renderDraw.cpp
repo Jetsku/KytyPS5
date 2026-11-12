@@ -2573,6 +2573,43 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 // an open query such a draw is still dropped.
 static Live::Switch g_occlusion_no_output_draws("KYTY_OCCLUSION_NO_OUTPUT_DRAWS", Live::ParseDefaultOff);
 
+// KYTY_EMPTY_SCISSOR_SKIP (default on, upstream b727a1faa; "0" draws them as before): a draw whose
+// SCREEN scissor is empty rasterizes nothing in any viewport, so it is skipped unless a vertex stage
+// writes buffers (descriptor writes, address writes or BDA writes); another title ends mip
+// reductions with a 0x0 pass past the last level. Decided in PrepareDrawRenderState once the
+// programs are known, before target resolution and the draw-run candidate: every commit path
+// (DrawIndex, DrawAuto, both MRT split passes, DrawIndirectNative, a draw-prep slot's commit, a
+// draw-run continuation) passes there. The continuation kernel (KYTY_CONT_KERNEL) does not, and needs
+// not: it continues only a committed draw with the same structure key, which hashes every context
+// register, the screen scissor included, and a skipped draw never records a run.
+static bool EmptyScissorSkipEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EMPTY_SCISSOR_SKIP");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static bool DrawHasEmptyScreenScissor(const CommandBuffer& buffer, const DrawRenderState& state) {
+	const auto& vp = buffer.GetRegisters().GetScreenViewport();
+	if (vp.screen_scissor_right > vp.screen_scissor_left &&
+	    vp.screen_scissor_bottom > vp.screen_scissor_top) {
+		return false;
+	}
+	const auto vertex_stages = std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	// A stage without a runtime counts as writing (the draw is not skipped).
+	return std::ranges::none_of(vertex_stages, [](const ShaderVertexInputInfo& info) {
+		return !info.stage || HasShaderBufferWrites(info.stage) ||
+		       info.stage.program->info.bda_writes;
+	});
+}
+
+// The empty-screen-scissor skip's counter site (one call per skipped draw; a draw's MRT split second
+// pass is never reached for one).
+static void NoteEmptyScissorSkip() {
+	PassCensus::Drop('d', 0, "skipped: empty screen scissor (KYTY_EMPTY_SCISSOR_SKIP)");
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -2622,6 +2659,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		                 !state.programs.vertex[0] ? "dropped: vertex program missing"
 		                 : tess_missing           ? "dropped: tessellation program missing"
 		                                          : "dropped: pixel program missing");
+		return false;
+	}
+	if (EmptyScissorSkipEnabled() && DrawHasEmptyScreenScissor(buffer, state)) {
+		NoteEmptyScissorSkip();
 		return false;
 	}
 	if (PassCensus::Enabled()) {

@@ -258,9 +258,12 @@ static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) 
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
 }
 
+// 1D textures are 2D images one texel high, so they share 2D surfaces at their address
+// (upstream e6cc1ce30; the shaders address them with a y of 0 / the row centre).
 static Prospero::ImageType TextureBaseType(Prospero::ImageType type) {
 	switch (type) {
-		case Prospero::ImageType::kColor1DArray: return Prospero::ImageType::kColor1D;
+		case Prospero::ImageType::kColor1D:
+		case Prospero::ImageType::kColor1DArray:
 		case Prospero::ImageType::kColor2DArray:
 		case Prospero::ImageType::kColor2DMsaa:
 		case Prospero::ImageType::kColor2DMsaaArray: return Prospero::ImageType::kColor2D;
@@ -468,9 +471,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
-// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state.
+// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state and the
+// mip-stats counter only counts sampling (upstream 8d2b53f7a, 259186917).
 static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
-	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
+	constexpr uint32_t field1_reserved_mask = 1u << 29u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
@@ -479,6 +483,7 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                     (uint32_t {descriptor.MipStatsCntEn()} << 25u) |
 	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
 	if ((descriptor.fields[1] & field1_reserved_mask) != 0 ||
 	    (descriptor.fields[2] & field2_reserved_mask) != 0 || descriptor.fields[3] != field3_expected) {
@@ -501,11 +506,14 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
-	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
-	if (metadata_control == 0) {
+	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
+	// settings (upstream c1d1003d8, 4fa10abbf, 2e152f699).
+	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
+	constexpr uint32_t pipe_aligned     = 1u << 19u;
+	if (!descriptor.MetaCompress()) {
 		return true;
 	}
-	constexpr uint32_t htile_control = 0x00280000u;
+	constexpr uint32_t htile_control = pipe_aligned | 1u << 21u;
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
 	return metadata_control == expected_control && metadata_addr != 0 &&
@@ -700,8 +708,9 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) &&
 	       supported_tile && descriptor.BaseLevel() <= descriptor.LastLevel() &&
-	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
-	       !descriptor.MsaaDepth();
+	       // A 4.8 fixed-point MIN_LOD at or below BASE_LEVEL clamps no level of the view.
+	       descriptor.MinLod() <= descriptor.BaseLevel() * 256u && supported_swizzle &&
+	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
 bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -811,13 +820,9 @@ TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResourc
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
 	switch (resource.dimension) {
-		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
-			desc.info.type      = Prospero::ImageType::kColor1D;
-			desc.view_info.type = vk::ImageViewType::e1D;
-			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D: break; // a 2D image (e6cc1ce30)
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
-			desc.info.type      = Prospero::ImageType::kColor1D;
-			desc.view_info.type = vk::ImageViewType::e1DArray;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			desc.info.type      = Prospero::ImageType::kColor3D;
@@ -1101,30 +1106,12 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
-		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
-			view.type       = vk::ImageViewType::e1D;
-			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers && ClampsBaseLayer(resource.dimension, image_layers)) {
-				view.base_layer = 0;
-			}
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
-			}
-			view.layer_count = 1;
-			break;
-		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
-			view.type       = vk::ImageViewType::e1DArray;
-			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
-			}
-			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
-			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
 			view.base_layer  = 0;
 			view.layer_count = 1;
 			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
 			view.type       = vk::ImageViewType::e2DArray;
@@ -1134,6 +1121,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			}
 			view.layer_count = ArrayViewLayers(resource, image_layers - view.base_layer);
 			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
@@ -1151,11 +1139,14 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
+// view_source: the T#'s chain when `description` is not it (a view rebased past MAX_MIP);
+// otherwise the view is `description` with `levels` levels.
 static bool ResolveTextureMipView(const TileSurfaceDescription& description, bool metadata,
-                                   uint32_t view_levels, uint32_t& levels, uint32_t& base_level) {
+                                   uint32_t view_levels, uint32_t& levels, uint32_t& base_level,
+                                   const TileSurfaceDescription* view_source = nullptr) {
 	TileSurfaceLayout physical {};
 	TileSurfaceLayout view {};
-	auto              view_description = description;
+	auto              view_description = view_source != nullptr ? *view_source : description;
 	view_description.levels            = levels;
 	if (!TileGetTiledTextureLayout(description, physical) ||
 	    !TileGetTiledTextureLayout(view_description, view)) {
@@ -1181,9 +1172,12 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 			const auto target = base + i;
 			if (physical.mips[target] != view.mips[source] ||
 			    (target >= physical.first_tail_level) != (source >= view.first_tail_level) ||
-			    std::max(description.width >> target, 1u) != std::max(description.width >> source, 1u) ||
-			    std::max(description.height >> target, 1u) != std::max(description.height >> source, 1u) ||
-			    std::max(description.depth >> target, 1u) != std::max(description.depth >> source, 1u)) {
+			    std::max(description.width >> target, 1u) !=
+			        std::max(view_description.width >> source, 1u) ||
+			    std::max(description.height >> target, 1u) !=
+			        std::max(view_description.height >> source, 1u) ||
+			    std::max(description.depth >> target, 1u) !=
+			        std::max(view_description.depth >> source, 1u)) {
 				matches = false;
 				break;
 			}
@@ -1205,19 +1199,31 @@ static TextureCache::ImageDesc SkipTextureDescriptor(const ShaderRecompiler::IR:
                                                      const ShaderTextureResource& descriptor,
                                                      const char* why, std::atomic_bool& logged);
 
+// KYTY_TEXTURE_REBASE_PAST_MAX_MIP (default on; =0 off; upstream bd41e2f6c for another title): a
+// tiled view whose BASE_LEVEL lies past MAX_MIP addresses its own chain starting at its base mip
+// (the base address holds that mip's surface). Off: such views go through
+// KYTY_TEXTURE_CLAMP_LAST_LEVEL or are skipped as before.
+static bool TextureRebasePastMaxMip() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TEXTURE_REBASE_PAST_MAX_MIP");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static TextureCache::ImageDesc BuildTextureDescription(
     const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
 	const bool skip    = Common::SkipInvalidEnabled();
 	const auto address         = descriptor.Base40();
-	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	auto       width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+	auto       height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto base_level      = descriptor.BaseLevel();
 	const auto last_level      = descriptor.LastLevel();
 	const auto type            = TextureType(descriptor);
 	const bool multisampled    = IsMultisampledTexture(type);
 	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
-	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
+	auto       physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
@@ -1280,14 +1286,40 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
-	const auto    image_layers = layered ? depth : 1u;
+	auto          image_layers = layered ? depth : 1u;
+	// A cube holds six faces even when DEPTH, its last face slice, ends before them (upstream
+	// cdd44764d).
+	if (descriptor.Type() == Prospero::ImageType::kCube) {
+		image_layers = std::max(image_layers, 6u);
+	}
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
 		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
-		const bool resolved = ResolveTextureMipView(
-		    physical, !resource.r128 && descriptor.MetaCompress(), view_levels, levels, view_base);
+		const bool metadata = !resource.r128 && descriptor.MetaCompress();
+		bool       resolved = false;
+		if (base_level >= physical_levels && tile != Prospero::TileMode::kLinear && !volume &&
+		    TextureRebasePastMaxMip()) {
+			auto rebased   = physical;
+			rebased.width  = std::max(width >> base_level, 1u);
+			rebased.height = std::max(height >> base_level, 1u);
+			rebased.levels = view_levels;
+			auto rebased_levels = levels;
+			auto rebased_base   = static_cast<uint32_t>(base_level);
+			if (ResolveTextureMipView(rebased, metadata, view_levels, rebased_levels, rebased_base,
+			                          &physical)) {
+				width           = rebased.width;
+				height          = rebased.height;
+				physical_levels = rebased.levels;
+				levels          = rebased_levels;
+				view_base       = rebased_base;
+				resolved        = true;
+			}
+		}
+		if (!resolved) {
+			resolved = ResolveTextureMipView(physical, metadata, view_levels, levels, view_base);
+		}
 		if (!resolved && TextureClampLastLevel()) {
 			// KYTY_TEXTURE_CLAMP_LAST_LEVEL (Erlou93/KytyPS5-Yotei FIX_TEXTURE_CLAMP_LAST_LEVEL, logged
 			// APPROXIMATION there): a view whose LAST_LEVEL exceeds the allocated MAX_MIP (partially
@@ -1407,7 +1439,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	                                     ? vk::Format::eR16Uint
 	                                 : small_sint_view && format == Prospero::BufferFormat::k8SInt
 	                                     ? vk::Format::eR8Uint
-	                                     : SrgbStorageViewFormat(pixel_format);
+	                                     : SrgbUnormViewFormat(pixel_format);
 	auto view_format = storage && storage_view_format != vk::Format::eUndefined ? storage_view_format
 	                                                                            : pixel_format;
 	// KYTY_SRGB8_VIEW: a sampled 8 sRGB texture reads its R8_UNORM image (MUTABLE_FORMAT) through an
@@ -1878,6 +1910,10 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 			binding.image_id = texture_cache.FindImage(desc);
 			return;
 		}
+		// Upstream e914ec6db reads an sRGB texture through a UNorm view when its sampler skips
+		// degamma (ImageResource::skip_degamma). Not taken: the flag would have to live in
+		// ResourceSpecialization::Image, whose encoding the stored pipeline journals use (group A,
+		// upsync8 CROSS).
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 		// KYTY_SUB_EXTENT_COPY=1 (usa-ratt/KytyPS5-GT7 429692dd3, Franseven): a texture smaller

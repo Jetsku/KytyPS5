@@ -42,6 +42,8 @@ constexpr int32_t VIDEODEC2_ERROR_ACCESS_UNIT          = -2128805119; // 0x811d0
 constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0302
 
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
@@ -114,6 +116,7 @@ struct Videodec2FrameBuffer {
 };
 
 using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
+using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
 
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
@@ -303,23 +306,23 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
-// One output picture as the decoder writes it: NV12, rows padded to a 256-byte pitch
-// (videoDec2Decoder.cpp), rounded up to 64 KiB. Games size their frame pools from this value:
-// Ghost of Yotei skipped every movie with the old fixed 16 MiB (based on Erlou93/KytyPS5-Yotei).
-// KYTY_VIDEODEC2_FRAME_SIZE=1 (default off, PPSA26344 preset): report this size instead of the
-// fixed 16 MiB.
+// One output picture as the decoder writes it (NV12, 256-byte pitch), rounded up to 64 KiB. Games
+// size their frame pools from this value: Ghost of Yotei skipped every movie with the old fixed
+// 16 MiB (based on Erlou93/KytyPS5-Yotei). KYTY_VIDEODEC2_FRAME_SIZE=1 (default off, PPSA26344
+// preset): report this size instead of the fixed 16 MiB. Upstream 6832e5b7b reports it by default
+// for AVC, with the height rounded up to 16 lines (1080 -> 1088 decoded lines) and 4096 bytes of
+// metadata; both are taken here (ours had neither). Upstream's default-on is an A/B candidate.
 static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo* config) {
 	static const bool exact = [] {
 		const char* value = std::getenv("KYTY_VIDEODEC2_FRAME_SIZE");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (!exact) {
+	if (!exact || config->max_frame_width <= 0 || config->max_frame_height <= 0) {
 		return VIDEODEC2_MIN_MEMORY_SIZE;
 	}
-	const auto width  = static_cast<uint64_t>(std::max(config->max_frame_width, 1));
-	const auto height = static_cast<uint64_t>(std::max(config->max_frame_height, 1));
-	const auto pitch  = (width + 255u) & ~uint64_t {255};
-	const auto bytes  = pitch * height + pitch * ((height + 1u) / 2u);
+	const auto pitch  = (static_cast<uint64_t>(config->max_frame_width) + 255u) & ~uint64_t {255};
+	const auto height = (static_cast<uint64_t>(config->max_frame_height) + 15u) & ~uint64_t {15};
+	const auto bytes  = pitch * height * 3 / 2 + 4096;
 	return static_cast<size_t>((bytes + 0xffffu) & ~uint64_t {0xffff});
 }
 
@@ -554,7 +557,7 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		return OK;
 	};
 
-	if (output_info->codec_type == 1) {
+	if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_AVC) {
 		const auto requested_size = *static_cast<const size_t*>(first_picture_info);
 		if (requested_size != sizeof(Videodec2AvcPictureInfo) &&
 		    (requested_size | 16u) != sizeof(Videodec2AvcPictureInfo)) {
@@ -563,6 +566,12 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 
 		const auto picture = Decoder::MakeAvcPictureInfo(decoded, requested_size);
 		std::memcpy(first_picture_info, &picture, requested_size);
+	} else if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
+		auto* picture = static_cast<Videodec2Vp9PictureInfo*>(first_picture_info);
+		if (picture->this_size != sizeof(Videodec2Vp9PictureInfo)) {
+			return VIDEODEC2_ERROR_STRUCT_SIZE;
+		}
+		*picture = Decoder::MakeVp9PictureInfo(decoded);
 	} else {
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {

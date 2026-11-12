@@ -72,13 +72,17 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 }
 
 void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
-                                         bool is64) {
-	const auto type      = is64 ? IR::Type::F64 : IR::Type::F32;
-	const auto is_nan_op = is64 ? IR::ValueOpcode::FPIsNan64 : IR::ValueOpcode::FPIsNan32;
-	const auto lhs       = ReadOperand(inst.src0, type);
-	const auto rhs       = ReadOperand(inst.src1, type);
-	const auto unordered = ir.LogicalOr(IR::U1(ir.Emit(is_nan_op, {lhs})),
-	                                    IR::U1(ir.Emit(is_nan_op, {rhs})));
+                                         IR::Type type) {
+	// V_CMP_U_F16 (b1f154a21): F16 operands are widened to F32 for the NaN test.
+	const auto is_nan_op =
+	    type == IR::Type::F64 ? IR::ValueOpcode::FPIsNan64 : IR::ValueOpcode::FPIsNan32;
+	const auto is_nan = [&](const Decoder::Operand& operand) {
+		const auto value =
+		    type == IR::Type::F16 ? IR::Value(ReadF16AsF32(operand)) : ReadOperand(operand, type);
+		return IR::U1(ir.Emit(is_nan_op, {value}));
+	};
+	const auto lhs       = is_nan(inst.src0);
+	const auto unordered = ir.LogicalOr(lhs, is_nan(inst.src1));
 	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, cmpx);
 }
 

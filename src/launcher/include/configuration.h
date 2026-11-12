@@ -127,6 +127,9 @@ public:
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
+	enum class PssrUpscaler { Linear, DLSS };
+	Q_ENUM(PssrUpscaler)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -141,6 +144,7 @@ public:
 	QString     addons_dir;  /* Global setting; not saved per game. */
 	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
 	bool        custom_settings = false;
+	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
 	GameStatus  game_status     = GameStatus::Unknown;
 	QString     game_comment;
 
@@ -168,13 +172,16 @@ public:
 	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
+	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
+	int                    flush_draws                 = 0;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	// Occlusion mode, saved per game (key gpu_occlusion_accurate): false = the bundled preset's
 	// (performance: always visible), true = accurate GPU occlusion queries (--gpu-occlusion on).
 	// A game config saved before it was per game inherits the global value when read.
 	bool                   gpu_occlusion_accurate      = false;
+	bool                   relaxed_shader_float        = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
@@ -196,7 +203,10 @@ public:
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   pro_enabled                 = false;
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	QString                dlss_folder;
 	QString                amd_cpu_mode                = QStringLiteral("auto"); // or "on", "off"
+	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -218,10 +228,13 @@ public:
 		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		readback_tiled_images       = other.readback_tiled_images;
+		readback_storage_images     = other.readback_storage_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
+		flush_draws                 = other.flush_draws;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		gpu_occlusion_accurate      = other.gpu_occlusion_accurate;
+		relaxed_shader_float        = other.relaxed_shader_float;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
@@ -243,7 +256,10 @@ public:
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		pro_enabled                 = other.pro_enabled;
+		pssr_upscaler               = other.pssr_upscaler;
+		dlss_folder                 = other.dlss_folder;
 		amd_cpu_mode                = other.amd_cpu_mode;
+		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -258,6 +274,7 @@ public:
 		basedir         = other.basedir;
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
+		pro_supported   = other.pro_supported;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}

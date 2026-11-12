@@ -8,6 +8,7 @@
 #include "libs/libs.h"
 
 #include <atomic>
+#include <thread>
 
 namespace Libs::Audio {
 
@@ -161,8 +162,7 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 	EXIT_NOT_IMPLEMENTED(result != OK);
 
 	g_ports[port].playback_finished = false;
-	Common::Thread playback_thread(playback_simulate, &g_ports[port]);
-	playback_thread.Detach();
+	std::thread(playback_simulate, &g_ports[port]).detach();
 
 	*id = port;
 

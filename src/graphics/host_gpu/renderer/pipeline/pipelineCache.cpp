@@ -139,7 +139,7 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
-	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
+	// PA_SU_SC_MODE_CNTL.POLY_MODE disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
 		return vk::PolygonMode::eFill;
 	}
@@ -4308,7 +4308,11 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
 				options.user_data_base = 0;
-				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+			}
+			// A hull stage compiles with its wave size (64 unless KYTY_TESS_WAVE32 accepts wave32
+			// stages, shader.cpp; upstream 27f290e95).
+			if (stage == ShaderType::Mesh) {
+				options.wave_size = input_info.mesh.wave_size;
 			}
 		} else {
 			options.wave_size = input_info.wave_size;
@@ -10010,16 +10014,6 @@ ShaderProgram PipelineCache::PlainPixelProgram(const StagePrep& prep) {
 	return prep.permutation != nullptr ? prep.permutation->plain : ShaderProgram {};
 }
 
-// Pipeline: temporary acceptance of EXEC_ON_NOOP with the depth test enabled (first 16 draws).
-static void NoteExecOnNoop(const RenderDepthInfo& depth, const ShaderPixelInputInfo* ps_input_info) {
-	if (ps_input_info != nullptr && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
-		}
-	}
-}
-
 // KYTY_LAYER_CLAMP: the least layer count of the bound attachments (0 without any).
 static uint32_t BoundLayerCount(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
                                 bool with_depth) {
@@ -10429,7 +10423,6 @@ PipelineCache::PlanLookup PipelineCache::FindGraphicsPipelineForPlan(
 
 void PipelineCache::NotePlannedPipeline(const RenderDepthInfo&      depth,
                                         const ShaderPixelInputInfo* ps_input_info) {
-	NoteExecOnNoop(depth, ps_input_info);
 	FlushCompileStall();
 }
 
@@ -10573,7 +10566,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	(void)BuildGraphicsPipelineKey(targets, command.GetRegisters(), command.GetUserConfig(),
 	                               vs_input_info, ps_input_info, topology, primitive_restart_enable,
 	                               programs, true, key);
-	NoteExecOnNoop(depth, ps_input_info);
 
 	// Last-key memo (KYTY_PIPELINE_MEMO): most draws use their predecessor's pipeline. Exact:
 	// the comparison is the map's own key equality, and pipeline objects are never destroyed

@@ -255,20 +255,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const auto shaders =
 		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
-		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
-			     static_cast<void*>(tess_control_shader_module));
-		}
-
-		tess_eval_shader_module = CompileSPV(shaders.evaluation, graphics.device);
-		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done module=%p\n",
-			     static_cast<void*>(tess_eval_shader_module));
-		}
+		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}
-
-	EXIT_NOT_IMPLEMENTED(
-	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
@@ -550,11 +538,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 	}
 	AssignPipelineLayout(graphics, pipeline, descriptor_bindings, graphics_stages);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: pipeline layout VS=%" PRIu64 " PS=%" PRIu64 " layout=%p push=%d\n",
-		     vertex_program.id, ps_active ? pixel_program.id : 0,
-		     static_cast<void*>(pipeline.pipeline_layout), pipeline.uses_push_descriptors ? 1 : 0);
-	}
 	vk::Result result = vk::Result::eSuccess;
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
@@ -663,17 +646,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.layout                  = pipeline.pipeline_layout;
 	pipeline_info.basePipelineIndex       = -1;
 
-	EXIT_IF(pipeline.pipeline != nullptr);
-
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
-		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
-		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
-		     vertex_program.id, ps_active ? pixel_program.id : 0,
-		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
-		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
-		     dynamic_state.dynamicStateCount);
-	}
 	const auto driver_begin = std::chrono::steady_clock::now();
 	if (create_hook != nullptr) {
 		// The pipeline-library path shares libraries only between identically defined layouts.
@@ -721,10 +693,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                                 std::chrono::steady_clock::now() - driver_begin)
 	                                                 .count()));
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
-	}
 	const auto destroy_tess_modules = [&] {
 		if (tess_control_shader_module != nullptr) {
 			graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -795,8 +763,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline.uses_bindless = UsesBindless(*input_info.stage.program);
 	AssignPipelineLayout(graphics, pipeline, descriptor_bindings,
 	                     vk::ShaderStageFlagBits::eCompute);
-	LOGF("PipelineTrace: pipeline layout CS layout=%p push=%d\n",
-	     static_cast<void*>(pipeline.pipeline_layout), pipeline.uses_push_descriptors ? 1 : 0);
 	vk::Result result = vk::Result::eSuccess;
 
 	vk::ComputePipelineCreateInfo info {};
@@ -809,18 +775,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
 
-	EXIT_IF(pipeline.pipeline != nullptr);
-
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
 	if (create_hook != nullptr) {
 		result = (*create_hook)(info, &pipeline.pipeline);
 	} else {
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 		                                                &pipeline.pipeline);
 	}
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	if (result_out != nullptr) {
 		// The caller can live without this pipeline (an optional ray-tracing kernel): report the
 		// failure instead of stopping the emulator, and give back what was created for it.

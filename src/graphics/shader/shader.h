@@ -41,6 +41,8 @@ enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
+	// Unused by our stages, kept so the values stored in shader journals and pipeline lists keep
+	// their meaning (upstream 45b35fafb dropped it).
 	Fetch,
 	Compute,
 	Mesh,

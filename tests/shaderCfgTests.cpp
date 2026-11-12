@@ -1174,39 +1174,6 @@ void TestDeclaredShaderHashMarker() {
         "a signed block with an unknown code size keeps its declared hash");
 }
 
-void TestResourceDescriptorClassification() {
-  uint32_t raw_texture[8] = {};
-  raw_texture[3] = 9u << 28u;
-  raw_texture[5] = 2u << 27u;
-  Check(ShaderClassifyResourceDescriptor(raw_texture) ==
-            ResourceDescriptorType::Texture,
-        "raw texture descriptor must not be classified by ResourceDescriptor "
-        "byte 23 fields");
-
-  uint32_t tagged_buffer[8] = {};
-  tagged_buffer[5] = 1u << 27u;
-  Check(ShaderClassifyResourceDescriptor(tagged_buffer) ==
-            ResourceDescriptorType::Buffer,
-        "tagged ResourceDescriptor buffer was not recognized");
-
-  uint32_t tagged_sampler[8] = {};
-  tagged_sampler[5] = 2u << 27u;
-  Check(ShaderClassifyResourceDescriptor(tagged_sampler) ==
-            ResourceDescriptorType::Sampler,
-        "tagged ResourceDescriptor sampler was not recognized");
-
-  uint32_t tagged_unused[8] = {};
-  tagged_unused[5] = 3u << 27u;
-  Check(ShaderClassifyResourceDescriptor(tagged_unused) ==
-            ResourceDescriptorType::Unused,
-        "tagged ResourceDescriptor unused slot was not recognized");
-
-  uint32_t raw_buffer[8] = {};
-  Check(ShaderClassifyResourceDescriptor(raw_buffer) ==
-            ResourceDescriptorType::Buffer,
-        "raw buffer descriptor fallback was not preserved");
-}
-
 constexpr uint32_t EncodeSMovB32(uint32_t dst, uint32_t src) {
   return 0x80000000u | (0x7du << 23u) | ((dst & 0x7fu) << 16u) | (0x03u << 8u) |
          (src & 0xffu);
@@ -2133,6 +2100,17 @@ void TestDisabledDebugBranches() {
           "disabled debug branch lost its identity or fallthrough write");
     CheckSpirvBinaryValidates(result.spirv);
   }
+}
+
+void TestOrderedPsDoneEndsProgram() {
+  using namespace ShaderRecompiler;
+  // Pixel shaders that end in s_endpgm_ordered_ps_done, padded to 16 bytes (upstream f3c22dcb7).
+  const std::array shader = {EncodeSopp(0x1e), 0u, 0u, 0u};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 1u &&
+            decoded.instructions.front().opcode == Decoder::Opcode::S_ENDPGM,
+        "s_endpgm_ordered_ps_done did not end the program");
 }
 
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
@@ -10723,7 +10701,7 @@ void TestGraphicsComputeGetreg() {
       IR::Program program;
       program.wave_size = wave;
       IR::Block block;
-      Frontend::Translator translator(program, &block, 1, false, true);
+      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false, true);
       translator.TranslateInstruction(decoded);
       bool wrote_vcc = false;
       for (const auto& inst : block) {
@@ -10784,6 +10762,30 @@ void TestNewShaderRecompilerSetpcBranch() {
   Check((result.ir_dump.find("successors=[") != std::string::npos),
         "S_SETPC_B64 did not participate in CFG");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+// Upstream 346e9a3c6: s_getpc_b64; s_add_u32; s_addc_u32 through VCC, then a jump.
+void TestNewShaderRecompilerSetpcLongBranch() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 106, 0),              // s_getpc_b64 vcc
+      EncodeSop2(0x00, 106, 106, 255), 0x14u, // s_add_u32 vcc_lo, vcc_lo, 0x14
+      EncodeSop2(0x04, 107, 107, 128),       // s_addc_u32 vcc_hi, vcc_hi, 0
+      EncodeSop1(0x21, 125, 106),            // s_swappc_b64 null, vcc
+      EncodeSMovB32(0, 129),                 // skipped
+      0xbf810000u,                           // s_endpgm at 0x18
+  };
+
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  const auto graph = CFG::BuildGraph(decoded);
+  const auto* jump = graph.FindBlockByPc(0u);
+  const auto* target = graph.FindBlockByPc(0x18u);
+  Check(jump != nullptr && target != nullptr &&
+            jump->terminator.kind == CFG::TerminatorKind::Branch &&
+            jump->terminator.true_block == target->id,
+        "S_GETPC/S_ADD/S_ADDC long jump through VCC missed its target");
+  CheckSpirvBinaryValidates(RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute)).spirv);
 }
 
 void TestFusedShaderHandoffPreservesRegisters() {
@@ -11428,10 +11430,10 @@ void TestEmbeddedVertexFormatSwizzle() {
        {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000},
        Prospero::VertexAttribFormat::k32_32_32_32Float},
   };
-  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
-  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1> offsets;
+  offsets.fill(ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 2;
   ShaderUserData user_data{};
   user_data.direct_resource_offset = offsets.data();
   user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
@@ -15289,7 +15291,7 @@ void TestComputeLdsAllocationIdentity() {
   ShaderComputeInputInfo scratch_info{};
   const auto scratch_params = PrepareProgram(regs, sh, scratch_info);
   Check(scratch_info.scratch_size_dwords == 7,
-        "AGC per-thread scratch size was not propagated");
+        "per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
   scratch_options.shader_hash = scratch_params.hash;
   scratch_options.user_data = std::span(scratch_params.user_data).first(scratch_params.user_data_count);
@@ -15299,7 +15301,7 @@ void TestComputeLdsAllocationIdentity() {
   auto scratch_result =
       RecompileForTest(scratch_params.code, scratch_options);
   Check(scratch_result.program.scratch_dwords == 7,
-        "AGC per-thread scratch size did not reach the compiler program");
+        "per-thread scratch size did not reach the compiler program");
   Check(MakeStageStaticKey(scratch_info) != MakeStageStaticKey(lds_896),
         "compute pipeline identity omitted the scratch allocation");
 
@@ -16566,7 +16568,6 @@ int main(int argc, char **argv) {
   TestRayTracingSharedFunction();
   TestTraversalLoopBreakRegion();
   TestDeclaredShaderHashMarker();
-  TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
@@ -16690,10 +16691,12 @@ int main(int argc, char **argv) {
   TestCapturedBufferAtomicsX2();
   TestWaveRowReduction();
   TestDisabledDebugBranches();
+  TestOrderedPsDoneEndsProgram();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerImageQueryTranslation();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestNewShaderRecompilerSetpcLongBranch();
   TestGraphicsComputeGetreg();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();

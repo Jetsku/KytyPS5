@@ -477,6 +477,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_U_F16,
 	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
@@ -572,6 +573,7 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
 	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
 	BUFFER_LOAD_FORMAT_D16_XY,
 	BUFFER_LOAD_FORMAT_D16_XYZ,
 	BUFFER_LOAD_FORMAT_D16_XYZW,
@@ -586,7 +588,10 @@ enum class Opcode {
 	BUFFER_STORE_FORMAT_D16_XYZW,
 	BUFFER_LOAD_UBYTE,
 	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
 	BUFFER_LOAD_SBYTE,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
 	BUFFER_LOAD_SHORT_D16,
@@ -952,6 +957,7 @@ struct Instruction {
 	// status dword in the VGPR right after the data dwords.
 	bool           tfe                                          = false;
 	bool           lwe                                          = false;
+	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
 	// The pc the instruction had in the decoded guest code when a rewrite moved it (the native
 	// ray tracing patch); S_GETPC_B64 returns the address after it. UINT32_MAX: not moved.

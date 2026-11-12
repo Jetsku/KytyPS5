@@ -173,8 +173,10 @@ public:
 	void DrawIndexAuto(DrawAutoArgs args);
 	// GET_LOD_STATS: the packet's 4 body dwords (the report, or its KYTY_LOD_STATS_MODE fallback).
 	void GetLodStats(const uint32_t* body);
+	// `records` > 1: a KYTY_INDIRECT_RUNS run, that many packets drawing consecutive records from
+	// data_offset (one op, one draw-prep slot, one host multi-draw where the native path takes it).
 	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-	                  uint32_t draw_initiator, bool indexed);
+	                  uint32_t draw_initiator, bool indexed, uint32_t records = 1);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed,

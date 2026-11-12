@@ -543,7 +543,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
 	m_image_page_counts = std::make_unique<std::atomic<uint32_t>[]>(
 	    size_t {1} << (ImagePageTable::kAddressSpaceBits - ImagePageTable::kPageBits));
 	m_fault_fast_path = EnvNotZero("KYTY_TEXTURE_FAULT_FAST_PATH");
@@ -1403,8 +1404,10 @@ void TextureCache::DeleteImage(ImageId id) {
 		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
 		if (metadata != m_surface_metas.end() &&
 		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
-			// A later binding may have reused this address for another metadata type.
+		    metadata->second.type == MetaDataInfo::Type::HTile && metadata->second.owner == id) {
+			// A later binding may have reused this address for another metadata type, and only
+			// the last image to acquire an HTile range releases its clear state (upstream
+			// 2d84e36b4): a superseded image freed later keeps its successor's clear state.
 			m_surface_metas.erase(metadata);
 			NoteSurfaceMetaChange();
 		}
@@ -4578,17 +4581,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
-	// PPSA04264
-	const bool raw_d16_texture =
-	    binding == BindingType::Texture && cached.info.IsDepth() &&
-	    cached.info.guest_format == Prospero::BufferFormat::k16UNorm &&
-	    requested.guest_format == Prospero::BufferFormat::k16UInt &&
-	    requested.pixel_format == vk::Format::eR16Uint && cached.backing.samples == 1 &&
-	    requested.samples == 1 && requested.data == cached.info.data &&
-	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
-	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.tile_mode == cached.info.tile_mode && !requested.HasStencil() &&
-	    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.
@@ -4612,6 +4604,15 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	// Depth bytes sampled through a color format no depth view provides (16_UINT, 8_8_UNORM)
+	// need a color copy of the whole single-sample depth layout (upstream 0543c3d22, which
+	// generalizes the former 16_UNORM -> 16_UINT case).
+	const bool raw_depth_texture =
+	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasStencil() &&
+	    !requested.HasMetadata() && cached.backing.samples == 1 && requested.samples == 1 &&
+	    requested.pitch == cached.info.pitch &&
+	    (requested.resources == cached.info.resources || retain_cached_layout) &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
 	// KYTY_IMAGE_CONTAINS=1 (Erlou93/KytyPS5-Yotei): capacity = levels AND layers, not the
 	// lexicographic compare (which reused 7 levels x 9 layers for a 1 level x 12 layers request).
 	const bool too_small = ImageContainsEnabled() ? !cached.info.resources.Contains(requested.resources)
@@ -4620,7 +4621,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
-			recreate |= raw_d16_texture;
+			recreate |= raw_depth_texture;
 			// Astro Bot (PPSA21567) samples the D32 memory of its 3328x1872 depth target as
 			// R16G16_SFLOAT: a colour alias is filled from the depth image.
 			recreate |= !requested.HasStencil() && !cached.info.HasStencil() &&
@@ -7347,6 +7348,16 @@ void TextureCache::RefreshImage(ImageId id, RefreshIntent intent) {
 	InitializeImage(id, intent);
 }
 
+ImageId TextureCache::FindStencilPlane(const Image& depth, GuestRange range) const {
+	for (const auto id: depth.stencil_ids) {
+		const auto* stencil = m_slot_images.try_get(id);
+		if (stencil != nullptr && stencil->info.data == range) {
+			return id;
+		}
+	}
+	return {};
+}
+
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
@@ -7367,6 +7378,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		const char* value = std::getenv("KYTY_STENCIL_TARGETS_APART");
 		return value != nullptr && value[0] == '1';
 	}();
+	// Not upstream 84419aef7's own-record-first order: an existing image at the stencil address
+	// (e.g. one a shader sampled as the stencil plane) becomes the association, as before
+	// (RenderExecutorStencilBindingDiscovery "existing stencil association selection").
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
@@ -7490,10 +7504,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	if (record != nullptr) {
 		*record = {};
 	}
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid()) {
-		EXIT("TextureCache: image lookup requires a valid command buffer\n");
-	}
+	// Draw preparation guarantees a valid command buffer (upstream e827c92a2 dropped the check).
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
 		std::scoped_lock lock {m_lock};
@@ -8051,6 +8062,14 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		EnsureResidency(id, RequestedFirstLevel(desc, image.info.resources.levels),
 		                desc.type == BindingType::Texture);
 	}
+	// Storage readback (upstream 9678c59b7) also queues the first GPU write since the CPU last
+	// wrote the image: an image rewritten every frame would otherwise be downloaded at every GL2
+	// writeback. GPU data in the buffer cache over the whole image is not a CPU write. Read before
+	// the image is marked GPU-written and before RefreshImage uploads the CPU write.
+	const bool first_write =
+	    m_readback_storage_images && desc.type == BindingType::Storage && !image.info.data.Empty() &&
+	    (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
+	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
 	if (desc.type == BindingType::Storage) {
 		m_bind_mark = true;
 		MarkImageGpuModified(image);
@@ -8063,14 +8082,8 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		if (image.info.HasStencil() &&
 		    desc.info.data.address >= image.info.stencil.address &&
 		    desc.info.data.End() <= image.info.stencil.End()) {
-			for (const auto stencil_id:
-			     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
-				const auto* stencil = m_slot_images.try_get(stencil_id);
-				if (stencil != nullptr && stencil->depth_id == id &&
-				    stencil->info.data == image.info.stencil) {
-					RefreshImage(stencil_id);
-					break;
-				}
+			if (const auto stencil_id = FindStencilPlane(image, image.info.stencil)) {
+				RefreshImage(stencil_id); // upstream 84419aef7
 			}
 		}
 	}
@@ -8084,6 +8097,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				}
 			}
 			TrackImageDownload(id, image);
+			if (first_write) {
+				m_download_images.insert(id);
+			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -8186,6 +8202,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			}
 		}
 		metadata->second.size = std::max(metadata->second.size, desc.info.metadata.range.size);
+		metadata->second.owner = id;
 		// The only insertion into m_surface_metas (EraseSurfaceMeta). Every draw with this target
 		// asks again; only an added entry is a change (KYTY_META_CLEAR_MEMO's generation).
 		m_surface_meta_inserts += inserted ? 1u : 0u;
@@ -10168,11 +10185,44 @@ bool TextureCache::DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic_b
 	// KYTY_IMAGE_WRITEBACK_GUARD: the range's pages stay watched until the write-back (see
 	// PendingWriteback).
 	const auto pending = m_writeback_guard ? BeginPendingWriteback(range) : nullptr;
+	// Storage readback (upstream 9678c59b7): guest accesses to the pages, reads too, wait until
+	// the stored data lands (RenderContext::WaitWriteBacks, WriteBackTick).
+	const StorageWriteBack storage_write_back {range, m_scheduler.CurrentTick()};
+	const bool             trapped = m_readback_storage_images;
+	if (trapped) {
+		{
+			std::scoped_lock write_back_lock {m_storage_write_back_mutex};
+			m_storage_write_backs.push_back(storage_write_back);
+		}
+		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
+	}
+	const auto release_trap = [this, storage_write_back, trapped] {
+		if (!trapped) {
+			return;
+		}
+		m_page_manager.UpdatePageWatchers<false, true>(storage_write_back.range.address,
+		                                               storage_write_back.range.size);
+		// Matched by value, not erased from the front: our oversized-download path defers its own
+		// operation (upstream f47da249b relies on queue order and drops the defaulted ==, which
+		// broke the MSVC STL 14.51 build).
+		std::scoped_lock write_back_lock {m_storage_write_back_mutex};
+		const auto found = std::find_if(
+		    m_storage_write_backs.begin(), m_storage_write_backs.end(), [&](const StorageWriteBack& entry) {
+			    return entry.tick == storage_write_back.tick &&
+			           entry.range.address == storage_write_back.range.address &&
+			           entry.range.size == storage_write_back.range.size;
+		    });
+		if (found != m_storage_write_backs.end()) {
+			m_storage_write_backs.erase(found);
+		}
+	};
 	if (oversized != nullptr) {
 		m_scheduler.DeferPriorityOperation(
-		    [this, owner = std::move(oversized), range, mapped, publication, pending, done]() mutable {
+		    [this, owner = std::move(oversized), range, mapped, publication, pending, done,
+		     release_trap]() mutable {
 			    owner->Invalidate(0, range.size);
 			    WriteBackImageBytes(range, mapped, pending);
+			    release_trap();
 			    m_buffer_cache.EndBackingPublication(publication);
 			    owner.reset();
 			    if (done != nullptr) {
@@ -10181,9 +10231,11 @@ bool TextureCache::DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic_b
 		    });
 		return true;
 	}
-	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication, pending, done] {
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication, pending, done,
+	                                    release_trap] {
 		download.Invalidate(offset, range.size);
 		WriteBackImageBytes(range, mapped, pending);
+		release_trap();
 		m_buffer_cache.EndBackingPublication(publication);
 		if (done != nullptr) {
 			done->store(true, std::memory_order_release);
@@ -11612,8 +11664,11 @@ void TextureCache::RunGarbageCollector() {
 			if (!owner->IsGpuModified()) {
 				return false;
 			}
+			// Under pressure a GPU-written image is downloaded and freed, tiled or not (upstream
+			// 16a7bbe3c). Unlike upstream, depth/stencil images are not kept: ours retires them with a
+			// deferred download (UnifiedTextureCacheFlow "depth/stencil deferred pressure retirement").
 			const bool safe = SafeToDownload(*owner);
-			return safe && (owner->info.IsTiled() || !pressured);
+			return safe && !pressured;
 		};
 		size_t passed = 0;
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -11629,23 +11684,15 @@ void TextureCache::RunGarbageCollector() {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id || KeepSmallRenderTarget(*owner)) {
 				continue;
 			}
-			if (owner->IsGpuModified()) {
-				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && !pressured) {
-					continue;
-				}
-				if (safe && !DownloadImageMemory(id)) {
-					continue;
-				}
+			if (owner->IsGpuModified() && SafeToDownload(*owner) &&
+			    (!pressured || !DownloadImageMemory(id))) {
+				continue; // upstream 16a7bbe3c: tiled GPU-written images are no longer skipped
 			}
+			--deletions; // only images actually freed spend the budget (16a7bbe3c)
 			FreeImage(id, HangTrace::ImageFreeReason::GarbageCollect);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
@@ -11994,6 +12041,41 @@ void TextureCache::ProcessDownloadImages() {
 		            m_frame.load(std::memory_order_relaxed), done, refused, skipped);
 	}
 	m_download_images.clear();
+}
+
+uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
+	if (!m_readback_storage_images) {
+		return 0;
+	}
+	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	uint64_t   tick  = 0;
+
+	std::scoped_lock write_back_lock {m_storage_write_back_mutex};
+	for (const auto& write_back: m_storage_write_backs) {
+		if (write_back.range.address < end && begin < write_back.range.End()) {
+			tick = std::max(tick, write_back.tick);
+		}
+	}
+	return tick;
+}
+
+bool TextureCache::WriteBackImages() {
+	return m_readback_storage_images && DownloadQueuedImages();
+}
+
+// Storage readback at a GL2 writeback (upstream 9678c59b7): the queued GPU-written images.
+bool TextureCache::DownloadQueuedImages() {
+	std::scoped_lock lock {m_lock};
+	bool             downloaded = false;
+	for (const auto id: m_download_images) {
+		const auto* owner = m_slot_images.try_get(id);
+		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
+			downloaded |= DownloadImageMemory(id);
+		}
+	}
+	m_download_images.clear();
+	return downloaded;
 }
 
 } // namespace Libs::Graphics

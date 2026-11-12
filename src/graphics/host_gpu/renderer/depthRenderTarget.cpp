@@ -303,13 +303,29 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 
 // ResolveRenderDepthTarget's decision whether depth or stencil is used at all, and whether the
 // registers describe an unbound attachment (then the draw has no depth target either).
+// KYTY_DEPTH_COMPRESS_DISABLE_BIND=1 (default off; upstream b64e430b9 for another title): an HTile
+// depth target whose pass sets DB_RENDER_CONTROL.DEPTH_COMPRESS_DISABLE is bound even with the
+// depth and stencil tests off, so its pending HTile clear is materialised.
+static bool DepthCompressDisableBind() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DEPTH_COMPRESS_DISABLE_BIND");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 static bool DepthTargetActive(const HW::Context& hw) {
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
 	const auto& dc          = hw.GetDepthControl();
 	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
-	const bool depth_active = dc.z_enable || dc.depth_bounds_enable ||
-	                          rc.depth_clear_enable || rc.copy_depth_to_color;
+	// With HTile, DEPTH_COMPRESS_DISABLE expands touched tiles even with depth/stencil tests off
+	// (upstream b64e430b9): a title fast-clears HTile each frame, runs such a pass, then samples the
+	// depth as raw memory; unbound, the clear never lands.
+	const bool depth_active = dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable ||
+	                          rc.copy_depth_to_color ||
+	                          (rc.depth_compress_disable && z.z_info.htile_acceleration &&
+	                           DepthCompressDisableBind());
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
 	return depth_active || stencil_active;

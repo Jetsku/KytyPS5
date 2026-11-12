@@ -8,6 +8,7 @@
 #include "common/file.h"
 #include "common/guestProbe.h"
 #include "common/hangTrace.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -52,9 +53,6 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #else
 #if defined(__APPLE__)
@@ -1654,8 +1652,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	// initializers execute on the host stack too, so grow it before calling any guest code.
 	size_t expanded_size = 0;
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		sys_dbg_stack_info_t stack {};
-		SysStackUsage(stack);
+		const auto stack = SysStackUsage();
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}
@@ -1682,6 +1679,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
 		Common::GuestProbe::Arm(m_programs.front()->base_vaddr, m_programs.front()->base_size);
 	}
+	// Upstream f399d4818: the main guest thread runs with the console's FP environment.
+	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
@@ -2102,7 +2101,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const uint64_t tsc_multiplier =
+	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -2227,23 +2229,24 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD instruction patch for Intel CPUs" : "Guest red-zone protection",
-			                module_name));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
+			    module_name));
 		}
 		if (emulate_amd) {
 			X64InstructionEmulator::ConfigureReciprocalSqrtStats();
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result = PatchGuestInstructions(
+			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+			    GetGuestInstructionHostFeatures(), tsc_multiplier);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
+			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -2256,6 +2259,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (totals.rdtsc.found != 0) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
+			                totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};

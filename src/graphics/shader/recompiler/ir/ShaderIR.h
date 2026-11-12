@@ -76,6 +76,7 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	bool                    image_cube                                            = false; // MIMG DIM is CUBE.
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
@@ -489,6 +490,9 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Upstream abc509d33: the task payload of an indirect mesh draw (draw parameters, then the
+	// record's first instance). Referenced by the emitter only.
+	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;
 	// Mesh draw dword 6, only for programs with ShaderMeshInputInfo::split_groups: the first
 	// workgroup of this part of a draw split past the host's X group limit (0 when unsplit; a
 	// native indirect draw's parameter block holds 0 there).
@@ -695,6 +699,9 @@ struct ShaderInfo {
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
+	// Flattened-SRT slots (low, high) of global-load bases read straight from the SRT (upstream
+	// c174ade18; renderCompute.cpp KYTY_BACK_ADDRESS_BASES backs their pages).
+	std::vector<std::array<uint32_t, 2>> address_bases;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::array<uint8_t, 32>          vertex_fetch_components {};

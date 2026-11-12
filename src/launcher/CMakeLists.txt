@@ -22,7 +22,7 @@ add_executable(launcher WIN32
 
 
 target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
-	LibAtrac9 kyty_git_version common)
+	LibAtrac9 kyty_git_version common FFmpeg::ffmpeg)
 if(LINUX)
 	find_package(Qt6 COMPONENTS DBus REQUIRED)
 	target_link_libraries(launcher Qt6::DBus)
@@ -248,9 +248,12 @@ elseif(LINUX)
 				RESOLVED_DEPENDENCIES_VAR kyty_resolved
 				POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
 				POST_EXCLUDE_REGEXES \".*\")
+			# Install each library once, as a regular file under the name the binaries load.
 			foreach(kyty_dep \${kyty_resolved})
+				get_filename_component(kyty_dep_file \"\${kyty_dep}\" REALPATH)
+				get_filename_component(kyty_dep_name \"\${kyty_dep}\" NAME)
 				file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\"
-					TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES \"\${kyty_dep}\")
+					RENAME \"\${kyty_dep_name}\" FILES \"\${kyty_dep_file}\")
 			endforeach()
 		")
 		install(CODE "

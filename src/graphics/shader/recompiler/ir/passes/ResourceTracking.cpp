@@ -55,6 +55,18 @@ bool LayerBoundEnabled() {
 	const int test = g_layer_bound_test.load(std::memory_order_relaxed);
 	return test >= 0 ? test != 0 : enabled;
 }
+
+// KYTY_IMAGE_CUBE_TRACK=1 (default off; upstream 9a29dc62c): a tracked image is a cube when its
+// MIMG instructions declare DIM CUBE (MemoryInfo::image_cube). A null T# with
+// KYTY_NULL_IMAGE_KEEP_DIM and a bindless image then keep the cube their instructions sample;
+// without it the tracked image stays non-cube as before.
+bool ImageCubeTrackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_CUBE_TRACK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 } // namespace
 
 void SetLayerBoundForTest(int enabled) {
@@ -223,12 +235,15 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 class LoopBoundProof {
 public:
 	LoopBoundProof(const Program& program, const Inst& induction, const Inst& bound)
-	    : m_program(program), m_induction(induction), m_bound(bound) {}
+	    : m_program(program), m_induction(induction), m_bound(bound),
+	      m_values(1u + induction.NumArgs()) {}
 
 	bool Excludes(Value condition, bool positive) {
+		// Upstream 4dc15e27c: the current-iteration values of each incoming edge stay valid
+		// across the guard conditions tested with this proof.
 		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
 			m_incoming = m_induction.PhiBlock(incoming);
-			m_values[1].clear();
+			m_current  = 1u + incoming;
 			if (Evaluate(condition, true) != (positive ? 0u : 1u)) return false;
 		}
 		return true;
@@ -312,7 +327,7 @@ private:
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return Unknown(value.GetType());
 		if (current && inst == &m_bound) return 0u;
-		auto& values = m_values[current];
+		auto& values = m_values[current ? m_current : 0u];
 		if (const auto found = values.find(inst); found != values.end()) {
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
 			return found->second;
@@ -381,10 +396,12 @@ private:
 	const Inst&                                                                 m_induction;
 	const Inst&                                                                 m_bound;
 	const Block*                                                                m_incoming  = nullptr;
+	uint32_t                                                                    m_current   = 1;
 	uint32_t                                                                    m_variables = 0;
 	std::vector<Node>                                                           m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>>                                     m_literals;
-	std::array<std::map<const Inst*, uint32_t>, 2>                              m_values;
+	// Previous-iteration values, then current ones per incoming edge, kept across conditions.
+	std::vector<std::map<const Inst*, uint32_t>>                                m_values;
 	std::map<std::array<uint32_t, 3>, uint32_t>                                 m_nodes_by_key;
 	std::map<std::array<uint32_t, 3>, uint32_t>                                 m_choices;
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
@@ -401,6 +418,7 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
+		m_info.address_bases.clear();
 		m_info.uses_dma   = false;
 		m_info.bda_writes = false;
 		m_shader_writes   = HasShaderMemoryWrites(program);
@@ -2172,6 +2190,11 @@ private:
 			case ValueOpcode::IAdd32: {
 				const auto sum = uint64_t {maximum(0)} + maximum(1);
 				if (sum <= UINT32_MAX) return std::min(result, static_cast<uint32_t>(sum));
+				break;
+			}
+			case ValueOpcode::IMul32: {
+				const auto result = uint64_t {maximum(0)} * maximum(1);
+				if (result <= UINT32_MAX) return static_cast<uint32_t>(result);
 				break;
 			}
 			case ValueOpcode::ShiftRightLogical32:
@@ -4115,6 +4138,7 @@ private:
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
+				image.cube |= ImageCubeTrackEnabled() && memory.image_cube;
 				image.max_array_index = std::max(image.max_array_index, array_index_bound);
 				Merge(image, op, pc);
 				image.table_access |= TableAccess(memory, op);
@@ -4132,6 +4156,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.cube           = ImageCubeTrackEnabled() && memory.image_cube;
 		image.atomic64       = atomic64;
 		if (const auto* descriptor = Source(source); descriptor != nullptr &&
 		                                             descriptor->indirect_descriptor.has_value() &&
@@ -4739,7 +4764,7 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					Fail(flags.pc, "scratch operation requires a nonzero per-thread scratch size");
 				}
 				return;
 			}
@@ -4760,6 +4785,24 @@ private:
 			}
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+			}
+			// Upstream c174ade18: the flattened-SRT slots of a base read straight from the SRT, so
+			// the renderer can back its pages before a compute dispatch (KYTY_BACK_ADDRESS_BASES).
+			if (const auto* base_handle = inst.Arg(0).Resolve().TryInstruction();
+			    base_handle != nullptr && base_handle->GetOpcode() == ValueOpcode::GetAddressResource &&
+			    base_handle->NumArgs() >= 2u) {
+				std::array<uint32_t, 2> base {UINT32_MAX, UINT32_MAX};
+				for (uint32_t word = 0; word < base.size(); ++word) {
+					const auto* read = base_handle->Arg(word).Resolve().TryInstruction();
+					if (read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+					    read->Arg(1).Resolve().IsImmediate()) {
+						base[word] = read->Arg(1).Resolve().U32();
+					}
+				}
+				auto& bases = m_info.address_bases;
+				if (std::ranges::max(base) != UINT32_MAX && std::ranges::find(bases, base) == bases.end()) {
+					bases.push_back(base);
+				}
 			}
 			m_info.uses_dma = true;
 			return;
