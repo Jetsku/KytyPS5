@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/spinGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
 
 #include <algorithm>
 #include <chrono>
@@ -769,7 +770,10 @@ void Ring::WaitConsumed(uint64_t position, const WaitPolicy& policy, WaitStats& 
 	Kick(stats);
 	const auto start = NowNs();
 	stats.spins++;
-	if (!Spin(policy.spin_ns, done)) {
+	const auto spin_start = DrawPrep::PrepStats::Tsc();
+	const bool spun       = Spin(policy.spin_ns, done);
+	stats.spin_tsc += DrawPrep::PrepStats::Tsc() - spin_start;
+	if (!spun) {
 		stats.blocks++;
 		for (;;) {
 			const auto bell = m_producer_bell.load(std::memory_order_acquire);
@@ -807,10 +811,18 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 	                         m_published_cache);
 	const auto start = NowNs();
 	stats.spins++;
-	// KYTY_SPIN_GATE: the consumer's idle spin only while the PC keeps CPUs idle.
-	const bool spun = Spin(Common::SpinGate::SpinAllowed() ? policy.spin_ns : 0,
+	// KYTY_SPIN_GATE: the consumer's idle spin only while the PC keeps CPUs idle. KYTY_SPIN_BUDGET:
+	// a short spin while the core budget is exceeded (common/spinGate.h).
+	using Common::SpinGate::Site;
+	const auto spin_tsc = DrawPrep::PrepStats::Tsc();
+	const bool spun = Spin(Common::SpinGate::SpinNs(Site::Recorder, policy.spin_ns),
 	                       [&] { return available() || stop.load(std::memory_order_acquire); });
+	// PrepStats: the recorder's spin time (one consumer thread; relaxed adds read by the reporter).
+	const auto spun_tsc = DrawPrep::PrepStats::Tsc() - spin_tsc;
+	DrawPrep::PrepStats::g_spin.recorder.fetch_add(spun_tsc, std::memory_order_relaxed);
+	Common::SpinGate::NoteSpin(Site::Recorder, spun_tsc);
 	if (!spun) {
+		Common::SpinGate::NotePark(Site::Recorder);
 		stats.blocks++;
 		for (;;) {
 			const auto bell = m_consumer_bell.load(std::memory_order_acquire);

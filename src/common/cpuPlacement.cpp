@@ -1,6 +1,8 @@
 #include "common/cpuPlacement.h"
 
+#include "common/coreBudget.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 
 #include <algorithm>
@@ -56,17 +58,27 @@ std::string MaskText(uint64_t mask) {
 } // namespace
 
 CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode mode,
-                           int forced_cp_logical, uint32_t min_general, uint64_t preferred_mask) {
+                           int forced_cp_logical, uint32_t min_general, uint64_t preferred_mask,
+                           const ReserveRules& rules) {
 	CpuLayout layout;
 	if (mode == CpuReserveMode::Off) {
 		layout.description = "off";
 		return layout;
 	}
+	// KYTY_CPU_RESERVE_SCALE: the budget the rules read, and the fastest efficiency class.
+	const bool scaled      = rules.scaled;
+	const auto budget      = scaled ? ComputeCoreBudget(sets) : CoreBudget {};
+	const auto budget_cores = rules.budget_cores != 0 ? rules.budget_cores : budget.cores;
+	const auto budget_lps   = rules.budget_logical != 0 ? rules.budget_logical : budget.logical;
+	// Hybrid: only the fastest class counts for the cache choice and as candidates.
+	const bool only_top = scaled && budget.hybrid;
 	struct Core {
 		int                            index      = 0;
 		uint8_t                        cache      = 0;
 		uint8_t                        preference = 0;
+		uint8_t                        efficiency = 0;
 		bool                           whole      = true; // every logical processor allowed
+		bool                           any        = false; // some logical processor allowed
 		bool                           has_zero   = false;
 		std::vector<const CpuSetInfo*> processors;
 	};
@@ -81,10 +93,12 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		core.index      = set.core;
 		core.cache      = set.cache;
 		core.preference = std::max(core.preference, set.scheduling_class);
+		core.efficiency = std::max(core.efficiency, set.efficiency_class);
 		core.whole      = core.whole && set.allowed;
+		core.any        = core.any || set.allowed;
 		core.has_zero   = core.has_zero || set.logical == 0;
 		core.processors.push_back(&set);
-		if (set.allowed) {
+		if (set.allowed && (!only_top || set.efficiency_class == budget.top_efficiency)) {
 			allowed_per_cache[set.cache]++;
 		}
 		if (((preferred_mask >> set.logical) & 1u) != 0) {
@@ -109,21 +123,126 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 			cache = index;
 		}
 	}
+	auto needed = mode == CpuReserveMode::Stages       ? size_t {3}
+	              : mode == CpuReserveMode::CpRecorder ? size_t {2}
+	                                                   : size_t {1};
+	// KYTY_CPU_RESERVE_SCALE: whole cores only while the budget has enough cores for the game's
+	// threads (cp+recorder and stages need one more each, otherwise they fall back to cp); else one
+	// logical processor for the CP, or nothing.
+	bool one_logical = false;
+	std::string scale_note;
+	if (scaled) {
+		const auto whole_ok = [&](size_t count) {
+			return budget_cores >= rules.whole_min_cores + static_cast<uint32_t>(count - 1u);
+		};
+		if (needed > 1 && !whole_ok(needed)) {
+			scale_note = "; " + std::to_string(budget_cores) + " cores in the budget: CP core only";
+			needed     = 1;
+		}
+		if (!whole_ok(1)) {
+			if (budget_lps < rules.logical_min) {
+				layout.description = "only " + std::to_string(budget_lps) + " logical processors on " +
+				                     std::to_string(budget_cores) +
+				                     " cores in the budget: nothing reserved (KYTY_CPU_RESERVE_SCALE)";
+				return layout;
+			}
+			one_logical = true;
+		}
+	}
+	const auto top_class = [&](const Core& core) {
+		return !only_top || core.efficiency == budget.top_efficiency;
+	};
 	std::vector<const Core*> candidates;
 	for (const auto& [index, core]: cores) {
-		if (core.whole && core.cache == cache) {
+		if ((one_logical ? core.any : core.whole) && core.cache == cache && top_class(core)) {
 			candidates.push_back(&core);
 		}
 	}
-	std::sort(candidates.begin(), candidates.end(), [](const Core* a, const Core* b) {
-		if (a->has_zero != b->has_zero) {
-			return !a->has_zero; // the core of processor 0 (interrupts) last
+	const auto order = [scaled](std::vector<const Core*>& list) {
+		std::sort(list.begin(), list.end(), [](const Core* a, const Core* b) {
+			if (a->has_zero != b->has_zero) {
+				return !a->has_zero; // the core of processor 0 (interrupts) last
+			}
+			if (a->preference != b->preference) {
+				return a->preference > b->preference;
+			}
+			return a->index < b->index;
+		});
+		if (scaled && !list.empty()) {
+			// KYTY_CPU_RESERVE_SCALE: the CP's core by the CPU's preferred-core ranking first (the
+			// core of processor 0 only loses ties); the other reserved cores keep the order above.
+			auto best = list.begin();
+			for (auto it = list.begin(); it != list.end(); ++it) {
+				if ((*it)->preference > (*best)->preference) {
+					best = it;
+				}
+			}
+			std::rotate(list.begin(), best, best + 1);
 		}
-		if (a->preference != b->preference) {
-			return a->preference > b->preference;
+	};
+	order(candidates);
+	if (scaled && !one_logical && candidates.size() < needed && needed == 1 &&
+	    budget_lps >= rules.logical_min) {
+		// No whole core (an odd affinity mask): one logical processor still fits.
+		candidates.clear();
+		for (const auto& [index, core]: cores) {
+			if (core.any && core.cache == cache && top_class(core)) {
+				candidates.push_back(&core);
+			}
 		}
-		return a->index < b->index;
-	});
+		order(candidates);
+		one_logical = true;
+	}
+	if (one_logical) {
+		// The CP's logical processor: the forced one, else the best candidate core's first allowed
+		// processor with the highest scheduling class.
+		const CpuSetInfo* chosen = nullptr;
+		if (forced_cp_logical >= 0) {
+			for (const auto& set: sets) {
+				if (set.group == 0 && set.logical == forced_cp_logical && set.allowed) {
+					chosen = &set;
+				}
+			}
+			if (chosen == nullptr) {
+				layout.description = "KYTY_CPU_RESERVE_CORE=" + std::to_string(forced_cp_logical) +
+				                     " is not an allowed processor";
+				return layout;
+			}
+		} else if (!candidates.empty()) {
+			for (const auto* processor: candidates[0]->processors) {
+				if (processor->allowed &&
+				    (chosen == nullptr || processor->scheduling_class > chosen->scheduling_class)) {
+					chosen = processor;
+				}
+			}
+		}
+		if (chosen == nullptr) {
+			layout.description = "no allowed processor in the largest cache";
+			return layout;
+		}
+		for (const auto& set: sets) {
+			if (set.group != 0 || set.logical >= 64 || !set.allowed) {
+				continue;
+			}
+			const auto bit = uint64_t {1} << set.logical;
+			if (&set == chosen) {
+				layout.cp_ids.push_back(set.id);
+				layout.cp_mask |= bit;
+			} else {
+				layout.general_ids.push_back(set.id);
+				layout.general_mask |= bit;
+			}
+		}
+		layout.reserved    = true;
+		layout.cp_core     = chosen->core;
+		layout.description = "CP on logical " + MaskText(layout.cp_mask) + " alone (core " +
+		                     std::to_string(chosen->core) + ", preference " +
+		                     std::to_string(chosen->scheduling_class) + "; " +
+		                     std::to_string(budget_cores) + " cores / " + std::to_string(budget_lps) +
+		                     " logical in the budget: one logical processor, KYTY_CPU_RESERVE_SCALE)" +
+		                     ", other threads on " + MaskText(layout.general_mask) + scale_note;
+		return layout;
+	}
 	if (forced_cp_logical >= 0) {
 		const Core* forced = nullptr;
 		for (const auto& [index, core]: cores) {
@@ -142,9 +261,6 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		                 candidates.end());
 		candidates.insert(candidates.begin(), forced);
 	}
-	const size_t needed = mode == CpuReserveMode::Stages       ? 3u
-	                      : mode == CpuReserveMode::CpRecorder ? 2u
-	                                                           : 1u;
 	if (candidates.size() < needed) {
 		layout.description =
 		    "fewer than " + std::to_string(needed) + " whole allowed cores in the largest cache";
@@ -195,7 +311,7 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		layout.description += ", sequencer on logical " + MaskText(layout.sequencer_mask) +
 		                      " (core " + std::to_string(sequencer->index) + ")";
 	}
-	layout.description += ", other threads on " + MaskText(layout.general_mask);
+	layout.description += ", other threads on " + MaskText(layout.general_mask) + scale_note;
 	return layout;
 }
 
@@ -286,8 +402,15 @@ VCacheDecision DecideVCachePlacement(VCacheMode mode, const VCacheTopology& topo
 
 CpuLayout ComputeVCacheLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode mode,
                               int forced_cp_logical, const VCacheTopology& topology,
-                              uint32_t min_general) {
+                              uint32_t min_general, const ReserveRules& rules) {
 	CpuLayout layout;
+	// KYTY_CPU_RESERVE_SCALE reads the whole process's budget (guest threads use both CCDs).
+	auto scaled_rules = rules;
+	if (rules.scaled && rules.budget_cores == 0) {
+		const auto budget           = ComputeCoreBudget(sets);
+		scaled_rules.budget_cores   = budget.cores;
+		scaled_rules.budget_logical = budget.logical;
+	}
 	if (!topology.dual) {
 		layout.description = "not a dual-CCD X3D";
 		return layout;
@@ -317,7 +440,7 @@ CpuLayout ComputeVCacheLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMod
 		return layout;
 	}
 	if (mode != CpuReserveMode::Off) {
-		layout = ComputeCpuLayout(hot, mode, forced_cp_logical, min_general);
+		layout = ComputeCpuLayout(hot, mode, forced_cp_logical, min_general, 0, scaled_rules);
 		if (!layout.reserved) {
 			layout.description =
 			    "KYTY_CPU_RESERVE does not fit in the V-cache CCD (" + layout.description + ")";
@@ -414,6 +537,33 @@ CpuReserveMode GetCpuReserveMode() {
 		return mode;
 	}();
 	return mode;
+}
+
+namespace {
+// KYTY_CPU_RESERVE_SCALE (live): a change (or a profile change while it is unset) makes the monitor
+// apply the layout again within a second.
+std::atomic<bool> g_rules_changed {false};
+Live::Switch      g_reserve_scale("KYTY_CPU_RESERVE_SCALE", ParseTriState,
+                                  [](int64_t, int64_t) { g_rules_changed.store(true); });
+[[maybe_unused]] const bool g_scale_listener = [] {
+	OnCoreBudgetProfileChange([](bool) { g_rules_changed.store(true); });
+	return true;
+}();
+
+uint32_t EnvRule(const char* name, uint32_t fallback) {
+	const auto* value = EnvValue(name);
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : fallback;
+}
+} // namespace
+
+ReserveRules CurrentReserveRules() {
+	static const uint32_t whole_min   = EnvRule("KYTY_CPU_RESERVE_WHOLE_MIN_CORES", 8);
+	static const uint32_t logical_min = EnvRule("KYTY_CPU_RESERVE_LOGICAL_MIN", 8);
+	ReserveRules rules;
+	rules.scaled          = EffectiveSwitch(g_reserve_scale.Get());
+	rules.whole_min_cores = whole_min;
+	rules.logical_min     = logical_min;
+	return rules;
 }
 
 bool RepinEnabled() {
@@ -549,7 +699,8 @@ std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity, const std::vector<ULONG>
 			set.core             = cpu.CoreIndex;
 			set.cache            = cpu.LastLevelCacheIndex;
 			set.scheduling_class = cpu.SchedulingClass;
-			const bool ours      = cpu.Allocated == 0 || cpu.AllocatedToTargetProcess != 0;
+			set.efficiency_class = cpu.EfficiencyClass;
+			const bool ours     = cpu.Allocated == 0 || cpu.AllocatedToTargetProcess != 0;
 			const bool in_constraint =
 			    restriction != 0
 			        ? cpu.LogicalProcessorIndex < 64 &&
@@ -751,7 +902,7 @@ std::string VCacheDecisionLocked(const State& state, CpuLayout* layout) {
 		       " ms for an external CPU-set/affinity rule first";
 	}
 	auto computed = ComputeVCacheLayout(state.sets, GetCpuReserveMode(), ForcedCpLogical(),
-	                                    state.topology);
+	                                    state.topology, kMinGeneralProcessors, CurrentReserveRules());
 	if (!computed.vcache) {
 		return decision.reason + ": not applied, " + computed.description;
 	}
@@ -845,7 +996,8 @@ void ApplyLayoutLocked(State& state, const char* why, bool log = true, bool keep
 	} else {
 		// Ties between caches go to the V-cache CCD (measured, not by index).
 		state.layout = ComputeCpuLayout(state.sets, mode, ForcedCpLogical(), kMinGeneralProcessors,
-		                                state.topology.dual ? state.topology.vcache_mask : 0);
+		                                state.topology.dual ? state.topology.vcache_mask : 0,
+		                                CurrentReserveRules());
 	}
 	if (log) {
 		LogVCacheLocked(state, why, vcache_text);
@@ -1042,6 +1194,11 @@ void MaintainCpuPlacement() {
 	}
 	if (static_cast<uint64_t>(process_mask) != state.affinity) {
 		ApplyLayoutLocked(state, "process affinity changed");
+		return;
+	}
+	if (g_rules_changed.exchange(false)) {
+		ApplyLayoutLocked(state, CurrentReserveRules().scaled ? "KYTY_CPU_RESERVE_SCALE on"
+		                                                      : "KYTY_CPU_RESERVE_SCALE off");
 		return;
 	}
 	if (!ReassertEnabled() || !state.applied_default) {
@@ -1325,6 +1482,57 @@ uint32_t CoreOfLogicalProcessor(uint32_t logical) {
 	}
 	return logical < g_core_of.size() ? g_core_of[logical].load(std::memory_order_relaxed)
 	                                  : UINT32_MAX;
+}
+
+std::vector<CpuSetInfo> ReadProcessCpuSets(uint64_t* affinity) {
+	uint64_t mask = 0;
+	std::vector<CpuSetInfo> sets;
+#if defined(_WIN32)
+	auto& state = GetState();
+	{
+		std::lock_guard lock(state.mutex);
+		// Before the placement started: the default CPU sets now are another process's.
+		const auto external = state.initialized ? state.external : ProcessDefaultCpuSets();
+		sets                = ReadCpuSets(mask, external);
+	}
+#endif
+	if (affinity != nullptr) {
+		*affinity = mask;
+	}
+	return sets;
+}
+
+void VisitPlacedThreads(void (*visit)(void* context, uint32_t tid, void* handle, bool guest),
+                        void* context) {
+#if defined(_WIN32)
+	auto&           state = GetState();
+	std::lock_guard lock(state.mutex);
+	for (const auto& thread: state.guest) {
+		visit(context, static_cast<uint32_t>(thread.tid), thread.handle, true);
+	}
+	for (const auto& thread: state.cold) {
+		visit(context, static_cast<uint32_t>(thread.tid), thread.handle, false);
+	}
+#else
+	(void)visit;
+	(void)context;
+#endif
+}
+
+uint32_t ProcessAffinityProcessorCount() {
+	if (CoreBudgetEnabled()) {
+		if (const auto logical = CoreBudgetLogical(); logical != 0) {
+			return logical;
+		}
+	}
+#if defined(_WIN32)
+	DWORD_PTR process_mask = 0;
+	DWORD_PTR system_mask  = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0 && process_mask != 0) {
+		return static_cast<uint32_t>(std::popcount(static_cast<uint64_t>(process_mask)));
+	}
+#endif
+	return std::max(1u, std::thread::hardware_concurrency());
 }
 
 void SamplePlacement(ThreadRole role) {

@@ -14,6 +14,7 @@
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spinGate.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -33,6 +34,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
@@ -2136,6 +2138,18 @@ void GuestGpu::ThreadRun(void* data) {
 					HangWatchdog::Scope suspended("cp-all-queues-suspended",
 					                              reinterpret_cast<uint64_t>(gpu),
 					                              gpu->m_submission_count);
+					// PrepStats (prepStats.h): what this idle stretch waits for.
+					bool any_queued = false;
+					for (const auto& queue: gpu->m_queues) {
+						any_queued = any_queued || !queue.empty();
+					}
+					auto& idle = DrawPrep::PrepStats::g_cp_idle;
+					struct IdleNote {
+						uint64_t& bucket;
+						uint64_t  start;
+						~IdleNote() { bucket += DrawPrep::PrepStats::Tsc() - start; }
+					} idle_note {!any_queued ? idle.empty : fence_held ? idle.fence : idle.blocked,
+					             DrawPrep::PrepStats::Tsc()};
 					gpu->m_processing = false;
 					const CpGaps::Scope gap(CpGaps::Cat::Blocked);
 					if (!wakeups) {
@@ -2748,9 +2762,12 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 
 	if (sequencer) {
 		// The resolver advances the epoch before the next op, i.e. before the next GPU work.
-		if (SyncEpoch::Enabled() &&
-		    DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
-			m_epoch_pending = true;
+		// The publication epoch advances here, before any draw after the packet is published.
+		if (DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
+			SyncEpoch::AdvancePublish();
+			if (SyncEpoch::Enabled()) {
+				m_epoch_pending = true;
+			}
 		}
 	} else if (!reference) {
 		// KYTY_SYNC_EPOCH (syncEpoch.h): every fence but a register load from memory is a point
@@ -7021,8 +7038,23 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
 			const CpGaps::Scope       starved_gap(CpGaps::Cat::Starved);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
+			struct StarvedNote {
+				uint64_t start = DrawPrep::PrepStats::Tsc();
+				~StarvedNote() {
+					auto& idle = DrawPrep::PrepStats::g_cp_idle;
+					idle.starved += DrawPrep::PrepStats::Tsc() - start;
+					idle.starved_n++;
+				}
+			} starved_note;
 			const auto start    = CpNowNs();
 			bool       produced = false;
+			// KYTY_SPIN_BUDGET (common/spinGate.h): while the core budget is exceeded only a short
+			// pause spin, then the yield loop gives the processor to ready threads. The whole loop
+			// counts as the site's spin; yields that let another thread run count as its parks.
+			using Common::SpinGate::Site;
+			const auto spin_limit = Common::SpinGate::SpinNs(Site::Resolver, CpSeq::ResolverSpinNs());
+			const auto spin_tsc   = Common::SpinGate::Tsc();
+			uint64_t   gave_way   = 0;
 			for (uint32_t spins = 0;; spins++) {
 				if (m_ops->Peek(view)) {
 					produced = true;
@@ -7035,7 +7067,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 					continue;
 				}
 				const auto elapsed = CpNowNs() - start;
-				if (elapsed < CpSeq::ResolverSpinNs()) {
+				if (elapsed < spin_limit) {
 					continue;
 				}
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
@@ -7045,7 +7077,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				    (g_gpu_state != nullptr && g_gpu_state->HasRunnableComputeWork())) {
 					break;
 				}
-				std::this_thread::yield();
+				gave_way += Common::SpinGate::GiveWay() ? 1u : 0u;
+			}
+			Common::SpinGate::NoteSpin(Site::Resolver, Common::SpinGate::Tsc() - spin_tsc);
+			if (gave_way != 0) {
+				Common::SpinGate::NotePark(Site::Resolver, gave_way);
 			}
 			if (!produced) {
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {

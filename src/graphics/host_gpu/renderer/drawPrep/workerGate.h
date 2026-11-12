@@ -1,10 +1,13 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WORKERGATE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_WORKERGATE_H_
 
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <utility>
 
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -152,6 +155,13 @@ public:
 		m_cold_token.notify_all();
 	}
 
+	// KYTY_DRAW_PREP_ADAPT live switch: after WakeAll moved the workers out, makes the gate usable
+	// again (the cold token leaves its shutdown state). No worker may be parked in the gate.
+	void Rearm() noexcept {
+		uint32_t shutdown = ColdTokenShutdown;
+		(void)m_cold_token.compare_exchange_strong(shutdown, 0u, std::memory_order_seq_cst);
+	}
+
 	// Tests: a cold wake token is outstanding (KYTY_DRAW_PREP_COLD_TOKEN), or the default
 	// protocol's pending flag is set.
 	[[nodiscard]] bool ColdWakeOutstanding() const noexcept {
@@ -205,37 +215,108 @@ inline void WorkerRelax() noexcept {
 // One preparation worker (Engine::Workers::Run; the unit tests run the same loop). `prepare` gets
 // each claimed slot and its sequence number and must complete it; `on_cold_wake` is called after
 // this worker woke a cold one. Workers look at the clock only every 256 idle spins.
-template <typename WindowT, typename Prepare, typename OnColdWake>
-void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uint64_t hot_spin_ns,
-                          uint64_t cold_spin_ns, const std::atomic<bool>& stop, Prepare&& prepare,
-                          OnColdWake&& on_cold_wake) {
+// KYTY_DRAW_PREP_LEAN claim part: a worker reserves `max_batch()` slots at once only while at least
+// this many are unclaimed, so a batch never holds back a slot another worker could start now.
+inline constexpr uint64_t ClaimBatchMinBacklog = 4;
+
+// The worker loop's idle hooks (KYTY_SPIN_BUDGET, common/spinGate.h): `SpinLimit(wanted)` at the
+// first empty look of each idle period gives the spin allowed before parking; `Spun(tsc, parked)`
+// reports each idle period's spin when it ends (a claim, or a park). The default changes nothing.
+struct NoWorkerHooks {
+	[[nodiscard]] uint64_t SpinLimit(uint64_t wanted) const noexcept { return wanted; }
+	void                   Spun(uint64_t /*tsc*/, bool /*parked*/) const noexcept {}
+};
+
+template <typename WindowT, typename Prepare, typename OnColdWake, typename MaxBatch,
+          typename Hooks = NoWorkerHooks>
+void RunPreparationWorkerBatched(WorkerGate& gate, WindowT& window, uint32_t index,
+                                 uint64_t hot_spin_ns, uint64_t cold_spin_ns,
+                                 const std::atomic<bool>& stop, Prepare&& prepare,
+                                 OnColdWake&& on_cold_wake, MaxBatch&& max_batch,
+                                 Hooks&& hooks = Hooks {}) {
 	const bool hot        = gate.Hot(index);
-	const auto spin_limit = hot ? hot_spin_ns : cold_spin_ns;
+	const auto wanted     = hot ? hot_spin_ns : cold_spin_ns;
+	auto       spin_limit = wanted;
+	bool       idle_begun = false; // this idle period asked the hooks for its spin
 	auto       idle_start = WorkerNowNs();
 	uint32_t   spins      = 0;
+	// PrepStats (prepStats.h): TSC split of this worker's time into preparing, spinning, parked.
+	auto& stats    = PrepStats::t_local;
+	stats.index    = index + 1u;
+	auto  idle_tsc = PrepStats::Tsc();
 	while (!stop.load(std::memory_order_acquire)) {
-		uint64_t seq = 0;
-		if (auto* slot = window.TryClaim(seq); slot != nullptr) {
+		uint64_t   seq   = 0;
+		uint32_t   count = 1;
+		const auto batch = static_cast<uint32_t>(max_batch());
+		decltype(window.TryClaim(seq)) slot = nullptr;
+		bool claimed = false;
+		if (batch <= 1u) {
+			slot    = window.TryClaim(seq);
+			claimed = slot != nullptr;
+		} else {
+			claimed = window.TryReserve(seq, count, batch, ClaimBatchMinBacklog);
+		}
+		if (claimed) {
+			const auto claimed_tsc = PrepStats::Tsc();
+			stats.spin += claimed_tsc - idle_tsc;
+			if (idle_begun) {
+				hooks.Spun(claimed_tsc - idle_tsc, false);
+				idle_begun = false;
+			}
 			if (gate.HasCold() && gate.MaybeWakeCold(window.Unclaimed())) {
 				on_cold_wake();
 			}
-			prepare(*slot, seq);
+			for (uint32_t i = 0; i < count; i++) {
+				auto* claimed_slot = batch <= 1u ? slot : window.ClaimReserved(seq + i);
+				if (claimed_slot == nullptr) {
+					continue; // the producer took it as the head
+				}
+				prepare(*claimed_slot, seq + i);
+				stats.slots++;
+			}
+			idle_tsc = PrepStats::Tsc();
+			stats.busy += idle_tsc - claimed_tsc;
+			if (stats.slots >= 32u) {
+				PrepStats::Flush(stats);
+			}
 			idle_start = WorkerNowNs();
 			spins      = 0;
 			continue;
+		}
+		if (!idle_begun) {
+			idle_begun = true;
+			spin_limit = hooks.SpinLimit(wanted);
 		}
 		WorkerRelax();
 		if ((++spins & 255u) != 0u || WorkerNowNs() - idle_start < spin_limit) {
 			continue;
 		}
+		const auto park_tsc = PrepStats::Tsc();
+		stats.spin += park_tsc - idle_tsc;
+		hooks.Spun(park_tsc - idle_tsc, true);
+		idle_begun = false;
 		if (hot) {
 			gate.ParkHot([&window] { return window.HasClaimable(); }, stop);
 		} else {
 			gate.ParkCold([&window, &gate] { return window.Unclaimed() >= gate.WakeBacklog(); },
 			              stop);
 		}
+		idle_tsc = PrepStats::Tsc();
+		stats.park += idle_tsc - park_tsc;
+		stats.parks++;
+		PrepStats::Flush(stats);
 		idle_start = WorkerNowNs();
 	}
+	PrepStats::Flush(stats);
+}
+
+template <typename WindowT, typename Prepare, typename OnColdWake>
+void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uint64_t hot_spin_ns,
+                          uint64_t cold_spin_ns, const std::atomic<bool>& stop, Prepare&& prepare,
+                          OnColdWake&& on_cold_wake) {
+	RunPreparationWorkerBatched(gate, window, index, hot_spin_ns, cold_spin_ns, stop,
+	                            std::forward<Prepare>(prepare), std::forward<OnColdWake>(on_cold_wake),
+	                            [] { return 1u; });
 }
 
 // When the producer steals (KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US). A stolen

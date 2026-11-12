@@ -10,6 +10,8 @@
 #include "common/spinGate.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
+#include "graphics/host_gpu/syncEpoch.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -159,10 +161,20 @@ void Sequencer::NoteHandoffDone(uint64_t submission) {
 bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewake_at) {
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::CpSeqSequencerWait);
 	auto                      start = NowNs();
-	// KYTY_SPIN_GATE: the wait spins only while the PC keeps CPUs idle.
-	const uint64_t spin_ns = Common::SpinGate::SpinAllowed() ? m_spin_ns : 0;
+	// KYTY_SPIN_GATE: the wait spins only while the PC keeps CPUs idle. KYTY_SPIN_BUDGET: only a
+	// short spin while the core budget is exceeded (common/spinGate.h).
+	using Common::SpinGate::Site;
+	const uint64_t spin_ns = Common::SpinGate::SpinNs(Site::Sequencer, m_spin_ns);
+	// PrepStats: the sequencer's spin time (until it is ready or parks).
+	auto       spin_tsc  = DrawPrep::PrepStats::Tsc();
+	const auto note_spin = [&spin_tsc] {
+		const auto spun = DrawPrep::PrepStats::Tsc() - spin_tsc;
+		DrawPrep::PrepStats::g_spin.sequencer.fetch_add(spun, std::memory_order_relaxed);
+		Common::SpinGate::NoteSpin(Site::Sequencer, spun);
+	};
 	for (uint32_t spins = 0;; spins++) {
 		if (ready()) {
+			note_spin();
 			return true;
 		}
 		if (Stopping()) {
@@ -172,12 +184,14 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 			Relax();
 			continue;
 		}
+		note_spin();
 		// Park: set the threshold, announce, re-check, sleep on the progress word. A resolver
 		// notification after the announcement changes the word, so the wait returns.
 		m_wake_at.store(wake_at, std::memory_order_seq_cst);
 		const auto observed = m_progress.load(std::memory_order_seq_cst);
 		m_parked.fetch_add(1, std::memory_order_seq_cst);
 		Common::HandoffLean::ParkFence(); // KYTY_HANDOFF_LEAN: before the re-check
+		Common::SpinGate::NotePark(Site::Sequencer);
 		if (!ready() && !Stopping()) {
 			HangWatchdog::Scope wait("sequencer-progress", reinterpret_cast<uint64_t>(this),
 			                         wake_at, observed, 0, rewake_at);
@@ -186,8 +200,9 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 		m_parked.fetch_sub(1, std::memory_order_seq_cst);
 		// Spin again after a wake (it is early, e.g. before a lockstep op's answer); a further
 		// park uses the later threshold.
-		wake_at = rewake_at;
-		start   = NowNs();
+		wake_at  = rewake_at;
+		start    = NowNs();
+		spin_tsc = DrawPrep::PrepStats::Tsc();
 	}
 }
 
@@ -234,6 +249,9 @@ void Sequencer::Run() {
 			m_intake.pop_front();
 		}
 		HangWatchdog::SetCpContext(0, intake.sequence);
+		// The publication epoch (syncEpoch.h): guest writes before this submission are ordered before
+		// every draw of it.
+		SyncEpoch::AdvancePublish();
 		const bool running = m_processor.SequenceSubmission(intake);
 		HangWatchdog::SetCpContext(UINT32_MAX, 0);
 		if (!running) {

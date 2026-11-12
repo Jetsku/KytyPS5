@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spinGate.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
@@ -691,7 +692,17 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	} else {
 		const auto end = m_encoder.DrainMarker(++m_drain_serial);
 		if (m_mode == Mode::Thread) {
-			m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+			// KYTY_SPIN_BUDGET (common/spinGate.h): a short spin while the core budget is exceeded.
+			using Common::SpinGate::Site;
+			auto policy    = m_drain_policy;
+			policy.spin_ns = Common::SpinGate::SpinNs(Site::RecorderDrain, m_drain_policy.spin_ns);
+			const auto spin_tsc = m_drain_stats.spin_tsc;
+			const auto blocks   = m_drain_stats.blocks;
+			m_ring.WaitConsumed(end, policy, m_drain_stats);
+			Common::SpinGate::NoteSpin(Site::RecorderDrain, m_drain_stats.spin_tsc - spin_tsc);
+			if (m_drain_stats.blocks != blocks) {
+				Common::SpinGate::NotePark(Site::RecorderDrain);
+			}
 		}
 	}
 	const auto now = NowNs();
@@ -726,8 +737,24 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 		m_ring.Kick(m_encoder.Stats());
 	}
 	const auto start = NowNs();
+	// KYTY_SPIN_BUDGET (common/spinGate.h): a short spin while the core budget is exceeded.
+	using Common::SpinGate::Site;
+	const auto spin_ns  = Common::SpinGate::SpinNs(Site::RecorderDrain, m_drain_policy.spin_ns);
+	struct SpinNote {
+		uint64_t start = Common::SpinGate::Tsc();
+		bool     open  = true;
+		void     End() {
+			if (open) {
+				open = false;
+				Common::SpinGate::NoteSpin(Site::RecorderDrain, Common::SpinGate::Tsc() - start);
+			}
+		}
+		~SpinNote() { End(); }
+	} note;
 	while (m_recorded_tick.load(std::memory_order_acquire) < tick) {
-		if (NowNs() - start >= m_drain_policy.spin_ns) {
+		if (NowNs() - start >= spin_ns) {
+			note.End(); // the spin ends here
+			Common::SpinGate::NotePark(Site::RecorderDrain);
 			m_recorded_waiters.fetch_add(1, std::memory_order_seq_cst);
 			for (;;) {
 				const auto value = m_recorded_tick.load(std::memory_order_seq_cst);

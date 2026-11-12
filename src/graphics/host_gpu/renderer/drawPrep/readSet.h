@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/coherenceLog.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
@@ -69,7 +70,31 @@ public:
 		m_digest_ranges.clear();
 		m_failure  = ReadFailure::None;
 		m_finished = false;
+		m_lean         = false;
+		m_online       = true;
+		m_inconsistent = false;
+		m_read_count   = 0;
+		m_byte_count   = 0;
+		m_last_end     = 0;
+		m_entries      = 0;
+		m_entry        = {};
+		m_prev_entry   = {};
 	}
+
+	// KYTY_DRAW_PREP_LEAN read-set part (lean.h), set per preparation after Reset and before the
+	// first Record. While the reads come in the order Finish would sort them into, Record merges
+	// each one into the ranges at once, exactly as Finish's loop would (the same comparisons in the
+	// same order, so the same ranges, bytes and failures): Finish then has nothing left to do, and
+	// the bytes are copied once. The first read out of that order turns the ranges built so far back
+	// into reads (each range one read, its merged bytes): merging those with the remaining reads
+	// gives the ranges merging all the original reads gives, since a merged range is the union of
+	// its reads and two pieces join on the same rule (overlap, or touch away from a 4 KiB boundary)
+	// whether they are reads or ranges, and two reads that disagree on a byte make either merge
+	// fail. The limits count the original reads and bytes, as the plain path does.
+	void SetLean(bool lean) noexcept { m_lean = lean; }
+	[[nodiscard]] bool Lean() const noexcept { return m_lean; }
+	// Tests: whether the lean read set is still merging online.
+	[[nodiscard]] bool LeanOnline() const noexcept { return m_lean && m_online; }
 
 	// Records that the `size` bytes read at `address` have the XXH3-64 digest `digest` (see the
 	// header comment). False (and a failure) when over the limits.
@@ -100,6 +125,9 @@ public:
 		}
 		if (size == 0) {
 			return true;
+		}
+		if (m_lean) {
+			return RecordLean(address, static_cast<const uint8_t*>(data), size);
 		}
 		if (m_reads.size() >= MaxReads || size > MaxBytes - m_bytes.size() ||
 		    address > UINT64_MAX - size) {
@@ -133,8 +161,8 @@ public:
 	}
 	[[nodiscard]] ReadFailure Failure() const noexcept { return m_failure; }
 	[[nodiscard]] bool        Failed() const noexcept { return m_failure != ReadFailure::None; }
-	[[nodiscard]] size_t      ReadCount() const noexcept { return m_reads.size(); }
-	[[nodiscard]] size_t      ByteCount() const noexcept { return m_bytes.size(); }
+	[[nodiscard]] size_t      ReadCount() const noexcept { return m_lean ? m_read_count : m_reads.size(); }
+	[[nodiscard]] size_t      ByteCount() const noexcept { return m_lean ? m_byte_count : m_bytes.size(); }
 
 	// Coalesces the recorded reads into sorted, non-overlapping ranges. Overlapping reads merge,
 	// and so do touching ones unless they meet at a 4 KiB boundary (two guest mappings can meet
@@ -144,6 +172,14 @@ public:
 	bool Finish() {
 		if (m_failure != ReadFailure::None) {
 			return false;
+		}
+		if (m_lean && m_inconsistent) {
+			Fail(ReadFailure::Inconsistent);
+			return false;
+		}
+		if (m_lean && m_online) {
+			m_finished = true;
+			return true;
 		}
 		m_order.resize(m_reads.size());
 		std::iota(m_order.begin(), m_order.end(), 0u);
@@ -201,6 +237,10 @@ public:
 	// Only for the coherence-log check: touching ranges merge across 4 KiB boundaries here, which
 	// a clean-read verdict must not do (AllClean keeps the separate lists).
 	void BuildCertificate(std::vector<Coherence::Range>& out) const {
+		if (m_lean && !m_digest_ranges.empty() && m_digest_ranges.size() <= MaxDigests) {
+			BuildCertificateLean(out);
+			return;
+		}
 		out.assign(m_ranges.begin(), m_ranges.end());
 		if (m_digest_ranges.empty()) {
 			return;
@@ -308,6 +348,140 @@ private:
 		uint64_t size    = 0;
 		uint64_t digest  = 0;
 	};
+	// An entry of the plain path's read list (a read, or reads Record coalesced into one).
+	struct Entry {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+
+	// The plain path's Record limits and coalescing, then the online merge (SetLean).
+	bool RecordLean(uint64_t address, const uint8_t* data, uint64_t size) {
+		if (m_read_count >= MaxReads || size > MaxBytes - m_byte_count || address > UINT64_MAX - size) {
+			Fail(ReadFailure::Overflow);
+			return false;
+		}
+		m_byte_count += static_cast<uint32_t>(size);
+		// The plain path extends its last entry instead of adding one (KYTY_DRAW_PREP_DIRECT_READS).
+		const bool extends = m_coalesce && m_entries != 0 && m_last_end == address &&
+		                     (address & (PageSize - 1u)) != 0;
+		m_last_end = address + size;
+		if (extends) {
+			m_entry.size += size;
+		} else {
+			m_read_count++;
+			m_prev_entry = m_entry;
+			m_entry      = {address, size};
+			m_entries++;
+		}
+		if (!m_online) {
+			AppendRead(address, data, size, extends);
+			return true;
+		}
+		// Finish's order: by address, then the larger read first. Still sorted if the previous
+		// entry does not sort after the current one (the current one may just have grown).
+		if (m_entries >= 2 && (m_entry.address < m_prev_entry.address ||
+		                       (m_entry.address == m_prev_entry.address && m_entry.size > m_prev_entry.size))) {
+			GoOffline();
+			AppendRead(address, data, size, extends);
+			return true;
+		}
+		if (!m_inconsistent) {
+			MergeOnline(address, data, size);
+		}
+		return true;
+	}
+
+	// Finish's loop body for one read (or the part a coalesced read added).
+	void MergeOnline(uint64_t address, const uint8_t* bytes, uint64_t size) {
+		const auto end = address + size;
+		if (!m_ranges.empty() &&
+		    (address < m_ranges.back().end ||
+		     (address == m_ranges.back().end && (address & (PageSize - 1u)) != 0))) {
+			auto&      range       = m_ranges.back();
+			const auto base        = m_range_offsets.back();
+			const auto overlap_end = std::min(end, range.end);
+			if (overlap_end > address &&
+			    std::memcmp(m_merged.data() + base + (address - range.begin), bytes,
+			                overlap_end - address) != 0) {
+				m_inconsistent = true; // Finish fails it, as the plain path's Finish would
+				return;
+			}
+			if (end > range.end) {
+				const auto tail = end - range.end;
+				m_merged.insert(m_merged.end(), bytes + (range.end - address),
+				                bytes + (range.end - address) + tail);
+				range.end = end;
+			}
+			return;
+		}
+		m_ranges.push_back({address, end});
+		m_range_offsets.push_back(static_cast<uint32_t>(m_merged.size()));
+		m_merged.insert(m_merged.end(), bytes, bytes + size);
+	}
+
+	// The ranges merged so far become the plain path's reads (each range one read of its merged
+	// bytes); Finish then sorts and merges them with the rest.
+	void GoOffline() {
+		m_online = false;
+		m_reads.clear();
+		m_bytes.swap(m_merged);
+		m_merged.clear();
+		for (size_t index = 0; index < m_ranges.size(); index++) {
+			m_reads.push_back({m_ranges[index].begin,
+			                   static_cast<uint32_t>(m_ranges[index].end - m_ranges[index].begin),
+			                   m_range_offsets[index]});
+		}
+		m_ranges.clear();
+		m_range_offsets.clear();
+	}
+
+	// After GoOffline: the plain path's list (a coalesced read extends the last read when its
+	// bytes are the tail of the buffer, otherwise it is a read of its own; both merge the same).
+	void AppendRead(uint64_t address, const uint8_t* data, uint64_t size, bool extends) {
+		const auto offset = static_cast<uint32_t>(m_bytes.size());
+		m_bytes.insert(m_bytes.end(), data, data + size);
+		if (extends && !m_reads.empty()) {
+			auto& last = m_reads.back();
+			if (last.address + last.size == address && last.offset + last.size == offset) {
+				last.size += static_cast<uint32_t>(size);
+				return;
+			}
+		}
+		m_reads.push_back({address, static_cast<uint32_t>(size), offset});
+	}
+
+	// BuildCertificate with sorted byte ranges: the few digest ranges are sorted and merged in with
+	// one linear pass, then merged as BuildCertificate merges (same output).
+	void BuildCertificateLean(std::vector<Coherence::Range>& out) const {
+		std::array<Coherence::Range, MaxDigests> digests;
+		size_t                                   count = 0;
+		for (const auto& range: m_digest_ranges) {
+			size_t at = count++;
+			while (at != 0 && digests[at - 1].begin > range.begin) {
+				digests[at] = digests[at - 1];
+				at--;
+			}
+			digests[at] = range;
+		}
+		out.clear();
+		out.reserve(m_ranges.size() + count);
+		const auto push = [&out](const Coherence::Range& range) {
+			if (!out.empty() && range.begin <= out.back().end) {
+				out.back().end = std::max(out.back().end, range.end);
+			} else {
+				out.push_back(range);
+			}
+		};
+		size_t bytes = 0;
+		size_t digest = 0;
+		while (bytes < m_ranges.size() || digest < count) {
+			if (digest == count || (bytes < m_ranges.size() && m_ranges[bytes].begin <= digests[digest].begin)) {
+				push(m_ranges[bytes++]);
+			} else {
+				push(digests[digest++]);
+			}
+		}
+	}
 
 	std::vector<Read>             m_reads;
 	std::vector<uint8_t>          m_bytes;
@@ -320,6 +494,17 @@ private:
 	ReadFailure                   m_failure  = ReadFailure::None;
 	bool                          m_finished = false;
 	bool                          m_coalesce = false;
+	// SetLean state: merging online, a disagreement found online, the plain path's read and byte
+	// counts, the end of the last read, the plain path's entry count and its last two entries.
+	bool     m_lean         = false;
+	bool     m_online       = true;
+	bool     m_inconsistent = false;
+	uint32_t m_read_count   = 0;
+	uint32_t m_byte_count   = 0;
+	uint64_t m_last_end     = 0;
+	uint64_t m_entries      = 0;
+	Entry    m_entry;
+	Entry    m_prev_entry;
 };
 
 // The read routing of a preparing thread. `exact`: the thread is the GPU thread and uses the
@@ -334,9 +519,16 @@ struct Recorder {
 	uint64_t       direct_page       = UINT64_MAX;
 	const uint8_t* direct_host       = nullptr;
 	uint64_t       direct_generation = 0;
+	// KYTY_DRAW_PREP_LEAN digest part (codeDigestCache.h): the publication epoch of the slot being
+	// prepared; 0 when the code digest cache must not be used (speculative slots, inline mode).
+	uint64_t code_epoch = 0;
 };
 
 inline thread_local Recorder* t_recorder = nullptr;
+
+// The publication epoch the next Recorder on this thread takes (Engine::Workers::PrepareClaimed,
+// Engine::ReadyHead; 0 elsewhere).
+inline thread_local uint64_t t_code_epoch = 0;
 
 // KYTY_DRAW_PREP_DIRECT_READS (drawPrep.cpp, kernel/memory.cpp): 0 off, 1 on, 2 verify, 3 exit.
 [[nodiscard]] int  DirectReadsMode();

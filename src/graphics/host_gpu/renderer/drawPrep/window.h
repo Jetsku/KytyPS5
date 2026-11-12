@@ -4,6 +4,7 @@
 #include "common/handoffLean.h"
 #include "common/ramStats.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -140,8 +141,76 @@ public:
 		}
 	}
 
+	// KYTY_DRAW_PREP_LEAN claim part: reserves the oldest unclaimed positions [first, first + count)
+	// with one claim-counter update: `max_batch` of them when at least `min_backlog` are unclaimed,
+	// otherwise one. False when there is none. The caller then takes each reserved position in
+	// order with ClaimReserved, just before preparing it: until then the producer may still take a
+	// reserved position that became the head (TryClaimHead), and no other worker can.
+	[[nodiscard]] bool TryReserve(uint64_t& first, uint32_t& count, uint32_t max_batch,
+	                              uint64_t min_backlog) noexcept {
+		for (;;) {
+			auto       next      = m_next_claim.load(std::memory_order_acquire);
+			const auto published = m_published.load(std::memory_order_acquire);
+			if (next >= published) {
+				return false;
+			}
+			const auto backlog = published - next;
+			const auto take    = backlog >= min_backlog && max_batch > 1u
+			                         ? static_cast<uint32_t>(std::min<uint64_t>(max_batch, backlog))
+			                         : 1u;
+			if (m_next_claim.compare_exchange_weak(next, next + take, std::memory_order_acq_rel)) {
+				first = next;
+				count = take;
+				return true;
+			}
+		}
+	}
+
+	// A reserved position (TryReserve): its payload, or null when the producer took it already.
+	[[nodiscard]] Payload* ClaimReserved(uint64_t seq) noexcept {
+		auto& slot     = m_slots[seq & m_mask];
+		auto  expected = Encode(seq, State::Published);
+		if (slot.state.compare_exchange_strong(expected, Encode(seq, State::Claimed),
+		                                       std::memory_order_acq_rel)) {
+			return &slot.payload;
+		}
+		return nullptr;
+	}
+
 	void Complete(uint64_t seq) noexcept {
-		m_slots[seq & m_mask].state.store(Encode(seq, State::Done), std::memory_order_release);
+		auto& state = m_slots[seq & m_mask].state;
+		if (!m_head_wake) {
+			state.store(Encode(seq, State::Done), std::memory_order_release);
+			return;
+		}
+		// Head wake (ParkHead): the seq_cst store and the load of the waiting flag pair with the
+		// waiter's seq_cst flag store and state load, so one of the two sees the other.
+		state.store(Encode(seq, State::Done), std::memory_order_seq_cst);
+		if (m_head_waiting.load(std::memory_order_seq_cst) != 0) {
+			state.notify_all();
+		}
+	}
+
+	// KYTY_SPIN_BUDGET head wake: before any worker starts (a startup decision). Complete then
+	// stores Done seq_cst and wakes a parked head waiter; ParkHead may be used.
+	void EnableHeadWake() noexcept { m_head_wake = true; }
+	[[nodiscard]] bool HeadWakeEnabled() const noexcept { return m_head_wake; }
+
+	// Producer (the committing thread), the head claimed by a worker: sleeps until the head's
+	// state changes (or returns at once when it already did). Requires EnableHeadWake. Returns
+	// whether it slept. The caller re-checks HeadDone (a wake may be early: any state change).
+	bool ParkHead() noexcept {
+		const auto head  = Head();
+		auto&      state = m_slots[head & m_mask].state;
+		m_head_waiting.store(1, std::memory_order_seq_cst);
+		const auto observed = state.load(std::memory_order_seq_cst);
+		bool       slept    = false;
+		if (observed != Encode(head, State::Done)) {
+			state.wait(observed, std::memory_order_seq_cst);
+			slept = true;
+		}
+		m_head_waiting.store(0, std::memory_order_relaxed);
+		return slept;
 	}
 
 private:
@@ -162,6 +231,9 @@ private:
 	alignas(64) std::atomic<uint64_t> m_head {0};
 	alignas(64) std::atomic<uint64_t> m_published {0};
 	alignas(64) std::atomic<uint64_t> m_next_claim {0};
+	// KYTY_SPIN_BUDGET head wake (set before the workers start, then read-only).
+	alignas(64) bool                  m_head_wake = false;
+	std::atomic<uint32_t>             m_head_waiting {0};
 };
 
 } // namespace Libs::Graphics::DrawPrep

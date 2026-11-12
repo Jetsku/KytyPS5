@@ -11,6 +11,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/drawPrep/codeDigestCache.h"
+#include "graphics/host_gpu/renderer/drawPrep/lean.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -469,6 +471,67 @@ static uint64_t HashCleanBackingInPlace(uint64_t address, uint64_t size, bool& o
 	return digest;
 }
 
+// KYTY_DRAW_PREP_LEAN digest part (drawPrep/codeDigestCache.h): the in-place certified hash below,
+// taken from this thread's cache when the cache's conditions hold. True when it decided (`digest`
+// is the result, 0 when the preparation failed); false: hash as usual.
+static bool LeanCodeDigest(uint64_t address, uint64_t size, uint64_t& digest) {
+	auto* recorder = DrawPrep::ActiveRecorder();
+	if (recorder == nullptr || !DrawPrep::Lean::On(DrawPrep::Lean::Digest)) {
+		return false;
+	}
+	if (recorder->code_epoch == 0) {
+		DrawPrep::Lean::NoteDigest(0, 0, 1); // a speculative slot
+		return false;
+	}
+	DrawPrep::CodeDigestKey key {address, size, recorder->code_epoch, ShaderMapGeneration(), 0, 0};
+	if (!LibKernel::Memory::CodeDigestCacheable(address, size, key.tag_begin, key.tag_end)) {
+		DrawPrep::Lean::NoteDigest(0, 0, 1);
+		return false;
+	}
+	static thread_local DrawPrep::CodeDigestCache cache;
+	auto& reads = *recorder->reads;
+	if (uint64_t cached = 0; cache.Lookup(key, cached)) {
+		if (DrawPrep::Lean::DigestVerifyMode() != 0) [[unlikely]] {
+			uint64_t fresh = 0;
+			if (LibKernel::Memory::HashBackingUnrecorded(address, size, fresh)) {
+				DrawPrep::Lean::NoteDigestVerify(fresh != cached);
+				if (fresh != cached) {
+					LOGF("DrawPrepLean: cached code digest 0x%016" PRIx64 " of 0x%016" PRIx64 "+%" PRIu64
+					     " differs from the bytes (0x%016" PRIx64 ")\n",
+					     cached, address, size, fresh);
+					if (DrawPrep::Lean::DigestVerifyMode() == 2) {
+						EXIT("DrawPrepLean: a cached code digest differs from the bytes\n");
+					}
+					cached = fresh;
+				}
+			}
+		}
+		DrawPrep::Lean::NoteDigest(1, 0, 0);
+		if (reads.Failed() || !reads.RecordDigest(address, size, cached)) {
+			digest = 0;
+			return true;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashCertified);
+		digest = cached;
+		return true;
+	}
+	DrawPrep::Lean::NoteDigest(0, 1, 0);
+	bool ok = false;
+	digest  = HashCleanBackingInPlace(address, size, ok);
+	if (!ok) {
+		digest = 0;
+		return true; // the recorder has failed the preparation
+	}
+	// Stored only if the mapping and the untouched state held across the hash.
+	DrawPrep::CodeDigestKey after = key;
+	if (LibKernel::Memory::CodeDigestCacheable(address, size, after.tag_begin, after.tag_end) &&
+	    ShaderMapGeneration() == key.map_generation && after == key) {
+		cache.Store(key, digest);
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashCertified);
+	return true;
+}
+
 static uint64_t HashShaderCodeCertified(std::span<const uint32_t> code) {
 	if (!DrawPrepCodeCertEnabled()) {
 		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
@@ -476,6 +539,9 @@ static uint64_t HashShaderCodeCertified(std::span<const uint32_t> code) {
 	}
 	const auto address = reinterpret_cast<uint64_t>(code.data());
 	if (DrawPrepCodeDigestEnabled() && LibKernel::Memory::BackingInPlaceEnabled()) {
+		if (uint64_t lean = 0; LeanCodeDigest(address, code.size_bytes(), lean)) {
+			return lean;
+		}
 		bool       ok     = false;
 		const auto digest = HashCleanBackingInPlace(address, code.size_bytes(), ok);
 		if (!ok) {

@@ -184,6 +184,14 @@ struct InPlaceStats {
 // and certified by that digest exactly as TryReadGpuCleanBackingDigest does, without a copy.
 bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
                          InPlaceStats* stats = nullptr);
+// KYTY_DRAW_PREP_LEAN digest cache (graphics/host_gpu/renderer/drawPrep/codeDigestCache.h):
+// whether a digest of [vaddr, vaddr + size) may be cached: the GPU-touched map is maintained
+// (KYTY_CP_SEQ=1), no page of the range was ever GPU-touched, and the range lies in at most two
+// backing mapping regions, whose mapping tags it returns. Any thread.
+[[nodiscard]] bool CodeDigestCacheable(uint64_t vaddr, uint64_t size, uint64_t& tag_begin,
+                                       uint64_t& tag_end);
+// The XXH3-64 digest of the backing bytes, not gated and not recorded (KYTY_DRAW_PREP_LEAN_VERIFY).
+[[nodiscard]] bool HashBackingUnrecorded(uint64_t vaddr, uint64_t size, uint64_t& digest);
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);

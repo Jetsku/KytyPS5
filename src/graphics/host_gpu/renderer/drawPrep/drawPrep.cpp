@@ -4,10 +4,12 @@
 
 #include "common/assert.h"
 #include "common/prepPhases.h"
+#include "common/coreBudget.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spinGate.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -16,16 +18,19 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/adaptivePool.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "graphics/host_gpu/renderer/drawPrep/lean.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -318,6 +323,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.pixel_info = {};
 	prepared.reads.Reset();
 	prepared.reads.SetCoalesce(DirectReadsEnabled());
+	prepared.reads.SetLean(Lean::On(Lean::ReadSet)); // KYTY_DRAW_PREP_LEAN read-set part
 	prepared.certificate.clear();
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
@@ -343,6 +349,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	Common::PrepPhases::Mark(Common::PrepPhases::Phase::Reset);
 
 	Recorder    recorder {&prepared.reads, exact};
+	recorder.code_epoch = t_code_epoch; // KYTY_DRAW_PREP_LEAN digest cache (0: not used)
 	RecordScope scope(recorder);
 	// KYTY_DRAW_PREP_TESS: a tessellated draw's three vertex stages (otherwise Ineligible).
 	const bool tess = PipelineCache::TessellationActive(registers.user_config) &&
@@ -410,6 +417,49 @@ static Live::Switch g_direct_reads("KYTY_DRAW_PREP_DIRECT_READS", [](const char*
 int DirectReadsMode() {
 	return static_cast<int>(g_direct_reads.Get());
 }
+
+// KYTY_DRAW_PREP_LEAN (lean.h): live; every part is valid at any time (the digest cache's epochs
+// are maintained whether it is on or not).
+// A change also makes the next commit print the PrepStats / DrawPrep lines (closing the A/B slot).
+static std::atomic<bool> g_stats_due {false};
+static Live::Switch g_lean(
+    "KYTY_DRAW_PREP_LEAN", [](const char* value) -> int64_t { return Lean::ParseParts(value); },
+    [](int64_t, int64_t) { g_stats_due.store(true, std::memory_order_relaxed); });
+static std::atomic<uint64_t> g_lean_verify_checks {0};
+static std::atomic<uint64_t> g_lean_verify_mismatches {0};
+
+namespace Lean {
+
+uint32_t Parts() noexcept {
+	return static_cast<uint32_t>(g_lean.Get());
+}
+
+int DigestVerifyMode() noexcept {
+	static const int mode = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_LEAN_VERIFY");
+		if (value == nullptr || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+void NoteDigest(uint32_t hits, uint32_t misses, uint32_t uncacheable) noexcept {
+	auto& local = PrepStats::t_local;
+	local.digest_hits += hits;
+	local.digest_misses += misses;
+	local.digest_uncacheable += uncacheable;
+}
+
+void NoteDigestVerify(bool mismatch) noexcept {
+	g_lean_verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (mismatch) {
+		g_lean_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+} // namespace Lean
 
 bool DirectReadsEnabled() {
 	return g_direct_reads.Get() != 0;
@@ -777,6 +827,7 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	prepared.compute_program    = {};
 	prepared.reads.Reset();
 	prepared.reads.SetCoalesce(DirectReadsEnabled());
+	prepared.reads.SetLean(Lean::On(Lean::ReadSet)); // KYTY_DRAW_PREP_LEAN read-set part
 	prepared.certificate.clear();
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
@@ -792,6 +843,7 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	const auto& cs = registers.shaders.GetCs();
 	MakeComputeInputInfo(cs, args, prepared.compute_info);
 	Recorder    recorder {&prepared.reads, exact};
+	recorder.code_epoch = t_code_epoch; // KYTY_DRAW_PREP_LEAN digest cache (0: not used)
 	RecordScope scope(recorder);
 	const auto  result = pipeline_cache.PrepareComputeProgramSpeculative(
         cs, registers.context.GetShaderRegisters(), prepared.compute_info, prepared.compute_prep,
@@ -1432,7 +1484,29 @@ struct Engine::Slot {
 	// KYTY_DRAW_RUN_KEY_DIAG: the key's part hashes (only while the switch is on).
 	DrawRun::KeyParts run_parts {};
 	bool              run_parts_valid = false;
+	// PrepStats: the TSC when the preparing thread completed the slot.
+	uint64_t done_tsc = 0;
+	// KYTY_DRAW_PREP_LEAN digest cache: the publication epoch when the slot was filled
+	// (syncEpoch.h CurrentPublish, read by the publishing thread).
+	uint64_t code_epoch = 0;
 };
+
+namespace {
+// The epoch a preparation of `slot` may use for the code digest cache: none for speculative slots
+// (published before their wait completed).
+uint64_t SlotCodeEpoch(const Engine::Slot& slot) {
+	return slot.speculative ? 0 : slot.code_epoch;
+}
+
+// Sets t_code_epoch for one preparation on this thread.
+class CodeEpochScope {
+public:
+	explicit CodeEpochScope(uint64_t epoch) noexcept { t_code_epoch = epoch; }
+	~CodeEpochScope() { t_code_epoch = 0; }
+	CodeEpochScope(const CodeEpochScope&)            = delete;
+	CodeEpochScope& operator=(const CodeEpochScope&) = delete;
+};
+} // namespace
 
 namespace {
 
@@ -1548,20 +1622,93 @@ private:
 // slots (register snapshot in, preparation out); everything else stays on the GPU thread.
 // Parking follows WorkerGate (workerGate.h): KYTY_DRAW_PREP_HOT workers spin as before, the
 // others park until the unclaimed backlog reaches KYTY_DRAW_PREP_WAKE_BACKLOG.
+// KYTY_DRAW_PREP_ADAPT (adaptivePool.h): the demand-sized pool's settings.
+struct AdaptConfig {
+	uint64_t spin_ns     = 0;
+	uint32_t min_cap     = 1;
+	uint32_t max_cap     = 0; // 0: (affinity processors - 4) / 2
+	uint64_t interval_ns = 250'000'000;
+};
+
+namespace {
+// The logical processors the process may run on (its affinity mask), not the machine's.
+uint32_t ProcessAffinityProcessors() {
+	return Common::ProcessAffinityProcessorCount();
+}
+
+// The adaptive pool's last cap decision, for the PrepStats line (publisher thread writes).
+std::atomic<uint32_t> g_adapt_cap {0};
+std::atomic<uint32_t> g_adapt_lps {0};
+std::atomic<uint64_t> g_adapt_busy_milli {0}; // busy cores x 1000 of the last interval
+
+// The engine's worker pool (one parallel engine per process) and its mode setter, for the live switch
+// below (Engine::Workers is private to the engine).
+std::atomic<void*> g_live_workers {nullptr};
+void (*g_live_set_adapt)(void*, bool) = nullptr;
+void ApplyAdaptMode(int64_t previous, int64_t value);
+} // namespace
+
+// KYTY_DRAW_PREP_ADAPT=1 (live, default 0): the adaptive pool instead of the hot/cold gate. Both
+// exist from the start; a change moves the workers from one loop to the other (on the command
+// processor thread at a flip): the new loop's leave flag is cleared and the mode set before the old
+// loop's leave flag is set and its sleepers woken, so a worker leaving one loop finds the other.
+// Publishes in between may wake the side the workers just left; the commit thread then prepares
+// such a head itself, as any unclaimed head.
+// Unset follows KYTY_CORE_BUDGET_PROFILE (common/coreBudget.h); a profile change moves the workers
+// the same way while the switch is unset.
+static Live::Switch g_adapt_mode("KYTY_DRAW_PREP_ADAPT", Common::ParseTriState,
+                                 [](int64_t previous, int64_t value) { ApplyAdaptMode(previous, value); });
+
+namespace {
+bool AdaptOn() {
+	return Common::EffectiveSwitch(g_adapt_mode.Get());
+}
+[[maybe_unused]] const bool g_adapt_profile_listener = [] {
+	Common::OnCoreBudgetProfileChange([](bool /*on*/) {
+		if (g_adapt_mode.Get() < 0) {
+			ApplyAdaptMode(-1, -1);
+		}
+	});
+	return true;
+}();
+} // namespace
+
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
 	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal,
-	        bool cold_token)
+	        bool cold_token, const AdaptConfig& config)
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
-	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token) {
+	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token),
+	      adapt_config(config) {
+		// KYTY_SPIN_BUDGET (common/spinGate.h): the commit thread may park on a held head; the
+		// workers' Complete then wakes it. Decided before any worker starts.
+		if (Common::SpinGate::BudgetAvailable()) {
+			this->window.EnableHeadWake();
+		}
+		const auto lps = ProcessAffinityProcessors();
+		// Start at the bound; the first interval's busy time sizes it.
+		const auto cap = AdaptiveCap(1000.0, count, lps, config.min_cap, config.max_cap);
+		adapt          = std::make_unique<AdaptivePool>(count, cap);
+		g_adapt_cap.store(cap, std::memory_order_relaxed);
+		g_adapt_lps.store(lps, std::memory_order_relaxed);
+		const bool on = AdaptOn();
+		adapt_on.store(on, std::memory_order_seq_cst);
+		leave_adapt.store(!on, std::memory_order_seq_cst);
+		leave_gate.store(on, std::memory_order_seq_cst);
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
+		g_live_set_adapt = [](void* workers, bool on) { static_cast<Workers*>(workers)->SetAdapt(on); };
+		g_live_workers.store(this, std::memory_order_seq_cst);
 	}
 
 	~Workers() {
+		g_live_workers.store(nullptr, std::memory_order_seq_cst);
 		stop.store(true, std::memory_order_seq_cst);
+		leave_gate.store(true, std::memory_order_seq_cst);
+		leave_adapt.store(true, std::memory_order_seq_cst);
 		gate.WakeAll();
+		adapt->WakeAll();
 		for (auto& thread: threads) {
 			thread.join();
 		}
@@ -1570,11 +1717,46 @@ struct Engine::Workers {
 	Workers(const Workers&)            = delete;
 	Workers& operator=(const Workers&) = delete;
 
+	// KYTY_DRAW_PREP_ADAPT live change (command processor thread).
+	void SetAdapt(bool on) {
+		if (on) {
+			leave_adapt.store(false, std::memory_order_seq_cst);
+			adapt_on.store(true, std::memory_order_seq_cst);
+			leave_gate.store(true, std::memory_order_seq_cst);
+			gate.WakeAll();
+		} else {
+			// WakeAll left the cold token in its shutdown state; no worker is parked in the gate now.
+			gate.Rearm();
+			leave_gate.store(false, std::memory_order_seq_cst);
+			adapt_on.store(false, std::memory_order_seq_cst);
+			leave_adapt.store(true, std::memory_order_seq_cst);
+			adapt->WakeAll();
+		}
+	}
+
 	// Producer side, after Publish: wake parked hot workers, and now and then check whether the
 	// backlog needs a cold one. Paired with the gate's park protocol (seq_cst sleepers count and
 	// predicate reload): either the worker sees the new slot before parking, or this thread sees
 	// it parking and changes the signal it waits on.
+	// KYTY_DRAW_PREP_ADAPT: wake one parked worker when nobody spins (adaptivePool.h), and
+	// recompute the active cap about every 250 ms.
 	void Wake() {
+		if (adapt_on.load(std::memory_order_relaxed)) {
+			if (adapt->OnPublish()) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes);
+			}
+			if (adapt->CapDue(adapt_config.interval_ns)) {
+				const auto busy = adapt->TakeBusyCores();
+				const auto lps  = ProcessAffinityProcessors();
+				const auto cap  = AdaptiveCap(busy, adapt->Workers(), lps, adapt_config.min_cap,
+				                              adapt_config.max_cap);
+				adapt->SetCap(cap);
+				g_adapt_cap.store(cap, std::memory_order_relaxed);
+				g_adapt_lps.store(lps, std::memory_order_relaxed);
+				g_adapt_busy_milli.store(static_cast<uint64_t>(busy * 1000.0), std::memory_order_relaxed);
+			}
+			return;
+		}
 		if (gate.OnPublish([this] { return window.Unclaimed(); })) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes);
 		}
@@ -1591,12 +1773,16 @@ struct Engine::Workers {
 		// KYTY_DRAW_PREP_PHASES (common/prepPhases.h): the split of this preparation.
 		namespace Phases = Common::PrepPhases;
 		Phases::Begin();
-		PrepareSlot(pipeline_cache, slot, false);
+		{
+			const CodeEpochScope epoch(SlotCodeEpoch(slot));
+			PrepareSlot(pipeline_cache, slot, false);
+		}
 		HashForRepeatTrace(slot);
 		Phases::Mark(Phases::Phase::RunKey);
 		PlanBindings(slot, plan_context);
 		Phases::Mark(Phases::Phase::Plan);
 		slot.worker_prepared = true;
+		slot.done_tsc        = PrepStats::Tsc();
 		window.Complete(seq);
 		Phases::End(Phases::Phase::Complete);
 	}
@@ -1608,17 +1794,46 @@ struct Engine::Workers {
 		t_worker_thread = true;
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
 		t_worker_number = index + 1u;
-		RunPreparationWorker(
-		    gate, window, index, spin_ns, cold_spin_ns, stop,
-		    [this, &placement_count](Slot& slot, uint64_t seq) {
-			    PrepareClaimed(slot, seq);
-			    if ((++placement_count & 63u) == 0u) {
-				    Common::SamplePlacement(Common::ThreadRole::Host);
-			    }
-		    },
-		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+		const auto prepare = [this, &placement_count](Slot& slot, uint64_t seq) {
+			PrepareClaimed(slot, seq);
+			if ((++placement_count & 63u) == 0u) {
+				Common::SamplePlacement(Common::ThreadRole::Host);
+			}
+		};
+		// KYTY_DRAW_PREP_LEAN claim part: two slots per claim-counter update in a backlog.
+		const auto batch = [] { return Lean::On(Lean::Claim) ? 2u : 1u; };
+		while (!stop.load(std::memory_order_acquire)) {
+			if (adapt_on.load(std::memory_order_seq_cst)) {
+				if (leave_adapt.load(std::memory_order_seq_cst)) {
+					WorkerRelax(); // a switch in progress
+					continue;
+				}
+				RunAdaptiveWorker(*adapt, window, index, adapt_config.spin_ns, leave_adapt, prepare, batch);
+			} else {
+				if (leave_gate.load(std::memory_order_seq_cst)) {
+					WorkerRelax();
+					continue;
+				}
+				// KYTY_SPIN_BUDGET (common/spinGate.h): a short idle spin while the core budget is
+				// exceeded; the idle periods' spin and parks go to the site counters.
+				struct BudgetHooks {
+					[[nodiscard]] uint64_t SpinLimit(uint64_t wanted) const {
+						return Common::SpinGate::SpinNs(Common::SpinGate::Site::Worker, wanted);
+					}
+					void Spun(uint64_t tsc, bool parked) const {
+						Common::SpinGate::NoteSpin(Common::SpinGate::Site::Worker, tsc);
+						if (parked) {
+							Common::SpinGate::NotePark(Common::SpinGate::Site::Worker);
+						}
+					}
+				};
+				RunPreparationWorkerBatched(
+				    gate, window, index, spin_ns, cold_spin_ns, leave_gate, prepare,
+				    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); }, batch,
+				    BudgetHooks {});
+			}
+		}
 	}
-
 	PipelineCache&           pipeline_cache;
 	BindingPlanContext       plan_context; // set by the engine before the first Submit
 	Window<Slot>             window;
@@ -1626,9 +1841,27 @@ struct Engine::Workers {
 	uint64_t                 cold_spin_ns = 0;
 	StealPolicy              steal; // KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US
 	WorkerGate               gate;
+	AdaptConfig              adapt_config;
+	std::unique_ptr<AdaptivePool> adapt; // KYTY_DRAW_PREP_ADAPT
+	// KYTY_DRAW_PREP_ADAPT live: which loop the workers run, and each loop's leave flag (also set at
+	// shutdown).
+	std::atomic<bool> adapt_on {false};
+	std::atomic<bool> leave_gate {false};
+	std::atomic<bool> leave_adapt {true};
 	std::atomic<bool>        stop {false};
 	std::vector<std::thread> threads;
 };
+
+namespace {
+void ApplyAdaptMode(int64_t /*previous*/, int64_t value) {
+	// Command processor thread only. Unset (-1) follows KYTY_CORE_BUDGET_PROFILE.
+	const bool on = Common::EffectiveSwitch(value);
+	if (auto* workers = g_live_workers.load(std::memory_order_seq_cst); workers != nullptr) {
+		g_live_set_adapt(workers, on);
+	}
+	g_stats_due.store(true, std::memory_order_relaxed); // closes the A/B slot's PrepStats period
+}
+} // namespace
 
 Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
                std::function<void()> after_commit)
@@ -1661,15 +1894,25 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		// KYTY_DRAW_PREP_COLD_TOKEN=1: the cold-wake protocol whose wakes cannot stick
 		// (workerGate.h); with the default one the cold workers stop waking after a race.
 		const bool cold_token = EnvUnsigned("KYTY_DRAW_PREP_COLD_TOKEN", 0, 0, 1) != 0;
+		// KYTY_DRAW_PREP_ADAPT=1 (adaptivePool.h): the demand-sized pool instead of the hot/cold
+		// gate (KYTY_DRAW_PREP_HOT, _SPIN_US, _COLD_SPIN_US, _WAKE_BACKLOG are then unused).
+		AdaptConfig adapt;
+		adapt.spin_ns     = uint64_t {EnvUnsigned("KYTY_DRAW_PREP_ADAPT_SPIN_US", 10, 0, 1000000)} * 1000u;
+		adapt.min_cap     = EnvUnsigned("KYTY_DRAW_PREP_ADAPT_MIN", 1, 1, 32);
+		adapt.max_cap     = EnvUnsigned("KYTY_DRAW_PREP_ADAPT_MAX", 0, 0, 32);
+		adapt.interval_ns = uint64_t {EnvUnsigned("KYTY_DRAW_PREP_ADAPT_INTERVAL_MS", 250, 10, 10000)} * 1000000u;
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
-		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token);
+		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token, adapt);
 		m_workers->plan_context = MakeBindingPlanContext(m_renderer);
 		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
-		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d\n",
+		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d adapt=%d "
+		     "adapt_spin=%" PRIu64 "us adapt_min=%u adapt_max=%u cap=%u lps=%u\n",
 		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
 		     wake_backlog, cold_spin_us, cold_token ? 1 : 0, steal.min_unclaimed, steal_us,
-		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
+		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode(), AdaptOn() ? 1 : 0,
+		     adapt.spin_ns / 1000u, adapt.min_cap, adapt.max_cap,
+		     g_adapt_cap.load(std::memory_order_relaxed), g_adapt_lps.load(std::memory_order_relaxed));
 	}
 }
 
@@ -1706,6 +1949,7 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
 	slot.worker_prepared = false;
 	slot.after_stop      = 0;
 	slot.speculative     = false;
+	slot.code_epoch      = SyncEpoch::CurrentPublish();
 	slot.repeat_packet   = RepeatTrace::Enabled() ? RepeatTrace::TakeDrawPacket() : 0;
 }
 
@@ -1896,21 +2140,41 @@ Engine::Slot& Engine::ReadyHead() {
 	auto& slot = window.HeadPayload();
 	CommitStats::StepMark(CommitStats::Step::GapDrawOp);
 	const auto stats_start = CommitStats::Now();
+	auto&      prep_stats  = PrepStats::g_commit;
+	const auto head_tsc    = PrepStats::Tsc();
+	prep_stats.heads++;
+	prep_stats.occupancy += window.Occupancy();
 	// KYTY_HANDOFF_LEAN: a head a worker has finished is seen with a plain acquire load, without
 	// the locked compare-exchange that would fail on it anyway.
 	const bool head_done = Common::HandoffLean::On() && window.HeadDone();
 	if (!head_done && window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
 		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
-		PrepareSlot(m_renderer.GetPipelineCache(), slot, true);
+		{
+			const CodeEpochScope epoch(SlotCodeEpoch(slot));
+			PrepareSlot(m_renderer.GetPipelineCache(), slot, true);
+		}
 		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 		if (stats_start != 0) {
 			CommitStats::NoteHead(CommitStats::Now() - stats_start, 0);
 		}
+		prep_stats.self++;
+		prep_stats.self_tsc += PrepStats::Tsc() - head_tsc;
 	} else if (head_done || window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
+		prep_stats.ready++;
+		const auto lead = head_tsc > slot.done_tsc ? head_tsc - slot.done_tsc : 0;
+		prep_stats.lead_tsc += lead;
+		// Buckets in TSC ticks at ~4 GHz: <2, <10, <50, <200, <1000 us.
+		const uint64_t bounds[5] = {8'000, 40'000, 200'000, 800'000, 4'000'000};
+		size_t         bucket    = 0;
+		while (bucket < 5 && lead >= bounds[bucket]) {
+			bucket++;
+		}
+		prep_stats.lead_hist[bucket]++;
 	} else {
+		prep_stats.waited++;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
 		const CpGaps::Scope gap(CpGaps::Cat::HeadWait);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
@@ -1927,6 +2191,15 @@ Engine::Slot& Engine::ReadyHead() {
 		// preparation. Only a head this thread claims itself (above) uses the exact predicate: it
 		// is committed at once. A stolen slot is committed after the draws before it, which change
 		// what that predicate reads, so the certificate at its commit decides.
+		// KYTY_SPIN_BUDGET (common/spinGate.h): while the core budget is exceeded this thread spins
+		// only briefly, then sleeps on the head's state word until the worker's Complete wakes it
+		// (Window::ParkHead; the head wake is enabled at startup when the switch is available).
+		using Common::SpinGate::Site;
+		const uint64_t gated      = Common::SpinGate::SpinNs(Site::CommitHead, UINT64_MAX);
+		const uint64_t park_after = window.HeadWakeEnabled() ? gated : UINT64_MAX;
+		const auto     wait_ns0   = NowNs();
+		uint64_t       parked_tsc = 0;
+		uint64_t       parks      = 0;
 		const auto stats = AwaitHead(
 		    m_workers->gate, window, m_workers->steal,
 		    [this](Slot& claimed, uint64_t seq) {
@@ -1935,8 +2208,15 @@ Engine::Slot& Engine::ReadyHead() {
 			    m_workers->PrepareClaimed(claimed, seq);
 			    m_renderer.GetPipelineCache().NoteProgramPrefetchWait(claimed.prepared.program_compile_ns);
 		    },
-		    [this](uint32_t spins, uint64_t spin_start) {
+		    [this, &window, park_after, &parked_tsc, &parks](uint32_t spins, uint64_t spin_start) {
 			    CpuRelax();
+			    if (park_after != UINT64_MAX && (spins & 15u) == 15u && NowNs() - spin_start >= park_after) {
+				    const auto park_tsc = PrepStats::Tsc();
+				    if (window.ParkHead()) {
+					    parks++;
+				    }
+				    parked_tsc += PrepStats::Tsc() - park_tsc;
+			    }
 			    // Workers never dereference guest memory, so they cannot page fault into a
 			    // request this thread must service. Only as a last-resort deadlock guard, after
 			    // 2 ms of spinning, pending cross-thread commands are serviced here; such a
@@ -1948,6 +2228,19 @@ Engine::Slot& Engine::ReadyHead() {
 			    }
 		    },
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+		{
+			// The spin share of this wait in TSC ticks: its spin time (steals excluded) at the wait's
+			// own TSC rate, minus the time parked.
+			const auto wait_tsc = PrepStats::Tsc() - head_tsc;
+			const auto wait_ns  = std::max<uint64_t>(NowNs() - wait_ns0, 1);
+			const auto spin_tsc = static_cast<uint64_t>(static_cast<double>(stats.spin_ns) *
+			                                            static_cast<double>(wait_tsc) /
+			                                            static_cast<double>(wait_ns));
+			Common::SpinGate::NoteSpin(Site::CommitHead, spin_tsc > parked_tsc ? spin_tsc - parked_tsc : 0);
+			if (parks != 0) {
+				Common::SpinGate::NotePark(Site::CommitHead, parks);
+			}
+		}
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
 		// Actual idle CP wait on a shader miss, capped by the compiler call duration. Steals
@@ -1982,6 +2275,7 @@ Engine::Slot& Engine::ReadyHead() {
 		if (stats_start != 0) {
 			CommitStats::NoteHead(0, CommitStats::Now() - stats_start);
 		}
+		prep_stats.wait_tsc += PrepStats::Tsc() - head_tsc;
 	}
 	CommitStats::StepMark(CommitStats::Step::GapHead);
 	if (const auto mode = g_cert_prefetch.Get(); mode != 0) {
@@ -2175,6 +2469,110 @@ void Engine::Drain() {
 // preparation against draws that fell back to the serial path, and why. Fallbacks run the whole
 // program preparation on the command processor, so the ratio says how much of it is avoidable.
 namespace {
+// PrepStats (prepStats.h): one line per 10 s, the deltas since the previous line. TSC ticks are
+// converted with the TSC rate measured between two lines.
+void PrintPrepStats(uint64_t now_ns) {
+	static uint64_t last_ns  = 0;
+	static uint64_t last_tsc = 0;
+	struct W {
+		uint64_t slots = 0, busy = 0, spin = 0, park = 0, parks = 0;
+	};
+	static W                                         last_w[PrepStats::MaxWorkers] {};
+	static PrepStats::Commit                         last_c {};
+	const auto                                       tsc = PrepStats::Tsc();
+	if (last_ns == 0) {
+		last_ns  = now_ns;
+		last_tsc = tsc;
+		last_c   = PrepStats::g_commit;
+		std::printf("PrepStats sizes: slot %zu registers %zu prepared %zu plan %zu reads %zu\n",
+		            sizeof(Engine::Slot), sizeof(RegisterSnapshot), sizeof(PreparedDraw),
+		            sizeof(BindingPlan), sizeof(ReadSet));
+		return;
+	}
+	const double ticks_per_us = static_cast<double>(tsc - last_tsc) / (static_cast<double>(now_ns - last_ns) * 1e-3);
+	const double secs         = static_cast<double>(now_ns - last_ns) * 1e-9;
+	const auto   ms           = [&](uint64_t t) { return static_cast<double>(t) / ticks_per_us * 1e-3 / secs; };
+	const auto&  c            = PrepStats::g_commit;
+	const auto   heads        = c.heads - last_c.heads;
+	const auto   ready        = c.ready - last_c.ready;
+	std::string  workers;
+	W            sum;
+	for (uint32_t i = 0; i < PrepStats::MaxWorkers; i++) {
+		const auto& g = PrepStats::g_workers[i];
+		W           v {g.slots.load(std::memory_order_relaxed), g.busy.load(std::memory_order_relaxed),
+                       g.spin.load(std::memory_order_relaxed), g.park.load(std::memory_order_relaxed),
+                       g.parks.load(std::memory_order_relaxed)};
+		W           d {v.slots - last_w[i].slots, v.busy - last_w[i].busy, v.spin - last_w[i].spin,
+                       v.park - last_w[i].park, v.parks - last_w[i].parks};
+		last_w[i] = v;
+		if (d.slots == 0 && d.spin == 0 && d.park == 0) {
+			continue;
+		}
+		sum.slots += d.slots; sum.busy += d.busy; sum.spin += d.spin; sum.park += d.park; sum.parks += d.parks;
+		char text[160];
+		std::snprintf(text, sizeof(text), " w%u:%.0f/s,%.2fus,b%.0f,s%.0f,p%.0f,n%.0f", i,
+		              static_cast<double>(d.slots) / secs,
+		              d.slots != 0 ? static_cast<double>(d.busy) / ticks_per_us / static_cast<double>(d.slots) : 0.0,
+		              ms(d.busy), ms(d.spin), ms(d.park), static_cast<double>(d.parks) / secs);
+		workers += text;
+	}
+	std::printf("PrepStats %.0fs: tsc %.0f MHz | heads %.0f/s ready %.1f%% waited %.1f%% (%.2f ms/s) self %.1f%% "
+	            "(%.2f ms/s) | lead avg %.1f us hist %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+	            "/%" PRIu64 " | occupancy %.1f | workers %.0f slots/s %.2f us/slot busy %.0f spin %.0f park %.0f "
+	            "ms/s parks %.0f/s |%s\n",
+	            secs, ticks_per_us, static_cast<double>(heads) / secs,
+	            heads != 0 ? 100.0 * static_cast<double>(ready) / static_cast<double>(heads) : 0.0,
+	            heads != 0 ? 100.0 * static_cast<double>(c.waited - last_c.waited) / static_cast<double>(heads) : 0.0,
+	            ms(c.wait_tsc - last_c.wait_tsc),
+	            heads != 0 ? 100.0 * static_cast<double>(c.self - last_c.self) / static_cast<double>(heads) : 0.0,
+	            ms(c.self_tsc - last_c.self_tsc),
+	            ready != 0 ? static_cast<double>(c.lead_tsc - last_c.lead_tsc) / ticks_per_us / static_cast<double>(ready) : 0.0,
+	            c.lead_hist[0] - last_c.lead_hist[0], c.lead_hist[1] - last_c.lead_hist[1],
+	            c.lead_hist[2] - last_c.lead_hist[2], c.lead_hist[3] - last_c.lead_hist[3],
+	            c.lead_hist[4] - last_c.lead_hist[4], c.lead_hist[5] - last_c.lead_hist[5],
+	            heads != 0 ? static_cast<double>(c.occupancy - last_c.occupancy) / static_cast<double>(heads) : 0.0,
+	            static_cast<double>(sum.slots) / secs,
+	            sum.slots != 0 ? static_cast<double>(sum.busy) / ticks_per_us / static_cast<double>(sum.slots) : 0.0,
+	            ms(sum.busy), ms(sum.spin), ms(sum.park), static_cast<double>(sum.parks) / secs, workers.c_str());
+	static PrepStats::CpIdle last_i {};
+	const auto&              i = PrepStats::g_cp_idle;
+	std::printf("PrepStats cp idle %.0fs: starved %.2f ms/s (%.0f/s) | outside slices: empty %.2f blocked %.2f "
+	            "fence %.2f ms/s\n",
+	            secs, ms(i.starved - last_i.starved), static_cast<double>(i.starved_n - last_i.starved_n) / secs,
+	            ms(i.empty - last_i.empty), ms(i.blocked - last_i.blocked), ms(i.fence - last_i.fence));
+	last_i = i;
+	static uint64_t last_seq = 0, last_rec = 0;
+	const auto      seq_spin = PrepStats::g_spin.sequencer.load(std::memory_order_relaxed);
+	const auto      rec_spin = PrepStats::g_spin.recorder.load(std::memory_order_relaxed);
+	std::printf("PrepStats spin %.0fs: workers %.0f sequencer %.0f recorder %.0f ms/s\n", secs, ms(sum.spin),
+	            ms(seq_spin - last_seq), ms(rec_spin - last_rec));
+	last_seq = seq_spin;
+	last_rec = rec_spin;
+	// KYTY_DRAW_PREP_LEAN: the parts on now, and the digest cache's lookups (workers).
+	static uint64_t last_hits = 0, last_misses = 0, last_unc = 0;
+	uint64_t        hits = 0, misses = 0, unc = 0;
+	for (const auto& g: PrepStats::g_workers) {
+		hits += g.digest_hits.load(std::memory_order_relaxed);
+		misses += g.digest_misses.load(std::memory_order_relaxed);
+		unc += g.digest_uncacheable.load(std::memory_order_relaxed);
+	}
+	std::printf("PrepStats lean %.0fs: parts 0x%x | digest hits %.0f/s misses %.0f/s uncacheable %.0f/s | verify "
+	            "%" PRIu64 " checks %" PRIu64 " mismatches (total) | adapt cap %u of %u lps, busy %.2f cores\n",
+	            secs, Lean::Parts(), static_cast<double>(hits - last_hits) / secs,
+	            static_cast<double>(misses - last_misses) / secs, static_cast<double>(unc - last_unc) / secs,
+	            g_lean_verify_checks.load(std::memory_order_relaxed),
+	            g_lean_verify_mismatches.load(std::memory_order_relaxed),
+	            g_adapt_cap.load(std::memory_order_relaxed), g_adapt_lps.load(std::memory_order_relaxed),
+	            static_cast<double>(g_adapt_busy_milli.load(std::memory_order_relaxed)) / 1000.0);
+	last_hits   = hits;
+	last_misses = misses;
+	last_unc    = unc;
+	std::fflush(stdout);
+	last_ns  = now_ns;
+	last_tsc = tsc;
+	last_c   = c;
+}
+
 void PrintDrawPrepSummary() {
 	static uint64_t last_ns        = 0;
 	static uint64_t last_committed = 0;
@@ -2182,7 +2580,10 @@ void PrintDrawPrepSummary() {
 	static std::array<uint64_t, static_cast<size_t>(Failure::Mismatch) + 1u> last_reasons {};
 	// KYTY_CP_COMMIT=draws: the clock is read every 256th commit (the line is due every 10 s).
 	static uint32_t calls = 0;
-	if (CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
+	// A live change of KYTY_DRAW_PREP_LEAN closes the period at once (same-boot A/B slots).
+	const bool forced = g_stats_due.load(std::memory_order_relaxed) &&
+	                    g_stats_due.exchange(false, std::memory_order_relaxed);
+	if (!forced && CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
 		return;
 	}
 	const auto now = NowNs();
@@ -2190,7 +2591,10 @@ void PrintDrawPrepSummary() {
 		last_ns = now;
 		return;
 	}
-	if (now - last_ns < 10'000'000'000ull) {
+	// KYTY_DRAW_PREP_STATS_PERIOD_S (default 10): the lines' period.
+	static const uint64_t period_ns = uint64_t {EnvUnsigned("KYTY_DRAW_PREP_STATS_PERIOD_S", 10, 1, 1000000)} *
+	                                  1'000'000'000ull;
+	if (!forced && now - last_ns < period_ns) {
 		return;
 	}
 	const auto committed = g_totals.committed.load(std::memory_order_relaxed);
@@ -2241,6 +2645,13 @@ void PrintDrawPrepSummary() {
 		              std::to_string(g_draw_verify_mismatches.load(std::memory_order_relaxed)) +
 		              " mismatches (total)";
 	}
+	if (BindingsVerifyMode() != 0) {
+		auto& totals = GetBindingTotals();
+		dispatches += " | binding verify: " +
+		              std::to_string(totals.verify_checks.load(std::memory_order_relaxed)) + " checks, " +
+		              std::to_string(totals.verify_mismatches.load(std::memory_order_relaxed)) +
+		              " mismatches (total)";
+	}
 	if (g_clean_since.Get() >= 2) {
 		dispatches += " | clean-since verify: " +
 		              std::to_string(g_clean_since_checks.load(std::memory_order_relaxed)) +
@@ -2284,6 +2695,7 @@ void PrintDrawPrepSummary() {
 		std::printf("DrawPrep plan abstains %.0fs:%s\n", static_cast<double>(now - last_ns) * 1e-9,
 		            reasons.c_str());
 	}
+	PrintPrepStats(now);
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;
