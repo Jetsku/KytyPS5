@@ -1,6 +1,7 @@
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/processHeap.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/u59Preset.h"
@@ -1029,6 +1030,11 @@ static void ApplyTitlePresetFallback(int argc, char* argv[]) {
 
 static int Main(int argc, char* argv[]) {
 	std::set_terminate(ReportUncaughtException);
+#if defined(KYTY_SEGMENT_HEAP)
+	// KYTY_SEGMENT_HEAP build: which heap the manifest gave (a log for the A/B's record).
+	std::printf("Process heap: %s (KYTY_SEGMENT_HEAP build)\n",
+	            Common::ProcessHeapKindName(Common::GetProcessHeapKind()));
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	InitCudaEarly();
 #endif

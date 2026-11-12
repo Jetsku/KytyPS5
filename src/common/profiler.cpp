@@ -532,6 +532,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.EqueueCoalescedTriggers.Cumulative",
     "FrameEvent.EqueueCoalescedDataChanges.Cumulative",
     "FrameEvent.DrawPrepColdWakes.Cumulative",
+    "FrameEvent.DrawPrepServedInWait.Cumulative",
     "FrameEvent.RenderStateVertexPartialCopies.Cumulative",
     "FrameEvent.RenderStateVertexFullCopies.Cumulative",
     "FrameEvent.RenderStateMinimalResets.Cumulative",

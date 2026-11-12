@@ -920,6 +920,8 @@ enum class FrameEvent : uint32_t {
 	EqueueCoalescedDataChanges,
 	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
 	DrawPrepColdWakes,
+	// KYTY_SERVE_IN_WAITS bit 1: service commands run while the commit thread waited for a held head.
+	DrawPrepServedInWait,
 	// KYTY_RENDER_STATE_FAST (colorRenderTarget.h): prepared vertex inputs copied as their used
 	// prefixes, or in full (a count out of range); draws whose target entries were not
 	// value-initialised first; stage preparations swapped member by member. VerifyChecks/Mismatches:

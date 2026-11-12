@@ -36,6 +36,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -397,6 +398,30 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.reads_untouched = ReadsUntouched(prepared);
 	Common::PrepPhases::Mark(Common::PrepPhases::Phase::Certificate);
 	prepared.ok = true;
+}
+
+// KYTY_SERVE_IN_WAITS (live, default 0; based on chenxiao07/KytyPS5 6801ddc13, 6e19833bc,
+// 3658131e6): a mask of the command-processor waits that also run queued service commands (a game
+// thread's readback, an unmap). 1: the commit thread's wait for a head a worker holds (CommitHead),
+// which before ran them only after 2 ms. The resolver's wait for the sequencer and the blocked
+// queues' wait already run them (graphicsRun.cpp).
+static Live::Switch g_serve_in_waits("KYTY_SERVE_IN_WAITS", [](const char* value) -> int64_t {
+	return value != nullptr ? static_cast<int64_t>(std::strtoul(value, nullptr, 0) & 1u) : 0;
+});
+
+bool ServeInHeadWait() {
+	return (g_serve_in_waits.Get() & 1) != 0;
+}
+
+static std::atomic<bool (*)()> g_service_commands_pending {nullptr};
+
+void SetServiceCommandsPending(bool (*pending)()) {
+	g_service_commands_pending.store(pending, std::memory_order_release);
+}
+
+bool ServiceCommandsPending() {
+	auto* pending = g_service_commands_pending.load(std::memory_order_acquire);
+	return pending != nullptr && pending();
 }
 
 // KYTY_DRAW_PREP_DIRECT_READS (readSet.h, kernel/memory.cpp TryReadForDrawPrep): live, default 1;
@@ -2222,8 +2247,25 @@ Engine::Slot& Engine::ReadyHead() {
 			    // 2 ms of spinning, pending cross-thread commands are serviced here; such a
 			    // command then observes the window partially committed, as if it had arrived
 			    // just before these draws were parsed.
-			    if ((spins & 1023u) == 1023u && m_service_commands &&
-			        NowNs() - spin_start > 2'000'000u) {
+			    // KYTY_SERVE_IN_WAITS bit 1 (based on chenxiao07/KytyPS5 6801ddc13, 6e19833bc):
+			    // the same, every 64th look instead of after 2 ms, so a game thread's readback
+			    // does not queue behind the head's preparation.
+			    if ((spins & 63u) != 63u || !m_service_commands) {
+				    return;
+			    }
+			    // (The clock only at a guard look, as before.)
+			    const uint64_t waited  = (spins & 1023u) == 1023u ? NowNs() - spin_start : 0;
+			    const auto     service = HeadWaitServiceAt(spins, waited, ServeInHeadWait(),
+			                                           [] { return ServiceCommandsPending(); });
+			    if (service == HeadWaitService::Serve) {
+				    Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepServedInWait);
+				    static uint64_t served = 0; // (the commit thread only)
+				    if ((++served & 0xfffu) == 1) {
+					    std::printf("ServeInWaits: %" PRIu64 " head waits served service commands\n", served);
+					    std::fflush(stdout);
+				    }
+			    }
+			    if (service != HeadWaitService::None) {
 				    m_service_commands();
 			    }
 		    },
