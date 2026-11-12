@@ -16,19 +16,20 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/adaptivePool.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
-#include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/lean.h"
+#include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/shader.h"
 #include "graphics/host_gpu/syncEpoch.h"
+#include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 
@@ -320,8 +321,8 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.pixel_info = {};
 	prepared.reads.Reset();
 	prepared.reads.SetCoalesce(DirectReadsEnabled());
-	prepared.certificate.clear();
 	prepared.reads.SetLean(Lean::On(Lean::ReadSet)); // KYTY_DRAW_PREP_LEAN read-set part
+	prepared.certificate.clear();
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
 	prepared.touched_valid     = false;
@@ -346,8 +347,8 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	Common::PrepPhases::Mark(Common::PrepPhases::Phase::Reset);
 
 	Recorder    recorder {&prepared.reads, exact};
-	RecordScope scope(recorder);
 	recorder.code_epoch = t_code_epoch; // KYTY_DRAW_PREP_LEAN digest cache (0: not used)
+	RecordScope scope(recorder);
 	// KYTY_DRAW_PREP_TESS: a tessellated draw's three vertex stages (otherwise Ineligible).
 	const bool tess = PipelineCache::TessellationActive(registers.user_config) &&
 	                  PipelineCache::DrawPrepTessEnabled();
@@ -415,7 +416,6 @@ int DirectReadsMode() {
 	return static_cast<int>(g_direct_reads.Get());
 }
 
-bool DirectReadsEnabled() {
 // KYTY_DRAW_PREP_LEAN (lean.h): live; every part is valid at any time (the digest cache's epochs
 // are maintained whether it is on or not).
 // A change also makes the next commit print the PrepStats / DrawPrep lines (closing the A/B slot).
@@ -459,6 +459,7 @@ void NoteDigestVerify(bool mismatch) noexcept {
 
 } // namespace Lean
 
+bool DirectReadsEnabled() {
 	return g_direct_reads.Get() != 0;
 }
 
@@ -824,8 +825,8 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	prepared.compute_program    = {};
 	prepared.reads.Reset();
 	prepared.reads.SetCoalesce(DirectReadsEnabled());
-	prepared.certificate.clear();
 	prepared.reads.SetLean(Lean::On(Lean::ReadSet)); // KYTY_DRAW_PREP_LEAN read-set part
+	prepared.certificate.clear();
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
 	prepared.touched_valid     = false;
@@ -840,8 +841,8 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	const auto& cs = registers.shaders.GetCs();
 	MakeComputeInputInfo(cs, args, prepared.compute_info);
 	Recorder    recorder {&prepared.reads, exact};
-	RecordScope scope(recorder);
 	recorder.code_epoch = t_code_epoch; // KYTY_DRAW_PREP_LEAN digest cache (0: not used)
+	RecordScope scope(recorder);
 	const auto  result = pipeline_cache.PrepareComputeProgramSpeculative(
         cs, registers.context.GetShaderRegisters(), prepared.compute_info, prepared.compute_prep,
         prepared.compute_program, &prepared.program_compile_ns);
@@ -1483,7 +1484,6 @@ struct Engine::Slot {
 	bool              run_parts_valid = false;
 	// PrepStats: the TSC when the preparing thread completed the slot.
 	uint64_t done_tsc = 0;
-};
 	// KYTY_DRAW_PREP_LEAN digest cache: the publication epoch when the slot was filled
 	// (syncEpoch.h CurrentPublish, read by the publishing thread).
 	uint64_t code_epoch = 0;
@@ -1503,8 +1503,9 @@ public:
 	~CodeEpochScope() { t_code_epoch = 0; }
 	CodeEpochScope(const CodeEpochScope&)            = delete;
 	CodeEpochScope& operator=(const CodeEpochScope&) = delete;
-
+};
 } // namespace
+
 namespace {
 
 // After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs, and the
@@ -1619,20 +1620,72 @@ private:
 // slots (register snapshot in, preparation out); everything else stays on the GPU thread.
 // Parking follows WorkerGate (workerGate.h): KYTY_DRAW_PREP_HOT workers spin as before, the
 // others park until the unclaimed backlog reaches KYTY_DRAW_PREP_WAKE_BACKLOG.
+// KYTY_DRAW_PREP_ADAPT (adaptivePool.h): the demand-sized pool's settings.
+struct AdaptConfig {
+	uint64_t spin_ns     = 0;
+	uint32_t min_cap     = 1;
+	uint32_t max_cap     = 0; // 0: (affinity processors - 4) / 2
+	uint64_t interval_ns = 250'000'000;
+};
+
+namespace {
+// The logical processors the process may run on (its affinity mask), not the machine's.
+uint32_t ProcessAffinityProcessors() {
+	return Common::ProcessAffinityProcessorCount();
+}
+
+// The adaptive pool's last cap decision, for the PrepStats line (publisher thread writes).
+std::atomic<uint32_t> g_adapt_cap {0};
+std::atomic<uint32_t> g_adapt_lps {0};
+std::atomic<uint64_t> g_adapt_busy_milli {0}; // busy cores x 1000 of the last interval
+
+// The engine's worker pool (one parallel engine per process) and its mode setter, for the live switch
+// below (Engine::Workers is private to the engine).
+std::atomic<void*> g_live_workers {nullptr};
+void (*g_live_set_adapt)(void*, bool) = nullptr;
+void ApplyAdaptMode(int64_t previous, int64_t value);
+} // namespace
+
+// KYTY_DRAW_PREP_ADAPT=1 (live, default 0): the adaptive pool instead of the hot/cold gate. Both
+// exist from the start; a change moves the workers from one loop to the other (on the command
+// processor thread at a flip): the new loop's leave flag is cleared and the mode set before the old
+// loop's leave flag is set and its sleepers woken, so a worker leaving one loop finds the other.
+// Publishes in between may wake the side the workers just left; the commit thread then prepares
+// such a head itself, as any unclaimed head.
+static Live::Switch g_adapt_mode("KYTY_DRAW_PREP_ADAPT", Live::ParseDefaultOff,
+                                 [](int64_t previous, int64_t value) { ApplyAdaptMode(previous, value); });
+
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
 	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal,
-	        bool cold_token)
+	        bool cold_token, const AdaptConfig& config)
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
-	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token) {
+	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token),
+	      adapt_config(config) {
+		const auto lps = ProcessAffinityProcessors();
+		// Start at the bound; the first interval's busy time sizes it.
+		const auto cap = AdaptiveCap(1000.0, count, lps, config.min_cap, config.max_cap);
+		adapt          = std::make_unique<AdaptivePool>(count, cap);
+		g_adapt_cap.store(cap, std::memory_order_relaxed);
+		g_adapt_lps.store(lps, std::memory_order_relaxed);
+		const bool on = g_adapt_mode.On();
+		adapt_on.store(on, std::memory_order_seq_cst);
+		leave_adapt.store(!on, std::memory_order_seq_cst);
+		leave_gate.store(on, std::memory_order_seq_cst);
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
+		g_live_set_adapt = [](void* workers, bool on) { static_cast<Workers*>(workers)->SetAdapt(on); };
+		g_live_workers.store(this, std::memory_order_seq_cst);
 	}
 
 	~Workers() {
+		g_live_workers.store(nullptr, std::memory_order_seq_cst);
 		stop.store(true, std::memory_order_seq_cst);
+		leave_gate.store(true, std::memory_order_seq_cst);
+		leave_adapt.store(true, std::memory_order_seq_cst);
 		gate.WakeAll();
+		adapt->WakeAll();
 		for (auto& thread: threads) {
 			thread.join();
 		}
@@ -1641,11 +1694,46 @@ struct Engine::Workers {
 	Workers(const Workers&)            = delete;
 	Workers& operator=(const Workers&) = delete;
 
+	// KYTY_DRAW_PREP_ADAPT live change (command processor thread).
+	void SetAdapt(bool on) {
+		if (on) {
+			leave_adapt.store(false, std::memory_order_seq_cst);
+			adapt_on.store(true, std::memory_order_seq_cst);
+			leave_gate.store(true, std::memory_order_seq_cst);
+			gate.WakeAll();
+		} else {
+			// WakeAll left the cold token in its shutdown state; no worker is parked in the gate now.
+			gate.Rearm();
+			leave_gate.store(false, std::memory_order_seq_cst);
+			adapt_on.store(false, std::memory_order_seq_cst);
+			leave_adapt.store(true, std::memory_order_seq_cst);
+			adapt->WakeAll();
+		}
+	}
+
 	// Producer side, after Publish: wake parked hot workers, and now and then check whether the
 	// backlog needs a cold one. Paired with the gate's park protocol (seq_cst sleepers count and
 	// predicate reload): either the worker sees the new slot before parking, or this thread sees
 	// it parking and changes the signal it waits on.
+	// KYTY_DRAW_PREP_ADAPT: wake one parked worker when nobody spins (adaptivePool.h), and
+	// recompute the active cap about every 250 ms.
 	void Wake() {
+		if (adapt_on.load(std::memory_order_relaxed)) {
+			if (adapt->OnPublish()) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes);
+			}
+			if (adapt->CapDue(adapt_config.interval_ns)) {
+				const auto busy = adapt->TakeBusyCores();
+				const auto lps  = ProcessAffinityProcessors();
+				const auto cap  = AdaptiveCap(busy, adapt->Workers(), lps, adapt_config.min_cap,
+				                              adapt_config.max_cap);
+				adapt->SetCap(cap);
+				g_adapt_cap.store(cap, std::memory_order_relaxed);
+				g_adapt_lps.store(lps, std::memory_order_relaxed);
+				g_adapt_busy_milli.store(static_cast<uint64_t>(busy * 1000.0), std::memory_order_relaxed);
+			}
+			return;
+		}
 		if (gate.OnPublish([this] { return window.Unclaimed(); })) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes);
 		}
@@ -1683,19 +1771,32 @@ struct Engine::Workers {
 		t_worker_thread = true;
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
 		t_worker_number = index + 1u;
-		RunPreparationWorkerBatched(
-		    gate, window, index, spin_ns, cold_spin_ns, stop,
-		    [this, &placement_count](Slot& slot, uint64_t seq) {
-			    PrepareClaimed(slot, seq);
-			    if ((++placement_count & 63u) == 0u) {
-				    Common::SamplePlacement(Common::ThreadRole::Host);
-			    }
-		    },
-		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); },
-		    // KYTY_DRAW_PREP_LEAN claim part: two slots per claim-counter update in a backlog.
-		    [] { return Lean::On(Lean::Claim) ? 2u : 1u; });
+		const auto prepare = [this, &placement_count](Slot& slot, uint64_t seq) {
+			PrepareClaimed(slot, seq);
+			if ((++placement_count & 63u) == 0u) {
+				Common::SamplePlacement(Common::ThreadRole::Host);
+			}
+		};
+		// KYTY_DRAW_PREP_LEAN claim part: two slots per claim-counter update in a backlog.
+		const auto batch = [] { return Lean::On(Lean::Claim) ? 2u : 1u; };
+		while (!stop.load(std::memory_order_acquire)) {
+			if (adapt_on.load(std::memory_order_seq_cst)) {
+				if (leave_adapt.load(std::memory_order_seq_cst)) {
+					WorkerRelax(); // a switch in progress
+					continue;
+				}
+				RunAdaptiveWorker(*adapt, window, index, adapt_config.spin_ns, leave_adapt, prepare, batch);
+			} else {
+				if (leave_gate.load(std::memory_order_seq_cst)) {
+					WorkerRelax();
+					continue;
+				}
+				RunPreparationWorkerBatched(
+				    gate, window, index, spin_ns, cold_spin_ns, leave_gate, prepare,
+				    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); }, batch);
+			}
+		}
 	}
-
 	PipelineCache&           pipeline_cache;
 	BindingPlanContext       plan_context; // set by the engine before the first Submit
 	Window<Slot>             window;
@@ -1703,9 +1804,25 @@ struct Engine::Workers {
 	uint64_t                 cold_spin_ns = 0;
 	StealPolicy              steal; // KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US
 	WorkerGate               gate;
+	AdaptConfig              adapt_config;
+	std::unique_ptr<AdaptivePool> adapt; // KYTY_DRAW_PREP_ADAPT
+	// KYTY_DRAW_PREP_ADAPT live: which loop the workers run, and each loop's leave flag (also set at
+	// shutdown).
+	std::atomic<bool> adapt_on {false};
+	std::atomic<bool> leave_gate {false};
+	std::atomic<bool> leave_adapt {true};
 	std::atomic<bool>        stop {false};
 	std::vector<std::thread> threads;
 };
+
+namespace {
+void ApplyAdaptMode(int64_t /*previous*/, int64_t value) {
+	if (auto* workers = g_live_workers.load(std::memory_order_seq_cst); workers != nullptr) {
+		g_live_set_adapt(workers, value != 0);
+	}
+	g_stats_due.store(true, std::memory_order_relaxed); // closes the A/B slot's PrepStats period
+}
+} // namespace
 
 Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
                std::function<void()> after_commit)
@@ -1738,15 +1855,25 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		// KYTY_DRAW_PREP_COLD_TOKEN=1: the cold-wake protocol whose wakes cannot stick
 		// (workerGate.h); with the default one the cold workers stop waking after a race.
 		const bool cold_token = EnvUnsigned("KYTY_DRAW_PREP_COLD_TOKEN", 0, 0, 1) != 0;
+		// KYTY_DRAW_PREP_ADAPT=1 (adaptivePool.h): the demand-sized pool instead of the hot/cold
+		// gate (KYTY_DRAW_PREP_HOT, _SPIN_US, _COLD_SPIN_US, _WAKE_BACKLOG are then unused).
+		AdaptConfig adapt;
+		adapt.spin_ns     = uint64_t {EnvUnsigned("KYTY_DRAW_PREP_ADAPT_SPIN_US", 10, 0, 1000000)} * 1000u;
+		adapt.min_cap     = EnvUnsigned("KYTY_DRAW_PREP_ADAPT_MIN", 1, 1, 32);
+		adapt.max_cap     = EnvUnsigned("KYTY_DRAW_PREP_ADAPT_MAX", 0, 0, 32);
+		adapt.interval_ns = uint64_t {EnvUnsigned("KYTY_DRAW_PREP_ADAPT_INTERVAL_MS", 250, 10, 10000)} * 1000000u;
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
-		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token);
+		                                      uint64_t {cold_spin_us} * 1000u, steal, cold_token, adapt);
 		m_workers->plan_context = MakeBindingPlanContext(m_renderer);
 		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
-		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d\n",
+		     "cold_spin=%uus cold_token=%d steal=%u steal_after=%uus cert=%s verify=%d adapt=%d "
+		     "adapt_spin=%" PRIu64 "us adapt_min=%u adapt_max=%u cap=%u lps=%u\n",
 		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
 		     wake_backlog, cold_spin_us, cold_token ? 1 : 0, steal.min_unclaimed, steal_us,
-		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
+		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode(), g_adapt_mode.On() ? 1 : 0,
+		     adapt.spin_ns / 1000u, adapt.min_cap, adapt.max_cap,
+		     g_adapt_cap.load(std::memory_order_relaxed), g_adapt_lps.load(std::memory_order_relaxed));
 	}
 }
 
@@ -1783,8 +1910,10 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
 	slot.worker_prepared = false;
 	slot.after_stop      = 0;
 	slot.speculative     = false;
+	slot.code_epoch      = SyncEpoch::CurrentPublish();
 	slot.repeat_packet   = RepeatTrace::Enabled() ? RepeatTrace::TakeDrawPacket() : 0;
 }
+
 bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
                     const DrawAutoArgs* auto_args, const HW::Context& context,
                     const HW::UserConfig& user_config, const HW::Shader& shaders) {
@@ -1912,7 +2041,6 @@ uint64_t Engine::DropSpeculative() {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchSkipped, count);
 		g_totals.prefetch_skipped.fetch_add(count, std::memory_order_relaxed);
 	}
-	slot.code_epoch      = SyncEpoch::CurrentPublish();
 	return count;
 }
 
@@ -2358,11 +2486,13 @@ void PrintPrepStats(uint64_t now_ns) {
 		unc += g.digest_uncacheable.load(std::memory_order_relaxed);
 	}
 	std::printf("PrepStats lean %.0fs: parts 0x%x | digest hits %.0f/s misses %.0f/s uncacheable %.0f/s | verify "
-	            "%" PRIu64 " checks %" PRIu64 " mismatches (total)\n",
+	            "%" PRIu64 " checks %" PRIu64 " mismatches (total) | adapt cap %u of %u lps, busy %.2f cores\n",
 	            secs, Lean::Parts(), static_cast<double>(hits - last_hits) / secs,
 	            static_cast<double>(misses - last_misses) / secs, static_cast<double>(unc - last_unc) / secs,
 	            g_lean_verify_checks.load(std::memory_order_relaxed),
-	            g_lean_verify_mismatches.load(std::memory_order_relaxed));
+	            g_lean_verify_mismatches.load(std::memory_order_relaxed),
+	            g_adapt_cap.load(std::memory_order_relaxed), g_adapt_lps.load(std::memory_order_relaxed),
+	            static_cast<double>(g_adapt_busy_milli.load(std::memory_order_relaxed)) / 1000.0);
 	last_hits   = hits;
 	last_misses = misses;
 	last_unc    = unc;
@@ -2442,6 +2572,13 @@ void PrintDrawPrepSummary() {
 		              std::to_string(g_draw_verify_checks.load(std::memory_order_relaxed)) +
 		              " checks, " +
 		              std::to_string(g_draw_verify_mismatches.load(std::memory_order_relaxed)) +
+		              " mismatches (total)";
+	}
+	if (BindingsVerifyMode() != 0) {
+		auto& totals = GetBindingTotals();
+		dispatches += " | binding verify: " +
+		              std::to_string(totals.verify_checks.load(std::memory_order_relaxed)) + " checks, " +
+		              std::to_string(totals.verify_mismatches.load(std::memory_order_relaxed)) +
 		              " mismatches (total)";
 	}
 	if (g_clean_since.Get() >= 2) {
@@ -2593,13 +2730,6 @@ void Engine::OnPacket(PacketClass packet_class, FenceKind fence_kind) {
 			    E::DrawPrepFenceEndOfPipe,   E::DrawPrepFenceAcquireMem,
 			    E::DrawPrepFenceWait,        E::DrawPrepFenceDataWrite,
 			    E::DrawPrepFenceConstantEngine, E::DrawPrepFenceMarker,
-	if (BindingsVerifyMode() != 0) {
-		auto& totals = GetBindingTotals();
-		dispatches += " | binding verify: " +
-		              std::to_string(totals.verify_checks.load(std::memory_order_relaxed)) + " checks, " +
-		              std::to_string(totals.verify_mismatches.load(std::memory_order_relaxed)) +
-		              " mismatches (total)";
-	}
 			    E::DrawPrepFenceDispatch,    E::DrawPrepFenceIndirectDraw,
 			    E::DrawPrepFenceContextControl, E::DrawPrepFenceOther,
 			};

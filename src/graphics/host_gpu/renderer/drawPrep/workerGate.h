@@ -155,6 +155,13 @@ public:
 		m_cold_token.notify_all();
 	}
 
+	// KYTY_DRAW_PREP_ADAPT live switch: after WakeAll moved the workers out, makes the gate usable
+	// again (the cold token leaves its shutdown state). No worker may be parked in the gate.
+	void Rearm() noexcept {
+		uint32_t shutdown = ColdTokenShutdown;
+		(void)m_cold_token.compare_exchange_strong(shutdown, 0u, std::memory_order_seq_cst);
+	}
+
 	// Tests: a cold wake token is outstanding (KYTY_DRAW_PREP_COLD_TOKEN), or the default
 	// protocol's pending flag is set.
 	[[nodiscard]] bool ColdWakeOutstanding() const noexcept {
@@ -281,13 +288,6 @@ void RunPreparationWorkerBatched(WorkerGate& gate, WindowT& window, uint32_t ind
 	PrepStats::Flush(stats);
 }
 
-// When the producer steals (KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US). A stolen
-// preparation that outlasts the head delays the head's commit, and every commit after it, so the
-// producer steals only while the head is likely to take long and the workers are behind.
-struct StealPolicy {
-	uint32_t min_unclaimed = 0; // 0: never; else steal while at least this many slots are unclaimed
-	uint64_t after_ns      = 0; // spin this long on the held head before the first steal
-};
 template <typename WindowT, typename Prepare, typename OnColdWake>
 void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uint64_t hot_spin_ns,
                           uint64_t cold_spin_ns, const std::atomic<bool>& stop, Prepare&& prepare,
@@ -297,6 +297,13 @@ void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uin
 	                            [] { return 1u; });
 }
 
+// When the producer steals (KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US). A stolen
+// preparation that outlasts the head delays the head's commit, and every commit after it, so the
+// producer steals only while the head is likely to take long and the workers are behind.
+struct StealPolicy {
+	uint32_t min_unclaimed = 0; // 0: never; else steal while at least this many slots are unclaimed
+	uint64_t after_ns      = 0; // spin this long on the held head before the first steal
+};
 
 struct AwaitStats {
 	uint32_t stolen  = 0; // slots the producer prepared

@@ -232,6 +232,9 @@ AffinityScan       ScanThreadAffinities(bool repin);
 // Placement samples (see above). Cheap: one processor-number read and a few relaxed increments.
 [[nodiscard]] bool PlacementSamplingEnabled();
 void               SamplePlacement(ThreadRole role);
+// The logical processors the process may run on now (popcount of its affinity mask; the machine's
+// count where that is unavailable). KYTY_DRAW_PREP_ADAPT's worker bound.
+[[nodiscard]] uint32_t ProcessAffinityProcessorCount();
 // group * 64 + number of the processor the calling thread runs on now.
 [[nodiscard]] uint32_t CurrentLogicalProcessor();
 // The physical core (group * 256 + CoreIndex) of a logical processor, UINT32_MAX if unknown.

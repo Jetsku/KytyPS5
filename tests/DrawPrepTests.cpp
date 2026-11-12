@@ -2,6 +2,7 @@
 // and (S6) the preparation window ring, worker parking and the producer's work stealing.
 // --measure-worker-gate [reps]: the parking/stealing configuration sweep (not a test).
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/drawPrep/adaptivePool.h"
 #include "graphics/host_gpu/renderer/drawPrep/codeDigestCache.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
@@ -941,6 +942,22 @@ void TestCodeDigestCache() {
 	Check(exact, "a lookup never returns another shader's digest");
 }
 
+// KYTY_DRAW_PREP_ADAPT: the active-worker cap formula.
+void TestAdaptiveCap() {
+	// ceil(1.3 x busy) + 1, bounded by (affinity processors - 4) / 2 and the workers.
+	Check(DrawPrep::AdaptiveCap(0.0, 6, 32, 1, 0) == 1, "idle: one worker");
+	Check(DrawPrep::AdaptiveCap(1.0, 6, 32, 1, 0) == 3, "1 busy core: ceil(1.3) + 1 = 3");
+	Check(DrawPrep::AdaptiveCap(2.4, 6, 32, 1, 0) == 5, "2.4 busy cores: ceil(3.12) + 1 = 5");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 32, 1, 0) == 6, "never more than the workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 0) == 4, "6-core mask (12 processors): (12 - 4) / 2 = 4");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 16, 1, 0) == 6, "8-core mask (16 processors): (16 - 4) / 2 = 6");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 4, 1, 0) == 1, "tiny masks still get one worker");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 2) == 2, "KYTY_DRAW_PREP_ADAPT_MAX overrides the bound");
+	Check(DrawPrep::AdaptiveCap(0.0, 6, 32, 3, 0) == 3, "KYTY_DRAW_PREP_ADAPT_MIN raises the floor");
+	Check(DrawPrep::AdaptiveCap(0.0, 2, 32, 3, 0) == 2, "the floor never exceeds the workers");
+	Check(DrawPrep::AdaptiveCap(-1.0, 6, 32, 1, 0) == 1, "negative busy (counter skew) counts as idle");
+}
+
 void TestRecordScopeNests() {
 	DrawPrep::ReadSet  outer_set;
 	DrawPrep::ReadSet  inner_set;
@@ -1033,6 +1050,12 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items, u
 	std::vector<std::thread> threads;
 	for (uint32_t w = 0; w < workers; w++) {
 		threads.emplace_back([&, w] {
+			const auto prepare = [&](Item* item, uint64_t seq) {
+				item->output      = Work(item->input);
+				item->prepared_by = w + 1u;
+				item->preparations++;
+				window.Complete(seq);
+			};
 			while (!stop.load(std::memory_order_acquire)) {
 				uint64_t seq = 0;
 				if (batch > 1u) {
@@ -1108,8 +1131,96 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items, u
 	Check(result_ok, "every item is prepared exactly once with the right result");
 	Check(next_retire == items && self + by_workers == items, "every item retires once");
 	// How many items the workers (rather than the producer) prepared depends on scheduling.
-	std::printf("  window %u x %u workers: %llu of %llu prepared by workers\n", capacity, workers,
-	            static_cast<unsigned long long>(by_workers), static_cast<unsigned long long>(items));
+	std::printf("  window %u x %u workers (batch %u): %llu of %llu prepared by workers\n", capacity,
+	            workers, batch, static_cast<unsigned long long>(by_workers),
+	            static_cast<unsigned long long>(items));
+}
+
+// KYTY_DRAW_PREP_ADAPT: the adaptive pool's workers (the production loop) against a producer that
+// publishes in bursts with pauses (so workers park and must be woken), retires in order, takes
+// unclaimed heads itself, and changes the cap while it runs. Every item is prepared exactly once
+// and the run ends (a lost wakeup would leave items to the producer only; a hang fails the test
+// by timing out in ctest).
+void TestAdaptivePoolStress(uint32_t workers, uint64_t spin_ns, uint32_t batch) {
+	DrawPrep::Window<Item>    window(32);
+	DrawPrep::AdaptivePool    pool(workers, workers);
+	std::atomic<bool>         stop {false};
+	std::vector<std::thread>  threads;
+	for (uint32_t w = 0; w < workers; w++) {
+		threads.emplace_back([&, w] {
+			DrawPrep::RunAdaptiveWorker(
+			    pool, window, w, spin_ns, stop,
+			    [&, w](Item& item, uint64_t seq) {
+				    item.output      = Work(item.input);
+				    item.prepared_by = w + 1u;
+				    item.preparations++;
+				    window.Complete(seq);
+			    },
+			    [batch] { return batch; });
+		});
+	}
+	constexpr uint64_t Items = 60000;
+	uint64_t next_input = 0, next_retire = 0, self = 0, by_workers = 0;
+	bool     ok         = true;
+	const auto retire_head = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.output = Work(item.input);
+			item.preparations++;
+			self++;
+		} else {
+			while (!window.HeadDone()) {
+				std::this_thread::yield();
+			}
+			by_workers++;
+		}
+		ok &= item.input == next_retire && item.output == Work(item.input) && item.preparations == 1;
+		next_retire++;
+		window.Retire();
+	};
+	std::mt19937 rng(77);
+	while (next_input < Items) {
+		const auto burst = 1u + rng() % 40u;
+		for (uint32_t i = 0; i < burst && next_input < Items; i++) {
+			if (window.Full()) {
+				retire_head();
+			}
+			auto& item        = window.Reserve();
+			item.input        = next_input++;
+			item.output       = 0;
+			item.preparations = 0;
+			window.Publish();
+			(void)pool.OnPublish();
+		}
+		if (rng() % 8u == 0) {
+			pool.SetCap(1u + rng() % workers);
+		}
+		if (rng() % 16u == 0) {
+			// A pause long enough for every worker to park.
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+		// Commit slowly enough that workers have work to find.
+		const auto retire = rng() % (burst + 2u);
+		for (uint32_t i = 0; i < retire && !window.Empty(); i++) {
+			retire_head();
+		}
+	}
+	while (!window.Empty()) {
+		retire_head();
+	}
+	stop.store(true, std::memory_order_seq_cst);
+	pool.WakeAll();
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(ok, "adaptive pool: in order, each item prepared exactly once");
+	Check(next_retire == Items && self + by_workers == Items, "adaptive pool: every item retires");
+	Check(by_workers > Items / 20,"adaptive pool: workers (not only the producer) prepare items");
+	Check(pool.Spinning() == 0, "adaptive pool: no worker counts as spinning after shutdown");
+	std::printf("  adaptive pool %u workers spin %llu ns batch %u: %llu of %llu by workers, %llu wakes\n",
+	            workers, static_cast<unsigned long long>(spin_ns), batch,
+	            static_cast<unsigned long long>(by_workers), static_cast<unsigned long long>(Items),
+	            static_cast<unsigned long long>(pool.Wakes()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1229,12 +1340,6 @@ void TestAwaitHead() {
 		int        prepared = 0;
 		int        spins    = 0;
 		const auto stats    = DrawPrep::AwaitHead(
-			const auto prepare = [&](Item* item, uint64_t seq) {
-				item->output      = Work(item->input);
-				item->prepared_by = w + 1u;
-				item->preparations++;
-				window.Complete(seq);
-			};
             gate, window, always, [&](Item&, uint64_t) { prepared++; },
             [&](uint32_t, uint64_t) {
                 spins++;
@@ -2238,6 +2343,7 @@ int main(int argc, char** argv) {
 	TestReadSetValidateInPlace();
 	TestReadSetLeanMatchesPlain();
 	TestCodeDigestCache();
+	TestAdaptiveCap();
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();
@@ -2247,12 +2353,18 @@ int main(int argc, char** argv) {
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
 	TestWindowConcurrent(32, 6, 200000); // the default shape
 	TestWindowConcurrent(32, 1, 50000);
+	TestWindowConcurrent(4, 8, 200000, 2); // KYTY_DRAW_PREP_LEAN claim part
+	TestWindowConcurrent(32, 6, 200000, 2);
+	TestWindowConcurrent(32, 3, 200000, 4);
 	TestWorkerGateBasics();
 	TestAwaitHead();
 	TestWorkerGateStress();
 	TestColdTokenStranded();
 	TestColdTokenStress();
 	TestStealStress();
+	TestAdaptivePoolStress(6, 10'000, 1);
+	TestAdaptivePoolStress(6, 0, 1);
+	TestAdaptivePoolStress(3, 2'000, 2);
 	TestGapLedgerExclusive();
 	TestGapLedgerPhasesAndNested();
 	TestGapLedgerFlushAndOverflow();
@@ -2263,6 +2375,3 @@ int main(int argc, char** argv) {
 	std::puts("DrawPrepTests: all cases passed");
 	return 0;
 }
-	TestWindowConcurrent(4, 8, 200000, 2); // KYTY_DRAW_PREP_LEAN claim part
-	TestWindowConcurrent(32, 6, 200000, 2);
-	TestWindowConcurrent(32, 3, 200000, 4);

@@ -1327,6 +1327,17 @@ uint32_t CoreOfLogicalProcessor(uint32_t logical) {
 	                                  : UINT32_MAX;
 }
 
+uint32_t ProcessAffinityProcessorCount() {
+#if defined(_WIN32)
+	DWORD_PTR process_mask = 0;
+	DWORD_PTR system_mask  = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0 && process_mask != 0) {
+		return static_cast<uint32_t>(std::popcount(static_cast<uint64_t>(process_mask)));
+	}
+#endif
+	return std::max(1u, std::thread::hardware_concurrency());
+}
+
 void SamplePlacement(ThreadRole role) {
 	if (!PlacementSamplingEnabled()) {
 		return;
