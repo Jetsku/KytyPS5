@@ -27,8 +27,10 @@ namespace Libs::Graphics {
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
+// specialization: optional specialization constants of the compute stage.
 vk::Pipeline     CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
-                                       vk::PipelineLayout layout, const char* operation);
+                                       vk::PipelineLayout layout, const char* operation,
+                                       const vk::SpecializationInfo* specialization = nullptr);
 
 // CompileSPV phase times (KYTY_SHADER_PRECOMPILE_STATS=1; all zero otherwise): the function-array
 // shrink, the spirv-val run on a shrunk module (or its skip, a known-valid module) and the driver's

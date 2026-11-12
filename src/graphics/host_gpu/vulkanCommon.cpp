@@ -477,12 +477,14 @@ uint64_t UseShrinkVerdictFile(const std::string& path) {
 }
 
 vk::Pipeline CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
-                                   vk::PipelineLayout layout, const char* operation) {
+                                   vk::PipelineLayout layout, const char* operation,
+                                   const vk::SpecializationInfo* specialization) {
 	const auto                    shader = CompileSPV(code, device);
 	vk::ComputePipelineCreateInfo create {};
 	create.stage.stage    = vk::ShaderStageFlagBits::eCompute;
 	create.stage.module   = shader;
 	create.stage.pName    = "main";
+	create.stage.pSpecializationInfo = specialization;
 	create.layout         = layout;
 	vk::Pipeline pipeline = nullptr;
 	const auto   result   = device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);

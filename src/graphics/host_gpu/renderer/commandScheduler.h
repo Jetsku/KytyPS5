@@ -142,6 +142,19 @@ public:
 	// GraphicContext::queue_mutex: the recorder may need it to submit.
 	void WaitRecorded(uint64_t tick, bool from_producer = true);
 
+	// KYTY_FLUSH_DEFER (graphicsRun.cpp, CommandProcessor::SliceEndFlush): whether a priority
+	// operation (a deferred label, an end-of-pipe interrupt, an eager readback's publication, a
+	// flip's completion) waits for the open recording's tick. Recording thread.
+	[[nodiscard]] bool CurrentTickHasPriorityWork() const noexcept {
+		return m_priority_tick.load(std::memory_order_relaxed) == CurrentTick();
+	}
+	// Submissions handed to the queue that the GPU has not completed (refreshes the timeline).
+	[[nodiscard]] uint64_t Backlog();
+	// A slice-end flush left open: the rendering instance and pending barriers end as a submission
+	// ends them; the recording goes with the next flush (any Submit clears the hold).
+	void                   HoldFlush();
+	[[nodiscard]] bool     FlushHeld() const noexcept { return m_flush_held; }
+
 private:
 	class CommandPool {
 	public:
@@ -226,6 +239,10 @@ private:
 	// clock nanoseconds; the recording producer only).
 	uint64_t m_last_pending_refresh_ns = 0;
 	std::array<SubmitDependency*, SubmitDependencySlots> m_submit_dependencies {};
+	// KYTY_FLUSH_DEFER: the tick the latest priority operation was registered for, and whether
+	// the open recording holds a deferred slice-end flush (recording producer).
+	std::atomic<uint64_t> m_priority_tick {0};
+	bool                  m_flush_held = false;
 	// KYTY_CP_RECORDER: the recorder thread of the guest scheduler (after m_gpu_timing, whose
 	// ring it drives; destroyed before it).
 	std::unique_ptr<CommandRecorder> m_recorder;

@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 
 #include <algorithm>
 #include <array>
@@ -76,6 +77,7 @@ enum class StampMode : uint8_t { Ops, Passes, Alternate };
 
 struct Config {
 	bool      counters     = false; // publish per-flip counters
+	bool      draw_counters = false; // KYTY_GPU_OP_COUNTERS=2: draws by pipeline fragment stage
 	bool      capture      = false; // sampled timestamp captures
 	double    period_s     = 0.0;
 	uint64_t  max_captures = 0;
@@ -116,7 +118,8 @@ const Config& GetConfig() {
 			}
 		}
 		if (EnvSet("KYTY_GPU_OP_COUNTERS")) {
-			c.counters = std::strcmp(std::getenv("KYTY_GPU_OP_COUNTERS"), "0") != 0;
+			c.counters      = std::strcmp(std::getenv("KYTY_GPU_OP_COUNTERS"), "0") != 0;
+			c.draw_counters = std::strcmp(std::getenv("KYTY_GPU_OP_COUNTERS"), "2") == 0;
 		} else {
 			c.counters = c.capture || HangTrace::Enabled() || Profiler::AggregateEnabled();
 		}
@@ -201,6 +204,58 @@ bool IsCapture(VkCommandBuffer cb) noexcept {
 	return cb == g_capture_cb.load(std::memory_order_relaxed);
 }
 
+// Cumulative totals for gpucounts.csv (counters on), never reset.
+struct Totals {
+	std::atomic<uint64_t> submit_calls {0};
+	std::atomic<uint64_t> submit_cbs {0};
+	std::atomic<uint64_t> full_barriers {0}; // a memory barrier ALL_COMMANDS -> ALL_COMMANDS
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(FlushCause::Count)> flush {};
+	// KYTY_GPU_OP_COUNTERS=2: guest draws by the bound pipeline's fragment stage
+	// (PipelineClass), switches between a pipeline with and one without a fragment stage between
+	// consecutive draws of one rendering instance, and graphics pipelines created per class.
+	std::array<std::atomic<uint64_t>, 4> draws {};
+	std::atomic<uint64_t>                fragment_switches {0};
+	std::array<std::atomic<uint64_t>, 4> pipelines {};
+	// Sums of the per-flip counters published by OnGuestFlip.
+	uint64_t guest_cbs = 0, render_passes = 0, rendering_ends = 0, barriers = 0;
+};
+Totals g_totals;
+
+constexpr std::array<const char*, static_cast<size_t>(FlushCause::Count)> kFlushCauseNames = {
+    "slice_end",          "slice_stopped",           "eop_batch",
+    "eop_packet_bound",   "idle_gpu",                "eager_readback",
+    "periodic",           "batched",                 "deferred_label_wait",
+    "proxy_label",        "flip_wait",               "before_gc",
+    "defer_held",         "defer_declined_priority", "defer_declined_backlog",
+    "defer_released_backlog", "defer_released_idle"};
+
+// KYTY_GPU_OP_COUNTERS=2: a graphics pipeline's fragment stage.
+enum class PipelineClass : uint8_t { Unknown, GuestFragment, NoFragment, EmptyFragment };
+constexpr std::array<const char*, 4> kPipelineClassNames = {"unknown", "guest_fs", "no_fs", "empty_fs"};
+std::mutex                                  g_pipeline_class_mutex;
+std::unordered_map<uint64_t, PipelineClass> g_pipeline_class;
+// The guest buffer's bound graphics pipeline class and the class of the previous draw of the
+// current rendering instance (Unknown after a begin). Only the guest buffer's recording thread.
+std::atomic<uint8_t> g_bound_class {0};
+std::atomic<uint8_t> g_pass_draw_class {0};
+
+void CountDraw(VkCommandBuffer cb) noexcept {
+	if (!IsGuest(cb)) {
+		return;
+	}
+	const auto bound = g_bound_class.load(std::memory_order_relaxed);
+	g_totals.draws[bound & 3u].fetch_add(1, std::memory_order_relaxed);
+	const auto previous = g_pass_draw_class.exchange(bound, std::memory_order_relaxed);
+	const auto has_fs   = [](uint8_t c) {
+		return c == static_cast<uint8_t>(PipelineClass::GuestFragment) ||
+		       c == static_cast<uint8_t>(PipelineClass::EmptyFragment);
+	};
+	const auto known = [](uint8_t c) { return c != static_cast<uint8_t>(PipelineClass::Unknown); };
+	if (known(previous) && known(bound) && has_fs(previous) != has_fs(bound)) {
+		g_totals.fragment_switches.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void CountBarrier(uint64_t transitions) noexcept {
 	g_counters.barriers.fetch_add(1, std::memory_order_relaxed);
 	if (transitions != 0) {
@@ -249,6 +304,8 @@ struct RealFunctions {
 	PFN_vkQueueSubmit2                     vkQueueSubmit2                     = nullptr;
 	PFN_vkCreateImageView                  vkCreateImageView                  = nullptr;
 	PFN_vkDestroyImageView                 vkDestroyImageView                 = nullptr;
+	PFN_vkCreateGraphicsPipelines          vkCreateGraphicsPipelines          = nullptr;
+	PFN_vkDestroyPipeline                  vkDestroyPipeline                  = nullptr;
 	// Not hooked; used to record the profiler's own commands.
 	PFN_vkCmdWriteTimestamp2 vkCmdWriteTimestamp2 = nullptr;
 	PFN_vkCmdWriteTimestamp  vkCmdWriteTimestamp  = nullptr;
@@ -1181,6 +1238,16 @@ Writer& GetWriter() {
 VKAPI_ATTR void VKAPI_CALL HookCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point,
                                                VkPipeline pipeline) {
 	g_real.vkCmdBindPipeline(cb, point, pipeline);
+	if (GetConfig().draw_counters && point == VK_PIPELINE_BIND_POINT_GRAPHICS && IsGuest(cb)) {
+		auto pipeline_class = PipelineClass::Unknown;
+		{
+			std::lock_guard lock(g_pipeline_class_mutex);
+			if (const auto found = g_pipeline_class.find(HandleBits(pipeline)); found != g_pipeline_class.end()) {
+				pipeline_class = found->second;
+			}
+		}
+		g_bound_class.store(static_cast<uint8_t>(pipeline_class), std::memory_order_relaxed);
+	}
 	if (IsCapture(cb)) [[unlikely]] {
 		std::lock_guard lock(g_state.mutex);
 		if (point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -1195,6 +1262,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDraw(VkCommandBuffer cb, uint32_t vertex_count
                                        uint32_t instance_count, uint32_t first_vertex,
                                        uint32_t first_instance) {
 	g_real.vkCmdDraw(cb, vertex_count, instance_count, first_vertex, first_instance);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::Draw, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
 			op.v[0] = vertex_count;
@@ -1208,6 +1276,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexed(VkCommandBuffer cb, uint32_t index
                                               int32_t vertex_offset, uint32_t first_instance) {
 	g_real.vkCmdDrawIndexed(cb, index_count, instance_count, first_index, vertex_offset,
 	                        first_instance);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndexed, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
 			op.v[0] = index_count;
@@ -1220,6 +1289,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buff
                                                VkDeviceSize offset, uint32_t draw_count,
                                                uint32_t stride) {
 	g_real.vkCmdDrawIndirect(cb, buffer, offset, draw_count, stride);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndirect, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.v[0] = draw_count; });
@@ -1230,6 +1300,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuff
                                                       VkDeviceSize offset, uint32_t draw_count,
                                                       uint32_t stride) {
 	g_real.vkCmdDrawIndexedIndirect(cb, buffer, offset, draw_count, stride);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndexedIndirect, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.v[0] = draw_count; });
@@ -1242,6 +1313,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer
                                                     uint32_t max_draw_count, uint32_t stride) {
 	g_real.vkCmdDrawIndirectCount(cb, buffer, offset, count_buffer, count_offset, max_draw_count,
 	                              stride);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndirectCount, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.v[0] = max_draw_count; });
@@ -1256,6 +1328,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirectCount(VkCommandBuffer cb, V
                                                            uint32_t     stride) {
 	g_real.vkCmdDrawIndexedIndirectCount(cb, buffer, offset, count_buffer, count_offset,
 	                                     max_draw_count, stride);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndexedIndirectCount, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.v[0] = max_draw_count; });
@@ -1265,6 +1338,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirectCount(VkCommandBuffer cb, V
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksEXT(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                                    uint32_t z) {
 	g_real.vkCmdDrawMeshTasksEXT(cb, x, y, z);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMesh, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
 			op.v[0] = x;
@@ -1278,6 +1352,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectEXT(VkCommandBuffer cb, V
                                                            VkDeviceSize offset,
                                                            uint32_t draw_count, uint32_t stride) {
 	g_real.vkCmdDrawMeshTasksIndirectEXT(cb, buffer, offset, draw_count, stride);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMeshIndirect, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.v[0] = draw_count; });
@@ -1289,6 +1364,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
     VkDeviceSize count_offset, uint32_t max_draw_count, uint32_t stride) {
 	g_real.vkCmdDrawMeshTasksIndirectCountEXT(cb, buffer, offset, count_buffer, count_offset,
 	                                          max_draw_count, stride);
+	CountDraw(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMeshIndirectCount, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.v[0] = max_draw_count; });
@@ -1521,6 +1597,10 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
 	if (!IsGuest(cb)) {
 		return;
 	}
+	if (memory_count != 0 && src_stages == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+	    dst_stages == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) {
+		g_totals.full_barriers.fetch_add(1, std::memory_order_relaxed);
+	}
 	uint32_t transitions = 0;
 	for (uint32_t i = 0; i < image_count; ++i) {
 		transitions += images[i].oldLayout != images[i].newLayout ? 1u : 0u;
@@ -1546,6 +1626,14 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
 	g_real.vkCmdPipelineBarrier2(cb, dependency);
 	if (!IsGuest(cb) || dependency == nullptr) {
 		return;
+	}
+	for (uint32_t i = 0; i < dependency->memoryBarrierCount; ++i) {
+		const auto& memory = dependency->pMemoryBarriers[i];
+		if (memory.srcStageMask == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT &&
+		    memory.dstStageMask == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) {
+			g_totals.full_barriers.fetch_add(1, std::memory_order_relaxed);
+			break;
+		}
 	}
 	uint32_t transitions = 0;
 	for (uint32_t i = 0; i < dependency->imageMemoryBarrierCount; ++i) {
@@ -1584,6 +1672,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdBeginRendering(VkCommandBuffer cb, const VkRen
 		return;
 	}
 	g_counters.render_passes.fetch_add(1, std::memory_order_relaxed);
+	g_pass_draw_class.store(static_cast<uint8_t>(PipelineClass::Unknown), std::memory_order_relaxed);
 	if (IsCapture(cb)) [[unlikely]] {
 		PassRecord pass;
 		pass.width     = info->renderArea.extent.width;
@@ -1679,6 +1768,14 @@ VKAPI_ATTR VkResult VKAPI_CALL HookEndCommandBuffer(VkCommandBuffer cb) {
 
 VKAPI_ATTR VkResult VKAPI_CALL HookQueueSubmit(VkQueue queue, uint32_t count,
                                                const VkSubmitInfo* submits, VkFence fence) {
+	{
+		uint64_t cbs = 0;
+		for (uint32_t i = 0; i < count; ++i) {
+			cbs += submits[i].commandBufferCount;
+		}
+		g_totals.submit_calls.fetch_add(1, std::memory_order_relaxed);
+		g_totals.submit_cbs.fetch_add(cbs, std::memory_order_relaxed);
+	}
 	if (g_capture_window.load(std::memory_order_relaxed)) [[unlikely]] {
 		uint64_t cbs = 0;
 		for (uint32_t i = 0; i < count; ++i) {
@@ -1693,6 +1790,14 @@ VKAPI_ATTR VkResult VKAPI_CALL HookQueueSubmit(VkQueue queue, uint32_t count,
 
 VKAPI_ATTR VkResult VKAPI_CALL HookQueueSubmit2(VkQueue queue, uint32_t count,
                                                 const VkSubmitInfo2* submits, VkFence fence) {
+	{
+		uint64_t cbs = 0;
+		for (uint32_t i = 0; i < count; ++i) {
+			cbs += submits[i].commandBufferInfoCount;
+		}
+		g_totals.submit_calls.fetch_add(1, std::memory_order_relaxed);
+		g_totals.submit_cbs.fetch_add(cbs, std::memory_order_relaxed);
+	}
 	if (g_capture_window.load(std::memory_order_relaxed)) [[unlikely]] {
 		uint64_t cbs = 0;
 		for (uint32_t i = 0; i < count; ++i) {
@@ -1724,6 +1829,114 @@ VKAPI_ATTR void VKAPI_CALL HookDestroyImageView(VkDevice device, VkImageView vie
 		g_view_formats.erase(HandleBits(view));
 	}
 	g_real.vkDestroyImageView(device, view, allocator);
+}
+
+// KYTY_GPU_OP_COUNTERS=2: the fragment stage of every graphics pipeline made (libraries are not
+// bound; a pipeline linked from libraries has no stages here and stays Unknown).
+PipelineClass ClassOf(const VkGraphicsPipelineCreateInfo& info) {
+	if (info.stageCount == 0 || info.pStages == nullptr) {
+		return PipelineClass::Unknown;
+	}
+	for (uint32_t i = 0; i < info.stageCount; ++i) {
+		if (info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+			const auto empty = EmptyFragment::Module(); // KYTY_EMPTY_FS
+			return empty != nullptr && info.pStages[i].module == static_cast<VkShaderModule>(empty)
+			           ? PipelineClass::EmptyFragment
+			           : PipelineClass::GuestFragment;
+		}
+	}
+	return PipelineClass::NoFragment;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL HookCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache,
+                                                           uint32_t                            count,
+                                                           const VkGraphicsPipelineCreateInfo* infos,
+                                                           const VkAllocationCallbacks*        allocator,
+                                                           VkPipeline*                         pipelines) {
+	const auto result = g_real.vkCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+	if (pipelines == nullptr || infos == nullptr) {
+		return result;
+	}
+	std::lock_guard lock(g_pipeline_class_mutex);
+	for (uint32_t i = 0; i < count; ++i) {
+		if (pipelines[i] == VK_NULL_HANDLE || (infos[i].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0) {
+			continue;
+		}
+		const auto pipeline_class = ClassOf(infos[i]);
+		g_pipeline_class[HandleBits(pipelines[i])] = pipeline_class;
+		g_totals.pipelines[static_cast<size_t>(pipeline_class)].fetch_add(1, std::memory_order_relaxed);
+	}
+	return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL HookDestroyPipeline(VkDevice device, VkPipeline pipeline,
+                                               const VkAllocationCallbacks* allocator) {
+	if (pipeline != VK_NULL_HANDLE) {
+		std::lock_guard lock(g_pipeline_class_mutex);
+		g_pipeline_class.erase(HandleBits(pipeline));
+	}
+	g_real.vkDestroyPipeline(device, pipeline, allocator);
+}
+
+// gpucounts.csv (counters on, hang trace on): cumulative totals, appended at most once a second
+// from OnGuestFlip. Per-window values are differences of two snapshots (the same t_ms groups one).
+void WriteCountsFile(uint64_t flips) {
+	static uint64_t last_ns = 0;
+	static bool     failed  = false;
+	const auto      now     = NowNs();
+	if (failed || now - last_ns < 1'000'000'000ull) {
+		return;
+	}
+	last_ns         = now;
+	const auto dir  = HangTrace::OutputDirectory();
+	if (dir.empty()) {
+		return;
+	}
+	const auto path   = std::filesystem::path(dir) / "gpucounts.csv";
+	static bool header = false;
+	auto*       file   = std::fopen(path.string().c_str(), header ? "ab" : "wb");
+	if (file == nullptr) {
+		failed = true;
+		return;
+	}
+	std::string out;
+	if (!header) {
+		out += "t_ms,flips,kind,name,value\n";
+		header = true;
+	}
+	const auto t_ms = static_cast<unsigned long long>(HangTrace::NowNs() / 1'000'000ull);
+	const auto row  = [&](const char* kind, std::string_view name, uint64_t value) {
+		out += fmt::format("{},{},{},{},{}\n", t_ms, flips, kind, name, value);
+	};
+	const auto load = [](const std::atomic<uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+	row("total", "submit_calls", load(g_totals.submit_calls));
+	row("total", "submit_cbs", load(g_totals.submit_cbs));
+	row("total", "guest_cbs", g_totals.guest_cbs);
+	row("total", "render_passes", g_totals.render_passes);
+	row("total", "rendering_ends", g_totals.rendering_ends);
+	row("total", "barriers", g_totals.barriers);
+	row("total", "full_barriers", load(g_totals.full_barriers));
+	for (size_t i = 0; i < kFlushCauseNames.size(); ++i) {
+		row("flush", kFlushCauseNames[i], load(g_totals.flush[i]));
+	}
+	if (GetConfig().draw_counters) {
+		for (size_t i = 0; i < kPipelineClassNames.size(); ++i) {
+			row("draws", kPipelineClassNames[i], load(g_totals.draws[i]));
+			row("pipelines", kPipelineClassNames[i], load(g_totals.pipelines[i]));
+		}
+		row("total", "fragment_switches", load(g_totals.fragment_switches));
+	}
+	for (auto* site = g_sites.load(std::memory_order_acquire); site != nullptr;
+	     site       = site->next.load(std::memory_order_relaxed)) {
+		if (const auto barriers = site->barriers.load(std::memory_order_relaxed); barriers != 0) {
+			row("site_barriers", site->name, barriers);
+		}
+		if (const auto ends = site->end_renderings.load(std::memory_order_relaxed); ends != 0) {
+			row("site_ends", site->name, ends);
+		}
+	}
+	std::fwrite(out.data(), 1, out.size(), file);
+	std::fclose(file);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1899,6 +2112,13 @@ void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept {
 	}
 }
 
+void CountFlush(FlushCause cause) noexcept {
+	const auto index = static_cast<size_t>(cause);
+	if (index < g_totals.flush.size()) {
+		g_totals.flush[index].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void CountEndRendering() noexcept {
 	g_counters.rendering_ends.fetch_add(1, std::memory_order_relaxed);
 	auto* site = t_site != nullptr ? t_site : &g_unknown_site;
@@ -1931,10 +2151,14 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier, &HookCmdPipelineBarrier);
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier2, &HookCmdPipelineBarrier2);
 	KYTY_GPU_OP_HOOK(vkCmdBeginRendering, &HookCmdBeginRendering);
-	if (capture) {
-		g_real.vkCmdWriteTimestamp2 = d.vkCmdWriteTimestamp2;
-		g_real.vkCmdWriteTimestamp  = d.vkCmdWriteTimestamp;
-		g_real.vkCmdResetQueryPool  = d.vkCmdResetQueryPool;
+	// gpucounts.csv submit totals (the capture also counts its own window through them).
+	KYTY_GPU_OP_HOOK(vkQueueSubmit, &HookQueueSubmit);
+	KYTY_GPU_OP_HOOK(vkQueueSubmit2, &HookQueueSubmit2);
+	if (GetConfig().draw_counters) {
+		KYTY_GPU_OP_HOOK(vkCreateGraphicsPipelines, &HookCreateGraphicsPipelines);
+		KYTY_GPU_OP_HOOK(vkDestroyPipeline, &HookDestroyPipeline);
+	}
+	if (capture || GetConfig().draw_counters) {
 		KYTY_GPU_OP_HOOK(vkCmdBindPipeline, &HookCmdBindPipeline);
 		KYTY_GPU_OP_HOOK(vkCmdDraw, &HookCmdDraw);
 		KYTY_GPU_OP_HOOK(vkCmdDrawIndexed, &HookCmdDrawIndexed);
@@ -1946,6 +2170,11 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksIndirectEXT, &HookCmdDrawMeshTasksIndirectEXT);
 		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksIndirectCountEXT,
 		                 &HookCmdDrawMeshTasksIndirectCountEXT);
+	}
+	if (capture) {
+		g_real.vkCmdWriteTimestamp2 = d.vkCmdWriteTimestamp2;
+		g_real.vkCmdWriteTimestamp  = d.vkCmdWriteTimestamp;
+		g_real.vkCmdResetQueryPool  = d.vkCmdResetQueryPool;
 		KYTY_GPU_OP_HOOK(vkCmdDispatch, &HookCmdDispatch);
 		KYTY_GPU_OP_HOOK(vkCmdDispatchIndirect, &HookCmdDispatchIndirect);
 		KYTY_GPU_OP_HOOK(vkCmdCopyBuffer, &HookCmdCopyBuffer);
@@ -1964,8 +2193,6 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 		KYTY_GPU_OP_HOOK(vkCmdEndQuery, &HookCmdEndQuery);
 		KYTY_GPU_OP_HOOK(vkCmdCopyQueryPoolResults, &HookCmdCopyQueryPoolResults);
 		KYTY_GPU_OP_HOOK(vkEndCommandBuffer, &HookEndCommandBuffer);
-		KYTY_GPU_OP_HOOK(vkQueueSubmit, &HookQueueSubmit);
-		KYTY_GPU_OP_HOOK(vkQueueSubmit2, &HookQueueSubmit2);
 		KYTY_GPU_OP_HOOK(vkCreateImageView, &HookCreateImageView);
 		KYTY_GPU_OP_HOOK(vkDestroyImageView, &HookDestroyImageView);
 	}
@@ -2076,6 +2303,16 @@ void OnGuestFlip() {
 	counts.draw_write_sinks      = take_batch(BarrierBatchEvent::DrawWriteSinks);
 	counts.rendering_ends = g_counters.rendering_ends.exchange(0, std::memory_order_relaxed);
 	HangTrace::RecordGpuOpCounts(counts);
+	if (HangTrace::Enabled()) {
+		// One flip thread at a time publishes (flips are serialized by the presenter).
+		static std::mutex           totals_mutex;
+		std::lock_guard             lock(totals_mutex);
+		g_totals.guest_cbs += counts.command_buffers;
+		g_totals.render_passes += counts.render_passes;
+		g_totals.rendering_ends += counts.rendering_ends;
+		g_totals.barriers += counts.barriers;
+		WriteCountsFile(g_flip_seq.load(std::memory_order_relaxed));
+	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuRenderingEnds, counts.rendering_ends);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuDrawWriteSinks, counts.draw_write_sinks);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarrierRequests, counts.barrier_requests);

@@ -140,6 +140,14 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferFlushAndWait();
+	// The flush at the end of a queue's slice that made progress (complete: the submission ended;
+	// otherwise it stopped at a wait or yielded).
+	void            SliceEndFlush(bool complete);
+	// KYTY_FLUSH_DEFER: a held slice-end flush submitted once the GPU is down to its last
+	// submission (checked every 16 units of weight: a draw 1, a dispatch 4); true when submitted.
+	bool            MaybeReleaseHeldFlush(uint32_t weight);
+	// KYTY_FLUSH_DEFER: the held flush, if any, before the GPU thread waits for work.
+	void            ReleaseHeldFlush();
 	static uint32_t EopFlushPacketLimit();
 	void            BufferWait();
 	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
@@ -542,6 +550,7 @@ private:
 	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
 	uint64_t  m_idle_flush_tick             = 0;
 	uint32_t  m_idle_flush_draws            = 0;
+	uint32_t  m_held_flush_checks           = 0; // KYTY_FLUSH_DEFER (MaybeReleaseHeldFlush)
 	// KYTY_SUBMIT_EVERY: the recording's idle-early submit is armed (its first command after a
 	// non-batch submit found the GPU idle), and the tick our last batch submit opened.
 	bool      m_idle_flush_armed            = false;

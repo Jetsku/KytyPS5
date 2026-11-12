@@ -6,6 +6,12 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// Bitmap words each invocation reads (FaultManager, KYTY_FAULT_SCAN_WORDS): 4 (default, upstream
+// fd04c3fa9) reads one uvec4; 16 (chenxiao07/KytyPS5 b7aa2b877) reads four uvec4s, each pass
+// consecutive across the invocations, skips zero blocks and stores only into the nonzero words it
+// reports. Either way, past MAX_PAGE_FAULTS the pages not reported stay set for the next scan.
+layout(constant_id = 0) const uint WORDS_PER_INVOCATION = 4u;
+
 layout(std430, binding = 0) buffer input_buf {
     uvec4 fault_buffer[];
 };
@@ -17,8 +23,44 @@ layout(std430, binding = 1) buffer output_buf32 {
     uint download_buffer32[];
 };
 
+// KYTY_FAULT_SCAN_WORDS=16: four uvec4s per invocation.
+void ScanSixteen() {
+    const uint invocations = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint pass = 0u; pass < WORDS_PER_INVOCATION / 4u; ++pass) {
+        const uint  vec   = pass * invocations + gl_GlobalInvocationID.x;
+        const uvec4 words = fault_buffer[vec];
+        if (all(equal(words, uvec4(0u)))) {
+            continue;
+        }
+        for (uint component = 0u; component < 4u; ++component) {
+            uint word = words[component];
+            if (word == 0u) {
+                continue;
+            }
+            const uint base_bit = (vec * 4u + component) * 32u;
+            while (word != 0u) {
+                const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+                if (store_index >= MAX_PAGE_FAULTS) {
+                    // Pages not reported stay set for the next scan.
+                    fault_buffer[vec][component] = word;
+                    return;
+                }
+                const uint bit = findLSB(word);
+                word &= word - 1;
+                const uint page = base_bit + bit;
+                download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+            }
+            fault_buffer[vec][component] = 0u;
+        }
+    }
+}
+
 // Each invocation scans four bitmap words; nearly all are zero and return without a store.
 void main() {
+    if (WORDS_PER_INVOCATION != 4u) {
+        ScanSixteen();
+        return;
+    }
     const uint id = gl_GlobalInvocationID.x;
     const uvec4 words = fault_buffer[id];
     if (all(equal(words, uvec4(0u)))) {

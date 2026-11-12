@@ -250,6 +250,21 @@ uint64_t CommandScheduler::FlushObservable() {
 	return tick;
 }
 
+uint64_t CommandScheduler::Backlog() {
+	m_master.Refresh();
+	const auto submitted = m_master.CurrentTick() - 1;
+	const auto done      = m_master.KnownGpuTick();
+	return submitted > done ? submitted - done : 0;
+}
+
+void CommandScheduler::HoldFlush() {
+	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
+	m_command.EndRendering();
+	m_command.FlushBarriers();
+	m_flush_held = true;
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit({}, true);
 	m_master.Wait(tick);
@@ -415,6 +430,7 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 			}
 		}
 		const bool was_empty = m_priority_operations.empty();
+		m_priority_tick.store(CurrentTick(), std::memory_order_relaxed);
 		m_priority_operations.push({std::move(operation), CurrentTick()});
 		lock.unlock();
 		if (!PriorityWakeupsBatched()) {
@@ -656,6 +672,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
 	EXIT_IF(m_command.IsInvalid());
+	m_flush_held = false; // KYTY_FLUSH_DEFER: a held slice end goes with this submission
 	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
 		// Work its owner deferred to the end of this command buffer (SetPreSubmitHook).
 		m_in_pre_submit = true;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -30,6 +31,20 @@ constexpr size_t BdaDownloadSize   = BdaStoreLogOffset + BufferCache::BDA_STORE_
 
 bool StoreLogEnabled() {
 	return ShaderRecompiler::GetCodegenOptions().bda_store_log;
+}
+
+// KYTY_FAULT_SCAN_WORDS=16 (default 4 = upstream fd04c3fa9; 16 from chenxiao07/KytyPS5 b7aa2b877):
+// bitmap words each invocation of fault_buffer_process.comp reads (its WORDS_PER_INVOCATION
+// specialization constant). 4: one uvec4 per invocation (upstream's scan). 16: a quarter of those
+// invocations, each reading four uvec4s, skipping zero blocks and storing only into nonzero words; the
+// reported pages are the same. Any other value: 4.
+uint32_t FaultScanWords() {
+	static const uint32_t words = [] {
+		const auto* value = std::getenv("KYTY_FAULT_SCAN_WORDS");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 4ul;
+		return n == 16 ? 16u : 4u;
+	}();
+	return words;
 }
 
 } // namespace
@@ -65,9 +80,14 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                           &m_fault_process_pipeline_layout),
 	    "create fault-buffer pipeline layout");
 
+	// KYTY_FAULT_SCAN_WORDS: WORDS_PER_INVOCATION (constant 0).
+	const uint32_t                   scan_words = FaultScanWords();
+	const vk::SpecializationMapEntry scan_entry {0, 0, sizeof(uint32_t)};
+	const vk::SpecializationInfo     scan_spec {1, &scan_entry, sizeof(uint32_t), &scan_words};
 	m_fault_process_pipeline =
 	    CreateComputePipeline(m_graphics.device, FAULT_BUFFER_PROCESS_SPV,
-		                      m_fault_process_pipeline_layout, "create fault-buffer pipeline");
+	                          m_fault_process_pipeline_layout, "create fault-buffer pipeline",
+	                          &scan_spec);
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
 }
 
@@ -129,7 +149,7 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128; // Four words per invocation (fd04c3fa9).
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32 / FaultScanWords(); // Four words per invocation by default (fd04c3fa9).
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;

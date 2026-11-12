@@ -5972,7 +5972,9 @@ struct PipelineCache::FastFirstState {
 		LOGF("PipelineTrace: graphics unoptimized build VS=0x%016" PRIx64 " PS=0x%016" PRIx64 "\n",
 		     outer.a, outer.b);
 		const auto begin  = CompileClockNs();
-		const auto result = device.createGraphicsPipelines(nullptr, 1, &fast_info, nullptr, pipeline);
+		EmptyFragment::Storage empty_fs; // KYTY_EMPTY_FS: the driver's copy only
+		const auto result = device.createGraphicsPipelines(nullptr, 1, &EmptyFragment::Apply(fast_info, empty_fs),
+		                                                   nullptr, pipeline);
 		if (result != vk::Result::eSuccess || *pipeline == nullptr) {
 			scheduler.Release();
 			counters.fast_failed.fetch_add(1, std::memory_order_relaxed);

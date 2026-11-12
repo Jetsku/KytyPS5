@@ -59,6 +59,15 @@
 //                                      batcher (KYTY_BARRIER_BATCH, render.h) also its request,
 //                                      merge, elision, sink and render-split counts; recorded
 //                                      batches are attributed to the batch.<origin> sites.
+//                                      With the hang trace on, gpucounts.csv gets cumulative
+//                                      totals about once a second (flips, vkQueueSubmit calls
+//                                      and command buffers, guest command buffers, render-pass
+//                                      begins and ends per site, barriers per site and full
+//                                      ALL_COMMANDS->ALL_COMMANDS memory barriers, FlushCause).
+//                                      =2 also hooks pipeline creation, binds and draws: guest
+//                                      draws by pipeline fragment stage (guest pixel shader,
+//                                      none) and the switches between the two inside one
+//                                      rendering instance.
 //
 // With everything unset no hook is installed and each KYTY_GPU_OP_SITE scope costs one
 // predictable branch on a global flag.
@@ -199,6 +208,41 @@ inline void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount = 1) noex
 inline void CountEndRendering() noexcept {
 	if (Detail::g_active) [[unlikely]] {
 		Detail::CountEndRendering();
+	}
+}
+
+// Why the command processor submitted a guest command buffer, and the decisions of the flush
+// deferral (KYTY_FLUSH_DEFER, graphicsRun.cpp). Counted with the counters on; written cumulatively
+// to gpucounts.csv in the hang-trace directory (see WriteCountsFile in gpuOpProfiler.cpp). Guest
+// command buffers minus the sum of the submit causes are the submits of other paths (waits at the
+// current tick, readbacks, flips, shutdown).
+enum class FlushCause : uint32_t {
+	SliceEnd,          // a queue's submission completed (slice end)
+	SliceStopped,      // a slice stopped at a wait or yielded
+	EopBatch,          // every KYTY_EOP_FLUSH_BATCH-th end-of-pipe interrupt request
+	EopPacketBound,    // KYTY_EOP_FLUSH_PACKETS after a batched interrupt request
+	IdleGpu,           // KYTY_IDLE_FLUSH_DRAWS early submit
+	EagerReadback,     // KYTY_READBACK_EAGER producer submit
+	Periodic,          // KYTY_DRAW_FLUSH_INTERVAL / KYTY_DISPATCH_FLUSH_INTERVAL
+	Batched,           // KYTY_SUBMIT_EVERY
+	DeferredLabelWait, // WAIT_REG_MEM on a label written at its tick's completion
+	ProxyLabel,        // visibility-proxy label a guest thread is about to wait for
+	FlipWait,          // blocking WAIT_FLIP_DONE
+	BeforeGc,          // KYTY_FLUSH_BEFORE_GC
+	// KYTY_FLUSH_DEFER decisions (not submits):
+	DeferHeld,             // a slice-end flush left open (GPU backlog at the threshold)
+	DeferDeclinedPriority, // not deferred: completion work registered on the open tick
+	DeferDeclinedBacklog,  // not deferred: the GPU backlog was below the threshold
+	DeferReleasedBacklog,  // a held flush submitted once the backlog fell to one submission
+	DeferReleasedIdle,     // a held flush submitted before the GPU thread waited for work
+	Count,
+};
+namespace Detail {
+void CountFlush(FlushCause cause) noexcept;
+} // namespace Detail
+inline void CountFlush(FlushCause cause) noexcept {
+	if (Detail::g_active) [[unlikely]] {
+		Detail::CountFlush(cause);
 	}
 }
 

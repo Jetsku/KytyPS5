@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -2610,6 +2611,8 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// KYTY_EMPTY_FS (pipelineFeedback.h): before any graphics pipeline.
+	EmptyFragment::Configure(graphic_ctx.device, graphic_ctx.physical_device_properties.vendorID);
 	// Diagnostic only (KYTY_GPU_OP_PROFILE / KYTY_GPU_OP_COUNTERS): wraps dispatcher entries.
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	// KYTY_CP_RECORDER_VERIFY ownership hooks wrap the GpuOpProfiler's.

@@ -1200,6 +1200,67 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+// KYTY_FLUSH_DEFER=<n> (live, default 0 = off; adapted from chenxiao07/KytyPS5 31119bdfd): the
+// flush at the end of a completed submission's slice stays open while the GPU still has at least
+// n submissions to run, unless something waits for the open recording's tick: a priority operation
+// registered on it (a label written at completion, an end-of-pipe interrupt, an eager readback's
+// publication; checked after the eager copies are appended, as the flush would). The recording then
+// goes with the next flush of any kind (a slice stopped at a wait, a WAIT_REG_MEM on a deferred
+// label, a flip, a readback's Wait on the open tick, the end-of-pipe batch), once the GPU is down to
+// its last submission (asked every 16 draws or 4 dispatches, MaybeFlushIdleGpu), or before the GPU
+// thread waits for work (ReleaseHeldFlush). Each submission is a drain between back-to-back
+// command buffers on the GPU and a submit on the recorder; what is recorded and the order of GPU
+// work are unchanged.
+static Live::Switch g_flush_defer("KYTY_FLUSH_DEFER", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 64ul));
+});
+
+void CommandProcessor::SliceEndFlush(bool complete) {
+	if (const auto threshold = static_cast<uint64_t>(g_flush_defer.Get()); complete && threshold != 0) {
+		auto& scheduler = GetScheduler();
+		// As BufferFlush would: a read-hot page's eager copy joins this recording first.
+		m_renderer.GetBufferCache().IssueEagerReadbacks();
+		if (scheduler.CurrentTickHasPriorityWork()) {
+			GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferDeclinedPriority);
+		} else if (scheduler.Backlog() < threshold) {
+			GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferDeclinedBacklog);
+		} else {
+			GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferHeld);
+			scheduler.HoldFlush();
+			m_held_flush_checks = 0;
+			return;
+		}
+	}
+	GpuOpProfiler::CountFlush(complete ? GpuOpProfiler::FlushCause::SliceEnd
+	                                   : GpuOpProfiler::FlushCause::SliceStopped);
+	BufferFlush();
+}
+
+bool CommandProcessor::MaybeReleaseHeldFlush(uint32_t weight) {
+	auto& scheduler = GetScheduler();
+	if (!scheduler.FlushHeld()) {
+		return false;
+	}
+	if ((m_held_flush_checks += weight) < 16u) {
+		return false;
+	}
+	m_held_flush_checks = 0;
+	if (scheduler.Backlog() > 1) {
+		return false;
+	}
+	GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferReleasedBacklog);
+	BufferFlush();
+	return true;
+}
+
+void CommandProcessor::ReleaseHeldFlush() {
+	if (GetScheduler().FlushHeld()) {
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferReleasedIdle);
+		BufferFlush();
+	}
+}
+
 // KYTY_EOP_FLUSH_PACKETS: packets processed after the first deferred interrupt before the command
 // buffer is flushed anyway (default 256). Live switch (common/liveSwitch.h), as are
 // KYTY_EOP_FLUSH_BATCH, KYTY_IDLE_FLUSH_DRAWS and KYTY_GFX_SLICE_DRAWS below: thresholds the
@@ -1242,6 +1303,7 @@ uint32_t CommandProcessor::EopFlushPacketLimit() {
 
 void CommandProcessor::BufferFlushForEop() {
 	if (++m_deferred_eop_flushes >= static_cast<uint32_t>(g_eop_flush_batch.Get()) && OptionalSubmitAllowed()) {
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::EopBatch);
 		BufferFlush();
 	}
 }
@@ -1322,6 +1384,7 @@ bool CommandProcessor::MaybeFlushPeriodic(bool dispatch) {
 	if (!OptionalSubmitAllowed()) {
 		return false;
 	}
+	GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::Periodic);
 	BufferFlush();
 	return true;
 }
@@ -1349,7 +1412,11 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	// this producer at most, not for everything recorded until then (KYTY_READBACK_EAGER).
 	if (m_renderer.GetBufferCache().TakeEagerFlushRequest(CurrentBuffer().ActiveRenderingSerial() !=
 	                                                     0)) {
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::EagerReadback);
 		BufferFlush();
+		return;
+	}
+	if (MaybeReleaseHeldFlush(dispatch ? 4u : 1u)) {
 		return;
 	}
 	if (MaybeFlushPeriodic(dispatch)) {
@@ -1394,6 +1461,7 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	}
 	Profiler::CountFrameEvent(in_pass ? Profiler::FrameEvent::IdleFlushesInPass
 	                                  : Profiler::FrameEvent::IdleFlushes);
+	GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::IdleGpu);
 	BufferFlush();
 }
 
@@ -1430,6 +1498,7 @@ void CommandProcessor::MaybeFlushBatched(uint32_t every) {
 			Profiler::CountFrameEvent(in_pass ? Profiler::FrameEvent::IdleFlushesInPass
 			                                  : Profiler::FrameEvent::IdleFlushes);
 		}
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::Batched);
 		BufferFlush();
 		m_batch_flush_tick = GetScheduler().CurrentTick();
 		m_idle_flush_armed = false;
@@ -1690,6 +1759,7 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 				Profiler::CountFrameEvent(Profiler::FrameEvent::WaitRegMemDeferredLabel);
 				if (tick >= GetScheduler().CurrentTick()) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::WaitRegMemDeferredLabelFlushes);
+					GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferredLabelWait);
 					BufferFlush();
 				}
 			}
@@ -2084,6 +2154,13 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (gpu->m_renderer.GetCommandScheduler().FlushHeld()) {
+					// KYTY_FLUSH_DEFER: nothing else would submit the held recording.
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_gfx_cp->ReleaseHeldFlush();
+					gpu->m_queue_mutex.Lock();
+					continue;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
@@ -2133,6 +2210,13 @@ void GuestGpu::ThreadRun(void* data) {
 				if (fence_held && selected_queue >= 0) {
 					// The fence changed which queue runs next.
 					Profiler::CountFrameEvent(Profiler::FrameEvent::FrameFenceHolds);
+				}
+				if (selected_queue < 0 && gpu->m_renderer.GetCommandScheduler().FlushHeld()) {
+					// KYTY_FLUSH_DEFER: every queue waits; what they wait for may be in the held recording.
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_gfx_cp->ReleaseHeldFlush();
+					gpu->m_queue_mutex.Lock();
+					continue;
 				}
 				if (selected_queue < 0) {
 					HangWatchdog::Scope suspended("cp-all-queues-suspended",
@@ -2388,11 +2472,12 @@ bool GuestGpu::Process(Submission& submission) {
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
 					if (FlushBeforeGc()) {
+						GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::BeforeGc);
 						cp.BufferFlush();
 					}
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				cp.SliceEndFlush(complete);
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -2438,11 +2523,12 @@ bool GuestGpu::ProcessGraphicsDirect(Submission& submission, CommandProcessor& c
 	if (progressed) {
 		if (complete) {
 			if (FlushBeforeGc()) {
+				GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::BeforeGc);
 				cp.BufferFlush();
 			}
 			m_renderer.RunGarbageCollector();
 		}
-		cp.BufferFlush();
+		cp.SliceEndFlush(complete);
 	} else if (complete) {
 		m_renderer.RunGarbageCollector();
 	}
@@ -2519,11 +2605,12 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	if (progressed) {
 		if (complete) {
 			if (FlushBeforeGc()) {
+				GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::BeforeGc);
 				cp.BufferFlush();
 			}
 			m_renderer.RunGarbageCollector();
 		}
-		cp.BufferFlush();
+		cp.SliceEndFlush(complete);
 	} else if (complete) {
 		m_renderer.RunGarbageCollector();
 	}
@@ -2837,6 +2924,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	if (!reference && !sequencer && m_deferred_eop_flushes != 0 &&
 	    ++m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
 		// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::EopPacketBound);
 		BufferFlush();
 	}
 	if (!execution.m_next_buffer.empty()) {
@@ -4086,6 +4174,7 @@ CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op
 	const auto handle = static_cast<int>(op.video_out_handle);
 	const auto index  = static_cast<int>(op.display_buffer_index);
 	if (!FlipWaitSuspends()) {
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::FlipWait);
 		BufferFlush();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitBlocking);
 		HangWatchdog::Scope wait("cp-flip-done", handle, index);
@@ -4333,6 +4422,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	if (proxy) {
 		// A guest thread is about to wait for this label: submit its tick now rather than at the
 		// next EOP batch or slice boundary, which can be most of a frame away.
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::ProxyLabel);
 		BufferFlush();
 	}
 	return true;
@@ -7157,6 +7247,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				    static_cast<uint32_t>(std::min<uint64_t>(packet - m_resolver_packets, 1u << 20u));
 				if (m_packets_since_eop_request >= EopFlushPacketLimit() && OptionalSubmitAllowed()) {
 					// Bound how long a batched end-of-pipe interrupt waits (at an op, not a packet).
+					GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::EopPacketBound);
 					BufferFlush();
 				}
 			}

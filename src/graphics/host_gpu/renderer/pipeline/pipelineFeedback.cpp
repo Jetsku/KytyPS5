@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 
@@ -51,8 +52,11 @@ bool Enabled() {
 	return enabled;
 }
 
-vk::Result CreateGraphics(vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info,
+vk::Result CreateGraphics(vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& original,
                           vk::Pipeline* pipeline, Path path) {
+	// KYTY_EMPTY_FS: the driver's copy only (the caller keyed the original).
+	EmptyFragment::Storage storage;
+	const auto&            info = EmptyFragment::Apply(original, storage);
 	if (!Enabled()) {
 		return device.createGraphicsPipelines(cache, 1, &info, nullptr, pipeline);
 	}
@@ -112,3 +116,110 @@ std::string Report() {
 }
 
 } // namespace Libs::Graphics::PipelineFeedback
+
+namespace Libs::Graphics::EmptyFragment {
+
+namespace {
+
+// main() { } with OriginUpperLeft and EarlyFragmentTests, no inputs or outputs (SPIR-V 1.0;
+// chenxiao07/KytyPS5 5a7fa9a1b).
+constexpr uint32_t kEmptyFragmentSpirv[] = {
+    0x07230203, 0x00010000, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+    0x00000000, 0x00000001, 0x0005000f, 0x00000004, 0x00000001, 0x6e69616d, 0x00000000, 0x00030010,
+    0x00000001, 0x00000007, 0x00030010, 0x00000001, 0x00000009, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000001, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000004, 0x000100fd, 0x00010038};
+
+constexpr uint32_t kVendorNvidia = 0x10deu;
+
+vk::ShaderModule                  g_module = nullptr;
+vk::PipelineShaderStageCreateInfo g_stage {};
+std::atomic<uint64_t>             g_applied {0};
+
+} // namespace
+
+void Configure(vk::Device device, uint32_t vendor_id) {
+	const char* value = std::getenv("KYTY_EMPTY_FS");
+	const int   mode  = value != nullptr ? std::atoi(value) : 0;
+	if (g_module != nullptr || mode <= 0 || (mode == 1 && vendor_id != kVendorNvidia)) {
+		if (mode == 1 && vendor_id != kVendorNvidia) {
+			std::printf("Kyty empty fragment shader: off (KYTY_EMPTY_FS=1 applies to NVIDIA only; vendor 0x%x)\n",
+			            vendor_id);
+		}
+		return;
+	}
+	vk::ShaderModuleCreateInfo create {};
+	create.codeSize = sizeof(kEmptyFragmentSpirv);
+	create.pCode    = kEmptyFragmentSpirv;
+	vk::ShaderModule module = nullptr;
+	if (device.createShaderModule(&create, nullptr, &module) != vk::Result::eSuccess || module == nullptr) {
+		std::printf("Kyty empty fragment shader: module creation failed, off (KYTY_EMPTY_FS)\n");
+		return;
+	}
+	g_module       = module;
+	g_stage        = vk::PipelineShaderStageCreateInfo {};
+	g_stage.stage  = vk::ShaderStageFlagBits::eFragment;
+	g_stage.module = module;
+	g_stage.pName  = "main";
+	std::printf("Kyty empty fragment shader: on for pipelines without a pixel shader (KYTY_EMPTY_FS=%d, vendor 0x%x)\n",
+	            mode, vendor_id);
+}
+
+vk::ShaderModule Module() noexcept {
+	return g_module;
+}
+
+bool Eligible(bool library, bool linked, uint32_t stage_count, bool has_fragment, bool rasterizer_discard) noexcept {
+	return !library && !linked && stage_count != 0 && stage_count < Storage {}.stages.size() && !has_fragment &&
+	       !rasterizer_discard;
+}
+
+const vk::GraphicsPipelineCreateInfo& Apply(const vk::GraphicsPipelineCreateInfo& info, Storage& storage) noexcept {
+	if (g_module == nullptr) {
+		return info;
+	}
+	bool linked = false;
+	for (const auto* next = static_cast<const vk::BaseInStructure*>(info.pNext); next != nullptr; next = next->pNext) {
+		if (next->sType == vk::StructureType::ePipelineLibraryCreateInfoKHR ||
+		    next->sType == vk::StructureType::eGraphicsPipelineLibraryCreateInfoEXT) {
+			linked = true;
+		}
+	}
+	bool has_fragment = false;
+	for (uint32_t i = 0; i < info.stageCount && info.pStages != nullptr; i++) {
+		has_fragment |= info.pStages[i].stage == vk::ShaderStageFlagBits::eFragment;
+	}
+	const bool discard = info.pRasterizationState != nullptr && info.pRasterizationState->rasterizerDiscardEnable;
+	if (!Eligible(static_cast<bool>(info.flags & vk::PipelineCreateFlagBits::eLibraryKHR), linked, info.stageCount,
+	              has_fragment, discard) ||
+	    info.pStages == nullptr) {
+		return info;
+	}
+	for (uint32_t i = 0; i < info.stageCount; i++) {
+		storage.stages[i] = info.pStages[i];
+	}
+	storage.stages[info.stageCount] = g_stage;
+	storage.info                    = info;
+	storage.info.stageCount         = info.stageCount + 1;
+	storage.info.pStages            = storage.stages.data();
+	g_applied.fetch_add(1, std::memory_order_relaxed);
+	return storage.info;
+}
+
+const vk::PipelineShaderStageCreateInfo* LibraryStage() noexcept {
+	return g_module != nullptr ? &g_stage : nullptr;
+}
+
+uint64_t AppliedCount() noexcept {
+	return g_applied.load(std::memory_order_relaxed);
+}
+
+void SetModuleForTest(vk::ShaderModule module) noexcept {
+	g_module       = module;
+	g_stage        = vk::PipelineShaderStageCreateInfo {};
+	g_stage.stage  = vk::ShaderStageFlagBits::eFragment;
+	g_stage.module = module;
+	g_stage.pName  = "main";
+}
+
+} // namespace Libs::Graphics::EmptyFragment
