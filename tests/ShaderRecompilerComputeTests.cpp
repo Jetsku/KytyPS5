@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_batch_spv.h"
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_spv.h"
+#include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
@@ -3602,6 +3603,139 @@ public:
     }
     for (auto &segment : old_results) {
       DestroyBuffer(&segment);
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_FAULT_SCAN_WORDS (faultManager.cpp, fault_buffer_process.comp): the scan of the GPU-access bitmap at 16
+  // words per invocation (WORDS_PER_INVOCATION 16, a sixteenth of the workgroups) reports the same pages as at 1 word
+  // and leaves the bitmap clear; past the list's capacity both store a full list of distinct pages that were set.
+  void CheckFaultScanWords() {
+    constexpr const char *name = "FaultScanWords";
+    constexpr u32 words = BufferCache::CACHING_NUMPAGES / 32;
+    constexpr u32 max_faults = 1024; // MAX_PAGE_FAULTS of the build (CMakeLists.txt)
+    constexpr u32 page_bits = 14;    // CACHING_PAGEBITS
+    const auto usage = vk::BufferUsageFlagBits::eStorageBuffer;
+    const auto run = [&](const std::vector<u32> &bitmap, u32 per_invocation, std::vector<uint64_t> &pages,
+                         u32 &count, std::vector<u32> &after) {
+      auto fault = CreateHostBuffer(name, words * 4u, usage, bitmap);
+      auto download = CreateHostBuffer(name, max_faults * 8u, usage, std::vector<u32>(max_faults * 2u, 0u));
+      const vk::DescriptorSetLayoutBinding bindings[]{
+          {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+          {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}};
+      vk::DescriptorSetLayoutCreateInfo layout_info{};
+      layout_info.bindingCount = 2;
+      layout_info.pBindings = bindings;
+      vk::DescriptorSetLayout set_layout = nullptr;
+      RequireVk(name, "layout", m_device.createDescriptorSetLayout(&layout_info, nullptr, &set_layout),
+                "vkCreateDescriptorSetLayout");
+      vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+      pipeline_layout_info.setLayoutCount = 1;
+      pipeline_layout_info.pSetLayouts = &set_layout;
+      vk::PipelineLayout pipeline_layout = nullptr;
+      RequireVk(name, "layout", m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+                "vkCreatePipelineLayout");
+      const auto module = CreateShaderModule(
+          name, std::vector<u32>(std::begin(FAULT_BUFFER_PROCESS_SPV), std::end(FAULT_BUFFER_PROCESS_SPV)));
+      const vk::SpecializationMapEntry entry{0, 0, sizeof(u32)};
+      const vk::SpecializationInfo spec{1, &entry, sizeof(u32), &per_invocation};
+      vk::ComputePipelineCreateInfo pipeline_info{};
+      pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+      pipeline_info.stage.module = module;
+      pipeline_info.stage.pName = "main";
+      pipeline_info.stage.pSpecializationInfo = &spec;
+      pipeline_info.layout = pipeline_layout;
+      vk::Pipeline pipeline = nullptr;
+      RequireVk(name, "pipeline", m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+                "vkCreateComputePipelines");
+      m_device.destroyShaderModule(module, nullptr);
+      const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 2};
+      vk::DescriptorPoolCreateInfo pool_info{};
+      pool_info.maxSets = 1;
+      pool_info.poolSizeCount = 1;
+      pool_info.pPoolSizes = &pool_size;
+      vk::DescriptorPool pool = nullptr;
+      RequireVk(name, "pool", m_device.createDescriptorPool(&pool_info, nullptr, &pool), "vkCreateDescriptorPool");
+      vk::DescriptorSetAllocateInfo allocate{};
+      allocate.descriptorPool = pool;
+      allocate.descriptorSetCount = 1;
+      allocate.pSetLayouts = &set_layout;
+      vk::DescriptorSet set = nullptr;
+      RequireVk(name, "set", m_device.allocateDescriptorSets(&allocate, &set), "vkAllocateDescriptorSets");
+      const vk::DescriptorBufferInfo infos[]{{fault.buffer, 0, fault.size}, {download.buffer, 0, download.size}};
+      vk::WriteDescriptorSet writes[2]{};
+      for (u32 binding = 0; binding < 2; binding++) {
+        writes[binding].dstSet = set;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorCount = 1;
+        writes[binding].descriptorType = vk::DescriptorType::eStorageBuffer;
+        writes[binding].pBufferInfo = &infos[binding];
+      }
+      m_device.updateDescriptorSets(2, writes, 0, nullptr);
+      const auto cmd = BeginCommands(name, "dispatch");
+      cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0, nullptr);
+      cmd.dispatch((words / per_invocation + 63u) / 64u, 1, 1); // as FaultManager::ProcessFaultBuffer
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, 1,
+                          &barrier, 0, nullptr, 0, nullptr);
+      EndSubmitAndFree(name, "dispatch", cmd);
+      const auto list = ReadBuffer(name, download, max_faults * 2u);
+      after = ReadBuffer(name, fault, words);
+      count = list[0];
+      pages.clear();
+      for (u32 i = 1; i <= std::min(count, max_faults - 1u); i++) {
+        pages.push_back(uint64_t{list[i * 2u]} | (uint64_t{list[i * 2u + 1u]} << 32u));
+      }
+      std::sort(pages.begin(), pages.end());
+      m_device.destroyDescriptorPool(pool, nullptr);
+      m_device.destroyPipeline(pipeline, nullptr);
+      m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+      m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+      DestroyBuffer(&fault);
+      DestroyBuffer(&download);
+    };
+    for (const u32 bits : {600u, 1500u}) {
+      std::vector<u32> bitmap(words, 0u);
+      uint64_t state = 0x243f6a8885a308d3ull ^ bits;
+      std::vector<uint64_t> set_pages;
+      while (set_pages.size() < bits) {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        // Clustered (as real faults are: a few bitmap words) and spread over the whole bitmap.
+        const u32 page = (set_pages.size() % 3u == 0) ? static_cast<u32>(state % (words * 32ull))
+                                                       : static_cast<u32>((state % 4096u) + 123456u);
+        if ((bitmap[page / 32u] & (1u << (page % 32u))) == 0) {
+          bitmap[page / 32u] |= 1u << (page % 32u);
+          set_pages.push_back(uint64_t{page} << page_bits);
+        }
+      }
+      std::sort(set_pages.begin(), set_pages.end());
+      std::vector<uint64_t> one, sixteen;
+      std::vector<u32> after_one, after_sixteen;
+      u32 count_one = 0, count_sixteen = 0;
+      run(bitmap, 1u, one, count_one, after_one);
+      run(bitmap, 16u, sixteen, count_sixteen, after_sixteen);
+      const bool distinct_one = std::adjacent_find(one.begin(), one.end()) == one.end();
+      const bool distinct_sixteen = std::adjacent_find(sixteen.begin(), sixteen.end()) == sixteen.end();
+      const bool subset_one = std::includes(set_pages.begin(), set_pages.end(), one.begin(), one.end());
+      const bool subset_sixteen = std::includes(set_pages.begin(), set_pages.end(), sixteen.begin(), sixteen.end());
+      if (bits < max_faults) {
+        Require(name, "under capacity", count_one == bits && count_sixteen == bits, "counts differ from the set bits");
+        Require(name, "under capacity", one == set_pages && sixteen == one, "16-word scan reports other pages");
+        Require(name, "under capacity",
+                std::all_of(after_one.begin(), after_one.end(), [](u32 w) { return w == 0; }) &&
+                    std::all_of(after_sixteen.begin(), after_sixteen.end(), [](u32 w) { return w == 0; }),
+                "bitmap not clear after the scan");
+      } else {
+        Require(name, "over capacity", one.size() == max_faults - 1u && sixteen.size() == max_faults - 1u,
+                "a full list expected from both");
+        Require(name, "over capacity", distinct_one && distinct_sixteen && subset_one && subset_sixteen,
+                "listed pages must be distinct and set");
+      }
     }
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -62025,6 +62159,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckOcclusionBatchShader();
     vulkan.CheckSchedulerPreSubmitHook();
+    vulkan.CheckFaultScanWords();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--predication-only") == 0) {
@@ -63044,6 +63179,7 @@ int main(int argc, char **argv) {
   CheckPm4Predication(vulkan.RuntimeRenderer());
   vulkan.CheckOcclusionBatchShader();
   vulkan.CheckSchedulerPreSubmitHook();
+  vulkan.CheckFaultScanWords();
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());

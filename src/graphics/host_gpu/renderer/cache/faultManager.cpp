@@ -13,6 +13,7 @@
 
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -33,6 +34,18 @@ constexpr size_t BdaDownloadSize   = BdaStoreLogOffset + BufferCache::BDA_STORE_
 
 bool StoreLogEnabled() {
 	return ShaderRecompiler::GetCodegenOptions().bda_store_log;
+}
+
+// KYTY_FAULT_SCAN_WORDS=16 (default 1; chenxiao07/KytyPS5 b7aa2b877): bitmap words each invocation of
+// fault_buffer_process.comp reads (its WORDS_PER_INVOCATION specialization constant). 16: a quarter of the
+// invocations read uvec4s, skip zero blocks and store only into nonzero words; the reported pages are the same.
+uint32_t FaultScanWords() {
+	static const uint32_t words = [] {
+		const auto* value = std::getenv("KYTY_FAULT_SCAN_WORDS");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 1ul;
+		return n == 16 ? 16u : 1u;
+	}();
+	return words;
 }
 
 } // namespace
@@ -74,6 +87,11 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	stage.stage  = vk::ShaderStageFlagBits::eCompute;
 	stage.module = module;
 	stage.pName  = "main";
+	// KYTY_FAULT_SCAN_WORDS: WORDS_PER_INVOCATION (constant 0).
+	const uint32_t                   scan_words = FaultScanWords();
+	const vk::SpecializationMapEntry scan_entry {0, 0, sizeof(uint32_t)};
+	const vk::SpecializationInfo     scan_spec {1, &scan_entry, sizeof(uint32_t), &scan_words};
+	stage.pSpecializationInfo = &scan_spec;
 	vk::ComputePipelineCreateInfo pipeline_info {};
 	pipeline_info.stage  = stage;
 	pipeline_info.layout = m_fault_process_pipeline_layout;
@@ -142,7 +160,7 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32 / FaultScanWords();
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;

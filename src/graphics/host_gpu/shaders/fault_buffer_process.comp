@@ -6,8 +6,17 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// Bitmap words each invocation reads (FaultManager, KYTY_FAULT_SCAN_WORDS): 1 (default) reads and clears one word;
+// 16 (chenxiao07/KytyPS5 b7aa2b877) reads four uvec4s, each pass consecutive across the invocations, skips zero
+// blocks and clears only the nonzero words it reports. Past MAX_PAGE_FAULTS the words not reached stay set for the
+// next processing (with 1 the rest of the batch is dropped).
+layout(constant_id = 0) const uint WORDS_PER_INVOCATION = 1u;
+
 layout(std430, binding = 0) buffer input_buf {
     uint fault_buffer[];
+};
+layout(std430, binding = 0) buffer input_vec {
+    uvec4 fault_vec[];
 };
 
 layout(std430, binding = 1) buffer output_buf {
@@ -17,19 +26,47 @@ layout(std430, binding = 1) buffer output_buf32 {
     uint download_buffer32[];
 };
 
-void main() {
-    const uint id = gl_GlobalInvocationID.x;
-    uint word = fault_buffer[id];
-    fault_buffer[id] = 0u;
-    const uint base_bit = id * 32u;
+// Reports the set bits of `word` (bitmap word `index`); false once the list is full.
+bool Report(uint index, uint word) {
+    const uint base_bit = index * 32u;
     while (word != 0u) {
         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
         if (store_index >= MAX_PAGE_FAULTS) {
-            return;
+            return false;
         }
         const uint bit = findLSB(word);
         word &= word - 1;
         const uint page = base_bit + bit;
         download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+    }
+    return true;
+}
+
+void main() {
+    if (WORDS_PER_INVOCATION == 1u) {
+        const uint id = gl_GlobalInvocationID.x;
+        const uint word = fault_buffer[id];
+        fault_buffer[id] = 0u;
+        Report(id, word);
+        return;
+    }
+    const uint invocations = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint pass = 0u; pass < WORDS_PER_INVOCATION / 4u; ++pass) {
+        const uint  vec   = pass * invocations + gl_GlobalInvocationID.x;
+        const uvec4 words = fault_vec[vec];
+        if (all(equal(words, uvec4(0u)))) {
+            continue;
+        }
+        for (uint component = 0u; component < 4u; ++component) {
+            const uint word = words[component];
+            if (word == 0u) {
+                continue;
+            }
+            const uint index = vec * 4u + component;
+            fault_buffer[index] = 0u;
+            if (!Report(index, word)) {
+                return;
+            }
+        }
     }
 }
