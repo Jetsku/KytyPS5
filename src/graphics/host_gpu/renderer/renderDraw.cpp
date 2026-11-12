@@ -3412,6 +3412,10 @@ void RenderExecutor::BeginDrawRun() {
 	m_run_pipeswap       = false;
 	m_prepared_validated = false;
 	m_kernel_verify      = false;
+	if (CommitStats::Enabled()) [[unlikely]] {
+		m_stats_kernel    = CommitStats::KernelOutcome::Off;
+		m_stats_candidate = CommitStats::CandidateOutcome::NotReached;
+	}
 	if (!m_in_engine_commit && DrawRun::Enabled()) {
 		DrawRun::NoteForeignActivity("draw outside an engine commit");
 	}
@@ -3711,6 +3715,13 @@ void RenderExecutor::DrawRunKeyDiagResolved(const CommandBuffer& buffer,
 bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
                                       uint32_t render_target_slice_offset) {
 	using DrawRun::Miss;
+	using Cand = CommitStats::CandidateOutcome;
+	// KYTY_CP_COMMIT_STATS: the outcome for the change classes.
+	const auto note = [this](Cand outcome) {
+		if (CommitStats::Enabled()) [[unlikely]] {
+			m_stats_candidate = outcome;
+		}
+	};
 	auto& totals = DrawRun::GetTotals();
 	OwnedCounters::Add(totals.draws, 1);
 	if (m_run_parts != nullptr) [[unlikely]] {
@@ -3742,6 +3753,7 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		// KYTY_DRAW_RUN_PIPESWAP: the key differs in the vertex program alone.
 		if (!m_run_prev_valid || m_run_key == 0 || m_run_swap_key == 0 ||
 		    m_run_swap_key != m_run.swap_key || !DrawRun::PipeSwapEnabled()) {
+			note(m_run_prev_valid && m_run_key != 0 ? Cand::Key : Cand::NoRecord);
 			return false;
 		}
 		pipeswap = true;
@@ -3751,20 +3763,24 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 	}
 	if (DrawRun::ActivityEpoch() != m_run.activity) {
 		DrawRun::CountMiss(Miss::Activity);
+		note(Cand::Activity);
 		return false;
 	}
 	if (buffer.Identity() != m_run.command ||
 	    m_context.GetCommandScheduler().CurrentTick() != m_run.tick) {
 		DrawRun::CountMiss(Miss::Command);
+		note(Cand::Command);
 		return false;
 	}
 	if (buffer.ActiveRenderingSerial() == 0 ||
 	    buffer.ActiveRenderingSerial() != m_run.rendering_serial) {
 		DrawRun::CountMiss(Miss::Instance);
+		note(Cand::Instance);
 		return false;
 	}
 	if (!m_prepared_validated) {
 		DrawRun::CountMiss(Miss::Validation);
+		note(Cand::Validation);
 		return false;
 	}
 	const void* pixel = state.ps_active ? state.ps_input_info.stage.program : nullptr;
@@ -3773,6 +3789,7 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 	    (!pipeswap && state.vertex_info[0].stage.program != m_run.vertex_program) ||
 	    pixel != m_run.pixel_program) {
 		DrawRun::CountMiss(Miss::Programs);
+		note(Cand::Programs);
 		return false;
 	}
 	bool swap_writes = false;
@@ -3782,6 +3799,7 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 		const auto& program = *state.vertex_info[0].stage.program;
 		if (recorded == nullptr || recorded == &program || !DrawRunPipeSwapCompatible(*recorded, program)) {
 			OwnedCounters::Add(totals.swap_incompatible, 1);
+			note(Cand::SwapIncompatible);
 			return false;
 		}
 		// The new vertex program: run-eligible, and its buffer writes (if allowed) off the run's images.
@@ -3789,12 +3807,16 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 			if (!m_run.record_writes_ok ||
 			    !DrawRunProgramEligible(program, true, g_draw_run_fault_buffer.On())) {
 				DrawRun::CountMiss(Miss::Writes);
+				note(Cand::Writes);
 				return false;
 			}
 			switch (DrawRunWritesOverRun(state.vertex_info[0].stage, m_run.images)) {
 				case 0: break;
 				case 1: swap_writes = true; break;
-				default: DrawRun::CountMiss(Miss::Writes); return false;
+				default:
+					DrawRun::CountMiss(Miss::Writes);
+					note(Cand::Writes);
+					return false;
 			}
 		}
 	}
@@ -3811,10 +3833,14 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 			switch (DrawRunWritesOverRun(*runtime, m_run.images)) {
 				case 0: break;
 				case 1: writes = true; break;
-				default: DrawRun::CountMiss(Miss::Writes); return false;
+				default:
+					DrawRun::CountMiss(Miss::Writes);
+					note(Cand::Writes);
+					return false;
 			}
 		}
 	}
+	note(Cand::Continued);
 	OwnedCounters::Add(totals.continued, 1);
 	if (writes || swap_writes) {
 		OwnedCounters::Add(totals.write_continued, 1);
@@ -4659,9 +4685,13 @@ static CommitStats::DrawShape MakeCommitShape(
 	shape.pipeline = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
 	    static_cast<VkPipeline>(pipeline.pipeline)));
 	shape.shader_writes = static_cast<bool>(shader_write_stages);
-	// Structure: programs, texture views and layouts, samplers, attachments.
+	// Structure: programs, texture views and layouts, samplers, attachments (each part on its own).
 	for (const auto* stage: stages) {
 		words.Add(reinterpret_cast<uintptr_t>(stage->runtime->program));
+	}
+	shape.programs = words.Finish();
+	for (const auto* stage: stages) {
+		words.Add(stage->images.size());
 		for (const auto& image: stage->images) {
 			words.AddHandle(image.image_view);
 			words.Add(static_cast<uint64_t>(image.layout));
@@ -4669,16 +4699,26 @@ static CommitStats::DrawShape MakeCommitShape(
 				words.AddHandle(view);
 			}
 		}
+	}
+	shape.textures = words.Finish();
+	for (const auto* stage: stages) {
+		words.Add(stage->samplers.size());
 		for (const auto sampler: stage->samplers) {
 			words.AddHandle(sampler);
 		}
 	}
+	shape.samplers = words.Finish();
 	for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
 		words.AddHandle(rendering.color_attachments[i].image_view);
 		words.Add(static_cast<uint64_t>(rendering.color_attachments[i].image_layout));
 	}
 	words.AddHandle(rendering.depth_stencil_attachment.image_view);
 	words.Add(static_cast<uint64_t>(rendering.depth_stencil_attachment.image_layout));
+	shape.attachments = words.Finish();
+	words.Add(shape.programs);
+	words.Add(shape.textures);
+	words.Add(shape.samplers);
+	words.Add(shape.attachments);
 	shape.structure = words.Finish();
 	// Dynamic state.
 	words.Add(dynamic.viewport_count);
@@ -6070,6 +6110,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_run_active = false;
 		if (std::exchange(m_kernel, false)) {
 			ContKernel::g_counters.left.fetch_add(1, std::memory_order_relaxed);
+			if (CommitStats::Enabled()) [[unlikely]] {
+				m_stats_kernel = CommitStats::KernelOutcome::Left;
+			}
 		}
 		DrawRunRecallFallback();
 		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
@@ -6185,6 +6228,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (m_kernel && !kernel_valid) {
 		m_kernel = false; // barrier safety depends on the plain-pixel choice
 		ContKernel::g_counters.left.fetch_add(1, std::memory_order_relaxed);
+		if (CommitStats::Enabled()) [[unlikely]] {
+			m_stats_kernel = CommitStats::KernelOutcome::Left;
+		}
 	}
 	const auto* planned_pipeline =
 	    plan_stages && plan->pipeline != nullptr
@@ -7007,6 +7053,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                             vertex_bindings, index_binding, draw, emit, index_source,
 		                             shader_write_stages);
 		shape.run_continued = m_run_active;
+		shape.kernel        = m_kernel ? CommitStats::KernelOutcome::Taken : m_stats_kernel;
+		shape.candidate     = m_stats_candidate;
 		CommitStats::NoteRecorded(shape);
 		// The hashing above is the diagnostic's own cost: not counted in any phase.
 		CommitStats::Skip();
@@ -7157,7 +7205,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	// KYTY_CONT_KERNEL (above ExecutePreparedDraw).
-	if (const auto kernel_mode = g_cont_kernel.Get(); kernel_mode != 0 && ContinuationKernelEntry(args)) {
+	const auto kernel_mode  = g_cont_kernel.Get();
+	const bool kernel_entry = kernel_mode != 0 && ContinuationKernelEntry(args);
+	if (CommitStats::Enabled()) [[unlikely]] {
+		m_stats_kernel = kernel_mode == 0 ? CommitStats::KernelOutcome::Off
+		                 : kernel_entry   ? CommitStats::KernelOutcome::Declined
+		                                  : CommitStats::KernelOutcome::NoEntry;
+	}
+	if (kernel_entry) {
 		if (kernel_mode == 1) {
 			CommitStats::StepMark(CommitStats::Step::KernelEntry);
 			if (ContinuationKernel(submit_id, buffer, args)) {

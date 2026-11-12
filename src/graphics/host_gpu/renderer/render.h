@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/commandStream.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
@@ -1727,6 +1728,9 @@ private:
 	} m_kernel_record;
 	bool m_kernel        = false; // KYTY_CONT_KERNEL=1: the committed draw takes the kernel
 	bool m_kernel_verify = false; // KYTY_CONT_KERNEL=2: the committed draw would have
+	// KYTY_CP_COMMIT_STATS: the kernel's outcome for the committed draw (Taken is m_kernel itself).
+	CommitStats::KernelOutcome    m_stats_kernel    = CommitStats::KernelOutcome::Off;
+	CommitStats::CandidateOutcome m_stats_candidate = CommitStats::CandidateOutcome::NotReached;
 	[[nodiscard]] bool ContinuationKernelEntry(const DrawIndexArgs& args) const;
 	[[nodiscard]] bool ContinuationKernel(uint64_t submit_id, CommandBuffer& buffer,
 	                                      const DrawIndexArgs& args);
