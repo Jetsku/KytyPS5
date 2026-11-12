@@ -140,6 +140,9 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferFlushAndWait();
+	// The flush at the end of a queue's slice that made progress (complete: the submission ended;
+	// otherwise it stopped at a wait or yielded).
+	void            SliceEndFlush(bool complete);
 	static uint32_t EopFlushPacketLimit();
 	void            BufferWait();
 	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
