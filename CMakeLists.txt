@@ -811,6 +811,16 @@ add_executable(cpu_placement_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(cpu_placement_tests common)
 target_include_directories(cpu_placement_tests PRIVATE ${inc_headers})
+
+# KYTY_SEGMENT_HEAP (common/processHeap.h): the heap kind read back, plain and with the manifest.
+if(WIN32)
+	add_executable(process_heap_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ProcessHeapTests.cpp")
+	target_include_directories(process_heap_tests PRIVATE ${inc_headers})
+	add_executable(process_heap_segment_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ProcessHeapTests.cpp"
+		"${KYTY_SOURCE_DIR}/segmentHeap.manifest")
+	target_include_directories(process_heap_segment_tests PRIVATE ${inc_headers})
+	target_compile_definitions(process_heap_segment_tests PRIVATE KYTY_EXPECT_SEGMENT_HEAP=1)
+endif()
 if(LINUX)
 	target_link_libraries(cpu_placement_tests Threads::Threads)
 endif()
@@ -1473,6 +1483,10 @@ if(BUILD_TESTING)
 	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
 	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
+	if(WIN32)
+		add_test(NAME process_heap COMMAND $<TARGET_FILE:process_heap_tests>)
+		add_test(NAME process_heap_segment COMMAND $<TARGET_FILE:process_heap_segment_tests>)
+	endif()
 	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
 	add_test(NAME cpu_placement_vcache_sets COMMAND $<TARGET_FILE:cpu_placement_tests> --vcache sets)
 	add_test(NAME cpu_placement_vcache_affinity
@@ -2842,6 +2856,19 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+
+# Windows: the process heap (and so malloc/new) as the Segment Heap, through the executable's
+# manifest (based on chenxiao07/KytyPS5 d36975759, where the Segment Heap manifest measured level
+# with mimalloc for parallel translation: 57.7 against 58.1 fps, CRT heap 36.1). Process-wide: the
+# drivers' allocations move too. A build option, so an A/B is two executables. Default OFF.
+option(KYTY_SEGMENT_HEAP "Windows: the process heap as the Segment Heap (executable manifest)" OFF)
+if(KYTY_SEGMENT_HEAP)
+	if(NOT WIN32)
+		message(FATAL_ERROR "KYTY_SEGMENT_HEAP is Windows-only")
+	endif()
+	target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/segmentHeap.manifest")
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_SEGMENT_HEAP=1)
+endif()
 
 option(KYTY_EMULATOR_IPO "Enable release interprocedural optimization for the emulator target" OFF)
 if(KYTY_EMULATOR_IPO)
