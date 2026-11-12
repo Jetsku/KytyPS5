@@ -1334,6 +1334,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	// KYTY_NO_FEEDBACK_LOOP=1 (debug, default off): the device reports attachment feedback loops as
+	// unavailable, as one without the extensions does (pipeline list tests on another card type).
+	if (const auto* off = std::getenv("KYTY_NO_FEEDBACK_LOOP"); off != nullptr && off[0] == '1') {
+		graphics.attachment_feedback_loop_enabled = false;
+	}
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
