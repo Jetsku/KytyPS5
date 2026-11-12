@@ -354,6 +354,18 @@ void TestMeshIndex() {
 	spans.clear();
 	Check(evaluator.DmaSpans(f.program.write_ranges, inputs, spans, why) && Covers(spans, 0x7000, 0x7806),
 	      "the index range, dword aligned");
+	// A non-indexed draw (direct, or a native indirect one): known, empty.
+	inputs.mesh_index_begin = 0;
+	inputs.mesh_index_end   = 0;
+	spans.clear();
+	Check(evaluator.DmaSpans(f.program.write_ranges, inputs, spans, why) && spans.empty(),
+	      "a known empty index range reads nothing");
+	// A native indexed indirect draw: the bound [INDEX_BASE, +INDEX_BUFFER_SIZE) range.
+	inputs.mesh_index_begin = 0x9000;
+	inputs.mesh_index_end   = 0x9000 + 3 * 2;
+	spans.clear();
+	Check(evaluator.DmaSpans(f.program.write_ranges, inputs, spans, why) && Covers(spans, 0x9000, 0x900a),
+	      "the bound index range of an indirect draw");
 }
 void TestNormalize() {
 	Spans spans {{0x5010, 0x5020}, {0x1000, 0x1001}, {0x4ff0, 0x5000}, {0x9000, 0x9000}, {0xc010, 0xc011}};
