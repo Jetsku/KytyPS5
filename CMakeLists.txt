@@ -1169,6 +1169,15 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
 
+# Kernel semaphores: queue order, counts, cancel/delete/timeout, targeted wake-ups.
+add_executable(semaphore_wake_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SemaphoreWakeTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/semaphore.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(semaphore_wake_tests common fmt::fmt)
+target_include_directories(semaphore_wake_tests PRIVATE ${inc_headers})
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -1612,6 +1621,7 @@ if(BUILD_TESTING)
 	add_test(NAME thread_service COMMAND $<TARGET_FILE:thread_service_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
+	add_test(NAME semaphore_wake COMMAND $<TARGET_FILE:semaphore_wake_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_diag COMMAND $<TARGET_FILE:audio_diag_tests>)
 	add_test(NAME audio_mix COMMAND $<TARGET_FILE:audio_mix_tests>)
@@ -1672,6 +1682,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-exit-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	# Guest FP environment (upstream f399d4818): fibers start with the console's MXCSR and carry
+	# their own across switches.
+	add_test(NAME guest_fp_env_fibers
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --fiber-fp-env-only)
 	if(WIN32)
 		add_test(NAME virtual_memory_allocation_lazy_backing
 			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
@@ -2794,6 +2808,7 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		semaphore_wake_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_diag_tests

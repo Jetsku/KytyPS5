@@ -6,6 +6,7 @@
 #include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/fpEnv.h"
+#include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
 #include "common/hostException.h"
 #include "common/liveSwitch.h"
@@ -2039,6 +2040,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	// PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	// Placement samples of guest threads (common/cpuPlacement.h), every 64th lock.
 	static thread_local uint32_t placement_locks = 0;
@@ -3103,6 +3105,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 	// PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3142,6 +3145,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3273,6 +3277,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3527,6 +3532,7 @@ static void* RunThread(void* arg) {
 	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
 #endif
 	Common::PlaceCurrentThreadGuest();
+	GThreadStats::MarkGuestThread();
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
@@ -4172,6 +4178,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	GThreadStats::FpProbe();
 	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	SleepMicroWithSignalPoll(microseconds);

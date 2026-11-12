@@ -120,6 +120,8 @@ void TestPeriodicTimerEvents() {
 	      "deleted timer is not delivered again");
 	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == KERNEL_ERROR_ENOENT,
 	      "deleting a missing timer reports ENOENT");
+	Check(EventQueue::KernelDeleteTimerEvent(EventQueue::KERNEL_EQUEUE_INVALID, 10) == KERNEL_ERROR_EBADF,
+	      "deleting from an invalid queue reports EBADF");
 
 	const Libs::LibKernel::KernelTimespec delay {0, 1000000};
 	Check(EventQueue::KernelAddHRTimerEvent(queue, 10, &delay, user_data) == OK,

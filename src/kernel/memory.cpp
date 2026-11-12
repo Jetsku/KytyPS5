@@ -4,6 +4,7 @@
 
 #include "common/assert.h"
 #include "common/cruzStats.h"
+#include "common/gthreadStats.h"
 #include "common/hangTrace.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
@@ -1465,9 +1466,39 @@ static std::recursive_mutex  g_memory_operation_mutex;
 static std::shared_mutex     g_memory_state_mutex;
 static thread_local uint32_t t_memory_operation_depth = 0;
 
+// KYTY_GTHREAD_STATS (common/gthreadStats.h): acquisitions, contended acquisitions and wait time
+// of the two locks below, guest threads apart from the others ("memlock": MemoryOperationLock, the
+// operation mutex and the state lock together; "memread": MemoryStateReadLock). Off: one relaxed
+// load, then the plain locks.
+template <typename TryLock, typename Lock>
+static void LockCounted(TryLock&& try_lock, Lock&& lock, uint64_t& wait_ns) {
+	if (try_lock()) {
+		return;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	lock();
+	wait_ns += 1u + static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                          std::chrono::steady_clock::now() - start)
+	                                          .count());
+}
+
+static void NoteLockStats(std::atomic<uint64_t>* acq, std::atomic<uint64_t>* contended,
+                          std::atomic<uint64_t>* wait, uint64_t wait_ns) {
+	const int kind = GThreadStats::IsGuestThread() ? 0 : 1;
+	GThreadStats::Add(acq[kind]);
+	if (wait_ns != 0) {
+		GThreadStats::Add(contended[kind]);
+		GThreadStats::Add(wait[kind], wait_ns);
+	}
+}
+
 class MemoryOperationLock {
 public:
 	MemoryOperationLock() {
+		if (GThreadStats::Enabled()) {
+			LockCountedStats();
+			return;
+		}
 		g_memory_operation_mutex.lock();
 		if (t_memory_operation_depth++ == 0) {
 			g_memory_state_mutex.lock();
@@ -1480,14 +1511,37 @@ public:
 		g_memory_operation_mutex.unlock();
 	}
 	KYTY_CLASS_NO_COPY(MemoryOperationLock);
+
+private:
+	static void LockCountedStats() {
+		uint64_t wait_ns = 0;
+		LockCounted([] { return g_memory_operation_mutex.try_lock(); },
+		            [] { g_memory_operation_mutex.lock(); }, wait_ns);
+		if (t_memory_operation_depth++ == 0) {
+			LockCounted([] { return g_memory_state_mutex.try_lock(); },
+			            [] { g_memory_state_mutex.lock(); }, wait_ns);
+		}
+		auto& counters = GThreadStats::Local();
+		NoteLockStats(counters.mem_acq, counters.mem_contended, counters.mem_wait_ns, wait_ns);
+	}
 };
 
 class MemoryStateReadLock {
 public:
 	MemoryStateReadLock(): m_locked(t_memory_operation_depth == 0) {
-		if (m_locked) {
-			g_memory_state_mutex.lock_shared();
+		if (!m_locked) {
+			return;
 		}
+		if (GThreadStats::Enabled()) {
+			uint64_t wait_ns = 0;
+			LockCounted([] { return g_memory_state_mutex.try_lock_shared(); },
+			            [] { g_memory_state_mutex.lock_shared(); }, wait_ns);
+			auto& counters = GThreadStats::Local();
+			NoteLockStats(counters.mem_read_acq, counters.mem_read_contended, counters.mem_read_wait_ns,
+			              wait_ns);
+			return;
+		}
+		g_memory_state_mutex.lock_shared();
 	}
 	~MemoryStateReadLock() {
 		if (m_locked) {
