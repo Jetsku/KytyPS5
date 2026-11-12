@@ -144,13 +144,16 @@ void Sequencer::NoteHandoffDone(uint64_t submission) {
 bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewake_at) {
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::CpSeqSequencerWait);
 	auto                      start = NowNs();
-	// KYTY_SPIN_GATE: the wait spins only while the PC keeps CPUs idle.
-	const uint64_t spin_ns = Common::SpinGate::SpinAllowed() ? m_spin_ns : 0;
+	// KYTY_SPIN_GATE: the wait spins only while the PC keeps CPUs idle. KYTY_SPIN_BUDGET: only a
+	// short spin while the core budget is exceeded (common/spinGate.h).
+	using Common::SpinGate::Site;
+	const uint64_t spin_ns = Common::SpinGate::SpinNs(Site::Sequencer, m_spin_ns);
 	// PrepStats: the sequencer's spin time (until it is ready or parks).
 	auto       spin_tsc  = DrawPrep::PrepStats::Tsc();
 	const auto note_spin = [&spin_tsc] {
-		DrawPrep::PrepStats::g_spin.sequencer.fetch_add(DrawPrep::PrepStats::Tsc() - spin_tsc,
-		                                                 std::memory_order_relaxed);
+		const auto spun = DrawPrep::PrepStats::Tsc() - spin_tsc;
+		DrawPrep::PrepStats::g_spin.sequencer.fetch_add(spun, std::memory_order_relaxed);
+		Common::SpinGate::NoteSpin(Site::Sequencer, spun);
 	};
 	for (uint32_t spins = 0;; spins++) {
 		if (ready()) {
@@ -170,6 +173,7 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 		m_wake_at.store(wake_at, std::memory_order_seq_cst);
 		const auto observed = m_progress.load(std::memory_order_seq_cst);
 		m_parked.fetch_add(1, std::memory_order_seq_cst);
+		Common::SpinGate::NotePark(Site::Sequencer);
 		if (!ready() && !Stopping()) {
 			HangWatchdog::Scope wait("sequencer-progress", reinterpret_cast<uint64_t>(this),
 			                         wake_at, observed, 0, rewake_at);

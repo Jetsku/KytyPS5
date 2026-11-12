@@ -219,13 +219,25 @@ inline void WorkerRelax() noexcept {
 // this many are unclaimed, so a batch never holds back a slot another worker could start now.
 inline constexpr uint64_t ClaimBatchMinBacklog = 4;
 
-template <typename WindowT, typename Prepare, typename OnColdWake, typename MaxBatch>
+// The worker loop's idle hooks (KYTY_SPIN_BUDGET, common/spinGate.h): `SpinLimit(wanted)` at the
+// first empty look of each idle period gives the spin allowed before parking; `Spun(tsc, parked)`
+// reports each idle period's spin when it ends (a claim, or a park). The default changes nothing.
+struct NoWorkerHooks {
+	[[nodiscard]] uint64_t SpinLimit(uint64_t wanted) const noexcept { return wanted; }
+	void                   Spun(uint64_t /*tsc*/, bool /*parked*/) const noexcept {}
+};
+
+template <typename WindowT, typename Prepare, typename OnColdWake, typename MaxBatch,
+          typename Hooks = NoWorkerHooks>
 void RunPreparationWorkerBatched(WorkerGate& gate, WindowT& window, uint32_t index,
                                  uint64_t hot_spin_ns, uint64_t cold_spin_ns,
                                  const std::atomic<bool>& stop, Prepare&& prepare,
-                                 OnColdWake&& on_cold_wake, MaxBatch&& max_batch) {
+                                 OnColdWake&& on_cold_wake, MaxBatch&& max_batch,
+                                 Hooks&& hooks = Hooks {}) {
 	const bool hot        = gate.Hot(index);
-	const auto spin_limit = hot ? hot_spin_ns : cold_spin_ns;
+	const auto wanted     = hot ? hot_spin_ns : cold_spin_ns;
+	auto       spin_limit = wanted;
+	bool       idle_begun = false; // this idle period asked the hooks for its spin
 	auto       idle_start = WorkerNowNs();
 	uint32_t   spins      = 0;
 	// PrepStats (prepStats.h): TSC split of this worker's time into preparing, spinning, parked.
@@ -247,6 +259,10 @@ void RunPreparationWorkerBatched(WorkerGate& gate, WindowT& window, uint32_t ind
 		if (claimed) {
 			const auto claimed_tsc = PrepStats::Tsc();
 			stats.spin += claimed_tsc - idle_tsc;
+			if (idle_begun) {
+				hooks.Spun(claimed_tsc - idle_tsc, false);
+				idle_begun = false;
+			}
 			if (gate.HasCold() && gate.MaybeWakeCold(window.Unclaimed())) {
 				on_cold_wake();
 			}
@@ -267,12 +283,18 @@ void RunPreparationWorkerBatched(WorkerGate& gate, WindowT& window, uint32_t ind
 			spins      = 0;
 			continue;
 		}
+		if (!idle_begun) {
+			idle_begun = true;
+			spin_limit = hooks.SpinLimit(wanted);
+		}
 		WorkerRelax();
 		if ((++spins & 255u) != 0u || WorkerNowNs() - idle_start < spin_limit) {
 			continue;
 		}
 		const auto park_tsc = PrepStats::Tsc();
 		stats.spin += park_tsc - idle_tsc;
+		hooks.Spun(park_tsc - idle_tsc, true);
+		idle_begun = false;
 		if (hot) {
 			gate.ParkHot([&window] { return window.HasClaimable(); }, stop);
 		} else {

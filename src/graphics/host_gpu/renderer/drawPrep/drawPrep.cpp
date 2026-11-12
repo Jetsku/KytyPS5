@@ -8,6 +8,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spinGate.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -1655,6 +1656,7 @@ void ApplyAdaptMode(int64_t previous, int64_t value);
 static Live::Switch g_adapt_mode("KYTY_DRAW_PREP_ADAPT", Live::ParseDefaultOff,
                                  [](int64_t previous, int64_t value) { ApplyAdaptMode(previous, value); });
 
+
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
 	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal,
@@ -1662,6 +1664,11 @@ struct Engine::Workers {
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
 	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog, cold_token),
 	      adapt_config(config) {
+		// KYTY_SPIN_BUDGET (common/spinGate.h): the commit thread may park on a held head; the
+		// workers' Complete then wakes it. Decided before any worker starts.
+		if (Common::SpinGate::BudgetAvailable()) {
+			this->window.EnableHeadWake();
+		}
 		const auto lps = ProcessAffinityProcessors();
 		// Start at the bound; the first interval's busy time sizes it.
 		const auto cap = AdaptiveCap(1000.0, count, lps, config.min_cap, config.max_cap);
@@ -1791,9 +1798,23 @@ struct Engine::Workers {
 					WorkerRelax();
 					continue;
 				}
+				// KYTY_SPIN_BUDGET (common/spinGate.h): a short idle spin while the core budget is
+				// exceeded; the idle periods' spin and parks go to the site counters.
+				struct BudgetHooks {
+					[[nodiscard]] uint64_t SpinLimit(uint64_t wanted) const {
+						return Common::SpinGate::SpinNs(Common::SpinGate::Site::Worker, wanted);
+					}
+					void Spun(uint64_t tsc, bool parked) const {
+						Common::SpinGate::NoteSpin(Common::SpinGate::Site::Worker, tsc);
+						if (parked) {
+							Common::SpinGate::NotePark(Common::SpinGate::Site::Worker);
+						}
+					}
+				};
 				RunPreparationWorkerBatched(
 				    gate, window, index, spin_ns, cold_spin_ns, leave_gate, prepare,
-				    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); }, batch);
+				    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); }, batch,
+				    BudgetHooks {});
 			}
 		}
 	}
@@ -2149,6 +2170,15 @@ Engine::Slot& Engine::ReadyHead() {
 		// preparation. Only a head this thread claims itself (above) uses the exact predicate: it
 		// is committed at once. A stolen slot is committed after the draws before it, which change
 		// what that predicate reads, so the certificate at its commit decides.
+		// KYTY_SPIN_BUDGET (common/spinGate.h): while the core budget is exceeded this thread spins
+		// only briefly, then sleeps on the head's state word until the worker's Complete wakes it
+		// (Window::ParkHead; the head wake is enabled at startup when the switch is available).
+		using Common::SpinGate::Site;
+		const uint64_t gated      = Common::SpinGate::SpinNs(Site::CommitHead, UINT64_MAX);
+		const uint64_t park_after = window.HeadWakeEnabled() ? gated : UINT64_MAX;
+		const auto     wait_ns0   = NowNs();
+		uint64_t       parked_tsc = 0;
+		uint64_t       parks      = 0;
 		const auto stats = AwaitHead(
 		    m_workers->gate, window, m_workers->steal,
 		    [this](Slot& claimed, uint64_t seq) {
@@ -2157,8 +2187,15 @@ Engine::Slot& Engine::ReadyHead() {
 			    m_workers->PrepareClaimed(claimed, seq);
 			    m_renderer.GetPipelineCache().NoteProgramPrefetchWait(claimed.prepared.program_compile_ns);
 		    },
-		    [this](uint32_t spins, uint64_t spin_start) {
+		    [this, &window, park_after, &parked_tsc, &parks](uint32_t spins, uint64_t spin_start) {
 			    CpuRelax();
+			    if (park_after != UINT64_MAX && (spins & 15u) == 15u && NowNs() - spin_start >= park_after) {
+				    const auto park_tsc = PrepStats::Tsc();
+				    if (window.ParkHead()) {
+					    parks++;
+				    }
+				    parked_tsc += PrepStats::Tsc() - park_tsc;
+			    }
 			    // Workers never dereference guest memory, so they cannot page fault into a
 			    // request this thread must service. Only as a last-resort deadlock guard, after
 			    // 2 ms of spinning, pending cross-thread commands are serviced here; such a
@@ -2170,6 +2207,19 @@ Engine::Slot& Engine::ReadyHead() {
 			    }
 		    },
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+		{
+			// The spin share of this wait in TSC ticks: its spin time (steals excluded) at the wait's
+			// own TSC rate, minus the time parked.
+			const auto wait_tsc = PrepStats::Tsc() - head_tsc;
+			const auto wait_ns  = std::max<uint64_t>(NowNs() - wait_ns0, 1);
+			const auto spin_tsc = static_cast<uint64_t>(static_cast<double>(stats.spin_ns) *
+			                                            static_cast<double>(wait_tsc) /
+			                                            static_cast<double>(wait_ns));
+			Common::SpinGate::NoteSpin(Site::CommitHead, spin_tsc > parked_tsc ? spin_tsc - parked_tsc : 0);
+			if (parks != 0) {
+				Common::SpinGate::NotePark(Site::CommitHead, parks);
+			}
+		}
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
 		// Actual idle CP wait on a shader miss, capped by the compiler call duration. Steals

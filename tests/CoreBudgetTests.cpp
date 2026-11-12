@@ -6,6 +6,7 @@
 
 #include "common/coreBudget.h"
 #include "common/cpuPlacement.h"
+#include "common/spinGate.h"
 
 #include <bit>
 #include <cstdint>
@@ -143,10 +144,92 @@ void TestBudget() {
 	std::puts("CoreBudgetTests: budget ok");
 }
 
+void TestGate() {
+	using namespace Common::SpinGate;
+	// One interval of 1,000,000 ticks.
+	constexpr uint64_t I = 1'000'000;
+	{
+		// 6-core mask, Sky Garden-like: 8 game/emulator threads busy, 6 idle workers spinning
+		// 20 %, sequencer and recorder spinning 60 % / 45 % beside little work.
+		std::vector<ThreadSample> samples;
+		for (int i = 0; i < 8; i++) {
+			samples.push_back({I * 7 / 10, 0, i == 0}); // commit thread registered, busy
+		}
+		for (int i = 0; i < 6; i++) {
+			samples.push_back({I / 4, I / 5, true}); // 5 % work, 20 % spin
+		}
+		samples.push_back({I * 7 / 10, I * 6 / 10, true}); // sequencer: 10 % work
+		samples.push_back({I / 2, I * 45 / 100, true});    // recorder
+		samples.push_back({I / 100, 0, false});            // an idle game thread
+		const auto d = ClassifyThreads(samples.data(), static_cast<uint32_t>(samples.size()), I, 0.25);
+		Check(d.busy == 8 && d.spinning == 8 && d.idle_spinners == 8, "6C: 8 busy, 8 spinning");
+		GateInput in;
+		in.budget_logical = 12;
+		in.busy           = d.busy;
+		in.spinning       = d.spinning;
+		in.idle_spinners  = d.idle_spinners;
+		Check(!NextBudgetGateOpen(true, in), "6C: 8 + 8 > 12 closes the gate");
+		// Closed, the spinners back off: their spin falls under 5 %, the gate still stays shut.
+		in.spinning = 0;
+		Check(!NextBudgetGateOpen(false, in), "6C closed: 8 + 8 idle spinners + 1 > 12 stays shut");
+		Check(NextBudgetGateOpen(true, in), "...and an open gate with nobody spinning stays open");
+	}
+	{
+		GateInput in;
+		in.budget_logical = 32;
+		in.busy           = 12;
+		in.spinning       = 9;
+		in.idle_spinners  = 9;
+		Check(NextBudgetGateOpen(true, in), "16C: 12 + 9 fits in 32");
+		Check(NextBudgetGateOpen(false, in), "16C closed: reopens (12 + 9 + 1 <= 32)");
+	}
+	{
+		// Hysteresis: no oscillation when only the spin share changes.
+		GateInput in;
+		in.budget_logical = 16;
+		in.busy           = 10;
+		in.spinning       = 7;
+		in.idle_spinners  = 7;
+		bool open = true;
+		open      = NextBudgetGateOpen(open, in);
+		Check(!open, "8C: 10 + 7 > 16 closes");
+		in.spinning = 0;
+		for (int i = 0; i < 10; i++) {
+			open = NextBudgetGateOpen(open, in);
+		}
+		Check(!open, "8C: backing off never reopens it");
+		in.busy = 8;
+		open    = NextBudgetGateOpen(open, in);
+		Check(open, "8C: the game's load falls: 8 + 7 + 1 <= 16 reopens");
+		in.margin = 2;
+		in.spinning = 7;
+		Check(!NextBudgetGateOpen(true, in), "margin counts");
+	}
+	{
+		GateInput in; // no budget read yet: never closes
+		in.busy = 100;
+		Check(NextBudgetGateOpen(true, in), "no budget: open");
+		const ThreadSample s {500, 900, true};
+		const auto d = ClassifyThreads(&s, 1, 1000, 0.25);
+		Check(d.busy == 0 && d.spinning == 1 && d.spin_cores == 0.5,
+		      "spin above the cycles is clamped to them");
+		Check(ClassifyThreads(&s, 1, 0, 0.25).busy == 0, "empty interval");
+	}
+	// The runtime gate with the switch unset and no profile: spins as wanted, counts.
+	Check(!BudgetEnabled() && !BudgetClosed(), "KYTY_SPIN_BUDGET unset: off");
+	Check(SpinNs(Site::Sequencer, 200'000) == 200'000, "off: the wanted spin");
+	Check(SpinNs(Site::CommitHead, UINT64_MAX) == UINT64_MAX, "off: unbounded stays unbounded");
+	NoteSpin(Site::Sequencer, 1234);
+	NotePark(Site::Sequencer);
+	Check(std::string(SiteName(Site::Resolver)) == "resolver", "site names");
+	std::puts("CoreBudgetTests: spin gate ok");
+}
+
 } // namespace
 
 int main() {
 	TestBudget();
+	TestGate();
 	std::puts("CoreBudgetTests: all ok");
 	return 0;
 }

@@ -1136,6 +1136,96 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items, u
 	            static_cast<unsigned long long>(items));
 }
 
+// KYTY_SPIN_BUDGET: the head wake (Window::EnableHeadWake / ParkHead) with the production gate-pool
+// worker loop and its idle hooks. The producer parks on every head a worker holds instead of
+// spinning; the hooks give the workers no idle spin (every idle period parks). Every item retires
+// once, in order, with the right result; a lost head wake hangs the test (ctest times it out).
+void BusyNs(uint64_t ns);
+
+void TestHeadWakeAndWorkerHooks(uint32_t workers, uint64_t items) {
+	DrawPrep::Window<Item> window(32);
+	window.EnableHeadWake();
+	Check(window.HeadWakeEnabled(), "head wake enabled");
+	DrawPrep::WorkerGate gate(workers, workers, 2);
+	std::atomic<bool>    stop {false};
+	std::atomic<uint64_t> limits {0};
+	std::atomic<uint64_t> parked_periods {0};
+	struct Hooks {
+		std::atomic<uint64_t>* limits;
+		std::atomic<uint64_t>* parked;
+		[[nodiscard]] uint64_t SpinLimit(uint64_t /*wanted*/) const {
+			limits->fetch_add(1, std::memory_order_relaxed);
+			return 0; // a closed budget gate's shortest spin
+		}
+		void Spun(uint64_t /*tsc*/, bool parked_now) const {
+			if (parked_now) {
+				parked->fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	};
+	std::vector<std::thread> threads;
+	for (uint32_t w = 0; w < workers; w++) {
+		threads.emplace_back([&, w] {
+			DrawPrep::RunPreparationWorkerBatched(
+			    gate, window, w, 200'000, 200'000, stop,
+			    [&](Item& item, uint64_t seq) {
+				    BusyNs(2'000);
+				    item.output      = Work(item.input);
+				    item.prepared_by = w + 1u;
+				    item.preparations++;
+				    window.Complete(seq);
+			    },
+			    [] {}, [] { return 1u; }, Hooks {&limits, &parked_periods});
+		});
+	}
+	uint64_t next_input = 0, next_retire = 0, head_parks = 0;
+	bool     ok         = true;
+	const auto retire = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.output = Work(item.input);
+			item.preparations++;
+		} else {
+			while (!window.HeadDone()) {
+				head_parks += window.ParkHead() ? 1u : 0u;
+			}
+		}
+		ok &= item.input == next_retire && item.output == Work(item.input) && item.preparations == 1;
+		next_retire++;
+		window.Retire();
+	};
+	while (next_input < items) {
+		if (window.Full()) {
+			retire();
+		}
+		auto& item        = window.Reserve();
+		item.input        = next_input++;
+		item.output       = 0;
+		item.preparations = 0;
+		window.Publish();
+		gate.OnPublish([&] { return window.Unclaimed(); });
+		if (next_input % 61u == 0u) {
+			while (!window.Empty()) {
+				retire();
+			}
+			std::this_thread::sleep_for(std::chrono::microseconds(200)); // let the workers park
+		}
+	}
+	while (!window.Empty()) {
+		retire();
+	}
+	stop.store(true, std::memory_order_seq_cst);
+	gate.WakeAll();
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(ok && next_retire == items, "head wake: every item once, in order, right result");
+	Check(limits.load() != 0 && parked_periods.load() != 0, "worker hooks: asked per idle period, parks reported");
+	std::printf("  head wake %u workers: %llu items, %llu head parks, %llu worker idle parks\n", workers,
+	            static_cast<unsigned long long>(items), static_cast<unsigned long long>(head_parks),
+	            static_cast<unsigned long long>(parked_periods.load()));
+}
+
 // KYTY_DRAW_PREP_ADAPT: the adaptive pool's workers (the production loop) against a producer that
 // publishes in bursts with pauses (so workers park and must be woken), retires in order, takes
 // unclaimed heads itself, and changes the cap while it runs. Every item is prepared exactly once
@@ -2356,6 +2446,9 @@ int main(int argc, char** argv) {
 	TestWindowConcurrent(4, 8, 200000, 2); // KYTY_DRAW_PREP_LEAN claim part
 	TestWindowConcurrent(32, 6, 200000, 2);
 	TestWindowConcurrent(32, 3, 200000, 4);
+	TestHeadWakeAndWorkerHooks(6, 60000);
+	TestHeadWakeAndWorkerHooks(2, 60000);
+	TestHeadWakeAndWorkerHooks(1, 20000);
 	TestWorkerGateBasics();
 	TestAwaitHead();
 	TestWorkerGateStress();

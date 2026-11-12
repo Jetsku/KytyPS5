@@ -510,6 +510,7 @@ struct WaitStats {
 	uint64_t blocks  = 0; // waits that blocked in the OS
 	uint64_t wait_ns = 0; // total time waiting
 	uint64_t wakes   = 0; // OS wakes issued to the other side
+	uint64_t spin_tsc = 0; // WaitConsumed: TSC ticks spent spinning (KYTY_SPIN_BUDGET counters)
 };
 
 // Spin, then (after spin_ns) block. A spin of 0 blocks at once.

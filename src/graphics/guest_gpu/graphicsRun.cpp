@@ -12,6 +12,7 @@
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spinGate.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -6927,6 +6928,13 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			} starved_note;
 			const auto start    = CpNowNs();
 			bool       produced = false;
+			// KYTY_SPIN_BUDGET (common/spinGate.h): while the core budget is exceeded only a short
+			// pause spin, then the yield loop gives the processor to ready threads. The whole loop
+			// counts as the site's spin; yields that let another thread run count as its parks.
+			using Common::SpinGate::Site;
+			const auto spin_limit = Common::SpinGate::SpinNs(Site::Resolver, CpSeq::ResolverSpinNs());
+			const auto spin_tsc   = Common::SpinGate::Tsc();
+			uint64_t   gave_way   = 0;
 			for (uint32_t spins = 0;; spins++) {
 				if (m_ops->Peek(view)) {
 					produced = true;
@@ -6939,7 +6947,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 					continue;
 				}
 				const auto elapsed = CpNowNs() - start;
-				if (elapsed < CpSeq::ResolverSpinNs()) {
+				if (elapsed < spin_limit) {
 					continue;
 				}
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
@@ -6949,7 +6957,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 				    (g_gpu_state != nullptr && g_gpu_state->HasRunnableComputeWork())) {
 					break;
 				}
-				std::this_thread::yield();
+				gave_way += Common::SpinGate::GiveWay() ? 1u : 0u;
+			}
+			Common::SpinGate::NoteSpin(Site::Resolver, Common::SpinGate::Tsc() - spin_tsc);
+			if (gave_way != 0) {
+				Common::SpinGate::NotePark(Site::Resolver, gave_way);
 			}
 			if (!produced) {
 				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
