@@ -1196,10 +1196,65 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+// KYTY_FLUSH_DEFER=<n> (live, default 0 = off; adapted from chenxiao07/KytyPS5 31119bdfd): the
+// flush at the end of a completed submission's slice stays open while the GPU still has at least
+// n submissions to run, unless something waits for the open recording's tick: a priority operation
+// registered on it (a label written at completion, an end-of-pipe interrupt, an eager readback's
+// publication; checked after the eager copies are appended, as the flush would). The recording then
+// goes with the next flush of any kind (a slice stopped at a wait, a WAIT_REG_MEM on a deferred
+// label, a flip, a readback's Wait on the open tick, the end-of-pipe batch), once the GPU is down to
+// its last submission (asked every 16 draws or 4 dispatches, MaybeFlushIdleGpu), or before the GPU
+// thread waits for work (ReleaseHeldFlush). Each submission is a drain between back-to-back
+// command buffers on the GPU and a submit on the recorder; what is recorded and the order of GPU
+// work are unchanged.
+static Live::Switch g_flush_defer("KYTY_FLUSH_DEFER", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 64ul));
+});
+
 void CommandProcessor::SliceEndFlush(bool complete) {
+	if (const auto threshold = static_cast<uint64_t>(g_flush_defer.Get()); complete && threshold != 0) {
+		auto& scheduler = GetScheduler();
+		// As BufferFlush would: a read-hot page's eager copy joins this recording first.
+		m_renderer.GetBufferCache().IssueEagerReadbacks();
+		if (scheduler.CurrentTickHasPriorityWork()) {
+			GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferDeclinedPriority);
+		} else if (scheduler.Backlog() < threshold) {
+			GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferDeclinedBacklog);
+		} else {
+			GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferHeld);
+			scheduler.HoldFlush();
+			m_held_flush_checks = 0;
+			return;
+		}
+	}
 	GpuOpProfiler::CountFlush(complete ? GpuOpProfiler::FlushCause::SliceEnd
 	                                   : GpuOpProfiler::FlushCause::SliceStopped);
 	BufferFlush();
+}
+
+bool CommandProcessor::MaybeReleaseHeldFlush(uint32_t weight) {
+	auto& scheduler = GetScheduler();
+	if (!scheduler.FlushHeld()) {
+		return false;
+	}
+	if ((m_held_flush_checks += weight) < 16u) {
+		return false;
+	}
+	m_held_flush_checks = 0;
+	if (scheduler.Backlog() > 1) {
+		return false;
+	}
+	GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferReleasedBacklog);
+	BufferFlush();
+	return true;
+}
+
+void CommandProcessor::ReleaseHeldFlush() {
+	if (GetScheduler().FlushHeld()) {
+		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::DeferReleasedIdle);
+		BufferFlush();
+	}
 }
 
 // KYTY_EOP_FLUSH_PACKETS: packets processed after the first deferred interrupt before the command
@@ -1343,6 +1398,9 @@ void CommandProcessor::MaybeFlushIdleGpu(bool dispatch) {
 	                                                     0)) {
 		GpuOpProfiler::CountFlush(GpuOpProfiler::FlushCause::EagerReadback);
 		BufferFlush();
+		return;
+	}
+	if (MaybeReleaseHeldFlush(dispatch ? 4u : 1u)) {
 		return;
 	}
 	if (MaybeFlushPeriodic(dispatch)) {
@@ -2080,6 +2138,13 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (gpu->m_renderer.GetCommandScheduler().FlushHeld()) {
+					// KYTY_FLUSH_DEFER: nothing else would submit the held recording.
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_gfx_cp->ReleaseHeldFlush();
+					gpu->m_queue_mutex.Lock();
+					continue;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
@@ -2129,6 +2194,13 @@ void GuestGpu::ThreadRun(void* data) {
 				if (fence_held && selected_queue >= 0) {
 					// The fence changed which queue runs next.
 					Profiler::CountFrameEvent(Profiler::FrameEvent::FrameFenceHolds);
+				}
+				if (selected_queue < 0 && gpu->m_renderer.GetCommandScheduler().FlushHeld()) {
+					// KYTY_FLUSH_DEFER: every queue waits; what they wait for may be in the held recording.
+					gpu->m_queue_mutex.Unlock();
+					gpu->m_gfx_cp->ReleaseHeldFlush();
+					gpu->m_queue_mutex.Lock();
+					continue;
 				}
 				if (selected_queue < 0) {
 					HangWatchdog::Scope suspended("cp-all-queues-suspended",
