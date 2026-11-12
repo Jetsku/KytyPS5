@@ -122,6 +122,11 @@ public:
 	// one. False when ranges were dropped since the last take (overflow): the caller must
 	// re-examine everything.
 	[[nodiscard]] bool TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch);
+	// KYTY_BDA_REACH=verify (bufferCacheReach.cpp): a second log of the same transitions, with or
+	// without CPU-mutation tracking, taken by the reach verification only. False from the take
+	// when ranges were dropped (overflow).
+	void EnableReachLog(bool enable) noexcept { m_reach_log_on.store(enable, std::memory_order_release); }
+	[[nodiscard]] bool TakeReachLog(RangeSet& ranges);
 	// The sum of the mutation serials (RegionManager::Serial) of the regions [vaddr, vaddr + size)
 	// spans, or 0 when one of them does not exist yet (or the range is invalid). Serials only grow,
 	// so while this sum is unchanged no CPU-dirty, GPU-dirty, hot or readback-pending bit of any
@@ -167,6 +172,9 @@ private:
 		    write_fault && ahead > policy.ahead_pages) {
 			policy.ahead_pages = ahead;
 		}
+		if (write_fault && s_sequential_ahead.load(std::memory_order_relaxed)) {
+			policy.sequential_ahead = true;
+		}
 		// KYTY_HOT_PAGE_MAX_LIVE / KYTY_HOT_PAGE_FRAMES_LIVE (SetHotOverride), hot pages on only.
 		if (write_fault && policy.hot_frames != 0) {
 			if (const auto max = s_hot_max_override.load(std::memory_order_relaxed); max != 0) {
@@ -196,7 +204,8 @@ private:
 					return true;
 				}
 				if (write_fault) {
-					const auto [begin, end] = FaultWindow(offset, bytes, policy.ahead_pages);
+					const auto [begin, end] =
+					    FaultWindow(offset, bytes, policy.ahead_pages, policy.sequential_ahead);
 					NotifyCpuMutation(manager->GetCpuAddr() + begin, end - begin);
 				} else {
 					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
@@ -253,6 +262,11 @@ public:
 	}
 	[[nodiscard]] static uint32_t FaultAheadOverride() noexcept {
 		return s_ahead_override.load(std::memory_order_relaxed);
+	}
+	// KYTY_FAULT_AHEAD_SEQUENTIAL (BufferCache, live): write faults open their fault-ahead window
+	// only for sequential fills (FaultPolicy::sequential_ahead). Any thread.
+	static void SetSequentialAhead(bool on) noexcept {
+		s_sequential_ahead.store(on, std::memory_order_relaxed);
 	}
 	// KYTY_HOT_PAGE_MAX_LIVE / KYTY_HOT_PAGE_FRAMES_LIVE (BufferCache, live): with hot pages on,
 	// write faults promote up to `max` hot pages after `frames` consecutive faulting frames instead
@@ -495,9 +509,12 @@ private:
 	void           AdvanceCpuMutationEpoch() noexcept;
 	// The region-relative byte window a write fault of [offset, offset + bytes) can make CPU-dirty
 	// (RegionManager::MarkWriteFault's fault-ahead window of `ahead` pages).
+	// `sequential`: FaultPolicy::sequential_ahead (the window may reach `ahead` pages past the start).
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset, uint64_t bytes,
-	                                                               uint64_t ahead) noexcept;
+	                                                               uint64_t ahead,
+	                                                               bool     sequential = false) noexcept;
 	inline static std::atomic_uint32_t s_ahead_override {0};
+	inline static std::atomic_bool     s_sequential_ahead {false};
 	inline static std::atomic_uint32_t s_hot_max_override {0};
 	inline static std::atomic_uint32_t s_hot_frames_override {0};
 	inline static thread_local bool   t_fault_found_dirty = false;
@@ -518,6 +535,10 @@ private:
 	std::mutex              m_dirtied_mutex;
 	RangeSet                m_dirtied;
 	bool                    m_dirtied_overflow = false;
+	// Reach log (EnableReachLog), under m_dirtied_mutex.
+	std::atomic_bool        m_reach_log_on {false};
+	RangeSet                m_reach_log;
+	bool                    m_reach_log_overflow = false;
 };
 
 } // namespace Libs::Graphics

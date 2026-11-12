@@ -1105,6 +1105,44 @@ void TestFaultAheadWindow() {
   Release(memory);
 }
 
+// KYTY_FAULT_AHEAD_SEQUENTIAL (FaultPolicy::sequential_ahead): an isolated write fault opens only
+// its own page; a fault whose page below is CPU-dirty already opens the window forward from it.
+void TestSequentialFaultAhead() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  policy.sequential_ahead = true;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 24);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, page_size * 24);
+
+  std::vector<std::pair<uint64_t, uint64_t>> ahead_runs;
+  Check(WriteFault(tracker, address + page_size * 6 + 8, &ahead_runs) == 0,
+        "sequential fault-ahead: isolated fault requested a GPU flush");
+  Check(ahead_runs.empty(), "sequential fault-ahead: an isolated fault opened a window");
+  for (uint64_t page = 0; page < 24; page++) {
+    Check(tracker.IsRegionCpuModified(address + page * page_size, page_size) == (page == 6),
+          "sequential fault-ahead: isolated fault state is wrong");
+  }
+  // Page 7: the page below (6) is CPU-dirty, so pages 8..14 open ahead (7 is the faulting page).
+  ahead_runs.clear();
+  Check(WriteFault(tracker, address + page_size * 7, &ahead_runs) == 0,
+        "sequential fault-ahead: sequential fault requested a GPU flush");
+  Check(ahead_runs.size() == 1 && ahead_runs[0].first == address + page_size * 8 &&
+            ahead_runs[0].second == page_size * 7,
+        "sequential fault-ahead: the forward window is wrong");
+  for (uint64_t page = 0; page < 24; page++) {
+    const bool dirty = page >= 6 && page < 15;
+    Check(tracker.IsRegionCpuModified(address + page * page_size, page_size) == dirty &&
+              IsWritable(memory + page * page_size) == dirty,
+          "sequential fault-ahead: window state is wrong");
+  }
+  tracker.UntrackMemory(address, page_size * 24);
+  Release(memory);
+}
+
 // The lock-free dirty mirrors are republished only for the pages a transition changes
 // (RegionManager::Publish*Mirror): transitions spanning mirror words (64 pages each) and a
 // 128-page fault-ahead window keep every word equal to the locked bits. The allocation starts 16
@@ -3042,6 +3080,7 @@ int main(int argc, char **argv) {
   TestCleanVerdictTrackerTransitionsBump();
   TestCleanVerdictCrossThreadInvalidation();
   TestFaultAheadWindow();
+  TestSequentialFaultAhead();
   TestMirrorsAcrossWords();
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();

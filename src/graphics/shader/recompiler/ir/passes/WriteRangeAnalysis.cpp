@@ -3,7 +3,10 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <fmt/format.h>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -298,6 +301,302 @@ private:
 	bool                                    m_overflow = false;
 };
 
+// The bits a 32-bit value can have set (UINT32_MAX: unknown). Based on TheCruZ/KytyPS5-GTA
+// (ResourceTracking.cpp PossibleU32Bits), with BitFieldUExtract added.
+uint32_t PossibleBits(Value value, std::unordered_map<const Inst*, uint32_t>& known) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 ? value.U32() : UINT32_MAX;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return UINT32_MAX;
+	}
+	// A cycle stays unknown; results are shared across the SSA graph.
+	const auto [entry, inserted] = known.try_emplace(inst, UINT32_MAX);
+	if (!inserted) {
+		return entry->second;
+	}
+	uint32_t   bits = UINT32_MAX;
+	const auto arg  = [&](uint32_t index) {
+		return index < inst->NumArgs() ? PossibleBits(inst->Arg(index), known) : UINT32_MAX;
+	};
+	const auto immediate = [&](uint32_t index, uint32_t& out) {
+		if (index >= inst->NumArgs()) return false;
+		const auto at = inst->Arg(index).Resolve();
+		if (!at.IsImmediate() || at.GetType() != Type::U32) return false;
+		out = at.U32();
+		return true;
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::Identity: bits = arg(0); break;
+		case ValueOpcode::BitwiseAnd32: bits = arg(0) & arg(1); break;
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::UMax32: bits = arg(0) | arg(1); break;
+		case ValueOpcode::SelectU32: bits = arg(1) | arg(2); break;
+		case ValueOpcode::Phi: {
+			uint32_t merged = 0;
+			for (uint32_t index = 0; index < inst->NumArgs(); ++index) merged |= arg(index);
+			if (inst->NumArgs() != 0u) bits = merged;
+			break;
+		}
+		case ValueOpcode::ShiftLeftLogical32: {
+			uint32_t shift = 0;
+			if (immediate(1, shift)) bits = arg(0) << (shift & 31u);
+			break;
+		}
+		case ValueOpcode::ShiftRightLogical32: {
+			uint32_t shift = 0;
+			if (immediate(1, shift)) bits = arg(0) >> (shift & 31u);
+			break;
+		}
+		case ValueOpcode::BitFieldUExtract: {
+			uint32_t offset = 0;
+			uint32_t count  = 0;
+			if (immediate(1, offset) && immediate(2, count) && offset < 32u && count <= 32u - offset) {
+				const auto mask = count == 32u ? UINT32_MAX : (1u << count) - 1u;
+				bits            = (arg(0) >> offset) & mask;
+			}
+			break;
+		}
+		case ValueOpcode::BitFieldInsert: {
+			uint32_t offset = 0;
+			uint32_t count  = 0;
+			if (immediate(2, offset) && immediate(3, count) && offset < 32u && count <= 32u - offset) {
+				const auto field = (count == 32u ? UINT32_MAX : (1u << count) - 1u) << offset;
+				bits             = (arg(0) & ~field) | ((arg(1) << offset) & field);
+			}
+			break;
+		}
+		default: break;
+	}
+	known[inst] = bits;
+	return bits;
+}
+
+// A LoadAddressU32 scalar address read of one dword (ResourceKind::ScalarAddress) that the
+// emitter loads: its base pair handle, offset value and dword-aligned immediate.
+bool ScalarAddressRead(const Program& program, const Inst* read, const Inst*& handle, Value& offset,
+                       int32_t& immediate) {
+	if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 || read->NumArgs() != 4u) {
+		return false;
+	}
+	const auto index = read->Flags<MemoryFlags>().index;
+	if (index >= program.memory_info.size()) {
+		return false;
+	}
+	const auto& memory = program.memory_info[index];
+	const auto  high   = read->Arg(2).Resolve();
+	const auto  active = read->Arg(3).Resolve();
+	if (memory.kind != ResourceKind::ScalarAddress || memory.address_is_full || memory.planning_only ||
+	    !high.IsImmediate() || high.GetType() != Type::U32 || high.U32() != 0u || !active.IsImmediate() ||
+	    active.GetType() != Type::U1 || !active.U1()) {
+		return false;
+	}
+	handle = read->Arg(0).Resolve().TryInstruction();
+	if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+	    handle->NumArgs() != 2u) {
+		return false;
+	}
+	offset    = read->Arg(1).Resolve();
+	immediate = static_cast<int32_t>(memory.offset & ~3u);
+	return true;
+}
+
+bool SameAddressBase(const Inst& left, const Inst& right) {
+	return &left == &right ||
+	       (left.Arg(0).Resolve() == right.Arg(0).Resolve() && left.Arg(1).Resolve() == right.Arg(1).Resolve());
+}
+
+// Collects DmaReadReach for the program (see ShaderIR.h). Every opcode the SPIR-V emitter turns
+// into a page-table walk (get_bda_pointer) reaches here through the checks below: address loads,
+// loads through a computed V#, and the BVH / ray-tracing walks, which are unbounded.
+template <typename Visitor>
+void CollectDmaReads(const Program& program, Visitor&& visit, DmaReadReach& dma) {
+	constexpr size_t MaxAccesses = 256;
+	dma = {};
+	if (!program.info.uses_dma) {
+		return;
+	}
+	const auto fail = [&](DmaUnbounded why) {
+		if (dma.reason == 0u) {
+			dma.reason = static_cast<uint32_t>(why);
+		}
+	};
+	if (program.has_address_writes || program.info.bda_writes) {
+		fail(DmaUnbounded::AddressWrites);
+	}
+	if (program.info.uses_bvh || program.info.ray_query_sites != 0u) {
+		fail(DmaUnbounded::RayTracing);
+	}
+	std::unordered_map<const Inst*, uint32_t> known_bits;
+	std::vector<DmaReadAccess>                accesses;
+	const auto add = [&](DmaReadAccess access) {
+		// Accesses that differ only in their immediate share one entry over the immediates' hull.
+		for (auto& other: accesses) {
+			auto a = other;
+			auto b = access;
+			a.immediate = b.immediate = 0;
+			a.extent = b.extent = 0;
+			if (!(a == b)) {
+				continue;
+			}
+			const int64_t begin = std::min<int64_t>(other.immediate, access.immediate);
+			const int64_t end   = std::max<int64_t>(int64_t {other.immediate} + other.extent,
+			                                        int64_t {access.immediate} + access.extent);
+			if (end - begin > INT32_MAX) {
+				break;
+			}
+			other.immediate = static_cast<int32_t>(begin);
+			other.extent    = static_cast<uint32_t>(end - begin);
+			return;
+		}
+		accesses.push_back(access);
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (dma.reason != 0u) {
+				break;
+			}
+			const auto op      = inst.GetOpcode();
+			const auto address = AddressOpcodeInfoOf(op);
+			const auto buffer  = BufferAccessOf(op);
+			if (address.access == AddressAccess::None && buffer == BufferAccess::None) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size() || inst.NumArgs() == 0u) {
+				fail(DmaUnbounded::OtherAccess);
+				break;
+			}
+			const auto& memory = program.memory_info[index];
+			if (address.access != AddressAccess::None) {
+				if (memory.kind == ResourceKind::Scratch || memory.kind == ResourceKind::Lds ||
+				    memory.kind == ResourceKind::Gds) {
+					continue;
+				}
+				if (op == ValueOpcode::LoadAddressU32 && memory.planning_only) {
+					continue; // not emitted
+				}
+				if (address.access != AddressAccess::Read) {
+					fail(DmaUnbounded::AddressWrites);
+					break;
+				}
+				if (op != ValueOpcode::LoadAddressU8 && op != ValueOpcode::LoadAddressU16 &&
+				    op != ValueOpcode::LoadAddressU32) {
+					fail(DmaUnbounded::RayTracing);
+					break;
+				}
+				if (memory.address_is_full) {
+					fail(DmaUnbounded::FullAddress);
+					break;
+				}
+				const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+				    handle->NumArgs() != 2u || inst.NumArgs() < 2u) {
+					fail(DmaUnbounded::AddressHandle);
+					break;
+				}
+				// The mesh prologue's index fetch (Translate.cpp): GetAddressResource(draw dword 4 & ~3,
+				// draw dword 5). No guest code yields MeshDrawParameter.
+				const auto mesh_dword = [](Value value, uint32_t dword) {
+					const auto* source = value.Resolve().TryInstruction();
+					return source != nullptr && source->GetOpcode() == ValueOpcode::MeshDrawParameter &&
+					       source->NumArgs() == 1u && source->Arg(0).IsImmediate() && source->Arg(0).U32() == dword;
+				};
+				const auto* low_and = handle->Arg(0).Resolve().TryInstruction();
+				if (mesh_dword(handle->Arg(1), 5u) && low_and != nullptr &&
+				    low_and->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+				    (mesh_dword(low_and->Arg(0), 4u) || mesh_dword(low_and->Arg(1), 4u))) {
+					DmaReadAccess mesh;
+					mesh.kind = DmaReadAccess::Kind::MeshIndex;
+					add(mesh);
+					continue;
+				}
+				DmaReadAccess access;
+				access.kind      = DmaReadAccess::Kind::Window;
+				access.scalar    = memory.kind == ResourceKind::ScalarAddress;
+				access.base_low  = visit(handle->Arg(0));
+				access.base_high = visit(handle->Arg(1));
+				access.offset    = visit(inst.Arg(1));
+				access.immediate = static_cast<int32_t>(access.scalar ? memory.offset & ~3u : memory.offset);
+				// Unaligned loads read the dword(s) holding their bytes: at most 8 bytes past the
+				// aligned address; 16 leaves room for every load shape.
+				access.extent = 16;
+				add(access);
+				continue;
+			}
+			if (memory.kind != ResourceKind::IndirectBuffer) {
+				continue; // a bound descriptor, not a device address
+			}
+			if ((op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::LoadAddressU32) &&
+			    memory.planning_only) {
+				continue; // not emitted
+			}
+			if (buffer != BufferAccess::Read) {
+				fail(DmaUnbounded::AddressWrites);
+				break;
+			}
+			const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+			if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    handle->NumArgs() != 4u) {
+				fail(DmaUnbounded::IndirectHandle);
+				break;
+			}
+			DmaReadAccess access;
+			const bool    scalar = op == ValueOpcode::ReadConstBuffer;
+			access.kind = scalar ? DmaReadAccess::Kind::IndirectScalar : DmaReadAccess::Kind::IndirectVector;
+			for (uint32_t word = 0; word < 4u; ++word) {
+				access.words[word] = visit(handle->Arg(word));
+			}
+			// The V# from one table entry: dwords k = 0..3 read at the same base and offset, the
+			// immediate 4k past dword 0's.
+			const Inst* table_handle = nullptr;
+			Value       table_offset;
+			int32_t     table_immediate = 0;
+			if (ScalarAddressRead(program, handle->Arg(0).Resolve().TryInstruction(), table_handle,
+			                      table_offset, table_immediate)) {
+				access.table_words = 1u;
+				for (uint32_t word = 1; word < 4u; ++word) {
+					const Inst* other_handle = nullptr;
+					Value       other_offset;
+					int32_t     other_immediate = 0;
+					if (ScalarAddressRead(program, handle->Arg(word).Resolve().TryInstruction(), other_handle,
+					                      other_offset, other_immediate) &&
+					    SameAddressBase(*other_handle, *table_handle) && other_offset == table_offset &&
+					    int64_t {other_immediate} == int64_t {table_immediate} + 4 * word) {
+						access.table_words |= static_cast<uint8_t>(1u << word);
+					}
+				}
+				access.base_low        = visit(table_handle->Arg(0));
+				access.base_high       = visit(table_handle->Arg(1));
+				access.table_offset    = visit(table_offset);
+				access.table_bits      = PossibleBits(table_offset, known_bits) & ~3u;
+				access.table_immediate = table_immediate;
+			}
+			if (!scalar) {
+				if (inst.NumArgs() < 4u) {
+					fail(DmaUnbounded::IndirectHandle);
+					break;
+				}
+				access.index     = visit(inst.Arg(1));
+				access.offset    = visit(inst.Arg(2));
+				access.soffset   = visit(inst.Arg(3));
+				access.immediate = static_cast<int32_t>(memory.offset);
+				access.extent    = 16;
+			}
+			add(access);
+		}
+	}
+	if (dma.reason == 0u && accesses.size() > MaxAccesses) {
+		fail(DmaUnbounded::TooManyAccesses);
+	}
+	if (dma.reason == 0u) {
+		dma.bounded  = true;
+		dma.accesses = std::move(accesses);
+	}
+}
+
 // Interval arithmetic over unsigned 32-bit values. Every result contains all values the native
 // operation (with 32-bit wrap-around) can produce for operands inside the operand intervals.
 struct Range {
@@ -382,9 +681,16 @@ void AnalyzeBufferWriteRanges(Program& program, ShaderStageInputInfo input_info)
 		}
 		result.buffers.push_back(std::move(entry));
 	}
-	if (result.buffers.empty() ||
-	    std::none_of(result.buffers.begin(), result.buffers.end(),
-	                 [](const BufferWriteRange& entry) { return entry.bounded; })) {
+	// KYTY_BDA_REACH: the guest memory the device-address reads can reach (on the same tape).
+	CollectDmaReads(program, [&](Value value) { return builder.Visit(value); }, result.dma);
+	if (result.dma.bounded && builder.Overflowed()) {
+		result.dma          = {};
+		result.dma.reason   = static_cast<uint32_t>(DmaUnbounded::NodeOverflow);
+	}
+	if (!result.dma.bounded &&
+	    (result.buffers.empty() ||
+	     std::none_of(result.buffers.begin(), result.buffers.end(),
+	                  [](const BufferWriteRange& entry) { return entry.bounded; }))) {
 		result.nodes.clear();
 		result.nodes.shrink_to_fit();
 	}
@@ -572,6 +878,271 @@ bool WriteRangeEvaluator::Spans(const WriteRangeProgram& program, uint32_t buffe
 		spans.assign(1, hull);
 	}
 	return true;
+}
+
+void NormalizeDmaSpans(std::vector<std::pair<uint64_t, uint64_t>>& spans, uint64_t page) {
+	std::erase_if(spans, [](const auto& span) { return span.second <= span.first; });
+	for (auto& [begin, end]: spans) {
+		begin &= ~(page - 1u);
+		end = end > UINT64_MAX - (page - 1u) ? UINT64_MAX : (end + page - 1u) & ~(page - 1u);
+	}
+	std::sort(spans.begin(), spans.end());
+	size_t out = 0;
+	for (size_t index = 0; index < spans.size(); index++) {
+		if (spans[index].second <= spans[index].first) {
+			continue;
+		}
+		if (out != 0 && spans[index].first <= spans[out - 1].second) {
+			spans[out - 1].second = std::max(spans[out - 1].second, spans[index].second);
+		} else {
+			spans[out++] = spans[index];
+		}
+	}
+	spans.resize(out);
+}
+
+bool WriteRangeEvaluator::DmaSpans(const WriteRangeProgram& program, const DmaReachInputs& inputs,
+                                   std::vector<std::pair<uint64_t, uint64_t>>& spans,
+                                   DmaReachFailure& why) const {
+	why = DmaReachFailure::None;
+	if (!program.dma.bounded || m_program != &program || m_values.size() != program.nodes.size()) {
+		why = DmaReachFailure::NotBounded;
+		return false;
+	}
+	const auto value_of = [&](uint32_t node) -> Range {
+		if (node >= m_values.size()) return Full();
+		return {m_values[node].lo, m_values[node].hi};
+	};
+	const auto exact = [&](uint32_t node, uint32_t& value) {
+		const auto range = value_of(node);
+		if (range.lo != range.hi) return false;
+		value = static_cast<uint32_t>(range.lo);
+		return true;
+	};
+	const auto fail = [&](DmaReachFailure reason) {
+		why = reason;
+		return false;
+	};
+	// [base + lo, base + hi) with lo, hi signed byte offsets; clamped to the 64-bit space.
+	const auto add_span = [&](uint64_t base, int64_t lo, int64_t hi) {
+		const uint64_t begin = lo < 0 ? (base > static_cast<uint64_t>(-lo) ? base + lo : 0)
+		                              : base + static_cast<uint64_t>(lo);
+		const uint64_t end   = base + static_cast<uint64_t>(std::max<int64_t>(hi, 0));
+		if (end <= begin) return true;
+		if (end - begin > inputs.max_span_bytes) return false;
+		spans.emplace_back(begin, end);
+		return true;
+	};
+	for (const auto& access: program.dma.accesses) {
+		m_dma_failed = static_cast<size_t>(&access - program.dma.accesses.data());
+		if (access.kind == DmaReadAccess::Kind::MeshIndex) {
+			// Dword-aligned loads of the index bytes: [begin & ~3, end + 4).
+			if (!inputs.mesh_index_known) {
+				return fail(DmaReachFailure::Base);
+			}
+			if (inputs.mesh_index_end > inputs.mesh_index_begin &&
+			    !add_span(inputs.mesh_index_begin & ~uint64_t {3}, 0,
+			              static_cast<int64_t>(inputs.mesh_index_end - (inputs.mesh_index_begin & ~uint64_t {3})) + 4)) {
+				return fail(DmaReachFailure::Size);
+			}
+			continue;
+		}
+		if (access.kind == DmaReadAccess::Kind::Window) {
+			uint32_t low  = 0;
+			uint32_t high = 0;
+			if (!exact(access.base_low, low) || !exact(access.base_high, high)) {
+				return fail(DmaReachFailure::Base);
+			}
+			// GuestAddress(): base + zext(offset) + sext(immediate); a scalar read clears bits 1:0 of
+			// the base, the offset and the immediate (already cleared in `immediate`).
+			uint64_t base = low | (uint64_t {high} << 32u);
+			auto     offset = value_of(access.offset);
+			if (access.scalar) {
+				base &= ~uint64_t {3};
+				offset.lo &= ~uint64_t {3};
+			}
+			// LoadBda reads the aligned dword(s) holding the bytes: 4 below covers the alignment.
+			if (!add_span(base, static_cast<int64_t>(offset.lo) + access.immediate - 4,
+			              static_cast<int64_t>(offset.hi) + access.immediate + access.extent)) {
+				return fail(DmaReachFailure::Size);
+			}
+			continue;
+		}
+		const bool vector = access.kind == DmaReadAccess::Kind::IndirectVector;
+		// The words a V# needs: 0..2 for a scalar load (RDNA2 ISA 7.2.1 uses base, stride and
+		// records), 0..3 for a vector load (word 3 optional: unknown means the widest rules).
+		std::array<uint32_t, 4> fixed {};
+		std::array<bool, 4>     known {};
+		for (uint32_t word = 0; word < 4u; ++word) {
+			if ((access.table_words & (1u << word)) == 0u) {
+				known[word] = exact(access.words[word], fixed[word]);
+			}
+		}
+		const auto needed_known = [&](uint32_t word) {
+			return (access.table_words & (1u << word)) != 0u || known[word];
+		};
+		if (!needed_known(0) || !needed_known(1) || !needed_known(2)) {
+			return fail(DmaReachFailure::Base);
+		}
+		const auto reach_of = [&](const std::array<uint32_t, 4>& words, bool word3_known) {
+			const uint64_t base    = words[0] | (uint64_t {words[1] & 0xffffu} << 32u);
+			const uint64_t stride  = (words[1] >> 16u) & 0x3fffu;
+			const bool     swizzle = stride != 0u && (words[1] >> 31u) != 0u;
+			const uint64_t records = words[2];
+			if (!vector) {
+				// LoadIndirectScalarBuffer: (offset & ~3) + 4 <= size, address (base + offset) & ~3.
+				const uint64_t size = stride == 0u ? records : stride * records;
+				return add_span(base & ~uint64_t {3}, 0, static_cast<int64_t>((base & 3u) + size))
+				           ? DmaReachFailure::None
+				           : DmaReachFailure::Size;
+			}
+			const uint32_t format = word3_known ? (words[3] >> 12u) & 0x7fu : 1u;
+			if (format == 0u) {
+				return DmaReachFailure::None; // FORMAT 0 (unbound): every load reads 0
+			}
+			const bool     add_tid      = !word3_known || ((words[3] >> 23u) & 1u) != 0u;
+			const uint32_t mode         = word3_known ? (words[3] >> 28u) & 3u : 2u; // 2: records only
+			if (swizzle && !word3_known) {
+				return DmaReachFailure::Swizzle;
+			}
+			const uint32_t index_stride = word3_known ? (words[3] >> 21u) & 3u : 0u;
+			// Every in-range access (IndirectBufferInBounds) satisfies the bounds of its OOB_SELECT
+			// mode; out-of-range lanes read nothing. byte = index * stride + offset + soffset.
+			auto index = value_of(access.index);
+			if (add_tid) index.hi += 63u;
+			uint64_t index_hi   = index.hi;
+			uint64_t offset_hi  = value_of(access.offset).hi + static_cast<uint64_t>(access.immediate < 0 ? 0 : access.immediate);
+			if (access.immediate < 0) offset_hi = U32Max; // a wrapping immediate: unknown
+			uint64_t soffset_hi = value_of(access.soffset).hi;
+			if (mode != 2u && records == 0u) {
+				return DmaReachFailure::None; // nothing is in range
+			}
+			// Modes 0 and 1 check index < records; mode 3 checks index < records - soffset only
+			// when swizzled.
+			if (mode == 0u || mode == 1u || (mode == 3u && swizzle)) {
+				index_hi = std::min(index_hi, records - 1u);
+			}
+			if (mode == 0u) offset_hi = std::min(offset_hi, stride);
+			if (mode == 3u) {
+				soffset_hi = std::min(soffset_hi, records);
+				offset_hi  = std::min(offset_hi, swizzle ? stride : records);
+			}
+			uint64_t byte_hi = 0;
+			if (swizzle) {
+				const uint64_t indices = uint64_t {1} << (index_stride + 3u);
+				byte_hi = ((index_hi >> (index_stride + 3u)) * stride + (offset_hi & ~uint64_t {3})) * indices +
+				          std::min<uint64_t>(index_hi, indices - 1u) * 4u + 3u + soffset_hi;
+			} else if (mode == 3u) {
+				// offset + soffset + bytes <= records.
+				byte_hi = (stride == 0u ? 0u : index_hi * stride) + records;
+			} else {
+				byte_hi = (stride == 0u ? 0u : index_hi * stride) + offset_hi + soffset_hi;
+			}
+			// A sum that can pass 32 bits wraps in the shader: any byte of the 4 GiB past base.
+			if ((stride != 0u && index_hi >= U32Max) || byte_hi + access.extent > U32Max) {
+				return DmaReachFailure::Offset;
+			}
+			return add_span(base, -4, static_cast<int64_t>(byte_hi + access.extent + 4u))
+			           ? DmaReachFailure::None
+			           : DmaReachFailure::Size;
+		};
+		if (access.table_words == 0u) {
+			const auto result = reach_of(fixed, known[3]);
+			if (result != DmaReachFailure::None) return fail(result);
+			continue;
+		}
+		uint32_t table_low  = 0;
+		uint32_t table_high = 0;
+		if (!exact(access.base_low, table_low) || !exact(access.base_high, table_high) ||
+		    inputs.read == nullptr) {
+			return fail(DmaReachFailure::Base);
+		}
+		const uint64_t table = (table_low | (uint64_t {table_high} << 32u)) & ~uint64_t {3};
+		const auto     range = value_of(access.table_offset);
+		const uint64_t lo    = range.lo & ~uint64_t {3};
+		const uint64_t hi    = range.hi;
+		const uint32_t bits  = access.table_bits;
+		uint32_t       entries = 0;
+		const auto visit_entry = [&](uint64_t offset) {
+			const int64_t  at      = static_cast<int64_t>(offset) + access.table_immediate;
+			const uint64_t address = at < 0 ? table - static_cast<uint64_t>(-at) : table + static_cast<uint64_t>(at);
+			if (at < 0 && table < static_cast<uint64_t>(-at)) return DmaReachFailure::TableRead;
+			std::array<uint32_t, 4> words = fixed;
+			uint32_t first = 0;
+			uint32_t last  = 0;
+			for (uint32_t word = 0; word < 4u; ++word) {
+				if ((access.table_words & (1u << word)) != 0u) {
+					last = word;
+				}
+			}
+			while ((access.table_words & (1u << first)) == 0u) ++first;
+			std::array<uint32_t, 4> read {};
+			if (!inputs.read(inputs.user, address + first * 4u,
+			                 std::span<uint32_t>(read.data(), last - first + 1u))) {
+				return DmaReachFailure::TableRead;
+			}
+			for (uint32_t word = first; word <= last; ++word) {
+				if ((access.table_words & (1u << word)) != 0u) words[word] = read[word - first];
+			}
+			return reach_of(words, needed_known(3));
+		};
+		// Offsets in [lo, hi] (dword-aligned) whose set bits are possible.
+		if (std::popcount(bits) <= 16) {
+			for (uint32_t sub = bits;; sub = (sub - 1u) & bits) {
+				if (sub >= lo && sub <= hi) {
+					if (++entries > inputs.max_table_entries) return fail(DmaReachFailure::TableEntries);
+					const auto result = visit_entry(sub);
+					if (result != DmaReachFailure::None) return fail(result);
+				}
+				if (sub == 0u) break;
+			}
+		} else {
+			if (hi >= U32Max || (hi - lo) / 4u + 1u > inputs.max_table_entries) {
+				return fail(DmaReachFailure::TableEntries);
+			}
+			for (uint64_t offset = lo; offset <= hi; offset += 4u) {
+				if ((offset & ~uint64_t {bits}) != 0u) continue;
+				const auto result = visit_entry(offset);
+				if (result != DmaReachFailure::None) return fail(result);
+			}
+		}
+	}
+	return true;
+}
+
+std::string WriteRangeEvaluator::DescribeDmaFailure(const WriteRangeProgram& program) const {
+	if (m_dma_failed >= program.dma.accesses.size()) {
+		return "-";
+	}
+	const auto& access = program.dma.accesses[m_dma_failed];
+	const auto  node   = [&](uint32_t index) {
+		if (index >= program.nodes.size()) return std::string("?");
+		const auto& item  = program.nodes[index];
+		const auto  value = index < m_values.size() ? m_values[index] : Interval {};
+		std::string what;
+		switch (item.op) {
+			case Op::Range:
+				what = item.a == 0u ? "range"
+				       : item.a == UnknownLoopOrDepth
+				           ? "loop"
+				           : std::string(ValueOpcodeName(static_cast<ValueOpcode>(item.a - 1u)));
+				break;
+			case Op::UserData: what = fmt::format("ud{}", item.a); break;
+			case Op::FlatSrt: what = fmt::format("flat{}", item.a); break;
+			default: what = fmt::format("op{}", static_cast<uint32_t>(item.op)); break;
+		}
+		return fmt::format("{}[{:x}..{:x}]", what, value.lo, value.hi);
+	};
+	static constexpr const char* kinds[] = {"window", "indirect-scalar", "indirect-vector", "mesh-index"};
+	std::string text = fmt::format("access {}/{} {}{} base {}:{} offset {}", m_dma_failed, program.dma.accesses.size(),
+	                               kinds[static_cast<uint32_t>(access.kind) % 4u], access.scalar ? " scalar" : "",
+	                               node(access.base_low), node(access.base_high), node(access.offset));
+	if (access.kind != DmaReadAccess::Kind::Window) {
+		text += fmt::format(" table_words {:x} table_offset {} words {} {} {} {}", access.table_words,
+		                    node(access.table_offset), node(access.words[0]), node(access.words[1]),
+		                    node(access.words[2]), node(access.words[3]));
+	}
+	return text;
 }
 
 std::string WriteRangeEvaluator::Describe(const WriteRangeProgram& program, uint32_t buffer) const {

@@ -255,6 +255,12 @@ public:
 		uint32_t hot_max     = 0;
 		// Written uploads copy with no region lock held (MemoryTracker::ForEachWrittenUploadRange).
 		bool copy_outside_lock = false;
+		// KYTY_FAULT_AHEAD_SEQUENTIAL (MemoryTracker::SetSequentialAhead): the window opens only for a
+		// sequential fill, i.e. when the page below the faulting ones is CPU-dirty already, and then
+		// covers the `ahead_pages` pages from the faulting page on (forward, within the region). Any
+		// other fault makes only its own pages CPU-dirty. Adapted from TheCruZ/KytyPS5-GTA
+		// (InvalidateFaultedPage).
+		bool sequential_ahead = false;
 	};
 	struct FaultResult {
 		uint64_t ahead_pages   = 0;
@@ -281,15 +287,21 @@ public:
 		result.already_dirty = already_dirty.Any();
 		// The pages that become CPU-dirty here, for the protection update (79a04b9a1).
 		RegionBits changed(~m_cpu_dirty, start, end);
+		const bool sequential = start > 0 && m_cpu_dirty.Get(start - 1);
 		m_cpu_dirty.SetRange(start, end);
 		// The pages whose CPU-dirty bits may change: the faulting ones and the fault-ahead window.
 		size_t changed_begin = start;
 		size_t changed_end   = end;
-		if (policy.ahead_pages > 1) {
-			const size_t window_begin = start / policy.ahead_pages * policy.ahead_pages;
-			const size_t window_end = std::min<size_t>((end + policy.ahead_pages - 1) /
-			                                               policy.ahead_pages * policy.ahead_pages,
-			                                           TRACKER_REGION_PAGES);
+		if (policy.ahead_pages > 1 && (!policy.sequential_ahead || sequential)) {
+			const size_t window_begin = policy.sequential_ahead
+			                                ? start
+			                                : start / policy.ahead_pages * policy.ahead_pages;
+			const size_t window_end =
+			    policy.sequential_ahead
+			        ? std::min<size_t>(std::max<size_t>(start + policy.ahead_pages, end), TRACKER_REGION_PAGES)
+			        : std::min<size_t>((end + policy.ahead_pages - 1) / policy.ahead_pages *
+			                               policy.ahead_pages,
+			                           TRACKER_REGION_PAGES);
 			changed_begin           = std::min(changed_begin, window_begin);
 			changed_end             = std::max(changed_end, window_end);
 			RegionBits all;

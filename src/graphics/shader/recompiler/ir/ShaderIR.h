@@ -898,9 +898,65 @@ struct BufferWriteRange {
 	bool operator==(const BufferWriteRange& other) const = default;
 };
 
+// The guest memory one read through a computed address (BDA) can reach (KYTY_BDA_REACH, see
+// WriteRangeEvaluator::DmaSpans). Node fields index WriteRangeProgram::nodes.
+// - Window: an address load at base + offset + immediate + [0, extent), base = (base_low,
+//   base_high) (both bits 1:0 cleared for a scalar address read, as the emitter does), the
+//   offset zero-extended from 32 bits.
+// - IndirectScalar / IndirectVector: a load through a V# the shader assembles from words[0..3];
+//   word k comes from table dword k when bit k of table_words is set: the 16 bytes at
+//   (base & ~3) + (o & ~3) + table_immediate for every o of node table_offset whose set bits
+//   lie in table_bits. A scalar load reads [V# base, V# base + V# size). A vector load reads at
+//   index * stride + offset + immediate + soffset (+ lane with ADD_TID) and extent bytes past it.
+struct DmaReadAccess {
+	// MeshIndex: the mesh prologue's index fetch (Translate.cpp: base = draw dwords 4-5, read only for
+	// input vertices below the dispatch's count): the reach is the draw's index range, from the host.
+	enum class Kind : uint8_t { Window, IndirectScalar, IndirectVector, MeshIndex };
+	Kind     kind          = Kind::Window;
+	bool     scalar        = false; // Window: ResourceKind::ScalarAddress (bits 1:0 cleared)
+	uint8_t  table_words   = 0;
+	uint32_t base_low      = 0;
+	uint32_t base_high     = 0;
+	uint32_t offset        = 0;
+	int32_t  immediate     = 0;
+	uint32_t extent        = 0;
+	uint32_t table_offset  = 0;
+	uint32_t table_bits    = 0;
+	int32_t  table_immediate = 0;
+	std::array<uint32_t, 4> words {};
+	uint32_t index         = 0;
+	uint32_t soffset       = 0;
+
+	bool operator==(const DmaReadAccess& other) const = default;
+};
+
+struct DmaReadReach {
+	// Every guest memory read of the program through a device address is one of `accesses`.
+	bool                       bounded = false;
+	// Why not (DmaUnbounded); 0 when bounded or when the program has no device-address access.
+	uint32_t                   reason  = 0;
+	std::vector<DmaReadAccess> accesses;
+
+	bool operator==(const DmaReadReach& other) const = default;
+};
+
+enum class DmaUnbounded : uint32_t {
+	None = 0,
+	AddressWrites,   // stores or atomics through device addresses
+	RayTracing,      // BVH or native ray tracing walks
+	FullAddress,     // a 64-bit address computed per lane
+	AddressHandle,   // an address load without a GetAddressResource base pair
+	IndirectHandle,  // an indirect V# access without a four-word GetBufferResource
+	OtherAccess,     // another kind of device-address access
+	TooManyAccesses, // more distinct accesses than the host walks per draw
+	NodeOverflow,    // the interval tape is full
+	Count,
+};
+
 struct WriteRangeProgram {
 	std::vector<WriteRangeNode>   nodes;
 	std::vector<BufferWriteRange> buffers; // One entry per written buffer resource.
+	DmaReadReach                  dma;
 
 	[[nodiscard]] const BufferWriteRange* Find(uint32_t buffer) const {
 		for (const auto& entry: buffers) {

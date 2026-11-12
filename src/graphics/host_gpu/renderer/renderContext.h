@@ -18,7 +18,9 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <atomic>
+#include <span>
 #include <string>
 #include <memory>
 #include <shared_mutex>
@@ -115,6 +117,7 @@ private:
 };
 
 class NativeRayTracing;
+struct ShaderStageRuntime;
 
 class RenderContext {
 public:
@@ -173,6 +176,22 @@ public:
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
 	void               PrepareBda();
+	// KYTY_BDA_REACH=1|verify (default off, live; renderContextReach.cpp; based on TheCruZ/KytyPS5-GTA
+	// SynchronizeDmaFootprint): the stages of one draw or dispatch. When every stage that reads
+	// through device addresses has a reach proven for its inputs (ShaderInfo write_ranges.dma), only
+	// the buffers inside the reach are synchronized; otherwise, and with the switch off, PrepareBda().
+	struct BdaReachStage {
+		const ShaderStageRuntime*                 runtime = nullptr;
+		// Bindless patches of the stage's flattened SRT (PreparedBindings::bindless_patches).
+		std::span<const std::array<uint32_t, 3>> bindless_patches;
+		std::array<uint32_t, 3>                  groups {};
+		bool                                     has_groups = false;
+		// A mesh stage's index bytes [mesh_index_begin, mesh_index_end), when known (may be empty).
+		bool                                     mesh_index_known = false;
+		uint64_t                                 mesh_index_begin = 0;
+		uint64_t                                 mesh_index_end   = 0;
+	};
+	void               PrepareBda(std::span<const BdaReachStage> stages);
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS (vramStats.h): one GPU memory report (GPU thread).
 	void               ReportVram();
@@ -235,6 +254,9 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	std::unique_ptr<NativeRayTracing> m_native_ray_tracing;
 	bool                      m_fault_process_pending = false;
+	// KYTY_BDA_REACH state (renderContextReach.cpp; shared_ptr: complete only there).
+	struct BdaReach;
+	std::shared_ptr<BdaReach> m_bda_reach;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -1613,6 +1613,14 @@ const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
+uint64_t GuestBackingBase() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingBase() : 0;
+}
+
+uint64_t GuestBackingSize() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingSize() : 0;
+}
+
 static std::atomic<bool (*)(uint64_t)> g_pending_amm_map_covers {nullptr};
 
 void SetPendingAmmMapHook(bool (*covers)(uint64_t vaddr)) {

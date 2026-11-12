@@ -227,7 +227,78 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, void* host_pointer, uint64_t size,
+               ImportHostTag)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Stream), m_cpu_address(0),
+      m_size(size) {
+	if (!graphics.external_memory_host_enabled || host_pointer == nullptr || size == 0) {
+		return;
+	}
+	const auto handle_type = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = handle_type;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	vk::Buffer buffer = nullptr;
+	if (graphics.device.createBuffer(&buffer_info, nullptr, &buffer) != vk::Result::eSuccess) {
+		return;
+	}
+	vk::MemoryHostPointerPropertiesEXT pointer_properties {};
+	vk::MemoryRequirements             requirements {};
+	graphics.device.getBufferMemoryRequirements(buffer, &requirements);
+	uint32_t type = UINT32_MAX;
+	if (graphics.device.getMemoryHostPointerPropertiesEXT(handle_type, host_pointer, &pointer_properties) ==
+	    vk::Result::eSuccess) {
+		const auto memory    = graphics.physical_device.getMemoryProperties();
+		const auto candidate = pointer_properties.memoryTypeBits & requirements.memoryTypeBits;
+		// Prefer host-coherent memory (the probe's choice on NVIDIA: HOST_VISIBLE | HOST_COHERENT).
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
+			if ((candidate & (1u << i)) != 0 &&
+			    (memory.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+				type = i;
+			}
+		}
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
+			if ((candidate & (1u << i)) != 0) {
+				type = i;
+			}
+		}
+	}
+	vk::ImportMemoryHostPointerInfoEXT import_info {};
+	import_info.handleType   = handle_type;
+	import_info.pHostPointer = host_pointer;
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.pNext = &import_info;
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	vk::DeviceMemory memory = nullptr;
+	if (type == UINT32_MAX || graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess ||
+	    graphics.device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+		if (memory != nullptr) {
+			graphics.device.freeMemory(memory, nullptr);
+		}
+		graphics.device.destroyBuffer(buffer, nullptr);
+		return;
+	}
+	m_buffer          = buffer;
+	m_imported_memory = memory;
+	m_coherent        = true;
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = m_buffer;
+	m_device_address    = graphics.device.getBufferAddress(address_info);
+}
+
 Buffer::~Buffer() {
+	if (m_imported_memory != nullptr) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		m_graphics->device.freeMemory(m_imported_memory, nullptr);
+		return;
+	}
 	if (m_vram_bytes != 0) {
 		VramStats::Note(static_cast<VramStats::Kind>(m_vram_kind), m_vram_device_local,
 		                -static_cast<int64_t>(m_vram_bytes));

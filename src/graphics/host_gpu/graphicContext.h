@@ -88,6 +88,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_external_memory_host, requested only with KYTY_INPLACE (InplaceHeap).
+	bool                               external_memory_host_enabled          = false;
 	// KYTY_FULLSCREEN_EXCLUSIVE=0|1 (Windows): the swapchain asks the driver to keep out of exclusive
 	// fullscreen (0) or allows it (1), through VK_EXT_full_screen_exclusive; -1 (unset, or the
 	// extension missing): the driver's own choice.

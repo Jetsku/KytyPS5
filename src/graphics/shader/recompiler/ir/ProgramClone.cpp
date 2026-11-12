@@ -36,7 +36,7 @@ namespace {
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update CloneProgram");
 static_assert(sizeof(Block) == 9384, "IR::Block changed: update CloneProgram");
 static_assert(sizeof(ResourcePlan) == 784, "IR::ResourcePlan changed: update CloneProgram");
-static_assert(sizeof(Program) == 1088, "IR::Program changed: update CloneProgram");
+static_assert(sizeof(Program) == 1120, "IR::Program changed: update CloneProgram");
 static_assert(sizeof(BlockInfo) == 192, "IR::BlockInfo changed: update CloneProgram");
 static_assert(sizeof(DescriptorSource) == 304, "IR::DescriptorSource changed: update CloneProgram");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update CloneProgram");

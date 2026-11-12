@@ -35,6 +35,7 @@ class TextureCache;
 class UploadDma;
 struct UploadHostCopy;
 class CommandRecorder;
+class InplaceHeap;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -123,6 +124,9 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
 	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
 	void                   AdvanceFrame() noexcept;
+	// KYTY_INPLACE (inplaceHeap.h): a command-processor CPU write of guest memory (DMA_DATA) is
+	// about to happen. Any thread.
+	void                   InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size);
 	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
 	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
 	// records them all behind one barrier. Every command recorded meanwhile through
@@ -406,6 +410,31 @@ public:
 	// (ChangeRegister<true>); every other structure change goes through
 	// InvalidateBdaSynchronization.
 	void               NoteBdaRegistered(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_REACH (bufferCacheReach.cpp; based on TheCruZ/KytyPS5-GTA SynchronizeDmaFootprint):
+	// uploads the CPU writes of the buffers in `spans` (sorted, disjoint, caching-page aligned,
+	// inside the GPU mappings) for an operation whose device-address reads cannot reach other
+	// memory, instead of a full BDA pass. verify: the checks described in bufferCacheReach.cpp.
+	// Returns the upload bytes. GPU thread.
+	uint64_t           SynchronizeBdaReach(std::span<const std::pair<uint64_t, uint64_t>> spans, bool verify);
+	// After a full BDA pass (or its skip) and whenever verification is off: every page-table entry
+	// the verification left zero gets its buffer's address back. GPU thread.
+	// keep_verifying false: the switch left verify (the verification stops).
+	void               RestoreBdaReachTraps(bool keep_verifying);
+	// The 4-byte aligned dwords at `address` as the GPU will read them: from the backing store, when
+	// the range is not GPU-modified (no newer bytes on the GPU). False otherwise.
+	[[nodiscard]] bool ReadGuestForBdaReach(uint64_t address, std::span<uint32_t> words);
+	// Verification totals since start (any thread reads them for the report).
+	struct BdaReachVerifyTotals {
+		uint64_t checks          = 0; // limited synchronizations checked
+		uint64_t inside_dirty    = 0; // normal CPU-dirty tracker pages left inside the reach (must be 0)
+		uint64_t trapped         = 0; // caching pages whose entry was zeroed (dirty, outside the reach)
+		uint64_t restored        = 0; // entries given back
+		uint64_t trap_faults     = 0; // GPU page faults on pages the verification zeroed (must be 0)
+		uint64_t log_overflows   = 0; // reach-log losses (pages dirtied then are not trapped)
+	};
+	[[nodiscard]] BdaReachVerifyTotals GetBdaReachVerifyTotals() const;
+	// FaultManager: a page fault the GPU recorded at [start, start + size).
+	void               NoteBdaReachFault(uint64_t start, uint64_t size);
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
 	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
@@ -528,6 +557,8 @@ private:
 		uint64_t verify_fault_epoch     = 0;
 		uint64_t verify_structure_epoch = 0;
 		uint64_t verify_mismatch_pages  = 0;
+		// KYTY_BDA_REACH: a footprint-limited synchronization (upload accounting only).
+		bool     reach                  = false;
 	};
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
 	// KYTY_BDA_HOT_SYNC pass: re-synchronizes only the hot page runs the last full pass recorded.
@@ -1009,6 +1040,12 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_heaps;
 	bool                                              m_bda_heaps_loaded = false;
 	PageTable                                         m_page_table;
+	// KYTY_BDA_REACH=verify state (bufferCacheReach.cpp), created on first use.
+	struct BdaReachVerify;
+	// shared_ptr: the type is complete only in bufferCacheReach.cpp.
+	std::shared_ptr<BdaReachVerify>                   m_bda_reach;
+	// ChangeRegister: page-table entries of [first_page, last_page) were rewritten.
+	void NoteBdaReachRegister(uint64_t first_page, uint64_t last_page, bool insert);
 	RangeSet                                          m_gpu_modified_ranges;
 	uint64_t                                          m_unregister_epoch = 0;
 	struct KnownFillRange {
@@ -1216,6 +1253,11 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	// After the staging ring: destroyed first, waiting for its copies that read the ring.
 	std::unique_ptr<UploadDma>                        m_upload_dma;
+	// KYTY_INPLACE (inplaceHeap.h), null when off.
+	std::unique_ptr<InplaceHeap>                      m_inplace;
+	// GPU thread: [vaddr, +size) bound to an imported window when every page is a candidate and
+	// guest memory holds its current bytes.
+	[[nodiscard]] bool TryInplaceBinding(uint64_t vaddr, uint64_t size, std::pair<Buffer*, uint64_t>& result);
 	StreamBuffer                                      m_stream_buffer;
 	// KYTY_STREAM_COPY_DEFER: copies encoded for the recorder that it may not have executed yet
 	// (ring position after each), in encoding order from m_deferred_head; [lo, hi) bounds them.

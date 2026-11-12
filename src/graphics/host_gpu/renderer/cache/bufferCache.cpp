@@ -23,6 +23,8 @@
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/readFaultDiag.h"
 #include "graphics/host_gpu/renderer/cache/bufferLookupStats.h"
+#include "graphics/host_gpu/renderer/cache/inplaceHeap.h"
+#include "graphics/host_gpu/renderer/cache/inplaceStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -171,6 +173,13 @@ Live::Switch g_hot_max_live("KYTY_HOT_PAGE_MAX_LIVE", [](const char* value) -> i
 Live::Switch g_hot_frames_live("KYTY_HOT_PAGE_FRAMES_LIVE", [](const char* value) -> int64_t {
 	return value == nullptr ? 0 : static_cast<int64_t>(std::min<uint64_t>(std::strtoull(value, nullptr, 10), 255));
 });
+
+// KYTY_FAULT_AHEAD_SEQUENTIAL=1 (default off; live): the fault-ahead window (KYTY_FAULT_AHEAD_KB /
+// KYTY_FAULT_AHEAD_ADAPT size) opens only when the page below the faulting page is CPU-dirty already
+// (a sequential fill), forward from the faulting page; any other write fault makes only its own
+// pages CPU-dirty (FaultPolicy::sequential_ahead). Fewer pages uploaded that the guest did not
+// write, possibly more faults. Adapted from TheCruZ/KytyPS5-GTA InvalidateFaultedPage.
+Live::Switch g_fault_ahead_sequential("KYTY_FAULT_AHEAD_SEQUENTIAL", Live::ParseDefaultOff);
 
 uint32_t FaultAheadOverridePages() {
 	const auto value = g_fault_ahead_adapt.Get();
@@ -681,8 +690,14 @@ MemoryTracker::FaultPolicy BufferFaultPolicy() {
 	if (ParseEnvU64("KYTY_HOT_PAGES", 1) != 0) {
 		policy.hot_frames = static_cast<uint32_t>(
 		    std::clamp<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_FRAMES", 3), 1, 255));
+		// KYTY_INPLACE: pages bound in place must stay writable (hot) without faulting, so the hot
+		// set defaults to the in-place cap (KYTY_INPLACE_MAX_MB in 4 KiB pages) unless set.
+		const uint64_t hot_default =
+		    InplaceHeap::ConfiguredMode() != InplaceHeap::Mode::Off
+		        ? (ParseEnvU64("KYTY_INPLACE_MAX_MB", 512) << 20u) / TRACKER_PAGE_SIZE
+		        : 1024;
 		policy.hot_max =
-		    static_cast<uint32_t>(std::min<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_MAX", 1024), 65536));
+		    static_cast<uint32_t>(std::min<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_MAX", hot_default), 65536));
 		if (policy.hot_max == 0) {
 			policy.hot_frames = 0;
 		}
@@ -717,6 +732,7 @@ bool DirtyQueryCombinedEnabled() {
 // the stream buffer reads the guest bytes through the guest mapping instead of the backing store
 // (TryReadBacking). Its pages are CPU-dirty and not GPU-dirty, so no protection stops the read.
 BufferCache* g_defer_cache = nullptr; // the BufferCache whose stream copies are deferred
+InplaceHeap* g_inplace_heap = nullptr; // KYTY_INPLACE: CP writes check its candidate pages
 UploadDma*   g_write_drain_dma = nullptr; // KYTY_UPLOAD_DMA_WRITE_DRAIN: the cache's upload DMA
 
 bool StreamCopyProbe() {
@@ -1355,6 +1371,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
+	NoteBdaReachRegister(pages.first, pages.last_exclusive, insert); // KYTY_BDA_REACH=verify
 }
 
 // KYTY_BUFFER_LRU_SKIP=1 (default off): draws touch the same buffers many times per GC tick. The
@@ -1655,6 +1672,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (m_upload_dma != nullptr) {
 		g_write_drain_dma = m_upload_dma.get(); // KYTY_UPLOAD_DMA_WRITE_DRAIN
 	}
+	if (const auto mode = InplaceHeap::ConfiguredMode(); mode != InplaceHeap::Mode::Off) {
+		if (graphics.external_memory_host_enabled && Libs::LibKernel::Memory::GuestBackingBase() != 0) {
+			m_inplace       = std::make_unique<InplaceHeap>(graphics, scheduler, mode);
+			g_inplace_heap  = m_inplace.get();
+		} else {
+			std::printf("Kyty in-place reads: off (no VK_EXT_external_memory_host or no backing alias)\n");
+		}
+	}
 	m_relaxed_queries = RelaxedQueriesEnabled();
 	m_bda_dirty_log   = m_bda_hot_sync && BdaDirtyLogEnabled();
 	if (m_bda_dirty_log) {
@@ -1676,6 +1701,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
 	}
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	MemoryTracker::SetSequentialAhead(g_fault_ahead_sequential.Get() != 0);
 	if (ParseEnvU64("KYTY_INDIRECT_FORMAT_COUNT", 0) == 1) {
 		m_format_counts = std::make_unique<Buffer>(
 		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
@@ -1747,6 +1773,9 @@ BufferCache::~BufferCache() {
 	if (g_defer_cache == this) {
 		g_defer_cache = nullptr;
 	}
+	if (m_inplace != nullptr && g_inplace_heap == m_inplace.get()) {
+		g_inplace_heap = nullptr;
+	}
 	if (m_upload_dma != nullptr && g_write_drain_dma == m_upload_dma.get()) {
 		g_write_drain_dma = nullptr;
 	}
@@ -1778,6 +1807,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 	if (!write_fault) {
 		m_memory_tracker.InvalidateRegion(vaddr, size, flush);
 		return;
+	}
+	InplaceStats::NoteFault(vaddr);
+	if (m_inplace != nullptr) {
+		m_inplace->NoteFault(vaddr);
 	}
 	// KYTY_READBACK_SIDE_WRITES: only a fault taken by the exception handler is retried.
 	const auto fault_flush = [this, vaddr, size] {
@@ -1820,9 +1853,14 @@ BufferCache::UploadBatch::~UploadBatch() {
 
 void BufferCache::AdvanceFrame() noexcept {
 	m_memory_tracker.AdvanceFrame();
+	InplaceStats::AdvanceFrame();
+	if (m_inplace != nullptr) {
+		m_inplace->AdvanceFrame();
+	}
 	FaultCost::AdvanceFrame();
 	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	MemoryTracker::SetSequentialAhead(g_fault_ahead_sequential.Get() != 0);
 	MemoryTracker::SetHotOverride(static_cast<uint32_t>(g_hot_frames_live.Get()),
 	                              static_cast<uint32_t>(g_hot_max_live.Get()));
 	if (m_format_counts != nullptr && ++m_format_count_frames % 600 == 0) {
@@ -1883,10 +1921,43 @@ void BufferCache::MaintainHotPages() {
 		return;
 	}
 	m_hot_sweep_frame = frame;
-	m_memory_tracker.SweepHotPages(m_hot_quiet_frames);
+	// KYTY_INPLACE: pages bound in place get no uploads, so the idle sweep would demote them
+	// (write-protect them, and they would fault again) although the GPU reads them every frame.
+	if (m_inplace == nullptr) {
+		m_memory_tracker.SweepHotPages(m_hot_quiet_frames);
+	}
 	std::erase_if(m_hot_shadows, [this, frame](const auto& entry) {
 		return frame - entry.second.last_use > m_hot_quiet_frames;
 	});
+}
+
+// KYTY_HOT_PAGE_SPANS=1 (default off): a changed hot page uploads only the span from its first to
+// its last 64-byte line that differs from the page's shadow (what the buffer holds), not the whole
+// 4 KiB page. Idea from TheCruZ/KytyPS5-GTA (uploads only what the guest wrote).
+static bool HotPageSpansEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOT_PAGE_SPANS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// [first, last) byte offsets of the 64-byte lines of a 4 KiB page that differ; the whole page when
+// none differ (the caller found a difference, so that only happens with a racing write).
+static std::pair<uint64_t, uint64_t> DifferingLines(const uint8_t* shadow, const uint8_t* page) {
+	constexpr uint64_t Line  = 64;
+	uint64_t           first = 0;
+	while (first < TRACKER_PAGE_SIZE && std::memcmp(shadow + first, page + first, Line) == 0) {
+		first += Line;
+	}
+	if (first == TRACKER_PAGE_SIZE) {
+		return {0, TRACKER_PAGE_SIZE};
+	}
+	uint64_t last = TRACKER_PAGE_SIZE;
+	while (last > first + Line && std::memcmp(shadow + last - Line, page + last - Line, Line) == 0) {
+		last -= Line;
+	}
+	return {first, last};
 }
 
 void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
@@ -1961,14 +2032,25 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				staged += TRACKER_PAGE_SIZE;
 				continue;
 			}
+			bool fresh = false;
 			if (shadow == m_hot_shadows.end()) {
 				if (m_hot_shadows.size() < max_pages) {
 					shadow = m_hot_shadows.emplace(page, HotShadow {}).first;
+					fresh  = true;
 					shadow->second.data = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
 				} else {
 					// No shadow to compare against: back to faulting on writes.
 					demote.push_back(page);
 				}
+			}
+			// KYTY_HOT_PAGE_SPANS: with a shadow of the buffer's contents, only the span of 64-byte
+			// lines that differ from it is uploaded (moved to the start of the snapshot slot).
+			uint64_t span_begin = 0;
+			uint64_t span_bytes = TRACKER_PAGE_SIZE;
+			if (shadow != m_hot_shadows.end() && !fresh && HotPageSpansEnabled()) {
+				const auto [first, last] = DifferingLines(shadow->second.data.get(), snapshot);
+				span_begin               = first;
+				span_bytes               = last - first;
 			}
 			if (shadow != m_hot_shadows.end()) {
 				std::memcpy(shadow->second.data.get(), snapshot, TRACKER_PAGE_SIZE);
@@ -1976,9 +2058,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				shadow->second.last_use         = frame;
 				shadow->second.unchanged_checks = 0;
 			}
-			copies.emplace_back(total_size, buffer.Offset(page), TRACKER_PAGE_SIZE);
-			total_size += TRACKER_PAGE_SIZE;
-			staged += TRACKER_PAGE_SIZE;
+			if (span_begin != 0) {
+				std::memmove(snapshot, snapshot + span_begin, span_bytes);
+			}
+			copies.emplace_back(total_size, buffer.Offset(page) + span_begin, span_bytes);
+			total_size += span_bytes;
+			staged += span_bytes;
 		}
 	}
 	MemoryStats::Count(MemoryStats::Counter::HotUploadPages, visited);
@@ -4191,11 +4276,31 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
 	}
 	if (source || late_source) {
+		if (InplaceStats::Enabled()) {
+			InplaceStats::NoteUploadBytes(total_size + late_size, copies.size() + late_copies.size());
+			const auto path = stats != nullptr ? (stats->reach ? InplaceStats::UploadPath::BdaReach : InplaceStats::UploadPath::BdaSync)
+			                  : is_written     ? InplaceStats::UploadPath::Written
+			                  : is_texel_buffer ? InplaceStats::UploadPath::Texel
+			                                    : InplaceStats::UploadPath::Read;
+			for (size_t i = 0; i < copies.size(); i++) {
+				const auto& copy = copies[i];
+				InplaceStats::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+				// Copies past guest_copies were added by CollectHotPages (changed hot pages).
+				InplaceStats::NoteUploadDetail(path, i >= guest_copies, buffer.CpuAddress() + copy.dstOffset,
+				                               copy.size);
+			}
+			for (const auto& copy: late_copies) {
+				InplaceStats::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+				InplaceStats::NoteUploadDetail(path, false, buffer.CpuAddress() + copy.dstOffset, copy.size);
+			}
+		}
 		if (stats != nullptr) {
 			stats->upload_bytes += total_size + late_size;
 			stats->upload_copies += copies.size() + late_copies.size();
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size + late_size);
+		// The overlay's "Buffer transfers": every path, the staged reservation included.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size + late_size);
 		if (HangTrace::Enabled()) {
 			const char* reason = upload_reason;
 			if (reason == nullptr) {
@@ -4390,7 +4495,6 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		}
 		return host_data + (copy.srcOffset - host_base);
 	};
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -4572,6 +4676,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	if (m_inplace != nullptr) {
+		if (is_written) {
+			m_inplace->Demote(vaddr, size);
+		} else if (!is_texel_buffer) {
+			std::pair<Buffer*, uint64_t> result;
+			if (TryInplaceBinding(vaddr, size, result)) {
+				return result;
+			}
+		}
+	}
 	if (!is_written && m_binding_memo != nullptr && size < BindingMemoMaxSize &&
 	    GuestGpu::IsGpuThread()) {
 		if (!is_texel_buffer) {
@@ -4588,6 +4702,38 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	return ObtainBufferNow(vaddr, size, is_written, is_texel_buffer, id, nullptr);
+}
+
+bool BufferCache::TryInplaceBinding(uint64_t vaddr, uint64_t size, std::pair<Buffer*, uint64_t>& result) {
+	if (!m_inplace->AllCandidates(vaddr, size) || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// Guest memory must hold the current bytes: no GPU-written bytes the cache still owns, no
+	// readback or backing publication about to land, no image that wrote the range.
+	MemoryTracker::DirtyState state;
+	if (!m_memory_tracker.QueryDirtyRelaxed(vaddr, size, state)) {
+		state = m_memory_tracker.QueryDirty(vaddr, size);
+	}
+	const uint64_t page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const uint64_t page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (state.gpu || HasPendingBackingPublication(vaddr, size) || OverlapsPendingSideReadback(page_begin, page_end) ||
+	    (!m_early_released.empty() && OverlapsUnpublished(vaddr, size)) ||
+	    m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	Buffer*  buffer = nullptr;
+	uint64_t offset = 0;
+	if (!m_inplace->Bind(vaddr, size, buffer, offset)) {
+		return false;
+	}
+	result = {buffer, offset};
+	return true;
+}
+
+void BufferCache::InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size) {
+	if (m_inplace != nullptr) {
+		m_inplace->BeforeCpWrite(vaddr, size);
+	}
 }
 
 void BufferCache::PrefetchReadBinding(uint64_t vaddr, uint64_t size, bool at_find) const noexcept {
@@ -5173,6 +5319,9 @@ bool BufferCache::TryDeferStreamCopy(uint8_t* mapped, uint64_t vaddr, uint64_t s
 }
 
 void StreamCopyDefer::NoteGpuOnlyWrite(uint64_t address, uint64_t size) {
+	if (auto* inplace = g_inplace_heap; inplace != nullptr && size != 0) {
+		inplace->BeforeCpWrite(address, size);
+	}
 	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {
 		(void)dma->DrainHostCopies(address, size, false);
@@ -5197,6 +5346,9 @@ void StreamCopyDefer::NoteGuestWrite(uint64_t address, uint64_t size) {
 	// KYTY_UPLOAD_DMA_WRITE_DRAIN (uploadDma.h): the guest may observe this write (a label) and
 	// then rewrite memory an earlier upload still has to read, so every queued host copy is made
 	// first.
+	if (auto* inplace = g_inplace_heap; inplace != nullptr && size != 0) {
+		inplace->BeforeCpWrite(address, size);
+	}
 	if (auto* dma = g_write_drain_dma; dma != nullptr && size != 0 && UploadDmaWriteDrainEnabled() &&
 	                                   GuestGpu::IsGpuThread()) {
 		(void)dma->DrainHostCopies(address, size, true);
@@ -5327,6 +5479,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 				}
 			}
 			if (read) {
+				InplaceStats::NoteStream(vaddr, size);
 				m_stream_buffer.Commit();
 				return {&m_stream_buffer, offset};
 			}

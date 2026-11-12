@@ -39,8 +39,17 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 // memory.
 [[nodiscard]] uint64_t HostBufferBytes();
 
+// Buffer over imported host memory (KYTY_INPLACE, InplaceHeap).
+struct ImportHostTag {};
+
 class Buffer {
 public:
+	// A buffer whose memory is the host range [host_pointer, +size) imported with
+	// VK_EXT_external_memory_host (GraphicContext::external_memory_host_enabled), usable as
+	// uniform, storage, vertex, index and indirect buffer and by device address. CpuAddress() is 0:
+	// the owner computes offsets. Handle() is null when the import failed.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, void* host_pointer, uint64_t size,
+	       ImportHostTag);
 	// transfer_shared: concurrent sharing with the upload DMA transfer queue family
 	// (GraphicContext::transfer_queue_family), when the device has that queue.
 	// host_cached: mapped cached host memory (CPU writes stay in the CPU caches, the GPU reads
@@ -113,6 +122,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::DeviceMemory              m_imported_memory = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	bool                          m_sparse   = false;
