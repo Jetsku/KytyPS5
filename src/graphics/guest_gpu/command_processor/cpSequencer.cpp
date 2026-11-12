@@ -9,6 +9,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
+#include "graphics/host_gpu/syncEpoch.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -226,6 +227,9 @@ void Sequencer::Run() {
 			m_intake.pop_front();
 		}
 		HangWatchdog::SetCpContext(0, intake.sequence);
+		// The publication epoch (syncEpoch.h): guest writes before this submission are ordered before
+		// every draw of it.
+		SyncEpoch::AdvancePublish();
 		const bool running = m_processor.SequenceSubmission(intake);
 		HangWatchdog::SetCpContext(UINT32_MAX, 0);
 		if (!running) {

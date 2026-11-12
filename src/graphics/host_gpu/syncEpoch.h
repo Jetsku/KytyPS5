@@ -30,7 +30,24 @@ namespace Libs::Graphics::SyncEpoch {
 namespace Detail {
 inline std::atomic<uint64_t> g_epoch {1};
 inline std::atomic<uint64_t> g_submission {1};
+alignas(64) inline std::atomic<uint64_t> g_publish {1};
 } // namespace Detail
+
+// The publication epoch (KYTY_DRAW_PREP_LEAN digest cache, drawPrep/codeDigestCache.h): the epoch
+// as the thread that publishes draw preparations sees it. With KYTY_CP_SEQ=1 the sequencer
+// publishes draws ahead of the resolver, which advances the epoch below only when it reaches the
+// op after a fence; a preparation stamped with Current() could then predate a fence its draw
+// follows. This one advances with every Advance() and also on the sequencer thread itself, when it
+// takes a submission and at every packet that advances the epoch (whether or not KYTY_SYNC_EPOCH
+// is on), before it publishes any draw after it. A draw's stamp, read when it is published, is
+// therefore newer than every ordering point before the draw in its stream. Starts at 1; never 0.
+[[nodiscard]] inline uint64_t CurrentPublish() noexcept {
+	return Detail::g_publish.load(std::memory_order_acquire);
+}
+
+inline void AdvancePublish() noexcept {
+	Detail::g_publish.fetch_add(1, std::memory_order_acq_rel);
+}
 
 // KYTY_SYNC_EPOCH=0 disables every consumer of the epoch (they then check on every use).
 [[nodiscard]] inline bool Enabled() noexcept {
@@ -49,6 +66,7 @@ inline std::atomic<uint64_t> g_submission {1};
 // Any thread. The RMW orders the new epoch before whatever the caller does next.
 inline void Advance() noexcept {
 	Detail::g_epoch.fetch_add(1, std::memory_order_acq_rel);
+	AdvancePublish();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::SyncEpochAdvances);
 }
 

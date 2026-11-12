@@ -2,6 +2,7 @@
 // and (S6) the preparation window ring, worker parking and the producer's work stealing.
 // --measure-worker-gate [reps]: the parking/stealing configuration sweep (not a test).
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/drawPrep/codeDigestCache.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
@@ -772,6 +773,174 @@ void TestReadSetValidateInPlace() {
 	Check(same("restored memory") == DrawPrep::ValidateResult::Ok, "restored memory validates");
 }
 
+// KYTY_DRAW_PREP_LEAN read-set part: a lean read set (online merge while the reads come in order,
+// the plain path after the first read out of order) gives the plain read set's results for the
+// same reads: Finish's verdict and failure, the ranges and their bytes, the read and byte counts,
+// the record-time failures (limits) and BuildCertificate.
+void TestReadSetLeanMatchesPlain() {
+	std::mt19937_64    rng(0x1ea2026u);
+	constexpr uint64_t Base   = 0x200000;
+	constexpr uint64_t Window = 0x5000;
+	std::vector<uint8_t> memory(Window);
+	for (auto& byte: memory) {
+		byte = static_cast<uint8_t>(rng());
+	}
+	std::vector<Coherence::Range> built_plain;
+	std::vector<Coherence::Range> built_lean;
+	int  differences = 0;
+	int  online_finishes = 0;
+	int  offline_finishes = 0;
+	int  failures        = 0;
+	for (int iteration = 0; iteration < 20000; iteration++) {
+		DrawPrep::ReadSet plain;
+		DrawPrep::ReadSet lean;
+		const bool coalesce = (rng() & 1u) != 0;
+		plain.SetCoalesce(coalesce);
+		lean.SetCoalesce(coalesce);
+		lean.SetLean(true);
+		// Mostly ascending reads (as preparations read), contiguous runs, page-boundary meetings,
+		// repeated addresses, the odd out-of-order read and the odd disagreeing byte.
+		const auto reads   = 1u + rng() % 40u;
+		const auto shape   = rng() % 4u; // 0 random, 1 ascending, 2 ascending with rare jumps back, 3 contiguous
+		uint64_t   cursor  = rng() % 0x800u;
+		const bool corrupt = rng() % 8u == 0;
+		bool       ok_plain = true;
+		bool       ok_lean  = true;
+		for (uint32_t i = 0; i < reads; i++) {
+			uint64_t size   = 1u + rng() % 64u;
+			uint64_t offset = 0;
+			switch (shape) {
+				case 0: offset = rng() % (Window - 64u); break;
+				case 1: offset = std::min<uint64_t>(cursor + rng() % 96u, Window - 64u); break;
+				case 2:
+					offset = rng() % 10u == 0 ? rng() % (Window - 64u)
+					                          : std::min<uint64_t>(cursor + rng() % 64u, Window - 64u);
+					break;
+				default:
+					offset = std::min<uint64_t>(cursor, Window - 64u);
+					if (rng() % 6u == 0) {
+						offset = std::min<uint64_t>((offset | 0xfffu) + 1u - 8u, Window - 64u); // run up to a page end
+						size   = 8u;
+					}
+					break;
+			}
+			if (rng() % 16u == 0 && offset >= 4u) {
+				offset -= 4u; // overlap the previous read
+			}
+			cursor = offset + size;
+			std::vector<uint8_t> bytes(memory.begin() + static_cast<ptrdiff_t>(offset),
+			                           memory.begin() + static_cast<ptrdiff_t>(offset + size));
+			if (corrupt && rng() % 6u == 0) {
+				bytes[rng() % size] ^= 0x5au;
+			}
+			ok_plain = plain.Record(Base + offset, bytes.data(), size) && ok_plain;
+			ok_lean  = lean.Record(Base + offset, bytes.data(), size) && ok_lean;
+			if (rng() % 12u == 0) {
+				const auto dsize   = 1u + rng() % 0x400u;
+				const auto doffset = rng() % (Window - dsize);
+				const auto value   = rng();
+				ok_plain = plain.RecordDigest(Base + doffset, dsize, value) && ok_plain;
+				ok_lean  = lean.RecordDigest(Base + doffset, dsize, value) && ok_lean;
+			}
+		}
+		const bool online      = lean.LeanOnline();
+		const bool finish_plain = plain.Finish();
+		const bool finish_lean  = lean.Finish();
+		bool       same         = ok_plain == ok_lean && finish_plain == finish_lean &&
+		                plain.Failure() == lean.Failure() && plain.ReadCount() == lean.ReadCount() &&
+		                plain.ByteCount() == lean.ByteCount();
+		if (same && finish_plain) {
+			const auto a = plain.Ranges();
+			const auto b = lean.Ranges();
+			same = std::equal(a.begin(), a.end(), b.begin(), b.end());
+			for (size_t i = 0; same && i < a.size(); i++) {
+				const auto x = plain.RangeBytes(i);
+				const auto y = lean.RangeBytes(i);
+				same = std::equal(x.begin(), x.end(), y.begin(), y.end());
+			}
+			plain.BuildCertificate(built_plain);
+			lean.BuildCertificate(built_lean);
+			same = same && built_plain == built_lean && built_lean == ReferenceCertificateRanges(lean);
+		}
+		if (!same) {
+			if (differences++ < 4) {
+				std::fprintf(stderr, "lean read set differs: iteration %d shape %u coalesce %d online %d\n",
+				             iteration, static_cast<unsigned>(shape), coalesce ? 1 : 0, online ? 1 : 0);
+			}
+		}
+		online_finishes += finish_lean && online ? 1 : 0;
+		offline_finishes += finish_lean && !online ? 1 : 0;
+		failures += finish_lean ? 0 : 1;
+	}
+	Check(differences == 0, "a lean read set equals the plain one on random reads");
+	Check(online_finishes > 1000 && offline_finishes > 1000 && failures > 100,
+	      "the random reads cover online merges, the offline path and failures");
+
+	// The limits: the plain path's read count (coalesced reads count once) and byte count.
+	DrawPrep::ReadSet plain;
+	DrawPrep::ReadSet lean;
+	plain.SetCoalesce(true);
+	lean.SetCoalesce(true);
+	lean.SetLean(true);
+	const uint8_t one = 1;
+	bool          same_limits = true;
+	for (uint32_t i = 0; i < DrawPrep::ReadSet::MaxReads + 8u; i++) {
+		const uint64_t address = 0x1000 + uint64_t {i} * 2u; // touching pairs coalesce
+		same_limits &= plain.Record(address, &one, 1) == lean.Record(address, &one, 1);
+		same_limits &= plain.Failure() == lean.Failure() && plain.ReadCount() == lean.ReadCount();
+	}
+	Check(same_limits, "the lean read set refuses the same read as the plain one");
+}
+
+// KYTY_DRAW_PREP_LEAN digest part: a cached code digest is found only under the key it was stored
+// with; every key field (address, size, publication epoch, shader map generation, the two backing
+// mapping tags) invalidates it, epoch 0 never caches, and a colliding entry replaces the old one.
+void TestCodeDigestCache() {
+	DrawPrep::CodeDigestCache cache;
+	const DrawPrep::CodeDigestKey key {0x10000, 0x900, 5, 7, 11, 13};
+	uint64_t                      digest = 0;
+	Check(!cache.Lookup(key, digest), "an empty cache misses");
+	cache.Store(key, 0xabcdu);
+	Check(cache.Lookup(key, digest) && digest == 0xabcdu, "a stored digest hits under its key");
+	const auto changed = [&](auto mutate) {
+		auto other = key;
+		mutate(other);
+		uint64_t value = 0;
+		return !cache.Lookup(other, value);
+	};
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.address += 4; }), "another address misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.size += 4; }), "another size misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.epoch++; }), "a newer publication epoch misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.map_generation++; }), "a newer shader map misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.tag_begin++; }), "a remapped first region misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.tag_end++; }), "a remapped last region misses");
+	auto zero  = key;
+	zero.epoch = 0;
+	cache.Store(zero, 1u);
+	Check(!cache.Lookup(zero, digest), "epoch 0 (speculative or inline) never caches");
+	// Re-stored under a newer epoch: the old key misses, the new one hits.
+	auto newer = key;
+	newer.epoch++;
+	cache.Store(newer, 0x1234u);
+	Check(!cache.Lookup(key, digest) && cache.Lookup(newer, digest) && digest == 0x1234u,
+	      "a re-stored entry replaces the older epoch's");
+	// Many shaders: each finds its own digest or misses, never another's.
+	DrawPrep::CodeDigestCache many;
+	bool                      exact = true;
+	for (uint64_t i = 0; i < 4096; i++) {
+		const DrawPrep::CodeDigestKey k {0x400000 + i * 0x340u, 0x300 + (i % 7u) * 16u, 9, 1, 2, 2};
+		many.Store(k, i * 31u + 1u);
+	}
+	for (uint64_t i = 0; i < 4096; i++) {
+		const DrawPrep::CodeDigestKey k {0x400000 + i * 0x340u, 0x300 + (i % 7u) * 16u, 9, 1, 2, 2};
+		uint64_t                      value = 0;
+		if (many.Lookup(k, value)) {
+			exact &= value == i * 31u + 1u;
+		}
+	}
+	Check(exact, "a lookup never returns another shader's digest");
+}
+
 void TestRecordScopeNests() {
 	DrawPrep::ReadSet  outer_set;
 	DrawPrep::ReadSet  inner_set;
@@ -856,23 +1025,35 @@ void TestWindowSingleThread() {
 	window.Retire();
 }
 
-void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
+// batch > 1: the workers reserve up to `batch` slots per claim (KYTY_DRAW_PREP_LEAN claim part,
+// Window::TryReserve) and take each with ClaimReserved; the producer may take a reserved head.
+void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items, uint32_t batch = 1) {
 	DrawPrep::Window<Item> window(capacity);
 	std::atomic<bool>      stop {false};
 	std::vector<std::thread> threads;
 	for (uint32_t w = 0; w < workers; w++) {
 		threads.emplace_back([&, w] {
 			while (!stop.load(std::memory_order_acquire)) {
-				uint64_t seq  = 0;
-				auto*    item = window.TryClaim(seq);
+				uint64_t seq = 0;
+				if (batch > 1u) {
+					uint32_t count = 0;
+					if (!window.TryReserve(seq, count, batch, 2)) {
+						std::this_thread::yield();
+						continue;
+					}
+					for (uint32_t i = 0; i < count; i++) {
+						if (auto* item = window.ClaimReserved(seq + i); item != nullptr) {
+							prepare(item, seq + i);
+						}
+					}
+					continue;
+				}
+				auto* item = window.TryClaim(seq);
 				if (item == nullptr) {
 					std::this_thread::yield();
 					continue;
 				}
-				item->output      = Work(item->input);
-				item->prepared_by = w + 1u;
-				item->preparations++;
-				window.Complete(seq);
+				prepare(item, seq);
 			}
 		});
 	}
@@ -1048,6 +1229,12 @@ void TestAwaitHead() {
 		int        prepared = 0;
 		int        spins    = 0;
 		const auto stats    = DrawPrep::AwaitHead(
+			const auto prepare = [&](Item* item, uint64_t seq) {
+				item->output      = Work(item->input);
+				item->prepared_by = w + 1u;
+				item->preparations++;
+				window.Complete(seq);
+			};
             gate, window, always, [&](Item&, uint64_t) { prepared++; },
             [&](uint32_t, uint64_t) {
                 spins++;
@@ -2049,6 +2236,8 @@ int main(int argc, char** argv) {
 	TestReadSetDigests();
 	TestReadSetCertificate();
 	TestReadSetValidateInPlace();
+	TestReadSetLeanMatchesPlain();
+	TestCodeDigestCache();
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();
@@ -2074,3 +2263,6 @@ int main(int argc, char** argv) {
 	std::puts("DrawPrepTests: all cases passed");
 	return 0;
 }
+	TestWindowConcurrent(4, 8, 200000, 2); // KYTY_DRAW_PREP_LEAN claim part
+	TestWindowConcurrent(32, 6, 200000, 2);
+	TestWindowConcurrent(32, 3, 200000, 4);

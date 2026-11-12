@@ -2755,9 +2755,12 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 
 	if (sequencer) {
 		// The resolver advances the epoch before the next op, i.e. before the next GPU work.
-		if (SyncEpoch::Enabled() &&
-		    DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
-			m_epoch_pending = true;
+		// The publication epoch advances here, before any draw after the packet is published.
+		if (DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
+			SyncEpoch::AdvancePublish();
+			if (SyncEpoch::Enabled()) {
+				m_epoch_pending = true;
+			}
 		}
 	} else if (!reference) {
 		// KYTY_SYNC_EPOCH (syncEpoch.h): every fence but a register load from memory is a point

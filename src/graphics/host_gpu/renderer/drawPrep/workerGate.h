@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <utility>
 
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -207,10 +208,15 @@ inline void WorkerRelax() noexcept {
 // One preparation worker (Engine::Workers::Run; the unit tests run the same loop). `prepare` gets
 // each claimed slot and its sequence number and must complete it; `on_cold_wake` is called after
 // this worker woke a cold one. Workers look at the clock only every 256 idle spins.
-template <typename WindowT, typename Prepare, typename OnColdWake>
-void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uint64_t hot_spin_ns,
-                          uint64_t cold_spin_ns, const std::atomic<bool>& stop, Prepare&& prepare,
-                          OnColdWake&& on_cold_wake) {
+// KYTY_DRAW_PREP_LEAN claim part: a worker reserves `max_batch()` slots at once only while at least
+// this many are unclaimed, so a batch never holds back a slot another worker could start now.
+inline constexpr uint64_t ClaimBatchMinBacklog = 4;
+
+template <typename WindowT, typename Prepare, typename OnColdWake, typename MaxBatch>
+void RunPreparationWorkerBatched(WorkerGate& gate, WindowT& window, uint32_t index,
+                                 uint64_t hot_spin_ns, uint64_t cold_spin_ns,
+                                 const std::atomic<bool>& stop, Prepare&& prepare,
+                                 OnColdWake&& on_cold_wake, MaxBatch&& max_batch) {
 	const bool hot        = gate.Hot(index);
 	const auto spin_limit = hot ? hot_spin_ns : cold_spin_ns;
 	auto       idle_start = WorkerNowNs();
@@ -220,17 +226,34 @@ void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uin
 	stats.index    = index + 1u;
 	auto  idle_tsc = PrepStats::Tsc();
 	while (!stop.load(std::memory_order_acquire)) {
-		uint64_t seq = 0;
-		if (auto* slot = window.TryClaim(seq); slot != nullptr) {
+		uint64_t   seq   = 0;
+		uint32_t   count = 1;
+		const auto batch = static_cast<uint32_t>(max_batch());
+		decltype(window.TryClaim(seq)) slot = nullptr;
+		bool claimed = false;
+		if (batch <= 1u) {
+			slot    = window.TryClaim(seq);
+			claimed = slot != nullptr;
+		} else {
+			claimed = window.TryReserve(seq, count, batch, ClaimBatchMinBacklog);
+		}
+		if (claimed) {
 			const auto claimed_tsc = PrepStats::Tsc();
 			stats.spin += claimed_tsc - idle_tsc;
 			if (gate.HasCold() && gate.MaybeWakeCold(window.Unclaimed())) {
 				on_cold_wake();
 			}
-			prepare(*slot, seq);
+			for (uint32_t i = 0; i < count; i++) {
+				auto* claimed_slot = batch <= 1u ? slot : window.ClaimReserved(seq + i);
+				if (claimed_slot == nullptr) {
+					continue; // the producer took it as the head
+				}
+				prepare(*claimed_slot, seq + i);
+				stats.slots++;
+			}
 			idle_tsc = PrepStats::Tsc();
 			stats.busy += idle_tsc - claimed_tsc;
-			if ((++stats.slots & 31u) == 0u) {
+			if (stats.slots >= 32u) {
 				PrepStats::Flush(stats);
 			}
 			idle_start = WorkerNowNs();
@@ -265,6 +288,15 @@ struct StealPolicy {
 	uint32_t min_unclaimed = 0; // 0: never; else steal while at least this many slots are unclaimed
 	uint64_t after_ns      = 0; // spin this long on the held head before the first steal
 };
+template <typename WindowT, typename Prepare, typename OnColdWake>
+void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uint64_t hot_spin_ns,
+                          uint64_t cold_spin_ns, const std::atomic<bool>& stop, Prepare&& prepare,
+                          OnColdWake&& on_cold_wake) {
+	RunPreparationWorkerBatched(gate, window, index, hot_spin_ns, cold_spin_ns, stop,
+	                            std::forward<Prepare>(prepare), std::forward<OnColdWake>(on_cold_wake),
+	                            [] { return 1u; });
+}
+
 
 struct AwaitStats {
 	uint32_t stolen  = 0; // slots the producer prepared

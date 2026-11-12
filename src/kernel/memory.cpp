@@ -2260,6 +2260,30 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest, InPlac
 	return reads.RecordDigest(vaddr, size, digest);
 }
 
+bool CodeDigestCacheable(uint64_t vaddr, uint64_t size, uint64_t& tag_begin, uint64_t& tag_end) {
+	constexpr uint32_t RegionShift = 26; // GuestAddressSpace's 64 MiB mapping-tag regions
+	if (g_guest_address_space == nullptr || !Graphics::GpuTouched::Enabled() || size == 0 ||
+	    vaddr > UINT64_MAX - size) {
+		return false;
+	}
+	const auto last = vaddr + size - 1u;
+	if ((last >> RegionShift) - (vaddr >> RegionShift) > 1u) {
+		return false;
+	}
+	// The 4 KiB marks: coarser than the 1 KiB ones, so never untouched where those are not.
+	if (Graphics::GpuTouched::AnyTouched(false, vaddr, vaddr + size)) {
+		return false;
+	}
+	tag_begin = GuestAddressSpace::BackingMappingTag(vaddr);
+	tag_end   = GuestAddressSpace::BackingMappingTag(last);
+	return true;
+}
+
+bool HashBackingUnrecorded(uint64_t vaddr, uint64_t size, uint64_t& digest) {
+	auto hash = [&](const uint8_t* bytes) { digest = XXH3_64bits(bytes, static_cast<size_t>(size)); };
+	return TryInspectBacking(vaddr, size, hash, nullptr);
+}
+
 bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
 }

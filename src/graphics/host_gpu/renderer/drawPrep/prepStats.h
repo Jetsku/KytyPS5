@@ -35,6 +35,11 @@ struct alignas(64) WorkerCounters {
 	std::atomic<uint64_t> spin {0};
 	std::atomic<uint64_t> park {0};
 	std::atomic<uint64_t> parks {0};
+	// KYTY_DRAW_PREP_LEAN digest part: code digests taken from the cache, hashed (and stored), and
+	// looked up where the cache could not be used.
+	std::atomic<uint64_t> digest_hits {0};
+	std::atomic<uint64_t> digest_misses {0};
+	std::atomic<uint64_t> digest_uncacheable {0};
 };
 
 inline WorkerCounters g_workers[MaxWorkers];
@@ -46,6 +51,9 @@ struct Local {
 	uint64_t spin  = 0;
 	uint64_t park  = 0;
 	uint64_t parks = 0;
+	uint64_t digest_hits        = 0;
+	uint64_t digest_misses      = 0;
+	uint64_t digest_uncacheable = 0;
 	uint64_t unflushed = 0;
 };
 
@@ -58,6 +66,9 @@ inline void Flush(Local& local) noexcept {
 	g.spin.fetch_add(local.spin, std::memory_order_relaxed);
 	g.park.fetch_add(local.park, std::memory_order_relaxed);
 	g.parks.fetch_add(local.parks, std::memory_order_relaxed);
+	g.digest_hits.fetch_add(local.digest_hits, std::memory_order_relaxed);
+	g.digest_misses.fetch_add(local.digest_misses, std::memory_order_relaxed);
+	g.digest_uncacheable.fetch_add(local.digest_uncacheable, std::memory_order_relaxed);
 	const auto index = local.index;
 	local            = Local {};
 	local.index      = index;

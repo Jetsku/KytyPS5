@@ -21,12 +21,14 @@
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
+#include "graphics/host_gpu/renderer/drawPrep/lean.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 #include "graphics/host_gpu/renderer/drawPrep/xframeReuse.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 
@@ -319,6 +321,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.reads.Reset();
 	prepared.reads.SetCoalesce(DirectReadsEnabled());
 	prepared.certificate.clear();
+	prepared.reads.SetLean(Lean::On(Lean::ReadSet)); // KYTY_DRAW_PREP_LEAN read-set part
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
 	prepared.touched_valid     = false;
@@ -344,6 +347,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 
 	Recorder    recorder {&prepared.reads, exact};
 	RecordScope scope(recorder);
+	recorder.code_epoch = t_code_epoch; // KYTY_DRAW_PREP_LEAN digest cache (0: not used)
 	// KYTY_DRAW_PREP_TESS: a tessellated draw's three vertex stages (otherwise Ineligible).
 	const bool tess = PipelineCache::TessellationActive(registers.user_config) &&
 	                  PipelineCache::DrawPrepTessEnabled();
@@ -412,6 +416,49 @@ int DirectReadsMode() {
 }
 
 bool DirectReadsEnabled() {
+// KYTY_DRAW_PREP_LEAN (lean.h): live; every part is valid at any time (the digest cache's epochs
+// are maintained whether it is on or not).
+// A change also makes the next commit print the PrepStats / DrawPrep lines (closing the A/B slot).
+static std::atomic<bool> g_stats_due {false};
+static Live::Switch g_lean(
+    "KYTY_DRAW_PREP_LEAN", [](const char* value) -> int64_t { return Lean::ParseParts(value); },
+    [](int64_t, int64_t) { g_stats_due.store(true, std::memory_order_relaxed); });
+static std::atomic<uint64_t> g_lean_verify_checks {0};
+static std::atomic<uint64_t> g_lean_verify_mismatches {0};
+
+namespace Lean {
+
+uint32_t Parts() noexcept {
+	return static_cast<uint32_t>(g_lean.Get());
+}
+
+int DigestVerifyMode() noexcept {
+	static const int mode = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_LEAN_VERIFY");
+		if (value == nullptr || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+void NoteDigest(uint32_t hits, uint32_t misses, uint32_t uncacheable) noexcept {
+	auto& local = PrepStats::t_local;
+	local.digest_hits += hits;
+	local.digest_misses += misses;
+	local.digest_uncacheable += uncacheable;
+}
+
+void NoteDigestVerify(bool mismatch) noexcept {
+	g_lean_verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (mismatch) {
+		g_lean_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+} // namespace Lean
+
 	return g_direct_reads.Get() != 0;
 }
 
@@ -778,6 +825,7 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	prepared.reads.Reset();
 	prepared.reads.SetCoalesce(DirectReadsEnabled());
 	prepared.certificate.clear();
+	prepared.reads.SetLean(Lean::On(Lean::ReadSet)); // KYTY_DRAW_PREP_LEAN read-set part
 	prepared.certificate_built = false;
 	prepared.reads_untouched   = false;
 	prepared.touched_valid     = false;
@@ -793,6 +841,7 @@ void PrepareDispatch(PipelineCache& pipeline_cache, const RegisterSnapshot& regi
 	MakeComputeInputInfo(cs, args, prepared.compute_info);
 	Recorder    recorder {&prepared.reads, exact};
 	RecordScope scope(recorder);
+	recorder.code_epoch = t_code_epoch; // KYTY_DRAW_PREP_LEAN digest cache (0: not used)
 	const auto  result = pipeline_cache.PrepareComputeProgramSpeculative(
         cs, registers.context.GetShaderRegisters(), prepared.compute_info, prepared.compute_prep,
         prepared.compute_program, &prepared.program_compile_ns);
@@ -1435,7 +1484,27 @@ struct Engine::Slot {
 	// PrepStats: the TSC when the preparing thread completed the slot.
 	uint64_t done_tsc = 0;
 };
+	// KYTY_DRAW_PREP_LEAN digest cache: the publication epoch when the slot was filled
+	// (syncEpoch.h CurrentPublish, read by the publishing thread).
+	uint64_t code_epoch = 0;
+};
 
+namespace {
+// The epoch a preparation of `slot` may use for the code digest cache: none for speculative slots
+// (published before their wait completed).
+uint64_t SlotCodeEpoch(const Engine::Slot& slot) {
+	return slot.speculative ? 0 : slot.code_epoch;
+}
+
+// Sets t_code_epoch for one preparation on this thread.
+class CodeEpochScope {
+public:
+	explicit CodeEpochScope(uint64_t epoch) noexcept { t_code_epoch = epoch; }
+	~CodeEpochScope() { t_code_epoch = 0; }
+	CodeEpochScope(const CodeEpochScope&)            = delete;
+	CodeEpochScope& operator=(const CodeEpochScope&) = delete;
+
+} // namespace
 namespace {
 
 // After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs, and the
@@ -1593,7 +1662,10 @@ struct Engine::Workers {
 		// KYTY_DRAW_PREP_PHASES (common/prepPhases.h): the split of this preparation.
 		namespace Phases = Common::PrepPhases;
 		Phases::Begin();
-		PrepareSlot(pipeline_cache, slot, false);
+		{
+			const CodeEpochScope epoch(SlotCodeEpoch(slot));
+			PrepareSlot(pipeline_cache, slot, false);
+		}
 		HashForRepeatTrace(slot);
 		Phases::Mark(Phases::Phase::RunKey);
 		PlanBindings(slot, plan_context);
@@ -1611,7 +1683,7 @@ struct Engine::Workers {
 		t_worker_thread = true;
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
 		t_worker_number = index + 1u;
-		RunPreparationWorker(
+		RunPreparationWorkerBatched(
 		    gate, window, index, spin_ns, cold_spin_ns, stop,
 		    [this, &placement_count](Slot& slot, uint64_t seq) {
 			    PrepareClaimed(slot, seq);
@@ -1619,7 +1691,9 @@ struct Engine::Workers {
 				    Common::SamplePlacement(Common::ThreadRole::Host);
 			    }
 		    },
-		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); },
+		    // KYTY_DRAW_PREP_LEAN claim part: two slots per claim-counter update in a backlog.
+		    [] { return Lean::On(Lean::Claim) ? 2u : 1u; });
 	}
 
 	PipelineCache&           pipeline_cache;
@@ -1711,7 +1785,6 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
 	slot.speculative     = false;
 	slot.repeat_packet   = RepeatTrace::Enabled() ? RepeatTrace::TakeDrawPacket() : 0;
 }
-
 bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
                     const DrawAutoArgs* auto_args, const HW::Context& context,
                     const HW::UserConfig& user_config, const HW::Shader& shaders) {
@@ -1839,6 +1912,7 @@ uint64_t Engine::DropSpeculative() {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPrefetchSkipped, count);
 		g_totals.prefetch_skipped.fetch_add(count, std::memory_order_relaxed);
 	}
+	slot.code_epoch      = SyncEpoch::CurrentPublish();
 	return count;
 }
 
@@ -1906,7 +1980,10 @@ Engine::Slot& Engine::ReadyHead() {
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
 		const CpGaps::Scope gap(CpGaps::Cat::HeadSelf);
-		PrepareSlot(m_renderer.GetPipelineCache(), slot, true);
+		{
+			const CodeEpochScope epoch(SlotCodeEpoch(slot));
+			PrepareSlot(m_renderer.GetPipelineCache(), slot, true);
+		}
 		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 		if (stats_start != 0) {
@@ -2272,6 +2349,23 @@ void PrintPrepStats(uint64_t now_ns) {
 	            ms(seq_spin - last_seq), ms(rec_spin - last_rec));
 	last_seq = seq_spin;
 	last_rec = rec_spin;
+	// KYTY_DRAW_PREP_LEAN: the parts on now, and the digest cache's lookups (workers).
+	static uint64_t last_hits = 0, last_misses = 0, last_unc = 0;
+	uint64_t        hits = 0, misses = 0, unc = 0;
+	for (const auto& g: PrepStats::g_workers) {
+		hits += g.digest_hits.load(std::memory_order_relaxed);
+		misses += g.digest_misses.load(std::memory_order_relaxed);
+		unc += g.digest_uncacheable.load(std::memory_order_relaxed);
+	}
+	std::printf("PrepStats lean %.0fs: parts 0x%x | digest hits %.0f/s misses %.0f/s uncacheable %.0f/s | verify "
+	            "%" PRIu64 " checks %" PRIu64 " mismatches (total)\n",
+	            secs, Lean::Parts(), static_cast<double>(hits - last_hits) / secs,
+	            static_cast<double>(misses - last_misses) / secs, static_cast<double>(unc - last_unc) / secs,
+	            g_lean_verify_checks.load(std::memory_order_relaxed),
+	            g_lean_verify_mismatches.load(std::memory_order_relaxed));
+	last_hits   = hits;
+	last_misses = misses;
+	last_unc    = unc;
 	std::fflush(stdout);
 	last_ns  = now_ns;
 	last_tsc = tsc;
@@ -2285,7 +2379,10 @@ void PrintDrawPrepSummary() {
 	static std::array<uint64_t, static_cast<size_t>(Failure::Mismatch) + 1u> last_reasons {};
 	// KYTY_CP_COMMIT=draws: the clock is read every 256th commit (the line is due every 10 s).
 	static uint32_t calls = 0;
-	if (CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
+	// A live change of KYTY_DRAW_PREP_LEAN closes the period at once (same-boot A/B slots).
+	const bool forced = g_stats_due.load(std::memory_order_relaxed) &&
+	                    g_stats_due.exchange(false, std::memory_order_relaxed);
+	if (!forced && CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
 		return;
 	}
 	const auto now = NowNs();
@@ -2293,7 +2390,10 @@ void PrintDrawPrepSummary() {
 		last_ns = now;
 		return;
 	}
-	if (now - last_ns < 10'000'000'000ull) {
+	// KYTY_DRAW_PREP_STATS_PERIOD_S (default 10): the lines' period.
+	static const uint64_t period_ns = uint64_t {EnvUnsigned("KYTY_DRAW_PREP_STATS_PERIOD_S", 10, 1, 1000000)} *
+	                                  1'000'000'000ull;
+	if (!forced && now - last_ns < period_ns) {
 		return;
 	}
 	const auto committed = g_totals.committed.load(std::memory_order_relaxed);
@@ -2493,6 +2593,13 @@ void Engine::OnPacket(PacketClass packet_class, FenceKind fence_kind) {
 			    E::DrawPrepFenceEndOfPipe,   E::DrawPrepFenceAcquireMem,
 			    E::DrawPrepFenceWait,        E::DrawPrepFenceDataWrite,
 			    E::DrawPrepFenceConstantEngine, E::DrawPrepFenceMarker,
+	if (BindingsVerifyMode() != 0) {
+		auto& totals = GetBindingTotals();
+		dispatches += " | binding verify: " +
+		              std::to_string(totals.verify_checks.load(std::memory_order_relaxed)) + " checks, " +
+		              std::to_string(totals.verify_mismatches.load(std::memory_order_relaxed)) +
+		              " mismatches (total)";
+	}
 			    E::DrawPrepFenceDispatch,    E::DrawPrepFenceIndirectDraw,
 			    E::DrawPrepFenceContextControl, E::DrawPrepFenceOther,
 			};
