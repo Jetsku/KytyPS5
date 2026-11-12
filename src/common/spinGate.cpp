@@ -184,9 +184,34 @@ uint64_t EnvU64(const char* name, uint64_t fallback, uint64_t low, uint64_t high
 
 Live::Switch g_budget_switch("KYTY_SPIN_BUDGET", ParseTriState);
 
-uint64_t ShortNs() {
-	static const uint64_t ns = EnvU64("KYTY_SPIN_BUDGET_SHORT_US", 2, 0, 1000000) * 1000u;
-	return ns;
+int64_t ParseUs(const char* value, int64_t fallback) {
+	if (value == nullptr || *value == '\0') {
+		return fallback;
+	}
+	return static_cast<int64_t>(std::min<unsigned long long>(std::strtoull(value, nullptr, 10), 1000000ull));
+}
+
+// KYTY_SPIN_BUDGET_SITES (live, default 0x3F = all six): the sites the closed gate caps, bit per
+// Site (1 sequencer, 2 recorder, 4 commit-head, 8 recorder-drain, 16 resolver, 32 worker).
+Live::Switch g_sites_switch("KYTY_SPIN_BUDGET_SITES", [](const char* value) -> int64_t {
+	return value == nullptr || *value == '\0' ? 0x3F
+	                                          : static_cast<int64_t>(std::strtoull(value, nullptr, 0) & 0x3Fu);
+});
+// KYTY_SPIN_BUDGET_SHORT_US (live, default 2): the closed gate's spin. KYTY_SPIN_BUDGET_PIPE_SHORT_US
+// (live, default: the same): the sequencer's and recorder's (their parks are wake-ups on the
+// commit thread's path).
+Live::Switch g_short_switch("KYTY_SPIN_BUDGET_SHORT_US",
+                            [](const char* value) -> int64_t { return ParseUs(value, 2); });
+Live::Switch g_pipe_short_switch("KYTY_SPIN_BUDGET_PIPE_SHORT_US",
+                                 [](const char* value) -> int64_t { return ParseUs(value, -1); });
+
+uint64_t ShortNs(Site site) {
+	if (site == Site::Sequencer || site == Site::Recorder) {
+		if (const auto pipe = g_pipe_short_switch.Get(); pipe >= 0) {
+			return static_cast<uint64_t>(pipe) * 1000u;
+		}
+	}
+	return static_cast<uint64_t>(g_short_switch.Get()) * 1000u;
 }
 
 // One registered spinner thread. Every counter has one writer (the thread), so updates are a
@@ -282,8 +307,8 @@ uint64_t SpinNs(Site site, uint64_t wanted_ns) {
 	if (Enabled() && !SpinAllowed()) {
 		return 0;
 	}
-	if (BudgetClosed()) {
-		return std::min(wanted_ns, ShortNs());
+	if (BudgetClosed() && ((g_sites_switch.Get() >> index) & 1) != 0) {
+		return std::min(wanted_ns, ShortNs(site));
 	}
 	return wanted_ns;
 }
@@ -521,11 +546,13 @@ void MonitorLoop() {
 		const auto closes = filter ? filter->Closes() - closes_seen : 0;
 		closes_seen       = filter ? filter->Closes() : 0;
 		const auto mean   = filter ? filter->Mean() : input;
-		std::printf("SpinBudget %.0fs: KYTY_SPIN_BUDGET=%d profile=%d legacy_gate=%d, gate %s "
+		std::printf("SpinBudget %.0fs: KYTY_SPIN_BUDGET=%d profile=%d legacy_gate=%d sites=0x%llx short=%lld/%lldus, gate %s "
 		            "(closed %.1f%% of the time, %llu closes), budget %u lps, demand busy %.1f spinning %.1f "
 		            "idle-spinners %.1f (window mean; busy %.2f spin %.2f cores), scan %u threads %.0f us avg "
 		            "%.0f us max (%.3f ms/s)%s\n",
 		            seconds, on ? 1 : 0, CoreBudgetProfileOn() ? 1 : 0, Enabled() ? 1 : 0,
+		            static_cast<unsigned long long>(g_sites_switch.Get()), static_cast<long long>(g_short_switch.Get()),
+		            static_cast<long long>(g_pipe_short_switch.Get()),
 		            g_closed.load(std::memory_order_relaxed) ? "closed" : "open",
 		            100.0 * static_cast<double>(closed_ns) / (seconds * 1e9),
 		            static_cast<unsigned long long>(closes), input.budget_logical, mean.busy,
