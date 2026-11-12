@@ -959,6 +959,33 @@ void TestWorkerGateBasics() {
 	Check(backlog_reads == 8, "the producer reads the backlog every WakeBacklog-th publish");
 }
 
+// KYTY_SERVE_IN_WAITS bit 1 (HeadWaitServiceAt): off keeps the 2 ms deadlock guard only; on serves
+// at every 64th look while commands are queued, and asks whether they are only at such a look.
+void TestHeadWaitService() {
+	using DrawPrep::HeadWaitService;
+	int        asked   = 0;
+	const auto queued  = [&] { asked++; return true; };
+	const auto nothing = [&] { asked++; return false; };
+	for (uint32_t spins = 0; spins < 4096; spins++) {
+		const auto off = DrawPrep::HeadWaitServiceAt(spins, 1'000'000u, false, queued);
+		Check(off == HeadWaitService::None, "serve-in-waits off: nothing before 2 ms");
+	}
+	Check(asked == 0, "serve-in-waits off: the pending test is never asked");
+	Check(DrawPrep::HeadWaitServiceAt(1023, 2'000'001u, false, queued) == HeadWaitService::Guard,
+	      "serve-in-waits off: the guard after 2 ms at a 1024th look");
+	Check(DrawPrep::HeadWaitServiceAt(1022, 2'000'001u, false, queued) == HeadWaitService::None,
+	      "serve-in-waits off: the guard only at a 1024th look");
+	uint32_t served = 0;
+	for (uint32_t spins = 0; spins < 4096; spins++) {
+		served += DrawPrep::HeadWaitServiceAt(spins, 0, true, queued) == HeadWaitService::Serve ? 1 : 0;
+	}
+	Check(served == 64 && asked == 64, "serve-in-waits on: every 64th look, asked only there");
+	Check(DrawPrep::HeadWaitServiceAt(63, 0, true, nothing) == HeadWaitService::None,
+	      "serve-in-waits on: nothing queued, nothing run");
+	Check(DrawPrep::HeadWaitServiceAt(1023, 2'000'001u, true, nothing) == HeadWaitService::Guard,
+	      "serve-in-waits on: the guard still runs");
+}
+
 // AwaitHead step by step: this thread is the producer and also plays the workers holding slots.
 void TestAwaitHead() {
 	DrawPrep::WorkerGate gate(2, 2, 8); // every worker hot: AwaitHead never wakes a cold one
@@ -2059,6 +2086,7 @@ int main(int argc, char** argv) {
 	TestWindowConcurrent(32, 6, 200000); // the default shape
 	TestWindowConcurrent(32, 1, 50000);
 	TestWorkerGateBasics();
+	TestHeadWaitService();
 	TestAwaitHead();
 	TestWorkerGateStress();
 	TestColdTokenStranded();

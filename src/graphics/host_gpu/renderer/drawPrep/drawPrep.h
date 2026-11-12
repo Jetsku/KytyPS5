@@ -87,6 +87,13 @@ enum class CertMode : uint8_t { Value, Log };
 // with a connected profiler and KYTY_DRAW_PREP_FENCE_HISTOGRAM=1 (opt-in). The hook changes
 // nothing in off mode; it only classifies packets and counts.
 [[nodiscard]] bool PacketHookActive();
+// KYTY_SERVE_IN_WAITS bit 1 (live, default 0): the commit thread runs queued service commands
+// while it waits for a head a worker holds (Engine::CommitHead), not only after 2 ms.
+[[nodiscard]] bool ServeInHeadWait();
+// The GPU thread's "service commands are queued" test (GuestGpu::HasPendingCommands), set once by
+// the command processor; false while unset.
+void               SetServiceCommandsPending(bool (*pending)());
+[[nodiscard]] bool ServiceCommandsPending();
 
 // The register state a draw reads, copied when the draw packet is parsed.
 struct RegisterSnapshot {

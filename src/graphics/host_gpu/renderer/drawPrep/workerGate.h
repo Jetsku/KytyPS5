@@ -246,6 +246,23 @@ struct StealPolicy {
 	uint64_t after_ns      = 0; // spin this long on the held head before the first steal
 };
 
+// What the producer's wait for a held head does with queued service commands at one look
+// (Engine::CommitHead). Guard: the deadlock guard (every 1024th look, after 2 ms). Serve:
+// KYTY_SERVE_IN_WAITS bit 1 (based on chenxiao07/KytyPS5 6801ddc13): every 64th look while
+// commands are queued. `pending` is asked only at a look that could serve.
+enum class HeadWaitService { None, Serve, Guard };
+template <typename Pending>
+[[nodiscard]] HeadWaitService HeadWaitServiceAt(uint32_t spins, uint64_t waited_ns, bool serve_in_waits,
+                                                Pending&& pending) {
+	if (serve_in_waits && (spins & 63u) == 63u && pending()) {
+		return HeadWaitService::Serve;
+	}
+	if ((spins & 1023u) == 1023u && waited_ns > 2'000'000u) {
+		return HeadWaitService::Guard;
+	}
+	return HeadWaitService::None;
+}
+
 struct AwaitStats {
 	uint32_t stolen  = 0; // slots the producer prepared
 	uint64_t spin_ns = 0; // time it spun, steals excluded

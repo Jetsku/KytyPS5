@@ -1061,6 +1061,8 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 		return nullptr;
 	}
 	if (m_draw_prep == nullptr) {
+		DrawPrep::SetServiceCommandsPending(
+		    [] { return g_gpu_state != nullptr && g_gpu_state->HasPendingCommands(); });
 		m_draw_prep.reset(new DrawPrep::Engine(
 		    m_renderer,
 		    [] {
