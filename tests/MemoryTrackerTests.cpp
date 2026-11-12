@@ -1113,7 +1113,7 @@ void TestSequentialFaultAhead() {
   policy.sequential_ahead = true;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 24);
   const auto address = reinterpret_cast<uint64_t>(memory);
   UploadAll(tracker, address, page_size * 24);
